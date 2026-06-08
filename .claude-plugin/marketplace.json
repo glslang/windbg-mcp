@@ -1,0 +1,12 @@
+{
+  "name": "windbg-mcp",
+  "description": "WinDbg/DbgEng debugging tools for Claude Code: an MCP server plus a skill that drives crash-dump, live, and Time Travel Debugging workflows.",
+  "owner": { "name": "glslang", "email": "glslang@gmail.com" },
+  "plugins": [
+    {
+      "name": "windbg-mcp",
+      "source": ".",
+      "description": "WinDbg/DbgEng MCP server + debugging skill."
+    }
+  ]
+}

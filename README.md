@@ -85,6 +85,23 @@ Point your client at the built binary, e.g. Claude Code:
 }
 ```
 
+### As a Claude Code plugin
+
+This repo is also a single-plugin [Claude Code marketplace](https://code.claude.com/docs/en/plugin-marketplaces):
+installing it registers the `windbg` MCP server **and** a `windbg-debugging` skill that
+knows how to drive it (setup, crash-dump, live/kernel, and TTD playbooks).
+
+```
+/plugin marketplace add glslang/windbg-mcp
+/plugin install windbg-mcp@windbg-mcp
+```
+
+The plugin ships source, not a binary, so after installing you still build it in place and
+(for `.run` replay) bundle the WinDbg engine — the skill's `setup.md` walks through it, and
+it mirrors the [*Build*](#build) and [*TTD engine*](#ttd-engine-required-for-run-replay)
+sections above. Then `/reload-plugins` to connect the server. The plugin points at
+`${CLAUDE_PLUGIN_ROOT}/target/release/windbg-mcp.exe`.
+
 ## Walkthrough
 
 [`docs/ttd-walkthrough.md`](docs/ttd-walkthrough.md) is a hands-on tour of the TTD tools against the

@@ -1,0 +1,16 @@
+{
+  "name": "windbg-mcp",
+  "description": "WinDbg/DbgEng debugging: crash dumps, live user-mode and kernel, and Time Travel Debugging (TTD) — MCP server plus a skill that drives it.",
+  "version": "0.1.0",
+  "author": { "name": "glslang", "email": "glslang@gmail.com" },
+  "homepage": "https://github.com/glslang/windbg-mcp",
+  "repository": "https://github.com/glslang/windbg-mcp",
+  "license": "Apache-2.0",
+  "mcpServers": {
+    "windbg": {
+      "type": "stdio",
+      "command": "${CLAUDE_PLUGIN_ROOT}/target/release/windbg-mcp.exe",
+      "args": []
+    }
+  }
+}
