@@ -22,7 +22,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: glslang/win-kexp
-          ref: dbgeng-dump-launch-attach-ttd
+          ref: main
           path: win-kexp
 
       - name: Install Rust toolchain
