@@ -52,7 +52,13 @@ fn hexdump(base: u64, bytes: &[u8]) -> String {
         let hex: Vec<String> = chunk.iter().map(|b| format!("{b:02x}")).collect();
         let ascii: String = chunk
             .iter()
-            .map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' })
+            .map(|&b| {
+                if (0x20..0x7f).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         out.push_str(&format!("{addr:016x}  {:<47}  {ascii}\n", hex.join(" ")));
     }
@@ -188,7 +194,8 @@ impl WindbgServer {
                 e.open_trace(&args.path).map_err(es)?;
                 e.wait_for_event(LOAD_WAIT_MS).map_err(es)?;
                 // Confirm TTD replay is active and report the trace's position span.
-                e.execute_command("dx @$curprocess.TTD.Lifetime").map_err(es)
+                e.execute_command("dx @$curprocess.TTD.Lifetime")
+                    .map_err(es)
             })
             .await?;
         text_result(out)
@@ -265,7 +272,11 @@ impl WindbgServer {
     async fn end_session(&self) -> Result<CallToolResult, ErrorData> {
         let out = self
             .engine
-            .run(move |e| e.end_session().map(|_| "session ended".to_string()).map_err(es))
+            .run(move |e| {
+                e.end_session()
+                    .map(|_| "session ended".to_string())
+                    .map_err(es)
+            })
             .await?;
         text_result(out)
     }
@@ -357,10 +368,7 @@ impl WindbgServer {
 
     /// Evaluate a data-model (LINQ) expression with `dx` — ideal for TTD queries.
     #[rmcp::tool]
-    async fn dx(
-        &self,
-        Parameters(args): Parameters<DxArgs>,
-    ) -> Result<CallToolResult, ErrorData> {
+    async fn dx(&self, Parameters(args): Parameters<DxArgs>) -> Result<CallToolResult, ErrorData> {
         let cmd = format!("dx {}", args.expression);
         let out = self
             .engine
@@ -421,7 +429,10 @@ impl WindbgServer {
     async fn ttd_events(&self) -> Result<CallToolResult, ErrorData> {
         let out = self
             .engine
-            .run(move |e| e.execute_command("dx -r2 @$curprocess.TTD.Events").map_err(es))
+            .run(move |e| {
+                e.execute_command("dx -r2 @$curprocess.TTD.Events")
+                    .map_err(es)
+            })
             .await?;
         text_result(out)
     }

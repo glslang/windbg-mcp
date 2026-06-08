@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-win-kexp = { path = "../win-kexp" }
+win-kexp = { git = "https://github.com/glslang/win-kexp", branch = "main" }
 rmcp = { version = "1", features = ["server", "transport-io", "macros", "schemars"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }

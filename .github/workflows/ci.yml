@@ -1,5 +1,8 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -12,18 +15,12 @@ concurrency:
 jobs:
   build:
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
-      - name: Checkout windbg-mcp
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          path: windbg-mcp
-
-      - name: Checkout win-kexp (path dependency)
-        uses: actions/checkout@v4
-        with:
-          repository: glslang/win-kexp
-          ref: main
-          path: win-kexp
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -32,21 +29,15 @@ jobs:
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: windbg-mcp
 
       - name: Format check
         run: cargo fmt --all --check
-        working-directory: windbg-mcp
 
       - name: Clippy
         run: cargo clippy --all-targets
-        working-directory: windbg-mcp
 
       - name: Build
         run: cargo build --release
-        working-directory: windbg-mcp
 
       - name: Test
         run: cargo test
-        working-directory: windbg-mcp
