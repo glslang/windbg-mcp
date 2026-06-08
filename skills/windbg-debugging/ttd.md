@@ -60,7 +60,7 @@ either direction. Jump anywhere with `goto_position { "position": "25:508" }`.
 
 Symbol names like `ucrtbase!__stdio_common_vfprintf` only resolve after a settled context:
 
-```
+```text
 execute { "command": ".sympath srv*C:\\ProgramData\\Dbg\\sym*https://msdl.microsoft.com/download/symbols" }
 set_breakpoint { "expression": "0x..." }
 goto_position  { "position": "0" }

@@ -91,7 +91,7 @@ This repo is also a single-plugin [Claude Code marketplace](https://code.claude.
 installing it registers the `windbg` MCP server **and** a `windbg-debugging` skill that
 knows how to drive it (setup, crash-dump, live/kernel, and TTD playbooks).
 
-```
+```text
 /plugin marketplace add glslang/windbg-mcp
 /plugin install windbg-mcp@windbg-mcp
 ```
