@@ -17,8 +17,8 @@ culprit driver named by a manual device-stack walk when `!analyze` couldn't.
 open_dump { "path": "…/docs/samples/052126-34312-01.dmp" }
 ```
 
-`open_dump` loads the dump, waits for it to settle, **loads `ext.dll`** (so
-`!ext.analyze` resolves — see [§5](#5-why-ext-analyze-and-not-analyze)), and returns the
+`open_dump` loads the dump, waits for it to settle, **loads `ext.dll`** so
+`!ext.analyze` resolves (see [§5](#5-why-extanalyze-and-not-analyze)), and returns the
 module list (`lm`). The module list already tells a story: third-party drivers present
 include `nvlddmkm` (NVIDIA), `nvhda64v` (NVIDIA HD-audio, many unloaded instances),
 `RzDev_*`/`RzCommon` (Razer), and the virtualization stack (`VBox*`, `vmx86`/`hcmon`/`vmnet*`,
@@ -105,7 +105,7 @@ test with sleep / fast-startup disabled.
 
 ## 4. Pitfall: partial minidumps and `0x80040205`
 
-This is a small triage minidump, so most of pool isn't captured. Reads of non-captured
+This is a small triage minidump, so most of the pool isn't captured. Reads of non-captured
 pages don't return a clean "memory read error" — the engine raises an exception that the
 server surfaces as:
 

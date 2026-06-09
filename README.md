@@ -48,11 +48,13 @@ cargo build --release --manifest-path C:\workspace\windbg-mcp\Cargo.toml
 > Until that merges, check out that branch in the sibling `win-kexp` checkout:
 > `git -C ..\win-kexp fetch origin dbgeng-dump-launch-attach-ttd && git -C ..\win-kexp checkout dbgeng-dump-launch-attach-ttd`.
 
-### Bundling the WinDbg engine (TTD replay + crash-dump `!analyze`)
+### Bundling the WinDbg engine
 
+Needed for two things: TTD `.run` replay (System32's engine rejects traces with `0x80070057`) and
+crash-dump `!analyze` (which lives in the `winext\` extensions that System32 doesn't ship).
 `DebugCreate` binds to whichever `dbgeng.dll` the loader finds first, and the app directory is
-searched before `System32`. So drop the **WinDbg** engine (which can replay TTD traces and ships the
-debugger extensions) next to the built binary. One-time, from the installed WinDbg store package:
+searched before `System32`, so the copied **WinDbg** engine (which replays TTD traces and ships the
+extensions) wins. One-time, from the installed WinDbg store package:
 
 ```pwsh
 $wd  = (Get-AppxPackage Microsoft.WinDbg).InstallLocation + "\amd64"
@@ -105,10 +107,10 @@ knows how to drive it (setup, crash-dump, live/kernel, and TTD playbooks).
 ```
 
 The plugin ships source, not a binary, so after installing you still build it in place and
-(for `.run` replay) bundle the WinDbg engine — the skill's `setup.md` walks through it, and
-it mirrors the [*Build*](#build) and [*TTD engine*](#ttd-engine-required-for-run-replay)
-sections above. Then `/reload-plugins` to connect the server. The plugin points at
-`${CLAUDE_PLUGIN_ROOT}/target/release/windbg-mcp.exe`.
+(for `.run` replay and crash-dump `!analyze`) bundle the WinDbg engine — the skill's `setup.md`
+walks through it, and it mirrors the [*Build*](#build) and
+[*Bundling the WinDbg engine*](#bundling-the-windbg-engine) sections above. Then `/reload-plugins`
+to connect the server. The plugin points at `${CLAUDE_PLUGIN_ROOT}/target/release/windbg-mcp.exe`.
 
 ## Walkthroughs
 

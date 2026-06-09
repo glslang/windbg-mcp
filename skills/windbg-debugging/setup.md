@@ -31,12 +31,18 @@ git -C ..\win-kexp checkout dbgeng-dump-launch-attach-ttd
 
 After `cargo build`, run `/reload-plugins` so Claude Code connects the `windbg` MCP server.
 
-## TTD engine — required for `.run` replay only
+## WinDbg engine + extensions — for `.run` replay and crash-dump `!analyze`
 
-System32's `dbgeng.dll` **rejects** `.run` traces with `0x80070057`. `DebugCreate` binds to
-whichever `dbgeng.dll` the loader finds first, and the app directory is searched before
-`System32` — so drop the **WinDbg** engine next to the built binary. One-time, from the
-installed WinDbg store package:
+Drop the **WinDbg** store-package binaries next to the built binary for two reasons:
+
+- **TTD `.run` replay** — System32's `dbgeng.dll` **rejects** traces with `0x80070057`.
+- **Crash-dump `!analyze`** — it lives in the `winext\` extensions, which System32 doesn't ship
+  (so a `.dmp`-only user still needs the `winext\` copy below, even though dump *loading* itself
+  works on System32's engine).
+
+`DebugCreate` binds to whichever `dbgeng.dll` the loader finds first, and the app directory is
+searched before `System32`, so the copied engine wins. One-time, from the installed WinDbg store
+package:
 
 ```pwsh
 $wd  = (Get-AppxPackage Microsoft.WinDbg).InstallLocation + "\amd64"
