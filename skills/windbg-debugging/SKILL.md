@@ -43,8 +43,12 @@ a bare `execute`, which only sets the run state and doesn't move the target.
 
 ## Cross-cutting gotchas (apply to every workflow)
 
-- **One debug session at a time** (single engine instance). End one with `end_session`
-  before opening another target.
+- **One debug session, and one command at a time** (single engine instance, run serially on
+  one thread). End a session with `end_session` before opening another target. Issue tool calls
+  **sequentially — await each result before the next**: concurrent in-flight requests aren't
+  ordered, so a pipelined call can run before `open_dump` establishes a target and fail with
+  `0x80040205`, and pipelining stateful debugger commands is unsafe regardless. (Normal MCP
+  clients serialize call→result; this only bites custom/batched callers.)
 - **Symbol *names* (`module!func`) need three things together:** (a) `msdia140.dll`
   bundled next to the binary, (b) a symbol path (`execute` →
   `.sympath srv*C:\ProgramData\Dbg\sym*https://msdl.microsoft.com/download/symbols`), and
