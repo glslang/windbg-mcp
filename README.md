@@ -171,7 +171,14 @@ timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressio
   (after a `go`/breakpoint, not straight off a `!tt`) so the module's PDB is matched and loaded.
   With those, e.g. `ttd_calls("ucrtbase!__stdio_common_vfprintf")` returns the exact call count.
   Without symbols, the data model, navigation, and memory reads still work — query by address.
-- One debug session at a time (single engine instance).
+- **One debug session, one command at a time.** A single engine instance runs on a dedicated
+  thread and processes operations serially. Issue tool calls **sequentially — await each result
+  before sending the next**; the server does not order concurrent in-flight requests, so pipelining
+  them (firing several calls before their results return) can run a command before the one that
+  establishes its state (a call racing ahead of `open_dump` fails with `0x80040205`), and is
+  meaningless for stateful, order-dependent debugger commands anyway. Standard MCP clients already
+  serialize call→result, so this is only a concern for custom/batched callers. End a session with
+  `end_session` before opening another target.
 - TTD **replay** (`open_trace`) needs `TTDReplay.dll` discoverable but **not** elevation; TTD
   **recording** (`record_trace`) needs `TTD.exe` **and** Administrator. `record_trace` captures the
   recorder's startup output to `<out_dir>\ttd_record.log` and watches it briefly, so a fast failure
