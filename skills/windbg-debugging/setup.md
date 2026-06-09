@@ -43,11 +43,14 @@ $wd  = (Get-AppxPackage Microsoft.WinDbg).InstallLocation + "\amd64"
 $dst = "<plugin dir>\target\release"
 Copy-Item "$wd\dbgeng.dll","$wd\dbghelp.dll","$wd\dbgcore.dll","$wd\dbgmodel.dll",`
           "$wd\symsrv.dll","$wd\msdia140.dll" $dst -Force
-Copy-Item "$wd\ttd" "$dst\ttd" -Recurse -Force   # TTDReplay*.dll, TtdExt.dll, TTDAnalyze.dll, ...
+Copy-Item "$wd\ttd"    "$dst\ttd"    -Recurse -Force   # TTDReplay*.dll, TtdExt.dll, TTDAnalyze.dll, ...
+Copy-Item "$wd\winext" "$dst\winext" -Recurse -Force   # ext.dll (!analyze), kext.dll, … — for crash dumps
 ```
 
 - The `ttd\` subdir provides the `@$cursession.TTD` / `@$curprocess.TTD` data model and the
   `!tt` time-travel commands.
+- The `winext\` subdir provides `ext.dll` (which exports `!analyze`) and the other `!`-extensions.
+  Required for crash-dump triage — without it `!analyze` returns *"No export analyze found"*.
 - `cargo clean` wipes `target\`, so re-copy after one.
 
 ## Symbols — required for `module!func` name resolution

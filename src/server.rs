@@ -176,6 +176,13 @@ impl WindbgServer {
             .run(move |e| {
                 e.open_dump(&args.path).map_err(es)?;
                 e.wait_for_event(LOAD_WAIT_MS).map_err(es)?;
+                // Load the WinDbg extension DLL so `!`-extension commands resolve — most
+                // importantly `!ext.analyze -v`, the crash-dump triage workhorse. A bare
+                // engine doesn't auto-load it, and even after `.load ext` the unqualified
+                // `!analyze` won't resolve, so callers must use `!ext.analyze`. Best-effort:
+                // a minimal engine without a bundled `winext\` directory simply won't have
+                // ext.dll, which must not fail the open (live/dump state is still usable).
+                let _ = e.execute_command(".load ext");
                 e.execute_command("lm").map_err(es)
             })
             .await?;

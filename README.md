@@ -23,6 +23,9 @@ The low-level engine bindings live in [`win-kexp`](https://github.com/glslang/wi
 - Windows x64 (host bitness must match the target).
 - `dbgeng.dll` / `dbghelp.dll` — present in `System32` on modern Windows 11 (verified with
   `10.0.26100`). This is enough for live user-mode/kernel debugging and crash-dump analysis.
+- **For crash-dump `!analyze`** (and any other `!`-extension command), the engine needs the
+  WinDbg `winext\` extensions bundled next to the binary — System32's engine ships none, so
+  `!analyze` would return *"No export analyze found"*. See *Bundling the WinDbg engine* below.
 - **For Time Travel Debugging (`.run`) replay**, the System32 engine is *not* enough — it rejects
   `.run` traces (`0x80070057`). You need the **WinDbg engine** (which bundles the TTD replay
   components) loaded next to the binary — see *TTD engine* below.
@@ -45,22 +48,27 @@ cargo build --release --manifest-path C:\workspace\windbg-mcp\Cargo.toml
 > Until that merges, check out that branch in the sibling `win-kexp` checkout:
 > `git -C ..\win-kexp fetch origin dbgeng-dump-launch-attach-ttd && git -C ..\win-kexp checkout dbgeng-dump-launch-attach-ttd`.
 
-### TTD engine (required for `.run` replay)
+### Bundling the WinDbg engine (TTD replay + crash-dump `!analyze`)
 
 `DebugCreate` binds to whichever `dbgeng.dll` the loader finds first, and the app directory is
-searched before `System32`. So drop the **WinDbg** engine (which can replay TTD traces) next to the
-built binary. One-time, from the installed WinDbg store package:
+searched before `System32`. So drop the **WinDbg** engine (which can replay TTD traces and ships the
+debugger extensions) next to the built binary. One-time, from the installed WinDbg store package:
 
 ```pwsh
 $wd  = (Get-AppxPackage Microsoft.WinDbg).InstallLocation + "\amd64"
 $dst = "C:\workspace\windbg-mcp\target\release"
 Copy-Item "$wd\dbgeng.dll","$wd\dbghelp.dll","$wd\dbgcore.dll","$wd\dbgmodel.dll",`
           "$wd\symsrv.dll","$wd\msdia140.dll" $dst -Force
-Copy-Item "$wd\ttd" "$dst\ttd" -Recurse -Force   # TTDReplay*.dll, TtdExt.dll, TTDAnalyze.dll, ...
+Copy-Item "$wd\ttd"    "$dst\ttd"    -Recurse -Force   # TTDReplay*.dll, TtdExt.dll, TTDAnalyze.dll, ...
+Copy-Item "$wd\winext" "$dst\winext" -Recurse -Force   # ext.dll (!analyze), kext.dll, … — crash-dump triage
 ```
 
 - The `ttd\` subdir provides the `@$cursession.TTD` / `@$curprocess.TTD` data model and the `!tt`
   time-travel commands.
+- The `winext\` subdir provides `ext.dll` (which exports `!analyze`) and the other `!`-extensions.
+  `open_dump` runs `.load ext` for you, but note the **unqualified `!analyze` does not resolve** on
+  this minimal engine — use the module-qualified **`!ext.analyze -v`** for crash-dump triage. Without
+  `winext\`, `!analyze` returns *"No export analyze found"*.
 - **`msdia140.dll` is required for PDB symbols.** Without it, `dbghelp` can't parse any PDB
   (`dia error 0x8007007e`) and silently falls back to *export* symbols — which makes `module!name`
   lookups (and so `ttd_calls("ucrtbase!__stdio_common_vfprintf")`) fail even with the right PDB in
@@ -102,12 +110,16 @@ it mirrors the [*Build*](#build) and [*TTD engine*](#ttd-engine-required-for-run
 sections above. Then `/reload-plugins` to connect the server. The plugin points at
 `${CLAUDE_PLUGIN_ROOT}/target/release/windbg-mcp.exe`.
 
-## Walkthrough
+## Walkthroughs
 
-[`docs/ttd-walkthrough.md`](docs/ttd-walkthrough.md) is a hands-on tour of the TTD tools against the
-[`xusheng6/TTD_lab`](https://github.com/xusheng6/TTD_lab) `helloworld` sample — opening a `.run`,
-surveying events/threads, forward/reverse navigation, memory analysis, and counting `printf` calls
-with symbols (with the real outputs and the gotchas). It maps each tool to the lab's exercises.
+- [`docs/crash-dump-walkthrough.md`](docs/crash-dump-walkthrough.md) — triaging a real kernel
+  minidump ([`docs/samples/052126-34312-01.dmp`](docs/samples/052126-34312-01.dmp)): a
+  `0x9F DRIVER_POWER_STATE_FAILURE` traced to `nvlddmkm.sys` via `!ext.analyze -v` and a manual
+  device-stack walk, with the real outputs and the partial-minidump (`0x80040205`) gotcha.
+- [`docs/ttd-walkthrough.md`](docs/ttd-walkthrough.md) — a hands-on tour of the TTD tools against the
+  [`xusheng6/TTD_lab`](https://github.com/xusheng6/TTD_lab) `helloworld` sample: opening a `.run`,
+  surveying events/threads, forward/reverse navigation, memory analysis, and counting `printf` calls
+  with symbols (with the real outputs and the gotchas). It maps each tool to the lab's exercises.
 
 ## Tools
 
@@ -143,6 +155,12 @@ timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressio
   can hit `0xD000010A` (that PID is a transient launcher) — attach to a classic Win32 process.
 - `read_memory` takes a numeric/`0x`-hex address only; for register/symbol expressions use
   `execute` with `db`/`dd` (e.g. `db @rip`).
+- **Crash-dump triage uses `!ext.analyze -v`**, not `!analyze` — the bundled engine only resolves
+  the module-qualified form (see *Bundling the WinDbg engine*). On a **partial minidump**, reads of
+  pages that weren't captured raise `An unexpected exception was raised (0x80040205)` rather than a
+  clean "memory read error"; query the specific field you need (e.g.
+  `dt nt!_DRIVER_OBJECT <addr> DriverName`) instead of dumping whole structures. See the
+  [crash-dump walkthrough](docs/crash-dump-walkthrough.md).
 - Single-stepping is only valid once the target is stopped with a real thread context (after a
   `go`/step or a breakpoint hit). Stepping straight after a bare `goto_position` to the very start of
   a trace (before any thread is live) returns `0x80040205` — `go` to a breakpoint first.

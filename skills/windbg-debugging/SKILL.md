@@ -52,6 +52,10 @@ a bare `execute`, which only sets the run state and doesn't move the target.
   a `goto_position`/`!tt`). Without these you silently get export symbols only and
   `module!name` lookups fail. Address-based queries, navigation, and memory reads still
   work without symbols — query by address.
+- **`!`-extension commands need the WinDbg `winext\` extensions bundled** next to the engine
+  ([setup.md](setup.md)) **and** the module-qualified form: use `!ext.analyze -v`, not bare
+  `!analyze` (which this engine resolves to *"No export analyze found"* even after `.load ext`).
+  `open_dump` runs `.load ext` for you.
 - **`read_memory` takes a numeric/`0x`-hex address only.** For a register/symbol
   expression use `execute` with `db`/`dd` (e.g. `db @rip`).
 - **Single-stepping needs a live thread context** — valid only once the target is stopped
