@@ -151,3 +151,48 @@ fn first_meaningful_line(log: &str) -> Option<&str> {
                 && !lower.starts_with("eula")
         })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::first_meaningful_line;
+
+    #[test]
+    fn empty_or_whitespace_has_no_meaningful_line() {
+        assert_eq!(first_meaningful_line(""), None);
+        assert_eq!(first_meaningful_line("   \n\t\n  "), None);
+    }
+
+    #[test]
+    fn banner_only_has_no_meaningful_line() {
+        let log = "Microsoft (R) TTD 1.01.11\n\
+                   Release: 1.11.428.0\n\
+                   Copyright (C) Microsoft Corporation. All rights reserved.\n\
+                   EULA accepted.\n";
+        assert_eq!(first_meaningful_line(log), None);
+    }
+
+    #[test]
+    fn banner_prefix_match_is_case_insensitive() {
+        let log = "MICROSOFT (R) TTD 1.01.11\nRELEASE: 1.11\nCOPYRIGHT foo\nEULA bar\n";
+        assert_eq!(first_meaningful_line(log), None);
+    }
+
+    #[test]
+    fn returns_first_error_after_banner_trimmed() {
+        let log = "Microsoft (R) TTD 1.01.11\n\
+                   Release: 1.11.428.0\n\
+                   \n\
+                   \tAdministrative privileges are required to record a trace.\n\
+                   Some later line.\n";
+        assert_eq!(
+            first_meaningful_line(log),
+            Some("Administrative privileges are required to record a trace.")
+        );
+    }
+
+    #[test]
+    fn skips_leading_blank_lines() {
+        let log = "\n\n   \nactual message\n";
+        assert_eq!(first_meaningful_line(log), Some("actual message"));
+    }
+}

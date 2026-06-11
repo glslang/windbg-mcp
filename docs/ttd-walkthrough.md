@@ -35,10 +35,11 @@ It was recorded with no extra arguments (`argc == 1`), so it makes **3** `printf
 
 ## 1. Open the trace
 
-```
+```text
 open_trace { "path": "C:\\workspace\\TTD_lab\\helloworld01.run" }
 ```
-```
+
+```text
 @$curprocess.TTD.Lifetime : [C:0, 124:8C2]
     MinPosition : C:0
     MaxPosition : 124:8C2
@@ -52,19 +53,21 @@ The reported `Lifetime` confirms TTD replay is live and gives the position span.
 `ttd_events` lists module loads/unloads, thread create/exit and exceptions — it runs
 `dx -r2 @$curprocess.TTD.Events`, so you get the full event objects. For just a tally:
 
-```
+```text
 dx { "expression": "@$curprocess.TTD.Events.Count()" }
 ```
-```
+
+```text
 @$curprocess.TTD.Events.Count() : 0x16        # 22 events
 ```
 
 Module-load timeline (a raw `dx` with LINQ — `ttd_events` is the convenience wrapper):
 
-```
+```text
 dx { "expression": "-g @$curprocess.TTD.Events.Where(e => e.Type == \"ModuleLoaded\").Select(e => new { Pos = e.Position, Mod = e.Module.Name })" }
 ```
-```
+
+```text
 =          = Pos   = Mod
 = [0x0]    - 2:0   - C:\workspace\TTD_lab\helloworld.exe
 = [0x1]    - 3:0   - C:\Windows\SYSTEM32\VCRUNTIME140.dll
@@ -79,10 +82,11 @@ dx { "expression": "-g @$curprocess.TTD.Events.Where(e => e.Type == \"ModuleLoad
 
 Threads (`@$curprocess.TTD.Threads`) — the main thread plus a short-lived worker:
 
-```
+```text
 dx { "expression": "-g @$curprocess.TTD.Threads" }
 ```
-```
+
+```text
 = [0x0] UID:2 TID:0x1324 Lifetime [A:0, 125:0]  ActiveTime [C:0, 124:8C2]
 = [0x1] UID:3 TID:0xFE4  Lifetime [0:0, ...]    ActiveTime [91:0, B3:0]
 ```
@@ -101,16 +105,18 @@ The control tools map to a debugger UI's F-keys and their Shift (reverse) varian
 
 Set a code breakpoint, jump to the start, and continue forward to it — then reverse:
 
-```
+```text
 set_breakpoint { "expression": "0x7ff887e453e4" }     # ucrtbase format-string read loop
 goto_position  { "position": "0" }                    # start of trace
 go {}
 ```
-```
+
+```text
 Breakpoint 0 hit
 Time Travel Position: 27:50E
 ```
-```
+
+```text
 go {}            → Time Travel Position: 27:550       # next hit, forward
 reverse_go {}    → Time Travel Position: 27:50E       # back to previous hit  ← time travel
 step_into {}     → 27:50F   step_into {} → 27:510     # single-step forward
@@ -127,10 +133,11 @@ step_back {}     → 27:50F                             # single-step backward
 `"Hello, world!"` string (its address comes from a memory search — see §5 for how, or just read it
 with `execute { "command": "s -a helloworld L?0x7000 \"Hello\"" }`):
 
-```
+```text
 ttd_memory { "address": "0x7ff629fe2210", "size": 14, "mode": "r" }
 ```
-```
+
+```text
 # 14 read records — one per byte — all from the same instruction:
 = Pos     = IP             = Acc
 = 27:50E  - 0x7ff887e453e4 - Read
@@ -147,7 +154,7 @@ This is the only part that needs PDB symbols. Point at a symbol store, then **re
 position** (after a `go`, not straight off a `!tt` — the settled context is what lets the module's
 PDB load and `module!name` lookups resolve):
 
-```
+```text
 execute { "command": ".sympath srv*C:\\ProgramData\\Dbg\\sym*https://msdl.microsoft.com/download/symbols" }
 set_breakpoint { "expression": "0x7ff887e453e4" }
 goto_position  { "position": "0" }
@@ -155,17 +162,19 @@ go {}
 execute { "command": ".reload /f" }
 execute { "command": "lm m ucrtbase" }
 ```
-```
+
+```text
 ucrtbase   (pdb symbols)   ...\ucrtbase.pdb\ACEA08EF1B94F30576F5085FC95B3A841\ucrtbase.pdb
 ```
 
 `(pdb symbols)` (not `(export symbols)`) means it worked. Now count the `printf` implementation:
 
-```
+```text
 ttd_calls { "function": "ucrtbase!__stdio_common_vfprintf" }
 dx        { "expression": "@$cursession.TTD.Calls(\"ucrtbase!__stdio_common_vfprintf\").Count()" }
 ```
-```
+
+```text
 @$cursession.TTD.Calls("ucrtbase!__stdio_common_vfprintf").Count() : 0x3
 ```
 
@@ -173,10 +182,11 @@ dx        { "expression": "@$cursession.TTD.Calls(\"ucrtbase!__stdio_common_vfpr
 underscores; the lab's `_stdio_common_vfprintf` is the display alias.) Pull the format string of
 each call (3rd x64 argument → `r8` → `Parameters[2]`):
 
-```
+```text
 dx { "expression": "-g @$cursession.TTD.Calls(\"ucrtbase!__stdio_common_vfprintf\").Select(c => new { Time = c.TimeStart, Format = ((char*)c.Parameters[2]) })" }
 ```
-```
+
+```text
 = Time     = Format
 = 25:508   - "Hello, world!."
 = 29:12D   - "argc: %d."
@@ -185,7 +195,7 @@ dx { "expression": "-g @$cursession.TTD.Calls(\"ucrtbase!__stdio_common_vfprintf
 
 Double-click equivalent — travel to the first call and inspect it:
 
-```
+```text
 goto_position { "position": "25:508" }
 registers {}                              # r8 holds the format pointer
 ```
