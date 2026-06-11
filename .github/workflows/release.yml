@@ -24,7 +24,7 @@ jobs:
           persist-credentials: false
 
       - name: Verify tag matches manifest versions
-        if: github.ref_type == 'tag'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         shell: pwsh
         run: |
           # The release checklist says: bump Cargo.toml + plugin.json, then tag
@@ -59,7 +59,9 @@ jobs:
           Set-Content dist/SHA256SUMS.txt "$hash  $name.zip"
 
       - name: Publish GitHub release
-        if: github.ref_type == 'tag'
+        # event_name guard: a workflow_dispatch run from a tag ref also has
+        # ref_type == 'tag', and a dry run must never publish.
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -68,7 +70,7 @@ jobs:
           generate_release_notes: true
 
       - name: Upload artifact (dry run)
-        if: github.ref_type != 'tag'
+        if: github.event_name != 'push'
         uses: actions/upload-artifact@v4
         with:
           name: windbg-mcp-windows-x64
