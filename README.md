@@ -39,14 +39,10 @@ The low-level engine bindings live in [`win-kexp`](https://github.com/glslang/wi
 ## Build
 
 ```pwsh
-# Expects win-kexp checked out as a sibling: ..\win-kexp
 cargo build --release --manifest-path C:\workspace\windbg-mcp\Cargo.toml
 ```
 
-> This crate uses a path dependency on [`win-kexp`](https://github.com/glslang/win-kexp) and needs its
-> dbgeng MCP-support changes ([glslang/win-kexp#54](https://github.com/glslang/win-kexp/pull/54)).
-> Until that merges, check out that branch in the sibling `win-kexp` checkout:
-> `git -C ..\win-kexp fetch origin dbgeng-dump-launch-attach-ttd && git -C ..\win-kexp checkout dbgeng-dump-launch-attach-ttd`.
+`win-kexp` is fetched automatically as a git dependency from [`glslang/win-kexp`](https://github.com/glslang/win-kexp) — no sibling checkout needed.
 
 ### Bundling the WinDbg engine
 
