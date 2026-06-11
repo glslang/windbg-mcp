@@ -1,8 +1,5 @@
 name: Release
 
-permissions:
-  contents: write
-
 on:
   push:
     tags: ["v*"]
@@ -16,6 +13,8 @@ jobs:
   release:
     name: Build & publish binary
     runs-on: windows-latest
+    permissions:
+      contents: write # create the GitHub release and upload its assets
     timeout-minutes: 30
     steps:
       - name: Checkout
