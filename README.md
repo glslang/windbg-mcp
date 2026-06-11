@@ -36,7 +36,12 @@ The low-level engine bindings live in [`win-kexp`](https://github.com/glslang/wi
   data model still work; symbol *names* won't resolve.
 - **Administrator** for live kernel debugging and TTD recording (not for replay).
 
-## Build
+## Build or download
+
+Prebuilt Windows x64 binaries are attached to each
+[GitHub release](https://github.com/glslang/windbg-mcp/releases) as
+`windbg-mcp-vX.Y.Z-windows-x64.zip` (with a SHA256 checksum) — no Rust toolchain needed.
+To build from source instead:
 
 ```pwsh
 cargo build --release
@@ -102,9 +107,10 @@ knows how to drive it (setup, crash-dump, live/kernel, and TTD playbooks).
 /plugin install windbg-mcp@windbg-mcp
 ```
 
-The plugin ships source, not a binary, so after installing you still build it in place and
-(for `.run` replay and crash-dump `!analyze`) bundle the WinDbg engine — the skill's `setup.md`
-walks through it, and it mirrors the [*Build*](#build) and
+The plugin ships source, not a binary, so after installing you still put the server binary in
+place — download a prebuilt release or build from source — and (for `.run` replay and
+crash-dump `!analyze`) bundle the WinDbg engine — the skill's `setup.md`
+walks through it, and it mirrors the [*Build or download*](#build-or-download) and
 [*Bundling the WinDbg engine*](#bundling-the-windbg-engine) sections above. Then `/reload-plugins`
 to connect the server. The plugin points at `${CLAUDE_PLUGIN_ROOT}/target/release/windbg-mcp.exe`.
 
@@ -113,8 +119,11 @@ to connect the server. The plugin points at `${CLAUDE_PLUGIN_ROOT}/target/releas
 The plugin sets an explicit `version` in
 [`.claude-plugin/plugin.json`](.claude-plugin/plugin.json), so users only receive an update
 when that version changes — pushing commits alone does not trigger one. To cut a release, bump
-`version` in `plugin.json`, add a matching entry to [`CHANGELOG.md`](CHANGELOG.md), and tag the
-commit `vX.Y.Z`. Run `claude plugin validate . --strict` before publishing.
+`version` in `plugin.json` and `Cargo.toml`, add a matching entry to
+[`CHANGELOG.md`](CHANGELOG.md), and tag the commit `vX.Y.Z`. Run
+`claude plugin validate . --strict` before publishing. Pushing the tag runs
+[`release.yml`](.github/workflows/release.yml), which verifies the tag matches both manifest
+versions, builds `windbg-mcp.exe`, and attaches the zip + SHA256 checksum to the GitHub release.
 
 ## Walkthroughs
 
