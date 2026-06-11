@@ -577,3 +577,77 @@ to an address range), and ttd_events (module/thread/exception events), or run an
 with record_trace (needs elevation). Use `execute` for any raw command not covered by a dedicated tool."
 )]
 impl rmcp::ServerHandler for WindbgServer {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_u64_decimal() {
+        assert_eq!(parse_u64("4096"), Ok(4096));
+        assert_eq!(parse_u64("0"), Ok(0));
+    }
+
+    #[test]
+    fn parse_u64_hex_either_case_prefix() {
+        assert_eq!(parse_u64("0x1000"), Ok(0x1000));
+        assert_eq!(parse_u64("0X1000"), Ok(0x1000));
+        assert_eq!(parse_u64("0xdeadbeef"), Ok(0xdead_beef));
+    }
+
+    #[test]
+    fn parse_u64_trims_surrounding_whitespace() {
+        assert_eq!(parse_u64("  4096  "), Ok(4096));
+        assert_eq!(parse_u64("\t0x10\n"), Ok(0x10));
+    }
+
+    #[test]
+    fn parse_u64_boundaries() {
+        assert_eq!(parse_u64("18446744073709551615"), Ok(u64::MAX));
+        assert_eq!(parse_u64("0xffffffffffffffff"), Ok(u64::MAX));
+    }
+
+    #[test]
+    fn parse_u64_rejects_invalid() {
+        for bad in ["xyz", "", "0xZZ", "0x", "-1", "12.3"] {
+            let err = parse_u64(bad).unwrap_err();
+            assert!(
+                err.starts_with("invalid number:"),
+                "unexpected error for {bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn hexdump_empty_is_empty() {
+        assert_eq!(hexdump(0, &[]), "");
+    }
+
+    #[test]
+    fn hexdump_short_row_pads_hex_column() {
+        // Three bytes: the hex column is left-aligned to 47 chars, then the ASCII
+        // column follows. Printable bytes pass through verbatim. Build the expected
+        // padding with the same width constant rather than hand-counting spaces.
+        let out = hexdump(0, b"abc");
+        let expected = format!("0000000000000000  {:<47}  abc\n", "61 62 63");
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn hexdump_full_row_then_partial_advances_address() {
+        let bytes: Vec<u8> = (0u8..18).collect();
+        let out = hexdump(0x1000, &bytes);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("0000000000001000  "));
+        // Second chunk starts 16 bytes (0x10) on.
+        assert!(lines[1].starts_with("0000000000001010  "));
+    }
+
+    #[test]
+    fn hexdump_renders_nonprintable_as_dot() {
+        // 0x00 and 0x7f are non-printable; 'A' (0x41) is printable.
+        let out = hexdump(0, &[0x00, 0x41, 0x7f]);
+        assert!(out.ends_with(".A.\n"), "got: {out:?}");
+    }
+}

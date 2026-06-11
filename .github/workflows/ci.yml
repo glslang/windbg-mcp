@@ -41,3 +41,49 @@ jobs:
 
       - name: Test
         run: cargo test
+
+      - name: Validate plugin manifests
+        shell: pwsh
+        run: |
+          # Guard against malformed plugin/marketplace manifests (the JSON that
+          # tells the marketplace how to install this plugin).
+          foreach ($f in '.claude-plugin/plugin.json', '.claude-plugin/marketplace.json') {
+            Write-Host "Validating $f"
+            Get-Content $f -Raw | ConvertFrom-Json | Out-Null
+          }
+
+  docs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Markdown lint
+        uses: DavidAnson/markdownlint-cli2-action@v20
+        with:
+          globs: |
+            README.md
+            CHANGELOG.md
+            docs/**/*.md
+            skills/**/*.md
+
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Soft-warn: a freshly-disclosed advisory in a transitive dependency should
+    # surface here without blocking unrelated PRs.
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Audit dependencies
+        run: cargo audit

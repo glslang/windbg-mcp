@@ -108,6 +108,14 @@ walks through it, and it mirrors the [*Build*](#build) and
 [*Bundling the WinDbg engine*](#bundling-the-windbg-engine) sections above. Then `/reload-plugins`
 to connect the server. The plugin points at `${CLAUDE_PLUGIN_ROOT}/target/release/windbg-mcp.exe`.
 
+### Releasing
+
+The plugin sets an explicit `version` in
+[`.claude-plugin/plugin.json`](.claude-plugin/plugin.json), so users only receive an update
+when that version changes — pushing commits alone does not trigger one. To cut a release, bump
+`version` in `plugin.json`, add a matching entry to [`CHANGELOG.md`](CHANGELOG.md), and tag the
+commit `vX.Y.Z`. Run `claude plugin validate . --strict` before publishing.
+
 ## Walkthroughs
 
 - [`docs/crash-dump-walkthrough.md`](docs/crash-dump-walkthrough.md) — triaging a real kernel
