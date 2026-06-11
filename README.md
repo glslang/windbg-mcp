@@ -39,7 +39,7 @@ The low-level engine bindings live in [`win-kexp`](https://github.com/glslang/wi
 ## Build
 
 ```pwsh
-cargo build --release --manifest-path C:\workspace\windbg-mcp\Cargo.toml
+cargo build --release
 ```
 
 `win-kexp` is fetched automatically as a git dependency from [`glslang/win-kexp`](https://github.com/glslang/win-kexp) — no sibling checkout needed.
