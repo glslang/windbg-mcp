@@ -1,0 +1,75 @@
+name: Release
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags: ["v*"]
+  # Dry run: build and package, upload as a workflow artifact, no release.
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  release:
+    name: Build & publish binary
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify tag matches manifest versions
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          # The release checklist says: bump Cargo.toml + plugin.json, then tag
+          # vX.Y.Z. Fail the release if the three disagree.
+          $tag    = $env:GITHUB_REF_NAME.TrimStart('v')
+          $cargo  = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
+          $plugin = (Get-Content .claude-plugin/plugin.json -Raw | ConvertFrom-Json).version
+          if ($cargo -ne $tag -or $plugin -ne $tag) {
+            Write-Error "Version mismatch: tag v$tag, Cargo.toml $cargo, plugin.json $plugin"
+          }
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $ver  = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
+          $name = "windbg-mcp-v$ver-windows-x64"
+          New-Item dist -ItemType Directory | Out-Null
+          Compress-Archive -Path target/release/windbg-mcp.exe, LICENSE -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          Set-Content dist/SHA256SUMS.txt "$hash  $name.zip"
+
+      - name: Publish GitHub release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/SHA256SUMS.txt
+          generate_release_notes: true
+
+      - name: Upload artifact (dry run)
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windbg-mcp-windows-x64
+          path: dist/

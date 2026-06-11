@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Prebuilt Windows x64 binary releases: pushing a `vX.Y.Z` tag now builds
+  `windbg-mcp.exe` and attaches `windbg-mcp-vX.Y.Z-windows-x64.zip` (plus a SHA256
+  checksum) to the GitHub release, and the setup docs gained a no-Rust install path
+  that downloads it into `target\release\`.
+
 ## [0.1.0]
 
 Initial release, packaged as a single-plugin Claude Code marketplace.

@@ -10,26 +10,40 @@ section for the workflow you're about to run before blaming the target.
   `10.0.26100`). That is enough for live user-mode/kernel debugging and crash-dump
   analysis — **but not for TTD `.run` replay** (see below).
 
-## Build the server
+## Get the server binary
 
-The plugin ships the source, not a binary. Build it in place so the path in
-`plugin.json` (`${CLAUDE_PLUGIN_ROOT}/target/release/windbg-mcp.exe`) resolves:
+The plugin ships the source, not a binary. Put `windbg-mcp.exe` in place so the path in
+`plugin.json` (`${CLAUDE_PLUGIN_ROOT}/target/release/windbg-mcp.exe`) resolves — either
+option below lands it there.
+
+### Option A — download a prebuilt release (no Rust required)
+
+Each `vX.Y.Z` tag publishes a Windows x64 build on the
+[releases page](https://github.com/glslang/windbg-mcp/releases). From the installed
+plugin / repo directory:
 
 ```pwsh
-# From the installed plugin / repo directory. Expects win-kexp as a sibling: ..\win-kexp
+$dst = "target\release"
+New-Item $dst -ItemType Directory -Force | Out-Null
+$asset = (Invoke-RestMethod https://api.github.com/repos/glslang/windbg-mcp/releases/latest).assets |
+         Where-Object name -Like 'windbg-mcp-*-windows-x64.zip'
+$zip = Join-Path $env:TEMP $asset.name
+Invoke-WebRequest $asset.browser_download_url -OutFile $zip
+Unblock-File $zip   # clear Mark-of-the-Web so the extracted exe isn't blocked
+Expand-Archive $zip $dst -Force
+```
+
+### Option B — build from source
+
+```pwsh
+# From the installed plugin / repo directory.
 cargo build --release
 ```
 
-This crate has a path dependency on [`win-kexp`](https://github.com/glslang/win-kexp) and
-needs its dbgeng MCP-support changes. Until those merge upstream, check out the matching
-branch in the sibling checkout, e.g.:
+[`win-kexp`](https://github.com/glslang/win-kexp) is fetched automatically as a git
+dependency — no sibling checkout needed.
 
-```pwsh
-git -C ..\win-kexp fetch origin dbgeng-dump-launch-attach-ttd
-git -C ..\win-kexp checkout dbgeng-dump-launch-attach-ttd
-```
-
-After `cargo build`, run `/reload-plugins` so Claude Code connects the `windbg` MCP server.
+Either way, run `/reload-plugins` afterwards so Claude Code connects the `windbg` MCP server.
 
 ## WinDbg engine + extensions — for `.run` replay and crash-dump `!analyze`
 
@@ -57,7 +71,7 @@ Copy-Item "$wd\winext" "$dst\winext" -Recurse -Force   # ext.dll (!analyze), kex
   `!tt` time-travel commands.
 - The `winext\` subdir provides `ext.dll` (which exports `!analyze`) and the other `!`-extensions.
   Required for crash-dump triage — without it `!analyze` returns *"No export analyze found"*.
-- `cargo clean` wipes `target\`, so re-copy after one.
+- `cargo clean` (when building from source) wipes `target\`, so re-copy after one.
 
 ## Symbols — required for `module!func` name resolution
 

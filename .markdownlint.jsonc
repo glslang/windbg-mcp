@@ -4,5 +4,8 @@
   "MD013": false,
   // Tables use compact `|---|` separators; the table-pipe-spacing rule is
   // purely cosmetic, so it is not enforced.
-  "MD060": false
+  "MD060": false,
+  // Keep a Changelog repeats "### Added"/"### Fixed" under every version, so
+  // only flag duplicate headings that share the same parent.
+  "MD024": { "siblings_only": true }
 }
