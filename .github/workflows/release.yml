@@ -28,7 +28,7 @@ jobs:
         run: |
           # The release checklist says: bump Cargo.toml + plugin.json, then tag
           # vX.Y.Z. Fail the release if the three disagree.
-          $tag    = $env:GITHUB_REF_NAME.TrimStart('v')
+          $tag    = $env:GITHUB_REF_NAME -replace '^v', ''
           $cargo  = [regex]::Match((Get-Content Cargo.toml -Raw), '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"').Groups[1].Value
           $plugin = (Get-Content .claude-plugin/plugin.json -Raw | ConvertFrom-Json).version
           if ($cargo -ne $tag -or $plugin -ne $tag) {
