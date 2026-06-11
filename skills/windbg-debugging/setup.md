@@ -25,10 +25,12 @@ plugin / repo directory:
 ```pwsh
 $dst = "target\release"
 New-Item $dst -ItemType Directory -Force | Out-Null
-$asset = (Invoke-RestMethod https://api.github.com/repos/glslang/windbg-mcp/releases/latest).assets |
-         Where-Object name -Like 'windbg-mcp-*-windows-x64.zip'
-$zip = Join-Path $env:TEMP $asset.name
+$rel   = Invoke-RestMethod https://api.github.com/repos/glslang/windbg-mcp/releases/latest
+$asset = $rel.assets | Where-Object name -Like 'windbg-mcp-*-windows-x64.zip'
+$zip   = Join-Path $env:TEMP $asset.name
 Invoke-WebRequest $asset.browser_download_url -OutFile $zip
+$sum = ((Invoke-RestMethod ($rel.assets | Where-Object name -EQ 'SHA256SUMS.txt').browser_download_url) -split '\s+')[0]
+if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLower() -ne $sum) { throw "SHA256 mismatch for $($asset.name)" }
 Unblock-File $zip   # clear Mark-of-the-Web so the extracted exe isn't blocked
 Expand-Archive $zip $dst -Force
 ```
