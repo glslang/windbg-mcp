@@ -30,7 +30,7 @@ jobs:
           # The release checklist says: bump Cargo.toml + plugin.json, then tag
           # vX.Y.Z. Fail the release if the three disagree.
           $tag    = $env:GITHUB_REF_NAME.TrimStart('v')
-          $cargo  = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
+          $cargo  = [regex]::Match((Get-Content Cargo.toml -Raw), '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"').Groups[1].Value
           $plugin = (Get-Content .claude-plugin/plugin.json -Raw | ConvertFrom-Json).version
           if ($cargo -ne $tag -or $plugin -ne $tag) {
             Write-Error "Version mismatch: tag v$tag, Cargo.toml $cargo, plugin.json $plugin"
@@ -51,7 +51,7 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $ver  = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"(.+)"').Matches[0].Groups[1].Value
+          $ver  = [regex]::Match((Get-Content Cargo.toml -Raw), '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"').Groups[1].Value
           $name = "windbg-mcp-v$ver-windows-x64"
           New-Item dist -ItemType Directory | Out-Null
           Compress-Archive -Path target/release/windbg-mcp.exe, LICENSE -DestinationPath "dist/$name.zip"

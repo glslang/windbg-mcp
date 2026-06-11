@@ -40,7 +40,8 @@ The low-level engine bindings live in [`win-kexp`](https://github.com/glslang/wi
 
 Prebuilt Windows x64 binaries are attached to each
 [GitHub release](https://github.com/glslang/windbg-mcp/releases) as
-`windbg-mcp-vX.Y.Z-windows-x64.zip` (with a SHA256 checksum) — no Rust toolchain needed.
+`windbg-mcp-vX.Y.Z-windows-x64.zip` (with a `SHA256SUMS.txt` to verify the download
+against — the skill's `setup.md` snippet does this for you) — no Rust toolchain needed.
 To build from source instead:
 
 ```pwsh
