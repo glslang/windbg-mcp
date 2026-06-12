@@ -127,8 +127,15 @@ when that version changes — pushing commits alone does not trigger one. To cut
 versions, builds `windbg-mcp.exe`, and attaches the zip + SHA256 checksum to the GitHub release.
 The zip also gets a signed
 [build-provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations)
-tying it to the workflow run that built it — verify with
-`gh attestation verify <zip> --repo glslang/windbg-mcp`.
+tying it to the workflow run that built it — verify with:
+
+```pwsh
+gh attestation verify <zip> --repo glslang/windbg-mcp `
+   --signer-workflow glslang/windbg-mcp/.github/workflows/release.yml
+```
+
+(`--repo` alone only proves the attestation came from *some* workflow in this repo;
+`--signer-workflow` pins it to the release workflow.)
 
 ## Walkthroughs
 

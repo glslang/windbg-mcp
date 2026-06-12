@@ -37,7 +37,11 @@ Expand-Archive $zip $dst -Force
 
 Optionally, with the [GitHub CLI](https://cli.github.com/), verify the zip's build provenance
 (proves it was built by this repo's release workflow, not tampered with):
-`gh attestation verify $zip --repo glslang/windbg-mcp`.
+
+```pwsh
+gh attestation verify $zip --repo glslang/windbg-mcp `
+   --signer-workflow glslang/windbg-mcp/.github/workflows/release.yml
+```
 
 ### Option B — build from source
 
