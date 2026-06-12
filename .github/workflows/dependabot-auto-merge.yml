@@ -1,0 +1,33 @@
+name: Dependabot auto-merge
+
+# Auto-approve Dependabot PRs and enable squash auto-merge. The approval here
+# satisfies the "Main Branch" ruleset's required review; GitHub still holds the
+# merge until that ruleset's required status checks (Build & test, Documentation
+# lint) pass, so a red CI run never merges. Requires the repo setting
+# "Allow GitHub Actions to create and approve pull requests".
+
+on: pull_request
+
+# Dependabot-triggered pull_request runs get a read-only token by default; this
+# block elevates it for the bot's own PRs. Scoped to the minimum needed.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  dependabot-auto-merge:
+    name: Dependabot auto-merge
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    steps:
+      - name: Approve the PR
+        run: gh pr review --approve "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Enable auto-merge
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
