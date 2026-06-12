@@ -6,19 +6,26 @@ name: Dependabot auto-merge
 # lint) pass, so a red CI run never merges. Requires the repo setting
 # "Allow GitHub Actions to create and approve pull requests".
 
-on: pull_request
+on:
+  pull_request:
+    types: [opened, reopened, synchronize]
 
-# Dependabot-triggered pull_request runs get a read-only token by default; this
-# block elevates it for the bot's own PRs. Scoped to the minimum needed.
-permissions:
-  contents: write
-  pull-requests: write
+# Serialise per PR so a rapid sequence of Dependabot pushes can't launch
+# overlapping approve/merge attempts.
+concurrency:
+  group: dependabot-auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   dependabot-auto-merge:
     name: Dependabot auto-merge
     runs-on: ubuntu-latest
     if: github.event.pull_request.user.login == 'dependabot[bot]'
+    # Write scope lives on the job, not the workflow, so nothing else inherits
+    # it. Dependabot-triggered runs start read-only; this elevates just this job.
+    permissions:
+      contents: write
+      pull-requests: write
     steps:
       - name: Approve the PR
         run: gh pr review --approve "$PR_URL"
