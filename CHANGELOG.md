@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `windbg-mcp.exe` and attaches `windbg-mcp-vX.Y.Z-windows-x64.zip` (plus a SHA256
   checksum) to the GitHub release, and the setup docs gained a no-Rust install path
   that downloads it into `target\release\`.
+- Signed build-provenance attestations for release zips, verifiable with
+  `gh attestation verify <zip> --repo glslang/windbg-mcp`.
 
 ## [0.1.0]
 
