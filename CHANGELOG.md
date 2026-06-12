@@ -16,6 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Signed build-provenance attestations for release zips, verifiable with
   `gh attestation verify` (see the README's *Releasing* section).
 
+### Security
+
+- GitHub Actions in the CI and release workflows are pinned to immutable
+  commit SHAs, with Dependabot configured to keep the pins (and their
+  version comments) up to date.
+
 ## [0.1.0]
 
 Initial release, packaged as a single-plugin Claude Code marketplace.

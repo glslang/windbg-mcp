@@ -20,7 +20,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
 
@@ -38,10 +38,13 @@ jobs:
           }
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        # Pinned to a SHA, so the toolchain comes from the input, not the ref.
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
 
       - name: Cache cargo registry and build
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Build
         run: cargo build --release --locked
@@ -63,7 +66,7 @@ jobs:
         # Records a signed SLSA provenance statement linking the zip to this
         # workflow run; users verify with `gh attestation verify`.
         if: github.event_name == 'push' && github.ref_type == 'tag'
-        uses: actions/attest-build-provenance@v4
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4
         with:
           subject-path: dist/*.zip
 
@@ -71,7 +74,7 @@ jobs:
         # event_name guard: a workflow_dispatch run from a tag ref also has
         # ref_type == 'tag', and a dry run must never publish.
         if: github.event_name == 'push' && github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: |
             dist/*.zip
@@ -80,7 +83,7 @@ jobs:
 
       - name: Upload artifact (dry run)
         if: github.event_name != 'push'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: windbg-mcp-windows-x64
           path: dist/
