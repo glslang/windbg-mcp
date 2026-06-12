@@ -38,8 +38,10 @@ jobs:
           }
 
       - name: Install Rust toolchain
-        # Pinned to a SHA, so the toolchain comes from the input, not the ref.
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        # Pinned to a master-history SHA (per the action's README — toolchain
+        # branch commits get force-pushed), so the toolchain comes from the
+        # input, not the ref.
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: stable
 
