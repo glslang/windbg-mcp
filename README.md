@@ -125,6 +125,10 @@ when that version changes — pushing commits alone does not trigger one. To cut
 `claude plugin validate . --strict` before publishing. Pushing the tag runs
 [`release.yml`](.github/workflows/release.yml), which verifies the tag matches both manifest
 versions, builds `windbg-mcp.exe`, and attaches the zip + SHA256 checksum to the GitHub release.
+The zip also gets a signed
+[build-provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations)
+tying it to the workflow run that built it — verify with
+`gh attestation verify <zip> --repo glslang/windbg-mcp`.
 
 ## Walkthroughs
 

@@ -15,6 +15,8 @@ jobs:
     runs-on: windows-latest
     permissions:
       contents: write # create the GitHub release and upload its assets
+      id-token: write # sign the build-provenance attestation (Sigstore OIDC)
+      attestations: write # store the attestation in the repo
     timeout-minutes: 30
     steps:
       - name: Checkout
@@ -56,6 +58,14 @@ jobs:
           Compress-Archive -Path target/release/windbg-mcp.exe, LICENSE -DestinationPath "dist/$name.zip"
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
           Set-Content dist/SHA256SUMS.txt "$hash  $name.zip"
+
+      - name: Attest build provenance
+        # Records a signed SLSA provenance statement linking the zip to this
+        # workflow run; users verify with `gh attestation verify`.
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*.zip
 
       - name: Publish GitHub release
         # event_name guard: a workflow_dispatch run from a tag ref also has

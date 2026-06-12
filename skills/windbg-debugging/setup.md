@@ -35,6 +35,10 @@ Unblock-File $zip   # clear Mark-of-the-Web so the extracted exe isn't blocked
 Expand-Archive $zip $dst -Force
 ```
 
+Optionally, with the [GitHub CLI](https://cli.github.com/), verify the zip's build provenance
+(proves it was built by this repo's release workflow, not tampered with):
+`gh attestation verify $zip --repo glslang/windbg-mcp`.
+
 ### Option B — build from source
 
 ```pwsh
