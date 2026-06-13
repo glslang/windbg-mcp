@@ -214,7 +214,7 @@ impl WindbgServer {
         let out = self
             .engine
             .run(move |e| {
-                e.attach_local_kernel();
+                e.attach_local_kernel().map_err(es)?;
                 e.wait_for_event(LOAD_WAIT_MS).map_err(es)?;
                 e.execute_command("vertarget").map_err(es)
             })
@@ -231,7 +231,7 @@ impl WindbgServer {
         let out = self
             .engine
             .run(move |e| {
-                e.attach_kernel(&args.connection);
+                e.attach_kernel(&args.connection).map_err(es)?;
                 e.wait_for_event(LOAD_WAIT_MS).map_err(es)?;
                 e.execute_command("vertarget").map_err(es)
             })
