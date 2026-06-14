@@ -106,10 +106,9 @@ try {
     Show-ToolResult "registers @ breakpoint" (Call-Tool "registers" @{} 60000)
     Show-ToolResult "backtrace @ breakpoint" (Call-Tool "backtrace" @{} 60000)
 
-    # ---- Cleanup: clear breakpoints and let the target run, then detach ----
+    # ---- Cleanup: clear the breakpoint, then end_session (resumes the kernel and detaches) ----
     Show-ToolResult "execute: bc * (clear breakpoints)" (Call-Tool "execute" @{ command = "bc *" } 60000)
-    Show-ToolResult "execute: g (set running, no wait)" (Call-Tool "execute" @{ command = "g" } 15000)
-    Show-ToolResult "end_session (detach, leave target running)" (Call-Tool "end_session" @{} 30000)
+    Show-ToolResult "end_session (resume + detach, leaves target running)" (Call-Tool "end_session" @{} 30000)
 
     Write-Host "`n[driver] sequence complete" -ForegroundColor Green
 }
