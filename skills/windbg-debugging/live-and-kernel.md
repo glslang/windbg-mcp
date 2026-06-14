@@ -11,8 +11,12 @@ Pick one entry point:
   — stops at the initial breakpoint with a live thread context (the binding enables the
   `sxe ibp` initial-breakpoint filter, which a bare host leaves off).
 - **Attach to a running process.** `attach_process { "pid": 1234 }` — breaks in.
-- **Local kernel.** `attach_kernel_local {}` (returns `vertarget`).
-- **Remote kernel (KDNET).** `attach_kernel { "connection": "net:port=50000,key=..." }`.
+- **Local kernel.** `attach_kernel_local {}` — breaks in and returns `vertarget`.
+- **Remote kernel (KDNET).** `attach_kernel { "connection": "net:port=<n>,key=<w.x.y.z>" }`
+  — connects, breaks in, and returns `vertarget`. **Ask the user for the actual
+  connection string**; the port and key are specific to the target's KDNET setup (from
+  `bcdedit /dbgsettings` on the target, or the `windbgx -k` / `kd -k` command they use)
+  and cannot be guessed — never invent a placeholder key.
 
 End with `end_session {}` before opening another target (one session at a time).
 
@@ -36,7 +40,11 @@ End with `end_session {}` before opening another target (one session at a time).
 - **`read_memory` is numeric/hex only.** Use `execute` → `db @rip` for register/symbol
   expressions.
 - **`go` is bounded by the per-call timeout** (~60s). A long-running live target may not
-  reach a breakpoint within one call.
+  reach a breakpoint within one call; on a live kernel it is force-broken at the cap.
+- **Unreachable kernel target blocks.** `attach_kernel` to a target that never establishes
+  the KDNET link waits like `kd` does (a connecting link can't be cancelled mid-handshake),
+  so confirm the target is up and the port/key are correct. A *connected* target that
+  doesn't break in is bounded and returns an error.
 - **TTD is user-mode only** — you cannot time-travel a kernel target. For reverse
   execution, record a user-mode trace instead (see [ttd.md](ttd.md)).
 - Symbol names need the full setup (`msdia140.dll` + `.sympath` + `.reload /f` at a stop) —

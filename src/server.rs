@@ -214,8 +214,9 @@ impl WindbgServer {
         let out = self
             .engine
             .run(move |e| {
-                e.attach_local_kernel();
-                e.wait_for_event(LOAD_WAIT_MS).map_err(es)?;
+                // attach_local_kernel breaks the target in internally (INITIAL_BREAK +
+                // an INFINITE wait, as a live kernel requires).
+                e.attach_local_kernel().map_err(es)?;
                 e.execute_command("vertarget").map_err(es)
             })
             .await?;
@@ -231,8 +232,9 @@ impl WindbgServer {
         let out = self
             .engine
             .run(move |e| {
-                e.attach_kernel(&args.connection);
-                e.wait_for_event(LOAD_WAIT_MS).map_err(es)?;
+                // attach_kernel connects, requests an initial break, and waits (INFINITE,
+                // as a live kernel requires) for the break-in — all internally.
+                e.attach_kernel(&args.connection).map_err(es)?;
                 e.execute_command("vertarget").map_err(es)
             })
             .await?;
