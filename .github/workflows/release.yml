@@ -28,13 +28,16 @@ jobs:
         if: github.event_name == 'push' && github.ref_type == 'tag'
         shell: pwsh
         run: |
-          # The release checklist says: bump Cargo.toml + plugin.json, then tag
-          # vX.Y.Z. Fail the release if the three disagree.
+          # The release checklist says: bump Cargo.toml + plugin.json + the
+          # README release badge, then tag vX.Y.Z. Fail the release if they
+          # disagree. The README badge is static, so this guard keeps it from
+          # silently going stale.
           $tag    = $env:GITHUB_REF_NAME -replace '^v', ''
           $cargo  = [regex]::Match((Get-Content Cargo.toml -Raw), '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"').Groups[1].Value
           $plugin = (Get-Content .claude-plugin/plugin.json -Raw | ConvertFrom-Json).version
-          if ($cargo -ne $tag -or $plugin -ne $tag) {
-            Write-Error "Version mismatch: tag v$tag, Cargo.toml $cargo, plugin.json $plugin"
+          $readme = [regex]::Match((Get-Content README.md -Raw), 'img\.shields\.io/badge/release-v([^-]+)-').Groups[1].Value
+          if ($cargo -ne $tag -or $plugin -ne $tag -or $readme -ne $tag) {
+            Write-Error "Version mismatch: tag v$tag, Cargo.toml $cargo, plugin.json $plugin, README badge $readme"
           }
 
       - name: Install Rust toolchain
