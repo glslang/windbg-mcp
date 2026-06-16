@@ -126,11 +126,12 @@ to connect the server. The plugin points at `${CLAUDE_PLUGIN_ROOT}/target/releas
 The plugin sets an explicit `version` in
 [`.claude-plugin/plugin.json`](.claude-plugin/plugin.json), so users only receive an update
 when that version changes — pushing commits alone does not trigger one. To cut a release, bump
-`version` in `plugin.json` and `Cargo.toml`, add a matching entry to
+`version` in `plugin.json` and `Cargo.toml`, bump the release badge near the top of this README,
+add a matching entry to
 [`CHANGELOG.md`](CHANGELOG.md), and tag the commit `vX.Y.Z`. Run
 `claude plugin validate . --strict` before publishing. Pushing the tag runs
 [`release.yml`](.github/workflows/release.yml), which verifies the tag matches both manifest
-versions, builds `windbg-mcp.exe`, and attaches the zip + SHA256 checksum to the GitHub release.
+versions and the README badge, builds `windbg-mcp.exe`, and attaches the zip + SHA256 checksum to the GitHub release.
 The zip also gets a signed
 [build-provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations)
 tying it to the workflow run that built it — verify with:
