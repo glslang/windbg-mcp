@@ -195,9 +195,18 @@ standard user**:
     -Codes 0x6d0008,0x6d0030,0x6d4020,0x6dc000
 ```
 
-Expect `0x6d0008`/`0x6d0030` to succeed and `0x6d4020`/`0x6dc000` to fail with
-`ERROR_ACCESS_DENIED (5)` — and confirm on the host that the denied codes never reach an
-`ioctl_trace` breakpoint.
+Reachability is "**delivered to the driver**", not "`DeviceIoControl` succeeded". With an
+`ioctl_trace` breakpoint on the host:
+
+- `0x6d0008`/`0x6d0030` (ANY_ACCESS) → the **breakpoint fires** (reachable). `DeviceIoControl`
+  itself will usually still *fail* — the sender's 16-byte zeroed buffers don't satisfy the
+  MountMgr query structures, so you'll see `ERROR_INSUFFICIENT_BUFFER (122)` /
+  `ERROR_INVALID_PARAMETER (87)`, **not** access-denied. That's fine: the IRP reached the driver.
+- `0x6d4020`/`0x6dc000` (READ / READ|WRITE) → `DeviceIoControl` fails with
+  `ERROR_ACCESS_DENIED (5)` at the I/O-manager gate and the **breakpoint never fires** (blocked).
+
+So the decisive signal is *bp fired / `gle != 5`* (reachable) vs *`gle == 5` / no bp* (blocked) —
+don't read `DeviceIoControl` success as the reachability verdict.
 
 ## Gotchas recap
 

@@ -145,7 +145,11 @@ Manager). Structure:
 4. **Reachability** — per tier, the verdict for **standard user** vs **admin/SYSTEM**, with the
    reason (DACL grant vs `RequiredAccess`, plus any in-dispatch privilege check).
 5. **Dynamic confirmation** — what `ioctl_trace`/`irp_stack` actually observed, and the token it
-   ran under (note: a sweep run as admin does *not* prove standard-user reachability).
+   ran under (note: a sweep run as admin does *not* prove standard-user reachability). Reachable
+   means **delivered** (the dispatch bp fires), *not* that `DeviceIoControl` returned success — a
+   dummy/short buffer often makes the call fail (`ERROR_INSUFFICIENT_BUFFER`/`INVALID_PARAMETER`)
+   while the IRP still reached the driver. The blocked signal is `ERROR_ACCESS_DENIED (5)` with no
+   bp hit (rejected at the I/O-manager gate).
 6. **Caveats** — anything not fully expanded (e.g. a jump-table group), and the optional
    empirical check: run `examples/send_ioctls_target.ps1` as a non-admin token in the guest.
 
