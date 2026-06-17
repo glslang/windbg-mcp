@@ -71,8 +71,7 @@ fn hexdump(base: u64, bytes: &[u8]) -> String {
 ///
 /// Layout: `DeviceType` = bits 16–31, `RequiredAccess` = bits 14–15,
 /// `FunctionCode` = bits 2–13, `Method` = bits 0–1.
-fn decode_ioctl_text(code: u64) -> String {
-    let c = code as u32;
+fn decode_ioctl_text(c: u32) -> String {
     let device_type = (c >> 16) & 0xFFFF;
     let access = (c >> 14) & 0x3;
     let function = (c >> 2) & 0xFFF;
@@ -664,6 +663,14 @@ impl WindbgServer {
         Parameters(args): Parameters<DecodeIoctlArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let code = parse_u64(&args.code).map_err(|e| ErrorData::invalid_params(e, None))?;
+        // An IOCTL is a 32-bit value; reject anything wider rather than silently
+        // truncating it to a different code.
+        let code = u32::try_from(code).map_err(|_| {
+            ErrorData::invalid_params(
+                format!("IOCTL must be a 32-bit value (got 0x{code:x})"),
+                None,
+            )
+        })?;
         text_result(decode_ioctl_text(code))
     }
 
@@ -849,8 +856,9 @@ mod tests {
     #[test]
     fn decode_ioctl_neither_write_flags_both_warnings() {
         // CTL_CODE(DeviceType=0x8000, Function=0x800, METHOD_NEITHER, FILE_WRITE_DATA).
+        // Device type 0x8000 sets bit 31 — exercises a full 32-bit (unsigned) code.
         let code = (0x8000u32 << 16) | (2u32 << 14) | (0x800u32 << 2) | 3;
-        let out = decode_ioctl_text(code as u64);
+        let out = decode_ioctl_text(code);
         assert!(out.contains("DeviceType     0x8000"), "got: {out}");
         assert!(out.contains("FunctionCode   0x800"), "got: {out}");
         assert!(

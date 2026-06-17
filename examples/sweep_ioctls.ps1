@@ -7,8 +7,10 @@ param(
     # from the driver_object output). Leave empty on a first pass to just inspect the
     # dispatch table, then re-run with -Dispatch to install the logging sweep.
     [string]$Dispatch = "",
-    # How long (ms) to hold the target running while you drive the target-side sender.
-    [int]$RunMs = 120000,
+    # Number of consecutive collection windows. The server caps each `go` at
+    # EXEC_WAIT_MS (~60s) regardless of the client timeout, so to keep logging while the
+    # target-side sender runs we issue several back-to-back `go`s rather than one long one.
+    [int]$Sweeps = 2,
     [string]$Exe = "$PSScriptRoot\..\target\release\windbg-mcp.exe"
 )
 
@@ -125,9 +127,13 @@ try {
     Write-Host "`n[driver] >>> Now run send_ioctls_target.ps1 on the TARGET VM (normal user, then" -ForegroundColor Green
     Write-Host "[driver] >>> elevated). The logging bp prints each delivered IOCTL into 'go' below." -ForegroundColor Green
 
-    # `go` runs while the bp logs-and-continues (gc); it returns the accumulated
-    # IOCTL log when the per-call window elapses.
-    Show-ToolResult "go (collecting IOCTL log)" (Call-Tool "go" @{} $RunMs)
+    # Each `go` runs while the bp logs-and-continues (gc) and is force-broken at the
+    # server's ~60s cap, returning that window's accumulated IOCTL log. The client timeout
+    # (90s) stays above the server cap so we wait for its return, not time out first. Loop
+    # so the operator's sender (normal user, then elevated) can span more than one window.
+    for ($i = 1; $i -le $Sweeps; $i++) {
+        Show-ToolResult "go (collection window $i/$Sweeps, server-capped ~60s)" (Call-Tool "go" @{} 90000)
+    }
 
     # ---- Cleanup ----
     Show-ToolResult "execute: bc * (clear breakpoints)" (Call-Tool "execute" @{ command = "bc *" } 60000)
