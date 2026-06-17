@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `!drvobj`/`!devobj`/`!irp` commands behind `driver_object`/`device_object`/`irp_stack`
     resolve; `setup.md` bundles `winxp\kdexts.dll`. Verified end-to-end against a live
     KDNET kernel (the tools captured real mountmgr IOCTLs).
+  - [`docs/driver-ioctl-walkthrough.md`](docs/driver-ioctl-walkthrough.md): a worked
+    `\Driver\mountmgr` enumeration + reachability report against a live kernel. The
+    playbook now ends with a "Write the report" step + template.
 
 ## [0.1.3] - 2026-06-14
 

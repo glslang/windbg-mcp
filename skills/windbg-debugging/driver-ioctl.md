@@ -127,6 +127,30 @@ sweep requires a real **KDNET/VM** target via `attach_kernel`.
    static candidate map → label each code **delivered / taken-case / return-status /
    reachable-as-whom**.
 
+## Write the report
+
+Close the workflow with a written report so the result is reviewable. Keep it grounded in the
+tool output you gathered (cite the live addresses / DACL / codes — don't assert from memory). A
+worked end-to-end example is
+[`docs/driver-ioctl-walkthrough.md`](../../docs/driver-ioctl-walkthrough.md) (Mount Point
+Manager). Structure:
+
+1. **Verdict up front** — one paragraph: which IOCTLs a standard user can reach, which are
+   blocked and by which gate. State the target driver/device + build.
+2. **Openable gate** — the device DACL (principal → granted access) and `FILE_DEVICE_SECURE_OPEN`;
+   note the access a normal user's handle actually gets.
+3. **Discovered IOCTLs** — the full static set from `uf`, grouped by `RequiredAccess` tier
+   (`FILE_ANY_ACCESS` / `READ` / `READ|WRITE`), each row: code, handler/name, function, method.
+   Flag any `METHOD_NEITHER` or `FILE_ANY_ACCESS` *mutators*.
+4. **Reachability** — per tier, the verdict for **standard user** vs **admin/SYSTEM**, with the
+   reason (DACL grant vs `RequiredAccess`, plus any in-dispatch privilege check).
+5. **Dynamic confirmation** — what `ioctl_trace`/`irp_stack` actually observed, and the token it
+   ran under (note: a sweep run as admin does *not* prove standard-user reachability).
+6. **Caveats** — anything not fully expanded (e.g. a jump-table group), and the optional
+   empirical check: run `examples/send_ioctls_target.ps1` as a non-admin token in the guest.
+
+Save it under `docs/` (the repo's walkthrough convention) or hand it back inline.
+
 ## Pitfalls
 
 - **Local kernel = read-only.** `attach_kernel_local` cannot set code breakpoints or step — the
