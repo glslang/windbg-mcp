@@ -154,6 +154,11 @@ gh attestation verify <zip> --repo glslang/windbg-mcp `
   [`xusheng6/TTD_lab`](https://github.com/xusheng6/TTD_lab) `helloworld` sample: opening a `.run`,
   surveying events/threads, forward/reverse navigation, memory analysis, and counting `printf` calls
   with symbols (with the real outputs and the gotchas). It maps each tool to the lab's exercises.
+- [`docs/driver-ioctl-walkthrough.md`](docs/driver-ioctl-walkthrough.md) — enumerating a driver's IOCTL
+  surface and deciding user-mode reachability on a live KDNET kernel: `driver_object`/`uf` to recover
+  the `\Driver\mountmgr` dispatch switch, `decode_ioctl` for the access tiers, the device DACL parsed
+  from memory, and an `ioctl_trace` sweep — ending with a reachability report (which codes a standard
+  user can reach vs. what the I/O manager blocks).
 
 ## Tools
 
