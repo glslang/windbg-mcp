@@ -20,7 +20,7 @@ caller token. An IOCTL is only useful to a user if it passes all four:
 | Gate | Question | How to answer |
 |------|----------|---------------|
 | **Openable** | Can this token open the device at all? | `device_object` → device DACL (`!sd` on its `SecurityDescriptor`); `FILE_DEVICE_SECURE_OPEN` |
-| **Namespace-visible** | Does `CreateFile(\\.\Foo)` resolve in the caller's session? | symbolic-link scope (`\GLOBAL??\Foo` vs. session-local) via `execute` → `!object \GLOBAL?? ` |
+| **Namespace-visible** | Does `CreateFile(\\.\Foo)` resolve in the caller's session? | symbolic-link scope (`\GLOBAL??\Foo` vs. session-local) via `execute` → `!object \GLOBAL??` |
 | **Deliverable** | Does the I/O manager forward the IRP to the driver? | `decode_ioctl` → `RequiredAccess` (bits 14–15) checked against the handle's *granted* access **before** the IRP reaches the driver |
 | **Handled** | Does the driver do something, or reject it? | `irp_stack` at the break + `Irp->IoStatus.Status` on return (a `default:` case returns `STATUS_INVALID_DEVICE_REQUEST` / `STATUS_NOT_SUPPORTED`) |
 
@@ -31,7 +31,7 @@ already passed, and you still have to watch the return path for the *handled* ga
 
 A control code is a packed 32-bit value:
 
-```
+```text
  31              16 15 14 13            2 1  0
 +------------------+-----+---------------+----+
 |   DeviceType     | Acc |  FunctionCode | Mth|
@@ -59,7 +59,7 @@ reads.
 4. **Device surface.** `device_object { "device": "\\Device\\MyDevice" }` (`!devobj`) for the
    device type and characteristics; then `execute { "command": "!sd <SecurityDescriptor> 1" }`
    on the pointer it prints to decode the DACL (the *openable* gate). Inspect the symbolic link
-   with `execute { "command": "!object \\GLOBAL?? " }` for the *namespace* gate.
+   with `execute { "command": "!object \\GLOBAL??" }` for the *namespace* gate.
 
 > **No PDBs.** Third-party drivers ship no symbols, so `module!Dispatch` won't resolve —
 > everything is **address-based**. RVAs from static analysis must be **rebased to the live load
@@ -75,7 +75,15 @@ table), load the `.sys` in Binary Ninja:
    calls.
 2. Recover the `IoControlCode` switch constants, the expected input/output sizes per case, and
    the SDDL string passed to `IoCreateDeviceSecure`.
-3. Emit a **JSON IOCTL map** for the dynamic step to join against. Suggested schema (one object
+3. **Pin the `IO_STACK_LOCATION` offsets exactly.** With NT types applied (the wdm/ntddk type
+   library, or the platform PDB), Binary Ninja shows the precise layout — and the dispatch
+   routine's own prologue *reads* it, so you can lift the exact offsets from the disassembly
+   instead of trusting a generic constant: `Irp->Tail.Overlay.CurrentStackLocation`
+   (`Irp+0xb8` on x64), then within the `IO_STACK_LOCATION` `IoControlCode` (`+0x18`),
+   `InputBufferLength` (`+0x10`), `OutputBufferLength` (`+0x08`), `Type3InputBuffer`/`UserBuffer`
+   (`+0x20`). These confirm the `poi(@rdx+0xb8)+…` chain `ioctl_trace` uses — no runtime
+   guesswork.
+4. Emit a **JSON IOCTL map** for the dynamic step to join against. Suggested schema (one object
    per code):
 
    ```json
@@ -104,8 +112,9 @@ sweep requires a real **KDNET/VM** target via `attach_kernel`.
 2. **Install the sweep.** `ioctl_trace { "dispatch": "<dispatchVA-rebased>" }` installs a
    conditional logging breakpoint that prints `IOCTL <code> in=<n> out=<n>` and continues
    (`gc`) for every delivered IOCTL. It reads the current `IO_STACK_LOCATION` via
-   `poi(@rdx+0xb8)` on x64 — **verify that offset** with `execute { "command": "dt nt!_IRP" }`
-   and `dt nt!_IO_STACK_LOCATION` for the target build before trusting the log.
+   `poi(@rdx+0xb8)` on x64. These offsets are the standard x64 layout — confirm them exactly
+   from the Binary Ninja analysis above (the dispatch routine dereferences them directly), or
+   at runtime with `execute { "command": "dt nt!_IRP" }` / `dt nt!_IO_STACK_LOCATION`.
 3. **Drive the harness as the target token.** `go {}`, then from user mode run a sender (see
    `examples/sweep_ioctls.ps1`) that issues each candidate code **once as a low-priv token and
    again as admin**. Reachability is answered *as that user*: a code whose `RequiredAccess`
@@ -133,4 +142,3 @@ sweep requires a real **KDNET/VM** target via `attach_kernel`.
 - **No PDBs → rebase.** Static RVAs are ASLR-relative; rebase to `lm m <driver>` before setting
   any breakpoint. See the symbol/elevation notes in [setup.md](setup.md) and
   [live-and-kernel.md](live-and-kernel.md).
-</content>

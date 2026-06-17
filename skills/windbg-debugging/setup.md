@@ -53,6 +53,19 @@ cargo build --release
 [`win-kexp`](https://github.com/glslang/win-kexp) is fetched automatically as a git
 dependency — no sibling checkout needed.
 
+> **Developing from the repo? Disconnect the `windbg` MCP server before a release build.**
+> While the server is connected it *runs* `target\release\windbg-mcp.exe`, so the file is
+> locked and `cargo build --release` fails with `failed to remove file … windbg-mcp.exe:
+> Access is denied (os error 5)`. End-to-end testing of a change can't happen until the
+> rebuilt binary is in place, so:
+>
+> 1. Disconnect it — disable the `windbg` server (the `/mcp` menu) or the plugin for this session.
+> 2. `cargo build --release` (or download a release), then `/reload-plugins` to reconnect.
+>
+> To iterate on logic without disconnecting, use the **dev profile** (writes `target\debug`,
+> which is *not* locked): `cargo test` compiles everything and runs the unit tests, and
+> `cargo clippy --all-targets` lints — neither touches the locked release binary.
+
 Either way, run `/reload-plugins` afterwards so Claude Code connects the `windbg` MCP server.
 
 ## WinDbg engine + extensions — for `.run` replay and crash-dump `!analyze`
