@@ -164,6 +164,7 @@ gh attestation verify <zip> --repo glslang/windbg-mcp `
 | Control | `go`, `step_over`, `step_into`, `set_breakpoint` |
 | TTD nav | `step_back` (`t-`), `step_over_back` (`p-`), `reverse_go` (`g-`), `goto_position` (`!tt`) |
 | TTD analysis | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
+| Driver IOCTL | `decode_ioctl`, `driver_object`, `device_object`, `irp_stack`, `ioctl_trace` |
 | Raw     | `execute` — run any debugger command, returns full text output |
 
 The forward (`go`/`step_over`/`step_into`) and reverse (`reverse_go`/`step_over_back`/`step_back`)

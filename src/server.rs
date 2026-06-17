@@ -65,6 +65,58 @@ fn hexdump(base: u64, bytes: &[u8]) -> String {
     out
 }
 
+/// Decodes a 32-bit Windows IOCTL control code into its `CTL_CODE` fields and
+/// renders a human-readable report. Pure (no debugger) so it is unit-testable and
+/// works without a live session.
+///
+/// Layout: `DeviceType` = bits 16–31, `RequiredAccess` = bits 14–15,
+/// `FunctionCode` = bits 2–13, `Method` = bits 0–1.
+fn decode_ioctl_text(code: u64) -> String {
+    let c = code as u32;
+    let device_type = (c >> 16) & 0xFFFF;
+    let access = (c >> 14) & 0x3;
+    let function = (c >> 2) & 0xFFF;
+    let method = c & 0x3;
+
+    let method_name = match method {
+        0 => "METHOD_BUFFERED",
+        1 => "METHOD_IN_DIRECT",
+        2 => "METHOD_OUT_DIRECT",
+        _ => "METHOD_NEITHER",
+    };
+    let access_name = match access {
+        0 => "FILE_ANY_ACCESS",
+        1 => "FILE_READ_DATA",
+        2 => "FILE_WRITE_DATA",
+        _ => "FILE_READ_DATA | FILE_WRITE_DATA",
+    };
+
+    let mut out = String::new();
+    out.push_str(&format!("IOCTL 0x{c:08x}\n"));
+    out.push_str(&format!(
+        "  CTL_CODE(0x{device_type:04x}, 0x{function:03x}, {method_name}, {access_name})\n"
+    ));
+    out.push_str(&format!("  DeviceType     0x{device_type:04x}\n"));
+    out.push_str(&format!("  FunctionCode   0x{function:03x}\n"));
+    out.push_str(&format!("  Method         {method} ({method_name})\n"));
+    out.push_str(&format!("  RequiredAccess {access} ({access_name})\n"));
+
+    // Surface the two fields that matter most for reachability / bug-class triage.
+    if method == 3 {
+        out.push_str(
+            "  [!] METHOD_NEITHER: the driver receives raw user-mode pointers \
+             (Type3InputBuffer / UserBuffer) — classic input-validation bug surface.\n",
+        );
+    }
+    if access == 0 {
+        out.push_str(
+            "  [!] FILE_ANY_ACCESS: no access gate — the I/O manager delivers this IOCTL \
+             on any handle, even one opened with minimal access.\n",
+        );
+    }
+    out
+}
+
 // ---- Tool parameter types ------------------------------------------------
 
 #[derive(Deserialize, JsonSchema)]
@@ -155,6 +207,40 @@ pub struct TtdMemoryArgs {
     /// Omit to report every access.
     #[serde(default)]
     pub mode: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DecodeIoctlArgs {
+    /// 32-bit IOCTL control code (decimal or 0x-hex), e.g. "0x70000".
+    pub code: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DriverObjectArgs {
+    /// Driver object name, e.g. "mydriver" or "\\Driver\\mydriver".
+    pub name: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DeviceObjectArgs {
+    /// Device object: a name (e.g. "\\Device\\MyDevice") or an address (0x-hex).
+    pub device: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct IrpStackArgs {
+    /// IRP address (decimal or 0x-hex). Defaults to `@rdx` — the PIRP passed to the
+    /// dispatch routine on x64, valid only at the dispatch *entry*, before any step
+    /// clobbers the register.
+    #[serde(default)]
+    pub irp: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct IoctlTraceArgs {
+    /// Virtual address of the IRP_MJ_DEVICE_CONTROL dispatch routine, rebased to the
+    /// live load base. Recover it via `driver_object` (MajorFunction[0x0e]).
+    pub dispatch: String,
 }
 
 // ---- Tools ---------------------------------------------------------------
@@ -568,6 +654,92 @@ impl WindbgServer {
             Err(e) => Err(ErrorData::internal_error(e, None)),
         }
     }
+
+    /// Decode a 32-bit IOCTL control code into its CTL_CODE fields (DeviceType,
+    /// FunctionCode, Method, RequiredAccess) and flag METHOD_NEITHER / FILE_ANY_ACCESS.
+    /// Pure — needs no debug session.
+    #[rmcp::tool]
+    async fn decode_ioctl(
+        &self,
+        Parameters(args): Parameters<DecodeIoctlArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let code = parse_u64(&args.code).map_err(|e| ErrorData::invalid_params(e, None))?;
+        text_result(decode_ioctl_text(code))
+    }
+
+    /// Dump a driver object's dispatch table and devices (`!drvobj <name> 7`).
+    /// The MajorFunction table's index 0x0e is the IRP_MJ_DEVICE_CONTROL handler — the
+    /// IOCTL dispatch routine. Root of the device-tree walk.
+    #[rmcp::tool]
+    async fn driver_object(
+        &self,
+        Parameters(args): Parameters<DriverObjectArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cmd = format!("!drvobj {} 7", args.name);
+        let out = self
+            .engine
+            .run(move |e| e.execute_command(&cmd).map_err(es))
+            .await?;
+        text_result(out)
+    }
+
+    /// Inspect a device object (`!devobj <device>`): device type, characteristics
+    /// (e.g. FILE_DEVICE_SECURE_OPEN), and the SecurityDescriptor pointer. To answer the
+    /// *openable* gate, decode that DACL with `!sd <SecurityDescriptor>` via `execute`.
+    #[rmcp::tool]
+    async fn device_object(
+        &self,
+        Parameters(args): Parameters<DeviceObjectArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let cmd = format!("!devobj {}", args.device);
+        let out = self
+            .engine
+            .run(move |e| e.execute_command(&cmd).map_err(es))
+            .await?;
+        text_result(out)
+    }
+
+    /// Dump the current IO_STACK_LOCATION of an IRP (`!irp <irp> 1`): major/minor,
+    /// IoControlCode, input/output buffer lengths, and buffer pointers. Defaults the IRP
+    /// to `@rdx` (the PIRP at the dispatch entry on x64) — valid only before stepping.
+    #[rmcp::tool]
+    async fn irp_stack(
+        &self,
+        Parameters(args): Parameters<IrpStackArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let irp = args.irp.unwrap_or_else(|| "@rdx".to_string());
+        let cmd = format!("!irp {irp} 1");
+        let out = self
+            .engine
+            .run(move |e| e.execute_command(&cmd).map_err(es))
+            .await?;
+        text_result(out)
+    }
+
+    /// Install a conditional logging breakpoint at the IOCTL dispatch routine that prints
+    /// each IoControlCode + input/output lengths and continues (`gc`), so the IOCTL sweep
+    /// needs no hand-assembled offsets. Reads the current IO_STACK_LOCATION via
+    /// `poi(@rdx+0xb8)` (x64); confirm the offset with `dt nt!_IRP` / `dt nt!_IO_STACK_LOCATION`
+    /// on the target. Requires a real KDNET/VM target — a local kernel cannot set code bp's.
+    #[rmcp::tool]
+    async fn ioctl_trace(
+        &self,
+        Parameters(args): Parameters<IoctlTraceArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // IRP in @rdx at dispatch entry (x64). CurrentStackLocation = poi(Irp+0xb8).
+        // Within IO_STACK_LOCATION: OutputBufferLength +0x08, InputBufferLength +0x10,
+        // IoControlCode +0x18 (Parameters union begins at +0x08).
+        let cmd = format!(
+            "bp {} \".printf \\\"IOCTL %08x in=%x out=%x\\\\n\\\", \
+             dwo(poi(@rdx+0xb8)+0x18), dwo(poi(@rdx+0xb8)+0x10), dwo(poi(@rdx+0xb8)+0x08); gc\"",
+            args.dispatch
+        );
+        let out = self
+            .engine
+            .run(move |e| e.execute_command(&cmd).map_err(es))
+            .await?;
+        text_result(out)
+    }
 }
 
 #[rmcp::tool_handler(
@@ -576,7 +748,9 @@ Open a dump or .run trace, attach to a process or the kernel, inspect registers/
 Navigate a TTD trace in both directions: go/step_over/step_into forward, and reverse_go/step_over_back/step_back backward, \
 or jump with goto_position. Analyze a trace with the data-model tools ttd_calls (calls to a function), ttd_memory (accesses \
 to an address range), and ttd_events (module/thread/exception events), or run any data-model query with dx. Record new traces \
-with record_trace (needs elevation). Use `execute` for any raw command not covered by a dedicated tool."
+with record_trace (needs elevation). For driver IOCTL work: decode_ioctl (decode a control code), driver_object \
+and device_object (walk the driver/device tree and security), irp_stack (dump an IRP's IO_STACK_LOCATION), and \
+ioctl_trace (log every dispatched IOCTL). Use `execute` for any raw command not covered by a dedicated tool."
 )]
 impl rmcp::ServerHandler for WindbgServer {}
 
@@ -651,5 +825,44 @@ mod tests {
         // 0x00 and 0x7f are non-printable; 'A' (0x41) is printable.
         let out = hexdump(0, &[0x00, 0x41, 0x7f]);
         assert!(out.ends_with(".A.\n"), "got: {out:?}");
+    }
+
+    #[test]
+    fn decode_ioctl_disk_get_drive_geometry() {
+        // IOCTL_DISK_GET_DRIVE_GEOMETRY = CTL_CODE(IOCTL_DISK_BASE=0x7, 0, BUFFERED, ANY).
+        let out = decode_ioctl_text(0x70000);
+        assert!(out.contains("DeviceType     0x0007"), "got: {out}");
+        assert!(out.contains("FunctionCode   0x000"), "got: {out}");
+        assert!(
+            out.contains("Method         0 (METHOD_BUFFERED)"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("RequiredAccess 0 (FILE_ANY_ACCESS)"),
+            "got: {out}"
+        );
+        // FILE_ANY_ACCESS is flagged; METHOD_NEITHER is not.
+        assert!(out.contains("[!] FILE_ANY_ACCESS"), "got: {out}");
+        assert!(!out.contains("[!] METHOD_NEITHER"), "got: {out}");
+    }
+
+    #[test]
+    fn decode_ioctl_neither_write_flags_both_warnings() {
+        // CTL_CODE(DeviceType=0x8000, Function=0x800, METHOD_NEITHER, FILE_WRITE_DATA).
+        let code = (0x8000u32 << 16) | (2u32 << 14) | (0x800u32 << 2) | 3;
+        let out = decode_ioctl_text(code as u64);
+        assert!(out.contains("DeviceType     0x8000"), "got: {out}");
+        assert!(out.contains("FunctionCode   0x800"), "got: {out}");
+        assert!(
+            out.contains("Method         3 (METHOD_NEITHER)"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains("RequiredAccess 2 (FILE_WRITE_DATA)"),
+            "got: {out}"
+        );
+        assert!(out.contains("[!] METHOD_NEITHER"), "got: {out}");
+        // FILE_WRITE_DATA is an access gate, so the ANY_ACCESS warning must be absent.
+        assert!(!out.contains("[!] FILE_ANY_ACCESS"), "got: {out}");
     }
 }
