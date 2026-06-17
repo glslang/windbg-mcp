@@ -302,6 +302,11 @@ impl WindbgServer {
                 // attach_local_kernel breaks the target in internally (INITIAL_BREAK +
                 // an INFINITE wait, as a live kernel requires).
                 e.attach_local_kernel().map_err(es)?;
+                // The driver_object/device_object/irp_stack tools use kernel-extension
+                // commands (!drvobj/!devobj/!irp) from kdexts.dll, which a bare engine does
+                // not auto-load. Best-effort, like open_dump's `.load ext`; harmless if the
+                // extension isn't bundled (those tools then report a clean "no export").
+                let _ = e.execute_command(".load kdexts");
                 e.execute_command("vertarget").map_err(es)
             })
             .await?;
@@ -320,6 +325,9 @@ impl WindbgServer {
                 // attach_kernel connects, requests an initial break, and waits (INFINITE,
                 // as a live kernel requires) for the break-in — all internally.
                 e.attach_kernel(&args.connection).map_err(es)?;
+                // Load kdexts.dll so the driver_object/device_object/irp_stack tools'
+                // !drvobj/!devobj/!irp commands resolve (see attach_kernel_local). Best-effort.
+                let _ = e.execute_command(".load kdexts");
                 e.execute_command("vertarget").map_err(es)
             })
             .await?;
@@ -691,8 +699,9 @@ impl WindbgServer {
     }
 
     /// Inspect a device object (`!devobj <device>`): device type, characteristics
-    /// (e.g. FILE_DEVICE_SECURE_OPEN), and the SecurityDescriptor pointer. To answer the
-    /// *openable* gate, decode that DACL with `!sd <SecurityDescriptor>` via `execute`.
+    /// (e.g. FILE_DEVICE_SECURE_OPEN), and the SecurityDescriptor pointer — the inputs to the
+    /// *openable* gate. (`!sd <SecurityDescriptor>` decodes the DACL where that extension is
+    /// available; it is not in the bundled engine.)
     #[rmcp::tool]
     async fn device_object(
         &self,

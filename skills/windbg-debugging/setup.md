@@ -88,12 +88,18 @@ Copy-Item "$wd\dbgeng.dll","$wd\dbghelp.dll","$wd\dbgcore.dll","$wd\dbgmodel.dll
           "$wd\symsrv.dll","$wd\msdia140.dll" $dst -Force
 Copy-Item "$wd\ttd"    "$dst\ttd"    -Recurse -Force   # TTDReplay*.dll, TtdExt.dll, TTDAnalyze.dll, ...
 Copy-Item "$wd\winext" "$dst\winext" -Recurse -Force   # ext.dll (!analyze), kext.dll, … — for crash dumps
+New-Item   "$dst\winxp" -ItemType Directory -Force | Out-Null
+Copy-Item "$wd\winxp\kdexts.dll" "$dst\winxp" -Force   # !drvobj/!devobj/!irp — for the driver-IOCTL tools (kernel)
 ```
 
 - The `ttd\` subdir provides the `@$cursession.TTD` / `@$curprocess.TTD` data model and the
   `!tt` time-travel commands.
 - The `winext\` subdir provides `ext.dll` (which exports `!analyze`) and the other `!`-extensions.
   Required for crash-dump triage — without it `!analyze` returns *"No export analyze found"*.
+- `winxp\kdexts.dll` provides the kernel-object extensions `!drvobj`/`!devobj`/`!irp` used by the
+  `driver_object`/`device_object`/`irp_stack` tools. `attach_kernel` / `attach_kernel_local`
+  `.load kdexts` automatically; without the file those tools return *"No export drvobj found"*.
+  (Note it lives in `winxp\`, not `winext\`, and the engine already searches a `WINXP` subdir.)
 - `cargo clean` (when building from source) wipes `target\`, so re-copy after one.
 
 ## Symbols — required for `module!func` name resolution

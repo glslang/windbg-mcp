@@ -19,7 +19,7 @@ caller token. An IOCTL is only useful to a user if it passes all four:
 
 | Gate | Question | How to answer |
 |------|----------|---------------|
-| **Openable** | Can this token open the device at all? | `device_object` → device DACL (`!sd` on its `SecurityDescriptor`); `FILE_DEVICE_SECURE_OPEN` |
+| **Openable** | Can this token open the device at all? | `device_object` → `SecurityDescriptor` pointer + `FILE_DEVICE_SECURE_OPEN` (decode the DACL with `!sd <ptr>` where that extension is present) |
 | **Namespace-visible** | Does `CreateFile(\\.\Foo)` resolve in the caller's session? | symbolic-link scope (`\GLOBAL??\Foo` vs. session-local) via `execute` → `!object \GLOBAL??` |
 | **Deliverable** | Does the I/O manager forward the IRP to the driver? | `decode_ioctl` → `RequiredAccess` (bits 14–15) checked against the handle's *granted* access **before** the IRP reaches the driver |
 | **Handled** | Does the driver do something, or reject it? | `irp_stack` at the break + `Irp->IoStatus.Status` on return (a `default:` case returns `STATUS_INVALID_DEVICE_REQUEST` / `STATUS_NOT_SUPPORTED`) |
@@ -57,9 +57,10 @@ reads.
 3. **Decode each candidate** with `decode_ioctl` to get its method + required access (and the
    `METHOD_NEITHER`/`FILE_ANY_ACCESS` flags).
 4. **Device surface.** `device_object { "device": "\\Device\\MyDevice" }` (`!devobj`) for the
-   device type and characteristics; then `execute { "command": "!sd <SecurityDescriptor> 1" }`
-   on the pointer it prints to decode the DACL (the *openable* gate). Inspect the symbolic link
-   with `execute { "command": "!object \\GLOBAL??" }` for the *namespace* gate.
+   device type, characteristics, and `SecurityDescriptor` pointer (the *openable* gate). Where the
+   `!sd` extension is present, `execute { "command": "!sd <SecurityDescriptor> 1" }` decodes the
+   DACL; it is not in the bundled engine, so otherwise inspect the SD by address. Inspect the
+   symbolic link with `execute { "command": "!object \\GLOBAL??" }` for the *namespace* gate.
 
 > **No PDBs.** Third-party drivers ship no symbols, so `module!Dispatch` won't resolve —
 > everything is **address-based**. RVAs from static analysis must be **rebased to the live load
@@ -131,6 +132,10 @@ sweep requires a real **KDNET/VM** target via `attach_kernel`.
 - **Local kernel = read-only.** `attach_kernel_local` cannot set code breakpoints or step — the
   `ioctl_trace`/`irp_stack` sweep needs `attach_kernel` (KDNET/VM). The static walk
   (`driver_object`/`device_object`/`uf`/`decode_ioctl`) works fine locally.
+- **Kernel-object commands need `kdexts.dll`.** `!drvobj`/`!devobj`/`!irp` (behind
+  `driver_object`/`device_object`/`irp_stack`) come from `kdexts.dll`. `attach_kernel` /
+  `attach_kernel_local` `.load` it automatically, but it must be bundled (`winxp\kdexts.dll`,
+  see [setup.md](setup.md)); without it the tools return *"No export drvobj found"*.
 - **The dispatch bp fires for *every* delivered IOCTL**, handled or not — it is noisy by design.
   The `default:` case still fires the bp; distinguish it by the return status, not the entry.
 - **An IOCTL rejected by the I/O manager's `RequiredAccess` check never reaches the driver**, so
