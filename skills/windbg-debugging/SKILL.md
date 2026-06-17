@@ -21,6 +21,7 @@ session of a workflow you haven't run yet in this environment.
 | Triage a `.dmp` crash dump | [crash-dump.md](crash-dump.md) |
 | Launch/attach a process, or debug the kernel | [live-and-kernel.md](live-and-kernel.md) |
 | Record / open / navigate / analyze a `.run` trace | [ttd.md](ttd.md) |
+| Enumerate a driver's IOCTLs & test user-mode reachability | [driver-ioctl.md](driver-ioctl.md) |
 
 ## Tool map
 

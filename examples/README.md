@@ -16,3 +16,13 @@ so build the server first: `cargo build --release`. For symbol resolution, set
 - **`verify_fixes.ps1`** — regression checks: `go`/step with no debuggee returns a
   clean "No active debuggee" error (no process crash), and a failed kernel attach is a
   clean error (no panic). The kernel-attach check needs a real KDNET key filled in.
+- **`sweep_ioctls.ps1`** — driver IOCTL sweep, **host side** (see
+  [`driver-ioctl.md`](../skills/windbg-debugging/driver-ioctl.md)). Attaches over KDNET,
+  prints the driver's dispatch table (`driver_object`) and load base, and — given the
+  rebased dispatch VA via `-Dispatch` — installs the `ioctl_trace` logging breakpoint and
+  collects the IOCTL log during a `go` window. Needs a real `-Connection` and a benign test
+  driver.
+- **`send_ioctls_target.ps1`** — the **target-side** companion: run it on the target VM
+  during the `go` window (once as a normal user, once elevated). It opens the device and
+  fires each `-Codes` IOCTL via `DeviceIoControl`; comparing which codes reach the host log
+  under each token is the per-token reachability answer.

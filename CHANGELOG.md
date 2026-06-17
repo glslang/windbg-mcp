@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Driver IOCTL discovery & user-mode reachability.** A new
+  [`driver-ioctl.md`](skills/windbg-debugging/driver-ioctl.md) playbook documents a
+  static-first, dynamic-confirm workflow for enumerating a driver's IOCTL surface and
+  testing whether each code is reachable from user mode (the openable → namespace →
+  deliverable → handled gate model), with WinDbg-native (`uf`) static enumeration by
+  default and Binary Ninja as an optional escalation. Five supporting tools:
+  - `decode_ioctl` — decode a 32-bit control code into its `CTL_CODE` fields and flag
+    `METHOD_NEITHER` / `FILE_ANY_ACCESS` (pure; no session needed).
+  - `driver_object` — dump a driver's dispatch table + devices (`!drvobj <name> 7`).
+  - `device_object` — inspect a device object's type/characteristics/SecurityDescriptor
+    (`!devobj`) to answer the *openable* gate.
+  - `irp_stack` — dump an IRP's current `IO_STACK_LOCATION` (`!irp`), defaulting the IRP
+    to `@rdx` at a dispatch break.
+  - `ioctl_trace` — install a conditional logging breakpoint at the IOCTL dispatch
+    routine that prints each `IoControlCode` + buffer lengths and continues.
+  - An `examples/sweep_ioctls.ps1` harness driving the dynamic confirm sweep.
+
 ## [0.1.3] - 2026-06-14
 
 ### Fixed
