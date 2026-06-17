@@ -24,7 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     to `@rdx` at a dispatch break.
   - `ioctl_trace` — install a conditional logging breakpoint at the IOCTL dispatch
     routine that prints each `IoControlCode` + buffer lengths and continues.
-  - An `examples/sweep_ioctls.ps1` harness driving the dynamic confirm sweep.
+  - An `examples/sweep_ioctls.ps1` harness (host) + `examples/send_ioctls_target.ps1`
+    (target-side `DeviceIoControl` sender) driving the dynamic confirm sweep.
+  - `attach_kernel` / `attach_kernel_local` now `.load kdexts` automatically so the
+    `!drvobj`/`!devobj`/`!irp` commands behind `driver_object`/`device_object`/`irp_stack`
+    resolve; `setup.md` bundles `winxp\kdexts.dll`. Verified end-to-end against a live
+    KDNET kernel (the tools captured real mountmgr IOCTLs).
 
 ## [0.1.3] - 2026-06-14
 
