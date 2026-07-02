@@ -5,6 +5,8 @@
 //! hatch, returning full text); session-management tools call the typed
 //! `win-kexp` methods and then wait for the target to stop.
 
+use std::collections::{HashMap, HashSet, VecDeque};
+
 use rmcp::ErrorData;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, Content};
@@ -113,6 +115,286 @@ fn decode_ioctl_text(c: u32) -> String {
              on any handle, even one opened with minimal access.\n",
         );
     }
+    out
+}
+
+// ---- IOCTL dispatch reachability (static call-graph walk) ----------------
+//
+// Answers "is the code block at <target> reachable from the IOCTL dispatch
+// routine?" with a bounded breadth-first walk over the call graph, built from
+// repeated `uf` (unassemble-function) disassembly parsed as text. The whole
+// algorithm is engine-free — `reachability` takes a disassembler closure — so it
+// unit-tests without a live debugger (like `decode_ioctl_text` above).
+
+/// Parses a WinDbg address token into a `u64`. Accepts the `hi`lo` backtick form
+/// ("fffff803`3e254750"), a plain hex run ("00401000"), and tokens wrapped or
+/// trailed by parens/commas ("(fffff803`3e2547f0)"). Requires >= 8 hex digits so
+/// it never mistakes a mnemonic, a short immediate, or a "module!Symbol:" label
+/// for an address.
+fn parse_windbg_addr(tok: &str) -> Option<u64> {
+    let cleaned: String = tok
+        .trim_matches(|c| c == '(' || c == ')' || c == ',')
+        .chars()
+        .filter(|&c| c != '`')
+        .collect();
+    if cleaned.len() < 8 || !cleaned.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(&cleaned, 16).ok()
+}
+
+/// The resolved target of a direct branch/call is the last parenthesized address
+/// WinDbg prints on the line ("... (fffff803`3e2547f0)"). Register/memory-indirect
+/// operands print no such address (or the *pointer's* address, which callers
+/// exclude via the `[` guard in [`parse_uf`]) and are not followed.
+fn branch_target(line: &str) -> Option<u64> {
+    let open = line.rfind('(')?;
+    let rest = &line[open..];
+    let close = rest.find(')')?;
+    parse_windbg_addr(&rest[..=close])
+}
+
+/// One function's `uf` disassembly, reduced to what the call-graph walk needs.
+#[derive(Debug, Default, PartialEq)]
+struct UfBlock {
+    /// First instruction address (the function entry), if any lines parsed.
+    entry: Option<u64>,
+    /// Address of every instruction in the function body.
+    instrs: Vec<u64>,
+    /// (call-site, resolved direct-call target).
+    calls: Vec<(u64, u64)>,
+    /// (site, unconditional `jmp` target).
+    jmps: Vec<(u64, u64)>,
+    /// (site, conditional-branch target: je/jne/jz/jg/...).
+    branches: Vec<(u64, u64)>,
+}
+
+/// Parses `uf <fn>` output. Each instruction line is `<addr> <bytes> <mnem> <ops>`;
+/// label lines ("module!Foo:"), blanks, and jump-table data lines have no leading
+/// address token and are skipped. Only *direct*, resolvable branch/call targets are
+/// recorded — memory-indirect operands (`call qword ptr [..]`) and register-indirect
+/// (`call rax`) are skipped so a REACHABLE verdict stays sound.
+fn parse_uf(text: &str) -> UfBlock {
+    let mut b = UfBlock::default();
+    for line in text.lines() {
+        let mut toks = line.split_whitespace();
+        let Some(addr) = toks.next().and_then(parse_windbg_addr) else {
+            continue;
+        };
+        let _bytes = toks.next(); // raw opcode-bytes column
+        if b.entry.is_none() {
+            b.entry = Some(addr);
+        }
+        b.instrs.push(addr);
+        let Some(mnem) = toks.next() else {
+            continue; // address with no mnemonic — treat as a bare instr line
+        };
+        // Memory-indirect operands are not directly resolvable; skip them (register-
+        // indirect operands have no parenthesized target and are dropped below).
+        if line.contains('[') {
+            continue;
+        }
+        let Some(t) = branch_target(line) else {
+            continue;
+        };
+        if mnem.starts_with("call") {
+            b.calls.push((addr, t));
+        } else if mnem == "jmp" {
+            b.jmps.push((addr, t));
+        } else if mnem.starts_with('j') {
+            b.branches.push((addr, t));
+        }
+    }
+    b
+}
+
+/// The first address token in `lm m <module>` output is the module's live start
+/// (its base). Header lines ("Browse full module list", the "start end module"
+/// legend) have no leading address and are skipped by the >= 8 hex-digit rule.
+fn parse_lm_base(text: &str) -> Option<u64> {
+    text.lines()
+        .find_map(|l| l.split_whitespace().next().and_then(parse_windbg_addr))
+}
+
+/// Outcome of a reachability walk. `verdict_reachable` is sound (a concrete static
+/// path exists); a false verdict is best-effort within the explored bounds.
+struct Report {
+    verdict_reachable: bool,
+    /// Resolved entry of the `from` function (None if `from` didn't disassemble).
+    from_entry: Option<u64>,
+    target: u64,
+    /// Entry of the function containing `target`, when reachable.
+    containing_fn: Option<u64>,
+    /// Call path seed -> ... -> containing function: (site, "call"/"jmp", callee).
+    path: Vec<(u64, &'static str, u64)>,
+    funcs_explored: usize,
+    max_depth_seen: usize,
+    /// True if a function/depth bound was hit (so the caller can raise it and retry).
+    bound_hit: bool,
+    max_functions: usize,
+    max_depth: usize,
+}
+
+/// Walks the call/branch graph from `from`, running `uf(arg)` for each discovered
+/// function, until `target` is found among some function's instructions, the graph
+/// is exhausted, or a bound is hit. `uf` returns the raw `uf <arg>` text or `None`
+/// (bad address / forwarded export / disassembly failure) to prune that branch.
+fn reachability(
+    from: &str,
+    target: u64,
+    max_functions: usize,
+    max_depth: usize,
+    mut uf: impl FnMut(&str) -> Option<String>,
+) -> Report {
+    let mut visited: HashSet<u64> = HashSet::new(); // function entries already uf'd
+    let mut enqueued: HashSet<u64> = HashSet::new(); // target tokens scheduled
+    // child token -> (caller token (None = seed), call site, kind).
+    let mut parent: HashMap<u64, (Option<u64>, u64, &'static str)> = HashMap::new();
+    let mut queue: VecDeque<(String, Option<u64>, usize)> = VecDeque::new();
+    queue.push_back((from.to_string(), None, 0));
+
+    let mut rpt = Report {
+        verdict_reachable: false,
+        from_entry: None,
+        target,
+        containing_fn: None,
+        path: Vec::new(),
+        funcs_explored: 0,
+        max_depth_seen: 0,
+        bound_hit: false,
+        max_functions,
+        max_depth,
+    };
+
+    while let Some((arg, token, depth)) = queue.pop_front() {
+        if rpt.funcs_explored >= max_functions || depth > max_depth {
+            rpt.bound_hit = true;
+            continue;
+        }
+        let Some(text) = uf(&arg) else {
+            continue; // disassembly failed — prune this branch
+        };
+        let block = parse_uf(&text);
+        let Some(entry) = block.entry else {
+            continue;
+        };
+        if !visited.insert(entry) {
+            continue; // this function was already explored (dedupe cycles)
+        }
+        if token.is_none() {
+            rpt.from_entry = Some(entry);
+        }
+        rpt.funcs_explored += 1;
+        rpt.max_depth_seen = rpt.max_depth_seen.max(depth);
+
+        if block.instrs.iter().any(|&i| i == target) {
+            rpt.verdict_reachable = true;
+            rpt.containing_fn = Some(entry);
+            rpt.path = reconstruct(&parent, token);
+            return rpt;
+        }
+
+        let in_func: HashSet<u64> = block.instrs.iter().copied().collect();
+        let mut schedule =
+            |site: u64,
+             t: u64,
+             kind: &'static str,
+             q: &mut VecDeque<(String, Option<u64>, usize)>| {
+                if enqueued.insert(t) {
+                    parent.insert(t, (token, site, kind));
+                    q.push_back((format!("0x{t:x}"), Some(t), depth + 1));
+                }
+            };
+        for &(site, t) in &block.calls {
+            schedule(site, t, "call", &mut queue);
+        }
+        // Follow only jmp/branch targets that LEAVE this function (tail calls,
+        // cross-function jumps). Intra-function branches are already inside this `uf`.
+        for &(site, t) in block.jmps.iter().chain(block.branches.iter()) {
+            if !in_func.contains(&t) {
+                schedule(site, t, "jmp", &mut queue);
+            }
+        }
+    }
+    rpt
+}
+
+/// Rebuilds the call path from the seed to the function reached via `token`, by
+/// walking the `parent` chain backward and reversing it.
+fn reconstruct(
+    parent: &HashMap<u64, (Option<u64>, u64, &'static str)>,
+    token: Option<u64>,
+) -> Vec<(u64, &'static str, u64)> {
+    let mut hops = Vec::new();
+    let mut cur = token;
+    while let Some(t) = cur {
+        let Some(&(caller, site, kind)) = parent.get(&t) else {
+            break;
+        };
+        hops.push((site, kind, t));
+        cur = caller;
+    }
+    hops.reverse();
+    hops
+}
+
+/// Formats a WinDbg-style `hi`lo` address.
+fn fmt_addr(a: u64) -> String {
+    format!("{:08x}`{:08x}", a >> 32, a & 0xffff_ffff)
+}
+
+/// Renders a [`Report`] as the tool's text output.
+fn format_report(r: &Report) -> String {
+    let mut out = String::new();
+    out.push_str("IOCTL dispatch reachability\n");
+    match r.from_entry {
+        Some(e) => out.push_str(&format!("  from   : entry {}\n", fmt_addr(e))),
+        None => out.push_str("  from   : <unresolved>\n"),
+    }
+    out.push_str(&format!("  target : {}\n", fmt_addr(r.target)));
+    if r.verdict_reachable {
+        out.push_str("VERDICT: REACHABLE\n");
+        if let Some(f) = r.containing_fn {
+            out.push_str(&format!("  Containing function entry: {}\n", fmt_addr(f)));
+        }
+        if r.path.is_empty() {
+            out.push_str("  Call path: target is inside the start function (0 hops)\n");
+        } else {
+            out.push_str(&format!("  Call path ({} hops):\n", r.path.len()));
+            for (site, kind, callee) in &r.path {
+                out.push_str(&format!(
+                    "    {}  {:<4} -> {}\n",
+                    fmt_addr(*site),
+                    kind,
+                    fmt_addr(*callee)
+                ));
+            }
+        }
+    } else {
+        out.push_str("VERDICT: NOT REACHABLE (within bounds)\n");
+        out.push_str(&format!(
+            "  Bound hit: {}\n",
+            if r.bound_hit {
+                "yes — raise max_functions/max_depth and retry"
+            } else {
+                "no — the reachable call graph was fully explored"
+            }
+        ));
+    }
+    out.push_str(&format!(
+        "  Functions explored: {} (bound {})   Max depth reached: {} (bound {})\n",
+        r.funcs_explored, r.max_functions, r.max_depth_seen, r.max_depth
+    ));
+    out.push_str(
+        "  Caveats: indirect/computed calls (call [ptr], call reg) and unresolved jump tables\n",
+    );
+    out.push_str(
+        "           are NOT followed. REACHABLE is sound; NOT REACHABLE within bounds does not\n",
+    );
+    out.push_str(
+        "           prove unreachability — raise max_functions/max_depth, or pass a specific\n",
+    );
+    out.push_str("           handler VA as `from` to scope past a jump-table switch dispatch.\n");
     out
 }
 
@@ -240,6 +522,32 @@ pub struct IoctlTraceArgs {
     /// Virtual address of the IRP_MJ_DEVICE_CONTROL dispatch routine, rebased to the
     /// live load base. Recover it via `driver_object` (MajorFunction[0x0e]).
     pub dispatch: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct ReachabilityArgs {
+    /// Start of the search: the IRP_MJ_DEVICE_CONTROL dispatch routine — a symbol,
+    /// address, or expression `uf` accepts (e.g. "mydriver!DispatchDeviceControl" or
+    /// "fffff8033e254750"). Recover it via `driver_object` (MajorFunction[0x0e]). Pass
+    /// a specific handler VA instead to scope the walk past a jump-table switch.
+    pub from: String,
+    /// Target code block as an absolute virtual address (decimal or 0x-hex). Provide
+    /// this OR `module`+`rva`, not both.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// Module name for a module+RVA target, e.g. "mydriver". Its live base is read from
+    /// `lm m <module>` and added to `rva`. Required (with `rva`) when `address` is omitted.
+    #[serde(default)]
+    pub module: Option<String>,
+    /// Relative virtual address (decimal or 0x-hex) added to `module`'s live base.
+    #[serde(default)]
+    pub rva: Option<String>,
+    /// Max distinct functions to disassemble before giving up (default 256). Bounds runtime.
+    #[serde(default)]
+    pub max_functions: Option<usize>,
+    /// Max call-graph depth to explore from `from` (default 32).
+    #[serde(default)]
+    pub max_depth: Option<usize>,
 }
 
 // ---- Tools ---------------------------------------------------------------
@@ -756,6 +1064,65 @@ impl WindbgServer {
             .await?;
         text_result(out)
     }
+
+    /// Static, best-effort control-flow reachability: is the code block at `address`
+    /// (or `module`+`rva`) reachable from the IOCTL dispatch routine `from`? Runs a
+    /// bounded breadth-first walk over the call graph via repeated `uf` disassembly,
+    /// following direct calls and cross-function tail jumps. "REACHABLE" is sound (a
+    /// concrete static path exists, and the call path is reported); "NOT REACHABLE"
+    /// means only that the block was not found within the bounds — indirect calls
+    /// through function pointers and unresolved compiler jump tables are NOT followed.
+    #[rmcp::tool]
+    async fn reachable_from_dispatch(
+        &self,
+        Parameters(args): Parameters<ReachabilityArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .engine
+            .run(move |e| {
+                // Resolve the target VA: an absolute address, or module+RVA rebased
+                // against the module's live base from `lm m <module>`.
+                let target = match (&args.address, &args.module, &args.rva) {
+                    (Some(a), _, _) => parse_u64(a)?,
+                    (None, Some(m), Some(r)) => {
+                        let rva = parse_u64(r)?;
+                        let lm = e.execute_command(&format!("lm m {m}")).map_err(es)?;
+                        let base = parse_lm_base(&lm).ok_or_else(|| {
+                            format!("module `{m}` not found (`lm m {m}` returned):\n{lm}")
+                        })?;
+                        base.checked_add(rva)
+                            .ok_or_else(|| "module base + rva overflowed u64".to_string())?
+                    }
+                    _ => {
+                        return Err("provide `address`, or both `module` and `rva`".to_string());
+                    }
+                };
+
+                let max_functions = args.max_functions.unwrap_or(256);
+                let max_depth = args.max_depth.unwrap_or(32);
+
+                let rpt = reachability(&args.from, target, max_functions, max_depth, |arg| {
+                    // A real `uf` lists backtick addresses or at least a "module!Func:"
+                    // label; error text ("Couldn't resolve...", "no code") lacks both
+                    // and prunes the branch. parse_uf then discards any non-disassembly.
+                    match e.execute_command(&format!("uf {arg}")) {
+                        Ok(t) if t.contains('`') || t.contains(':') => Some(t),
+                        _ => None,
+                    }
+                });
+
+                if rpt.from_entry.is_none() {
+                    return Err(format!(
+                        "could not disassemble `from` ({}): `uf` returned no function. \
+                         Check the symbol/address and that the module is loaded.",
+                        args.from
+                    ));
+                }
+                Ok(format_report(&rpt))
+            })
+            .await?;
+        text_result(out)
+    }
 }
 
 #[rmcp::tool_handler(
@@ -765,8 +1132,11 @@ Navigate a TTD trace in both directions: go/step_over/step_into forward, and rev
 or jump with goto_position. Analyze a trace with the data-model tools ttd_calls (calls to a function), ttd_memory (accesses \
 to an address range), and ttd_events (module/thread/exception events), or run any data-model query with dx. Record new traces \
 with record_trace (needs elevation). For driver IOCTL work: decode_ioctl (decode a control code), driver_object \
-and device_object (walk the driver/device tree and security), irp_stack (dump an IRP's IO_STACK_LOCATION), and \
-ioctl_trace (log every dispatched IOCTL). Use `execute` for any raw command not covered by a dedicated tool."
+and device_object (walk the driver/device tree and security), irp_stack (dump an IRP's IO_STACK_LOCATION), \
+ioctl_trace (log every dispatched IOCTL), and reachable_from_dispatch (statically test, via a bounded \
+uf-based call-graph walk, whether a code block — by address or module+RVA — is reachable from the IOCTL \
+dispatch routine; REACHABLE is sound, NOT REACHABLE is best-effort). Use `execute` for any raw command not \
+covered by a dedicated tool."
 )]
 impl rmcp::ServerHandler for WindbgServer {}
 
@@ -881,5 +1251,217 @@ mod tests {
         assert!(out.contains("[!] METHOD_NEITHER"), "got: {out}");
         // FILE_WRITE_DATA is an access gate, so the ANY_ACCESS warning must be absent.
         assert!(!out.contains("[!] FILE_ANY_ACCESS"), "got: {out}");
+    }
+
+    // ---- reachability: parsing --------------------------------------------
+
+    #[test]
+    fn parse_windbg_addr_forms() {
+        assert_eq!(
+            parse_windbg_addr("fffff803`3e254750"),
+            Some(0xfffff803_3e254750)
+        );
+        assert_eq!(
+            parse_windbg_addr("(fffff803`3e2547f0)"),
+            Some(0xfffff803_3e2547f0)
+        );
+        // Plain 32-bit (x86) hex, no backtick.
+        assert_eq!(parse_windbg_addr("00401000"), Some(0x0040_1000));
+        // Mnemonics, registers, labels, and short immediates are not addresses.
+        assert_eq!(parse_windbg_addr("call"), None);
+        assert_eq!(parse_windbg_addr("rax"), None);
+        assert_eq!(parse_windbg_addr("mydriver!Foo:"), None);
+        assert_eq!(parse_windbg_addr("28h"), None);
+    }
+
+    #[test]
+    fn parse_uf_classifies_targets_and_skips_indirect() {
+        // A function with a direct call, a conditional branch, an unconditional jmp,
+        // and a memory-indirect call (which must NOT be recorded as a direct target).
+        let text = "\
+mydriver!Dispatch:
+fffff803`3e254750 4c8bdc          mov     r11,rsp
+fffff803`3e254758 e893000000      call    mydriver!Helper (fffff803`3e2547f0)
+fffff803`3e25475d 85c0            test    eax,eax
+fffff803`3e25475f 0f8541000000    jne     mydriver!Dispatch+0x56 (fffff803`3e2547a6)
+fffff803`3e254765 ff15aabbccdd    call    qword ptr [mydriver!Ptr (fffff803`3e260000)]
+fffff803`3e25476b e9c0000000      jmp     mydriver!Tail (fffff803`3e254830)
+fffff803`3e254770 c3              ret
+";
+        let b = parse_uf(text);
+        assert_eq!(b.entry, Some(0xfffff803_3e254750));
+        assert_eq!(b.instrs.len(), 7); // 7 instruction lines; the label line is not one
+        assert_eq!(b.calls, vec![(0xfffff803_3e254758, 0xfffff803_3e2547f0)]);
+        assert_eq!(b.branches, vec![(0xfffff803_3e25475f, 0xfffff803_3e2547a6)]);
+        assert_eq!(b.jmps, vec![(0xfffff803_3e25476b, 0xfffff803_3e254830)]);
+        // The `call qword ptr [..]` line contributed an instruction but no direct call.
+        assert!(!b.calls.iter().any(|&(_, t)| t == 0xfffff803_3e260000));
+    }
+
+    #[test]
+    fn parse_lm_base_reads_module_start() {
+        let text = "\
+Browse full module list
+start             end                 module name
+fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
+";
+        assert_eq!(parse_lm_base(text), Some(0xfffff803_3e250000));
+        assert_eq!(parse_lm_base("Unable to enumerate modules\n"), None);
+    }
+
+    // ---- reachability: graph walk -----------------------------------------
+
+    /// Builds a `uf` block whose entry is `entry`, with the given follow-on lines
+    /// appended (each already a full `uf` instruction line).
+    fn uf_fn(label: &str, entry: u64, body: &[&str]) -> String {
+        let mut s = format!("{label}:\n{} 90              nop\n", fmt_addr(entry));
+        for l in body {
+            s.push_str(l);
+            s.push('\n');
+        }
+        s
+    }
+
+    #[test]
+    fn reachability_direct_call_chain() {
+        let mut m: HashMap<String, String> = HashMap::new();
+        m.insert(
+            "start".to_string(),
+            uf_fn(
+                "A",
+                0x1000,
+                &[&format!(
+                    "{} e8xx call A!B ({})",
+                    fmt_addr(0x1004),
+                    fmt_addr(0x2000)
+                )],
+            ),
+        );
+        m.insert(
+            "0x2000".to_string(),
+            uf_fn("B", 0x2000, &[&format!("{} c3 ret", fmt_addr(0x2008))]),
+        );
+        let r = reachability("start", 0x2008, 256, 32, |a| m.get(a).cloned());
+        assert!(r.verdict_reachable);
+        assert_eq!(r.from_entry, Some(0x1000));
+        assert_eq!(r.containing_fn, Some(0x2000));
+        assert_eq!(r.path, vec![(0x1004, "call", 0x2000)]);
+    }
+
+    #[test]
+    fn reachability_follows_tail_jmp() {
+        let mut m: HashMap<String, String> = HashMap::new();
+        m.insert(
+            "start".to_string(),
+            uf_fn(
+                "A",
+                0x1000,
+                &[&format!(
+                    "{} e9xx jmp A!B ({})",
+                    fmt_addr(0x1004),
+                    fmt_addr(0x2000)
+                )],
+            ),
+        );
+        m.insert(
+            "0x2000".to_string(),
+            uf_fn("B", 0x2000, &[&format!("{} c3 ret", fmt_addr(0x2008))]),
+        );
+        let r = reachability("start", 0x2008, 256, 32, |a| m.get(a).cloned());
+        assert!(r.verdict_reachable);
+        assert_eq!(r.path, vec![(0x1004, "jmp", 0x2000)]);
+    }
+
+    #[test]
+    fn reachability_target_in_seed_is_zero_hops() {
+        let mut m: HashMap<String, String> = HashMap::new();
+        m.insert(
+            "start".to_string(),
+            uf_fn("A", 0x1000, &[&format!("{} c3 ret", fmt_addr(0x1004))]),
+        );
+        let r = reachability("start", 0x1004, 256, 32, |a| m.get(a).cloned());
+        assert!(r.verdict_reachable);
+        assert_eq!(r.containing_fn, Some(0x1000));
+        assert!(r.path.is_empty());
+    }
+
+    #[test]
+    fn reachability_indirect_only_is_not_reached() {
+        let mut m: HashMap<String, String> = HashMap::new();
+        m.insert(
+            "start".to_string(),
+            uf_fn(
+                "A",
+                0x1000,
+                &[&format!(
+                    "{} ff15aa call qword ptr [A!Ptr ({})]",
+                    fmt_addr(0x1004),
+                    fmt_addr(0x9000)
+                )],
+            ),
+        );
+        // The target sits behind the indirect call, which is never followed.
+        let r = reachability("start", 0x2008, 256, 32, |a| m.get(a).cloned());
+        assert!(!r.verdict_reachable);
+        assert!(!r.bound_hit); // graph exhausted, not a bound
+    }
+
+    #[test]
+    fn reachability_cycle_terminates() {
+        let mut m: HashMap<String, String> = HashMap::new();
+        m.insert(
+            "start".to_string(),
+            uf_fn(
+                "A",
+                0x1000,
+                &[&format!(
+                    "{} e8xx call A!B ({})",
+                    fmt_addr(0x1004),
+                    fmt_addr(0x2000)
+                )],
+            ),
+        );
+        m.insert(
+            "0x2000".to_string(),
+            uf_fn(
+                "B",
+                0x2000,
+                &[&format!(
+                    "{} e8xx call B!A ({})",
+                    fmt_addr(0x2004),
+                    fmt_addr(0x1000)
+                )],
+            ),
+        );
+        // Target is absent — the A<->B cycle must not loop forever.
+        let r = reachability("start", 0x7777, 256, 32, |a| m.get(a).cloned());
+        assert!(!r.verdict_reachable);
+        assert_eq!(r.funcs_explored, 2);
+    }
+
+    #[test]
+    fn reachability_respects_function_bound() {
+        let mut m: HashMap<String, String> = HashMap::new();
+        m.insert(
+            "start".to_string(),
+            uf_fn(
+                "A",
+                0x1000,
+                &[&format!(
+                    "{} e8xx call A!B ({})",
+                    fmt_addr(0x1004),
+                    fmt_addr(0x2000)
+                )],
+            ),
+        );
+        m.insert(
+            "0x2000".to_string(),
+            uf_fn("B", 0x2000, &[&format!("{} c3 ret", fmt_addr(0x2004))]),
+        );
+        // Bound to a single function: B (which contains the target) is never explored.
+        let r = reachability("start", 0x2004, 1, 32, |a| m.get(a).cloned());
+        assert!(!r.verdict_reachable);
+        assert!(r.bound_hit);
+        assert_eq!(r.funcs_explored, 1);
     }
 }

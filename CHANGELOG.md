@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Static IOCTL dispatch reachability.** A new `reachable_from_dispatch` tool answers
+  whether a code block — given as an absolute address or `module`+`rva` — is reachable from
+  a driver's IOCTL dispatch routine, via a bounded breadth-first walk over the call graph
+  built from repeated `uf` disassembly. It follows direct calls and cross-function tail
+  jumps; it does **not** follow indirect calls through function pointers or unresolved
+  compiler jump tables, so a `REACHABLE` verdict is sound (and reports the call path) while
+  `NOT REACHABLE` is a best-effort within-bounds result. The `uf`-parsing and graph-walk
+  logic is pure and unit-tested (no debugger needed).
 - **Driver IOCTL discovery & user-mode reachability.** A new
   [`driver-ioctl.md`](skills/windbg-debugging/driver-ioctl.md) playbook documents a
   static-first, dynamic-confirm workflow for enumerating a driver's IOCTL surface and
