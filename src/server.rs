@@ -154,26 +154,69 @@ fn branch_target(line: &str) -> Option<u64> {
     parse_windbg_addr(&rest[..=close])
 }
 
-/// One function's `uf` disassembly, reduced to what the call-graph walk needs.
+/// The control-flow behavior of one instruction, used to walk *within* a function.
+/// Only *direct*, resolvable targets are carried; memory-indirect (`call qword ptr
+/// [..]`) and register-indirect (`call rax`) operands become the `*Indirect` variants
+/// with no target, so a REACHABLE verdict never rests on a guessed edge.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Flow {
+    /// Falls through to the next instruction (the common case).
+    Fallthrough,
+    /// Direct `call`: schedules the target, then falls through.
+    Call(u64),
+    /// Indirect `call`: falls through (target unknown, not followed).
+    CallIndirect,
+    /// Unconditional direct `jmp`: control goes to the target only (no fall-through).
+    Jmp(u64),
+    /// Indirect `jmp` (function pointer / jump table): flow stops; target not followed.
+    JmpIndirect,
+    /// Conditional branch (je/jne/jz/jg/...): the target OR the next instruction.
+    Branch(u64),
+    /// `ret`/`iret`: flow stops.
+    Return,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Insn {
+    addr: u64,
+    flow: Flow,
+}
+
+/// One function's `uf` disassembly as an ordered instruction list.
 #[derive(Debug, Default, PartialEq)]
 struct UfBlock {
     /// First instruction address (the function entry), if any lines parsed.
     entry: Option<u64>,
-    /// Address of every instruction in the function body.
-    instrs: Vec<u64>,
-    /// (call-site, resolved direct-call target).
-    calls: Vec<(u64, u64)>,
-    /// (site, unconditional `jmp` target).
-    jmps: Vec<(u64, u64)>,
-    /// (site, conditional-branch target: je/jne/jz/jg/...).
-    branches: Vec<(u64, u64)>,
+    /// Every instruction, in listing order, with its control-flow classification.
+    insns: Vec<Insn>,
+}
+
+/// Classifies one `uf` instruction line into a [`Flow`]. A memory-operand (`[..]`)
+/// line has no directly-resolvable target; otherwise the target is the parenthesized
+/// address WinDbg prints ([`branch_target`]).
+fn classify_flow(line: &str, mnem: &str) -> Flow {
+    let target = if line.contains('[') {
+        None
+    } else {
+        branch_target(line)
+    };
+    if mnem.starts_with("ret") || mnem.starts_with("iret") {
+        Flow::Return
+    } else if mnem == "jmp" {
+        target.map_or(Flow::JmpIndirect, Flow::Jmp)
+    } else if mnem.starts_with("call") {
+        target.map_or(Flow::CallIndirect, Flow::Call)
+    } else if mnem.starts_with('j') {
+        // A conditional branch; a jcc without a resolvable rel target just falls through.
+        target.map_or(Flow::Fallthrough, Flow::Branch)
+    } else {
+        Flow::Fallthrough
+    }
 }
 
 /// Parses `uf <fn>` output. Each instruction line is `<addr> <bytes> <mnem> <ops>`;
 /// label lines ("module!Foo:"), blanks, and jump-table data lines have no leading
-/// address token and are skipped. Only *direct*, resolvable branch/call targets are
-/// recorded — memory-indirect operands (`call qword ptr [..]`) and register-indirect
-/// (`call rax`) are skipped so a REACHABLE verdict stays sound.
+/// address token and are skipped.
 fn parse_uf(text: &str) -> UfBlock {
     let mut b = UfBlock::default();
     for line in text.lines() {
@@ -185,27 +228,79 @@ fn parse_uf(text: &str) -> UfBlock {
         if b.entry.is_none() {
             b.entry = Some(addr);
         }
-        b.instrs.push(addr);
-        let Some(mnem) = toks.next() else {
-            continue; // address with no mnemonic — treat as a bare instr line
+        let flow = match toks.next() {
+            Some(mnem) => classify_flow(line, mnem),
+            None => Flow::Fallthrough, // address with no mnemonic — treat as a bare line
         };
-        // Memory-indirect operands are not directly resolvable; skip them (register-
-        // indirect operands have no parenthesized target and are dropped below).
-        if line.contains('[') {
-            continue;
-        }
-        let Some(t) = branch_target(line) else {
-            continue;
-        };
-        if mnem.starts_with("call") {
-            b.calls.push((addr, t));
-        } else if mnem == "jmp" {
-            b.jmps.push((addr, t));
-        } else if mnem.starts_with('j') {
-            b.branches.push((addr, t));
-        }
+        b.insns.push(Insn { addr, flow });
     }
     b
+}
+
+/// Instructions reachable from `start` by walking *inside* one function — following
+/// fall-through, direct conditional branches, and direct `jmp`s that stay in the
+/// function — and stopping at `ret` or an unfollowed indirect/jump-table `jmp`. This
+/// keeps a mid-function start (a handler scoped past a switch) from spuriously
+/// treating sibling switch cases as reachable.
+struct FnWalk {
+    /// Instruction addresses reachable from `start` within the function.
+    reachable: HashSet<u64>,
+    /// Edges leaving the function, gathered only from reachable instructions:
+    /// (site, target, "call"/"jmp").
+    external: Vec<(u64, u64, &'static str)>,
+}
+
+/// Returns `None` if `start` is not an instruction boundary in `block` (the caller
+/// then falls back to the function entry).
+fn walk_function(block: &UfBlock, start: u64) -> Option<FnWalk> {
+    let idx: HashMap<u64, usize> = block
+        .insns
+        .iter()
+        .enumerate()
+        .map(|(i, x)| (x.addr, i))
+        .collect();
+    let start_i = *idx.get(&start)?;
+    let mut reachable: HashSet<u64> = HashSet::new();
+    let mut external: Vec<(u64, u64, &'static str)> = Vec::new();
+    let mut stack = vec![start_i];
+    while let Some(i) = stack.pop() {
+        let insn = block.insns[i];
+        if !reachable.insert(insn.addr) {
+            continue;
+        }
+        let next = (i + 1 < block.insns.len()).then_some(i + 1);
+        match insn.flow {
+            Flow::Return | Flow::JmpIndirect => {}
+            Flow::Jmp(t) => match idx.get(&t) {
+                Some(&j) => stack.push(j),
+                None => external.push((insn.addr, t, "jmp")),
+            },
+            Flow::Branch(t) => {
+                match idx.get(&t) {
+                    Some(&j) => stack.push(j),
+                    None => external.push((insn.addr, t, "jmp")),
+                }
+                if let Some(n) = next {
+                    stack.push(n);
+                }
+            }
+            Flow::Call(t) => {
+                external.push((insn.addr, t, "call"));
+                if let Some(n) = next {
+                    stack.push(n);
+                }
+            }
+            Flow::CallIndirect | Flow::Fallthrough => {
+                if let Some(n) = next {
+                    stack.push(n);
+                }
+            }
+        }
+    }
+    Some(FnWalk {
+        reachable,
+        external,
+    })
 }
 
 /// The first address token in `lm m <module>` output is the module's live start
@@ -236,9 +331,10 @@ struct Report {
 }
 
 /// Walks the call/branch graph from `from`, running `uf(arg)` for each discovered
-/// function, until `target` is found among some function's instructions, the graph
-/// is exhausted, or a bound is hit. `uf` returns the raw `uf <arg>` text or `None`
-/// (bad address / forwarded export / disassembly failure) to prune that branch.
+/// function and an intra-function control-flow walk ([`walk_function`]) within each,
+/// until `target` is found among the reachable instructions, the graph is exhausted,
+/// or a bound is hit. `uf` returns the raw `uf <arg>` text or `None` (bad address /
+/// forwarded export / disassembly failure) to prune that branch.
 fn reachability(
     from: &str,
     target: u64,
@@ -246,7 +342,10 @@ fn reachability(
     max_depth: usize,
     mut uf: impl FnMut(&str) -> Option<String>,
 ) -> Report {
-    let mut visited: HashSet<u64> = HashSet::new(); // function entries already uf'd
+    // If `from` is a bare address it may point *inside* a function (a handler scoped
+    // past a switch); start the intra-function walk there rather than at the entry.
+    let seed_start = parse_u64(from).ok();
+    let mut visited: HashSet<u64> = HashSet::new(); // walk start addresses already done
     let mut enqueued: HashSet<u64> = HashSet::new(); // target tokens scheduled
     // child token -> (caller token (None = seed), call site, kind).
     let mut parent: HashMap<u64, (Option<u64>, u64, &'static str)> = HashMap::new();
@@ -278,8 +377,19 @@ fn reachability(
         let Some(entry) = block.entry else {
             continue;
         };
-        if !visited.insert(entry) {
-            continue; // this function was already explored (dedupe cycles)
+        // Enter discovered functions at their call/jmp target (`token`); enter the
+        // seed at its resolved address, or the entry if `from` was a symbol. Fall back
+        // to the entry if the requested address isn't an instruction boundary.
+        let desired = token.or(seed_start).unwrap_or(entry);
+        let (start_used, walk) = match walk_function(&block, desired) {
+            Some(w) => (desired, w),
+            None => (
+                entry,
+                walk_function(&block, entry).expect("entry is always an instruction"),
+            ),
+        };
+        if !visited.insert(start_used) {
+            continue; // this (function, start) was already explored (dedupe cycles)
         }
         if token.is_none() {
             rpt.from_entry = Some(entry);
@@ -287,32 +397,20 @@ fn reachability(
         rpt.funcs_explored += 1;
         rpt.max_depth_seen = rpt.max_depth_seen.max(depth);
 
-        if block.instrs.iter().any(|&i| i == target) {
+        if walk.reachable.contains(&target) {
             rpt.verdict_reachable = true;
             rpt.containing_fn = Some(entry);
             rpt.path = reconstruct(&parent, token);
             return rpt;
         }
 
-        let in_func: HashSet<u64> = block.instrs.iter().copied().collect();
-        let mut schedule =
-            |site: u64,
-             t: u64,
-             kind: &'static str,
-             q: &mut VecDeque<(String, Option<u64>, usize)>| {
-                if enqueued.insert(t) {
-                    parent.insert(t, (token, site, kind));
-                    q.push_back((format!("0x{t:x}"), Some(t), depth + 1));
-                }
-            };
-        for &(site, t) in &block.calls {
-            schedule(site, t, "call", &mut queue);
-        }
-        // Follow only jmp/branch targets that LEAVE this function (tail calls,
-        // cross-function jumps). Intra-function branches are already inside this `uf`.
-        for &(site, t) in block.jmps.iter().chain(block.branches.iter()) {
-            if !in_func.contains(&t) {
-                schedule(site, t, "jmp", &mut queue);
+        // Schedule edges that leave this function, gathered only from instructions
+        // actually reachable from the start (so a mid-function start can't pull in
+        // calls from unrelated switch cases).
+        for (site, t, kind) in walk.external {
+            if enqueued.insert(t) {
+                parent.insert(t, (token, site, kind));
+                queue.push_back((format!("0x{t:x}"), Some(t), depth + 1));
             }
         }
     }
@@ -1083,7 +1181,12 @@ impl WindbgServer {
                 // Resolve the target VA: an absolute address, or module+RVA rebased
                 // against the module's live base from `lm m <module>`.
                 let target = match (&args.address, &args.module, &args.rva) {
-                    (Some(a), _, _) => parse_u64(a)?,
+                    // Reject conflicting target forms rather than silently ignoring one —
+                    // analysing the wrong target would give a misleading verdict.
+                    (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+                        return Err("provide `address` OR `module`+`rva`, not both".to_string());
+                    }
+                    (Some(a), None, None) => parse_u64(a)?,
                     (None, Some(m), Some(r)) => {
                         let rva = parse_u64(r)?;
                         let lm = e.execute_command(&format!("lm m {m}")).map_err(es)?;
@@ -1275,9 +1378,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_uf_classifies_targets_and_skips_indirect() {
-        // A function with a direct call, a conditional branch, an unconditional jmp,
-        // and a memory-indirect call (which must NOT be recorded as a direct target).
+    fn parse_uf_classifies_flow_and_skips_indirect() {
+        // A function with a direct call, a conditional branch, a memory-indirect call
+        // (which must classify as CallIndirect, not a resolved target), an unconditional
+        // jmp, and a ret.
         let text = "\
 mydriver!Dispatch:
 fffff803`3e254750 4c8bdc          mov     r11,rsp
@@ -1290,12 +1394,20 @@ fffff803`3e254770 c3              ret
 ";
         let b = parse_uf(text);
         assert_eq!(b.entry, Some(0xfffff803_3e254750));
-        assert_eq!(b.instrs.len(), 7); // 7 instruction lines; the label line is not one
-        assert_eq!(b.calls, vec![(0xfffff803_3e254758, 0xfffff803_3e2547f0)]);
-        assert_eq!(b.branches, vec![(0xfffff803_3e25475f, 0xfffff803_3e2547a6)]);
-        assert_eq!(b.jmps, vec![(0xfffff803_3e25476b, 0xfffff803_3e254830)]);
-        // The `call qword ptr [..]` line contributed an instruction but no direct call.
-        assert!(!b.calls.iter().any(|&(_, t)| t == 0xfffff803_3e260000));
+        assert_eq!(b.insns.len(), 7); // 7 instruction lines; the label line is not one
+        let flows: Vec<Flow> = b.insns.iter().map(|i| i.flow).collect();
+        assert_eq!(
+            flows,
+            vec![
+                Flow::Fallthrough,                 // mov
+                Flow::Call(0xfffff803_3e2547f0),   // direct call
+                Flow::Fallthrough,                 // test
+                Flow::Branch(0xfffff803_3e2547a6), // jne
+                Flow::CallIndirect,                // call qword ptr [..]
+                Flow::Jmp(0xfffff803_3e254830),    // jmp
+                Flow::Return,                      // ret
+            ]
+        );
     }
 
     #[test]
@@ -1463,5 +1575,42 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         assert!(!r.verdict_reachable);
         assert!(r.bound_hit);
         assert_eq!(r.funcs_explored, 1);
+    }
+
+    #[test]
+    fn reachability_scopes_from_mid_function_start() {
+        // A single dispatch function: the entry does an indirect jump-table `jmp`
+        // (which we don't follow), then two independent switch-case blocks. `uf` of
+        // any address returns the whole function, so a mid-function `from` must NOT
+        // treat the *other* case as reachable.
+        let dispatch = format!(
+            "Dispatch:\n\
+             {} 90 nop\n\
+             {} ff2500000000 jmp qword ptr [Dispatch!tbl ({})]\n\
+             {} 90 nop\n\
+             {} c3 ret\n\
+             {} 90 nop\n\
+             {} c3 ret\n",
+            fmt_addr(0x1000), // entry
+            fmt_addr(0x1004), // indirect jump-table switch
+            fmt_addr(0x9000), // (table pointer address, not a code target)
+            fmt_addr(0x1008), // case 1 block
+            fmt_addr(0x100c), // case 1 body (target A)
+            fmt_addr(0x1010), // case 2 block
+            fmt_addr(0x1014), // case 2 body (target B)
+        );
+        // `uf` of any address in the function returns the whole function. `&mut uf`
+        // implements FnMut, so the same disassembler can drive several walks.
+        let mut uf = |a: &str| match a {
+            "0x1008" | "0x1000" => Some(dispatch.clone()),
+            _ => None,
+        };
+
+        // Starting inside case 1, case 1's own body IS reachable.
+        assert!(reachability("0x1008", 0x100c, 256, 32, &mut uf).verdict_reachable);
+        // ...but case 2's body is NOT reachable from case 1 (no intra-function path).
+        assert!(!reachability("0x1008", 0x1014, 256, 32, &mut uf).verdict_reachable);
+        // From the entry, the switch cases are unreachable — the jump table isn't followed.
+        assert!(!reachability("0x1000", 0x1008, 256, 32, &mut uf).verdict_reachable);
     }
 }
