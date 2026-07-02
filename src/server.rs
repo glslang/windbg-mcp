@@ -311,6 +311,15 @@ fn parse_lm_base(text: &str) -> Option<u64> {
         .find_map(|l| l.split_whitespace().next().and_then(parse_windbg_addr))
 }
 
+/// Parses the value from WinDbg `?` (evaluate-expression) output, e.g.
+/// "Evaluate expression: 18446735277667370832 = fffff803`3e254750" — the address
+/// is the hex token after the `=`. Used to resolve a symbolic/backtick `from` (like
+/// `mydriver!Dispatch+0x123`) to the numeric VA the intra-function walk starts at.
+fn parse_eval(text: &str) -> Option<u64> {
+    let rhs = text.split('=').nth(1)?;
+    parse_windbg_addr(rhs.split_whitespace().next()?)
+}
+
 /// Outcome of a reachability walk. `verdict_reachable` is sound (a concrete static
 /// path exists); a false verdict is best-effort within the explored bounds.
 struct Report {
@@ -335,16 +344,20 @@ struct Report {
 /// until `target` is found among the reachable instructions, the graph is exhausted,
 /// or a bound is hit. `uf` returns the raw `uf <arg>` text or `None` (bad address /
 /// forwarded export / disassembly failure) to prune that branch.
+///
+/// `seed_start` is the resolved numeric VA of `from` (the caller resolves symbols /
+/// backtick / `module!sym+off` forms). When it points *inside* the seed function — a
+/// handler scoped past a switch — the intra-function walk begins there, not at the
+/// entry, so sibling switch cases aren't spuriously reachable. `None` (unresolvable)
+/// falls back to the function entry.
 fn reachability(
     from: &str,
+    seed_start: Option<u64>,
     target: u64,
     max_functions: usize,
     max_depth: usize,
     mut uf: impl FnMut(&str) -> Option<String>,
 ) -> Report {
-    // If `from` is a bare address it may point *inside* a function (a handler scoped
-    // past a switch); start the intra-function walk there rather than at the entry.
-    let seed_start = parse_u64(from).ok();
     let mut visited: HashSet<u64> = HashSet::new(); // walk start addresses already done
     let mut enqueued: HashSet<u64> = HashSet::new(); // target tokens scheduled
     // child token -> (caller token (None = seed), call site, kind).
@@ -1204,15 +1217,37 @@ impl WindbgServer {
                 let max_functions = args.max_functions.unwrap_or(256);
                 let max_depth = args.max_depth.unwrap_or(32);
 
-                let rpt = reachability(&args.from, target, max_functions, max_depth, |arg| {
-                    // A real `uf` lists backtick addresses or at least a "module!Func:"
-                    // label; error text ("Couldn't resolve...", "no code") lacks both
-                    // and prunes the branch. parse_uf then discards any non-disassembly.
-                    match e.execute_command(&format!("uf {arg}")) {
-                        Ok(t) if t.contains('`') || t.contains(':') => Some(t),
-                        _ => None,
-                    }
-                });
+                // Resolve `from` to a numeric VA so a mid-function start (a handler
+                // scoped past a switch) is honored even in WinDbg's own forms: a plain
+                // number, a `hi`lo` backtick address, or a `module!sym+off` expression
+                // evaluated via `?`. If it can't be resolved the walk starts at the
+                // function entry.
+                let seed_start = parse_u64(&args.from)
+                    .ok()
+                    .or_else(|| parse_windbg_addr(&args.from))
+                    .or_else(|| {
+                        e.execute_command(&format!("? {}", args.from))
+                            .ok()
+                            .as_deref()
+                            .and_then(parse_eval)
+                    });
+
+                let rpt = reachability(
+                    &args.from,
+                    seed_start,
+                    target,
+                    max_functions,
+                    max_depth,
+                    |arg| {
+                        // A real `uf` lists backtick addresses or at least a "module!Func:"
+                        // label; error text ("Couldn't resolve...", "no code") lacks both
+                        // and prunes the branch. parse_uf then discards any non-disassembly.
+                        match e.execute_command(&format!("uf {arg}")) {
+                            Ok(t) if t.contains('`') || t.contains(':') => Some(t),
+                            _ => None,
+                        }
+                    },
+                );
 
                 if rpt.from_entry.is_none() {
                     return Err(format!(
@@ -1421,6 +1456,21 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         assert_eq!(parse_lm_base("Unable to enumerate modules\n"), None);
     }
 
+    #[test]
+    fn parse_eval_reads_expression_value() {
+        // `? mydriver!Dispatch+0x123` → the address is the hex after the `=`.
+        assert_eq!(
+            parse_eval("Evaluate expression: 18446735277667370832 = fffff803`3e254750"),
+            Some(0xfffff803_3e254750)
+        );
+        assert_eq!(
+            parse_eval("Evaluate expression: 4096 = 00000000`00001000"),
+            Some(0x1000)
+        );
+        // A failed evaluation ("Couldn't resolve error ...") has no `=`/address.
+        assert_eq!(parse_eval("Couldn't resolve error at 'bogus'"), None);
+    }
+
     // ---- reachability: graph walk -----------------------------------------
 
     /// Builds a `uf` block whose entry is `entry`, with the given follow-on lines
@@ -1453,7 +1503,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             "0x2000".to_string(),
             uf_fn("B", 0x2000, &[&format!("{} c3 ret", fmt_addr(0x2008))]),
         );
-        let r = reachability("start", 0x2008, 256, 32, |a| m.get(a).cloned());
+        let r = reachability("start", None, 0x2008, 256, 32, |a| m.get(a).cloned());
         assert!(r.verdict_reachable);
         assert_eq!(r.from_entry, Some(0x1000));
         assert_eq!(r.containing_fn, Some(0x2000));
@@ -1479,7 +1529,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             "0x2000".to_string(),
             uf_fn("B", 0x2000, &[&format!("{} c3 ret", fmt_addr(0x2008))]),
         );
-        let r = reachability("start", 0x2008, 256, 32, |a| m.get(a).cloned());
+        let r = reachability("start", None, 0x2008, 256, 32, |a| m.get(a).cloned());
         assert!(r.verdict_reachable);
         assert_eq!(r.path, vec![(0x1004, "jmp", 0x2000)]);
     }
@@ -1491,7 +1541,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             "start".to_string(),
             uf_fn("A", 0x1000, &[&format!("{} c3 ret", fmt_addr(0x1004))]),
         );
-        let r = reachability("start", 0x1004, 256, 32, |a| m.get(a).cloned());
+        let r = reachability("start", None, 0x1004, 256, 32, |a| m.get(a).cloned());
         assert!(r.verdict_reachable);
         assert_eq!(r.containing_fn, Some(0x1000));
         assert!(r.path.is_empty());
@@ -1513,7 +1563,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             ),
         );
         // The target sits behind the indirect call, which is never followed.
-        let r = reachability("start", 0x2008, 256, 32, |a| m.get(a).cloned());
+        let r = reachability("start", None, 0x2008, 256, 32, |a| m.get(a).cloned());
         assert!(!r.verdict_reachable);
         assert!(!r.bound_hit); // graph exhausted, not a bound
     }
@@ -1546,7 +1596,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             ),
         );
         // Target is absent — the A<->B cycle must not loop forever.
-        let r = reachability("start", 0x7777, 256, 32, |a| m.get(a).cloned());
+        let r = reachability("start", None, 0x7777, 256, 32, |a| m.get(a).cloned());
         assert!(!r.verdict_reachable);
         assert_eq!(r.funcs_explored, 2);
     }
@@ -1571,7 +1621,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             uf_fn("B", 0x2000, &[&format!("{} c3 ret", fmt_addr(0x2004))]),
         );
         // Bound to a single function: B (which contains the target) is never explored.
-        let r = reachability("start", 0x2004, 1, 32, |a| m.get(a).cloned());
+        let r = reachability("start", None, 0x2004, 1, 32, |a| m.get(a).cloned());
         assert!(!r.verdict_reachable);
         assert!(r.bound_hit);
         assert_eq!(r.funcs_explored, 1);
@@ -1606,11 +1656,11 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             _ => None,
         };
 
-        // Starting inside case 1, case 1's own body IS reachable.
-        assert!(reachability("0x1008", 0x100c, 256, 32, &mut uf).verdict_reachable);
+        // Starting inside case 1 (seed_start resolved to 0x1008), case 1's body IS reachable.
+        assert!(reachability("0x1008", Some(0x1008), 0x100c, 256, 32, &mut uf).verdict_reachable);
         // ...but case 2's body is NOT reachable from case 1 (no intra-function path).
-        assert!(!reachability("0x1008", 0x1014, 256, 32, &mut uf).verdict_reachable);
+        assert!(!reachability("0x1008", Some(0x1008), 0x1014, 256, 32, &mut uf).verdict_reachable);
         // From the entry, the switch cases are unreachable — the jump table isn't followed.
-        assert!(!reachability("0x1000", 0x1008, 256, 32, &mut uf).verdict_reachable);
+        assert!(!reachability("0x1000", Some(0x1000), 0x1008, 256, 32, &mut uf).verdict_reachable);
     }
 }
