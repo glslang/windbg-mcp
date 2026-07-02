@@ -1218,19 +1218,19 @@ impl WindbgServer {
                 let max_depth = args.max_depth.unwrap_or(32);
 
                 // Resolve `from` to a numeric VA so a mid-function start (a handler
-                // scoped past a switch) is honored even in WinDbg's own forms: a plain
-                // number, a `hi`lo` backtick address, or a `module!sym+off` expression
-                // evaluated via `?`. If it can't be resolved the walk starts at the
-                // function entry.
-                let seed_start = parse_u64(&args.from)
+                // scoped past a switch) is honored. Evaluate via `?` first so the seed is
+                // read *exactly* as `uf` reads the same string — the MASM evaluator's
+                // default base is hex, so a digit-only WinDbg address like `00401234` is
+                // 0x00401234 (not decimal), and `module!Dispatch+0x123` resolves too. Fall
+                // back to pure parsing (backtick / bare-hex, then `0x`/decimal) only if `?`
+                // is unavailable; if nothing resolves, the walk starts at the entry.
+                let seed_start = e
+                    .execute_command(&format!("? {}", args.from))
                     .ok()
+                    .as_deref()
+                    .and_then(parse_eval)
                     .or_else(|| parse_windbg_addr(&args.from))
-                    .or_else(|| {
-                        e.execute_command(&format!("? {}", args.from))
-                            .ok()
-                            .as_deref()
-                            .and_then(parse_eval)
-                    });
+                    .or_else(|| parse_u64(&args.from).ok());
 
                 let rpt = reachability(
                     &args.from,
