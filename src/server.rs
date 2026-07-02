@@ -174,6 +174,9 @@ enum Flow {
     Branch(u64),
     /// `ret`/`iret`: flow stops.
     Return,
+    /// A `noreturn` trap — `int 29h` (`__fastfail`/stack-cookie failure), `int 3`,
+    /// `ud2`, `hlt`: execution stops, so the walk must not fall through it.
+    Trap,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -209,6 +212,10 @@ fn classify_flow(line: &str, mnem: &str) -> Flow {
     } else if mnem.starts_with('j') {
         // A conditional branch; a jcc without a resolvable rel target just falls through.
         target.map_or(Flow::Fallthrough, Flow::Branch)
+    } else if mnem == "ud2" || mnem == "hlt" || mnem == "int" || mnem == "int3" || mnem == "int1" {
+        // `noreturn` traps: `int 29h`/`int 3` (WinDbg emits mnemonic `int` + operand),
+        // a single `int3` token, `ud2`, `hlt`. Execution stops here.
+        Flow::Trap
     } else {
         Flow::Fallthrough
     }
@@ -270,7 +277,7 @@ fn walk_function(block: &UfBlock, start: u64) -> Option<FnWalk> {
         }
         let next = (i + 1 < block.insns.len()).then_some(i + 1);
         match insn.flow {
-            Flow::Return | Flow::JmpIndirect => {}
+            Flow::Return | Flow::JmpIndirect | Flow::Trap => {}
             Flow::Jmp(t) => match idx.get(&t) {
                 Some(&j) => stack.push(j),
                 None => external.push((insn.addr, t, "jmp")),
@@ -1671,5 +1678,41 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         assert!(!reachability("0x1008", Some(0x1008), 0x1014, 256, 32, &mut uf).verdict_reachable);
         // From the entry, the switch cases are unreachable — the jump table isn't followed.
         assert!(!reachability("0x1000", Some(0x1000), 0x1008, 256, 32, &mut uf).verdict_reachable);
+    }
+
+    #[test]
+    fn parse_uf_classifies_traps() {
+        // WinDbg emits `int 29h` / `int 3` as mnemonic `int` + operand; plus `ud2`/`hlt`.
+        let text = "\
+mydriver!Guard:
+fffff803`3e254750 cd29            int     29h
+fffff803`3e254752 0f0b            ud2
+fffff803`3e254754 f4              hlt
+fffff803`3e254755 cc              int     3
+";
+        let flows: Vec<Flow> = parse_uf(text).insns.iter().map(|i| i.flow).collect();
+        assert_eq!(flows, vec![Flow::Trap, Flow::Trap, Flow::Trap, Flow::Trap]);
+    }
+
+    #[test]
+    fn reachability_stops_at_trap() {
+        // A function: entry, a call, then `int 29h` (fastfail, noreturn), then a block
+        // that is reachable ONLY by falling through the trap. It must not be reachable.
+        let func = format!(
+            "Guard:\n\
+             {} 90 nop\n\
+             {} cd29 int 29h\n\
+             {} 90 nop\n\
+             {} c3 ret\n",
+            fmt_addr(0x1000), // entry
+            fmt_addr(0x1004), // int 29h — execution stops here
+            fmt_addr(0x1006), // dead code, only reachable by falling through the trap
+            fmt_addr(0x1007),
+        );
+        let mut uf = |a: &str| (a == "0x1000").then(|| func.clone());
+        // The entry (before the trap) is reachable...
+        assert!(reachability("0x1000", Some(0x1000), 0x1000, 256, 32, &mut uf).verdict_reachable);
+        // ...but code after the trap is not (the walk stops at `int 29h`).
+        assert!(!reachability("0x1000", Some(0x1000), 0x1006, 256, 32, &mut uf).verdict_reachable);
     }
 }
