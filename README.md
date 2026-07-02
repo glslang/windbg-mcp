@@ -169,7 +169,7 @@ gh attestation verify <zip> --repo glslang/windbg-mcp `
 | Control | `go`, `step_over`, `step_into`, `set_breakpoint` |
 | TTD nav | `step_back` (`t-`), `step_over_back` (`p-`), `reverse_go` (`g-`), `goto_position` (`!tt`) |
 | TTD analysis | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
-| Driver IOCTL | `decode_ioctl`, `driver_object`, `device_object`, `irp_stack`, `ioctl_trace` |
+| Driver IOCTL | `decode_ioctl`, `driver_object`, `device_object`, `irp_stack`, `ioctl_trace`, `reachable_from_dispatch` |
 | Raw     | `execute` — run any debugger command, returns full text output |
 
 The forward (`go`/`step_over`/`step_into`) and reverse (`reverse_go`/`step_over_back`/`step_back`)
@@ -195,6 +195,12 @@ timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressio
   can hit `0xD000010A` (that PID is a transient launcher) — attach to a classic Win32 process.
 - `read_memory` takes a numeric/`0x`-hex address only; for register/symbol expressions use
   `execute` with `db`/`dd` (e.g. `db @rip`).
+- `reachable_from_dispatch` is a **static** call-graph walk over `uf` disassembly: it follows
+  direct calls and cross-function tail jumps but **not** indirect calls through function pointers
+  or unresolved compiler jump tables. So a `REACHABLE` verdict is sound (a concrete static path
+  exists, and the path is reported), while `NOT REACHABLE` is best-effort within the explored
+  bounds. If the dispatch uses a `switch(IoControlCode)` jump table (common), pass the specific
+  handler VA as `from` to scope past it, or confirm dynamically with a breakpoint + `go`.
 - **Crash-dump triage uses `!ext.analyze -v`**, not `!analyze` — the bundled engine only resolves
   the module-qualified form (see *Bundling the WinDbg engine*). On a **partial minidump**, reads of
   pages that weren't captured raise `An unexpected exception was raised (0x80040205)` rather than a
