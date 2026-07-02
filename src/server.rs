@@ -642,15 +642,17 @@ pub struct ReachabilityArgs {
     /// "fffff8033e254750"). Recover it via `driver_object` (MajorFunction[0x0e]). Pass
     /// a specific handler VA instead to scope the walk past a jump-table switch.
     pub from: String,
-    /// Target code block as an absolute virtual address (decimal or 0x-hex). Provide
-    /// this OR `module`+`rva`, not both.
+    /// Target code block as an absolute virtual address, in any WinDbg form — a bare
+    /// value is hex (e.g. "fffff803`3e254750" or "00401234"), and "0x"-hex or a symbol
+    /// also work. Provide this OR `module`+`rva`, not both.
     #[serde(default)]
     pub address: Option<String>,
     /// Module name for a module+RVA target, e.g. "mydriver". Its live base is read from
     /// `lm m <module>` and added to `rva`. Required (with `rva`) when `address` is omitted.
     #[serde(default)]
     pub module: Option<String>,
-    /// Relative virtual address (decimal or 0x-hex) added to `module`'s live base.
+    /// Relative virtual address added to `module`'s live base, in WinDbg form (a bare
+    /// value is hex; "0x"-hex also works).
     #[serde(default)]
     pub rva: Option<String>,
     /// Max distinct functions to disassemble before giving up (default 256). Bounds runtime.
@@ -1191,6 +1193,22 @@ impl WindbgServer {
         let out = self
             .engine
             .run(move |e| {
+                // Resolve an address/offset expression the way `uf`/WinDbg read it:
+                // evaluate `? <expr>` first (the MASM evaluator's default base is hex, so
+                // a bare `00401234` is 0x00401234 and `module!Dispatch+0x123` resolves),
+                // then fall back to pure parsing (backtick / bare-hex, then `0x`/decimal).
+                // Applied to both the target VA and the `from` seed so a value pasted from
+                // WinDbg — a `hi`lo` backtick address or a digit-only 32-bit address — is
+                // read consistently on both sides.
+                let resolve = |expr: &str| -> Option<u64> {
+                    e.execute_command(&format!("? {expr}"))
+                        .ok()
+                        .as_deref()
+                        .and_then(parse_eval)
+                        .or_else(|| parse_windbg_addr(expr))
+                        .or_else(|| parse_u64(expr).ok())
+                };
+
                 // Resolve the target VA: an absolute address, or module+RVA rebased
                 // against the module's live base from `lm m <module>`.
                 let target = match (&args.address, &args.module, &args.rva) {
@@ -1199,9 +1217,11 @@ impl WindbgServer {
                     (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
                         return Err("provide `address` OR `module`+`rva`, not both".to_string());
                     }
-                    (Some(a), None, None) => parse_u64(a)?,
+                    (Some(a), None, None) => resolve(a)
+                        .ok_or_else(|| format!("could not resolve target address `{a}`"))?,
                     (None, Some(m), Some(r)) => {
-                        let rva = parse_u64(r)?;
+                        let rva =
+                            resolve(r).ok_or_else(|| format!("could not resolve rva `{r}`"))?;
                         let lm = e.execute_command(&format!("lm m {m}")).map_err(es)?;
                         let base = parse_lm_base(&lm).ok_or_else(|| {
                             format!("module `{m}` not found (`lm m {m}` returned):\n{lm}")
@@ -1217,20 +1237,9 @@ impl WindbgServer {
                 let max_functions = args.max_functions.unwrap_or(256);
                 let max_depth = args.max_depth.unwrap_or(32);
 
-                // Resolve `from` to a numeric VA so a mid-function start (a handler
-                // scoped past a switch) is honored. Evaluate via `?` first so the seed is
-                // read *exactly* as `uf` reads the same string — the MASM evaluator's
-                // default base is hex, so a digit-only WinDbg address like `00401234` is
-                // 0x00401234 (not decimal), and `module!Dispatch+0x123` resolves too. Fall
-                // back to pure parsing (backtick / bare-hex, then `0x`/decimal) only if `?`
-                // is unavailable; if nothing resolves, the walk starts at the entry.
-                let seed_start = e
-                    .execute_command(&format!("? {}", args.from))
-                    .ok()
-                    .as_deref()
-                    .and_then(parse_eval)
-                    .or_else(|| parse_windbg_addr(&args.from))
-                    .or_else(|| parse_u64(&args.from).ok());
+                // Resolve `from` to a numeric VA so a mid-function start (a handler scoped
+                // past a switch) is honored; `None` (unresolvable) starts at the entry.
+                let seed_start = resolve(&args.from);
 
                 let rpt = reachability(
                     &args.from,
