@@ -13,6 +13,8 @@ use rmcp::model::{CallToolResult, Content};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use win_kexp::dbgeng::RunToOutcome;
+
 use crate::engine::EngineHandle;
 use crate::ttd;
 
@@ -516,6 +518,440 @@ fn format_report(r: &Report) -> String {
     out
 }
 
+// ---- Directional path recipe (which input keeps control on the path) ------
+//
+// A REACHABLE verdict proves a static path exists, but not *which way* each on-path
+// conditional branch must go, nor *what* it tests. `path_recipe` walks the same `uf`
+// disassembly a second time (engine-free, like the walk above) and, for every function
+// on the reported call path, records the on-path branches with the direction required
+// to stay on the path plus a best-effort decode of the compare feeding each one. It is
+// heuristic: operands are text-parsed from `uf`, and the field mapping holds only when
+// the memory base is the current IO_STACK_LOCATION pointer.
+
+/// Which way an on-path conditional branch must go to keep control heading to the goal.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Direction {
+    /// The branch must be taken (control goes to the `jcc` target).
+    Taken,
+    /// The branch must fall through (control goes to the next instruction).
+    Fallthrough,
+    /// Either successor still reaches the goal — this branch does not gate the path.
+    Either,
+}
+
+/// The IO_STACK_LOCATION field a predicate's memory operand likely reads, inferred from
+/// its displacement — the offsets `ioctl_trace` encodes (`+0x18`/`+0x10`/`+0x08`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum IoField {
+    IoControlCode,
+    InputBufferLength,
+    OutputBufferLength,
+}
+
+impl IoField {
+    fn name(self) -> &'static str {
+        match self {
+            IoField::IoControlCode => "IoControlCode",
+            IoField::InputBufferLength => "InputBufferLength",
+            IoField::OutputBufferLength => "OutputBufferLength",
+        }
+    }
+}
+
+/// A best-effort decode of the flag-setting instruction feeding an on-path branch.
+#[derive(Debug, Clone, PartialEq)]
+struct Predicate {
+    /// Raw `uf` text of the compare (e.g. "cmp dword ptr [rdx+18h],222003h").
+    raw: String,
+    /// Heuristic mapping of the memory operand's displacement to an IO_STACK_LOCATION field.
+    field: Option<IoField>,
+    /// Immediate the compare tests against, when it has a trailing hex immediate.
+    value: Option<u64>,
+    /// Relation that holds in the required direction (e.g. "==", ">="), when derivable.
+    relation: Option<&'static str>,
+}
+
+/// One on-path conditional branch and what it requires.
+#[derive(Debug, Clone, PartialEq)]
+struct BranchStep {
+    /// Address of the `jcc`.
+    site: u64,
+    /// The `jcc` mnemonic (je/jne/jae/...), for rendering.
+    jcc: String,
+    /// Direction required to stay on the path to the goal.
+    required: Direction,
+    /// Decoded predicate (the flag-setting compare), when one was found.
+    predicate: Option<Predicate>,
+}
+
+/// The recipe for one function on the call path: the branch decisions between where the
+/// function is entered and where control leaves it toward the target.
+#[derive(Debug, Clone, PartialEq)]
+struct SegmentRecipe {
+    /// Entry (or mid-function start) the segment's walk begins at.
+    start: u64,
+    /// Address the segment routes to: the call/jmp site to the next hop, or the target.
+    goal: u64,
+    /// On-path conditional branches, in path order (includes `Either` steps).
+    steps: Vec<BranchStep>,
+}
+
+/// Maps each instruction address to its mnemonic+operands text (address and raw-bytes
+/// columns dropped). Mirrors [`parse_uf`]'s tokenization so the recipe can read operands
+/// `parse_uf` discards.
+fn uf_text_map(text: &str) -> HashMap<u64, String> {
+    let mut m = HashMap::new();
+    for line in text.lines() {
+        let mut toks = line.split_whitespace();
+        let Some(addr) = toks.next().and_then(parse_windbg_addr) else {
+            continue;
+        };
+        let _bytes = toks.next(); // raw opcode-bytes column
+        let rest: Vec<&str> = toks.collect();
+        if !rest.is_empty() {
+            m.insert(addr, rest.join(" "));
+        }
+    }
+    m
+}
+
+/// Instructions that set flags a following `jcc` reads.
+fn is_flag_setter(mnem: &str) -> bool {
+    matches!(
+        mnem,
+        "cmp"
+            | "test"
+            | "sub"
+            | "add"
+            | "and"
+            | "or"
+            | "xor"
+            | "inc"
+            | "dec"
+            | "neg"
+            | "bt"
+            | "cmpxchg"
+            | "shl"
+            | "shr"
+            | "sar"
+            | "sal"
+    )
+}
+
+/// Parses a WinDbg immediate token: `0x22`, `222003h`, or a plain hex run containing a
+/// digit (so a register mnemonic like `eax`/`rcx`/`ah` is rejected). `None` otherwise.
+fn parse_imm(tok: &str) -> Option<u64> {
+    let t = tok
+        .trim()
+        .trim_matches(|c| c == ',' || c == '(' || c == ')');
+    let hex = if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        h
+    } else if let Some(h) = t.strip_suffix('h').or_else(|| t.strip_suffix('H')) {
+        h
+    } else {
+        t
+    };
+    if !hex.is_empty()
+        && hex.chars().all(|c| c.is_ascii_hexdigit())
+        && hex.chars().any(|c| c.is_ascii_digit())
+    {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        None
+    }
+}
+
+/// Heuristically maps the displacement in a memory operand (`[reg+18h]`) to an
+/// IO_STACK_LOCATION field, using the offsets `ioctl_trace` encodes.
+fn field_from_operands(raw: &str) -> Option<IoField> {
+    let open = raw.find('[')?;
+    let close = raw[open..].find(']')? + open;
+    let inside = &raw[open + 1..close];
+    let plus = inside.rfind('+')?;
+    match parse_imm(&inside[plus + 1..])? {
+        0x18 => Some(IoField::IoControlCode),
+        0x10 => Some(IoField::InputBufferLength),
+        0x08 => Some(IoField::OutputBufferLength),
+        _ => None,
+    }
+}
+
+/// The immediate a compare tests against — its last comma-separated operand.
+fn predicate_value(raw: &str) -> Option<u64> {
+    parse_imm(raw.rsplit(',').next()?)
+}
+
+/// The relation that holds when a `jcc` goes the given direction, for the common
+/// signed/unsigned conditionals. `None` for branches we don't model.
+fn branch_relation(jcc: &str, taken: bool) -> Option<&'static str> {
+    let (t, f) = match jcc {
+        "je" | "jz" => ("==", "!="),
+        "jne" | "jnz" => ("!=", "=="),
+        "jae" | "jnb" | "jnc" => (">=", "<"),
+        "jb" | "jnae" | "jc" => ("<", ">="),
+        "ja" | "jnbe" => (">", "<="),
+        "jbe" | "jna" => ("<=", ">"),
+        "jge" | "jnl" => (">=", "<"),
+        "jl" | "jnge" => ("<", ">="),
+        "jg" | "jnle" => (">", "<="),
+        "jle" | "jng" => ("<=", ">"),
+        _ => return None,
+    };
+    Some(if taken { t } else { f })
+}
+
+/// Finds one intra-function path from `start` to `goal`, returning the on-path
+/// conditional-branch decisions `(branch addr, took_taken)` in path order, or `None` if
+/// `goal` is not reachable within the function. Follows the same edges as
+/// [`walk_function`]; a global visited-set bounds it and guarantees termination.
+fn find_path(
+    block: &UfBlock,
+    idx: &HashMap<u64, usize>,
+    start: u64,
+    goal: u64,
+) -> Option<Vec<(u64, bool)>> {
+    fn dfs(
+        block: &UfBlock,
+        idx: &HashMap<u64, usize>,
+        i: usize,
+        goal: u64,
+        visited: &mut HashSet<usize>,
+        acc: &mut Vec<(u64, bool)>,
+    ) -> bool {
+        let insn = block.insns[i];
+        if insn.addr == goal {
+            return true;
+        }
+        if !visited.insert(i) {
+            return false;
+        }
+        let next = (i + 1 < block.insns.len()).then_some(i + 1);
+        match insn.flow {
+            Flow::Return | Flow::JmpIndirect | Flow::Trap => false,
+            Flow::Jmp(t) => match idx.get(&t) {
+                Some(&j) => dfs(block, idx, j, goal, visited, acc),
+                None => false,
+            },
+            Flow::Branch(t) => {
+                if let Some(&j) = idx.get(&t) {
+                    acc.push((insn.addr, true));
+                    if dfs(block, idx, j, goal, visited, acc) {
+                        return true;
+                    }
+                    acc.pop();
+                }
+                if let Some(n) = next {
+                    acc.push((insn.addr, false));
+                    if dfs(block, idx, n, goal, visited, acc) {
+                        return true;
+                    }
+                    acc.pop();
+                }
+                false
+            }
+            Flow::Call(_) | Flow::CallIndirect | Flow::Fallthrough => match next {
+                Some(n) => dfs(block, idx, n, goal, visited, acc),
+                None => false,
+            },
+        }
+    }
+    let start_i = *idx.get(&start)?;
+    let mut visited = HashSet::new();
+    let mut acc = Vec::new();
+    dfs(block, idx, start_i, goal, &mut visited, &mut acc).then_some(acc)
+}
+
+/// Classifies one on-path branch decision into a [`BranchStep`]: whether the direction
+/// is forced (the other successor cannot reach `goal`) or don't-care, plus the decoded
+/// predicate for a forced branch.
+fn branch_step(
+    block: &UfBlock,
+    idx: &HashMap<u64, usize>,
+    textmap: &HashMap<u64, String>,
+    site: u64,
+    took_taken: bool,
+    goal: u64,
+) -> BranchStep {
+    let bi = idx[&site];
+    let taken_target = match block.insns[bi].flow {
+        Flow::Branch(t) => Some(t),
+        _ => None,
+    };
+    let fall_addr = (bi + 1 < block.insns.len()).then(|| block.insns[bi + 1].addr);
+    let other = if took_taken { fall_addr } else { taken_target };
+    let other_reaches = other
+        .and_then(|a| walk_function(block, a))
+        .is_some_and(|w| w.reachable.contains(&goal));
+    let required = if other_reaches {
+        Direction::Either
+    } else if took_taken {
+        Direction::Taken
+    } else {
+        Direction::Fallthrough
+    };
+    let jcc = textmap
+        .get(&site)
+        .and_then(|t| t.split_whitespace().next())
+        .unwrap_or("jcc")
+        .to_string();
+    let predicate = (required != Direction::Either)
+        .then(|| decode_predicate(block, textmap, bi, &jcc, took_taken))
+        .flatten();
+    BranchStep {
+        site,
+        jcc,
+        required,
+        predicate,
+    }
+}
+
+/// Finds the nearest flag-setting instruction preceding the branch at index `bi` (within
+/// a small window) and decodes it into a [`Predicate`].
+fn decode_predicate(
+    block: &UfBlock,
+    textmap: &HashMap<u64, String>,
+    bi: usize,
+    jcc: &str,
+    took_taken: bool,
+) -> Option<Predicate> {
+    for k in (bi.saturating_sub(6)..bi).rev() {
+        let Some(raw) = textmap.get(&block.insns[k].addr) else {
+            continue;
+        };
+        let Some(mnem) = raw.split_whitespace().next() else {
+            continue;
+        };
+        if is_flag_setter(mnem) {
+            return Some(Predicate {
+                raw: raw.clone(),
+                field: field_from_operands(raw),
+                value: predicate_value(raw),
+                relation: branch_relation(jcc, took_taken),
+            });
+        }
+    }
+    None
+}
+
+/// Builds the directional path recipe for a REACHABLE [`Report`]: one [`SegmentRecipe`]
+/// per function on the call path, re-disassembling each with `uf` (a handful of calls) and
+/// recording the on-path branch decisions. `from` disassembles the seed function (a symbol
+/// still resolves); later functions enter their callee by address. `seed_start` scopes the
+/// seed segment to a mid-function start when set.
+fn path_recipe(
+    from: &str,
+    seed_start: Option<u64>,
+    rpt: &Report,
+    mut uf: impl FnMut(&str) -> Option<String>,
+) -> Vec<SegmentRecipe> {
+    let Some(from_entry) = rpt.from_entry else {
+        return Vec::new();
+    };
+    // (uf arg, requested start, goal) per function on the path.
+    let mut segs: Vec<(String, u64, u64)> = Vec::new();
+    let from_start = seed_start.unwrap_or(from_entry);
+    if rpt.path.is_empty() {
+        segs.push((from.to_string(), from_start, rpt.target));
+    } else {
+        segs.push((from.to_string(), from_start, rpt.path[0].0));
+        for (i, hop) in rpt.path.iter().enumerate() {
+            let callee = hop.2;
+            let goal = rpt.path.get(i + 1).map_or(rpt.target, |h| h.0);
+            segs.push((format!("0x{callee:x}"), callee, goal));
+        }
+    }
+
+    let mut recipes = Vec::new();
+    for (arg, want_start, goal) in segs {
+        let Some(text) = uf(&arg) else { continue };
+        let block = parse_uf(&text);
+        let idx: HashMap<u64, usize> = block
+            .insns
+            .iter()
+            .enumerate()
+            .map(|(i, x)| (x.addr, i))
+            .collect();
+        // Fall back to the function entry if the requested start isn't a boundary
+        // (mirrors `reachability`'s handling of an unaligned seed).
+        let start = if idx.contains_key(&want_start) {
+            want_start
+        } else {
+            block.entry.unwrap_or(want_start)
+        };
+        let textmap = uf_text_map(&text);
+        let steps = find_path(&block, &idx, start, goal)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(site, took)| branch_step(&block, &idx, &textmap, site, took, goal))
+            .collect();
+        recipes.push(SegmentRecipe { start, goal, steps });
+    }
+    recipes
+}
+
+/// Renders the path recipe, appended after [`format_report`] on a REACHABLE verdict.
+fn format_recipe(recipes: &[SegmentRecipe]) -> String {
+    let mut out = String::new();
+    out.push_str("\nPath recipe (input that keeps control on the path to the target)\n");
+    out.push_str(
+        "  Note: the IOCTL dispatch switch is an indirect jump table the static walk does\n",
+    );
+    out.push_str(
+        "        not follow — pass the handler VA as `from`. Its IoControlCode is implied\n",
+    );
+    out.push_str(
+        "        by that choice, not by the branches below. Field mappings are heuristic.\n",
+    );
+    for (n, seg) in recipes.iter().enumerate() {
+        out.push_str(&format!(
+            "  Segment {}: {} -> {}\n",
+            n + 1,
+            fmt_addr(seg.start),
+            fmt_addr(seg.goal)
+        ));
+        let gating: Vec<&BranchStep> = seg
+            .steps
+            .iter()
+            .filter(|s| s.required != Direction::Either)
+            .collect();
+        if gating.is_empty() {
+            out.push_str("    (no gating branches — straight-line to the goal)\n");
+            continue;
+        }
+        for s in gating {
+            let dir = match s.required {
+                Direction::Taken => "take",
+                Direction::Fallthrough => "fall through",
+                Direction::Either => continue,
+            };
+            out.push_str(&format!(
+                "    {}  {} — must {}",
+                fmt_addr(s.site),
+                s.jcc,
+                dir
+            ));
+            if let Some(p) = &s.predicate {
+                out.push_str(&format!("   ; {}", p.raw));
+                match (p.field, p.value, p.relation) {
+                    (Some(f), Some(v), Some(rel)) => {
+                        out.push_str(&format!("   (likely {} {rel} 0x{v:x})", f.name()))
+                    }
+                    (Some(f), Some(v), None) => {
+                        out.push_str(&format!("   (likely {} == 0x{v:x})", f.name()))
+                    }
+                    (Some(f), None, _) => out.push_str(&format!("   (likely {})", f.name())),
+                    (None, Some(v), Some(rel)) => {
+                        out.push_str(&format!("   (tests {rel} 0x{v:x})"))
+                    }
+                    _ => {}
+                }
+            }
+            out.push('\n');
+        }
+    }
+    out
+}
+
 // ---- Tool parameter types ------------------------------------------------
 
 #[derive(Deserialize, JsonSchema)]
@@ -668,6 +1104,23 @@ pub struct ReachabilityArgs {
     /// Max call-graph depth to explore from `from` (default 32).
     #[serde(default)]
     pub max_depth: Option<usize>,
+    /// Emit a "Path recipe" on a REACHABLE verdict: the on-path branch directions and a
+    /// best-effort decode of the compares that gate them (default true). Set false for
+    /// the bare verdict + call path.
+    #[serde(default)]
+    pub recipe: Option<bool>,
+}
+
+/// Address to run the target to, for `run_to_address`.
+#[derive(Deserialize, JsonSchema)]
+pub struct RunToAddressArgs {
+    /// Address, symbol, or expression to run until (any WinDbg form — a bare value is
+    /// hex, "0x"-hex and symbols also work). Typically a block from `reachable_from_dispatch`.
+    pub address: String,
+    /// How long to wait for the target to reach `address` before reporting a timeout
+    /// (milliseconds). Defaults to the standard execution wait.
+    #[serde(default)]
+    pub timeout_ms: Option<u32>,
 }
 
 // ---- Tools ---------------------------------------------------------------
@@ -991,6 +1444,60 @@ impl WindbgServer {
         text_result(out)
     }
 
+    /// Run the target until it reaches `address` (a one-shot `g <addr>` that doesn't
+    /// disturb existing breakpoints) and report a structured verdict: HIT (reached it),
+    /// STOPPED ELSEWHERE (another breakpoint/exception fired first), or TIMEOUT (not
+    /// reached in time). Confirms *live* that the current input/state drives execution to
+    /// a block — e.g. one from `reachable_from_dispatch`. Needs a real KDNET/VM kernel
+    /// target (a local kernel can't set code breakpoints).
+    #[rmcp::tool]
+    async fn run_to_address(
+        &self,
+        Parameters(args): Parameters<RunToAddressArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .engine
+            .run(move |e| {
+                // Resolve the target the same WinDbg-aware way as `reachable_from_dispatch`.
+                let resolve = |expr: &str| -> Option<u64> {
+                    e.execute_command(&format!("? {expr}"))
+                        .ok()
+                        .as_deref()
+                        .and_then(parse_eval)
+                        .or_else(|| parse_windbg_addr(expr))
+                        .or_else(|| parse_u64(expr).ok())
+                };
+                let target = resolve(&args.address)
+                    .ok_or_else(|| format!("could not resolve address `{}`", args.address))?;
+                let wait = args.timeout_ms.unwrap_or(EXEC_WAIT_MS);
+
+                let res = e.run_to_address(target, wait).map_err(es)?;
+                let mut msg = match res.outcome {
+                    RunToOutcome::Hit => {
+                        format!("VERDICT: HIT — execution reached {}\n", fmt_addr(target))
+                    }
+                    RunToOutcome::StoppedElsewhere { stopped_at } => format!(
+                        "VERDICT: STOPPED ELSEWHERE — stopped at {} before reaching {}\n  \
+                         (another breakpoint or exception fired first)\n",
+                        fmt_addr(stopped_at),
+                        fmt_addr(target)
+                    ),
+                    RunToOutcome::Timeout => format!(
+                        "VERDICT: TIMEOUT — did not reach {} within {wait} ms\n  \
+                         (the current input/state likely does not drive execution to this block)\n",
+                        fmt_addr(target)
+                    ),
+                };
+                if !res.output.trim().is_empty() {
+                    msg.push_str("---- debugger output ----\n");
+                    msg.push_str(&res.output);
+                }
+                Ok(msg)
+            })
+            .await?;
+        text_result(out)
+    }
+
     /// Step over one source/instruction step (`p`).
     #[rmcp::tool]
     async fn step_over(&self) -> Result<CallToolResult, ErrorData> {
@@ -1248,21 +1755,22 @@ impl WindbgServer {
                 // past a switch) is honored; `None` (unresolvable) starts at the entry.
                 let seed_start = resolve(&args.from);
 
+                // A real `uf` lists backtick addresses or at least a "module!Func:" label;
+                // error text ("Couldn't resolve...", "no code") lacks both and prunes the
+                // branch. parse_uf then discards any non-disassembly. Held in a `&mut`
+                // binding so the same disassembler drives both the walk and the recipe.
+                let mut uf = |arg: &str| match e.execute_command(&format!("uf {arg}")) {
+                    Ok(t) if t.contains('`') || t.contains(':') => Some(t),
+                    _ => None,
+                };
+
                 let rpt = reachability(
                     &args.from,
                     seed_start,
                     target,
                     max_functions,
                     max_depth,
-                    |arg| {
-                        // A real `uf` lists backtick addresses or at least a "module!Func:"
-                        // label; error text ("Couldn't resolve...", "no code") lacks both
-                        // and prunes the branch. parse_uf then discards any non-disassembly.
-                        match e.execute_command(&format!("uf {arg}")) {
-                            Ok(t) if t.contains('`') || t.contains(':') => Some(t),
-                            _ => None,
-                        }
-                    },
+                    &mut uf,
                 );
 
                 if rpt.from_entry.is_none() {
@@ -1272,7 +1780,15 @@ impl WindbgServer {
                         args.from
                     ));
                 }
-                Ok(format_report(&rpt))
+
+                // On a REACHABLE verdict, re-walk the path functions to emit the directional
+                // recipe (which branch each on-path `jcc` must take, and what it tests).
+                let mut out = format_report(&rpt);
+                if rpt.verdict_reachable && args.recipe.unwrap_or(true) {
+                    let recipes = path_recipe(&args.from, seed_start, &rpt, &mut uf);
+                    out.push_str(&format_recipe(&recipes));
+                }
+                Ok(out)
             })
             .await?;
         text_result(out)
@@ -1289,8 +1805,10 @@ with record_trace (needs elevation). For driver IOCTL work: decode_ioctl (decode
 and device_object (walk the driver/device tree and security), irp_stack (dump an IRP's IO_STACK_LOCATION), \
 ioctl_trace (log every dispatched IOCTL), and reachable_from_dispatch (statically test, via a bounded \
 uf-based call-graph walk, whether a code block — by address or module+RVA — is reachable from the IOCTL \
-dispatch routine; REACHABLE is sound, NOT REACHABLE is best-effort). Use `execute` for any raw command not \
-covered by a dedicated tool."
+dispatch routine; REACHABLE is sound, NOT REACHABLE is best-effort, and a REACHABLE verdict includes a \
+directional path recipe of the on-path branch conditions). Confirm a static verdict live with \
+run_to_address (run to a block on a KDNET/VM kernel target and report HIT/STOPPED ELSEWHERE/TIMEOUT). \
+Use `execute` for any raw command not covered by a dedicated tool."
 )]
 impl rmcp::ServerHandler for WindbgServer {}
 
@@ -1714,5 +2232,149 @@ fffff803`3e254755 cc              int     3
         assert!(reachability("0x1000", Some(0x1000), 0x1000, 256, 32, &mut uf).verdict_reachable);
         // ...but code after the trap is not (the walk stops at `int 29h`).
         assert!(!reachability("0x1000", Some(0x1000), 0x1006, 256, 32, &mut uf).verdict_reachable);
+    }
+
+    // ---- reachability: path recipe ----------------------------------------
+
+    #[test]
+    fn recipe_forced_direction_decodes_ioctl_predicate() {
+        // Handler: `cmp [rdx+18h],222003h; jne bail`. The target block is the jne
+        // fall-through, so the branch is forced to fall through, and the compare decodes
+        // to `IoControlCode == 0x222003` (displacement +0x18, the IO_STACK_LOCATION offset).
+        let mut m: HashMap<String, String> = HashMap::new();
+        m.insert(
+            "Handler".to_string(),
+            uf_fn(
+                "Handler",
+                0x1000,
+                &[
+                    &format!("{} 813a cmp dword ptr [rdx+18h],222003h", fmt_addr(0x1004)),
+                    &format!(
+                        "{} 7506 jne Handler+0x10 ({})",
+                        fmt_addr(0x1008),
+                        fmt_addr(0x1010)
+                    ),
+                    &format!("{} 90 nop", fmt_addr(0x100c)), // target: jne fall-through
+                    &format!("{} c3 ret", fmt_addr(0x100e)),
+                    &format!("{} c3 ret", fmt_addr(0x1010)), // bail: jne taken
+                ],
+            ),
+        );
+        let rpt = reachability("Handler", Some(0x1000), 0x100c, 256, 32, |a| {
+            m.get(a).cloned()
+        });
+        assert!(rpt.verdict_reachable);
+
+        let recipes = path_recipe("Handler", Some(0x1000), &rpt, |a| m.get(a).cloned());
+        assert_eq!(recipes.len(), 1);
+        assert_eq!(recipes[0].start, 0x1000);
+        assert_eq!(recipes[0].goal, 0x100c);
+        assert_eq!(recipes[0].steps.len(), 1);
+        let step = &recipes[0].steps[0];
+        assert_eq!(step.site, 0x1008);
+        assert_eq!(step.jcc, "jne");
+        assert_eq!(step.required, Direction::Fallthrough);
+        let p = step.predicate.as_ref().expect("predicate decoded");
+        assert_eq!(p.field, Some(IoField::IoControlCode));
+        assert_eq!(p.value, Some(0x222003));
+        assert_eq!(p.relation, Some("==")); // jne, fall-through ⇒ equality holds
+
+        let rendered = format_recipe(&recipes);
+        assert!(rendered.contains("IoControlCode == 0x222003"), "{rendered}");
+        assert!(rendered.contains("must fall through"), "{rendered}");
+    }
+
+    #[test]
+    fn recipe_dont_care_branch_is_either() {
+        // Both successors of the `je` reach the goal (the taken edge jumps straight to it;
+        // the fall-through falls into it), so the branch does not gate the path.
+        let mut m: HashMap<String, String> = HashMap::new();
+        m.insert(
+            "Merge".to_string(),
+            uf_fn(
+                "Merge",
+                0x1000,
+                &[
+                    &format!("{} 85c0 test eax,eax", fmt_addr(0x1004)),
+                    &format!(
+                        "{} 7404 je Merge+0x10 ({})",
+                        fmt_addr(0x1008),
+                        fmt_addr(0x1010)
+                    ),
+                    &format!("{} 90 nop", fmt_addr(0x100c)), // fall-through, then into 0x1010
+                    &format!("{} 90 nop", fmt_addr(0x1010)), // goal (also the je target)
+                    &format!("{} c3 ret", fmt_addr(0x1012)),
+                ],
+            ),
+        );
+        let rpt = reachability("Merge", Some(0x1000), 0x1010, 256, 32, |a| {
+            m.get(a).cloned()
+        });
+        assert!(rpt.verdict_reachable);
+
+        let recipes = path_recipe("Merge", Some(0x1000), &rpt, |a| m.get(a).cloned());
+        assert_eq!(recipes.len(), 1);
+        assert_eq!(recipes[0].steps.len(), 1);
+        assert_eq!(recipes[0].steps[0].required, Direction::Either);
+        assert!(recipes[0].steps[0].predicate.is_none()); // no predicate for a don't-care branch
+
+        // A recipe with only don't-care branches renders as straight-line.
+        assert!(format_recipe(&recipes).contains("no gating branches"));
+    }
+
+    #[test]
+    fn recipe_spans_call_path_with_one_segment_per_function() {
+        // A (length gate) calls B (field gate) which contains the target. The recipe has
+        // one segment per function, each routing to the next hop's site / the target.
+        let mut m: HashMap<String, String> = HashMap::new();
+        m.insert(
+            "start".to_string(),
+            uf_fn(
+                "A",
+                0x1000,
+                &[
+                    &format!("{} 817a10 cmp dword ptr [rdx+10h],20h", fmt_addr(0x1004)),
+                    &format!("{} 7208 jb A+0x14 ({})", fmt_addr(0x1008), fmt_addr(0x1014)),
+                    &format!("{} e8xx call A!B ({})", fmt_addr(0x100c), fmt_addr(0x2000)),
+                    &format!("{} c3 ret", fmt_addr(0x1011)),
+                    &format!("{} c3 ret", fmt_addr(0x1014)), // bail: jb taken
+                ],
+            ),
+        );
+        m.insert(
+            "0x2000".to_string(),
+            uf_fn(
+                "B",
+                0x2000,
+                &[
+                    &format!("{} 803808 cmp byte ptr [rax+8h],1", fmt_addr(0x2004)),
+                    &format!(
+                        "{} 7506 jne B+0x10 ({})",
+                        fmt_addr(0x2008),
+                        fmt_addr(0x2010)
+                    ),
+                    &format!("{} 90 nop", fmt_addr(0x200c)), // target: jne fall-through
+                    &format!("{} c3 ret", fmt_addr(0x200e)),
+                    &format!("{} c3 ret", fmt_addr(0x2010)),
+                ],
+            ),
+        );
+        let rpt = reachability("start", None, 0x200c, 256, 32, |a| m.get(a).cloned());
+        assert!(rpt.verdict_reachable);
+        assert_eq!(rpt.path, vec![(0x100c, "call", 0x2000)]);
+
+        let recipes = path_recipe("start", None, &rpt, |a| m.get(a).cloned());
+        assert_eq!(recipes.len(), 2);
+        // Segment 1: A, routing from entry to the call site.
+        assert_eq!(recipes[0].start, 0x1000);
+        assert_eq!(recipes[0].goal, 0x100c);
+        let a_pred = recipes[0].steps[0].predicate.as_ref().expect("A predicate");
+        assert_eq!(a_pred.field, Some(IoField::InputBufferLength));
+        assert_eq!(a_pred.value, Some(0x20));
+        assert_eq!(recipes[0].steps[0].required, Direction::Fallthrough);
+        // Segment 2: B, routing from entry to the target.
+        assert_eq!(recipes[1].start, 0x2000);
+        assert_eq!(recipes[1].goal, 0x200c);
+        assert_eq!(recipes[1].steps[0].required, Direction::Fallthrough);
     }
 }
