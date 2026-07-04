@@ -16,9 +16,10 @@ in **all** exit paths (hit, stopped-elsewhere, timeout, error).
 
 - **Why deferred:** the interrupt + breakpoint-teardown semantics need a live KDNET/VM kernel target to
   validate; landing it blind risks a worse regression (hang, or clearing the caller's breakpoints).
-- **Picks up from:** win-kexp PR #62 review thread on `src/dbgeng.rs` (`run_to_address`, the `Timeout`
-  branch). A stale one-shot at `address` is currently harmless to this API's own flow (a later
-  `run_to`/`go` arms its own), so it is low-severity until an explicit rewrite is validated on hardware.
+- **Tracked as:** [glslang/win-kexp#63](https://github.com/glslang/win-kexp/issues/63) (picks up from
+  win-kexp PR #62's `src/dbgeng.rs` review thread on the `Timeout` branch). A stale one-shot at
+  `address` is currently harmless to this API's own flow (a later `run_to`/`go` arms its own), so it is
+  low-severity until an explicit rewrite is validated on hardware.
 
 ## 2. [win-kexp] Typed write primitives
 
