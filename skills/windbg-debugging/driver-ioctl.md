@@ -62,9 +62,35 @@ reads.
    DACL; it is not in the bundled engine, so otherwise inspect the SD by address. Inspect the
    symbolic link with `execute { "command": "!object \\GLOBAL??" }` for the *namespace* gate.
 
-> **No PDBs.** Third-party drivers ship no symbols, so `module!Dispatch` won't resolve —
-> everything is **address-based**. RVAs from static analysis must be **rebased to the live load
-> base** (`modules {}` / `lm m <driver>`) before use, because of ASLR.
+> **Symbols — ask for the PDB when it exists.** Production/third-party drivers usually ship no
+> PDB, so `module!Dispatch` won't resolve and you work **address-based** (rebase static RVAs to the
+> live load base — `modules {}` / `lm m <driver>` — because of ASLR). **But if the user built the
+> driver or has its PDB, symbols are available** and make everything readable. Find the exact PDB
+> the engine wants with `execute { "command": "!sym noisy; .reload /f <driver>.sys" }` (it prints
+> `<pdb>\<GUID>\…`), then **ask the user for the folder holding that PDB** — it must be on *this*
+> debugger host (symbols are never pulled from the target over the KD wire) — and apply it with
+> `set_symbol_path { "path": "<folder>", "reload": "/f <driver>.sys" }`. Names like
+> `HEVD!IrpDeviceIoCtlHandler` / `HEVD!ArbitraryWriteIoctlHandler` then resolve.
+
+## Static reachability — dispatch → handler (`reachable_from_dispatch`)
+
+Once you have the dispatch VA and a handler VA of interest, `reachable_from_dispatch { "from":
+"<dispatchVA-or-symbol>", "address": "<handlerVA>" }` runs a bounded control-flow walk and returns
+**REACHABLE** (with the call path) or **NOT REACHABLE** (within bounds). With `recipe: true`
+(default) it also emits the **on-path branch directions and the compare that gates each** — for the
+common MSVC binary-search `switch (IoControlCode)`, that recipe pins the **exact `IoControlCode`**
+routing to that handler. This is the fast way to answer "which IOCTL triggers handler X" and to
+prove a bug block is reachable from the dispatch entry.
+
+Then **confirm it live** (needs KDNET/VM): `run_to_address { "address": "<handlerVA>" }` runs the
+target and reports **HIT / STOPPED-ELSEWHERE / TIMEOUT** once a user-mode client sends that IOCTL —
+closing the static→dynamic loop without a scripted breakpoint.
+
+> `reachable_from_dispatch` does **not** follow indirect `call [ptr]`/`call reg` or unresolved jump
+> tables — REACHABLE is sound; NOT-REACHABLE only means "not found within bounds". For a jump-table
+> dispatch, pass the specific handler VA as `from` to scope past the switch. (Its boilerplate
+> "indirect jump table" note prints even when the dispatch is actually a direct compare chain it
+> *did* follow.)
 
 ## Static enumeration — Binary Ninja (optional escalation)
 
@@ -131,9 +157,12 @@ sweep requires a real **KDNET/VM** target via `attach_kernel`.
 
 Close the workflow with a written report so the result is reviewable. Keep it grounded in the
 tool output you gathered (cite the live addresses / DACL / codes — don't assert from memory). A
-worked end-to-end example is
-[`docs/driver-ioctl-walkthrough.md`](../../docs/driver-ioctl-walkthrough.md) (Mount Point
-Manager). Structure:
+worked end-to-end examples are
+[`docs/driver-ioctl-walkthrough.md`](../../docs/driver-ioctl-walkthrough.md) (Mount Point Manager —
+the four reachability gates on a built-in driver) and
+[`docs/hevd-ioctl-walkthrough.md`](../../docs/hevd-ioctl-walkthrough.md) (HEVD — a *service-loaded*
+third-party driver with a user PDB, `set_symbol_path`, and the `reachable_from_dispatch` /
+`run_to_address` loop). Structure:
 
 1. **Verdict up front** — one paragraph: which IOCTLs a standard user can reach, which are
    blocked and by which gate. State the target driver/device + build.
@@ -172,6 +201,13 @@ Save it under `docs/` (the repo's walkthrough convention) or hand it back inline
 - **`@rdx` holds the PIRP only at the dispatch *entry*** (x64 fastcall arg2). After any
   `step_over`/`step_into` the register is clobbered; read `irp_stack` before stepping, or pass an
   explicit IRP address.
+- **Caught the driver at *load*? Its dispatch table isn't populated yet.** For a driver that loads
+  after boot, `sxe ld:<drv>.sys` + `go` stops *before* `DriverEntry` runs, so `driver_object` shows
+  default handlers (or "is not a driver object"). Let `DriverEntry` finish first: compute the PE
+  entry point `? <base> + dwo(<base> + dwo(<base>+0x3c) + 0x28)`, `set_breakpoint` it and `go`; at
+  entry `@rcx` is the `DriverObject` and `poi(@rsp)` the return into `nt!PnpCallDriverEntry` —
+  breakpoint that return, `go`, and now `MajorFunction[0x0e]` (at `DriverObject+0xe0`) is the real
+  dispatch. (A driver already loaded when you attach needs none of this — just `driver_object`.)
 - **No PDBs → rebase.** Static RVAs are ASLR-relative; rebase to `lm m <driver>` before setting
   any breakpoint. See the symbol/elevation notes in [setup.md](setup.md) and
   [live-and-kernel.md](live-and-kernel.md).

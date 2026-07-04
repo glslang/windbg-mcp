@@ -1077,6 +1077,24 @@ pub struct DecodeIoctlArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct SymbolPathArgs {
+    /// Symbol search path to apply: a directory holding a module's PDB, a
+    /// `srv*downstream*server` spec, or a `;`-separated list. Point it at the folder
+    /// whose PDB matches the module's PDB GUID so `module!Symbol` names resolve. Must be
+    /// reachable from THIS (debugger) host — symbols are not pulled from the target over
+    /// the KD wire.
+    pub path: String,
+    /// Append to the existing path (default true) rather than replacing it. Appending
+    /// keeps the OS/`nt` symbol server already configured.
+    #[serde(default)]
+    pub append: Option<bool>,
+    /// Optional `.reload` argument applied after setting the path, e.g. "/f HEVD.sys" to
+    /// force-load one module's symbols. Omit to reload all deferred modules.
+    #[serde(default)]
+    pub reload: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct DriverObjectArgs {
     /// Driver object name, e.g. "mydriver" or "\\Driver\\mydriver".
     pub name: String,
@@ -1236,6 +1254,36 @@ impl WindbgServer {
                 // !drvobj/!devobj/!irp commands resolve (see attach_kernel_local). Best-effort.
                 let _ = e.execute_command(".load kdexts");
                 e.execute_command("vertarget").map_err(es)
+            })
+            .await?;
+        text_result(out)
+    }
+
+    /// Set or extend the symbol search path, then reload symbols, so `module!Symbol`
+    /// names resolve. Use it when a driver's PDB isn't on the default path: ask the user
+    /// for the folder holding the matching PDB (by GUID) and apply it here. The path must
+    /// be reachable from THIS (debugger) host — symbols are not fetched from the target
+    /// over the KD wire. Goes through the DbgEng API, so it avoids the `.sympath` command
+    /// quirk of swallowing the rest of the command line.
+    #[rmcp::tool]
+    async fn set_symbol_path(
+        &self,
+        Parameters(args): Parameters<SymbolPathArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let append = args.append.unwrap_or(true);
+        let out = self
+            .engine
+            .run(move |e| {
+                if append {
+                    e.append_symbol_path(&args.path).map_err(es)?;
+                } else {
+                    e.set_symbol_path(&args.path).map_err(es)?;
+                }
+                // Reload so the new path takes effect (default: all deferred modules).
+                e.reload_symbols(args.reload.as_deref().unwrap_or(""))
+                    .map_err(es)?;
+                // Echo the effective path so the caller can confirm what resolved.
+                e.execute_command(".sympath").map_err(es)
             })
             .await?;
         text_result(out)
