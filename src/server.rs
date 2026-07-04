@@ -847,22 +847,27 @@ fn path_recipe(
     let Some(from_entry) = rpt.from_entry else {
         return Vec::new();
     };
-    // (uf arg, requested start, goal) per function on the path.
-    let mut segs: Vec<(String, u64, u64)> = Vec::new();
+    // (uf arg, requested start, goal, goal_is_exit) per function on the path. `goal_is_exit`
+    // is true when the goal is a hop *site* (control leaves the function there) rather than
+    // the final target — used to capture a conditional exit branch (below).
+    let mut segs: Vec<(String, u64, u64, bool)> = Vec::new();
     let from_start = seed_start.unwrap_or(from_entry);
     if rpt.path.is_empty() {
-        segs.push((from.to_string(), from_start, rpt.target));
+        segs.push((from.to_string(), from_start, rpt.target, false));
     } else {
-        segs.push((from.to_string(), from_start, rpt.path[0].0));
+        segs.push((from.to_string(), from_start, rpt.path[0].0, true));
         for (i, hop) in rpt.path.iter().enumerate() {
             let callee = hop.2;
-            let goal = rpt.path.get(i + 1).map_or(rpt.target, |h| h.0);
-            segs.push((format!("0x{callee:x}"), callee, goal));
+            let (goal, is_exit) = rpt
+                .path
+                .get(i + 1)
+                .map_or((rpt.target, false), |h| (h.0, true));
+            segs.push((format!("0x{callee:x}"), callee, goal, is_exit));
         }
     }
 
     let mut recipes = Vec::new();
-    for (arg, want_start, goal) in segs {
+    for (arg, want_start, goal, goal_is_exit) in segs {
         let Some(text) = uf(&arg) else { continue };
         let block = parse_uf(&text);
         let idx: HashMap<u64, usize> = block
@@ -879,11 +884,32 @@ fn path_recipe(
             block.entry.unwrap_or(want_start)
         };
         let textmap = uf_text_map(&text);
-        let steps = find_path(&block, &idx, start, goal)
+        let mut steps: Vec<BranchStep> = find_path(&block, &idx, start, goal)
             .unwrap_or_default()
             .into_iter()
             .map(|(site, took)| branch_step(&block, &idx, &textmap, site, took, goal))
             .collect();
+        // When a function is left through a *conditional* branch to the next hop, the goal
+        // is that branch and `find_path` stops before recording its decision. Add it:
+        // reaching the callee means taking the branch. (A `call`/unconditional `jmp` exit
+        // gates nothing, so only `Flow::Branch` needs a step.)
+        if goal_is_exit
+            && let Some(&gi) = idx.get(&goal)
+            && matches!(block.insns[gi].flow, Flow::Branch(_))
+        {
+            let jcc = textmap
+                .get(&goal)
+                .and_then(|t| t.split_whitespace().next())
+                .unwrap_or("jcc")
+                .to_string();
+            let predicate = decode_predicate(&block, &textmap, gi, &jcc, true);
+            steps.push(BranchStep {
+                site: goal,
+                jcc,
+                required: Direction::Taken,
+                predicate,
+            });
+        }
         recipes.push(SegmentRecipe { start, goal, steps });
     }
     recipes
@@ -2376,5 +2402,52 @@ fffff803`3e254755 cc              int     3
         assert_eq!(recipes[1].start, 0x2000);
         assert_eq!(recipes[1].goal, 0x200c);
         assert_eq!(recipes[1].steps[0].required, Direction::Fallthrough);
+    }
+
+    #[test]
+    fn recipe_captures_conditional_branch_that_exits_the_function() {
+        // A leaves to B via `jne B` — a conditional branch whose target is outside A's
+        // block. The hop site is the branch itself, so the recipe must record "take this
+        // branch" (taking it is what leaves A toward B), not stop short of it.
+        let mut m: HashMap<String, String> = HashMap::new();
+        m.insert(
+            "start".to_string(),
+            uf_fn(
+                "A",
+                0x1000,
+                &[
+                    &format!("{} 813a cmp dword ptr [rdx+18h],222003h", fmt_addr(0x1004)),
+                    &format!("{} 7506 jne B ({})", fmt_addr(0x1008), fmt_addr(0x2000)), // exits A
+                    &format!("{} c3 ret", fmt_addr(0x100c)),
+                ],
+            ),
+        );
+        m.insert(
+            "0x2000".to_string(),
+            uf_fn(
+                "B",
+                0x2000,
+                &[
+                    &format!("{} 90 nop", fmt_addr(0x2004)), // target
+                    &format!("{} c3 ret", fmt_addr(0x2006)),
+                ],
+            ),
+        );
+        let rpt = reachability("start", None, 0x2004, 256, 32, |a| m.get(a).cloned());
+        assert!(rpt.verdict_reachable);
+        assert_eq!(rpt.path, vec![(0x1008, "jmp", 0x2000)]);
+
+        let recipes = path_recipe("start", None, &rpt, |a| m.get(a).cloned());
+        assert_eq!(recipes.len(), 2);
+        // Segment 1 (A): the exit branch is captured as a required "take" with its predicate.
+        assert_eq!(recipes[0].steps.len(), 1);
+        let exit = &recipes[0].steps[0];
+        assert_eq!(exit.site, 0x1008);
+        assert_eq!(exit.jcc, "jne");
+        assert_eq!(exit.required, Direction::Taken);
+        let p = exit.predicate.as_ref().expect("exit predicate decoded");
+        assert_eq!(p.field, Some(IoField::IoControlCode));
+        assert_eq!(p.value, Some(0x222003));
+        assert_eq!(p.relation, Some("!=")); // jne taken ⇒ inequality leaves toward B
     }
 }
