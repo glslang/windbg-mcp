@@ -54,7 +54,7 @@ execute { "command": "? 0xfffff80011820000 + dwo(0xfffff80011820000 + dwo(0xffff
 //   → fffff800`118aa140
 set_breakpoint { "expression": "0xfffff800118aa140" }
 go {}   // at entry: @rcx = DriverObject, poi(@rsp) = return into nt!PnpCallDriverEntry
-set_breakpoint { "expression": "<poi(@rsp)>" }   // e.g. 0xfffff8007cab3ff0
+set_breakpoint { "expression": "poi(@rsp)" }   // WinDbg evaluates it; here → 0xfffff8007cab3ff0
 go {}   // DriverEntry has now run; the MajorFunction table is populated
 ```
 
