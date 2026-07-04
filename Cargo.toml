@@ -4,9 +4,7 @@ version = "0.1.3"
 edition = "2024"
 
 [dependencies]
-# Temporarily tracks the run_to_address feature branch until it merges to win-kexp main;
-# move back to `branch = "main"` (and bump the pin) once both PRs land.
-win-kexp = { git = "https://github.com/glslang/win-kexp", branch = "feature/run-to-address" }
+win-kexp = { git = "https://github.com/glslang/win-kexp", branch = "main" }
 rmcp = { version = "1", features = ["server", "transport-io", "macros", "schemars"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync", "time"] }
 serde = { version = "1", features = ["derive"] }
