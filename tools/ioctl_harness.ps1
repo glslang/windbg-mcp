@@ -81,6 +81,14 @@ function ConvertFrom-HexString([string] $s) {
 $ioctl = if ($Code -match '^(0x|0X)') { [Convert]::ToUInt32($Code, 16) } else { [uint32] $Code }
 $inBytes = ConvertFrom-HexString $InputHex
 $inLength = if ($InLen -ge 0) { [uint32] $InLen } else { [uint32] $inBytes.Length }
+# When -InLen exceeds the supplied bytes (the documented pattern for satisfying an
+# `InputBufferLength >= N` gate), zero-pad the buffer so DeviceIoControl never reads past
+# the managed array (which would send garbage or fault).
+if ($inLength -gt $inBytes.Length) {
+    $padded = New-Object byte[] $inLength
+    [Array]::Copy($inBytes, $padded, $inBytes.Length)
+    $inBytes = $padded
+}
 $outLength = [uint32] $OutLen
 $outBytes = if ($outLength -gt 0) { New-Object byte[] $outLength } else { $null }
 
