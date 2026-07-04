@@ -528,15 +528,16 @@ fn format_report(r: &Report) -> String {
 // heuristic: operands are text-parsed from `uf`, and the field mapping holds only when
 // the memory base is the current IO_STACK_LOCATION pointer.
 
-/// Which way an on-path conditional branch must go to keep control heading to the goal.
+/// Which way an on-path conditional branch must go to keep control on the reconstructed
+/// path to the goal. This is the concrete direction taken by the found path — a sound
+/// *sufficient* condition. (An alternate successor may also reach the goal, but usually via
+/// its own further conditions, so it is not reported as "don't care".)
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Direction {
     /// The branch must be taken (control goes to the `jcc` target).
     Taken,
     /// The branch must fall through (control goes to the next instruction).
     Fallthrough,
-    /// Either successor still reaches the goal — this branch does not gate the path.
-    Either,
 }
 
 /// The IO_STACK_LOCATION field a predicate's memory operand likely reads, inferred from
@@ -569,6 +570,10 @@ struct Predicate {
     value: Option<u64>,
     /// Relation that holds in the required direction (e.g. "==", ">="), when derivable.
     relation: Option<&'static str>,
+    /// True when the setter is bitwise (`test`/`and`): the condition is `(field & value)
+    /// relation 0`, not `field relation value`. Distinguishes `test x,m; jne` — which means
+    /// `(x & m) != 0` — from a `cmp`.
+    mask: bool,
 }
 
 /// One on-path conditional branch and what it requires.
@@ -761,30 +766,17 @@ fn find_path(
     dfs(block, idx, start_i, goal, &mut visited, &mut acc).then_some(acc)
 }
 
-/// Classifies one on-path branch decision into a [`BranchStep`]: whether the direction
-/// is forced (the other successor cannot reach `goal`) or don't-care, plus the decoded
-/// predicate for a forced branch.
+/// Classifies one on-path branch decision into a [`BranchStep`]: the concrete direction the
+/// path took plus the decoded predicate feeding it.
 fn branch_step(
     block: &UfBlock,
     idx: &HashMap<u64, usize>,
     textmap: &HashMap<u64, String>,
     site: u64,
     took_taken: bool,
-    goal: u64,
 ) -> BranchStep {
     let bi = idx[&site];
-    let taken_target = match block.insns[bi].flow {
-        Flow::Branch(t) => Some(t),
-        _ => None,
-    };
-    let fall_addr = (bi + 1 < block.insns.len()).then(|| block.insns[bi + 1].addr);
-    let other = if took_taken { fall_addr } else { taken_target };
-    let other_reaches = other
-        .and_then(|a| walk_function(block, a))
-        .is_some_and(|w| w.reachable.contains(&goal));
-    let required = if other_reaches {
-        Direction::Either
-    } else if took_taken {
+    let required = if took_taken {
         Direction::Taken
     } else {
         Direction::Fallthrough
@@ -794,9 +786,7 @@ fn branch_step(
         .and_then(|t| t.split_whitespace().next())
         .unwrap_or("jcc")
         .to_string();
-    let predicate = (required != Direction::Either)
-        .then(|| decode_predicate(block, textmap, bi, &jcc, took_taken))
-        .flatten();
+    let predicate = decode_predicate(block, textmap, bi, &jcc, took_taken);
     BranchStep {
         site,
         jcc,
@@ -806,7 +796,9 @@ fn branch_step(
 }
 
 /// Finds the nearest flag-setting instruction preceding the branch at index `bi` (within
-/// a small window) and decodes it into a [`Predicate`].
+/// a small window) and decodes it into a [`Predicate`]. A `cmp`/`sub` yields a comparison
+/// (`field relation value`); a `test`/`and` yields a bitwise mask test (`(field & value)
+/// relation 0`); other setters carry no relation (only the raw text is trustworthy).
 fn decode_predicate(
     block: &UfBlock,
     textmap: &HashMap<u64, String>,
@@ -822,11 +814,20 @@ fn decode_predicate(
             continue;
         };
         if is_flag_setter(mnem) {
+            let mask = matches!(mnem, "test" | "and");
+            // Only subtractive (`cmp`/`sub`) and bitwise (`test`/`and`) setters map cleanly
+            // to a `jcc` relation; for the rest, don't claim one (`raw` still shows the op).
+            let relation = if mask || matches!(mnem, "cmp" | "sub") {
+                branch_relation(jcc, took_taken)
+            } else {
+                None
+            };
             return Some(Predicate {
                 raw: raw.clone(),
                 field: field_from_operands(raw),
                 value: predicate_value(raw),
-                relation: branch_relation(jcc, took_taken),
+                relation,
+                mask,
             });
         }
     }
@@ -887,7 +888,7 @@ fn path_recipe(
         let mut steps: Vec<BranchStep> = find_path(&block, &idx, start, goal)
             .unwrap_or_default()
             .into_iter()
-            .map(|(site, took)| branch_step(&block, &idx, &textmap, site, took, goal))
+            .map(|(site, took)| branch_step(&block, &idx, &textmap, site, took))
             .collect();
         // When a function is left through a *conditional* branch to the next hop, the goal
         // is that branch and `find_path` stops before recording its decision. Add it:
@@ -915,6 +916,23 @@ fn path_recipe(
     recipes
 }
 
+/// Renders the annotation for a decoded [`Predicate`]. A bitwise (`test`/`and`) setter is
+/// rendered as a mask test `(field & value) relation 0`; a `cmp`/`sub` as `field relation
+/// value`; a setter with no derivable relation carries only the field hint (`raw` still shows
+/// the operation).
+fn render_predicate(p: &Predicate) -> String {
+    match (p.field, p.value, p.relation) {
+        (Some(f), Some(v), Some(rel)) if p.mask => {
+            format!("   (likely ({} & 0x{v:x}) {rel} 0)", f.name())
+        }
+        (Some(f), Some(v), Some(rel)) => format!("   (likely {} {rel} 0x{v:x})", f.name()),
+        (Some(f), _, _) => format!("   (likely {})", f.name()),
+        (None, Some(v), Some(rel)) if p.mask => format!("   (bits & 0x{v:x} {rel} 0)"),
+        (None, Some(v), Some(rel)) => format!("   (tests {rel} 0x{v:x})"),
+        _ => String::new(),
+    }
+}
+
 /// Renders the path recipe, appended after [`format_report`] on a REACHABLE verdict.
 fn format_recipe(recipes: &[SegmentRecipe]) -> String {
     let mut out = String::new();
@@ -935,20 +953,14 @@ fn format_recipe(recipes: &[SegmentRecipe]) -> String {
             fmt_addr(seg.start),
             fmt_addr(seg.goal)
         ));
-        let gating: Vec<&BranchStep> = seg
-            .steps
-            .iter()
-            .filter(|s| s.required != Direction::Either)
-            .collect();
-        if gating.is_empty() {
+        if seg.steps.is_empty() {
             out.push_str("    (no gating branches — straight-line to the goal)\n");
             continue;
         }
-        for s in gating {
+        for s in &seg.steps {
             let dir = match s.required {
                 Direction::Taken => "take",
                 Direction::Fallthrough => "fall through",
-                Direction::Either => continue,
             };
             out.push_str(&format!(
                 "    {}  {} — must {}",
@@ -958,19 +970,7 @@ fn format_recipe(recipes: &[SegmentRecipe]) -> String {
             ));
             if let Some(p) = &s.predicate {
                 out.push_str(&format!("   ; {}", p.raw));
-                match (p.field, p.value, p.relation) {
-                    (Some(f), Some(v), Some(rel)) => {
-                        out.push_str(&format!("   (likely {} {rel} 0x{v:x})", f.name()))
-                    }
-                    (Some(f), Some(v), None) => {
-                        out.push_str(&format!("   (likely {} == 0x{v:x})", f.name()))
-                    }
-                    (Some(f), None, _) => out.push_str(&format!("   (likely {})", f.name())),
-                    (None, Some(v), Some(rel)) => {
-                        out.push_str(&format!("   (tests {rel} 0x{v:x})"))
-                    }
-                    _ => {}
-                }
+                out.push_str(&render_predicate(p));
             }
             out.push('\n');
         }
@@ -2311,9 +2311,10 @@ fffff803`3e254755 cc              int     3
     }
 
     #[test]
-    fn recipe_dont_care_branch_is_either() {
-        // Both successors of the `je` reach the goal (the taken edge jumps straight to it;
-        // the fall-through falls into it), so the branch does not gate the path.
+    fn recipe_reports_concrete_direction_even_when_other_side_reaches() {
+        // Both successors of the `je` can reach the goal, but the recipe reports the concrete
+        // direction the path took (a sound sufficient condition) rather than "don't care" —
+        // an alternate successor usually reaches the goal only via its own conditions.
         let mut m: HashMap<String, String> = HashMap::new();
         m.insert(
             "Merge".to_string(),
@@ -2341,11 +2342,51 @@ fffff803`3e254755 cc              int     3
         let recipes = path_recipe("Merge", Some(0x1000), &rpt, |a| m.get(a).cloned());
         assert_eq!(recipes.len(), 1);
         assert_eq!(recipes[0].steps.len(), 1);
-        assert_eq!(recipes[0].steps[0].required, Direction::Either);
-        assert!(recipes[0].steps[0].predicate.is_none()); // no predicate for a don't-care branch
+        assert_eq!(recipes[0].steps[0].required, Direction::Taken);
+        assert!(format_recipe(&recipes).contains("must take"));
+    }
 
-        // A recipe with only don't-care branches renders as straight-line.
-        assert!(format_recipe(&recipes).contains("no gating branches"));
+    #[test]
+    fn recipe_bit_test_predicate_renders_as_mask() {
+        // `test [rdx+10h],20h; jne target` means `(InputBufferLength & 0x20) != 0`, not the
+        // `cmp`-style `!= 0x20` — the recipe must render the bitwise mask form.
+        let mut m: HashMap<String, String> = HashMap::new();
+        m.insert(
+            "Handler".to_string(),
+            uf_fn(
+                "Handler",
+                0x1000,
+                &[
+                    &format!("{} f742 test dword ptr [rdx+10h],20h", fmt_addr(0x1004)),
+                    &format!(
+                        "{} 7504 jne Handler+0x10 ({})",
+                        fmt_addr(0x1008),
+                        fmt_addr(0x1010)
+                    ),
+                    &format!("{} c3 ret", fmt_addr(0x100c)),
+                    &format!("{} 90 nop", fmt_addr(0x1010)), // target: jne taken
+                    &format!("{} c3 ret", fmt_addr(0x1012)),
+                ],
+            ),
+        );
+        let rpt = reachability("Handler", Some(0x1000), 0x1010, 256, 32, |a| {
+            m.get(a).cloned()
+        });
+        assert!(rpt.verdict_reachable);
+
+        let recipes = path_recipe("Handler", Some(0x1000), &rpt, |a| m.get(a).cloned());
+        let step = &recipes[0].steps[0];
+        assert_eq!(step.required, Direction::Taken);
+        let p = step.predicate.as_ref().expect("predicate decoded");
+        assert!(p.mask);
+        assert_eq!(p.field, Some(IoField::InputBufferLength));
+        assert_eq!(p.value, Some(0x20));
+        assert_eq!(p.relation, Some("!=")); // jne taken ⇒ bit set
+        assert!(
+            format_recipe(&recipes).contains("(InputBufferLength & 0x20) != 0"),
+            "{}",
+            format_recipe(&recipes)
+        );
     }
 
     #[test]
