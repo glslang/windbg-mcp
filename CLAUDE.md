@@ -29,8 +29,10 @@ To rebuild and load the new code without stopping the session:
    ```
    cargo build --release
    ```
-   This pulls the latest `win-kexp` `main` (per `Cargo.toml`) and writes a fresh
-   `target\release\windbg-mcp.exe`. The running server keeps executing the *old* code from the
+   This builds the `win-kexp` revision pinned in `Cargo.lock` and writes a fresh
+   `target\release\windbg-mcp.exe`. If this `windbg-mcp` change depends on a newly pushed
+   `win-kexp` commit, run `cargo update -p win-kexp` first and commit the resulting `Cargo.lock`
+   bump with the `windbg-mcp` change. The running server keeps executing the *old* code from the
    renamed `.stale` file until its connection is recycled.
 3. **Load the new binary** by reconnecting the server: `/mcp` → reconnect `windbg` (or restart
    Claude Code). Only after this reconnect do the windbg tools run the new code.
@@ -44,6 +46,9 @@ pulls it from GitHub, so **local edits to `C:\workspace\win-kexp` are invisible 
 build until they are pushed to `win-kexp` `main`** (then bump the pin / rebuild). Add new DbgEng
 primitives as typed `win-kexp` methods (returning `Result<_, DbgEngError>`, not `panic!`/`.expect`),
 not via the `execute` text hatch.
+
+After pushing a required `win-kexp` change to `main`, run `cargo update -p win-kexp` in this repo and
+commit the resulting `Cargo.lock` change before building or opening the dependent `windbg-mcp` PR.
 
 To compile-check a `windbg-mcp` change that depends on un-pushed `win-kexp` edits, add a temporary
 patch and `cargo check`, then revert it (do **not** commit it — it breaks CI/other contributors):
