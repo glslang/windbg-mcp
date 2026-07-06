@@ -27,7 +27,7 @@ jobs:
         # Pinned to a master-history SHA (per the action's README — toolchain
         # branch commits get force-pushed), so the toolchain comes from the
         # input, not the ref.
-        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # master
+        uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master
         with:
           toolchain: stable
           components: rustfmt, clippy
