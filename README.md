@@ -154,6 +154,15 @@ gh attestation verify <zip> --repo glslang/windbg-mcp `
   [`xusheng6/TTD_lab`](https://github.com/xusheng6/TTD_lab) `helloworld` sample: opening a `.run`,
   surveying events/threads, forward/reverse navigation, memory analysis, and counting `printf` calls
   with symbols (with the real outputs and the gotchas). It maps each tool to the lab's exercises.
+- [`docs/flareauthenticator-ttd-walkthrough.md`](docs/flareauthenticator-ttd-walkthrough.md) — a full
+  **TTD → Z3 solve** of an obfuscated Qt crackme (Flare-On 12 #8). Defeats an anti-analysis env guard,
+  records a wrong-guess run, and uses `ttd_calls`/`ttd_memory`/reverse-navigation to peel control-flow
+  flattening + computed calls + encrypted strings down to the exact check: a per-keystroke rolling hash
+  that reduces to a pure weighted sum. The 25 weights come from the replay, the 250 `g` values from
+  debugger function-evaluation, and Z3 finds a satisfying code — which reveals the flag (the code is
+  intentionally non-unique). Runnable solver in [`examples/flareauthenticator/`](examples/flareauthenticator/);
+  recorded terminal session in [`docs/flareauthenticator.cast`](docs/flareauthenticator.cast)
+  (`asciinema play`) — [rendered as a GIF](docs/flareauthenticator.gif) in the walkthrough.
 - [`docs/driver-ioctl-walkthrough.md`](docs/driver-ioctl-walkthrough.md) — enumerating a driver's IOCTL
   surface and deciding user-mode reachability on a live KDNET kernel: `driver_object`/`uf` to recover
   the `\Driver\mountmgr` dispatch switch, `decode_ioctl` for the access tiers, the device DACL parsed

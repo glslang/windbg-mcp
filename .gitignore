@@ -23,5 +23,9 @@ target
 # MCP scratch (JSON-RPC transcripts)
 *.jsonl
 
+# Node deps (examples/flareauthenticator Z3 solver)
+node_modules/
+package-lock.json
+
 # Local Claude Code config
 .claude/
