@@ -13,11 +13,18 @@ TTD positions are `major:minor` (a sequencing point and a step within it), not w
 ## 1. Get a trace
 
 - **Record** (Administrator, `TTD.exe` on `PATH`):
-  `record_trace { "out_dir": "C:\\traces", "target": "C:\\path\\app.exe arg" }`
+  `record_trace { "out_dir": "C:\\traces", "target": "C:\\path\\app.exe arg" }`.
+  If the target needs a specific environment or working directory to run — a Qt app's
+  `QT_QPA_PLATFORM_PLUGIN_PATH`, or an anti-analysis "run me from here" guard — pass
+  `"env": ["KEY=VALUE", …]` and/or `"working_dir": "C:\\path"`; they're applied to the
+  recorded target (the recorder inherits the server's env otherwise).
 - **Open** an existing trace:
   `open_trace { "path": "C:\\traces\\app01.run" }` — returns
-  `@$curprocess.TTD.Lifetime` (e.g. `[C:0, 124:8C2]`), confirming replay is live and giving
-  the position span. If the index is stale, `index_trace {}` (`!tt.index`).
+  `@$curprocess.TTD.Lifetime` (e.g. `[C:0, 124:8C2]`), confirming replay is live. It also
+  flags an **unindexed** `.run` (freshly recorded traces have no `.idx`): the first
+  data-model query then builds an in-memory index and can run long — let it finish.
+  `index_trace {}` builds a **persistent** `.idx` (`!ttdext.index`) so queries and re-opens
+  are fast.
 
 ## 2. Navigate — forward and backward
 
@@ -83,3 +90,24 @@ Then `ttd_calls`/`dx` by name work. To inspect a specific call, travel to it
   `.reload` at a stopped position.
 - The `__stdio_common_vfprintf` display alias has two underscores; `_stdio_common_vfprintf`
   is the alias — match the real symbol.
+- **Never run an unbounded memory search on a trace.** A whole-address-space
+  `execute { "command": "s -u 0 L?0x400000000000 …" }` sends the engine into a scan that can
+  run for minutes — and it wedges the single engine thread, so every later tool call times
+  out queued behind it. **Scope every search** to a real region: a module range (`lm`), a
+  heap segment from the PEB (`dt ntdll!_PEB @$peb ProcessHeap`), or a stack window — and
+  prefer the indexed data model (`ttd_calls`/`ttd_memory`) over raw `s`. If you do wedge it,
+  the only recovery is to kill `windbg-mcp.exe` and reconnect (`/mcp`), then re-open the trace.
+- **`registers {}` empty** → no thread context at this position (a module-load break, or a
+  bare `goto_position 0`). Travel to a settled position after a `go`/breakpoint, or read one
+  register with `execute { "command": "r rip" }`.
+
+## Technique: tabulate a pure function for a solver
+
+To recover "what input passes this check" when the check is a math function of the input
+(a hash, a per-digit transform), **evaluate the function directly** instead of reversing it.
+On a **live** target (`attach_process`), break at the function's call site, then loop:
+set the argument registers, set `rip` to the call site, `go` to just past the call, read the
+return — for every input you care about. A WinDbg `.for` script with `.logopen` dumps the
+whole table to a file; feed it to an SMT solver (e.g. Z3). See the FlareAuthenticator TTD
+walkthrough (`docs/flareauthenticator-ttd-walkthrough.md`) for a full worked example.
+(Watch the `.for` **radix**: the default is 16, so `10` means `0x10` — write bounds as `0xa`.)
