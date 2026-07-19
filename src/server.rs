@@ -1049,6 +1049,15 @@ pub struct RecordArgs {
     pub out_dir: String,
     /// Program (with optional arguments) to launch and record.
     pub target: String,
+    /// Extra environment variables for the recorded target, each as "KEY=VALUE".
+    /// Useful when the target refuses to run without a specific environment (e.g. a Qt
+    /// app that needs `QT_QPA_PLATFORM_PLUGIN_PATH`, or an anti-analysis env guard).
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// Working directory for the recorded target (defaults to TTD.exe's cwd). Set this
+    /// when the target loads resources relative to its own directory.
+    #[serde(default)]
+    pub working_dir: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1211,8 +1220,26 @@ impl WindbgServer {
                 e.open_trace(&args.path).map_err(es)?;
                 e.wait_for_event(LOAD_WAIT_MS).map_err(es)?;
                 // Confirm TTD replay is active and report the trace's position span.
-                e.execute_command("dx @$curprocess.TTD.Lifetime")
-                    .map_err(es)
+                let mut out = e
+                    .execute_command("dx @$curprocess.TTD.Lifetime")
+                    .map_err(es)?;
+                // Surface the index state. `-status` only reports (never builds), so it is
+                // safe here. On an unindexed .run the first data-model query builds an
+                // in-memory index and can run long — worth warning about up front.
+                let status = e
+                    .execute_command("!ttdext.index -status")
+                    .unwrap_or_default();
+                if status.contains("does not exist")
+                    || status.to_ascii_lowercase().contains("not indexed")
+                {
+                    out.push_str(
+                        "\nNote: this trace is not indexed. The first data-model query \
+                         (ttd_calls/ttd_memory/ttd_events/dx) builds an in-memory index and \
+                         can run long — let it finish before issuing more queries. Run \
+                         index_trace to build a persistent .idx (fast queries and re-opens).",
+                    );
+                }
+                Ok(out)
             })
             .await?;
         text_result(out)
@@ -1355,6 +1382,16 @@ impl WindbgServer {
     #[rmcp::tool]
     async fn registers(&self) -> Result<CallToolResult, ErrorData> {
         let out = self.engine.run(move |e| e.registers().map_err(es)).await?;
+        if out.trim().is_empty() {
+            // DbgEng prints nothing for `r` when there is no live thread context (e.g. a
+            // module-load break, or a bare goto_position to the very start of a trace).
+            return text_result(
+                "(no thread register context at this position — e.g. a module-load break or \
+                 the start of a trace. Travel to a settled position after a go/breakpoint, or \
+                 read a specific register with execute { \"command\": \"r rip\" }.)"
+                    .to_string(),
+            );
+        }
         text_result(out)
     }
 
@@ -1636,18 +1673,25 @@ impl WindbgServer {
         text_result(out)
     }
 
-    /// Rebuild the index of the currently open TTD trace (`!tt.index`).
+    /// Build the persistent index of the currently open TTD trace (`!ttdext.index`),
+    /// writing an `.idx` next to the `.run` so later queries and re-opens are fast.
+    /// No-op if already indexed. (The bundled engine exposes this as `!ttdext.index`,
+    /// not `!tt.index` — the latter fails with `LoadLibrary(tt)` because there is no
+    /// `tt` extension; the TTD commands come from `TtdExt.dll`.)
     #[rmcp::tool]
     async fn index_trace(&self) -> Result<CallToolResult, ErrorData> {
         let out = self
             .engine
-            .run(move |e| e.execute_command("!tt.index").map_err(es))
+            .run(move |e| e.execute_command("!ttdext.index").map_err(es))
             .await?;
         text_result(out)
     }
 
     /// Record a new TTD trace by launching a target under TTD.exe (requires elevation).
     /// Reports an error if the recorder fails to start (e.g. not running elevated).
+    /// Optional `env` (KEY=VALUE entries) and `working_dir` are applied to the recorded
+    /// target — use them when it needs a specific environment or cwd to run (e.g. a Qt
+    /// app's `QT_QPA_PLATFORM_PLUGIN_PATH`, or an anti-analysis "run me from here" guard).
     #[rmcp::tool]
     async fn record_trace(
         &self,
@@ -1660,7 +1704,13 @@ impl WindbgServer {
             let ttd = ttd::find_ttd().ok_or_else(|| {
                 "TTD.exe not found (install the Windows debugging tools / WinDbg)".to_string()
             })?;
-            ttd::record_launch(&ttd, &args.out_dir, &args.target)
+            ttd::record_launch(
+                &ttd,
+                &args.out_dir,
+                &args.target,
+                &args.env,
+                args.working_dir.as_deref(),
+            )
         })
         .await
         .map_err(|e| ErrorData::internal_error(format!("record task panicked: {e}"), None))?;

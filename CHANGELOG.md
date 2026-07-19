@@ -41,6 +41,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - [`docs/driver-ioctl-walkthrough.md`](docs/driver-ioctl-walkthrough.md): a worked
     `\Driver\mountmgr` enumeration + reachability report against a live kernel. The
     playbook now ends with a "Write the report" step + template.
+- **`record_trace` `env` and `working_dir` options** — pass extra `KEY=VALUE` environment
+  entries and a working directory to the recorded target, for programs that refuse to run
+  without a specific environment (e.g. a Qt app's `QT_QPA_PLATFORM_PLUGIN_PATH`, or an
+  anti-analysis "run me from here" guard). Previously the recorder only inherited the
+  server's environment.
+
+### Fixed
+
+- **`index_trace` now works.** It invoked `!tt.index`, which fails with `LoadLibrary(tt)` —
+  there is no `tt` extension. The bundled engine exposes trace indexing through `TtdExt.dll`,
+  so `index_trace` now runs `!ttdext.index` (building a persistent `.idx` next to the `.run`).
+- **`open_trace` flags an unindexed trace.** A freshly recorded `.run` has no `.idx`, so the
+  first data-model query silently builds an in-memory index and can run long; `open_trace`
+  now says so up front (via `!ttdext.index -status`) and points at `index_trace`.
+- **`registers` no longer returns a blank result** when there is no thread context (a
+  module-load break or a bare `goto_position 0`); it explains why and how to get a context.
 
 ## [0.1.3] - 2026-06-14
 

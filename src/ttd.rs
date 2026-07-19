@@ -76,7 +76,13 @@ const STARTUP_WATCH: Duration = Duration::from_millis(2500);
 /// error instead of falsely reporting success.
 ///
 /// Requires Administrator privileges.
-pub fn record_launch(ttd: &Path, out_dir: &str, target: &str) -> Result<String, String> {
+pub fn record_launch(
+    ttd: &Path,
+    out_dir: &str,
+    target: &str,
+    env: &[String],
+    working_dir: Option<&str>,
+) -> Result<String, String> {
     // TTD requires the output directory to exist; create it up front.
     std::fs::create_dir_all(out_dir)
         .map_err(|e| format!("failed to create output dir `{out_dir}`: {e}"))?;
@@ -91,14 +97,24 @@ pub fn record_launch(ttd: &Path, out_dir: &str, target: &str) -> Result<String, 
         .try_clone()
         .map_err(|e| format!("failed to set up TTD logging: {e}"))?;
 
-    let mut child = Command::new(ttd)
-        .arg("-accepteula")
+    let mut cmd = Command::new(ttd);
+    cmd.arg("-accepteula")
         .arg("-out")
         .arg(out_dir)
         .arg("-launch")
         .arg(target)
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err))
+        .stderr(Stdio::from(log_err));
+    // Pass through caller-supplied environment (e.g. an anti-analysis env guard) and cwd
+    // to the recorded target. TTD.exe launches `target` with this environment inherited.
+    for kv in env {
+        let (key, val) = split_env_entry(kv)?;
+        cmd.env(key, val);
+    }
+    if let Some(dir) = working_dir {
+        cmd.current_dir(dir);
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("failed to launch TTD.exe: {e}"))?;
 
@@ -137,6 +153,15 @@ pub fn record_launch(ttd: &Path, out_dir: &str, target: &str) -> Result<String, 
     }
 }
 
+/// Splits a `KEY=VALUE` environment entry. The value may itself contain `=`; the key must
+/// be non-empty. Returns a clear error for malformed input rather than silently dropping it.
+fn split_env_entry(entry: &str) -> Result<(&str, &str), String> {
+    match entry.split_once('=') {
+        Some((key, val)) if !key.is_empty() => Ok((key, val)),
+        _ => Err(format!("invalid env entry `{entry}` (expected KEY=VALUE)")),
+    }
+}
+
 /// First non-empty, non-banner line of TTD's output — the part that usually carries
 /// the actual error (e.g. the "Administrative privileges are required" line).
 fn first_meaningful_line(log: &str) -> Option<&str> {
@@ -154,7 +179,27 @@ fn first_meaningful_line(log: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::first_meaningful_line;
+    use super::{first_meaningful_line, split_env_entry};
+
+    #[test]
+    fn split_env_entry_parses_key_value() {
+        assert_eq!(
+            split_env_entry("QT_QPA_PLATFORM_PLUGIN_PATH=C:\\app"),
+            Ok(("QT_QPA_PLATFORM_PLUGIN_PATH", "C:\\app"))
+        );
+    }
+
+    #[test]
+    fn split_env_entry_allows_equals_and_empty_value() {
+        assert_eq!(split_env_entry("K=a=b"), Ok(("K", "a=b")));
+        assert_eq!(split_env_entry("K="), Ok(("K", "")));
+    }
+
+    #[test]
+    fn split_env_entry_rejects_missing_equals_or_empty_key() {
+        assert!(split_env_entry("NOEQUALS").is_err());
+        assert!(split_env_entry("=value").is_err());
+    }
 
     #[test]
     fn empty_or_whitespace_has_no_meaningful_line() {
