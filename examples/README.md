@@ -1,4 +1,14 @@
-# Example drivers
+# Examples
+
+## Worked solve: `flareauthenticator/`
+
+A full **TTD → Z3** solve of an obfuscated Qt crackme (Flare-On 12 #8), driven entirely through this
+server. TTD reduces a per-keystroke rolling hash to a pure weighted sum; the recovered constants go to
+an SMT solver for the flag. See [`flareauthenticator/README.md`](flareauthenticator/README.md), the
+narrated walkthrough [`docs/flareauthenticator-ttd-walkthrough.md`](../docs/flareauthenticator-ttd-walkthrough.md),
+and the recorded terminal session [`docs/flareauthenticator.cast`](../docs/flareauthenticator.cast).
+
+## Example drivers
 
 Throwaway stdio JSON-RPC drivers written while developing the live-kernel support,
 kept for re-use in future debugging. They are plain PowerShell (`.ps1`) — Cargo does
