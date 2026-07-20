@@ -1219,19 +1219,23 @@ impl WindbgServer {
             .run(move |e| {
                 e.open_trace(&args.path).map_err(es)?;
                 e.wait_for_event(LOAD_WAIT_MS).map_err(es)?;
-                // Confirm TTD replay is active and report the trace's position span.
+                // Check the index state *before* any data-model query: `!ttdext.index -status`
+                // only reads the on-disk .idx (never builds), whereas a `dx` on an unindexed
+                // trace can itself trigger the long in-memory index build.
+                let unindexed = {
+                    let status = e
+                        .execute_command("!ttdext.index -status")
+                        .unwrap_or_default();
+                    status.contains("does not exist")
+                        || status.to_ascii_lowercase().contains("not indexed")
+                };
+                // Confirm TTD replay is active and report the trace's position span. Lifetime
+                // is cheap metadata (min/max position); the expensive indexing is triggered by
+                // Calls/Memory/Events queries, which is what the note below warns about.
                 let mut out = e
                     .execute_command("dx @$curprocess.TTD.Lifetime")
                     .map_err(es)?;
-                // Surface the index state. `-status` only reports (never builds), so it is
-                // safe here. On an unindexed .run the first data-model query builds an
-                // in-memory index and can run long — worth warning about up front.
-                let status = e
-                    .execute_command("!ttdext.index -status")
-                    .unwrap_or_default();
-                if status.contains("does not exist")
-                    || status.to_ascii_lowercase().contains("not indexed")
-                {
+                if unindexed {
                     out.push_str(
                         "\nNote: this trace is not indexed. The first data-model query \
                          (ttd_calls/ttd_memory/ttd_events/dx) builds an in-memory index and \
