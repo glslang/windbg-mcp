@@ -57,9 +57,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now says so up front (via `!ttdext.index -status`) and points at `index_trace`.
 - **`registers` no longer returns a blank result** when there is no thread context (a
   module-load break or a bare `goto_position 0`); it explains why and how to get a context.
-
-### Fixed
-
 - **A runaway debugger command no longer wedges the session.** `execute`, `dx`, and the
   `ttd_*` query tools now run through a bounded path
   ([`win-kexp`](https://github.com/glslang/win-kexp)'s `execute_command_bounded`) that
