@@ -1681,16 +1681,18 @@ impl WindbgServer {
         text_result(out)
     }
 
-    /// Build the persistent index of the currently open TTD trace (`!ttdext.index`),
-    /// writing an `.idx` next to the `.run` so later queries and re-opens are fast.
-    /// No-op if already indexed. (The bundled engine exposes this as `!ttdext.index`,
-    /// not `!tt.index` — the latter fails with `LoadLibrary(tt)` because there is no
-    /// `tt` extension; the TTD commands come from `TtdExt.dll`.)
+    /// Build (or repair) the persistent index of the currently open TTD trace
+    /// (`!ttdext.index -force`), writing an `.idx` next to the `.run` so later queries and
+    /// re-opens are fast. `-force` is a fast no-op on an already-loaded index but deletes and
+    /// rebuilds an unloadable/corrupt one — which plain `!ttdext.index` cannot repair, so this
+    /// is the mode that actually fixes the "index not loaded" state `open_trace` warns about.
+    /// (The bundled engine exposes these via `TtdExt.dll`; `!tt.index` fails with
+    /// `LoadLibrary(tt)` because there is no `tt` extension.)
     #[rmcp::tool]
     async fn index_trace(&self) -> Result<CallToolResult, ErrorData> {
         let out = self
             .engine
-            .run(move |e| e.execute_command("!ttdext.index").map_err(es))
+            .run(move |e| e.execute_command("!ttdext.index -force").map_err(es))
             .await?;
         text_result(out)
     }
