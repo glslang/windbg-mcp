@@ -83,14 +83,26 @@ pub fn record_launch(
     env: &[String],
     working_dir: Option<&str>,
 ) -> Result<String, String> {
-    // TTD requires the output directory to exist; create it up front.
-    std::fs::create_dir_all(out_dir)
-        .map_err(|e| format!("failed to create output dir `{out_dir}`: {e}"))?;
+    // Validate the caller-supplied environment up front — before any filesystem side effect —
+    // so a malformed entry doesn't leave a stray log file behind.
+    let mut parsed_env = Vec::with_capacity(env.len());
+    for kv in env {
+        parsed_env.push(split_env_entry(kv)?);
+    }
+
+    // Resolve out_dir to an absolute path. When `working_dir` is set, TTD.exe would otherwise
+    // resolve a relative `-out` against the *target's* cwd — mismatching where we create the
+    // directory and log (the server's cwd). `absolute` makes it absolute lexically: no cwd
+    // dependence, and unlike `canonicalize` it needs no existing path and adds no `\\?\` prefix.
+    let out_dir = std::path::absolute(out_dir)
+        .map_err(|e| format!("failed to resolve output dir `{out_dir}`: {e}"))?;
+    std::fs::create_dir_all(&out_dir)
+        .map_err(|e| format!("failed to create output dir `{}`: {e}", out_dir.display()))?;
 
     // Capture the recorder's banner/diagnostics to a file (not a pipe): a pipe would
     // deadlock a long, successful recording once its buffer filled and we stopped
     // draining it.
-    let log_path = Path::new(out_dir).join("ttd_record.log");
+    let log_path = out_dir.join("ttd_record.log");
     let log = std::fs::File::create(&log_path)
         .map_err(|e| format!("failed to create log `{}`: {e}", log_path.display()))?;
     let log_err = log
@@ -100,15 +112,14 @@ pub fn record_launch(
     let mut cmd = Command::new(ttd);
     cmd.arg("-accepteula")
         .arg("-out")
-        .arg(out_dir)
+        .arg(&out_dir)
         .arg("-launch")
         .arg(target)
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
-    // Pass through caller-supplied environment (e.g. an anti-analysis env guard) and cwd
-    // to the recorded target. TTD.exe launches `target` with this environment inherited.
-    for kv in env {
-        let (key, val) = split_env_entry(kv)?;
+    // Pass through the validated environment (e.g. an anti-analysis env guard) and cwd to the
+    // recorded target. TTD.exe launches `target` with this environment inherited.
+    for (key, val) in parsed_env {
         cmd.env(key, val);
     }
     if let Some(dir) = working_dir {
@@ -141,8 +152,9 @@ pub fn record_launch(
                     // Still running after the watch window → recording is underway.
                     return Ok(format!(
                         "TTD recording started (recorder pid {pid}). Tracing `{target}`; \
-                         output (.run/.idx) goes to `{out_dir}`. Recording finalizes when the \
+                         output (.run/.idx) goes to `{}`. Recording finalizes when the \
                          target exits. Recorder log: {}",
+                        out_dir.display(),
                         log_path.display()
                     ));
                 }
