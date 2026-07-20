@@ -1221,13 +1221,16 @@ impl WindbgServer {
                 e.wait_for_event(LOAD_WAIT_MS).map_err(es)?;
                 // Check the index state *before* any data-model query: `!ttdext.index -status`
                 // only reads the on-disk .idx (never builds), whereas a `dx` on an unindexed
-                // trace can itself trigger the long in-memory index build.
-                let unindexed = {
+                // trace can itself trigger the long in-memory index build. TtdExt reports a
+                // healthy, ready index as exactly "Index file loaded."; per MS guidance treat
+                // anything else (missing, out of date, corrupt, unloadable) as needing an index.
+                // A blank result means the status query itself failed — don't warn then.
+                let needs_index = {
                     let status = e
                         .execute_command("!ttdext.index -status")
                         .unwrap_or_default();
-                    status.contains("does not exist")
-                        || status.to_ascii_lowercase().contains("not indexed")
+                    !status.trim().is_empty()
+                        && !status.to_ascii_lowercase().contains("index file loaded")
                 };
                 // Confirm TTD replay is active and report the trace's position span. Lifetime
                 // is cheap metadata (min/max position); the expensive indexing is triggered by
@@ -1235,12 +1238,13 @@ impl WindbgServer {
                 let mut out = e
                     .execute_command("dx @$curprocess.TTD.Lifetime")
                     .map_err(es)?;
-                if unindexed {
+                if needs_index {
                     out.push_str(
-                        "\nNote: this trace is not indexed. The first data-model query \
-                         (ttd_calls/ttd_memory/ttd_events/dx) builds an in-memory index and \
-                         can run long — let it finish before issuing more queries. Run \
-                         index_trace to build a persistent .idx (fast queries and re-opens).",
+                        "\nNote: this trace's index is not loaded (missing, out of date, or \
+                         unusable). The first data-model query (ttd_calls/ttd_memory/ttd_events/dx) \
+                         then builds an in-memory index and can run long — let it finish before \
+                         issuing more queries. Run index_trace to (re)build a persistent .idx \
+                         (fast queries and re-opens).",
                     );
                 }
                 Ok(out)
