@@ -1379,10 +1379,9 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<ExecuteArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = self
-            .engine
-            .run(move |e| e.execute_command(&args.command).map_err(es))
-            .await?;
+        // Bounded: a runaway raw command (e.g. an unbounded `s` search) self-aborts instead
+        // of pinning the engine thread and wedging every later call.
+        let out = self.engine.run_command(args.command).await?;
         text_result(out)
     }
 
@@ -1472,10 +1471,9 @@ impl WindbgServer {
     #[rmcp::tool]
     async fn dx(&self, Parameters(args): Parameters<DxArgs>) -> Result<CallToolResult, ErrorData> {
         let cmd = format!("dx {}", args.expression);
-        let out = self
-            .engine
-            .run(move |e| e.execute_command(&cmd).map_err(es))
-            .await?;
+        // Bounded: a data-model query that runs away (e.g. a heavy LINQ or index build on a
+        // huge trace) self-aborts rather than pinning the engine thread.
+        let out = self.engine.run_command(cmd).await?;
         text_result(out)
     }
 
@@ -1489,10 +1487,7 @@ impl WindbgServer {
         Parameters(args): Parameters<TtdCallsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let cmd = format!("dx @$cursession.TTD.Calls(\"{}\")", args.function);
-        let out = self
-            .engine
-            .run(move |e| e.execute_command(&cmd).map_err(es))
-            .await?;
+        let out = self.engine.run_command(cmd).await?;
         text_result(out)
     }
 
@@ -1504,23 +1499,16 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<TtdMemoryArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let size = args.size;
-        let mode = args.mode.clone();
-        let out = self
-            .engine
-            .run(move |e| {
-                let start = parse_u64(&args.address)?;
-                let end = start.saturating_add(size as u64);
-                let cmd = match mode {
-                    Some(m) if !m.trim().is_empty() => format!(
-                        "dx @$cursession.TTD.Memory(0x{start:x}, 0x{end:x}, \"{}\")",
-                        m.trim()
-                    ),
-                    _ => format!("dx @$cursession.TTD.Memory(0x{start:x}, 0x{end:x})"),
-                };
-                e.execute_command(&cmd).map_err(es)
-            })
-            .await?;
+        let start = parse_u64(&args.address).map_err(|e| ErrorData::internal_error(e, None))?;
+        let end = start.saturating_add(args.size as u64);
+        let cmd = match args.mode.as_deref() {
+            Some(m) if !m.trim().is_empty() => format!(
+                "dx @$cursession.TTD.Memory(0x{start:x}, 0x{end:x}, \"{}\")",
+                m.trim()
+            ),
+            _ => format!("dx @$cursession.TTD.Memory(0x{start:x}, 0x{end:x})"),
+        };
+        let out = self.engine.run_command(cmd).await?;
         text_result(out)
     }
 
@@ -1531,10 +1519,7 @@ impl WindbgServer {
     async fn ttd_events(&self) -> Result<CallToolResult, ErrorData> {
         let out = self
             .engine
-            .run(move |e| {
-                e.execute_command("dx -r2 @$curprocess.TTD.Events")
-                    .map_err(es)
-            })
+            .run_command("dx -r2 @$curprocess.TTD.Events".to_string())
             .await?;
         text_result(out)
     }
