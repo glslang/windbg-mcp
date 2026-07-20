@@ -7,7 +7,7 @@
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rmcp::ErrorData;
 use tokio::sync::{mpsc, oneshot};
@@ -94,15 +94,22 @@ impl EngineHandle {
     /// call. Use this for command-executing tools (`execute`, `dx`, the `ttd_*` wrappers); the
     /// quick, inherently-bounded operations can keep using [`Self::run`].
     pub async fn run_command(&self, command: String) -> Result<String, ErrorData> {
-        // Interrupt slightly before our own async timeout fires, so the engine returns a
-        // (possibly partial, and annotated) result rather than the timeout tripping while the
-        // engine thread is still busy — which is exactly the wedge this avoids.
-        let budget_ms = self
-            .call_timeout
-            .saturating_sub(Duration::from_secs(15))
-            .as_millis()
-            .min(u32::MAX as u128) as u32;
+        // The outer timeout in `run` starts counting at *submission*, but this command may sit
+        // in the engine queue behind another job (e.g. a backgrounded `go`) before reaching the
+        // worker. Compute the watchdog budget from the time *remaining* until that timeout — not
+        // the full `call_timeout` — so it Ctrl+Breaks ~15s before the caller gives up regardless
+        // of queue wait. `submitted.elapsed()` (evaluated on the engine thread) is that wait.
+        let call_timeout = self.call_timeout;
+        let submitted = Instant::now();
         self.run(move |e| {
+            // Floor the budget so a command dequeued near the deadline still arms the watchdog
+            // (a 0 budget disables it) and thus still frees the engine promptly.
+            let budget_ms = call_timeout
+                .saturating_sub(submitted.elapsed())
+                .saturating_sub(Duration::from_secs(15))
+                .max(Duration::from_secs(15))
+                .as_millis()
+                .min(u32::MAX as u128) as u32;
             e.execute_command_bounded(&command, budget_ms)
                 .map_err(|e| e.to_string())
         })
