@@ -58,6 +58,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`registers` no longer returns a blank result** when there is no thread context (a
   module-load break or a bare `goto_position 0`); it explains why and how to get a context.
 
+### Fixed
+
+- **A runaway debugger command no longer wedges the session.** `execute`, `dx`, and the
+  `ttd_*` query tools now run through a bounded path
+  ([`win-kexp`](https://github.com/glslang/win-kexp)'s `execute_command_bounded`) that
+  `SetInterrupt`s the engine shortly before the per-call timeout. Previously an unbounded
+  command — most importantly a broad `s` memory search — could pin the single engine thread
+  indefinitely, so every later tool call timed out behind it and the only recovery was to
+  kill and reconnect the server. Now such a command self-aborts (with a note) and the engine
+  stays usable. (win-kexp pin bumped to include `execute_command_bounded` + its interrupt drain.)
+
 ## [0.1.3] - 2026-06-14
 
 ### Fixed

@@ -86,4 +86,26 @@ impl EngineHandle {
             )),
         }
     }
+
+    /// Runs a raw debugger command **bounded** by an engine-side watchdog. If the command
+    /// runs longer than the call budget, win-kexp's `execute_command_bounded` Ctrl+Breaks the
+    /// engine so it aborts and frees the thread — instead of a runaway command (most importantly
+    /// an unbounded `s` memory search) pinning the single engine thread and wedging every later
+    /// call. Use this for command-executing tools (`execute`, `dx`, the `ttd_*` wrappers); the
+    /// quick, inherently-bounded operations can keep using [`Self::run`].
+    pub async fn run_command(&self, command: String) -> Result<String, ErrorData> {
+        // Interrupt slightly before our own async timeout fires, so the engine returns a
+        // (possibly partial, and annotated) result rather than the timeout tripping while the
+        // engine thread is still busy — which is exactly the wedge this avoids.
+        let budget_ms = self
+            .call_timeout
+            .saturating_sub(Duration::from_secs(15))
+            .as_millis()
+            .min(u32::MAX as u128) as u32;
+        self.run(move |e| {
+            e.execute_command_bounded(&command, budget_ms)
+                .map_err(|e| e.to_string())
+        })
+        .await
+    }
 }
