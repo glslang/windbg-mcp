@@ -29,15 +29,20 @@ jobs:
         shell: pwsh
         run: |
           # The release checklist says: bump Cargo.toml + plugin.json + the
-          # README release badge, then tag vX.Y.Z. Fail the release if they
-          # disagree. The README badge is static, so this guard keeps it from
-          # silently going stale.
+          # README release badge, add the CHANGELOG section, then tag vX.Y.Z.
+          # Fail the release if they disagree. The README badge is static, so
+          # this guard keeps it from silently going stale.
           $tag    = $env:GITHUB_REF_NAME -replace '^v', ''
           $cargo  = [regex]::Match((Get-Content Cargo.toml -Raw), '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"').Groups[1].Value
           $plugin = (Get-Content .claude-plugin/plugin.json -Raw | ConvertFrom-Json).version
           $readme = [regex]::Match((Get-Content README.md -Raw), 'img\.shields\.io/badge/release-v([^-]+)-').Groups[1].Value
           if ($cargo -ne $tag -or $plugin -ne $tag -or $readme -ne $tag) {
             Write-Error "Version mismatch: tag v$tag, Cargo.toml $cargo, plugin.json $plugin, README badge $readme"
+          }
+          # The release body comes from this section (see "Prepare release
+          # notes"), so a missing one must fail here, not after a 4-minute build.
+          if ((Get-Content CHANGELOG.md -Raw) -notmatch "(?m)^## \[$([regex]::Escape($tag))\]") {
+            Write-Error "CHANGELOG.md has no '## [$tag]' section"
           }
 
       - name: Install Rust toolchain
@@ -67,6 +72,32 @@ jobs:
           $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
           Set-Content dist/SHA256SUMS.txt "$hash  $name.zip"
 
+      - name: Prepare release notes
+        # Body = this version's curated CHANGELOG section, not the
+        # auto-generated commit list. Runs on dry runs too (it lands in the
+        # uploaded artifact), so the extraction is testable without tagging.
+        shell: pwsh
+        run: |
+          $ver  = [regex]::Match((Get-Content Cargo.toml -Raw), '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"').Groups[1].Value
+          $log  = Get-Content CHANGELOG.md -Raw
+          $rx   = [regex]::Escape($ver)
+
+          # Everything between this version's heading and the next one.
+          $body = [regex]::Match($log, "(?ms)^## \[$rx\][^\r\n]*\r?\n(.*?)(?=^## \[|\z)").Groups[1].Value.Trim()
+          if (-not $body) { Write-Error "CHANGELOG.md section for $ver is missing or empty" }
+
+          # CHANGELOG links are repo-relative; a release body is not rendered in
+          # a file context, so repoint them at this tag's blobs.
+          $blob = "https://github.com/$env:GITHUB_REPOSITORY/blob/v$ver"
+          $body = [regex]::Replace($body, '\]\((?!\w+:|//|#)([^)\s]+)\)', "](" + $blob + "/`$1)")
+
+          # Reuse the compare URL the CHANGELOG already defines for this version.
+          $compare = [regex]::Match($log, "(?m)^\[$rx\]:\s*(\S+)\s*$")
+          if ($compare.Success) { $body += "`n`n**Full Changelog**: $($compare.Groups[1].Value)" }
+
+          Set-Content dist/RELEASE_NOTES.md $body
+          Write-Host $body
+
       - name: Attest build provenance
         # Records a signed SLSA provenance statement linking the zip to this
         # workflow run; users verify with `gh attestation verify`.
@@ -84,7 +115,7 @@ jobs:
           files: |
             dist/*.zip
             dist/SHA256SUMS.txt
-          generate_release_notes: true
+          body_path: dist/RELEASE_NOTES.md
 
       - name: Upload artifact (dry run)
         if: github.event_name != 'push'
