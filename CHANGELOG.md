@@ -16,8 +16,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `mcp-publisher` CLI, authenticated with GitHub OIDC (no secrets). The bundle's
   descriptor is [`packaging/mcpb/manifest.json`](packaging/mcpb/manifest.json); CI stamps
   the release version into both files and the bundle's SHA-256 into `server.json`, so a
-  release keeps the same manual bump list as before (Cargo.toml + plugin.json + README badge
-  + CHANGELOG).
+  release keeps the same manual bump list as before — Cargo.toml, plugin.json, the README
+  badge, and CHANGELOG.
 
 ## [0.2.0] - 2026-07-22
 
