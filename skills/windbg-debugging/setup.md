@@ -92,11 +92,12 @@ package:
 
 ```pwsh
 $wd  = (Get-AppxPackage Microsoft.WinDbg).InstallLocation + "\amd64"
-# $dst = the folder that actually holds windbg-mcp.exe:
+# Set $dst to the folder that actually holds windbg-mcp.exe — pick the one for
+# your install (do not leave it as the placeholder):
 #   plugin / build-from-source layout      -> <plugin dir>\target\release
 #   installed from the MCP registry / MCPB -> the client's extraction dir (the
-#     extension's ${__dirname}; e.g. under the client's extensions folder)
-$dst = "<plugin dir>\target\release"
+#     extension's ${__dirname}, under the client's extensions folder)
+$dst = "<folder that holds windbg-mcp.exe>"
 Copy-Item "$wd\dbgeng.dll","$wd\dbghelp.dll","$wd\dbgcore.dll","$wd\dbgmodel.dll",`
           "$wd\symsrv.dll","$wd\msdia140.dll" $dst -Force
 Copy-Item "$wd\ttd"    "$dst\ttd"    -Recurse -Force   # TTDReplay*.dll, TtdExt.dll, TTDAnalyze.dll, ...
