@@ -77,7 +77,9 @@ Either way, run `/reload-plugins` afterwards so Claude Code connects the `windbg
 
 ## WinDbg engine + extensions — for `.run` replay and crash-dump `!analyze`
 
-Drop the **WinDbg** store-package binaries next to the built binary for two reasons:
+Drop the **WinDbg** store-package binaries next to `windbg-mcp.exe` (the `$dst` below — for a
+registry/MCPB install that's the client's extraction directory, **not** `target\release`) for
+two reasons:
 
 - **TTD `.run` replay** — System32's `dbgeng.dll` **rejects** traces with `0x80070057`.
 - **Crash-dump `!analyze`** — it lives in the `winext\` extensions, which System32 doesn't ship
@@ -90,6 +92,10 @@ package:
 
 ```pwsh
 $wd  = (Get-AppxPackage Microsoft.WinDbg).InstallLocation + "\amd64"
+# $dst = the folder that actually holds windbg-mcp.exe:
+#   plugin / build-from-source layout      -> <plugin dir>\target\release
+#   installed from the MCP registry / MCPB -> the client's extraction dir (the
+#     extension's ${__dirname}; e.g. under the client's extensions folder)
 $dst = "<plugin dir>\target\release"
 Copy-Item "$wd\dbgeng.dll","$wd\dbghelp.dll","$wd\dbgcore.dll","$wd\dbgmodel.dll",`
           "$wd\symsrv.dll","$wd\msdia140.dll" $dst -Force
