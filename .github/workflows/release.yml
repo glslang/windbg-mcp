@@ -75,9 +75,41 @@ jobs:
           $ver  = [regex]::Match((Get-Content Cargo.toml -Raw), '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"').Groups[1].Value
           $name = "windbg-mcp-v$ver-windows-x64"
           New-Item dist -ItemType Directory | Out-Null
+
+          # Zip: the manual / plugin download path (setup.md, README).
           Compress-Archive -Path target/release/windbg-mcp.exe, LICENSE -DestinationPath "dist/$name.zip"
-          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
-          Set-Content dist/SHA256SUMS.txt "$hash  $name.zip"
+
+          # MCPB bundle: the one-click / MCP-registry path. An .mcpb is a zip with
+          # manifest.json at its root, so stamp the version into the committed
+          # manifest template, stage it beside the binary + LICENSE, and zip the
+          # staging dir's contents (they land at the archive root). Compress-Archive
+          # insists on a .zip destination, so build one and rename.
+          $stage = "mcpb_stage"
+          New-Item $stage -ItemType Directory | Out-Null
+          $m = Get-Content packaging/mcpb/manifest.json -Raw | ConvertFrom-Json
+          $m.version = $ver
+          $m | ConvertTo-Json -Depth 20 | Set-Content "$stage/manifest.json"
+          Copy-Item target/release/windbg-mcp.exe, LICENSE $stage
+          Compress-Archive -Path "$stage/*" -DestinationPath "dist/$name-mcpb.zip"
+          Move-Item "dist/$name-mcpb.zip" "dist/$name.mcpb"
+
+          # One checksum file covering both artifacts.
+          $zipHash  = (Get-FileHash "dist/$name.zip"  -Algorithm SHA256).Hash.ToLower()
+          $mcpbHash = (Get-FileHash "dist/$name.mcpb" -Algorithm SHA256).Hash.ToLower()
+          Set-Content dist/SHA256SUMS.txt @("$zipHash  $name.zip", "$mcpbHash  $name.mcpb")
+
+          # Point server.json at this release's .mcpb. CI is the source of truth for
+          # the version-derived fields (version, identifier URL, fileSha256); the
+          # committed server.json is a readable template. Copied into dist so a dry
+          # run's artifact carries the exact metadata that would be published.
+          $url = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/v$ver/$name.mcpb"
+          $srv = Get-Content server.json -Raw | ConvertFrom-Json
+          $srv.version = $ver
+          $srv.packages[0].identifier = $url
+          $srv.packages[0].fileSha256 = $mcpbHash
+          $srv | ConvertTo-Json -Depth 20 | Set-Content server.json
+          Copy-Item server.json dist/server.json
+          Write-Host (Get-Content server.json -Raw)
 
       - name: Prepare release notes
         # Body = this version's curated CHANGELOG section, not the
@@ -109,12 +141,15 @@ jobs:
           Write-Host $body
 
       - name: Attest build provenance
-        # Records a signed SLSA provenance statement linking the zip to this
-        # workflow run; users verify with `gh attestation verify`.
+        # Records a signed SLSA provenance statement linking each distributed
+        # artifact (zip + .mcpb) to this workflow run; users verify with
+        # `gh attestation verify`.
         if: github.event_name == 'push' && github.ref_type == 'tag'
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4
         with:
-          subject-path: dist/*.zip
+          subject-path: |
+            dist/*.zip
+            dist/*.mcpb
 
       - name: Publish GitHub release
         # event_name guard: a workflow_dispatch run from a tag ref also has
@@ -124,8 +159,25 @@ jobs:
         with:
           files: |
             dist/*.zip
+            dist/*.mcpb
             dist/SHA256SUMS.txt
           body_path: dist/RELEASE_NOTES.md
+
+      - name: Publish to the MCP Registry
+        # Lists the server at registry.modelcontextprotocol.io so MCP clients can
+        # discover it. Runs after the release so the .mcpb the server.json
+        # identifier points at already exists. GitHub OIDC authorizes the
+        # io.github.glslang/* namespace against this repo's owner — the
+        # id-token: write permission above is what mints that token, so no secret
+        # is needed. Tag pushes only (a dry run must not touch the registry).
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $url = "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_windows_amd64.tar.gz"
+          Invoke-WebRequest -Uri $url -OutFile mcp-publisher.tar.gz
+          tar xf mcp-publisher.tar.gz mcp-publisher.exe
+          ./mcp-publisher.exe login github-oidc
+          ./mcp-publisher.exe publish
 
       - name: Upload artifact (dry run)
         if: github.event_name != 'push'
