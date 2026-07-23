@@ -16,6 +16,13 @@ The plugin ships the source, not a binary. Put `windbg-mcp.exe` in place so the 
 `plugin.json` (`${CLAUDE_PLUGIN_ROOT}/target/release/windbg-mcp.exe`) resolves — either
 option below lands it there.
 
+> **Installing from the [MCP registry](https://registry.modelcontextprotocol.io) or an
+> [MCPB](https://github.com/anthropics/mcpb) bundle instead?** Add
+> **`io.github.glslang/windbg-mcp`** and your client fetches + SHA-256-verifies the prebuilt
+> `.mcpb` itself — skip Options A/B, which exist to populate the plugin's source layout. You
+> still do the one-time **engine bundling below**, dropping those DLLs next to the
+> *client-extracted* `windbg-mcp.exe` (its `${__dirname}`).
+
 ### Option A — download a prebuilt release (no Rust required)
 
 Each `vX.Y.Z` tag publishes a Windows x64 build on the
