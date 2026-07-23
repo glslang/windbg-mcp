@@ -170,11 +170,22 @@ jobs:
         # io.github.glslang/* namespace against this repo's owner — the
         # id-token: write permission above is what mints that token, so no secret
         # is needed. Tag pushes only (a dry run must not touch the registry).
+        #
+        # This runs a downloaded binary in a job holding id-token/contents: write,
+        # so pin it to a specific release and verify the archive's SHA-256 before
+        # executing it — same defense as the SHA-pinned Actions above. To bump,
+        # update both $ver and $sha together; the hash is the
+        # mcp-publisher_windows_amd64.tar.gz line from that release's
+        # registry_<ver>_checksums.txt.
         if: github.event_name == 'push' && github.ref_type == 'tag'
         shell: pwsh
         run: |
-          $url = "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_windows_amd64.tar.gz"
+          $ver = "v1.8.0"
+          $sha = "697df4aaf7941ad6fbac9ebc48bd23ff87a3131ae7bb6ee0543cb857d8029939"
+          $url = "https://github.com/modelcontextprotocol/registry/releases/download/$ver/mcp-publisher_windows_amd64.tar.gz"
           Invoke-WebRequest -Uri $url -OutFile mcp-publisher.tar.gz
+          $got = (Get-FileHash mcp-publisher.tar.gz -Algorithm SHA256).Hash.ToLower()
+          if ($got -ne $sha) { throw "mcp-publisher checksum mismatch: expected $sha, got $got" }
           tar xf mcp-publisher.tar.gz mcp-publisher.exe
           ./mcp-publisher.exe login github-oidc
           ./mcp-publisher.exe publish
