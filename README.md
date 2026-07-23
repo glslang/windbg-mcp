@@ -121,6 +121,19 @@ walks through it, and it mirrors the [*Build or download*](#build-or-download) a
 [*Bundling the WinDbg engine*](#bundling-the-windbg-engine) sections above. Then `/reload-plugins`
 to connect the server. The plugin points at `${CLAUDE_PLUGIN_ROOT}/target/release/windbg-mcp.exe`.
 
+### From the official MCP registry
+
+The server is listed in the [official MCP registry](https://registry.modelcontextprotocol.io) as
+**`io.github.glslang/windbg-mcp`**. Clients that support the registry — or that install
+[MCPB](https://github.com/anthropics/mcpb) bundles directly — can add it by name: the client
+downloads that release's `.mcpb` bundle, verifies its SHA-256, and wires up the `windbg-mcp.exe`
+inside it as an stdio server, with no Rust build or manual binary placement.
+
+The bundle is **Windows x64 only** and ships just the server binary, so the one-time engine setup
+still applies — for TTD `.run` replay and crash-dump `!analyze`, drop the WinDbg engine DLLs next
+to the client-extracted `windbg-mcp.exe` (the skill's `setup.md` covers it). Basic live and
+crash-dump work runs on the in-box `System32` engine without them.
+
 ### Releasing
 
 The plugin sets an explicit `version` in
