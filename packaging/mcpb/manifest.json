@@ -1,0 +1,41 @@
+{
+  "manifest_version": "0.3",
+  "name": "windbg-mcp",
+  "display_name": "WinDbg MCP",
+  "version": "0.2.0",
+  "description": "WinDbg/DbgEng over MCP: crash dumps, live user & kernel, driver IOCTLs, and TTD.",
+  "long_description": "Requires Windows x64. Basic live/user-mode and crash-dump analysis work on the in-box System32 DbgEng, so the server connects out of the box. TTD .run replay and crash-dump !analyze additionally require bundling the WinDbg store engine DLLs next to the binary — see the repository's setup guide.",
+  "author": {
+    "name": "Gonçalo Carvalho",
+    "email": "glslang@gmail.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/glslang/windbg-mcp"
+  },
+  "homepage": "https://github.com/glslang/windbg-mcp",
+  "documentation": "https://github.com/glslang/windbg-mcp#readme",
+  "support": "https://github.com/glslang/windbg-mcp/issues",
+  "license": "MIT",
+  "keywords": [
+    "windbg",
+    "dbgeng",
+    "debugging",
+    "crash-dump",
+    "kernel",
+    "ttd",
+    "time-travel-debugging",
+    "windows"
+  ],
+  "server": {
+    "type": "binary",
+    "entry_point": "windbg-mcp.exe",
+    "mcp_config": {
+      "command": "${__dirname}/windbg-mcp.exe",
+      "args": []
+    }
+  },
+  "compatibility": {
+    "platforms": ["win32"]
+  }
+}

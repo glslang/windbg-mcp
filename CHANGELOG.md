@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Discoverable via the official MCP Registry.** Each release now also builds an
+  `.mcpb` bundle (`windbg-mcp-vX.Y.Z-windows-x64.mcpb`) next to the existing zip and
+  publishes a [`server.json`](server.json) entry (`io.github.glslang/windbg-mcp`) to
+  [registry.modelcontextprotocol.io](https://registry.modelcontextprotocol.io) via the
+  `mcp-publisher` CLI, authenticated with GitHub OIDC (no secrets). The bundle's
+  descriptor is [`packaging/mcpb/manifest.json`](packaging/mcpb/manifest.json); CI stamps
+  the release version and the artifact's SHA-256 into both files, so a release keeps the
+  same manual bump list as before (Cargo.toml + plugin.json + README badge + CHANGELOG).
+
 ## [0.2.0] - 2026-07-22
 
 ### Added
