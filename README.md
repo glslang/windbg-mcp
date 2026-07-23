@@ -137,8 +137,8 @@ It also builds an [MCPB](https://github.com/anthropics/mcpb) bundle
 [`packaging/mcpb/manifest.json`](packaging/mcpb/manifest.json)) and publishes a
 [`server.json`](server.json) entry to the [official MCP Registry](https://registry.modelcontextprotocol.io)
 (`io.github.glslang/windbg-mcp`) with the `mcp-publisher` CLI over GitHub OIDC — no secrets. CI
-stamps the release version and the bundle's SHA-256 into `server.json` and the MCPB manifest, so
-those two files are **not** part of the manual bump list above.
+stamps the release version into both files and the bundle's SHA-256 into `server.json`, so
+neither is part of the manual bump list above.
 The zip also gets a signed
 [build-provenance attestation](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations)
 tying it to the workflow run that built it — verify with:
