@@ -42,11 +42,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   toward retiring — over-matching costs a re-open, under-matching would let a stale handle
   through — but it cannot be exhaustive, so inside `execute` a handle is a strong hint
   rather than a guarantee.
-- **Tool behaviour annotations.** All 36 tools now declare a title and the
+- **`session_status`.** Reports the handle of the session the server currently holds, or
+  that none is open. It exists to recover a `session_id` a caller never received: the
+  per-call timeout can fire while the engine thread is still working, and if that job then
+  succeeds it commits a handle no reply ever carried. A live `attach_kernel` is the case
+  that matters — it waits indefinitely by design, so the call reporting a timeout while the
+  attach completes later is normal, not exceptional. Recovering the handle beats the
+  alternative of retrying an attach or launch that would connect or spawn a second time.
+  Deliberately does not queue on the engine thread, since the situation it addresses is
+  that thread being parked.
+- **Tool behaviour annotations.** All 37 tools now declare a title and the
   read-only / destructive / idempotent / open-world hints, so a client can tell
   `read_memory` apart from `execute` before prompting the user. `openWorldHint` is true for
-  everything that touches a debug target and false only for `decode_ioctl`, which never
-  reaches the engine. Two reasons put the rest over the line: a symbol server on the path
+  everything that touches a debug target and false only for `decode_ioctl` and
+  `session_status`, which never reach the engine. Two reasons put the rest over the line: a
+  symbol server on the path
   means almost any command can pull a PDB (`r` symbolizes the current instruction, `k`
   symbolizes every frame, `bp module!Symbol` resolves a name), and a KDNET session puts the
   target itself across a network link, so even a raw `read_memory` is remote traffic. A
@@ -67,6 +77,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failed operation apart from an engine that never came up: a `DebugEngine::new()` failure
   (missing or unusable `dbgeng.dll`) is permanent and now reports as a protocol error, not
   as a retryable tool error that invites the model to try again forever.
+
+- **`index_trace` is now annotated destructive.** It runs `!ttdext.index -force`, which
+  deletes and rebuilds an unloadable `.idx` — replacing an on-disk artifact, whatever the
+  intent. `destructiveHint: false` told clients otherwise and could bypass confirmation.
 
 ### Documentation
 

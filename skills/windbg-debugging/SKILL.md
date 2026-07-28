@@ -30,7 +30,7 @@ already does the job.
 
 | Group | Tools |
 |-------|-------|
-| Session | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `end_session` |
+| Session | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `end_session`, `session_status` |
 | State | `registers`, `read_memory`, `backtrace`, `modules`, `threads`, `disassemble`, `dx` |
 | Control | `go`, `step_over`, `step_into`, `set_breakpoint` |
 | TTD nav | `step_back` (`t-`), `step_over_back` (`p-`), `reverse_go` (`g-`), `goto_position` (`!tt`) |
@@ -54,6 +54,9 @@ a bare `execute`, which only sets the run state and doesn't move the target.
   call. The server process is shared, so another caller can replace the target underneath you —
   with the handle that becomes a clear "stale session handle" error instead of a `read_memory`
   that quietly returns someone else's memory. Omitting it means "whatever session is current".
+  If you never got one back — most likely after an `attach_kernel` that reported a timeout while
+  the engine completed the attach later — call `session_status` to recover it. Do **not** retry
+  the attach or launch; that connects or spawns a second time.
 - **A failed debugger operation comes back as a normal tool result**, flagged as an error and
   carrying the debugger's own text — read it and adjust (wrong symbol, unmapped address, target
   still running). Only a dead engine surfaces as a transport-level protocol error.
