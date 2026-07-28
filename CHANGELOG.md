@@ -98,8 +98,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their arguments — `u {address}`, `bp {expression}`, `!drvobj {name} 7` — and DbgEng reads
   `;` as a command separator, so `disassemble { address: "rip; .opendump C:\other.dmp" }`
   ran a target swap from a tool advertising `readOnlyHint: true`, and did it without going
-  through the check that retires session handles. `;`, line breaks, and (for operands
-  interpolated inside a quoted data-model string) `"` are now refused with a tool error.
+  through the check that retires session handles. Quotes are the same problem deferred:
+  `bp <location> "command"` is real WinDbg syntax — `ioctl_trace` builds exactly that form —
+  so a quote in a breakpoint location arms a target swap that fires on the next hit, outside
+  any tool call. `;`, line breaks, and `"` are now refused with a tool error, the last
+  everywhere except `dx`, whose data-model expressions use quoted literals legitimately.
   These parameters were always documented as single operands, so nothing legitimate is
   lost: `execute` remains available for command lists, and is annotated destructive and
   handle-checked accordingly.

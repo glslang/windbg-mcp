@@ -258,10 +258,15 @@ still answers while a parked attach holds it.
 ### Typed operands are operands, not commands
 
 The typed tools build debugger commands by interpolation (`u {address}`, `bp {expression}`,
-`!drvobj {name} 7`), and DbgEng treats `;` as a command separator. So those parameters refuse `;`,
-line breaks, and — where the operand lands inside a quoted data-model string — `"`. Without that,
+`!drvobj {name} 7`), so those parameters refuse `;`, line breaks, and `"` — the last everywhere
+except `dx`, whose data-model expressions use quoted literals legitimately.
+
+Two things go wrong without that. DbgEng treats `;` as a command separator, so
 `disassemble { address: "rip; .opendump C:\other.dmp" }` would replace the debug target from a tool
-that reports itself read-only, and would do it without retiring anyone's session handle.
+that reports itself read-only. And `bp <location> "command"` is real WinDbg syntax — `ioctl_trace`
+builds exactly that form — so a quote in a breakpoint location arms a command that runs on every
+hit, replacing the target at some arbitrary later moment, outside any tool call and outside anything
+that could retire the session handle.
 
 Nothing legitimate is lost: these parameters were always single operands. Use `execute` to run a
 command list — it is annotated destructive and retires the handle when a command changes the target.

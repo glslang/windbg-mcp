@@ -1347,6 +1347,22 @@ fn lock(session: &Mutex<Option<String>>) -> std::sync::MutexGuard<'_, Option<Str
     session.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Whether an operand may legitimately contain a double quote.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Quotes {
+    /// Only `dx`, whose data-model expressions use quoted string literals as a matter of
+    /// course (`@$cursession.TTD.Calls("ntdll!Nt*")`).
+    Allowed,
+    /// Everywhere else. A quote either escapes a string literal this server wrapped around
+    /// the operand, or — for a `bp` location — opens a *breakpoint command string*, which
+    /// WinDbg runs every time the breakpoint fires. `ioctl_trace` builds exactly that form
+    /// deliberately, so `set_breakpoint { expression: "nt!Foo \".opendump other.dmp\"" }`
+    /// would arm a target swap that happens later: outside any tool call, and outside
+    /// anything that could retire the session handle. A quote has no legitimate meaning in
+    /// an address, a symbol, a device name or a TTD position, so refusing it costs nothing.
+    Rejected,
+}
+
 /// Rejects a caller-supplied operand that could end the command it is embedded in.
 ///
 /// The typed tools build commands by interpolation — `u {address}`, `bp {expression}`,
@@ -1360,12 +1376,12 @@ fn lock(session: &Mutex<Option<String>>) -> std::sync::MutexGuard<'_, Option<Str
 /// separator costs nothing real: `execute` exists for anything that genuinely needs to
 /// chain, and it is annotated and handle-checked accordingly.
 ///
-/// `quoted` additionally refuses `"`, for the operands interpolated inside a quoted string
-/// in a data-model expression, where a quote would escape the literal instead.
-fn reject_command_breakers(field: &str, value: &str, quoted: bool) -> Result<(), String> {
+/// Quotes are refused everywhere except `dx` — see [`Quotes`] for why a quote is never a
+/// legitimate part of an address, symbol, device name or breakpoint location.
+fn reject_command_breakers(field: &str, value: &str, quotes: Quotes) -> Result<(), String> {
     let bad = value
         .chars()
-        .find(|c| matches!(c, ';' | '\n' | '\r') || (quoted && *c == '"'));
+        .find(|c| matches!(c, ';' | '\n' | '\r') || (quotes == Quotes::Rejected && *c == '"'));
     let Some(bad) = bad else {
         return Ok(());
     };
@@ -2007,7 +2023,7 @@ impl WindbgServer {
         Parameters(args): Parameters<DisassembleArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         if let Some(a) = &args.address
-            && let Err(e) = reject_command_breakers("address", a, false)
+            && let Err(e) = reject_command_breakers("address", a, Quotes::Rejected)
         {
             return tool_error(e);
         }
@@ -2035,7 +2051,7 @@ impl WindbgServer {
         open_world_hint = true
     ))]
     async fn dx(&self, Parameters(args): Parameters<DxArgs>) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = reject_command_breakers("expression", &args.expression, false) {
+        if let Err(e) = reject_command_breakers("expression", &args.expression, Quotes::Allowed) {
             return tool_error(e);
         }
         let gate = self.session_gate(args.session_id.as_deref());
@@ -2059,7 +2075,7 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<TtdCallsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = reject_command_breakers("function", &args.function, true) {
+        if let Err(e) = reject_command_breakers("function", &args.function, Quotes::Rejected) {
             return tool_error(e);
         }
         let gate = self.session_gate(args.session_id.as_deref());
@@ -2082,7 +2098,7 @@ impl WindbgServer {
     ) -> Result<CallToolResult, ErrorData> {
         let gate = self.session_gate(args.session_id.as_deref());
         if let Some(mode) = &args.mode
-            && let Err(e) = reject_command_breakers("mode", mode, true)
+            && let Err(e) = reject_command_breakers("mode", mode, Quotes::Rejected)
         {
             return tool_error(e);
         }
@@ -2136,7 +2152,7 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<BreakpointArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = reject_command_breakers("expression", &args.expression, false) {
+        if let Err(e) = reject_command_breakers("expression", &args.expression, Quotes::Rejected) {
             return tool_error(e);
         }
         let gate = self.session_gate(args.session_id.as_deref());
@@ -2191,7 +2207,7 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<RunToAddressArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = reject_command_breakers("address", &args.address, false) {
+        if let Err(e) = reject_command_breakers("address", &args.address, Quotes::Rejected) {
             return tool_error(e);
         }
         let gate = self.session_gate(args.session_id.as_deref());
@@ -2368,7 +2384,7 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<PositionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = reject_command_breakers("position", &args.position, false) {
+        if let Err(e) = reject_command_breakers("position", &args.position, Quotes::Rejected) {
             return tool_error(e);
         }
         let gate = self.session_gate(args.session_id.as_deref());
@@ -2496,7 +2512,7 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<DriverObjectArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = reject_command_breakers("name", &args.name, false) {
+        if let Err(e) = reject_command_breakers("name", &args.name, Quotes::Rejected) {
             return tool_error(e);
         }
         let gate = self.session_gate(args.session_id.as_deref());
@@ -2524,7 +2540,7 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<DeviceObjectArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = reject_command_breakers("device", &args.device, false) {
+        if let Err(e) = reject_command_breakers("device", &args.device, Quotes::Rejected) {
             return tool_error(e);
         }
         let gate = self.session_gate(args.session_id.as_deref());
@@ -2552,7 +2568,7 @@ impl WindbgServer {
         Parameters(args): Parameters<IrpStackArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         if let Some(irp) = &args.irp
-            && let Err(e) = reject_command_breakers("irp", irp, false)
+            && let Err(e) = reject_command_breakers("irp", irp, Quotes::Rejected)
         {
             return tool_error(e);
         }
@@ -2585,7 +2601,7 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<IoctlTraceArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = reject_command_breakers("dispatch", &args.dispatch, false) {
+        if let Err(e) = reject_command_breakers("dispatch", &args.dispatch, Quotes::Rejected) {
             return tool_error(e);
         }
         let gate = self.session_gate(args.session_id.as_deref());
@@ -2630,7 +2646,7 @@ impl WindbgServer {
             ("rva", args.rva.as_ref()),
         ] {
             if let Some(value) = value
-                && let Err(e) = reject_command_breakers(field, value, false)
+                && let Err(e) = reject_command_breakers(field, value, Quotes::Rejected)
             {
                 return tool_error(e);
             }
@@ -2944,18 +2960,45 @@ mod tests {
             "rip\r\n.kill",
         ] {
             assert!(
-                reject_command_breakers("address", value, false).is_err(),
+                reject_command_breakers("address", value, Quotes::Rejected).is_err(),
                 "`{value}` must be refused"
             );
         }
     }
 
-    /// Operands interpolated inside a quoted data-model string can also escape via `"`.
+    /// A quote is refused everywhere except `dx`, for two separate reasons.
     #[test]
-    fn quoted_operands_may_not_escape_their_string() {
-        assert!(reject_command_breakers("function", "nt!*\") ; .detach //", true).is_err());
-        // Only the quoted positions are stricter; a quote is fine where none is implied.
-        assert!(reject_command_breakers("expression", "foo\"bar", false).is_ok());
+    fn operands_may_not_carry_quotes_except_in_dx() {
+        // Escaping the string literal this server wrapped around the operand.
+        assert!(
+            reject_command_breakers("function", "nt!*\") ; .detach //", Quotes::Rejected).is_err()
+        );
+
+        // Opening a `bp` command string, which WinDbg runs on every hit — a target swap
+        // armed for later, outside any tool call and outside handle retirement.
+        assert!(
+            reject_command_breakers(
+                "expression",
+                "nt!NtCreateFile \".opendump C:\\\\other.dmp\"",
+                Quotes::Rejected
+            )
+            .is_err()
+        );
+
+        // `dx` is the exception: quoted literals are ordinary data-model syntax.
+        assert!(
+            reject_command_breakers(
+                "expression",
+                "@$cursession.TTD.Calls(\"ntdll!Nt*\")",
+                Quotes::Allowed
+            )
+            .is_ok()
+        );
+        // Even there, a separator still ends the command.
+        assert!(
+            reject_command_breakers("expression", "@$curprocess; .detach", Quotes::Allowed)
+                .is_err()
+        );
     }
 
     /// The rejection must not swallow the operand forms these tools exist to accept.
@@ -2972,12 +3015,14 @@ mod tests {
             "12:0",
         ] {
             assert!(
-                reject_command_breakers("operand", value, false).is_ok(),
+                reject_command_breakers("operand", value, Quotes::Rejected).is_ok(),
                 "`{value}` must be accepted"
             );
         }
-        assert!(reject_command_breakers("function", "kernelbase!CreateFileW", true).is_ok());
-        assert!(reject_command_breakers("function", "ntdll!Nt*", true).is_ok());
+        assert!(
+            reject_command_breakers("function", "kernelbase!CreateFileW", Quotes::Rejected).is_ok()
+        );
+        assert!(reject_command_breakers("function", "ntdll!Nt*", Quotes::Rejected).is_ok());
     }
 
     /// `execute` is the one path that can swap the target without going through a typed
