@@ -56,8 +56,9 @@ a bare `execute`, which only sets the run state and doesn't move the target.
   that quietly returns someone else's memory. Omitting it means "whatever session is current".
   If an open **times out**, do not retry it — that connects or spawns a second time. The timeout
   abandons the wait, not the job, so the open may still land; the message names the `session_id`
-  it would commit. Call `session_status` and adopt the session **only if it reports that same
-  id** — a different id means someone else's open landed and that target is not yours.
+  it would commit. Poll `session_status` and adopt the session **only once it reports that same
+  id**. A different id means yours hasn't landed *yet* — it may still be queued — not that it
+  failed, so keep polling rather than concluding, and never re-run the open.
 - **A failed debugger operation comes back as a normal tool result**, flagged as an error and
   carrying the debugger's own text — read it and adjust (wrong symbol, unmapped address, target
   still running). Only a dead engine surfaces as a transport-level protocol error.

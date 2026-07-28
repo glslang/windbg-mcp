@@ -1473,12 +1473,12 @@ impl WindbgServer {
             // the caller would only learn "some session exists" and could adopt a handle
             // belonging to somebody else's open that landed in the meantime.
             Err(EngineError::Timeout(msg)) => tool_error(format!(
-                "{msg}\n\nThis open may still complete on the engine thread. If it does, its \
-                 handle will be exactly `{id}`. Call session_status: treat the session as \
-                 yours only if it reports that same id, and if it reports a different one \
-                 then another caller's target is loaded and yours never landed. Do not re-run \
-                 this open to recover — attaching or launching again would connect to, or \
-                 start, a second target."
+                "{msg}\n\nThe wait was abandoned, but this open was not: it may still be \
+                 queued behind other work, and may still run and commit the handle `{id}`. \
+                 Poll session_status — the session is yours once it reports `{id}`. A \
+                 different id means yours has not landed *yet*, not that it failed; it may \
+                 still be pending. Either way do not re-run this open to recover, which would \
+                 attach to, or start, a second target."
             )),
             Err(e) => engine_result(Err(e)),
         }
@@ -1745,6 +1745,11 @@ impl WindbgServer {
     /// This reports *the current* handle, not *your* handle — the two differ if another
     /// caller's open landed while yours was in flight. A timed-out open names the handle it
     /// would commit, so compare against that: adopt the session only when the two match.
+    ///
+    /// A mismatch means "not yours *yet*", not "yours failed". The timeout abandons the
+    /// wait, not the job, so a timed-out open can still be sitting in the queue and can
+    /// still land later. Poll rather than concluding; re-running the open is the one thing
+    /// that is never the answer.
     #[rmcp::tool(annotations(
         title = "Show current session handle",
         read_only_hint = true,
