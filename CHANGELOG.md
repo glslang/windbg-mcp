@@ -38,12 +38,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   So does a *panic* in the report — several win-kexp methods use `.expect`, and an unwind
   would otherwise skip straight past the code that attaches the handle.
 
-  `execute` is the one path that can swap the target without going through a typed tool, so
-  the session-control commands (`.opendump`, `.attach`, `.detach`, `.kill`, `.restart`,
-  `.abandon`, `.remote`, `q`/`qd`/`qq`) retire the current handle. The match is biased
-  toward retiring — over-matching costs a re-open, under-matching would let a stale handle
-  through — but it cannot be exhaustive, so inside `execute` a handle is a strong hint
-  rather than a guarantee.
+  `execute` and `dx` are the two paths that can swap the target without going through a
+  typed tool. For `execute` the session-control commands (`.opendump`, `.attach`, `.detach`,
+  `.kill`, `.restart`, `.abandon`, `.remote`, `q`/`qd`/`qq`) retire the current handle. `dx`
+  reaches command execution through the data model's
+  `Debugger.Utility.Control.ExecuteCommand`, which runs any command string, so an expression
+  touching command execution retires the handle too — conservatively, because the command is
+  a runtime string this server never sees. Both matches are biased toward retiring —
+  over-matching costs a re-open, under-matching would let a stale handle through — and
+  neither can be exhaustive, so inside `execute` and `dx` a handle is a strong hint rather
+  than a guarantee. Everywhere else it is a guarantee.
 - **`session_status`.** Reports the handle of the session the server currently holds, or
   that none is open. It exists to recover a `session_id` a caller never received: the
   per-call timeout can fire while the engine thread is still working, and if that job then
