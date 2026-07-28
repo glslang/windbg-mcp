@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Explicit session handles.** The tools that open a target (`open_dump`, `open_trace`,
+  `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`) now return a
+  `session_id`, and every tool that touches the debug target accepts it as an optional
+  argument, refusing to run when it no longer matches the session the engine holds. One
+  process drives one DbgEng session, but an MCP connection is not a session — a client may
+  interleave unrelated requests over the same stdio process — so without a handle a call
+  could silently act on a target it never opened. Omitting the argument keeps the previous
+  behaviour, so existing callers are unaffected. `decode_ioctl` (pure) and `record_trace`
+  (independent of the session) do not take it.
+- **Tool behaviour annotations.** All 36 tools now declare a title and the
+  read-only / destructive / idempotent / open-world hints, so a client can tell
+  `read_memory` apart from `execute` before prompting the user.
+
+### Changed
+
+- **Debugger failures are now tool-execution errors, not protocol errors.** An unresolvable
+  symbol, an unreadable address, a target that never stopped, or a recorder that won't
+  start now comes back as a normal tool result with `isError: true` and the debugger's text
+  intact, which is what lets the model see the failure and correct itself. Previously every
+  such failure became a JSON-RPC `-32603`, which clients surface as a transport-level fault
+  and models largely cannot act on. Only a dead engine thread remains a protocol error.
+  Semantic input validation (`decode_ioctl`'s code, `ttd_memory`'s address) moved the same
+  way — the request satisfies the schema, so the complaint belongs in the result.
+
+### Documentation
+
+- README now states which MCP protocol revision the server speaks (the `initialize`-handshake
+  era: `2025-11-25` / `2025-06-18`) and why `2026-07-28` is not supported yet.
+
 ## [0.2.1] - 2026-07-23
 
 ### Added
