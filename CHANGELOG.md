@@ -28,6 +28,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handle, so holding one does not prevent a replacement, it makes any later call of yours
   that supplies the handle fail instead of acting on the wrong target.
 
+  The opening tools commit the handle as soon as the target transition succeeds, before
+  their follow-up diagnostic (`lm`, `vertarget`, `r`, the TTD lifetime query) runs. A failed
+  diagnostic then reports the error *with* the `session_id` rather than swallowing it — the
+  target is genuinely open at that point, and the only other way to obtain a handle is to
+  open again, which for `launch` means spawning a second process.
+
   `execute` is the one path that can swap the target without going through a typed tool, so
   the session-control commands (`.opendump`, `.attach`, `.detach`, `.kill`, `.restart`,
   `.abandon`, `.remote`, `q`/`qd`/`qq`) retire the current handle. The match is biased
