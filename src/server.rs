@@ -1398,6 +1398,23 @@ fn reject_command_breakers(field: &str, value: &str, quotes: Quotes) -> Result<(
     ))
 }
 
+/// Can this data-model expression run debugger commands?
+///
+/// `dx` evaluates arbitrary data-model expressions, and the data model exposes
+/// `Debugger.Utility.Control.ExecuteCommand`, which runs any command string — `.opendump`
+/// included. So `dx` is a second command hatch beside `execute`, and has to be treated as
+/// one. Where [`changes_debug_target`] can read the command and decide, this cannot: the
+/// command is a runtime string inside an expression. So the trigger is *reaching command
+/// execution at all*, and the handle is retired without knowing what ran.
+///
+/// Best-effort for a stronger reason than [`changes_debug_target`]: the data model is
+/// extensible, so no fixed list can enumerate every route to execution. `dx` and `execute`
+/// are therefore both documented as surfaces where a handle is a strong hint, not a
+/// guarantee — everywhere else in this server it is a guarantee.
+fn dx_executes_commands(expression: &str) -> bool {
+    expression.to_ascii_lowercase().contains("executecommand")
+}
+
 /// Does this raw `execute` command replace or release the debug target?
 ///
 /// The typed tools announce their own transitions, but `execute` is an escape hatch: a
@@ -2043,10 +2060,15 @@ impl WindbgServer {
     }
 
     /// Evaluate a data-model (LINQ) expression with `dx` — ideal for TTD queries.
+    /// The data model can also run debugger commands, so this is a second command hatch
+    /// alongside `execute` and is annotated and handle-checked as one; see
+    /// [`dx_executes_commands`].
     #[rmcp::tool(annotations(
         title = "Evaluate data-model expression",
         read_only_hint = false,
-        destructive_hint = false,
+        // The data model reaches `Debugger.Utility.Control.ExecuteCommand`, so a `dx` can do
+        // anything `execute` can — including replacing the target.
+        destructive_hint = true,
         idempotent_hint = false,
         open_world_hint = true
     ))]
@@ -2055,10 +2077,22 @@ impl WindbgServer {
             return tool_error(e);
         }
         let gate = self.session_gate(args.session_id.as_deref());
+        let session = Arc::clone(&self.session);
+        let retires_session = dx_executes_commands(&args.expression);
+        let precheck = move || {
+            gate()?;
+            if retires_session {
+                // We cannot see *which* command the data model is about to run, so the
+                // conservative reading is the only sound one: assume it replaced the target.
+                // Dropped before the expression evaluates, for the reason `execute` does.
+                *lock(&session) = None;
+            }
+            Ok(())
+        };
         let cmd = format!("dx {}", args.expression);
         // Bounded: a data-model query that runs away (e.g. a heavy LINQ or index build on a
         // huge trace) self-aborts rather than pinning the engine thread.
-        let out = self.engine.run_command(cmd, gate).await;
+        let out = self.engine.run_command(cmd, precheck).await;
         engine_result(out)
     }
 
@@ -3023,6 +3057,37 @@ mod tests {
             reject_command_breakers("function", "kernelbase!CreateFileW", Quotes::Rejected).is_ok()
         );
         assert!(reject_command_breakers("function", "ntdll!Nt*", Quotes::Rejected).is_ok());
+    }
+
+    /// `dx` reaches command execution through the data model, so it retires the handle too
+    /// — conservatively, since the command it runs is a runtime string this server never
+    /// sees. The ordinary TTD queries `dx` exists for must not trip it, or the handle would
+    /// be useless for the workflow it was built for.
+    #[test]
+    fn dx_retires_the_handle_only_when_it_reaches_command_execution() {
+        for expression in [
+            "Debugger.Utility.Control.ExecuteCommand(\".opendump C:\\\\b.dmp\")",
+            "@$curprocess.TTD.Events.Select(e => Debugger.Utility.Control.ExecuteCommand(\"g\"))",
+            // Case is not an escape route.
+            "Debugger.Utility.Control.executecommand(\".detach\")",
+        ] {
+            assert!(
+                dx_executes_commands(expression),
+                "`{expression}` must retire the handle"
+            );
+        }
+
+        for expression in [
+            "@$curprocess.TTD.Lifetime",
+            "@$cursession.TTD.Calls(\"ntdll!Nt*\")",
+            "@$cursession.TTD.Calls(\"kernelbase!CreateFileW\").Where(c => c.ReturnValue != 0)",
+            "@$curprocess.TTD.Memory(0x1000, 0x2000, \"rw\")",
+        ] {
+            assert!(
+                !dx_executes_commands(expression),
+                "`{expression}` is an ordinary query and must keep the handle"
+            );
+        }
     }
 
     /// `execute` is the one path that can swap the target without going through a typed

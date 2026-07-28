@@ -80,7 +80,10 @@ a bare `execute`, which only sets the run state and doesn't move the target.
   any thread is live) returns `0x80040205`; `go` to a breakpoint first.
 - **`dx` is the escape hatch for the data model** — any LINQ query beyond the
   `ttd_calls`/`ttd_memory`/`ttd_events` wrappers, e.g.
-  `@$cursession.TTD.Calls("ntdll!NtCreateFile").Where(c => c.ReturnValue != 0)`.
+  `@$cursession.TTD.Calls("ntdll!NtCreateFile").Where(c => c.ReturnValue != 0)`. Note it can also
+  run debugger commands via `Debugger.Utility.Control.ExecuteCommand`, so like `execute` it is
+  annotated destructive and retires your `session_id` when the expression touches command
+  execution. Ordinary TTD queries don't trip it.
 - **TTD is user-mode only** (a Microsoft limitation) — you cannot time-travel a kernel target.
 - **Each tool call is bounded by a per-call timeout** (~60s for load/exec waits); a `go`
   against a long-running live target may hit it.
