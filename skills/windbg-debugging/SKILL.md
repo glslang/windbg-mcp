@@ -54,9 +54,10 @@ a bare `execute`, which only sets the run state and doesn't move the target.
   call. The server process is shared, so another caller can replace the target underneath you —
   with the handle that becomes a clear "stale session handle" error instead of a `read_memory`
   that quietly returns someone else's memory. Omitting it means "whatever session is current".
-  If you never got one back — most likely after an `attach_kernel` that reported a timeout while
-  the engine completed the attach later — call `session_status` to recover it. Do **not** retry
-  the attach or launch; that connects or spawns a second time.
+  If an open **times out**, do not retry it — that connects or spawns a second time. The timeout
+  abandons the wait, not the job, so the open may still land; the message names the `session_id`
+  it would commit. Call `session_status` and adopt the session **only if it reports that same
+  id** — a different id means someone else's open landed and that target is not yours.
 - **A failed debugger operation comes back as a normal tool result**, flagged as an error and
   carrying the debugger's own text — read it and adjust (wrong symbol, unmapped address, target
   still running). Only a dead engine surfaces as a transport-level protocol error.
