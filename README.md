@@ -229,6 +229,13 @@ The guarantee is *detection, not exclusion*: the opening tools deliberately take
 holding a handle does not stop another caller replacing your target — it guarantees that any later
 call of yours which supplies the handle fails loudly instead of acting on a target you did not open.
 
+One caveat, in `execute`. The typed tools announce their own transitions, but the raw hatch can
+replace the target directly (`.opendump`, `.attach`, `.detach`, `.kill`, `.restart`, `.abandon`,
+`.remote`, `q`/`qd`/`qq`), and those commands retire the current handle. The match is deliberately
+biased toward retiring: over-matching costs one re-open, under-matching would let a stale handle
+through. It cannot be exhaustive, though — DbgEng has more ways to reach the target than a name list
+can enumerate — so inside `execute` a handle is a strong hint rather than a guarantee.
+
 The argument is optional — omit it and a call operates on whatever session is current, exactly as
 before. `decode_ioctl` (pure) and `record_trace` (independent of the debug session) do not take it.
 

@@ -1346,6 +1346,41 @@ fn lock(session: &Mutex<Option<String>>) -> std::sync::MutexGuard<'_, Option<Str
     session.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Does this raw `execute` command replace or release the debug target?
+///
+/// The typed tools announce their own transitions, but `execute` is an escape hatch: a
+/// caller can `.opendump` a different file, or `.detach`, and every handle issued for the
+/// old target is then meaningless. Matching the first token of each `;`-separated segment
+/// catches the session-control commands by name.
+///
+/// This is deliberately **best-effort, biased toward retiring the handle**. Over-matching
+/// costs a caller one re-open; under-matching would let a stale handle pass, which is the
+/// failure this mechanism exists to prevent. It cannot be exhaustive — DbgEng has more ways
+/// to reach the target than a name list can enumerate — so `execute` remains the one place
+/// where a handle is a strong hint rather than a guarantee.
+fn changes_debug_target(command: &str) -> bool {
+    /// Session-control commands: open, attach to, release, or terminate a target.
+    const RETIRES_SESSION: &[&str] = &[
+        ".opendump",
+        ".attach",
+        ".detach",
+        ".kill",
+        ".restart",
+        ".create",
+        ".abandon",
+        ".remote",
+        "q",
+        "qd",
+        "qq",
+    ];
+    command.split(';').any(|segment| {
+        segment
+            .split_whitespace()
+            .next()
+            .is_some_and(|first| RETIRES_SESSION.contains(&first.to_ascii_lowercase().as_str()))
+    })
+}
+
 /// Builds the deferred session check.
 ///
 /// The returned closure reads the session *when it runs*, not when it is built — that is
@@ -1404,14 +1439,16 @@ impl WindbgServer {
 
 // ---- Tools ---------------------------------------------------------------
 //
-// On `open_world_hint`: with a symbol server on the symbol path — the documented, and
-// recommended, setup — almost anything here can make DbgEng reach out and download a PDB.
-// It is not just the obvious symbol-pattern queries: `r` symbolizes the current
-// instruction, `k` symbolizes every frame, `bp module!Symbol` resolves a name. So the hint
-// is true for all of them, and false only where it is genuinely, structurally false:
-// `read_memory` (raw bytes to a hex dump), `decode_ioctl` (pure arithmetic, no engine at
-// all), and `end_session` (teardown). Claiming otherwise would tell a client that a tool
-// cannot touch the network and let it skip whatever consent that decision gates.
+// On `open_world_hint`: everything that touches a debug target is open-world, and only
+// `decode_ioctl` — pure arithmetic on a control code, which never reaches the engine — is
+// not. Two independent reasons put the rest over the line. A symbol server on the symbol
+// path (the documented, recommended setup) means almost any command can make DbgEng
+// download a PDB, and not only the obvious symbol-pattern queries: `r` symbolizes the
+// current instruction, `k` symbolizes every frame, `bp module!Symbol` resolves a name.
+// And a session opened over KDNET puts the *target itself* on the far side of a network
+// link, so even `read_memory` fetching raw bytes, or `end_session` releasing the target,
+// is remote traffic. Claiming otherwise would tell a client the tool cannot touch the
+// network and let it skip whatever consent that decision gates.
 
 #[rmcp::tool_router]
 impl WindbgServer {
@@ -1637,7 +1674,7 @@ impl WindbgServer {
         read_only_hint = false,
         destructive_hint = true,
         idempotent_hint = true,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn end_session(
         &self,
@@ -1663,6 +1700,8 @@ impl WindbgServer {
     }
 
     /// Run a raw debugger command and return its full output. The universal escape hatch.
+    /// A command that replaces or releases the target (`.opendump`, `.attach`, `.detach`, …)
+    /// retires the current `session_id`; see [`changes_debug_target`].
     #[rmcp::tool(annotations(
         title = "Run raw debugger command",
         read_only_hint = false,
@@ -1675,9 +1714,23 @@ impl WindbgServer {
         Parameters(args): Parameters<ExecuteArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let gate = self.session_gate(args.session_id.as_deref());
+        let session = Arc::clone(&self.session);
+        let retires_session = changes_debug_target(&args.command);
+        // Both steps run on the engine thread, immediately before the command, for the same
+        // ordering reason the gate does.
+        let precheck = move || {
+            gate()?;
+            if retires_session {
+                // Dropped *before* the command runs, not after: a `.detach` that reports an
+                // error may still have detached, and a handle that outlives its target is
+                // the failure mode this whole mechanism exists to prevent.
+                *lock(&session) = None;
+            }
+            Ok(())
+        };
         // Bounded: a runaway raw command (e.g. an unbounded `s` search) self-aborts instead
         // of pinning the engine thread and wedging every later call.
-        let out = self.engine.run_command(args.command, gate).await;
+        let out = self.engine.run_command(args.command, precheck).await;
         engine_result(out)
     }
 
@@ -1718,7 +1771,7 @@ impl WindbgServer {
     #[rmcp::tool(annotations(
         title = "Read memory",
         read_only_hint = true,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn read_memory(
         &self,
@@ -2574,9 +2627,9 @@ mod tests {
         }
     }
 
-    /// Only the tools that structurally cannot reach a symbol server may say so. Everything
-    /// else can trigger a PDB download once a symbol server is on the path, and a client may
-    /// be gating network consent on this hint.
+    /// Only a tool that structurally cannot reach the network may say so. Everything that
+    /// touches a target can trigger a PDB download, and over KDNET the target itself is
+    /// remote — so `decode_ioctl`, which never reaches the engine, is the only one left.
     #[test]
     fn only_the_tools_that_cannot_reach_the_network_are_closed_world() {
         let closed: Vec<String> = WindbgServer::tool_router()
@@ -2590,7 +2643,7 @@ mod tests {
             .map(|t| t.name.to_string())
             .collect();
 
-        assert_eq!(closed, ["decode_ioctl", "end_session", "read_memory"]);
+        assert_eq!(closed, ["decode_ioctl"]);
     }
 
     /// Session-scoped tools take a handle; the two that are genuinely session-independent
@@ -2674,6 +2727,48 @@ mod tests {
         let gate = session_gate_for(Arc::clone(&session), None);
         *lock(&session) = Some("sess-B".to_string());
         assert!(gate().is_ok());
+    }
+
+    /// `execute` is the one path that can swap the target without going through a typed
+    /// tool, so the session-control commands have to retire the handle — otherwise a
+    /// `.detach` followed by `read_memory(session_id=A)` reads a target A never opened.
+    #[test]
+    fn session_control_commands_retire_the_handle() {
+        for cmd in [
+            ".detach",
+            ".opendump c:\\crash.dmp",
+            ".attach 0n4242",
+            ".kill",
+            ".restart",
+            ".abandon",
+            "qd",
+            // Case and chaining must not be an escape route.
+            ".DETACH",
+            "db @rip; .detach",
+        ] {
+            assert!(
+                changes_debug_target(cmd),
+                "`{cmd}` should retire the handle"
+            );
+        }
+    }
+
+    /// Over-matching only costs a re-open, but it should still not fire on ordinary
+    /// inspection commands, or the handle would be useless in practice.
+    #[test]
+    fn ordinary_commands_keep_the_handle() {
+        for cmd in [
+            "db @rip",
+            "dt nt!_EPROCESS",
+            "!ext.analyze -v",
+            "u rip",
+            "lm m HEVD",
+            // Starts with a token that merely contains a listed command as a substring.
+            ".sympath+ c:\\symbols\\qd",
+            ".reload /f",
+        ] {
+            assert!(!changes_debug_target(cmd), "`{cmd}` should keep the handle");
+        }
     }
 
     #[test]

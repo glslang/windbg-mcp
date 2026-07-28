@@ -27,14 +27,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   close B. The guarantee is detection rather than exclusion — the opening tools take no
   handle, so holding one does not prevent a replacement, it makes any later call of yours
   that supplies the handle fail instead of acting on the wrong target.
+
+  `execute` is the one path that can swap the target without going through a typed tool, so
+  the session-control commands (`.opendump`, `.attach`, `.detach`, `.kill`, `.restart`,
+  `.abandon`, `.remote`, `q`/`qd`/`qq`) retire the current handle. The match is biased
+  toward retiring — over-matching costs a re-open, under-matching would let a stale handle
+  through — but it cannot be exhaustive, so inside `execute` a handle is a strong hint
+  rather than a guarantee.
 - **Tool behaviour annotations.** All 36 tools now declare a title and the
   read-only / destructive / idempotent / open-world hints, so a client can tell
-  `read_memory` apart from `execute` before prompting the user. `openWorldHint` is true
-  for every tool that can make DbgEng pull a PDB from the configured symbol server, which
-  is nearly all of them once a symbol server is on the path — `r` symbolizes the current
-  instruction, `k` symbolizes every frame, `bp module!Symbol` resolves a name. It is false
-  only for `read_memory` (raw bytes), `decode_ioctl` (pure), and `end_session` (teardown),
-  since a client may be gating network consent on that hint.
+  `read_memory` apart from `execute` before prompting the user. `openWorldHint` is true for
+  everything that touches a debug target and false only for `decode_ioctl`, which never
+  reaches the engine. Two reasons put the rest over the line: a symbol server on the path
+  means almost any command can pull a PDB (`r` symbolizes the current instruction, `k`
+  symbolizes every frame, `bp module!Symbol` resolves a name), and a KDNET session puts the
+  target itself across a network link, so even a raw `read_memory` is remote traffic. A
+  client may be gating network consent on that hint.
 
 ### Changed
 
