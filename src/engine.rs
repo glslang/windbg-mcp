@@ -122,7 +122,14 @@ impl EngineHandle {
     /// an unbounded `s` memory search) pinning the single engine thread and wedging every later
     /// call. Use this for command-executing tools (`execute`, `dx`, the `ttd_*` wrappers); the
     /// quick, inherently-bounded operations can keep using [`Self::run`].
-    pub async fn run_command(&self, command: String) -> Result<String, EngineError> {
+    ///
+    /// `precheck` runs **on the engine thread**, immediately before the command and after any
+    /// job queued ahead of it. Callers use it for gates that must not be evaluated while
+    /// earlier work is still in flight — see [`crate::server`]'s session handles.
+    pub async fn run_command<P>(&self, command: String, precheck: P) -> Result<String, EngineError>
+    where
+        P: FnOnce() -> Result<(), String> + Send + 'static,
+    {
         // The outer timeout in `run` starts counting at *submission*, but this command may sit
         // in the engine queue behind another job (e.g. a backgrounded `go`) before reaching the
         // worker. Compute the watchdog budget from the time *remaining* until that timeout — not
@@ -131,6 +138,7 @@ impl EngineHandle {
         let call_timeout = self.call_timeout;
         let submitted = Instant::now();
         self.run(move |e| {
+            precheck()?;
             // Floor the budget so a command dequeued near the deadline still arms the watchdog
             // (a 0 budget disables it) and thus still frees the engine promptly.
             let budget_ms = call_timeout

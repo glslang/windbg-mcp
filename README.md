@@ -220,6 +220,15 @@ a session: a client may interleave unrelated requests over the same stdio proces
 a `read_memory` issued after someone else's `open_dump` silently reads the wrong target. Passing
 `session_id` turns that into a visible error instead.
 
+The check runs **on the engine thread**, in the same queued job as the debugger call it guards.
+That ordering is what makes it sound: checking on the caller side would leave a window in which a
+concurrently-issued `open_dump` is queued ahead of a call that already passed validation, so the
+call would still execute against the replaced target.
+
+The guarantee is *detection, not exclusion*: the opening tools deliberately take no `session_id`, so
+holding a handle does not stop another caller replacing your target — it guarantees that any later
+call of yours which supplies the handle fails loudly instead of acting on a target you did not open.
+
 The argument is optional — omit it and a call operates on whatever session is current, exactly as
 before. `decode_ioctl` (pure) and `record_trace` (independent of the debug session) do not take it.
 

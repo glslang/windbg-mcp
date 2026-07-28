@@ -16,7 +16,7 @@ use rmcp::model::{CallToolResult, Content};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use win_kexp::dbgeng::RunToOutcome;
+use win_kexp::dbgeng::{DebugEngine, RunToOutcome};
 
 use crate::engine::{EngineError, EngineHandle};
 use crate::ttd;
@@ -1302,7 +1302,16 @@ pub struct RunToAddressArgs {
 // refuses to run when it no longer matches.
 //
 // The handle is optional so existing callers keep working; supplying it is what buys
-// the guarantee that a call can never land on a target it did not open.
+// the guarantee that a call which does supply one can never land on a target it did
+// not open.
+//
+// That guarantee only holds because both the check and the session transition happen
+// **on the engine thread**, inside the same queued job as the debugger call itself.
+// Checking on the async side instead would be a time-of-check/time-of-use bug: with
+// session A current, an `open_dump` for B can already be in flight while `session`
+// still reads A, so an `end_session(session_id=A)` would pass the check, queue behind
+// the open, and then close B. The engine queue is the only serialisation point that
+// orders against DbgEng access, so the gate has to live on it.
 
 /// The session-handle policy, as a pure function so it unit-tests without an engine.
 ///
@@ -1330,42 +1339,64 @@ fn check_session_handle(current: Option<&str>, supplied: Option<&str>) -> Result
     }
 }
 
+/// A poisoned lock only ever means a previous holder panicked mid-update; the value is a
+/// plain `Option<String>` and cannot be left inconsistent, so recovering beats poisoning
+/// every later tool call. The lock is never held across a debugger operation.
+fn lock(session: &Mutex<Option<String>>) -> std::sync::MutexGuard<'_, Option<String>> {
+    session.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Builds the deferred session check.
+///
+/// The returned closure reads the session *when it runs*, not when it is built — that is
+/// the whole point, and it is why the gate must be handed to the engine thread rather than
+/// evaluated by the caller. Free function so it tests without an engine.
+fn session_gate_for(
+    session: Arc<Mutex<Option<String>>>,
+    supplied: Option<&str>,
+) -> impl FnOnce() -> Result<(), String> + Send + 'static + use<> {
+    let supplied = supplied.map(str::to_owned);
+    move || check_session_handle(lock(&session).as_deref(), supplied.as_deref())
+}
+
 impl WindbgServer {
-    /// Records a newly opened target and returns its handle.
-    fn begin_session(&self) -> String {
+    /// Builds the session gate for a caller-supplied handle. The returned closure is run
+    /// *by the engine thread*, immediately before the debugger operation it guards — see
+    /// the module note above for why checking any earlier is unsound.
+    fn session_gate(
+        &self,
+        supplied: Option<&str>,
+    ) -> impl FnOnce() -> Result<(), String> + Send + 'static + use<> {
+        session_gate_for(Arc::clone(&self.session), supplied)
+    }
+
+    /// Runs a session-opening operation and takes ownership of the session in the same
+    /// queued job, so no other call can be ordered across the transition.
+    async fn opened_result<F>(&self, f: F) -> Result<CallToolResult, ErrorData>
+    where
+        F: FnOnce(&DebugEngine) -> Result<String, String> + Send + 'static,
+    {
         let id = mint_session_id();
-        *self.session_lock() = Some(id.clone());
-        id
-    }
-
-    /// Forgets the current target, so handles held by callers now read as stale.
-    fn clear_session(&self) {
-        *self.session_lock() = None;
-    }
-
-    /// A poisoned lock here only ever means a previous holder panicked mid-update; the
-    /// value itself is a plain `Option<String>` and cannot be left inconsistent, so
-    /// recovering beats propagating the panic into every later tool call.
-    fn session_lock(&self) -> std::sync::MutexGuard<'_, Option<String>> {
-        self.session.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// Validates a caller-supplied handle against the target actually loaded.
-    fn check_session(&self, supplied: Option<&str>) -> Result<(), String> {
-        check_session_handle(self.session_lock().as_deref(), supplied)
-    }
-
-    /// Renders a session-creating tool's outcome, minting a handle on success.
-    fn opened_result(&self, r: Result<String, EngineError>) -> Result<CallToolResult, ErrorData> {
-        match r {
-            Ok(out) => {
-                let id = self.begin_session();
-                text_result(format!(
-                    "{out}\n\nsession_id: {id}\nPass this as `session_id` on later calls so they \
-                     fail loudly instead of silently acting on a different target if this \
-                     server's session is replaced."
-                ))
-            }
+        let session = Arc::clone(&self.session);
+        let new_id = id.clone();
+        let out = self
+            .engine
+            .run(move |e| {
+                // The target is being replaced, so every handle issued so far is stale from
+                // here on — including if the open fails partway and leaves the engine holding
+                // neither the old target nor a usable new one.
+                *lock(&session) = None;
+                let out = f(e)?;
+                *lock(&session) = Some(new_id);
+                Ok(out)
+            })
+            .await;
+        match out {
+            Ok(out) => text_result(format!(
+                "{out}\n\nsession_id: {id}\nPass this as `session_id` on later calls so they \
+                 fail loudly instead of silently acting on a different target if this \
+                 server's session is replaced."
+            )),
             Err(e) => engine_result(Err(e)),
         }
     }
@@ -1395,22 +1426,19 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<PathArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = self
-            .engine
-            .run(move |e| {
-                e.open_dump(&args.path).map_err(es)?;
-                e.wait_for_event(LOAD_WAIT_MS).map_err(es)?;
-                // Load the WinDbg extension DLL so `!`-extension commands resolve — most
-                // importantly `!ext.analyze -v`, the crash-dump triage workhorse. A bare
-                // engine doesn't auto-load it, and even after `.load ext` the unqualified
-                // `!analyze` won't resolve, so callers must use `!ext.analyze`. Best-effort:
-                // a minimal engine without a bundled `winext\` directory simply won't have
-                // ext.dll, which must not fail the open (live/dump state is still usable).
-                let _ = e.execute_command(".load ext");
-                e.execute_command("lm").map_err(es)
-            })
-            .await;
-        self.opened_result(out)
+        self.opened_result(move |e| {
+            e.open_dump(&args.path).map_err(es)?;
+            e.wait_for_event(LOAD_WAIT_MS).map_err(es)?;
+            // Load the WinDbg extension DLL so `!`-extension commands resolve — most
+            // importantly `!ext.analyze -v`, the crash-dump triage workhorse. A bare
+            // engine doesn't auto-load it, and even after `.load ext` the unqualified
+            // `!analyze` won't resolve, so callers must use `!ext.analyze`. Best-effort:
+            // a minimal engine without a bundled `winext\` directory simply won't have
+            // ext.dll, which must not fail the open (live/dump state is still usable).
+            let _ = e.execute_command(".load ext");
+            e.execute_command("lm").map_err(es)
+        })
+        .await
     }
 
     /// Open a TTD trace (.run); alias of open_dump. Enables time-travel navigation and TTD queries.
@@ -1426,9 +1454,7 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<PathArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = self
-            .engine
-            .run(move |e| {
+        self.opened_result(move |e| {
                 e.open_trace(&args.path).map_err(es)?;
                 e.wait_for_event(LOAD_WAIT_MS).map_err(es)?;
                 // Check the index state *before* any data-model query: `!ttdext.index -status`
@@ -1460,9 +1486,8 @@ impl WindbgServer {
                     );
                 }
                 Ok(out)
-            })
-            .await;
-        self.opened_result(out)
+        })
+        .await
     }
 
     /// Attach to the local kernel (live local kernel debugging).
@@ -1475,21 +1500,18 @@ impl WindbgServer {
         open_world_hint = true
     ))]
     async fn attach_kernel_local(&self) -> Result<CallToolResult, ErrorData> {
-        let out = self
-            .engine
-            .run(move |e| {
-                // attach_local_kernel breaks the target in internally (INITIAL_BREAK +
-                // an INFINITE wait, as a live kernel requires).
-                e.attach_local_kernel().map_err(es)?;
-                // The driver_object/device_object/irp_stack tools use kernel-extension
-                // commands (!drvobj/!devobj/!irp) from kdexts.dll, which a bare engine does
-                // not auto-load. Best-effort, like open_dump's `.load ext`; harmless if the
-                // extension isn't bundled (those tools then report a clean "no export").
-                let _ = e.execute_command(".load kdexts");
-                e.execute_command("vertarget").map_err(es)
-            })
-            .await;
-        self.opened_result(out)
+        self.opened_result(move |e| {
+            // attach_local_kernel breaks the target in internally (INITIAL_BREAK +
+            // an INFINITE wait, as a live kernel requires).
+            e.attach_local_kernel().map_err(es)?;
+            // The driver_object/device_object/irp_stack tools use kernel-extension
+            // commands (!drvobj/!devobj/!irp) from kdexts.dll, which a bare engine does
+            // not auto-load. Best-effort, like open_dump's `.load ext`; harmless if the
+            // extension isn't bundled (those tools then report a clean "no export").
+            let _ = e.execute_command(".load kdexts");
+            e.execute_command("vertarget").map_err(es)
+        })
+        .await
     }
 
     /// Attach to a kernel target over a connection string (e.g. KDNET).
@@ -1505,19 +1527,16 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<ConnectionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = self
-            .engine
-            .run(move |e| {
-                // attach_kernel connects, requests an initial break, and waits (INFINITE,
-                // as a live kernel requires) for the break-in — all internally.
-                e.attach_kernel(&args.connection).map_err(es)?;
-                // Load kdexts.dll so the driver_object/device_object/irp_stack tools'
-                // !drvobj/!devobj/!irp commands resolve (see attach_kernel_local). Best-effort.
-                let _ = e.execute_command(".load kdexts");
-                e.execute_command("vertarget").map_err(es)
-            })
-            .await;
-        self.opened_result(out)
+        self.opened_result(move |e| {
+            // attach_kernel connects, requests an initial break, and waits (INFINITE,
+            // as a live kernel requires) for the break-in — all internally.
+            e.attach_kernel(&args.connection).map_err(es)?;
+            // Load kdexts.dll so the driver_object/device_object/irp_stack tools'
+            // !drvobj/!devobj/!irp commands resolve (see attach_kernel_local). Best-effort.
+            let _ = e.execute_command(".load kdexts");
+            e.execute_command("vertarget").map_err(es)
+        })
+        .await
     }
 
     /// Set or extend the symbol search path, then reload symbols, so `module!Symbol`
@@ -1537,13 +1556,12 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SymbolPathArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let append = args.append.unwrap_or(true);
         let out = self
             .engine
             .run(move |e| {
+                gate()?;
                 if append {
                     e.append_symbol_path(&args.path).map_err(es)?;
                 } else {
@@ -1573,15 +1591,12 @@ impl WindbgServer {
         Parameters(args): Parameters<PidArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let pid = args.pid;
-        let out = self
-            .engine
-            .run(move |e| {
-                // attach_process waits for the break-in internally.
-                e.attach_process(pid).map_err(es)?;
-                e.execute_command("r").map_err(es)
-            })
-            .await;
-        self.opened_result(out)
+        self.opened_result(move |e| {
+            // attach_process waits for the break-in internally.
+            e.attach_process(pid).map_err(es)?;
+            e.execute_command("r").map_err(es)
+        })
+        .await
     }
 
     /// Launch a new user-mode process under the debugger, stopping at the initial breakpoint.
@@ -1597,15 +1612,12 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<CommandLineArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = self
-            .engine
-            .run(move |e| {
-                // launch_process waits for the initial break internally.
-                e.launch_process(&args.command_line).map_err(es)?;
-                e.execute_command("r").map_err(es)
-            })
-            .await;
-        self.opened_result(out)
+        self.opened_result(move |e| {
+            // launch_process waits for the initial break internally.
+            e.launch_process(&args.command_line).map_err(es)?;
+            e.execute_command("r").map_err(es)
+        })
+        .await
     }
 
     /// End the current debug session (detach/close the target) without exiting the server.
@@ -1622,20 +1634,22 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
+        let session = Arc::clone(&self.session);
         let out = self
             .engine
             .run(move |e| {
-                e.end_session()
+                gate()?;
+                let out = e
+                    .end_session()
                     .map(|_| "session ended".to_string())
-                    .map_err(es)
+                    .map_err(es)?;
+                // Cleared in the same job as the teardown, so a call queued behind this one
+                // sees "no session open" rather than a handle that outlived its target.
+                *lock(&session) = None;
+                Ok(out)
             })
             .await;
-        if out.is_ok() {
-            self.clear_session();
-        }
         engine_result(out)
     }
 
@@ -1651,12 +1665,10 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<ExecuteArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         // Bounded: a runaway raw command (e.g. an unbounded `s` search) self-aborts instead
         // of pinning the engine thread and wedging every later call.
-        let out = self.engine.run_command(args.command).await;
+        let out = self.engine.run_command(args.command, gate).await;
         engine_result(out)
     }
 
@@ -1670,10 +1682,14 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
-        let out = self.engine.run(move |e| e.registers().map_err(es)).await;
+        let gate = self.session_gate(args.session_id.as_deref());
+        let out = self
+            .engine
+            .run(move |e| {
+                gate()?;
+                e.registers().map_err(es)
+            })
+            .await;
         // DbgEng prints nothing for `r` when there is no live thread context (e.g. a
         // module-load break, or a bare goto_position to the very start of a trace).
         let out = out.map(|s| {
@@ -1699,13 +1715,12 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<ReadMemoryArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let size = args.size;
         let out = self
             .engine
             .run(move |e| {
+                gate()?;
                 let addr = parse_u64(&args.address)?;
                 let bytes = e.read_memory(addr, size as usize).map_err(es)?;
                 Ok(hexdump(addr, &bytes))
@@ -1724,12 +1739,13 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
             .engine
-            .run(move |e| e.execute_command("k").map_err(es))
+            .run(move |e| {
+                gate()?;
+                e.execute_command("k").map_err(es)
+            })
             .await;
         engine_result(out)
     }
@@ -1744,12 +1760,13 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
             .engine
-            .run(move |e| e.execute_command("lm").map_err(es))
+            .run(move |e| {
+                gate()?;
+                e.execute_command("lm").map_err(es)
+            })
             .await;
         engine_result(out)
     }
@@ -1764,12 +1781,13 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
             .engine
-            .run(move |e| e.execute_command("~").map_err(es))
+            .run(move |e| {
+                gate()?;
+                e.execute_command("~").map_err(es)
+            })
             .await;
         engine_result(out)
     }
@@ -1784,16 +1802,17 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<DisassembleArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let cmd = match args.address {
             Some(a) => format!("u {a}"),
             None => "u".to_string(),
         };
         let out = self
             .engine
-            .run(move |e| e.execute_command(&cmd).map_err(es))
+            .run(move |e| {
+                gate()?;
+                e.execute_command(&cmd).map_err(es)
+            })
             .await;
         engine_result(out)
     }
@@ -1807,13 +1826,11 @@ impl WindbgServer {
         open_world_hint = false
     ))]
     async fn dx(&self, Parameters(args): Parameters<DxArgs>) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let cmd = format!("dx {}", args.expression);
         // Bounded: a data-model query that runs away (e.g. a heavy LINQ or index build on a
         // huge trace) self-aborts rather than pinning the engine thread.
-        let out = self.engine.run_command(cmd).await;
+        let out = self.engine.run_command(cmd, gate).await;
         engine_result(out)
     }
 
@@ -1830,11 +1847,9 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<TtdCallsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let cmd = format!("dx @$cursession.TTD.Calls(\"{}\")", args.function);
-        let out = self.engine.run_command(cmd).await;
+        let out = self.engine.run_command(cmd, gate).await;
         engine_result(out)
     }
 
@@ -1850,9 +1865,7 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<TtdMemoryArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         // A bad address is the model's mistake to fix, so it comes back as a tool error
         // rather than a protocol error the model cannot act on.
         let start = match parse_u64(&args.address) {
@@ -1867,7 +1880,7 @@ impl WindbgServer {
             ),
             _ => format!("dx @$cursession.TTD.Memory(0x{start:x}, 0x{end:x})"),
         };
-        let out = self.engine.run_command(cmd).await;
+        let out = self.engine.run_command(cmd, gate).await;
         engine_result(out)
     }
 
@@ -1883,12 +1896,10 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
             .engine
-            .run_command("dx -r2 @$curprocess.TTD.Events".to_string())
+            .run_command("dx -r2 @$curprocess.TTD.Events".to_string(), gate)
             .await;
         engine_result(out)
     }
@@ -1905,13 +1916,14 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<BreakpointArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let cmd = format!("bp {}", args.expression);
         let out = self
             .engine
-            .run(move |e| e.execute_command(&cmd).map_err(es))
+            .run(move |e| {
+                gate()?;
+                e.execute_command(&cmd).map_err(es)
+            })
             .await;
         engine_result(out)
     }
@@ -1928,12 +1940,13 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
             .engine
-            .run(move |e| e.execute_and_wait("g", EXEC_WAIT_MS).map_err(es))
+            .run(move |e| {
+                gate()?;
+                e.execute_and_wait("g", EXEC_WAIT_MS).map_err(es)
+            })
             .await;
         engine_result(out)
     }
@@ -1955,12 +1968,11 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<RunToAddressArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
             .engine
             .run(move |e| {
+                gate()?;
                 // Resolve the target the same WinDbg-aware way as `reachable_from_dispatch`.
                 let resolve = |expr: &str| -> Option<u64> {
                     e.execute_command(&format!("? {expr}"))
@@ -2013,12 +2025,13 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
             .engine
-            .run(move |e| e.execute_and_wait("p", EXEC_WAIT_MS).map_err(es))
+            .run(move |e| {
+                gate()?;
+                e.execute_and_wait("p", EXEC_WAIT_MS).map_err(es)
+            })
             .await;
         engine_result(out)
     }
@@ -2035,12 +2048,13 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
             .engine
-            .run(move |e| e.execute_and_wait("t", EXEC_WAIT_MS).map_err(es))
+            .run(move |e| {
+                gate()?;
+                e.execute_and_wait("t", EXEC_WAIT_MS).map_err(es)
+            })
             .await;
         engine_result(out)
     }
@@ -2059,12 +2073,13 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
             .engine
-            .run(move |e| e.execute_and_wait("t-", EXEC_WAIT_MS).map_err(es))
+            .run(move |e| {
+                gate()?;
+                e.execute_and_wait("t-", EXEC_WAIT_MS).map_err(es)
+            })
             .await;
         engine_result(out)
     }
@@ -2081,12 +2096,13 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
             .engine
-            .run(move |e| e.execute_and_wait("p-", EXEC_WAIT_MS).map_err(es))
+            .run(move |e| {
+                gate()?;
+                e.execute_and_wait("p-", EXEC_WAIT_MS).map_err(es)
+            })
             .await;
         engine_result(out)
     }
@@ -2103,12 +2119,13 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
             .engine
-            .run(move |e| e.execute_and_wait("g-", EXEC_WAIT_MS).map_err(es))
+            .run(move |e| {
+                gate()?;
+                e.execute_and_wait("g-", EXEC_WAIT_MS).map_err(es)
+            })
             .await;
         engine_result(out)
     }
@@ -2125,13 +2142,14 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<PositionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let cmd = format!("!tt {}", args.position);
         let out = self
             .engine
-            .run(move |e| e.execute_command(&cmd).map_err(es))
+            .run(move |e| {
+                gate()?;
+                e.execute_command(&cmd).map_err(es)
+            })
             .await;
         engine_result(out)
     }
@@ -2154,12 +2172,13 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
             .engine
-            .run(move |e| e.execute_command("!ttdext.index -force").map_err(es))
+            .run(move |e| {
+                gate()?;
+                e.execute_command("!ttdext.index -force").map_err(es)
+            })
             .await;
         engine_result(out)
     }
@@ -2246,13 +2265,14 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<DriverObjectArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let cmd = format!("!drvobj {} 7", args.name);
         let out = self
             .engine
-            .run(move |e| e.execute_command(&cmd).map_err(es))
+            .run(move |e| {
+                gate()?;
+                e.execute_command(&cmd).map_err(es)
+            })
             .await;
         engine_result(out)
     }
@@ -2270,13 +2290,14 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<DeviceObjectArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let cmd = format!("!devobj {}", args.device);
         let out = self
             .engine
-            .run(move |e| e.execute_command(&cmd).map_err(es))
+            .run(move |e| {
+                gate()?;
+                e.execute_command(&cmd).map_err(es)
+            })
             .await;
         engine_result(out)
     }
@@ -2293,14 +2314,15 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<IrpStackArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let irp = args.irp.unwrap_or_else(|| "@rdx".to_string());
         let cmd = format!("!irp {irp} 1");
         let out = self
             .engine
-            .run(move |e| e.execute_command(&cmd).map_err(es))
+            .run(move |e| {
+                gate()?;
+                e.execute_command(&cmd).map_err(es)
+            })
             .await;
         engine_result(out)
     }
@@ -2321,9 +2343,7 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<IoctlTraceArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         // IRP in @rdx at dispatch entry (x64). CurrentStackLocation = poi(Irp+0xb8).
         // Within IO_STACK_LOCATION: OutputBufferLength +0x08, InputBufferLength +0x10,
         // IoControlCode +0x18 (Parameters union begins at +0x08).
@@ -2334,7 +2354,10 @@ impl WindbgServer {
         );
         let out = self
             .engine
-            .run(move |e| e.execute_command(&cmd).map_err(es))
+            .run(move |e| {
+                gate()?;
+                e.execute_command(&cmd).map_err(es)
+            })
             .await;
         engine_result(out)
     }
@@ -2355,12 +2378,11 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<ReachabilityArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = self.check_session(args.session_id.as_deref()) {
-            return tool_error(e);
-        }
+        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
             .engine
             .run(move |e| {
+                gate()?;
                 // Resolve an address/offset expression the way `uf`/WinDbg read it:
                 // evaluate `? <expr>` first (the MASM evaluator's default base is hex, so
                 // a bare `00401234` is 0x00401234 and `module!Dispatch+0x123` resolves),
@@ -2591,6 +2613,39 @@ mod tests {
     fn handle_is_refused_once_the_session_is_ended() {
         let err = check_session_handle(None, Some("sess-1")).unwrap_err();
         assert!(err.contains("no debug session open"), "{err}");
+    }
+
+    /// The gate must read the session at execution time. Building it and evaluating it at
+    /// submission time — the obvious-looking caller-side check — leaves a window in which a
+    /// concurrent `open_*` replaces the target between the check and the debugger call, so
+    /// a call that passed validation still runs against the wrong session.
+    #[test]
+    fn the_gate_reads_the_session_when_it_runs_not_when_it_is_built() {
+        let session = Arc::new(Mutex::new(Some("sess-A".to_string())));
+        let gate = session_gate_for(Arc::clone(&session), Some("sess-A"));
+
+        // A concurrent open lands after the gate was built but before it runs.
+        *lock(&session) = Some("sess-B".to_string());
+
+        let err = gate().unwrap_err();
+        assert!(err.contains("sess-B"), "{err}");
+    }
+
+    #[test]
+    fn the_gate_passes_when_the_session_is_unchanged_at_execution_time() {
+        let session = Arc::new(Mutex::new(Some("sess-A".to_string())));
+        let gate = session_gate_for(Arc::clone(&session), Some("sess-A"));
+        assert!(gate().is_ok());
+    }
+
+    /// A target replaced while the caller held no handle is still their problem to opt into,
+    /// so an absent handle keeps passing whatever the session did in the meantime.
+    #[test]
+    fn an_absent_handle_still_passes_after_a_replacement() {
+        let session = Arc::new(Mutex::new(Some("sess-A".to_string())));
+        let gate = session_gate_for(Arc::clone(&session), None);
+        *lock(&session) = Some("sess-B".to_string());
+        assert!(gate().is_ok());
     }
 
     #[test]
