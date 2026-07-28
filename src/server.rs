@@ -6,6 +6,7 @@
 //! `win-kexp` methods and then wait for the target to stop.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1444,7 +1445,15 @@ impl WindbgServer {
                 // The target is ours from here, so a failed diagnostic still has to hand the
                 // caller their handle — otherwise they cannot use the protection this whole
                 // mechanism promises without re-running a side-effecting open.
-                report(e).map_err(|err| {
+                //
+                // Caught here rather than left to the worker's outer guard: a panic in a
+                // win-kexp method (several use `.expect`) would unwind straight past the
+                // `map_err` below and strip the handle off a session that is already
+                // committed. The engine survives a caught panic either way — the thing that
+                // must not be lost is the id.
+                let reported = catch_unwind(AssertUnwindSafe(|| report(e)))
+                    .unwrap_or_else(|_| Err("debugger operation panicked".to_string()));
+                reported.map_err(|err| {
                     format!(
                         "{err}\n\nsession_id: {id_for_report}\nThe target opened; only this \
                          follow-up report failed, so the handle above is valid and usable."
