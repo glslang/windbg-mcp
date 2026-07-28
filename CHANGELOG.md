@@ -35,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than swallowing it. The target is genuinely open at that point, and the only other
   way to obtain a handle is to open again, which for `launch` means spawning a second
   process. A `wait_for_event` that times out counts: the dump or trace is loaded either way.
+  So does a *panic* in the report — several win-kexp methods use `.expect`, and an unwind
+  would otherwise skip straight past the code that attaches the handle.
 
   `execute` is the one path that can swap the target without going through a typed tool, so
   the session-control commands (`.opendump`, `.attach`, `.detach`, `.kill`, `.restart`,
