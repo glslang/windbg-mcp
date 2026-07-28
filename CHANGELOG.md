@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   could silently act on a target it never opened. Omitting the argument keeps the previous
   behaviour, so existing callers are unaffected. `decode_ioctl` (pure) and `record_trace`
   (independent of the session) do not take it.
+
+  The check and the session transition both run **on the engine thread**, in the same
+  queued job as the debugger call, so they are ordered by the queue that already serialises
+  DbgEng access. Validating on the caller side would leave a time-of-check/time-of-use
+  window: with session A current, an `open_dump` for B can be in flight while the session
+  still reads A, so an `end_session(session_id=A)` would pass, queue behind the open, and
+  close B. The guarantee is detection rather than exclusion — the opening tools take no
+  handle, so holding one does not prevent a replacement, it makes any later call of yours
+  that supplies the handle fail instead of acting on the wrong target.
 - **Tool behaviour annotations.** All 36 tools now declare a title and the
   read-only / destructive / idempotent / open-world hints, so a client can tell
   `read_memory` apart from `execute` before prompting the user.
