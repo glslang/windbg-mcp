@@ -29,7 +29,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that supplies the handle fail instead of acting on the wrong target.
 - **Tool behaviour annotations.** All 36 tools now declare a title and the
   read-only / destructive / idempotent / open-world hints, so a client can tell
-  `read_memory` apart from `execute` before prompting the user.
+  `read_memory` apart from `execute` before prompting the user. `openWorldHint` is true
+  for every tool that can make DbgEng pull a PDB from the configured symbol server, which
+  is nearly all of them once a symbol server is on the path — `r` symbolizes the current
+  instruction, `k` symbolizes every frame, `bp module!Symbol` resolves a name. It is false
+  only for `read_memory` (raw bytes), `decode_ioctl` (pure), and `end_session` (teardown),
+  since a client may be gating network consent on that hint.
 
 ### Changed
 
@@ -41,6 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and models largely cannot act on. Only a dead engine thread remains a protocol error.
   Semantic input validation (`decode_ioctl`'s code, `ttd_memory`'s address) moved the same
   way — the request satisfies the schema, so the complaint belongs in the result.
+
+  The classification is made by the engine worker, which is the only place that can tell a
+  failed operation apart from an engine that never came up: a `DebugEngine::new()` failure
+  (missing or unusable `dbgeng.dll`) is permanent and now reports as a protocol error, not
+  as a retryable tool error that invites the model to try again forever.
 
 ### Documentation
 
