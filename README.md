@@ -247,12 +247,13 @@ timeout while the attach completes moments later is normal (see *Limitations & n
 A timed-out open therefore names the handle it *would* commit. Recovery is a two-step check:
 
 1. Note the `session_id` the timeout message gives you.
-2. Call **`session_status`**, which reports the handle the server currently holds.
+2. Poll **`session_status`**, which reports the handle the server currently holds.
 
-Adopt the session only if the two match. If `session_status` reports a *different* id, another
-caller's open landed while yours was in flight and that target is not yours — the mismatch is the
-point of naming the id up front. `session_status` does not queue on the engine thread, so it still
-answers while a parked attach holds it.
+The session is yours once `session_status` reports that same id. A *different* id means yours has
+not landed **yet** — not that it failed: the timeout abandons the wait, not the job, so your open
+may still be queued behind other work and may still run. Keep polling rather than concluding, and
+in either case do not re-run the open. `session_status` does not queue on the engine thread, so it
+still answers while a parked attach holds it.
 
 ### Error reporting
 
