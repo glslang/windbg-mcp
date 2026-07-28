@@ -1407,23 +1407,45 @@ impl WindbgServer {
 
     /// Runs a session-opening operation and takes ownership of the session in the same
     /// queued job, so no other call can be ordered across the transition.
-    async fn opened_result<F>(&self, f: F) -> Result<CallToolResult, ErrorData>
+    ///
+    /// The work is split in two because the split is where correctness lives. `transition`
+    /// is the DbgEng call that actually changes the target; `report` is the follow-up
+    /// diagnostic (`lm`, `vertarget`, `r`, the TTD lifetime query) whose output the caller
+    /// reads. The handle is committed *between* them, so a failing diagnostic cannot cost
+    /// the caller a handle for a target that is genuinely open — which matters because the
+    /// only way to get one back is to open again, and for `launch` that spawns a second
+    /// process.
+    async fn opened_result<T, R>(
+        &self,
+        transition: T,
+        report: R,
+    ) -> Result<CallToolResult, ErrorData>
     where
-        F: FnOnce(&DebugEngine) -> Result<String, String> + Send + 'static,
+        T: FnOnce(&DebugEngine) -> Result<(), String> + Send + 'static,
+        R: FnOnce(&DebugEngine) -> Result<String, String> + Send + 'static,
     {
         let id = mint_session_id();
         let session = Arc::clone(&self.session);
         let new_id = id.clone();
+        let id_for_report = id.clone();
         let out = self
             .engine
             .run(move |e| {
                 // The target is being replaced, so every handle issued so far is stale from
-                // here on — including if the open fails partway and leaves the engine holding
-                // neither the old target nor a usable new one.
+                // here on — including if the transition fails partway and leaves the engine
+                // holding neither the old target nor a usable new one.
                 *lock(&session) = None;
-                let out = f(e)?;
+                transition(e)?;
                 *lock(&session) = Some(new_id);
-                Ok(out)
+                // The target is ours from here, so a failed diagnostic still has to hand the
+                // caller their handle — otherwise they cannot use the protection this whole
+                // mechanism promises without re-running a side-effecting open.
+                report(e).map_err(|err| {
+                    format!(
+                        "{err}\n\nsession_id: {id_for_report}\nThe target opened; only this \
+                         follow-up report failed, so the handle above is valid and usable."
+                    )
+                })
             })
             .await;
         match out {
@@ -1472,18 +1494,22 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<PathArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.opened_result(move |e| {
-            e.open_dump(&args.path).map_err(es)?;
-            e.wait_for_event(LOAD_WAIT_MS).map_err(es)?;
-            // Load the WinDbg extension DLL so `!`-extension commands resolve — most
-            // importantly `!ext.analyze -v`, the crash-dump triage workhorse. A bare
-            // engine doesn't auto-load it, and even after `.load ext` the unqualified
-            // `!analyze` won't resolve, so callers must use `!ext.analyze`. Best-effort:
-            // a minimal engine without a bundled `winext\` directory simply won't have
-            // ext.dll, which must not fail the open (live/dump state is still usable).
-            let _ = e.execute_command(".load ext");
-            e.execute_command("lm").map_err(es)
-        })
+        self.opened_result(
+            move |e| {
+                e.open_dump(&args.path).map_err(es)?;
+                e.wait_for_event(LOAD_WAIT_MS).map_err(es)
+            },
+            |e| {
+                // Load the WinDbg extension DLL so `!`-extension commands resolve — most
+                // importantly `!ext.analyze -v`, the crash-dump triage workhorse. A bare
+                // engine doesn't auto-load it, and even after `.load ext` the unqualified
+                // `!analyze` won't resolve, so callers must use `!ext.analyze`. Best-effort:
+                // a minimal engine without a bundled `winext\` directory simply won't have
+                // ext.dll, which must not fail the open (live/dump state is still usable).
+                let _ = e.execute_command(".load ext");
+                e.execute_command("lm").map_err(es)
+            },
+        )
         .await
     }
 
@@ -1500,9 +1526,12 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<PathArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.opened_result(move |e| {
+        self.opened_result(
+            move |e| {
                 e.open_trace(&args.path).map_err(es)?;
-                e.wait_for_event(LOAD_WAIT_MS).map_err(es)?;
+                e.wait_for_event(LOAD_WAIT_MS).map_err(es)
+            },
+            |e| {
                 // Check the index state *before* any data-model query: `!ttdext.index -status`
                 // only reads the on-disk .idx (never builds), whereas a `dx` on an unindexed
                 // trace can itself trigger the long in-memory index build. TtdExt reports a
@@ -1532,7 +1561,8 @@ impl WindbgServer {
                     );
                 }
                 Ok(out)
-        })
+            },
+        )
         .await
     }
 
@@ -1546,17 +1576,21 @@ impl WindbgServer {
         open_world_hint = true
     ))]
     async fn attach_kernel_local(&self) -> Result<CallToolResult, ErrorData> {
-        self.opened_result(move |e| {
-            // attach_local_kernel breaks the target in internally (INITIAL_BREAK +
-            // an INFINITE wait, as a live kernel requires).
-            e.attach_local_kernel().map_err(es)?;
-            // The driver_object/device_object/irp_stack tools use kernel-extension
-            // commands (!drvobj/!devobj/!irp) from kdexts.dll, which a bare engine does
-            // not auto-load. Best-effort, like open_dump's `.load ext`; harmless if the
-            // extension isn't bundled (those tools then report a clean "no export").
-            let _ = e.execute_command(".load kdexts");
-            e.execute_command("vertarget").map_err(es)
-        })
+        self.opened_result(
+            |e| {
+                // attach_local_kernel breaks the target in internally (INITIAL_BREAK +
+                // an INFINITE wait, as a live kernel requires).
+                e.attach_local_kernel().map_err(es)
+            },
+            |e| {
+                // The driver_object/device_object/irp_stack tools use kernel-extension
+                // commands (!drvobj/!devobj/!irp) from kdexts.dll, which a bare engine does
+                // not auto-load. Best-effort, like open_dump's `.load ext`; harmless if the
+                // extension isn't bundled (those tools then report a clean "no export").
+                let _ = e.execute_command(".load kdexts");
+                e.execute_command("vertarget").map_err(es)
+            },
+        )
         .await
     }
 
@@ -1573,15 +1607,19 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<ConnectionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.opened_result(move |e| {
-            // attach_kernel connects, requests an initial break, and waits (INFINITE,
-            // as a live kernel requires) for the break-in — all internally.
-            e.attach_kernel(&args.connection).map_err(es)?;
-            // Load kdexts.dll so the driver_object/device_object/irp_stack tools'
-            // !drvobj/!devobj/!irp commands resolve (see attach_kernel_local). Best-effort.
-            let _ = e.execute_command(".load kdexts");
-            e.execute_command("vertarget").map_err(es)
-        })
+        self.opened_result(
+            move |e| {
+                // attach_kernel connects, requests an initial break, and waits (INFINITE,
+                // as a live kernel requires) for the break-in — all internally.
+                e.attach_kernel(&args.connection).map_err(es)
+            },
+            |e| {
+                // Load kdexts.dll so the driver_object/device_object/irp_stack tools'
+                // !drvobj/!devobj/!irp commands resolve (see attach_kernel_local). Best-effort.
+                let _ = e.execute_command(".load kdexts");
+                e.execute_command("vertarget").map_err(es)
+            },
+        )
         .await
     }
 
@@ -1637,11 +1675,13 @@ impl WindbgServer {
         Parameters(args): Parameters<PidArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let pid = args.pid;
-        self.opened_result(move |e| {
-            // attach_process waits for the break-in internally.
-            e.attach_process(pid).map_err(es)?;
-            e.execute_command("r").map_err(es)
-        })
+        self.opened_result(
+            move |e| {
+                // attach_process waits for the break-in internally.
+                e.attach_process(pid).map_err(es)
+            },
+            |e| e.execute_command("r").map_err(es),
+        )
         .await
     }
 
@@ -1658,11 +1698,13 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<CommandLineArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.opened_result(move |e| {
-            // launch_process waits for the initial break internally.
-            e.launch_process(&args.command_line).map_err(es)?;
-            e.execute_command("r").map_err(es)
-        })
+        self.opened_result(
+            move |e| {
+                // launch_process waits for the initial break internally.
+                e.launch_process(&args.command_line).map_err(es)
+            },
+            |e| e.execute_command("r").map_err(es),
+        )
         .await
     }
 
