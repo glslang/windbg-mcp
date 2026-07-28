@@ -1466,15 +1466,16 @@ impl WindbgServer {
 // ---- Tools ---------------------------------------------------------------
 //
 // On `open_world_hint`: everything that touches a debug target is open-world, and only
-// `decode_ioctl` — pure arithmetic on a control code, which never reaches the engine — is
-// not. Two independent reasons put the rest over the line. A symbol server on the symbol
+// `decode_ioctl` (pure arithmetic on a control code) and `session_status` (a read of this
+// server's own state) are not. Two independent reasons put the rest over the line. A symbol server on the symbol
 // path (the documented, recommended setup) means almost any command can make DbgEng
 // download a PDB, and not only the obvious symbol-pattern queries: `r` symbolizes the
 // current instruction, `k` symbolizes every frame, `bp module!Symbol` resolves a name.
 // And a session opened over KDNET puts the *target itself* on the far side of a network
 // link, so even `read_memory` fetching raw bytes, or `end_session` releasing the target,
-// is remote traffic. Claiming otherwise would tell a client the tool cannot touch the
-// network and let it skip whatever consent that decision gates.
+// is remote traffic. That leaves `decode_ioctl` and `session_status`, the two that never
+// reach the engine at all. Claiming otherwise would tell a client the tool cannot touch
+// the network and let it skip whatever consent that decision gates.
 
 #[rmcp::tool_router]
 impl WindbgServer {
@@ -1710,6 +1711,35 @@ impl WindbgServer {
             |e| e.execute_command("r").map_err(es),
         )
         .await
+    }
+
+    /// Report the handle of the debug session this server currently holds, or that none is
+    /// open. Use it to recover a `session_id` you never received — most importantly after an
+    /// `attach_kernel` that reported a timeout: a live kernel attach waits indefinitely, so
+    /// the call can give up while the engine thread stays parked and completes the attach
+    /// later, committing a handle no reply ever carried. Prefer this to retrying the attach,
+    /// which would connect a second time.
+    #[rmcp::tool(annotations(
+        title = "Show current session handle",
+        read_only_hint = true,
+        open_world_hint = false
+    ))]
+    async fn session_status(&self) -> Result<CallToolResult, ErrorData> {
+        // Deliberately *not* queued on the engine thread. The case this exists for is a
+        // parked attach holding that thread, so queueing behind it would make the tool
+        // unavailable exactly when it is needed. The cost is that it can read a moment
+        // behind an open that is still in flight, which is fine for a status query.
+        let current = lock(&self.session).clone();
+        text_result(match current {
+            Some(id) => format!(
+                "session_id: {id}\nPass this as `session_id` on later calls so they fail \
+                 loudly instead of silently acting on a different target if this server's \
+                 session is replaced."
+            ),
+            None => "No debug session is open. Start one with open_dump / open_trace / \
+                     attach_process / attach_kernel / attach_kernel_local / launch."
+                .to_string(),
+        })
     }
 
     /// End the current debug session (detach/close the target) without exiting the server.
@@ -2272,7 +2302,9 @@ impl WindbgServer {
     #[rmcp::tool(annotations(
         title = "Build TTD trace index",
         read_only_hint = false,
-        destructive_hint = false,
+        // `-force` deletes and rebuilds an unloadable `.idx` — that is replacing an
+        // on-disk artifact, whatever the intent behind it.
+        destructive_hint = true,
         idempotent_hint = true,
         open_world_hint = true
     ))]
@@ -2675,7 +2707,7 @@ mod tests {
 
     /// Only a tool that structurally cannot reach the network may say so. Everything that
     /// touches a target can trigger a PDB download, and over KDNET the target itself is
-    /// remote — so `decode_ioctl`, which never reaches the engine, is the only one left.
+    /// remote — leaving the two that never reach the engine at all.
     #[test]
     fn only_the_tools_that_cannot_reach_the_network_are_closed_world() {
         let closed: Vec<String> = WindbgServer::tool_router()
@@ -2689,7 +2721,7 @@ mod tests {
             .map(|t| t.name.to_string())
             .collect();
 
-        assert_eq!(closed, ["decode_ioctl"]);
+        assert_eq!(closed, ["decode_ioctl", "session_status"]);
     }
 
     /// Session-scoped tools take a handle; the two that are genuinely session-independent
@@ -2708,7 +2740,14 @@ mod tests {
         for name in ["read_memory", "execute", "go", "end_session", "modules"] {
             assert!(takes_session(name), "`{name}` should accept session_id");
         }
-        for name in ["decode_ioctl", "record_trace", "open_dump"] {
+        // `session_status` in particular must not require one — it exists to hand back a
+        // handle the caller never received.
+        for name in [
+            "decode_ioctl",
+            "record_trace",
+            "open_dump",
+            "session_status",
+        ] {
             assert!(
                 !takes_session(name),
                 "`{name}` should not accept session_id"

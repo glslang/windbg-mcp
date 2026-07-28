@@ -200,7 +200,7 @@ gh attestation verify <zip> --repo glslang/windbg-mcp `
 
 | Group | Tools |
 |-------|-------|
-| Session | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `end_session` |
+| Session | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `end_session`, `session_status` |
 | State   | `registers`, `read_memory`, `backtrace`, `modules`, `threads`, `disassemble`, `dx` |
 | Control | `go`, `step_over`, `step_into`, `set_breakpoint` |
 | TTD nav | `step_back` (`t-`), `step_over_back` (`p-`), `reverse_go` (`g-`), `goto_position` (`!tt`) |
@@ -238,6 +238,14 @@ can enumerate — so inside `execute` a handle is a strong hint rather than a gu
 
 The argument is optional — omit it and a call operates on whatever session is current, exactly as
 before. `decode_ioctl` (pure) and `record_trace` (independent of the debug session) do not take it.
+
+If you never received a handle, ask for it with **`session_status`** rather than opening again. The
+per-call timeout can fire while the engine thread is still working, and a job that then succeeds
+commits a handle no reply carried. A live `attach_kernel` is the case that matters: it waits
+indefinitely by design, so a call that reports a timeout while the attach completes moments later is
+normal (see *Limitations & notes*). Retrying the attach would connect a second time; `session_status`
+just hands you the handle. It does not queue on the engine thread, so it still answers while a parked
+attach holds it.
 
 ### Error reporting
 
