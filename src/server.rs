@@ -1347,6 +1347,41 @@ fn lock(session: &Mutex<Option<String>>) -> std::sync::MutexGuard<'_, Option<Str
     session.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Rejects a caller-supplied operand that could end the command it is embedded in.
+///
+/// The typed tools build commands by interpolation — `u {address}`, `bp {expression}`,
+/// `!drvobj {name} 7` — and DbgEng reads `;` as a command separator. So an operand of
+/// `rip; .opendump C:\other.dmp` turns `disassemble` into a target swap: it runs a
+/// session-control command from a tool that advertises `readOnlyHint: true`, and it does
+/// it without going through the [`changes_debug_target`] check, leaving every outstanding
+/// handle pointing at a target that is no longer loaded.
+///
+/// These parameters are documented as *operands*, never command lists, so refusing the
+/// separator costs nothing real: `execute` exists for anything that genuinely needs to
+/// chain, and it is annotated and handle-checked accordingly.
+///
+/// `quoted` additionally refuses `"`, for the operands interpolated inside a quoted string
+/// in a data-model expression, where a quote would escape the literal instead.
+fn reject_command_breakers(field: &str, value: &str, quoted: bool) -> Result<(), String> {
+    let bad = value
+        .chars()
+        .find(|c| matches!(c, ';' | '\n' | '\r') || (quoted && *c == '"'));
+    let Some(bad) = bad else {
+        return Ok(());
+    };
+    let what = match bad {
+        ';' => "a `;`",
+        '"' => "a `\"`",
+        _ => "a line break",
+    };
+    Err(format!(
+        "`{field}` contains {what}, which would end the command this tool builds around it \
+         and let the rest run as a separate command. This parameter takes a single operand. \
+         Use `execute` if you meant to run a command list — it is annotated as destructive \
+         and retires the session handle when a command replaces the target."
+    ))
+}
+
 /// Does this raw `execute` command replace or release the debug target?
 ///
 /// The typed tools announce their own transitions, but `execute` is an escape hatch: a
@@ -1971,6 +2006,11 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<DisassembleArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(a) = &args.address
+            && let Err(e) = reject_command_breakers("address", a, false)
+        {
+            return tool_error(e);
+        }
         let gate = self.session_gate(args.session_id.as_deref());
         let cmd = match args.address {
             Some(a) => format!("u {a}"),
@@ -1995,6 +2035,9 @@ impl WindbgServer {
         open_world_hint = true
     ))]
     async fn dx(&self, Parameters(args): Parameters<DxArgs>) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = reject_command_breakers("expression", &args.expression, false) {
+            return tool_error(e);
+        }
         let gate = self.session_gate(args.session_id.as_deref());
         let cmd = format!("dx {}", args.expression);
         // Bounded: a data-model query that runs away (e.g. a heavy LINQ or index build on a
@@ -2016,6 +2059,9 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<TtdCallsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = reject_command_breakers("function", &args.function, true) {
+            return tool_error(e);
+        }
         let gate = self.session_gate(args.session_id.as_deref());
         let cmd = format!("dx @$cursession.TTD.Calls(\"{}\")", args.function);
         let out = self.engine.run_command(cmd, gate).await;
@@ -2035,6 +2081,11 @@ impl WindbgServer {
         Parameters(args): Parameters<TtdMemoryArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let gate = self.session_gate(args.session_id.as_deref());
+        if let Some(mode) = &args.mode
+            && let Err(e) = reject_command_breakers("mode", mode, true)
+        {
+            return tool_error(e);
+        }
         // A bad address is the model's mistake to fix, so it comes back as a tool error
         // rather than a protocol error the model cannot act on.
         let start = match parse_u64(&args.address) {
@@ -2085,6 +2136,9 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<BreakpointArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = reject_command_breakers("expression", &args.expression, false) {
+            return tool_error(e);
+        }
         let gate = self.session_gate(args.session_id.as_deref());
         let cmd = format!("bp {}", args.expression);
         let out = self
@@ -2137,6 +2191,9 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<RunToAddressArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = reject_command_breakers("address", &args.address, false) {
+            return tool_error(e);
+        }
         let gate = self.session_gate(args.session_id.as_deref());
         let out = self
             .engine
@@ -2311,6 +2368,9 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<PositionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = reject_command_breakers("position", &args.position, false) {
+            return tool_error(e);
+        }
         let gate = self.session_gate(args.session_id.as_deref());
         let cmd = format!("!tt {}", args.position);
         let out = self
@@ -2436,6 +2496,9 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<DriverObjectArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = reject_command_breakers("name", &args.name, false) {
+            return tool_error(e);
+        }
         let gate = self.session_gate(args.session_id.as_deref());
         let cmd = format!("!drvobj {} 7", args.name);
         let out = self
@@ -2461,6 +2524,9 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<DeviceObjectArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = reject_command_breakers("device", &args.device, false) {
+            return tool_error(e);
+        }
         let gate = self.session_gate(args.session_id.as_deref());
         let cmd = format!("!devobj {}", args.device);
         let out = self
@@ -2485,6 +2551,11 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<IrpStackArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Some(irp) = &args.irp
+            && let Err(e) = reject_command_breakers("irp", irp, false)
+        {
+            return tool_error(e);
+        }
         let gate = self.session_gate(args.session_id.as_deref());
         let irp = args.irp.unwrap_or_else(|| "@rdx".to_string());
         let cmd = format!("!irp {irp} 1");
@@ -2514,6 +2585,9 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<IoctlTraceArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = reject_command_breakers("dispatch", &args.dispatch, false) {
+            return tool_error(e);
+        }
         let gate = self.session_gate(args.session_id.as_deref());
         // IRP in @rdx at dispatch entry (x64). CurrentStackLocation = poi(Irp+0xb8).
         // Within IO_STACK_LOCATION: OutputBufferLength +0x08, InputBufferLength +0x10,
@@ -2549,6 +2623,18 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<ReachabilityArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        for (field, value) in [
+            ("from", Some(&args.from)),
+            ("address", args.address.as_ref()),
+            ("module", args.module.as_ref()),
+            ("rva", args.rva.as_ref()),
+        ] {
+            if let Some(value) = value
+                && let Err(e) = reject_command_breakers(field, value, false)
+            {
+                return tool_error(e);
+            }
+        }
         let gate = self.session_gate(args.session_id.as_deref());
         let out = self
             .engine
@@ -2843,6 +2929,55 @@ mod tests {
         let gate = session_gate_for(Arc::clone(&session), None);
         *lock(&session) = Some("sess-B".to_string());
         assert!(gate().is_ok());
+    }
+
+    /// The typed tools interpolate their operands into commands, and DbgEng chains on `;`.
+    /// Without this, `disassemble { address: "rip; .opendump other.dmp" }` runs a target
+    /// swap from a tool advertising `readOnlyHint: true`, and does it without retiring
+    /// anyone's session handle.
+    #[test]
+    fn operands_may_not_end_the_command_they_are_embedded_in() {
+        for value in [
+            "rip; .opendump C:\\other.dmp",
+            "rip;.detach",
+            "rip\n.detach",
+            "rip\r\n.kill",
+        ] {
+            assert!(
+                reject_command_breakers("address", value, false).is_err(),
+                "`{value}` must be refused"
+            );
+        }
+    }
+
+    /// Operands interpolated inside a quoted data-model string can also escape via `"`.
+    #[test]
+    fn quoted_operands_may_not_escape_their_string() {
+        assert!(reject_command_breakers("function", "nt!*\") ; .detach //", true).is_err());
+        // Only the quoted positions are stricter; a quote is fine where none is implied.
+        assert!(reject_command_breakers("expression", "foo\"bar", false).is_ok());
+    }
+
+    /// The rejection must not swallow the operand forms these tools exist to accept.
+    #[test]
+    fn ordinary_operands_are_accepted() {
+        for value in [
+            "rip",
+            "nt!NtCreateFile",
+            "fffff803`3e254750",
+            "0x1000",
+            "@$curprocess.TTD.Lifetime",
+            "HEVD!DispatchDeviceControl+0x42",
+            "\\Driver\\HEVD",
+            "12:0",
+        ] {
+            assert!(
+                reject_command_breakers("operand", value, false).is_ok(),
+                "`{value}` must be accepted"
+            );
+        }
+        assert!(reject_command_breakers("function", "kernelbase!CreateFileW", true).is_ok());
+        assert!(reject_command_breakers("function", "ntdll!Nt*", true).is_ok());
     }
 
     /// `execute` is the one path that can swap the target without going through a typed

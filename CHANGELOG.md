@@ -94,6 +94,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`index_trace` is now annotated destructive.** It runs `!ttdext.index -force`, which
   deletes and rebuilds an unloadable `.idx` — replacing an on-disk artifact, whatever the
   intent. `destructiveHint: false` told clients otherwise and could bypass confirmation.
+- **Typed tools reject operands that would end the command they build.** They interpolate
+  their arguments — `u {address}`, `bp {expression}`, `!drvobj {name} 7` — and DbgEng reads
+  `;` as a command separator, so `disassemble { address: "rip; .opendump C:\other.dmp" }`
+  ran a target swap from a tool advertising `readOnlyHint: true`, and did it without going
+  through the check that retires session handles. `;`, line breaks, and (for operands
+  interpolated inside a quoted data-model string) `"` are now refused with a tool error.
+  These parameters were always documented as single operands, so nothing legitimate is
+  lost: `execute` remains available for command lists, and is annotated destructive and
+  handle-checked accordingly.
 
 ### Documentation
 

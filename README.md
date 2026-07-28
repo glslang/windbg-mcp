@@ -255,6 +255,17 @@ may still be queued behind other work and may still run. Keep polling rather tha
 in either case do not re-run the open. `session_status` does not queue on the engine thread, so it
 still answers while a parked attach holds it.
 
+### Typed operands are operands, not commands
+
+The typed tools build debugger commands by interpolation (`u {address}`, `bp {expression}`,
+`!drvobj {name} 7`), and DbgEng treats `;` as a command separator. So those parameters refuse `;`,
+line breaks, and — where the operand lands inside a quoted data-model string — `"`. Without that,
+`disassemble { address: "rip; .opendump C:\other.dmp" }` would replace the debug target from a tool
+that reports itself read-only, and would do it without retiring anyone's session handle.
+
+Nothing legitimate is lost: these parameters were always single operands. Use `execute` to run a
+command list — it is annotated destructive and retires the handle when a command changes the target.
+
 ### Error reporting
 
 A failed *debugger operation* — an unresolvable symbol, an unreadable address, a target that never
