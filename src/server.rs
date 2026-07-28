@@ -1409,12 +1409,16 @@ impl WindbgServer {
     /// queued job, so no other call can be ordered across the transition.
     ///
     /// The work is split in two because the split is where correctness lives. `transition`
-    /// is the DbgEng call that actually changes the target; `report` is the follow-up
-    /// diagnostic (`lm`, `vertarget`, `r`, the TTD lifetime query) whose output the caller
-    /// reads. The handle is committed *between* them, so a failing diagnostic cannot cost
-    /// the caller a handle for a target that is genuinely open — which matters because the
-    /// only way to get one back is to open again, and for `launch` that spawns a second
-    /// process.
+    /// is the DbgEng call that actually changes the target; `report` is everything after it
+    /// — the load wait, and the diagnostic (`lm`, `vertarget`, `r`, the TTD lifetime query)
+    /// whose output the caller reads. The handle is committed *between* them, so a failure
+    /// after the target has already changed cannot cost the caller a handle for a target
+    /// that is genuinely open — which matters because the only way to get one back is to
+    /// open again, and for `launch` that spawns a second process.
+    ///
+    /// So `transition` must be **exactly the one call that replaces the target**, and
+    /// nothing else. Anything that can fail once the target is already replaced — a
+    /// `wait_for_event` that times out very much included — belongs in `report`.
     async fn opened_result<T, R>(
         &self,
         transition: T,
@@ -1495,11 +1499,11 @@ impl WindbgServer {
         Parameters(args): Parameters<PathArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.opened_result(
-            move |e| {
-                e.open_dump(&args.path).map_err(es)?;
-                e.wait_for_event(LOAD_WAIT_MS).map_err(es)
-            },
+            // `open_dump` is the call that replaces the target; the load wait belongs after
+            // the commit, since a wait that times out still leaves DbgEng holding the dump.
+            move |e| e.open_dump(&args.path).map_err(es),
             |e| {
+                e.wait_for_event(LOAD_WAIT_MS).map_err(es)?;
                 // Load the WinDbg extension DLL so `!`-extension commands resolve — most
                 // importantly `!ext.analyze -v`, the crash-dump triage workhorse. A bare
                 // engine doesn't auto-load it, and even after `.load ext` the unqualified
@@ -1527,11 +1531,11 @@ impl WindbgServer {
         Parameters(args): Parameters<PathArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.opened_result(
-            move |e| {
-                e.open_trace(&args.path).map_err(es)?;
-                e.wait_for_event(LOAD_WAIT_MS).map_err(es)
-            },
+            // As in `open_dump`: the load wait sits after the commit, because a wait that
+            // times out still leaves DbgEng holding the trace.
+            move |e| e.open_trace(&args.path).map_err(es),
             |e| {
+                e.wait_for_event(LOAD_WAIT_MS).map_err(es)?;
                 // Check the index state *before* any data-model query: `!ttdext.index -status`
                 // only reads the on-disk .idx (never builds), whereas a `dx` on an unindexed
                 // trace can itself trigger the long in-memory index build. TtdExt reports a
