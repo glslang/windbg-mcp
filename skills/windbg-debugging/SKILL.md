@@ -50,6 +50,13 @@ a bare `execute`, which only sets the run state and doesn't move the target.
   ordered, so a pipelined call can run before `open_dump` establishes a target and fail with
   `0x80040205`, and pipelining stateful debugger commands is unsafe regardless. (Normal MCP
   clients serialize call→result; this only bites custom/batched callers.)
+- **Carry the `session_id`.** The tools that open a target return one; pass it on every later
+  call. The server process is shared, so another caller can replace the target underneath you —
+  with the handle that becomes a clear "stale session handle" error instead of a `read_memory`
+  that quietly returns someone else's memory. Omitting it means "whatever session is current".
+- **A failed debugger operation comes back as a normal tool result**, flagged as an error and
+  carrying the debugger's own text — read it and adjust (wrong symbol, unmapped address, target
+  still running). Only a dead engine surfaces as a transport-level protocol error.
 - **Symbol *names* (`module!func`) need three things together:** (a) `msdia140.dll`
   bundled next to the binary, (b) a symbol path (`execute` →
   `.sympath srv*C:\ProgramData\Dbg\sym*https://msdl.microsoft.com/download/symbols`), and

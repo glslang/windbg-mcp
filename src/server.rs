@@ -6,6 +6,9 @@
 //! `win-kexp` methods and then wait for the target to stop.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmcp::ErrorData;
 use rmcp::handler::server::wrapper::Parameters;
@@ -15,7 +18,7 @@ use serde::Deserialize;
 
 use win_kexp::dbgeng::RunToOutcome;
 
-use crate::engine::EngineHandle;
+use crate::engine::{EngineError, EngineHandle};
 use crate::ttd;
 
 /// How long to wait for a target to stop after open/attach/launch (ms).
@@ -24,9 +27,16 @@ const LOAD_WAIT_MS: u32 = 60_000;
 /// next stop (ms).
 const EXEC_WAIT_MS: u32 = 60_000;
 
+/// Counter behind [`mint_session_id`]. Only needs to be unique within this process.
+static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
+
 #[derive(Clone)]
 pub struct WindbgServer {
     engine: EngineHandle,
+    /// Handle identifying the debug session the engine is currently attached to, or
+    /// `None` when no target is open. See [`WindbgServer::check_session`] for why this
+    /// exists rather than letting the connection stand in for the session.
+    session: Arc<Mutex<Option<String>>>,
 }
 
 /// Maps any error to a `String` for the engine `Reply` channel.
@@ -36,6 +46,37 @@ fn es<E: ToString>(e: E) -> String {
 
 fn text_result(s: String) -> Result<CallToolResult, ErrorData> {
     Ok(CallToolResult::success(vec![Content::text(s)]))
+}
+
+/// A tool-execution error: something the model should see in the result and can act on,
+/// as opposed to a JSON-RPC protocol error it cannot.
+fn tool_error(s: String) -> Result<CallToolResult, ErrorData> {
+    Ok(CallToolResult::error(vec![Content::text(s)]))
+}
+
+/// Renders an engine outcome using the MCP error model.
+///
+/// A failed *debugger operation* (bad symbol, unreadable address, target that never
+/// stopped) is feedback the model can act on, so it comes back as a tool-execution
+/// error with the text intact. Only a broken engine — the one thing no amount of
+/// retrying will fix — becomes a JSON-RPC protocol error.
+fn engine_result(r: Result<String, EngineError>) -> Result<CallToolResult, ErrorData> {
+    match r {
+        Ok(out) => text_result(out),
+        Err(EngineError::Debugger(m)) => tool_error(m),
+        Err(EngineError::Unavailable(m)) => Err(ErrorData::internal_error(m, None)),
+    }
+}
+
+/// Mints a fresh session handle. Unique per process, which is all the guard needs:
+/// the handle exists to detect *replacement* of the target, not to authenticate.
+fn mint_session_id() -> String {
+    let n = SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    format!("sess-{nanos:x}-{n}")
 }
 
 /// Parses a decimal or `0x`-prefixed hex integer.
@@ -979,6 +1020,21 @@ fn format_recipe(recipes: &[SegmentRecipe]) -> String {
 }
 
 // ---- Tool parameter types ------------------------------------------------
+//
+// Every tool that touches the debug target carries an optional `session_id` (see the
+// "Session handles" section below). The field is repeated per struct rather than
+// flattened from a shared type so each tool's input schema stays a plain, self-contained
+// object — flattening renders as a schema composition that clients handle unevenly.
+
+/// Parameters for tools that take no arguments beyond the session handle.
+#[derive(Deserialize, JsonSchema)]
+pub struct SessionArgs {
+    /// Session handle returned by open_dump/open_trace/attach_*/launch. Optional: omit it
+    /// to act on whatever session is current, or pass it to have the call refuse to run if
+    /// this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
 
 #[derive(Deserialize, JsonSchema)]
 pub struct PathArgs {
@@ -1008,6 +1064,10 @@ pub struct CommandLineArgs {
 pub struct ExecuteArgs {
     /// Raw debugger command to run (e.g. "!analyze -v", "u rip", "dt nt!_EPROCESS").
     pub command: String,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1016,6 +1076,10 @@ pub struct ReadMemoryArgs {
     pub address: String,
     /// Number of bytes to read.
     pub size: u32,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1023,24 +1087,40 @@ pub struct DisassembleArgs {
     /// Address or symbol to disassemble at; uses the current instruction pointer if omitted.
     #[serde(default)]
     pub address: Option<String>,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct DxArgs {
     /// Data-model (LINQ) expression, e.g. "@$cursession.TTD.Calls(\"ntdll!*\")".
     pub expression: String,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct BreakpointArgs {
     /// Breakpoint location: symbol, address, or expression (e.g. "nt!NtCreateFile").
     pub expression: String,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct PositionArgs {
     /// TTD position to travel to, e.g. "12:0" or "0" for the start of the trace.
     pub position: String,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1065,6 +1145,10 @@ pub struct TtdCallsArgs {
     /// Function symbol or wildcard pattern to find calls to, e.g.
     /// "kernelbase!CreateFileW" or "ntdll!Nt*".
     pub function: String,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1077,6 +1161,10 @@ pub struct TtdMemoryArgs {
     /// Omit to report every access.
     #[serde(default)]
     pub mode: Option<String>,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1101,18 +1189,30 @@ pub struct SymbolPathArgs {
     /// force-load one module's symbols. Omit to reload all deferred modules.
     #[serde(default)]
     pub reload: Option<String>,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct DriverObjectArgs {
     /// Driver object name, e.g. "mydriver" or "\\Driver\\mydriver".
     pub name: String,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
 pub struct DeviceObjectArgs {
     /// Device object: a name (e.g. "\\Device\\MyDevice") or an address (0x-hex).
     pub device: String,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1122,6 +1222,10 @@ pub struct IrpStackArgs {
     /// clobbers the register.
     #[serde(default)]
     pub irp: Option<String>,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1129,6 +1233,10 @@ pub struct IoctlTraceArgs {
     /// Virtual address of the IRP_MJ_DEVICE_CONTROL dispatch routine, rebased to the
     /// live load base. Recover it via `driver_object` (MajorFunction[0x0e]).
     pub dispatch: String,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1162,6 +1270,10 @@ pub struct ReachabilityArgs {
     /// the bare verdict + call path.
     #[serde(default)]
     pub recipe: Option<bool>,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Address to run the target to, for `run_to_address`.
@@ -1174,6 +1286,89 @@ pub struct RunToAddressArgs {
     /// (milliseconds). Defaults to the standard execution wait.
     #[serde(default)]
     pub timeout_ms: Option<u32>,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+// ---- Session handles -----------------------------------------------------
+//
+// One process drives one DbgEng session, but an MCP connection is explicitly *not*
+// a session: clients may interleave unrelated requests over the same stdio process,
+// so "the target the last open_* call attached to" is not a safe thing for a tool to
+// assume. Rather than silently operating on whatever target happens to be loaded,
+// the session-creating tools mint a handle and every other tool accepts it and
+// refuses to run when it no longer matches.
+//
+// The handle is optional so existing callers keep working; supplying it is what buys
+// the guarantee that a call can never land on a target it did not open.
+
+/// The session-handle policy, as a pure function so it unit-tests without an engine.
+///
+/// `supplied == None` means the caller opted out of the check and accepts whatever
+/// session is current — the behaviour from before handles existed. A handle that does
+/// not match is refused rather than silently honoured, because honouring it means
+/// reading memory from, or setting breakpoints on, a target the caller never opened.
+fn check_session_handle(current: Option<&str>, supplied: Option<&str>) -> Result<(), String> {
+    let Some(want) = supplied else {
+        return Ok(());
+    };
+    match current {
+        Some(cur) if cur == want => Ok(()),
+        Some(cur) => Err(format!(
+            "stale session handle `{want}`: this server is now debugging session `{cur}`. \
+             The debug target was replaced after you opened yours — this stdio process is \
+             shared, not per-conversation. Re-open your target, or omit `session_id` to \
+             operate on whatever session is current."
+        )),
+        None => Err(format!(
+            "stale session handle `{want}`: this server has no debug session open — it was \
+             ended, or never started. Re-open your target with open_dump / open_trace / \
+             attach_process / attach_kernel / attach_kernel_local / launch."
+        )),
+    }
+}
+
+impl WindbgServer {
+    /// Records a newly opened target and returns its handle.
+    fn begin_session(&self) -> String {
+        let id = mint_session_id();
+        *self.session_lock() = Some(id.clone());
+        id
+    }
+
+    /// Forgets the current target, so handles held by callers now read as stale.
+    fn clear_session(&self) {
+        *self.session_lock() = None;
+    }
+
+    /// A poisoned lock here only ever means a previous holder panicked mid-update; the
+    /// value itself is a plain `Option<String>` and cannot be left inconsistent, so
+    /// recovering beats propagating the panic into every later tool call.
+    fn session_lock(&self) -> std::sync::MutexGuard<'_, Option<String>> {
+        self.session.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Validates a caller-supplied handle against the target actually loaded.
+    fn check_session(&self, supplied: Option<&str>) -> Result<(), String> {
+        check_session_handle(self.session_lock().as_deref(), supplied)
+    }
+
+    /// Renders a session-creating tool's outcome, minting a handle on success.
+    fn opened_result(&self, r: Result<String, EngineError>) -> Result<CallToolResult, ErrorData> {
+        match r {
+            Ok(out) => {
+                let id = self.begin_session();
+                text_result(format!(
+                    "{out}\n\nsession_id: {id}\nPass this as `session_id` on later calls so they \
+                     fail loudly instead of silently acting on a different target if this \
+                     server's session is replaced."
+                ))
+            }
+            Err(e) => engine_result(Err(e)),
+        }
+    }
 }
 
 // ---- Tools ---------------------------------------------------------------
@@ -1181,11 +1376,21 @@ pub struct RunToAddressArgs {
 #[rmcp::tool_router]
 impl WindbgServer {
     pub fn new(engine: EngineHandle) -> Self {
-        Self { engine }
+        Self {
+            engine,
+            session: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// Open a crash dump (.dmp) or a Time Travel Debugging trace (.run) and wait for it to load.
-    #[rmcp::tool]
+    /// Replaces any session already open, and returns a `session_id` for later calls.
+    #[rmcp::tool(annotations(
+        title = "Open crash dump or TTD trace",
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = false,
+        open_world_hint = true
+    ))]
     async fn open_dump(
         &self,
         Parameters(args): Parameters<PathArgs>,
@@ -1204,12 +1409,19 @@ impl WindbgServer {
                 let _ = e.execute_command(".load ext");
                 e.execute_command("lm").map_err(es)
             })
-            .await?;
-        text_result(out)
+            .await;
+        self.opened_result(out)
     }
 
     /// Open a TTD trace (.run); alias of open_dump. Enables time-travel navigation and TTD queries.
-    #[rmcp::tool]
+    /// Replaces any session already open, and returns a `session_id` for later calls.
+    #[rmcp::tool(annotations(
+        title = "Open TTD trace",
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = false,
+        open_world_hint = true
+    ))]
     async fn open_trace(
         &self,
         Parameters(args): Parameters<PathArgs>,
@@ -1249,12 +1461,19 @@ impl WindbgServer {
                 }
                 Ok(out)
             })
-            .await?;
-        text_result(out)
+            .await;
+        self.opened_result(out)
     }
 
     /// Attach to the local kernel (live local kernel debugging).
-    #[rmcp::tool]
+    /// Replaces any session already open, and returns a `session_id` for later calls.
+    #[rmcp::tool(annotations(
+        title = "Attach to local kernel",
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = false,
+        open_world_hint = true
+    ))]
     async fn attach_kernel_local(&self) -> Result<CallToolResult, ErrorData> {
         let out = self
             .engine
@@ -1269,12 +1488,19 @@ impl WindbgServer {
                 let _ = e.execute_command(".load kdexts");
                 e.execute_command("vertarget").map_err(es)
             })
-            .await?;
-        text_result(out)
+            .await;
+        self.opened_result(out)
     }
 
     /// Attach to a kernel target over a connection string (e.g. KDNET).
-    #[rmcp::tool]
+    /// Replaces any session already open, and returns a `session_id` for later calls.
+    #[rmcp::tool(annotations(
+        title = "Attach to kernel target",
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = false,
+        open_world_hint = true
+    ))]
     async fn attach_kernel(
         &self,
         Parameters(args): Parameters<ConnectionArgs>,
@@ -1290,8 +1516,8 @@ impl WindbgServer {
                 let _ = e.execute_command(".load kdexts");
                 e.execute_command("vertarget").map_err(es)
             })
-            .await?;
-        text_result(out)
+            .await;
+        self.opened_result(out)
     }
 
     /// Set or extend the symbol search path, then reload symbols, so `module!Symbol`
@@ -1300,11 +1526,20 @@ impl WindbgServer {
     /// be reachable from THIS (debugger) host — symbols are not fetched from the target
     /// over the KD wire. Goes through the DbgEng API, so it avoids the `.sympath` command
     /// quirk of swallowing the rest of the command line.
-    #[rmcp::tool]
+    #[rmcp::tool(annotations(
+        title = "Set symbol search path",
+        read_only_hint = false,
+        destructive_hint = false,
+        idempotent_hint = false,
+        open_world_hint = true
+    ))]
     async fn set_symbol_path(
         &self,
         Parameters(args): Parameters<SymbolPathArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let append = args.append.unwrap_or(true);
         let out = self
             .engine
@@ -1320,12 +1555,19 @@ impl WindbgServer {
                 // Echo the effective path so the caller can confirm what resolved.
                 e.execute_command(".sympath").map_err(es)
             })
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// Attach to an existing user-mode process by PID and break in.
-    #[rmcp::tool]
+    /// Replaces any session already open, and returns a `session_id` for later calls.
+    #[rmcp::tool(annotations(
+        title = "Attach to process",
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = false,
+        open_world_hint = true
+    ))]
     async fn attach_process(
         &self,
         Parameters(args): Parameters<PidArgs>,
@@ -1338,12 +1580,19 @@ impl WindbgServer {
                 e.attach_process(pid).map_err(es)?;
                 e.execute_command("r").map_err(es)
             })
-            .await?;
-        text_result(out)
+            .await;
+        self.opened_result(out)
     }
 
     /// Launch a new user-mode process under the debugger, stopping at the initial breakpoint.
-    #[rmcp::tool]
+    /// Replaces any session already open, and returns a `session_id` for later calls.
+    #[rmcp::tool(annotations(
+        title = "Launch process under debugger",
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = false,
+        open_world_hint = true
+    ))]
     async fn launch(
         &self,
         Parameters(args): Parameters<CommandLineArgs>,
@@ -1355,13 +1604,27 @@ impl WindbgServer {
                 e.launch_process(&args.command_line).map_err(es)?;
                 e.execute_command("r").map_err(es)
             })
-            .await?;
-        text_result(out)
+            .await;
+        self.opened_result(out)
     }
 
     /// End the current debug session (detach/close the target) without exiting the server.
-    #[rmcp::tool]
-    async fn end_session(&self) -> Result<CallToolResult, ErrorData> {
+    /// Pass `session_id` to be sure you are ending your own session and not one another
+    /// caller opened in the meantime.
+    #[rmcp::tool(annotations(
+        title = "End debug session",
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = true,
+        open_world_hint = false
+    ))]
+    async fn end_session(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let out = self
             .engine
             .run(move |e| {
@@ -1369,45 +1632,76 @@ impl WindbgServer {
                     .map(|_| "session ended".to_string())
                     .map_err(es)
             })
-            .await?;
-        text_result(out)
+            .await;
+        if out.is_ok() {
+            self.clear_session();
+        }
+        engine_result(out)
     }
 
     /// Run a raw debugger command and return its full output. The universal escape hatch.
-    #[rmcp::tool]
+    #[rmcp::tool(annotations(
+        title = "Run raw debugger command",
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = false,
+        open_world_hint = true
+    ))]
     async fn execute(
         &self,
         Parameters(args): Parameters<ExecuteArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         // Bounded: a runaway raw command (e.g. an unbounded `s` search) self-aborts instead
         // of pinning the engine thread and wedging every later call.
-        let out = self.engine.run_command(args.command).await?;
-        text_result(out)
+        let out = self.engine.run_command(args.command).await;
+        engine_result(out)
     }
 
     /// Show the current register set.
-    #[rmcp::tool]
-    async fn registers(&self) -> Result<CallToolResult, ErrorData> {
-        let out = self.engine.run(move |e| e.registers().map_err(es)).await?;
-        if out.trim().is_empty() {
-            // DbgEng prints nothing for `r` when there is no live thread context (e.g. a
-            // module-load break, or a bare goto_position to the very start of a trace).
-            return text_result(
+    #[rmcp::tool(annotations(
+        title = "Show registers",
+        read_only_hint = true,
+        open_world_hint = false
+    ))]
+    async fn registers(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
+        let out = self.engine.run(move |e| e.registers().map_err(es)).await;
+        // DbgEng prints nothing for `r` when there is no live thread context (e.g. a
+        // module-load break, or a bare goto_position to the very start of a trace).
+        let out = out.map(|s| {
+            if s.trim().is_empty() {
                 "(no thread register context at this position — e.g. a module-load break or \
                  the start of a trace. Travel to a settled position after a go/breakpoint, or \
                  read a specific register with execute { \"command\": \"r rip\" }.)"
-                    .to_string(),
-            );
-        }
-        text_result(out)
+                    .to_string()
+            } else {
+                s
+            }
+        });
+        engine_result(out)
     }
 
     /// Read process/kernel virtual memory and return a hex dump.
-    #[rmcp::tool]
+    #[rmcp::tool(annotations(
+        title = "Read memory",
+        read_only_hint = true,
+        open_world_hint = false
+    ))]
     async fn read_memory(
         &self,
         Parameters(args): Parameters<ReadMemoryArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let size = args.size;
         let out = self
             .engine
@@ -1416,46 +1710,83 @@ impl WindbgServer {
                 let bytes = e.read_memory(addr, size as usize).map_err(es)?;
                 Ok(hexdump(addr, &bytes))
             })
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// Show the call stack of the current thread (`k`).
-    #[rmcp::tool]
-    async fn backtrace(&self) -> Result<CallToolResult, ErrorData> {
+    #[rmcp::tool(annotations(
+        title = "Show call stack",
+        read_only_hint = true,
+        open_world_hint = false
+    ))]
+    async fn backtrace(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let out = self
             .engine
             .run(move |e| e.execute_command("k").map_err(es))
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// List loaded modules (`lm`).
-    #[rmcp::tool]
-    async fn modules(&self) -> Result<CallToolResult, ErrorData> {
+    #[rmcp::tool(annotations(
+        title = "List modules",
+        read_only_hint = true,
+        open_world_hint = false
+    ))]
+    async fn modules(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let out = self
             .engine
             .run(move |e| e.execute_command("lm").map_err(es))
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// List threads (`~`).
-    #[rmcp::tool]
-    async fn threads(&self) -> Result<CallToolResult, ErrorData> {
+    #[rmcp::tool(annotations(
+        title = "List threads",
+        read_only_hint = true,
+        open_world_hint = false
+    ))]
+    async fn threads(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let out = self
             .engine
             .run(move |e| e.execute_command("~").map_err(es))
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// Disassemble at an address/symbol (or the current IP).
-    #[rmcp::tool]
+    #[rmcp::tool(annotations(
+        title = "Disassemble",
+        read_only_hint = true,
+        open_world_hint = false
+    ))]
     async fn disassemble(
         &self,
         Parameters(args): Parameters<DisassembleArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let cmd = match args.address {
             Some(a) => format!("u {a}"),
             None => "u".to_string(),
@@ -1463,43 +1794,71 @@ impl WindbgServer {
         let out = self
             .engine
             .run(move |e| e.execute_command(&cmd).map_err(es))
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// Evaluate a data-model (LINQ) expression with `dx` — ideal for TTD queries.
-    #[rmcp::tool]
+    #[rmcp::tool(annotations(
+        title = "Evaluate data-model expression",
+        read_only_hint = false,
+        destructive_hint = false,
+        idempotent_hint = false,
+        open_world_hint = false
+    ))]
     async fn dx(&self, Parameters(args): Parameters<DxArgs>) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let cmd = format!("dx {}", args.expression);
         // Bounded: a data-model query that runs away (e.g. a heavy LINQ or index build on a
         // huge trace) self-aborts rather than pinning the engine thread.
-        let out = self.engine.run_command(cmd).await?;
-        text_result(out)
+        let out = self.engine.run_command(cmd).await;
+        engine_result(out)
     }
 
     /// TTD: find every call to a function across the whole trace
     /// (`dx @$cursession.TTD.Calls(...)`). Each result carries the time, thread,
     /// parameters, and return value. Append LINQ in a follow-up `dx`/`execute` to
     /// filter (e.g. `.Where(c => c.ReturnValue != 0)`).
-    #[rmcp::tool]
+    #[rmcp::tool(annotations(
+        title = "TTD: find calls to a function",
+        read_only_hint = true,
+        open_world_hint = false
+    ))]
     async fn ttd_calls(
         &self,
         Parameters(args): Parameters<TtdCallsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let cmd = format!("dx @$cursession.TTD.Calls(\"{}\")", args.function);
-        let out = self.engine.run_command(cmd).await?;
-        text_result(out)
+        let out = self.engine.run_command(cmd).await;
+        engine_result(out)
     }
 
     /// TTD: find every access to a memory range across the trace
     /// (`dx @$cursession.TTD.Memory(start, end, mode)`) — when and from where it was
     /// read, written, or executed.
-    #[rmcp::tool]
+    #[rmcp::tool(annotations(
+        title = "TTD: find accesses to a memory range",
+        read_only_hint = true,
+        open_world_hint = false
+    ))]
     async fn ttd_memory(
         &self,
         Parameters(args): Parameters<TtdMemoryArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let start = parse_u64(&args.address).map_err(|e| ErrorData::internal_error(e, None))?;
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
+        // A bad address is the model's mistake to fix, so it comes back as a tool error
+        // rather than a protocol error the model cannot act on.
+        let start = match parse_u64(&args.address) {
+            Ok(v) => v,
+            Err(e) => return tool_error(e),
+        };
         let end = start.saturating_add(args.size as u64);
         let cmd = match args.mode.as_deref() {
             Some(m) if !m.trim().is_empty() => format!(
@@ -1508,44 +1867,75 @@ impl WindbgServer {
             ),
             _ => format!("dx @$cursession.TTD.Memory(0x{start:x}, 0x{end:x})"),
         };
-        let out = self.engine.run_command(cmd).await?;
-        text_result(out)
+        let out = self.engine.run_command(cmd).await;
+        engine_result(out)
     }
 
     /// TTD: list trace events — module loads/unloads, thread create/exit, and
     /// exceptions (`dx @$curprocess.TTD.Events`). Events and Threads hang off
     /// `@$curprocess.TTD`; Calls and Memory hang off `@$cursession.TTD`.
-    #[rmcp::tool]
-    async fn ttd_events(&self) -> Result<CallToolResult, ErrorData> {
+    #[rmcp::tool(annotations(
+        title = "TTD: list trace events",
+        read_only_hint = true,
+        open_world_hint = false
+    ))]
+    async fn ttd_events(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let out = self
             .engine
             .run_command("dx -r2 @$curprocess.TTD.Events".to_string())
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// Set a breakpoint at a symbol, address, or expression (`bp`).
-    #[rmcp::tool]
+    #[rmcp::tool(annotations(
+        title = "Set breakpoint",
+        read_only_hint = false,
+        destructive_hint = false,
+        idempotent_hint = false,
+        open_world_hint = false
+    ))]
     async fn set_breakpoint(
         &self,
         Parameters(args): Parameters<BreakpointArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let cmd = format!("bp {}", args.expression);
         let out = self
             .engine
             .run(move |e| e.execute_command(&cmd).map_err(es))
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// Continue execution (`g`). Runs to the next breakpoint, or the end of a TTD trace.
-    #[rmcp::tool]
-    async fn go(&self) -> Result<CallToolResult, ErrorData> {
+    #[rmcp::tool(annotations(
+        title = "Continue execution",
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = false,
+        open_world_hint = false
+    ))]
+    async fn go(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let out = self
             .engine
             .run(move |e| e.execute_and_wait("g", EXEC_WAIT_MS).map_err(es))
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// Run the target until it reaches `address` (a one-shot `g <addr>` that doesn't
@@ -1554,11 +1944,20 @@ impl WindbgServer {
     /// reached in time). Confirms *live* that the current input/state drives execution to
     /// a block — e.g. one from `reachable_from_dispatch`. Needs a real KDNET/VM kernel
     /// target (a local kernel can't set code breakpoints).
-    #[rmcp::tool]
+    #[rmcp::tool(annotations(
+        title = "Run to address",
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = false,
+        open_world_hint = false
+    ))]
     async fn run_to_address(
         &self,
         Parameters(args): Parameters<RunToAddressArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let out = self
             .engine
             .run(move |e| {
@@ -1598,72 +1997,143 @@ impl WindbgServer {
                 }
                 Ok(msg)
             })
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// Step over one source/instruction step (`p`).
-    #[rmcp::tool]
-    async fn step_over(&self) -> Result<CallToolResult, ErrorData> {
+    #[rmcp::tool(annotations(
+        title = "Step over",
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = false,
+        open_world_hint = false
+    ))]
+    async fn step_over(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let out = self
             .engine
             .run(move |e| e.execute_and_wait("p", EXEC_WAIT_MS).map_err(es))
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// Step into one instruction (`t`).
-    #[rmcp::tool]
-    async fn step_into(&self) -> Result<CallToolResult, ErrorData> {
+    #[rmcp::tool(annotations(
+        title = "Step into",
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = false,
+        open_world_hint = false
+    ))]
+    async fn step_into(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let out = self
             .engine
             .run(move |e| e.execute_and_wait("t", EXEC_WAIT_MS).map_err(es))
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// Step backward one instruction in a TTD trace (`t-`). Reverse of step_into.
-    #[rmcp::tool]
-    async fn step_back(&self) -> Result<CallToolResult, ErrorData> {
+    // The reverse-navigation tools only work on a TTD trace, which is a recorded replay:
+    // moving through it cannot destroy state, unlike stepping a live target.
+    #[rmcp::tool(annotations(
+        title = "Step back (TTD)",
+        read_only_hint = false,
+        destructive_hint = false,
+        idempotent_hint = false,
+        open_world_hint = false
+    ))]
+    async fn step_back(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let out = self
             .engine
             .run(move |e| e.execute_and_wait("t-", EXEC_WAIT_MS).map_err(es))
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// Step over one call backward in a TTD trace (`p-`). Reverse of step_over.
-    #[rmcp::tool]
-    async fn step_over_back(&self) -> Result<CallToolResult, ErrorData> {
+    #[rmcp::tool(annotations(
+        title = "Step over back (TTD)",
+        read_only_hint = false,
+        destructive_hint = false,
+        idempotent_hint = false,
+        open_world_hint = false
+    ))]
+    async fn step_over_back(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let out = self
             .engine
             .run(move |e| e.execute_and_wait("p-", EXEC_WAIT_MS).map_err(es))
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// Reverse-continue: run the TTD trace backward until a breakpoint or its start (`g-`).
-    #[rmcp::tool]
-    async fn reverse_go(&self) -> Result<CallToolResult, ErrorData> {
+    #[rmcp::tool(annotations(
+        title = "Reverse continue (TTD)",
+        read_only_hint = false,
+        destructive_hint = false,
+        idempotent_hint = false,
+        open_world_hint = false
+    ))]
+    async fn reverse_go(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let out = self
             .engine
             .run(move |e| e.execute_and_wait("g-", EXEC_WAIT_MS).map_err(es))
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// Travel to a specific position in a TTD trace (`!tt <position>`).
-    #[rmcp::tool]
+    #[rmcp::tool(annotations(
+        title = "Go to TTD position",
+        read_only_hint = false,
+        destructive_hint = false,
+        idempotent_hint = true,
+        open_world_hint = false
+    ))]
     async fn goto_position(
         &self,
         Parameters(args): Parameters<PositionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let cmd = format!("!tt {}", args.position);
         let out = self
             .engine
             .run(move |e| e.execute_command(&cmd).map_err(es))
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// Build (or repair) the persistent index of the currently open TTD trace
@@ -1673,13 +2143,25 @@ impl WindbgServer {
     /// is the mode that actually fixes the "index not loaded" state `open_trace` warns about.
     /// (The bundled engine exposes these via `TtdExt.dll`; `!tt.index` fails with
     /// `LoadLibrary(tt)` because there is no `tt` extension.)
-    #[rmcp::tool]
-    async fn index_trace(&self) -> Result<CallToolResult, ErrorData> {
+    #[rmcp::tool(annotations(
+        title = "Build TTD trace index",
+        read_only_hint = false,
+        destructive_hint = false,
+        idempotent_hint = true,
+        open_world_hint = true
+    ))]
+    async fn index_trace(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let out = self
             .engine
             .run(move |e| e.execute_command("!ttdext.index -force").map_err(es))
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// Record a new TTD trace by launching a target under TTD.exe (requires elevation).
@@ -1687,7 +2169,14 @@ impl WindbgServer {
     /// Optional `env` (KEY=VALUE entries) and `working_dir` are applied to the recorded
     /// target — use them when it needs a specific environment or cwd to run (e.g. a Qt
     /// app's `QT_QPA_PLATFORM_PLUGIN_PATH`, or an anti-analysis "run me from here" guard).
-    #[rmcp::tool]
+    /// Independent of the debug session, so it takes no `session_id`.
+    #[rmcp::tool(annotations(
+        title = "Record new TTD trace",
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = false,
+        open_world_hint = true
+    ))]
     async fn record_trace(
         &self,
         Parameters(args): Parameters<RecordArgs>,
@@ -1710,80 +2199,110 @@ impl WindbgServer {
         .await
         .map_err(|e| ErrorData::internal_error(format!("record task panicked: {e}"), None))?;
 
+        // A recorder that won't start (missing TTD.exe, not elevated, bad target) is
+        // actionable feedback, so it belongs in the result rather than a protocol error.
         match res {
             Ok(msg) => text_result(msg),
-            Err(e) => Err(ErrorData::internal_error(e, None)),
+            Err(e) => tool_error(e),
         }
     }
 
     /// Decode a 32-bit IOCTL control code into its CTL_CODE fields (DeviceType,
     /// FunctionCode, Method, RequiredAccess) and flag METHOD_NEITHER / FILE_ANY_ACCESS.
-    /// Pure — needs no debug session.
-    #[rmcp::tool]
+    /// Pure — needs no debug session, so it takes no `session_id`.
+    #[rmcp::tool(annotations(
+        title = "Decode IOCTL control code",
+        read_only_hint = true,
+        open_world_hint = false
+    ))]
     async fn decode_ioctl(
         &self,
         Parameters(args): Parameters<DecodeIoctlArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let code = parse_u64(&args.code).map_err(|e| ErrorData::invalid_params(e, None))?;
+        // Both rejections below are semantic input validation, not a malformed request:
+        // the schema is satisfied either way, so they belong in the result where the
+        // model can read them and correct the code it passed.
+        let code = match parse_u64(&args.code) {
+            Ok(v) => v,
+            Err(e) => return tool_error(e),
+        };
         // An IOCTL is a 32-bit value; reject anything wider rather than silently
         // truncating it to a different code.
-        let code = u32::try_from(code).map_err(|_| {
-            ErrorData::invalid_params(
-                format!("IOCTL must be a 32-bit value (got 0x{code:x})"),
-                None,
-            )
-        })?;
+        let Ok(code) = u32::try_from(code) else {
+            return tool_error(format!("IOCTL must be a 32-bit value (got 0x{code:x})"));
+        };
         text_result(decode_ioctl_text(code))
     }
 
     /// Dump a driver object's dispatch table and devices (`!drvobj <name> 7`).
     /// The MajorFunction table's index 0x0e is the IRP_MJ_DEVICE_CONTROL handler — the
     /// IOCTL dispatch routine. Root of the device-tree walk.
-    #[rmcp::tool]
+    #[rmcp::tool(annotations(
+        title = "Inspect driver object",
+        read_only_hint = true,
+        open_world_hint = false
+    ))]
     async fn driver_object(
         &self,
         Parameters(args): Parameters<DriverObjectArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let cmd = format!("!drvobj {} 7", args.name);
         let out = self
             .engine
             .run(move |e| e.execute_command(&cmd).map_err(es))
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// Inspect a device object (`!devobj <device>`): device type, characteristics
     /// (e.g. FILE_DEVICE_SECURE_OPEN), and the SecurityDescriptor pointer — the inputs to the
     /// *openable* gate. (`!sd <SecurityDescriptor>` decodes the DACL where that extension is
     /// available; it is not in the bundled engine.)
-    #[rmcp::tool]
+    #[rmcp::tool(annotations(
+        title = "Inspect device object",
+        read_only_hint = true,
+        open_world_hint = false
+    ))]
     async fn device_object(
         &self,
         Parameters(args): Parameters<DeviceObjectArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let cmd = format!("!devobj {}", args.device);
         let out = self
             .engine
             .run(move |e| e.execute_command(&cmd).map_err(es))
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// Dump the current IO_STACK_LOCATION of an IRP (`!irp <irp> 1`): major/minor,
     /// IoControlCode, input/output buffer lengths, and buffer pointers. Defaults the IRP
     /// to `@rdx` (the PIRP at the dispatch entry on x64) — valid only before stepping.
-    #[rmcp::tool]
+    #[rmcp::tool(annotations(
+        title = "Dump IRP stack location",
+        read_only_hint = true,
+        open_world_hint = false
+    ))]
     async fn irp_stack(
         &self,
         Parameters(args): Parameters<IrpStackArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let irp = args.irp.unwrap_or_else(|| "@rdx".to_string());
         let cmd = format!("!irp {irp} 1");
         let out = self
             .engine
             .run(move |e| e.execute_command(&cmd).map_err(es))
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// Install a conditional logging breakpoint at the IOCTL dispatch routine that prints
@@ -1791,11 +2310,20 @@ impl WindbgServer {
     /// needs no hand-assembled offsets. Reads the current IO_STACK_LOCATION via
     /// `poi(@rdx+0xb8)` (x64); confirm the offset with `dt nt!_IRP` / `dt nt!_IO_STACK_LOCATION`
     /// on the target. Requires a real KDNET/VM target — a local kernel cannot set code bp's.
-    #[rmcp::tool]
+    #[rmcp::tool(annotations(
+        title = "Trace dispatched IOCTLs",
+        read_only_hint = false,
+        destructive_hint = false,
+        idempotent_hint = false,
+        open_world_hint = false
+    ))]
     async fn ioctl_trace(
         &self,
         Parameters(args): Parameters<IoctlTraceArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         // IRP in @rdx at dispatch entry (x64). CurrentStackLocation = poi(Irp+0xb8).
         // Within IO_STACK_LOCATION: OutputBufferLength +0x08, InputBufferLength +0x10,
         // IoControlCode +0x18 (Parameters union begins at +0x08).
@@ -1807,8 +2335,8 @@ impl WindbgServer {
         let out = self
             .engine
             .run(move |e| e.execute_command(&cmd).map_err(es))
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 
     /// Static, best-effort control-flow reachability: is the code block at `address`
@@ -1818,11 +2346,18 @@ impl WindbgServer {
     /// concrete static path exists, and the call path is reported); "NOT REACHABLE"
     /// means only that the block was not found within the bounds — indirect calls
     /// through function pointers and unresolved compiler jump tables are NOT followed.
-    #[rmcp::tool]
+    #[rmcp::tool(annotations(
+        title = "Test reachability from IOCTL dispatch",
+        read_only_hint = true,
+        open_world_hint = false
+    ))]
     async fn reachable_from_dispatch(
         &self,
         Parameters(args): Parameters<ReachabilityArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.check_session(args.session_id.as_deref()) {
+            return tool_error(e);
+        }
         let out = self
             .engine
             .run(move |e| {
@@ -1909,8 +2444,8 @@ impl WindbgServer {
                 }
                 Ok(out)
             })
-            .await?;
-        text_result(out)
+            .await;
+        engine_result(out)
     }
 }
 
@@ -1934,6 +2469,157 @@ impl rmcp::ServerHandler for WindbgServer {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- MCP protocol surface ------------------------------------------
+
+    /// `tools/list` must not reorder between calls: clients cache the list, and a
+    /// shuffled order also costs LLM prompt-cache hits. The SDK's router sorts by name
+    /// today — this pins that so an SDK bump can't silently regress it.
+    #[test]
+    fn tool_list_is_deterministically_ordered() {
+        let names: Vec<String> = WindbgServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+
+        let mut expected = names.clone();
+        expected.sort();
+        assert_eq!(
+            names, expected,
+            "tools/list must be in a stable, sorted order"
+        );
+
+        // Guard against the list silently becoming empty if the macro wiring changes.
+        assert!(names.contains(&"open_dump".to_string()));
+    }
+
+    /// Behaviour hints let a client tell "read a register" apart from "run arbitrary
+    /// debugger commands" before prompting the user.
+    #[test]
+    fn every_tool_declares_annotations() {
+        for tool in WindbgServer::tool_router().list_all() {
+            let ann = tool
+                .annotations
+                .unwrap_or_else(|| panic!("tool `{}` declares no annotations", tool.name));
+            assert!(
+                ann.title.is_some(),
+                "tool `{}` has no annotation title",
+                tool.name
+            );
+        }
+    }
+
+    /// The tools that mutate a live target must not claim to be read-only, and the
+    /// pure/inspection tools must not be flagged destructive.
+    #[test]
+    fn annotations_match_tool_behaviour() {
+        let tools = WindbgServer::tool_router().list_all();
+        let ann = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("no tool `{name}`"))
+                .annotations
+                .clone()
+                .unwrap()
+        };
+
+        for name in ["execute", "launch", "record_trace", "end_session", "go"] {
+            assert_eq!(
+                ann(name).read_only_hint,
+                Some(false),
+                "`{name}` changes the target and must not be marked read-only"
+            );
+            assert_eq!(ann(name).destructive_hint, Some(true), "`{name}`");
+        }
+
+        for name in ["read_memory", "backtrace", "modules", "decode_ioctl"] {
+            assert_eq!(
+                ann(name).read_only_hint,
+                Some(true),
+                "`{name}` only inspects and should be marked read-only"
+            );
+        }
+    }
+
+    /// Session-scoped tools take a handle; the two that are genuinely session-independent
+    /// must not, or callers would think they were scoped when they are not.
+    #[test]
+    fn session_scoped_tools_accept_a_session_id() {
+        let tools = WindbgServer::tool_router().list_all();
+        let takes_session = |name: &str| {
+            let tool = tools.iter().find(|t| t.name == name).unwrap();
+            tool.input_schema
+                .get("properties")
+                .and_then(|p| p.get("session_id"))
+                .is_some()
+        };
+
+        for name in ["read_memory", "execute", "go", "end_session", "modules"] {
+            assert!(takes_session(name), "`{name}` should accept session_id");
+        }
+        for name in ["decode_ioctl", "record_trace", "open_dump"] {
+            assert!(
+                !takes_session(name),
+                "`{name}` should not accept session_id"
+            );
+        }
+    }
+
+    // ---- Session handles -----------------------------------------------
+
+    #[test]
+    fn omitted_handle_accepts_whatever_session_is_current() {
+        assert!(check_session_handle(Some("sess-1"), None).is_ok());
+        assert!(check_session_handle(None, None).is_ok());
+    }
+
+    #[test]
+    fn matching_handle_is_accepted() {
+        assert!(check_session_handle(Some("sess-1"), Some("sess-1")).is_ok());
+    }
+
+    #[test]
+    fn handle_from_a_replaced_session_is_refused() {
+        let err = check_session_handle(Some("sess-2"), Some("sess-1")).unwrap_err();
+        assert!(err.contains("sess-1"), "{err}");
+        assert!(err.contains("sess-2"), "{err}");
+    }
+
+    #[test]
+    fn handle_is_refused_once_the_session_is_ended() {
+        let err = check_session_handle(None, Some("sess-1")).unwrap_err();
+        assert!(err.contains("no debug session open"), "{err}");
+    }
+
+    #[test]
+    fn minted_handles_are_unique() {
+        let a = mint_session_id();
+        let b = mint_session_id();
+        assert_ne!(a, b);
+    }
+
+    // ---- Error reporting -----------------------------------------------
+
+    /// A failed debugger operation belongs in the result (`isError: true`) so the model
+    /// can read it and correct itself; only a dead engine is a protocol error.
+    #[test]
+    fn debugger_failures_are_tool_errors_not_protocol_errors() {
+        let r = engine_result(Err(EngineError::Debugger("no such symbol".into())))
+            .expect("debugger failure must not surface as a protocol error");
+        assert_eq!(r.is_error, Some(true));
+
+        let err = engine_result(Err(EngineError::Unavailable("engine gone".into())))
+            .expect_err("a dead engine must surface as a protocol error");
+        assert!(err.message.contains("engine gone"));
+    }
+
+    #[test]
+    fn successful_output_is_not_flagged_as_an_error() {
+        let r = engine_result(Ok("rax=0000000000000000".into())).unwrap();
+        assert_eq!(r.is_error, Some(false));
+    }
 
     #[test]
     fn parse_u64_decimal() {

@@ -24,6 +24,13 @@ The low-level engine bindings live in [`win-kexp`](https://github.com/glslang/wi
 - **`ttd.rs`** — locates `TTD.exe` and launches trace recording.
 - **`main.rs`** — tokio + stdio transport. **Logs go to stderr** (stdout is the JSON-RPC channel).
 
+**MCP protocol revision:** this server speaks the `initialize`-handshake ("legacy") era of MCP —
+`2025-11-25` and `2025-06-18`, whichever the client negotiates — because that is what `rmcp` 1.x
+implements. The `2026-07-28` revision replaces the handshake with a stateless, per-request model
+(`server/discover`, `resultType`, per-request `_meta`); clients that speak *only* `2026-07-28` cannot
+talk to this server. Support for it waits on a stable `rmcp` 3.x (`2026-07-28` support currently
+exists only in its beta line).
+
 ## Requirements
 
 - Windows x64 (host bitness must match the target).
@@ -200,6 +207,28 @@ gh attestation verify <zip> --repo glslang/windbg-mcp `
 | TTD analysis | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
 | Driver IOCTL | `decode_ioctl`, `driver_object`, `device_object`, `irp_stack`, `ioctl_trace`, `reachable_from_dispatch` |
 | Raw     | `execute` — run any debugger command, returns full text output |
+
+### Session handles
+
+The six Session tools that open a target (`open_dump`, `open_trace`, `attach_kernel_local`,
+`attach_kernel`, `attach_process`, `launch`) return a **`session_id`**. Every tool that touches the
+debug target accepts it as an optional argument and refuses to run if it no longer matches the
+session the engine is attached to.
+
+This matters because one server process drives one DbgEng session, while an MCP connection is *not*
+a session: a client may interleave unrelated requests over the same stdio process. Without a handle,
+a `read_memory` issued after someone else's `open_dump` silently reads the wrong target. Passing
+`session_id` turns that into a visible error instead.
+
+The argument is optional — omit it and a call operates on whatever session is current, exactly as
+before. `decode_ioctl` (pure) and `record_trace` (independent of the debug session) do not take it.
+
+### Error reporting
+
+A failed *debugger operation* — an unresolvable symbol, an unreadable address, a target that never
+stopped — comes back as a normal tool result with `isError: true` and the debugger's own text, so
+the model can read it and correct itself. Only a dead engine thread is reported as a JSON-RPC
+protocol error.
 
 The forward (`go`/`step_over`/`step_into`) and reverse (`reverse_go`/`step_over_back`/`step_back`)
 control tools mirror a debugger UI's F9/F8/F7 and Shift+F9/F8/F7, so an agent can drive a trace in

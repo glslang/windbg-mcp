@@ -5,16 +5,42 @@
 //! OS thread and marshal every operation onto it over a channel, returning results
 //! to the async (rmcp/tokio) side via oneshot replies.
 
+use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rmcp::ErrorData;
 use tokio::sync::{mpsc, oneshot};
 use win_kexp::dbgeng::DebugEngine;
 
 /// Result of an engine operation: `Ok(text)` or `Err(message)`.
 type Reply = Result<String, String>;
+
+/// Why an engine call failed, split by who can act on the failure.
+///
+/// The MCP tool spec draws exactly this line: failures the model can see and
+/// self-correct from belong in the tool *result* (`isError: true`), while failures
+/// of the server machinery belong in a JSON-RPC error. Keeping the two apart here
+/// lets [`crate::server`] render each one the right way instead of collapsing every
+/// debugger hiccup into an opaque protocol error the model never really sees.
+#[derive(Debug)]
+pub enum EngineError {
+    /// The debugger ran the operation and it failed — an unresolvable symbol, an
+    /// unreadable address, a command error, a target that never stopped. Actionable:
+    /// the model can adjust its arguments and retry.
+    Debugger(String),
+    /// The engine itself is unusable — the worker thread is gone or dropped the reply.
+    /// Nothing the model can do about it.
+    Unavailable(String),
+}
+
+impl fmt::Display for EngineError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Debugger(m) | Self::Unavailable(m) => f.write_str(m),
+        }
+    }
+}
 
 /// A unit of work to run on the engine thread, plus where to send its result.
 struct Job {
@@ -65,7 +91,7 @@ impl EngineHandle {
     }
 
     /// Runs `f` on the engine thread, awaiting the result with the configured timeout.
-    pub async fn run<F>(&self, f: F) -> Result<String, ErrorData>
+    pub async fn run<F>(&self, f: F) -> Result<String, EngineError>
     where
         F: FnOnce(&DebugEngine) -> Reply + Send + 'static,
     {
@@ -75,14 +101,17 @@ impl EngineHandle {
                 run: Box::new(f),
                 reply: rtx,
             })
-            .map_err(|_| ErrorData::internal_error("engine thread unavailable", None))?;
+            .map_err(|_| EngineError::Unavailable("engine thread unavailable".to_string()))?;
         match tokio::time::timeout(self.call_timeout, rrx).await {
             Ok(Ok(Ok(s))) => Ok(s),
-            Ok(Ok(Err(e))) => Err(ErrorData::internal_error(e, None)),
-            Ok(Err(_)) => Err(ErrorData::internal_error("engine dropped reply", None)),
-            Err(_) => Err(ErrorData::internal_error(
-                "engine call timed out (the target may still be running)",
-                None,
+            // The debugger reached a verdict and it was a failure — including a panic
+            // caught by the worker, which leaves the engine usable for the next call.
+            Ok(Ok(Err(e))) => Err(EngineError::Debugger(e)),
+            Ok(Err(_)) => Err(EngineError::Unavailable("engine dropped reply".to_string())),
+            // A timeout is an operational outcome, not broken plumbing: the target may
+            // simply still be running, and the model can wait, retry, or end the session.
+            Err(_) => Err(EngineError::Debugger(
+                "engine call timed out (the target may still be running)".to_string(),
             )),
         }
     }
@@ -93,7 +122,7 @@ impl EngineHandle {
     /// an unbounded `s` memory search) pinning the single engine thread and wedging every later
     /// call. Use this for command-executing tools (`execute`, `dx`, the `ttd_*` wrappers); the
     /// quick, inherently-bounded operations can keep using [`Self::run`].
-    pub async fn run_command(&self, command: String) -> Result<String, ErrorData> {
+    pub async fn run_command(&self, command: String) -> Result<String, EngineError> {
         // The outer timeout in `run` starts counting at *submission*, but this command may sit
         // in the engine queue behind another job (e.g. a backgrounded `go`) before reaching the
         // worker. Compute the watchdog budget from the time *remaining* until that timeout — not
