@@ -51,6 +51,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alternative of retrying an attach or launch that would connect or spawn a second time.
   Deliberately does not queue on the engine thread, since the situation it addresses is
   that thread being parked.
+
+  It reports *the current* handle, not *your* handle, so recovery is a two-step check. A
+  timed-out open now names the handle it would commit — the id is minted before the job is
+  queued, so it can be stated up front — and the caller adopts the session only if
+  `session_status` reports that same id. A different id means another caller's open landed
+  while theirs was in flight, and the loaded target is not theirs. Without that correlation,
+  "ask for the current handle" would quietly hand the wrong target to a caller following the
+  documented recovery flow, with every later session check passing.
 - **Tool behaviour annotations.** All 37 tools now declare a title and the
   read-only / destructive / idempotent / open-world hints, so a client can tell
   `read_memory` apart from `execute` before prompting the user. `openWorldHint` is true for

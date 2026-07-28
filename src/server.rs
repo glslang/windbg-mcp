@@ -63,7 +63,7 @@ fn tool_error(s: String) -> Result<CallToolResult, ErrorData> {
 fn engine_result(r: Result<String, EngineError>) -> Result<CallToolResult, ErrorData> {
     match r {
         Ok(out) => text_result(out),
-        Err(EngineError::Debugger(m)) => tool_error(m),
+        Err(EngineError::Debugger(m) | EngineError::Timeout(m)) => tool_error(m),
         Err(EngineError::Unavailable(m)) => Err(ErrorData::internal_error(m, None)),
     }
 }
@@ -1458,6 +1458,19 @@ impl WindbgServer {
                  fail loudly instead of silently acting on a different target if this \
                  server's session is replaced."
             )),
+            // A timeout abandons the *wait*, not the job: this open may still be running and
+            // may still commit. The handle was minted before the job was queued, so it can be
+            // named now — which is what makes recovery via `session_status` sound. Without it
+            // the caller would only learn "some session exists" and could adopt a handle
+            // belonging to somebody else's open that landed in the meantime.
+            Err(EngineError::Timeout(msg)) => tool_error(format!(
+                "{msg}\n\nThis open may still complete on the engine thread. If it does, its \
+                 handle will be exactly `{id}`. Call session_status: treat the session as \
+                 yours only if it reports that same id, and if it reports a different one \
+                 then another caller's target is loaded and yours never landed. Do not re-run \
+                 this open to recover — attaching or launching again would connect to, or \
+                 start, a second target."
+            )),
             Err(e) => engine_result(Err(e)),
         }
     }
@@ -1719,6 +1732,10 @@ impl WindbgServer {
     /// the call can give up while the engine thread stays parked and completes the attach
     /// later, committing a handle no reply ever carried. Prefer this to retrying the attach,
     /// which would connect a second time.
+    ///
+    /// This reports *the current* handle, not *your* handle — the two differ if another
+    /// caller's open landed while yours was in flight. A timed-out open names the handle it
+    /// would commit, so compare against that: adopt the session only when the two match.
     #[rmcp::tool(annotations(
         title = "Show current session handle",
         read_only_hint = true,
@@ -2876,6 +2893,15 @@ mod tests {
         let err = engine_result(Err(EngineError::Unavailable("engine gone".into())))
             .expect_err("a dead engine must surface as a protocol error");
         assert!(err.message.contains("engine gone"));
+    }
+
+    /// A timeout is still something the model can act on (wait, retry, end the session), so
+    /// it renders like any other debugger failure rather than as a protocol error.
+    #[test]
+    fn timeouts_are_tool_errors_too() {
+        let r = engine_result(Err(EngineError::Timeout("timed out".into())))
+            .expect("a timeout must not surface as a protocol error");
+        assert_eq!(r.is_error, Some(true));
     }
 
     #[test]

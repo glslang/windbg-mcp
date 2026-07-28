@@ -239,13 +239,20 @@ can enumerate — so inside `execute` a handle is a strong hint rather than a gu
 The argument is optional — omit it and a call operates on whatever session is current, exactly as
 before. `decode_ioctl` (pure) and `record_trace` (independent of the debug session) do not take it.
 
-If you never received a handle, ask for it with **`session_status`** rather than opening again. The
-per-call timeout can fire while the engine thread is still working, and a job that then succeeds
-commits a handle no reply carried. A live `attach_kernel` is the case that matters: it waits
-indefinitely by design, so a call that reports a timeout while the attach completes moments later is
-normal (see *Limitations & notes*). Retrying the attach would connect a second time; `session_status`
-just hands you the handle. It does not queue on the engine thread, so it still answers while a parked
-attach holds it.
+If an open times out, do not open again — recover instead. The per-call timeout abandons the *wait*,
+not the job, so the open may still be running and may still commit a handle no reply carried. A live
+`attach_kernel` is the case that matters: it waits indefinitely by design, so a call reporting a
+timeout while the attach completes moments later is normal (see *Limitations & notes*).
+
+A timed-out open therefore names the handle it *would* commit. Recovery is a two-step check:
+
+1. Note the `session_id` the timeout message gives you.
+2. Call **`session_status`**, which reports the handle the server currently holds.
+
+Adopt the session only if the two match. If `session_status` reports a *different* id, another
+caller's open landed while yours was in flight and that target is not yours — the mismatch is the
+point of naming the id up front. `session_status` does not queue on the engine thread, so it still
+answers while a parked attach holds it.
 
 ### Error reporting
 

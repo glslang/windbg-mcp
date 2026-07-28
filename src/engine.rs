@@ -35,6 +35,11 @@ pub enum EngineError {
     /// unreadable address, a command error, a target that never stopped. Actionable:
     /// the model can adjust its arguments and retry.
     Debugger(String),
+    /// The call outlived its budget. Reported to the model exactly like [`Self::Debugger`],
+    /// but kept separate because it means something the caller must know: the job was
+    /// abandoned by the *waiter*, not by the engine, so it may still be running and may
+    /// still succeed. Anything whose retry has side effects has to say so.
+    Timeout(String),
     /// The engine itself is unusable — the worker thread is gone or dropped the reply.
     /// Nothing the model can do about it.
     Unavailable(String),
@@ -43,7 +48,7 @@ pub enum EngineError {
 impl fmt::Display for EngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Debugger(m) | Self::Unavailable(m) => f.write_str(m),
+            Self::Debugger(m) | Self::Timeout(m) | Self::Unavailable(m) => f.write_str(m),
         }
     }
 }
@@ -121,7 +126,8 @@ impl EngineHandle {
             Ok(Err(_)) => Err(EngineError::Unavailable("engine dropped reply".to_string())),
             // A timeout is an operational outcome, not broken plumbing: the target may
             // simply still be running, and the model can wait, retry, or end the session.
-            Err(_) => Err(EngineError::Debugger(
+            // Note the job itself is *not* cancelled — only this wait for it is.
+            Err(_) => Err(EngineError::Timeout(
                 "engine call timed out (the target may still be running)".to_string(),
             )),
         }
