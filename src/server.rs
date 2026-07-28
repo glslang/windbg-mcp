@@ -1403,6 +1403,15 @@ impl WindbgServer {
 }
 
 // ---- Tools ---------------------------------------------------------------
+//
+// On `open_world_hint`: with a symbol server on the symbol path — the documented, and
+// recommended, setup — almost anything here can make DbgEng reach out and download a PDB.
+// It is not just the obvious symbol-pattern queries: `r` symbolizes the current
+// instruction, `k` symbolizes every frame, `bp module!Symbol` resolves a name. So the hint
+// is true for all of them, and false only where it is genuinely, structurally false:
+// `read_memory` (raw bytes to a hex dump), `decode_ioctl` (pure arithmetic, no engine at
+// all), and `end_session` (teardown). Claiming otherwise would tell a client that a tool
+// cannot touch the network and let it skip whatever consent that decision gates.
 
 #[rmcp::tool_router]
 impl WindbgServer {
@@ -1676,7 +1685,7 @@ impl WindbgServer {
     #[rmcp::tool(annotations(
         title = "Show registers",
         read_only_hint = true,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn registers(
         &self,
@@ -1733,7 +1742,7 @@ impl WindbgServer {
     #[rmcp::tool(annotations(
         title = "Show call stack",
         read_only_hint = true,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn backtrace(
         &self,
@@ -1754,7 +1763,7 @@ impl WindbgServer {
     #[rmcp::tool(annotations(
         title = "List modules",
         read_only_hint = true,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn modules(
         &self,
@@ -1775,7 +1784,7 @@ impl WindbgServer {
     #[rmcp::tool(annotations(
         title = "List threads",
         read_only_hint = true,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn threads(
         &self,
@@ -1796,7 +1805,7 @@ impl WindbgServer {
     #[rmcp::tool(annotations(
         title = "Disassemble",
         read_only_hint = true,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn disassemble(
         &self,
@@ -1823,7 +1832,7 @@ impl WindbgServer {
         read_only_hint = false,
         destructive_hint = false,
         idempotent_hint = false,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn dx(&self, Parameters(args): Parameters<DxArgs>) -> Result<CallToolResult, ErrorData> {
         let gate = self.session_gate(args.session_id.as_deref());
@@ -1841,7 +1850,7 @@ impl WindbgServer {
     #[rmcp::tool(annotations(
         title = "TTD: find calls to a function",
         read_only_hint = true,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn ttd_calls(
         &self,
@@ -1859,7 +1868,7 @@ impl WindbgServer {
     #[rmcp::tool(annotations(
         title = "TTD: find accesses to a memory range",
         read_only_hint = true,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn ttd_memory(
         &self,
@@ -1890,7 +1899,7 @@ impl WindbgServer {
     #[rmcp::tool(annotations(
         title = "TTD: list trace events",
         read_only_hint = true,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn ttd_events(
         &self,
@@ -1910,7 +1919,7 @@ impl WindbgServer {
         read_only_hint = false,
         destructive_hint = false,
         idempotent_hint = false,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn set_breakpoint(
         &self,
@@ -1934,7 +1943,7 @@ impl WindbgServer {
         read_only_hint = false,
         destructive_hint = true,
         idempotent_hint = false,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn go(
         &self,
@@ -1962,7 +1971,7 @@ impl WindbgServer {
         read_only_hint = false,
         destructive_hint = true,
         idempotent_hint = false,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn run_to_address(
         &self,
@@ -2019,7 +2028,7 @@ impl WindbgServer {
         read_only_hint = false,
         destructive_hint = true,
         idempotent_hint = false,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn step_over(
         &self,
@@ -2042,7 +2051,7 @@ impl WindbgServer {
         read_only_hint = false,
         destructive_hint = true,
         idempotent_hint = false,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn step_into(
         &self,
@@ -2067,7 +2076,7 @@ impl WindbgServer {
         read_only_hint = false,
         destructive_hint = false,
         idempotent_hint = false,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn step_back(
         &self,
@@ -2090,7 +2099,7 @@ impl WindbgServer {
         read_only_hint = false,
         destructive_hint = false,
         idempotent_hint = false,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn step_over_back(
         &self,
@@ -2113,7 +2122,7 @@ impl WindbgServer {
         read_only_hint = false,
         destructive_hint = false,
         idempotent_hint = false,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn reverse_go(
         &self,
@@ -2136,7 +2145,7 @@ impl WindbgServer {
         read_only_hint = false,
         destructive_hint = false,
         idempotent_hint = true,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn goto_position(
         &self,
@@ -2259,7 +2268,7 @@ impl WindbgServer {
     #[rmcp::tool(annotations(
         title = "Inspect driver object",
         read_only_hint = true,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn driver_object(
         &self,
@@ -2284,7 +2293,7 @@ impl WindbgServer {
     #[rmcp::tool(annotations(
         title = "Inspect device object",
         read_only_hint = true,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn device_object(
         &self,
@@ -2308,7 +2317,7 @@ impl WindbgServer {
     #[rmcp::tool(annotations(
         title = "Dump IRP stack location",
         read_only_hint = true,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn irp_stack(
         &self,
@@ -2337,7 +2346,7 @@ impl WindbgServer {
         read_only_hint = false,
         destructive_hint = false,
         idempotent_hint = false,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn ioctl_trace(
         &self,
@@ -2372,7 +2381,7 @@ impl WindbgServer {
     #[rmcp::tool(annotations(
         title = "Test reachability from IOCTL dispatch",
         read_only_hint = true,
-        open_world_hint = false
+        open_world_hint = true
     ))]
     async fn reachable_from_dispatch(
         &self,
@@ -2563,6 +2572,25 @@ mod tests {
                 "`{name}` only inspects and should be marked read-only"
             );
         }
+    }
+
+    /// Only the tools that structurally cannot reach a symbol server may say so. Everything
+    /// else can trigger a PDB download once a symbol server is on the path, and a client may
+    /// be gating network consent on this hint.
+    #[test]
+    fn only_the_tools_that_cannot_reach_the_network_are_closed_world() {
+        let closed: Vec<String> = WindbgServer::tool_router()
+            .list_all()
+            .into_iter()
+            .filter(|t| {
+                t.annotations
+                    .as_ref()
+                    .is_some_and(|a| a.open_world_hint == Some(false))
+            })
+            .map(|t| t.name.to_string())
+            .collect();
+
+        assert_eq!(closed, ["decode_ioctl", "end_session", "read_memory"]);
     }
 
     /// Session-scoped tools take a handle; the two that are genuinely session-independent

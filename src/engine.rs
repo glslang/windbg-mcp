@@ -13,8 +13,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use win_kexp::dbgeng::DebugEngine;
 
-/// Result of an engine operation: `Ok(text)` or `Err(message)`.
+/// What a job closure returns: `Ok(text)` or `Err(message)`. Jobs describe debugger work,
+/// so a plain message is all they can meaningfully report.
 type Reply = Result<String, String>;
+
+/// What travels back over the reply channel. The worker classifies each outcome at the
+/// point it knows the difference — an operation that failed versus an engine that was
+/// never usable — because that distinction is unrecoverable once it reaches the caller.
+type Classified = Result<String, EngineError>;
 
 /// Why an engine call failed, split by who can act on the failure.
 ///
@@ -45,7 +51,7 @@ impl fmt::Display for EngineError {
 /// A unit of work to run on the engine thread, plus where to send its result.
 struct Job {
     run: Box<dyn FnOnce(&DebugEngine) -> Reply + Send>,
-    reply: oneshot::Sender<Reply>,
+    reply: oneshot::Sender<Classified>,
 }
 
 /// Cloneable handle to the engine thread, shared across all tool calls.
@@ -69,21 +75,27 @@ impl EngineHandle {
                 let engine = match catch_unwind(AssertUnwindSafe(DebugEngine::new)) {
                     Ok(engine) => engine,
                     Err(_) => {
+                        // The engine never came up, and never will for this process. That is
+                        // `Unavailable`, not a failed operation: no argument the model can
+                        // change makes the next call work, so it must not come back as a
+                        // retryable tool error.
                         while let Some(job) = rx.blocking_recv() {
-                            let _ = job.reply.send(Err(
+                            let _ = job.reply.send(Err(EngineError::Unavailable(
                                 "failed to initialize DbgEng (is dbgeng.dll on the search path?)"
                                     .to_string(),
-                            ));
+                            )));
                         }
                         return;
                     }
                 };
                 while let Some(job) = rx.blocking_recv() {
                     // A panic inside a win-kexp method (several use `.expect`) must not
-                    // kill the worker — surface it as an error for this one call.
+                    // kill the worker — surface it as an error for this one call. The engine
+                    // survives, so this stays a debugger-level failure the model can work
+                    // around by trying something else.
                     let result = catch_unwind(AssertUnwindSafe(|| (job.run)(&engine)))
                         .unwrap_or_else(|_| Err("debugger operation panicked".to_string()));
-                    let _ = job.reply.send(result);
+                    let _ = job.reply.send(result.map_err(EngineError::Debugger));
                 }
             })
             .expect("failed to spawn dbgeng thread");
@@ -103,10 +115,9 @@ impl EngineHandle {
             })
             .map_err(|_| EngineError::Unavailable("engine thread unavailable".to_string()))?;
         match tokio::time::timeout(self.call_timeout, rrx).await {
-            Ok(Ok(Ok(s))) => Ok(s),
-            // The debugger reached a verdict and it was a failure — including a panic
-            // caught by the worker, which leaves the engine usable for the next call.
-            Ok(Ok(Err(e))) => Err(EngineError::Debugger(e)),
+            // Already classified by the worker, which is the only place that can tell a
+            // failed operation apart from an engine that never initialized.
+            Ok(Ok(classified)) => classified,
             Ok(Err(_)) => Err(EngineError::Unavailable("engine dropped reply".to_string())),
             // A timeout is an operational outcome, not broken plumbing: the target may
             // simply still be running, and the model can wait, retry, or end the session.
