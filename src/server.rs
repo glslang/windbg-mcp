@@ -35,9 +35,12 @@ static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 pub struct WindbgServer {
     engine: EngineHandle,
     /// Handle identifying the debug session the engine is currently attached to, or
-    /// `None` when no target is open. See [`WindbgServer::check_session`] for why this
-    /// exists rather than letting the connection stand in for the session.
+    /// `None` when no target is open. See [`check_session_handle`] for why this exists
+    /// rather than letting the connection stand in for the session.
     session: Arc<Mutex<Option<String>>>,
+    /// Recent opener outcomes, so a caller whose open timed out can find out whether it is
+    /// still pending, landed, or failed. See [`OpenOutcome`].
+    opens: Arc<Mutex<VecDeque<(String, OpenOutcome)>>>,
 }
 
 /// Maps any error to a `String` for the engine `Reply` channel.
@@ -1398,6 +1401,47 @@ fn reject_command_breakers(field: &str, value: &str, quotes: Quotes) -> Result<(
     ))
 }
 
+/// How far a session-opening job got.
+///
+/// Recorded because the per-call timeout abandons the *waiter*, not the job: a caller can
+/// stop hearing about an open that is still queued, still running, or already finished. The
+/// current session handle alone cannot tell those apart — a handle that is not yours means
+/// only "not yours", which is equally true while you wait and after you have failed. So the
+/// outcome is tracked per opener, and [`WindbgServer::session_status`] can be asked about a
+/// specific one.
+///
+/// The distinction matters because it changes what the caller should do: a `Pending` open
+/// must not be re-run (that attaches or launches a second time), while a `Failed` one has to
+/// be, since nothing else will produce a target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum OpenOutcome {
+    /// Queued or running. The handle may still be committed.
+    Pending,
+    /// The target was opened and the handle committed. It may since have been replaced by a
+    /// later open — that is what the handle check is for — but this open did land.
+    Landed,
+    /// The open failed. This handle will never be committed; opening again is the only way
+    /// forward.
+    Failed(String),
+}
+
+/// How many opener outcomes to remember. Opens are rare and a caller only ever asks about a
+/// recent one, so a short window keeps this from growing without bound.
+const OPEN_HISTORY: usize = 8;
+
+/// Records an opener's outcome, evicting the oldest once [`OPEN_HISTORY`] is reached.
+fn record_open(opens: &Mutex<VecDeque<(String, OpenOutcome)>>, id: &str, outcome: OpenOutcome) {
+    let mut opens = opens.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(slot) = opens.iter_mut().find(|(known, _)| known == id) {
+        slot.1 = outcome;
+        return;
+    }
+    if opens.len() == OPEN_HISTORY {
+        opens.pop_front();
+    }
+    opens.push_back((id.to_string(), outcome));
+}
+
 /// Can this data-model expression run debugger commands?
 ///
 /// `dx` evaluates arbitrary data-model expressions, and the data model exposes
@@ -1499,8 +1543,12 @@ impl WindbgServer {
     {
         let id = mint_session_id();
         let session = Arc::clone(&self.session);
+        let opens = Arc::clone(&self.opens);
         let new_id = id.clone();
         let id_for_report = id.clone();
+        // Recorded before the job is queued, so a caller who never hears back can still ask
+        // about it — the whole point is that the reply may never arrive.
+        record_open(&self.opens, &id, OpenOutcome::Pending);
         let out = self
             .engine
             .run(move |e| {
@@ -1508,8 +1556,18 @@ impl WindbgServer {
                 // here on — including if the transition fails partway and leaves the engine
                 // holding neither the old target nor a usable new one.
                 *lock(&session) = None;
-                transition(e)?;
-                *lock(&session) = Some(new_id);
+                // Under `catch_unwind` for the same reason the report is: an unwind here
+                // would leave the outcome recorded as `Pending` forever, and a caller
+                // following the documented recovery would poll for a handle that is never
+                // coming.
+                let transitioned = catch_unwind(AssertUnwindSafe(|| transition(e)))
+                    .unwrap_or_else(|_| Err("debugger operation panicked".to_string()));
+                if let Err(err) = transitioned {
+                    record_open(&opens, &new_id, OpenOutcome::Failed(err.clone()));
+                    return Err(err);
+                }
+                *lock(&session) = Some(new_id.clone());
+                record_open(&opens, &new_id, OpenOutcome::Landed);
                 // The target is ours from here, so a failed diagnostic still has to hand the
                 // caller their handle — otherwise they cannot use the protection this whole
                 // mechanism promises without re-running a side-effecting open.
@@ -1543,12 +1601,19 @@ impl WindbgServer {
             Err(EngineError::Timeout(msg)) => tool_error(format!(
                 "{msg}\n\nThe wait was abandoned, but this open was not: it may still be \
                  queued behind other work, and may still run and commit the handle `{id}`. \
-                 Poll session_status — the session is yours once it reports `{id}`. A \
-                 different id means yours has not landed *yet*, not that it failed; it may \
-                 still be pending. Either way do not re-run this open to recover, which would \
-                 attach to, or start, a second target."
+                 Ask `session_status {{ \"session_id\": \"{id}\" }}` — it reports whether this \
+                 open is still pending, has landed, or has failed. Do not re-run the open \
+                 while it is pending, which would attach to, or start, a second target; once \
+                 it reports failed, re-running is the only way forward."
             )),
-            Err(e) => engine_result(Err(e)),
+            Err(e) => {
+                // The job never reached the engine (the worker is gone), so nothing on that
+                // side will ever record an outcome for it.
+                if matches!(e, EngineError::Unavailable(_)) {
+                    record_open(&self.opens, &id, OpenOutcome::Failed(e.to_string()));
+                }
+                engine_result(Err(e))
+            }
         }
     }
 }
@@ -1573,6 +1638,7 @@ impl WindbgServer {
         Self {
             engine,
             session: Arc::new(Mutex::new(None)),
+            opens: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
@@ -1803,42 +1869,85 @@ impl WindbgServer {
         .await
     }
 
-    /// Report the handle of the debug session this server currently holds, or that none is
-    /// open. Use it to recover a `session_id` you never received — most importantly after an
-    /// `attach_kernel` that reported a timeout: a live kernel attach waits indefinitely, so
-    /// the call can give up while the engine thread stays parked and completes the attach
-    /// later, committing a handle no reply ever carried. Prefer this to retrying the attach,
-    /// which would connect a second time.
+    /// Report the handle of the debug session this server currently holds, and — when asked
+    /// about a specific `session_id` — what became of the open that would have committed it.
     ///
-    /// This reports *the current* handle, not *your* handle — the two differ if another
-    /// caller's open landed while yours was in flight. A timed-out open names the handle it
-    /// would commit, so compare against that: adopt the session only when the two match.
+    /// This exists because a per-call timeout abandons the *waiter*, not the job. A live
+    /// `attach_kernel` waits indefinitely by design, so an open reporting a timeout while it
+    /// completes moments later is normal, not exceptional; the handle it commits is one no
+    /// reply ever carried. Pass the `session_id` the timeout named and this reports whether
+    /// that open is still pending, has landed, or has failed — which is the difference
+    /// between "wait" and "open again", and re-running an attach or launch on a guess
+    /// connects or spawns a second time.
     ///
-    /// A mismatch means "not yours *yet*", not "yours failed". The timeout abandons the
-    /// wait, not the job, so a timed-out open can still be sitting in the queue and can
-    /// still land later. Poll rather than concluding; re-running the open is the one thing
-    /// that is never the answer.
+    /// Called with no argument it reports only the current handle, which answers "what is
+    /// loaded" but deliberately not "is it mine": another caller's open landing while yours
+    /// was in flight produces exactly the same answer.
     #[rmcp::tool(annotations(
         title = "Show current session handle",
         read_only_hint = true,
         open_world_hint = false
     ))]
-    async fn session_status(&self) -> Result<CallToolResult, ErrorData> {
+    async fn session_status(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         // Deliberately *not* queued on the engine thread. The case this exists for is a
         // parked attach holding that thread, so queueing behind it would make the tool
         // unavailable exactly when it is needed. The cost is that it can read a moment
         // behind an open that is still in flight, which is fine for a status query.
         let current = lock(&self.session).clone();
-        text_result(match current {
-            Some(id) => format!(
-                "session_id: {id}\nPass this as `session_id` on later calls so they fail \
-                 loudly instead of silently acting on a different target if this server's \
-                 session is replaced."
+        let mut out = match &current {
+            Some(id) => format!("Current session: {id}"),
+            None => "No debug session is open.".to_string(),
+        };
+
+        let Some(asked) = args.session_id.as_deref() else {
+            out.push_str(match current {
+                Some(_) => {
+                    "\nPass a `session_id` here to ask what became of a specific open — this \
+                     line says what is loaded, not whether it is yours."
+                }
+                None => {
+                    "\nStart one with open_dump / open_trace / attach_process / attach_kernel \
+                     / attach_kernel_local / launch."
+                }
+            });
+            return text_result(out);
+        };
+
+        let known = self
+            .opens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .find(|(id, _)| id == asked)
+            .map(|(_, outcome)| outcome.clone());
+
+        out.push_str(&match known {
+            Some(OpenOutcome::Landed) if current.as_deref() == Some(asked) => format!(
+                "\n\n`{asked}` landed and is the session now loaded. It is yours: pass it as \
+                 `session_id` on later calls."
             ),
-            None => "No debug session is open. Start one with open_dump / open_trace / \
-                     attach_process / attach_kernel / attach_kernel_local / launch."
-                .to_string(),
-        })
+            Some(OpenOutcome::Landed) => format!(
+                "\n\n`{asked}` landed, but has since been replaced by a later open. That \
+                 target is gone; calls carrying this handle will be refused. Open again."
+            ),
+            Some(OpenOutcome::Pending) => format!(
+                "\n\n`{asked}` is still pending — queued or running. Do not re-run the open, \
+                 which would attach to, or start, a second target. Ask again shortly."
+            ),
+            Some(OpenOutcome::Failed(why)) => format!(
+                "\n\n`{asked}` failed and will never be committed:\n  {why}\nOpening again is \
+                 the only way forward."
+            ),
+            None => format!(
+                "\n\n`{asked}` is not a handle this server issued recently. Only the last \
+                 {OPEN_HISTORY} opens are remembered, so an older one has been forgotten — \
+                 treat it as gone and open again."
+            ),
+        });
+        text_result(out)
     }
 
     /// End the current debug session (detach/close the target) without exiting the server.
@@ -2904,22 +3013,41 @@ mod tests {
                 .is_some()
         };
 
-        for name in ["read_memory", "execute", "go", "end_session", "modules"] {
-            assert!(takes_session(name), "`{name}` should accept session_id");
-        }
-        // `session_status` in particular must not require one — it exists to hand back a
-        // handle the caller never received.
         for name in [
-            "decode_ioctl",
-            "record_trace",
-            "open_dump",
+            "read_memory",
+            "execute",
+            "go",
+            "end_session",
+            "modules",
+            // Takes one to ask *about*, not to be checked against.
             "session_status",
         ] {
+            assert!(takes_session(name), "`{name}` should accept session_id");
+        }
+        for name in ["decode_ioctl", "record_trace", "open_dump"] {
             assert!(
                 !takes_session(name),
                 "`{name}` should not accept session_id"
             );
         }
+
+        // `session_status` must never *require* one: its whole purpose is answering for a
+        // caller who did not receive a handle, and requiring the thing you are asking for
+        // would defeat that.
+        let required = tools
+            .iter()
+            .find(|t| t.name == "session_status")
+            .unwrap()
+            .input_schema
+            .get("required")
+            .cloned();
+        let requires_nothing = required
+            .as_ref()
+            .is_none_or(|r| r.as_array().is_none_or(|r| r.is_empty()));
+        assert!(
+            requires_nothing,
+            "`session_status` must not require any argument, got {required:?}"
+        );
     }
 
     // ---- Session handles -----------------------------------------------
@@ -3130,6 +3258,54 @@ mod tests {
         ] {
             assert!(!changes_debug_target(cmd), "`{cmd}` should keep the handle");
         }
+    }
+
+    /// An opener whose wait timed out has to remain answerable, because the outcome is what
+    /// tells the caller whether to keep waiting or open again — and re-opening on a guess
+    /// attaches or launches a second time.
+    #[test]
+    fn opener_outcomes_are_recorded_and_answerable() {
+        let opens = Mutex::new(VecDeque::new());
+
+        record_open(&opens, "sess-A", OpenOutcome::Pending);
+        record_open(&opens, "sess-B", OpenOutcome::Pending);
+        let read = |id: &str| {
+            opens
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(known, _)| known == id)
+                .map(|(_, o)| o.clone())
+        };
+        assert_eq!(read("sess-A"), Some(OpenOutcome::Pending));
+
+        // An outcome replaces the pending entry in place rather than appending a second one.
+        record_open(&opens, "sess-A", OpenOutcome::Landed);
+        assert_eq!(read("sess-A"), Some(OpenOutcome::Landed));
+        assert_eq!(opens.lock().unwrap().len(), 2);
+
+        // A terminal failure is recorded too — the case that made "keep polling" wrong.
+        record_open(&opens, "sess-B", OpenOutcome::Failed("no such dump".into()));
+        assert_eq!(
+            read("sess-B"),
+            Some(OpenOutcome::Failed("no such dump".into()))
+        );
+    }
+
+    /// The history is bounded, so a long-lived server cannot accumulate outcomes forever.
+    #[test]
+    fn opener_history_is_bounded_and_evicts_oldest_first() {
+        let opens = Mutex::new(VecDeque::new());
+        for n in 0..OPEN_HISTORY + 3 {
+            record_open(&opens, &format!("sess-{n}"), OpenOutcome::Landed);
+        }
+        let opens = opens.lock().unwrap();
+        assert_eq!(opens.len(), OPEN_HISTORY);
+        assert_eq!(opens.front().unwrap().0, "sess-3");
+        assert_eq!(
+            opens.back().unwrap().0,
+            format!("sess-{}", OPEN_HISTORY + 2)
+        );
     }
 
     #[test]
