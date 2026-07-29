@@ -24,12 +24,12 @@ The low-level engine bindings live in [`win-kexp`](https://github.com/glslang/wi
 - **`ttd.rs`** — locates `TTD.exe` and launches trace recording.
 - **`main.rs`** — tokio + stdio transport. **Logs go to stderr** (stdout is the JSON-RPC channel).
 
-**MCP protocol revision:** this server speaks the `initialize`-handshake ("legacy") era of MCP —
-`2025-11-25` and `2025-06-18`, whichever the client negotiates — because that is what `rmcp` 1.x
-implements. The `2026-07-28` revision replaces the handshake with a stateless, per-request model
-(`server/discover`, `resultType`, per-request `_meta`); clients that speak *only* `2026-07-28` cannot
-talk to this server. Support for it waits on a stable `rmcp` 3.x (`2026-07-28` support currently
-exists only in its beta line).
+**MCP protocol revision:** built on `rmcp` 3.x, this server accepts every revision that SDK knows —
+`2026-07-28` and the `initialize`-handshake ("legacy") era before it (`2025-11-25`, `2025-06-18`,
+`2025-03-26`, `2024-11-05`) — and serves whichever the client selects. A `2026-07-28` client gets the
+stateless, per-request model (`server/discover`, `resultType`, per-request `_meta`) and may open with
+`server/discover` instead of `initialize`; older clients keep the handshake, and a client that offers
+an unknown revision is answered with `2025-11-25`.
 
 ## Requirements
 

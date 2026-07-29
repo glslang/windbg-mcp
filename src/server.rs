@@ -13,7 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use rmcp::ErrorData;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, Content};
+use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -49,13 +49,13 @@ fn es<E: ToString>(e: E) -> String {
 }
 
 fn text_result(s: String) -> Result<CallToolResult, ErrorData> {
-    Ok(CallToolResult::success(vec![Content::text(s)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(s)]))
 }
 
 /// A tool-execution error: something the model should see in the result and can act on,
 /// as opposed to a JSON-RPC protocol error it cannot.
 fn tool_error(s: String) -> Result<CallToolResult, ErrorData> {
-    Ok(CallToolResult::error(vec![Content::text(s)]))
+    Ok(CallToolResult::error(vec![ContentBlock::text(s)]))
 }
 
 /// Renders an engine outcome using the MCP error model.
