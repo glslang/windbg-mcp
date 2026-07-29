@@ -1444,16 +1444,27 @@ const OPEN_HISTORY: usize = 8;
 /// side.
 fn record_open(opens: &Mutex<VecDeque<(String, OpenOutcome)>>, id: &str, outcome: OpenOutcome) {
     let mut opens = opens.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(slot) = opens.iter_mut().find(|(known, _)| known == id) {
-        slot.1 = outcome;
-        return;
+    match opens.iter_mut().find(|(known, _)| known == id) {
+        Some(slot) => slot.1 = outcome,
+        None => opens.push_back((id.to_string(), outcome)),
     }
-    if opens.len() >= OPEN_HISTORY
-        && let Some(oldest_settled) = opens.iter().position(|(_, o)| *o != OpenOutcome::Pending)
-    {
+    // Trimmed after an update as well as an insertion. A burst of concurrent opens is all
+    // `Pending` at first and legitimately exceeds the bound; if only insertions trimmed,
+    // the ledger would stay over it forever once that burst settled in place, holding every
+    // handle and failure string for the life of the process.
+    trim_settled_opens(&mut opens);
+}
+
+/// Evicts oldest-settled entries until the ledger is back within [`OPEN_HISTORY`], or until
+/// only pending entries are left — those are never evicted, whatever the bound says.
+fn trim_settled_opens(opens: &mut VecDeque<(String, OpenOutcome)>) {
+    while opens.len() > OPEN_HISTORY {
+        let Some(oldest_settled) = opens.iter().position(|(_, o)| *o != OpenOutcome::Pending)
+        else {
+            return;
+        };
         opens.remove(oldest_settled);
     }
-    opens.push_back((id.to_string(), outcome));
 }
 
 /// Can this data-model expression run debugger commands?
@@ -1477,8 +1488,13 @@ fn dx_executes_commands(expression: &str) -> bool {
 ///
 /// The typed tools announce their own transitions, but `execute` is an escape hatch: a
 /// caller can `.opendump` a different file, or `.detach`, and every handle issued for the
-/// old target is then meaningless. Matching the first token of each `;`-separated segment
-/// catches the session-control commands by name.
+/// old target is then meaningless. Matching the first token of each segment catches the
+/// session-control commands by name.
+///
+/// Segments are split on `;` **and line breaks**, because DbgEng treats both as command
+/// boundaries — [`reject_command_breakers`] refuses both in typed operands for exactly that
+/// reason, and a scanner that honoured only `;` would let `r\n.opendump other.dmp` through
+/// while seeing nothing but `r`.
 ///
 /// This is deliberately **best-effort, biased toward retiring the handle**. Over-matching
 /// costs a caller one re-open; under-matching would let a stale handle pass, which is the
@@ -1500,7 +1516,7 @@ fn changes_debug_target(command: &str) -> bool {
         "qd",
         "qq",
     ];
-    command.split(';').any(|segment| {
+    command.split([';', '\n', '\r']).any(|segment| {
         segment
             .split_whitespace()
             .next()
@@ -3251,6 +3267,11 @@ mod tests {
             // Case and chaining must not be an escape route.
             ".DETACH",
             "db @rip; .detach",
+            // DbgEng ends a command at a line break too, and `reject_command_breakers`
+            // already refuses them in typed operands for that reason. `execute` accepts
+            // them, so the scanner has to split on them.
+            "r\n.opendump C:\\other.dmp",
+            "r\r\n.detach",
         ] {
             assert!(
                 changes_debug_target(cmd),
@@ -3337,6 +3358,29 @@ mod tests {
         let opens = opens.lock().unwrap();
         assert_eq!(opens.len(), OPEN_HISTORY);
         assert!(!opens.iter().any(|(id, _)| id == "sess-slow"));
+    }
+
+    /// A burst of concurrent opens legitimately exceeds the bound while all of them are
+    /// pending. Once they settle, the ledger has to come back down — otherwise it stays over
+    /// the bound for the life of the process, holding every handle and failure string.
+    #[test]
+    fn a_settled_burst_returns_the_ledger_to_its_bound() {
+        let opens = Mutex::new(VecDeque::new());
+        let burst = OPEN_HISTORY * 2;
+        for n in 0..burst {
+            record_open(&opens, &format!("sess-{n}"), OpenOutcome::Pending);
+        }
+        assert_eq!(
+            opens.lock().unwrap().len(),
+            burst,
+            "pending opens must all be kept, even past the bound"
+        );
+
+        // They settle in place, which is the path that previously skipped trimming.
+        for n in 0..burst {
+            record_open(&opens, &format!("sess-{n}"), OpenOutcome::Landed);
+        }
+        assert_eq!(opens.lock().unwrap().len(), OPEN_HISTORY);
     }
 
     /// Settled history is bounded, so a long-lived server cannot accumulate outcomes forever.
