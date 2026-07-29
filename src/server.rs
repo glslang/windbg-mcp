@@ -3136,6 +3136,110 @@ mod tests {
         );
     }
 
+    /// A `2026-07-28` client may skip the handshake entirely and open the connection with
+    /// `server/discover`. Nothing in this crate implements that path — it falls out of the
+    /// SDK's defaults — which is exactly why it is worth pinning: an SDK bump could take it
+    /// away silently, and the failure mode is a whole class of client that cannot connect at
+    /// all rather than a tool that misbehaves.
+    ///
+    /// Driven over a real duplex with hand-written JSON-RPC, because the claim is about the
+    /// bytes on the wire: calling `discover()` directly would prove only that the default
+    /// method exists, not that `serve` accepts it as the *opening* message.
+    #[tokio::test]
+    async fn discover_opens_a_session_without_initialize() {
+        use std::time::Duration;
+
+        use rmcp::ServiceExt;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        // Generous enough that a loaded CI runner never trips it, bounded so a regression
+        // fails this test instead of hanging the suite.
+        const STEP: Duration = Duration::from_secs(30);
+
+        let (mut client_io, server_io) = tokio::io::duplex(64 * 1024);
+
+        // Per-request metadata is what replaces the handshake, so a discover opener has to
+        // carry the two keys 2026-07-28 makes mandatory; without them the SDK is entitled to
+        // reject the request and demand `initialize`. Buffered before the server starts, so
+        // the opening message is already waiting when `serve` reads.
+        let discover = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "server/discover",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                }
+            }
+        });
+        client_io
+            .write_all(format!("{discover}\n").as_bytes())
+            .await
+            .expect("write the discover request");
+
+        // The engine thread is never reached — discover is answered from `get_info` alone —
+        // which is what lets this run on a machine with no debugger.
+        let service = tokio::time::timeout(
+            STEP,
+            WindbgServer::new(EngineHandle::spawn(STEP)).serve(server_io),
+        )
+        .await
+        .expect("serve must not block waiting for an `initialize` that never comes")
+        .expect("`server/discover` must open a session on its own");
+
+        let mut line = String::new();
+        tokio::time::timeout(
+            STEP,
+            tokio::io::BufReader::new(&mut client_io).read_line(&mut line),
+        )
+        .await
+        .expect("the discover response should arrive")
+        .expect("read the discover response");
+
+        let response: serde_json::Value = serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("malformed response {line:?}: {e}"));
+        assert_eq!(
+            response["error"],
+            serde_json::Value::Null,
+            "discover must not be answered with a JSON-RPC error: {line}"
+        );
+        let result = &response["result"];
+
+        // SEP-2322: 2026-07-28 requires the discriminator, and a client that parses results
+        // by it cannot read a response that omits it.
+        assert_eq!(result["resultType"], "complete");
+
+        // The point of the whole exercise: the revision that permits this opener is one the
+        // server actually offers, alongside the handshake era it still serves.
+        let versions = result["supportedVersions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("discover must advertise supportedVersions: {line}"));
+        for expected in ["2026-07-28", "2025-11-25"] {
+            assert!(
+                versions.iter().any(|v| v == expected),
+                "discover must advertise `{expected}`, got {versions:?}"
+            );
+        }
+
+        // A discover-first client learns the server only from this one response, so the tool
+        // capability and the usage instructions have to reach it here — not only via
+        // `initialize`, which such a client never sends.
+        assert!(
+            !result["capabilities"]["tools"].is_null(),
+            "discover must advertise the tools capability: {line}"
+        );
+        let instructions = result["instructions"]
+            .as_str()
+            .unwrap_or_else(|| panic!("discover must carry the server instructions: {line}"));
+        assert!(
+            instructions.contains("WinDbg"),
+            "instructions should be this server's, got {instructions:?}"
+        );
+
+        service.cancel().await.expect("shut the service down");
+    }
+
     // ---- Session handles -----------------------------------------------
 
     #[test]
