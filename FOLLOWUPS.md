@@ -54,7 +54,7 @@ when the compare's memory base is the current stack-location pointer, and comple
 (multi-instruction conditions, computed offsets, table lookups) aren't decoded. This is the documented
 boundary where item 6 would take over.
 
-## 6. [windbg-mcp] Concolic/symbolic buffer synthesis (DECISIONS.md L3 — scoped out)
+## 6. [windbg-mcp] Concolic/symbolic buffer synthesis (DECISIONS.md D2 — scoped out)
 
 Auto-emit a concrete `(code, buffer, lengths)` by SMT-solving the on-path branch predicates, rather
 than the human/LLM-readable recipe emitted today.
@@ -76,9 +76,10 @@ DbgEng call documented as safe from another thread, so this needs no new threadi
 engine stays confined to its one thread (`src/engine.rs`) and the interrupt arrives from outside it,
 exactly as it does today.
 
-- **Why it comes first:** it is the prerequisite for item 8's `tasks/cancel`, but it stands alone —
-  it also gives an operator a way to abort a runaway `execute` before `ENGINE_CALL_TIMEOUT`
-  (`src/main.rs:22`, 300s) elapses.
+- **Why it comes first:** it is what would give item 8's `tasks/cancel` anything to do — the spec's
+  cancellation is cooperative, so acknowledging one conforms, but a server whose engine thread is
+  blocked inside DbgEng cannot act on it at all. It stands alone too: it gives an operator a way to
+  abort a runaway `execute` before `ENGINE_CALL_TIMEOUT` (`src/main.rs:22`, 300s) elapses.
 - **Known limit, carried from win-kexp `src/dbgeng.rs:726`:** `SetInterrupt` cannot unblock a
   live-kernel wait until the target is *connected*. So the `attach_kernel` KDNET park documented in
   `CLAUDE.md` — the case that most wants cancelling — is not cancellable this way; only tearing down
@@ -111,7 +112,11 @@ Suggested order, chosen so the protocol work is proved before it touches DbgEng:
    converting it is pure protocol work with no debugger risk.
 2. `open_dump` / `open_trace` / `index_trace` / `attach_kernel` — where the pain actually is, and
    where the `opens` ring can shrink to a thin adapter over `tasks/get`.
-3. `go` / `run_to_address` / `execute` — hold until item 7 lands, or `tasks/cancel` is a lie.
+3. `go` / `run_to_address` / `execute` — best held until item 7 lands. `tasks/cancel` is
+   *cooperative* by spec: acknowledging it while the work runs on to some terminal state is
+   conformant, so these are implementable without an interrupt. But for exactly these three the
+   engine thread is blocked inside DbgEng, so until item 7 there is no effort the server could
+   make — cancel would be a no-op until the operation ends on its own. Conformant, useless.
 
 Fast, pure tools (`decode_ioctl`, `registers`, `read_memory`, `modules`, `threads`, `disassemble`,
 `backtrace`, `session_status`) should stay synchronous.
