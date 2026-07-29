@@ -1429,15 +1429,29 @@ enum OpenOutcome {
 /// recent one, so a short window keeps this from growing without bound.
 const OPEN_HISTORY: usize = 8;
 
-/// Records an opener's outcome, evicting the oldest once [`OPEN_HISTORY`] is reached.
+/// Records an opener's outcome, evicting the oldest *settled* entry once [`OPEN_HISTORY`]
+/// is reached.
+///
+/// Settled is the important word. A `Pending` entry is an open that is still queued or
+/// running, and forgetting one is worse than remembering it forever: `session_status` would
+/// report the handle as unknown, which tells the caller to open again — and that duplicates
+/// an attach or a launch, then lets the original job land afterwards and replace the target
+/// underneath them. Avoiding exactly that is why this ledger exists.
+///
+/// So the history can exceed [`OPEN_HISTORY`] while opens are in flight. That is
+/// self-limiting rather than unbounded: the engine runs jobs one at a time and every job
+/// settles, including the ones that never reach it, which settle as `Failed` on the caller
+/// side.
 fn record_open(opens: &Mutex<VecDeque<(String, OpenOutcome)>>, id: &str, outcome: OpenOutcome) {
     let mut opens = opens.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(slot) = opens.iter_mut().find(|(known, _)| known == id) {
         slot.1 = outcome;
         return;
     }
-    if opens.len() == OPEN_HISTORY {
-        opens.pop_front();
+    if opens.len() >= OPEN_HISTORY
+        && let Some(oldest_settled) = opens.iter().position(|(_, o)| *o != OpenOutcome::Pending)
+    {
+        opens.remove(oldest_settled);
     }
     opens.push_back((id.to_string(), outcome));
 }
@@ -1941,10 +1955,13 @@ impl WindbgServer {
                 "\n\n`{asked}` failed and will never be committed:\n  {why}\nOpening again is \
                  the only way forward."
             ),
+            // Pending opens are never evicted, so an id this server has forgotten is
+            // necessarily one that finished and aged out — never one still in flight.
             None => format!(
-                "\n\n`{asked}` is not a handle this server issued recently. Only the last \
-                 {OPEN_HISTORY} opens are remembered, so an older one has been forgotten — \
-                 treat it as gone and open again."
+                "\n\n`{asked}` is not a handle this server is holding. Either it was never \
+                 issued here, or it settled a while ago and has aged out of the recent-open \
+                 history. It is not still in flight — those are never forgotten — so opening \
+                 again is safe."
             ),
         });
         text_result(out)
@@ -3292,9 +3309,39 @@ mod tests {
         );
     }
 
-    /// The history is bounded, so a long-lived server cannot accumulate outcomes forever.
+    /// A pending open must survive any amount of later traffic. Forgetting one makes
+    /// `session_status` report it as unknown, which tells the caller to open again — and
+    /// that duplicates an attach or a launch, then lets the original land afterwards and
+    /// replace the target underneath them.
     #[test]
-    fn opener_history_is_bounded_and_evicts_oldest_first() {
+    fn a_pending_open_is_never_evicted() {
+        let opens = Mutex::new(VecDeque::new());
+        record_open(&opens, "sess-slow", OpenOutcome::Pending);
+        for n in 0..OPEN_HISTORY * 2 {
+            record_open(&opens, &format!("sess-{n}"), OpenOutcome::Landed);
+        }
+
+        let still_there = opens
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, outcome)| id == "sess-slow" && *outcome == OpenOutcome::Pending);
+        assert!(still_there, "a pending open must outlive the history bound");
+
+        // Once it settles it becomes evictable like any other, so the history returns to
+        // its bound rather than growing forever.
+        record_open(&opens, "sess-slow", OpenOutcome::Landed);
+        for n in 0..OPEN_HISTORY {
+            record_open(&opens, &format!("later-{n}"), OpenOutcome::Landed);
+        }
+        let opens = opens.lock().unwrap();
+        assert_eq!(opens.len(), OPEN_HISTORY);
+        assert!(!opens.iter().any(|(id, _)| id == "sess-slow"));
+    }
+
+    /// Settled history is bounded, so a long-lived server cannot accumulate outcomes forever.
+    #[test]
+    fn settled_opener_history_is_bounded_and_evicts_oldest_first() {
         let opens = Mutex::new(VecDeque::new());
         for n in 0..OPEN_HISTORY + 3 {
             record_open(&opens, &format!("sess-{n}"), OpenOutcome::Landed);
