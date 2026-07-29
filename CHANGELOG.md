@@ -40,7 +40,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   `execute` and `dx` are the two paths that can swap the target without going through a
   typed tool. For `execute` the session-control commands (`.opendump`, `.attach`, `.detach`,
-  `.kill`, `.restart`, `.abandon`, `.remote`, `q`/`qd`/`qq`) retire the current handle. `dx`
+  `.kill`, `.restart`, `.abandon`, `.remote`, `q`/`qd`/`qq`) retire the current handle,
+  matched per command across every DbgEng command boundary — `;` and line breaks alike,
+  since `r\n.opendump other.dmp` is two commands and a scanner that split only on `;` would
+  see nothing but `r`. `dx`
   reaches command execution through the data model's
   `Debugger.Utility.Control.ExecuteCommand`, which runs any command string, so an expression
   touching command execution retires the handle too — conservatively, because the command is
