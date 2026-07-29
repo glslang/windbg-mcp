@@ -145,8 +145,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
-- README now states which MCP protocol revision the server speaks (the `initialize`-handshake
-  era: `2025-11-25` / `2025-06-18`) and why `2026-07-28` is not supported yet.
+- README now states which MCP protocol revisions the server speaks — `2026-07-28` and the
+  `initialize`-handshake era before it — and what a client gets from each.
 
 ## [0.2.1] - 2026-07-23
 
