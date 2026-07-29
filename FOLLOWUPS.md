@@ -121,11 +121,19 @@ Suggested order, chosen so the protocol work is proved before it touches DbgEng:
 Fast, pure tools (`decode_ioctl`, `registers`, `read_memory`, `modules`, `threads`, `disassemble`,
 `backtrace`, `session_status`) should stay synchronous.
 
-- **Two things to get right, not plumbing:**
+- **Three things to get right, not plumbing:**
   - **TTL must not re-introduce the lie.** `DEFAULT_TASK_TTL_MS` is 5 minutes and expiry marks a task
     `failed`; a kernel attach waits indefinitely by design. Attaches need `ttl_ms: None`, or the task
     reports a failure while the attach is still genuinely pending — the exact false report the
     conversion was meant to remove.
+  - **An `attach_kernel` task must not report `cancelled`.** Item 7's interrupt cannot unblock a
+    KDNET wait before the target connects, so a cancel cannot end that job — and the job is not
+    inert while it runs: the attach self-heals and *lands* the moment the target dials in, replacing
+    the current target. A task that went `cancelled` on request would therefore have the session
+    swapped underneath a client that believes the operation is over. Cooperative cancellation is the
+    escape hatch here rather than the problem: acknowledge the request, decline to transition, and
+    leave the task `working` until the engine job actually resolves. A cancel that genuinely ends the
+    wait needs item 10's worker teardown.
   - **The session-handle contract needs a task-path clause.** The queued-precheck design survives
     untouched (a task's gate still runs in the same queued job, so the ordering guarantee in the
     CHANGELOG holds), but if an opener returns a task then the `session_id` arrives in the task
