@@ -1401,6 +1401,40 @@ fn reject_command_breakers(field: &str, value: &str, quotes: Quotes) -> Result<(
     ))
 }
 
+/// What a *failed* transition may nonetheless have already done.
+///
+/// win-kexp bundles the wait for the initial break into `launch_process`, `attach_process`
+/// and the kernel attaches, so a single call both creates the side effect and waits for it.
+/// From here those are one operation: a failure can mean "nothing happened" or "the process
+/// was started / the debugger attached, and then the wait failed", and this server cannot
+/// tell which. Splitting them properly means splitting the win-kexp methods, which is a
+/// change in that crate rather than this one; until then the recovery advice must not claim
+/// more than is known, because "just open again" is how a caller ends up with two processes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OpenSideEffect {
+    /// Loading a dump or trace. A failure leaves no target behind, so re-opening is clean.
+    None,
+    /// Attaching or launching. A failure may still have attached to, or started, a target.
+    MayHaveStartedTarget,
+}
+
+impl OpenSideEffect {
+    /// The caveat to append to a failed transition, so the failure says what is actually
+    /// known rather than asserting a clean slate.
+    fn failure_caveat(self) -> &'static str {
+        match self {
+            Self::None => "",
+            Self::MayHaveStartedTarget => {
+                "\n\nNote: this operation attaches or launches and waits for the initial break \
+                 in one step, so this failure may have left a target behind — the wait can \
+                 fail after the process was started or the attach succeeded. Check with \
+                 `execute { \"command\": \"vertarget\" }` before opening again; re-running \
+                 blindly can start a second process or attach twice."
+            }
+        }
+    }
+}
+
 /// How far a session-opening job got.
 ///
 /// Recorded because the per-call timeout abandons the *waiter*, not the job: a caller can
@@ -1564,6 +1598,7 @@ impl WindbgServer {
     /// `wait_for_event` that times out very much included — belongs in `report`.
     async fn opened_result<T, R>(
         &self,
+        side_effect: OpenSideEffect,
         transition: T,
         report: R,
     ) -> Result<CallToolResult, ErrorData>
@@ -1593,6 +1628,7 @@ impl WindbgServer {
                 let transitioned = catch_unwind(AssertUnwindSafe(|| transition(e)))
                     .unwrap_or_else(|_| Err("debugger operation panicked".to_string()));
                 if let Err(err) = transitioned {
+                    let err = format!("{err}{}", side_effect.failure_caveat());
                     record_open(&opens, &new_id, OpenOutcome::Failed(err.clone()));
                     return Err(err);
                 }
@@ -1686,6 +1722,7 @@ impl WindbgServer {
         Parameters(args): Parameters<PathArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.opened_result(
+            OpenSideEffect::None,
             // `open_dump` is the call that replaces the target; the load wait belongs after
             // the commit, since a wait that times out still leaves DbgEng holding the dump.
             move |e| e.open_dump(&args.path).map_err(es),
@@ -1718,6 +1755,7 @@ impl WindbgServer {
         Parameters(args): Parameters<PathArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.opened_result(
+            OpenSideEffect::None,
             // As in `open_dump`: the load wait sits after the commit, because a wait that
             // times out still leaves DbgEng holding the trace.
             move |e| e.open_trace(&args.path).map_err(es),
@@ -1768,6 +1806,7 @@ impl WindbgServer {
     ))]
     async fn attach_kernel_local(&self) -> Result<CallToolResult, ErrorData> {
         self.opened_result(
+            OpenSideEffect::MayHaveStartedTarget,
             |e| {
                 // attach_local_kernel breaks the target in internally (INITIAL_BREAK +
                 // an INFINITE wait, as a live kernel requires).
@@ -1799,6 +1838,7 @@ impl WindbgServer {
         Parameters(args): Parameters<ConnectionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.opened_result(
+            OpenSideEffect::MayHaveStartedTarget,
             move |e| {
                 // attach_kernel connects, requests an initial break, and waits (INFINITE,
                 // as a live kernel requires) for the break-in — all internally.
@@ -1867,6 +1907,7 @@ impl WindbgServer {
     ) -> Result<CallToolResult, ErrorData> {
         let pid = args.pid;
         self.opened_result(
+            OpenSideEffect::MayHaveStartedTarget,
             move |e| {
                 // attach_process waits for the break-in internally.
                 e.attach_process(pid).map_err(es)
@@ -1890,6 +1931,7 @@ impl WindbgServer {
         Parameters(args): Parameters<CommandLineArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.opened_result(
+            OpenSideEffect::MayHaveStartedTarget,
             move |e| {
                 // launch_process waits for the initial break internally.
                 e.launch_process(&args.command_line).map_err(es)
@@ -1946,6 +1988,20 @@ impl WindbgServer {
             return text_result(out);
         };
 
+        // The live session is authoritative and answered first, before the bounded history
+        // is consulted at all. The ledger can evict a settled entry while its handle is
+        // still the loaded one — a burst of pending opens pushes the oldest settled entry
+        // out — and falling through to the history would then contradict the line above:
+        // "Current session: A" followed by "A is not held, opening again is safe", which
+        // during timeout recovery is advice that duplicates an attach or a launch.
+        if current.as_deref() == Some(asked) {
+            out.push_str(&format!(
+                "\n\n`{asked}` is the session now loaded. It is yours: pass it as \
+                 `session_id` on later calls."
+            ));
+            return text_result(out);
+        }
+
         let known = self
             .opens
             .lock()
@@ -1955,10 +2011,6 @@ impl WindbgServer {
             .map(|(_, outcome)| outcome.clone());
 
         out.push_str(&match known {
-            Some(OpenOutcome::Landed) if current.as_deref() == Some(asked) => format!(
-                "\n\n`{asked}` landed and is the session now loaded. It is yours: pass it as \
-                 `session_id` on later calls."
-            ),
             Some(OpenOutcome::Landed) => format!(
                 "\n\n`{asked}` landed, but has since been replaced by a later open. That \
                  target is gone; calls carrying this handle will be refused. Open again."
@@ -1968,8 +2020,9 @@ impl WindbgServer {
                  which would attach to, or start, a second target. Ask again shortly."
             ),
             Some(OpenOutcome::Failed(why)) => format!(
-                "\n\n`{asked}` failed and will never be committed:\n  {why}\nOpening again is \
-                 the only way forward."
+                "\n\n`{asked}` failed and will never be committed:\n  {why}\n\nOpening again is \
+                 how you get a target — but read the reason first, since some failures leave \
+                 one behind."
             ),
             // Pending opens are never evicted, so an id this server has forgotten is
             // necessarily one that finished and aged out — never one still in flight.
@@ -3358,6 +3411,22 @@ mod tests {
         let opens = opens.lock().unwrap();
         assert_eq!(opens.len(), OPEN_HISTORY);
         assert!(!opens.iter().any(|(id, _)| id == "sess-slow"));
+    }
+
+    /// A failed transition must not claim a clean slate for the operations that create the
+    /// target and wait for it in one win-kexp call. "Just open again" is how a caller ends
+    /// up with two processes.
+    #[test]
+    fn side_effecting_opens_warn_that_a_failure_may_leave_a_target() {
+        let caveat = OpenSideEffect::MayHaveStartedTarget.failure_caveat();
+        assert!(caveat.contains("vertarget"), "must say how to check");
+        assert!(
+            caveat.contains("second process") || caveat.contains("attach twice"),
+            "must name the cost of re-running blindly"
+        );
+
+        // Loading a dump leaves nothing behind, so it says nothing extra.
+        assert!(OpenSideEffect::None.failure_caveat().is_empty());
     }
 
     /// A burst of concurrent opens legitimately exceeds the bound while all of them are
