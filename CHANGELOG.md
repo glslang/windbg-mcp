@@ -7,18 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-
-- **Upgraded the `rmcp` SDK from 1.x to 3.x**, now that the 3.x line is released rather than beta.
-  The practical gain is protocol coverage: 3.x knows the `2026-07-28` revision, so the server now
-  answers `server/discover` and the stateless per-request lifecycle in addition to the
-  `initialize` handshake, and a client that speaks *only* `2026-07-28` can now talk to it. Both
-  come from the SDK's defaults (`supported_protocol_versions` covers every known revision, and
-  `serve` dispatches a non-`initialize` opening request through the inline lifecycle), so no
-  handler code was needed. The only source change the bump required is the `Content` →
-  `ContentBlock` rename in `rmcp::model`; the tool surface, its schemas, and the tool-call wire
-  format are unchanged.
-
 ### Added
 
 - **Explicit session handles.** The tools that open a target (`open_dump`, `open_trace`,
@@ -114,6 +102,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client may be gating network consent on that hint.
 
 ### Changed
+
+- **Upgraded the `rmcp` SDK from 1.x to 3.x**, now that the 3.x line is released rather than beta.
+  The practical gain is protocol coverage: 3.x knows the `2026-07-28` revision, so the server now
+  answers `server/discover` and the stateless per-request lifecycle in addition to the
+  `initialize` handshake, and a client that speaks *only* `2026-07-28` can now talk to it. Both
+  come from the SDK's defaults (`supported_protocol_versions` covers every known revision, and
+  `serve` dispatches a non-`initialize` opening request through the inline lifecycle), so no
+  handler code was needed. The only source change the bump required is the `Content` →
+  `ContentBlock` rename in `rmcp::model`; the tool surface, its schemas, and the tool-call wire
+  format are unchanged.
 
 - **Debugger failures are now tool-execution errors, not protocol errors.** An unresolvable
   symbol, an unreadable address, a target that never stopped, or a recorder that won't
