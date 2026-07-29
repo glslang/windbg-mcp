@@ -38,6 +38,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   So does a *panic* in the report — several win-kexp methods use `.expect`, and an unwind
   would otherwise skip straight past the code that attaches the handle.
 
+  One limit is documented rather than fixed: win-kexp bundles the wait for the initial
+  break into `launch_process`, `attach_process` and the kernel attaches, so from this server
+  a failure there can mean "nothing happened" or "the process started / the attach
+  succeeded, then the wait failed", and the two are indistinguishable. Those tools therefore
+  say so on failure and point at `vertarget` rather than advising a blind retry, which for
+  `launch` would start a second process. Splitting them properly is a win-kexp change.
+
   `execute` and `dx` are the two paths that can swap the target without going through a
   typed tool. For `execute` the session-control commands (`.opendump`, `.attach`, `.detach`,
   `.kill`, `.restart`, `.abandon`, `.remote`, `q`/`qd`/`qq`) retire the current handle,
