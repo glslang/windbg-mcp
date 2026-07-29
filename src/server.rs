@@ -2973,7 +2973,15 @@ impl WindbgServer {
     }
 }
 
+// `name` is not cosmetic: without it the macro falls back to `Implementation::from_build_env()`,
+// whose `env!` macros expand inside *rmcp*, so the server introduces itself to every client as
+// "rmcp" version 3.0.0 — the SDK's identity, not this server's. Naming it here also fixes the
+// version, because the macro's one-argument path pairs the name with an `env!("CARGO_PKG_VERSION")`
+// that expands in this crate. Pass `name` only: the attribute takes a string literal, so
+// `version = env!(...)` would not even parse, and spelling the version out by hand would just be a
+// second place to forget to bump.
 #[rmcp::tool_handler(
+    name = "windbg-mcp",
     instructions = "Drive WinDbg/DbgEng for live user-mode, kernel, crash-dump, and Time Travel Debugging (TTD) analysis. \
 Open a dump or .run trace, attach to a process or the kernel, inspect registers/memory/stacks/modules, and set breakpoints. \
 Navigate a TTD trace in both directions: go/step_over/step_into forward, and reverse_go/step_over_back/step_back backward, \
@@ -3235,6 +3243,20 @@ mod tests {
         assert!(
             instructions.contains("WinDbg"),
             "instructions should be this server's, got {instructions:?}"
+        );
+
+        // The server has to introduce itself as itself. Left to the macro's default this reads
+        // `rmcp` at the SDK's version, because `Implementation::from_build_env()` resolves its
+        // `env!`s inside rmcp — so this asserts the `name` on `#[tool_handler]` is still there.
+        let server_info = &result["_meta"]["io.modelcontextprotocol/serverInfo"];
+        assert_eq!(
+            server_info["name"], "windbg-mcp",
+            "the server must not report the SDK's identity as its own: {line}"
+        );
+        assert_eq!(
+            server_info["version"],
+            env!("CARGO_PKG_VERSION"),
+            "the reported version must track this crate, not the SDK: {line}"
         );
 
         service.cancel().await.expect("shut the service down");

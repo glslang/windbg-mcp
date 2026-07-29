@@ -143,6 +143,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lost: `execute` remains available for command lists, and is annotated destructive and
   handle-checked accordingly.
 
+### Fixed
+
+- **The server no longer introduces itself as the SDK.** `serverInfo` reported
+  `{"name": "rmcp", "version": "<sdk version>"}` to every client, on both the `initialize`
+  handshake and the `2026-07-28` `server/discover` response — so anything that names or
+  keys off the connected server (client UIs, logs, per-server config) saw "rmcp" rather
+  than "windbg-mcp", and saw the SDK's version where it wanted this crate's. The
+  `#[tool_handler]` macro defaults to `Implementation::from_build_env()`, whose
+  `env!("CARGO_CRATE_NAME")` / `env!("CARGO_PKG_VERSION")` resolve inside `rmcp` rather
+  than here; naming the server on the attribute takes both from this crate instead. The
+  bug predates the `rmcp` 3.x upgrade — 1.x reported the same — so this is the first
+  release in which clients see the right identity.
+
 ### Documentation
 
 - README now states which MCP protocol revisions the server speaks — `2026-07-28` and the
