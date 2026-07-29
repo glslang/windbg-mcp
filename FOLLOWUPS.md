@@ -80,6 +80,15 @@ exactly as it does today.
   cancellation is cooperative, so acknowledging one conforms, but a server whose engine thread is
   blocked inside DbgEng cannot act on it at all. It stands alone too: it gives an operator a way to
   abort a runaway `execute` before `ENGINE_CALL_TIMEOUT` (`src/main.rs:22`, 300s) elapses.
+- **A bare `interrupt()` would hit the wrong job.** `SetInterrupt` addresses the engine, meaning
+  whichever operation is *currently running* — but the job queue is FIFO with one worker
+  (`src/engine.rs`), and item 8 makes several calls in flight at once the normal case rather than
+  the exception. Cancelling a task whose job is still queued would then Ctrl+Break an unrelated
+  task's running operation, and the cancelled job would go on to execute anyway when its turn came:
+  `EngineHandle::run` already documents that a timeout abandons the wait and "the job itself is
+  *not* cancelled". So the interrupt has to be bound to job identity — the engine tracks which job
+  is active, a cancel for a queued job drops it from the queue, and `SetInterrupt` fires only when
+  the cancelled job is the running one. That is the substance of this item, not an add-on to it.
 - **Known limit, carried from win-kexp `src/dbgeng.rs:726`:** `SetInterrupt` cannot unblock a
   live-kernel wait until the target is *connected*. So the `attach_kernel` KDNET park documented in
   `CLAUDE.md` — the case that most wants cancelling — is not cancellable this way; only tearing down
