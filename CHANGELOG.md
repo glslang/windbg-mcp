@@ -65,9 +65,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handle" would quietly hand the wrong target to a caller following the documented recovery
   flow, with every later session check passing.
 
-  A mismatch means "not yours *yet*", not "yours failed": the timeout abandons the wait, not
-  the job, so a timed-out open can still be queued and can still land. Recovery is therefore
-  a poll, and re-running the open is never the answer.
+  The current handle alone cannot say *which* of those a mismatch means — "not yours" is
+  equally true while an open is still queued and after it has permanently failed — and the
+  two need opposite responses: a pending open must not be re-run (that attaches or launches
+  a second time), while a failed one must be, since nothing else will produce a target. So
+  each opener's outcome is recorded (pending / landed / failed) and `session_status` takes
+  an optional `session_id` to ask about one. Outcomes are written from inside the job, under
+  `catch_unwind`, so a panicking transition cannot leave an open recorded as pending
+  forever; a job that never reaches the engine is recorded as failed on the caller side. The
+  history is bounded to the last few opens.
 - **Tool behaviour annotations.** All 37 tools now declare a title and the
   read-only / destructive / idempotent / open-world hints, so a client can tell
   `read_memory` apart from `execute` before prompting the user. `openWorldHint` is true for

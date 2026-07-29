@@ -250,16 +250,19 @@ not the job, so the open may still be running and may still commit a handle no r
 `attach_kernel` is the case that matters: it waits indefinitely by design, so a call reporting a
 timeout while the attach completes moments later is normal (see *Limitations & notes*).
 
-A timed-out open therefore names the handle it *would* commit. Recovery is a two-step check:
+A timed-out open therefore names the handle it *would* commit, and **`session_status`** answers for
+it: pass that id and it reports whether the open is still **pending**, has **landed**, or has
+**failed**.
 
-1. Note the `session_id` the timeout message gives you.
-2. Poll **`session_status`**, which reports the handle the server currently holds.
+That three-way answer is the point. The current handle alone cannot distinguish them — "not yours"
+is equally true while you wait and after you have failed — and the two cases need opposite
+responses. While pending, re-running the open would attach to or start a *second* target. Once
+failed, opening again is the only way forward. Guessing either way is a real mistake, so the server
+tracks the outcome rather than leaving you to infer it.
 
-The session is yours once `session_status` reports that same id. A *different* id means yours has
-not landed **yet** — not that it failed: the timeout abandons the wait, not the job, so your open
-may still be queued behind other work and may still run. Keep polling rather than concluding, and
-in either case do not re-run the open. `session_status` does not queue on the engine thread, so it
-still answers while a parked attach holds it.
+Only the last few opens are remembered; an id older than that reads as forgotten, which you should
+treat as gone. `session_status` does not queue on the engine thread, so it still answers while a
+parked attach holds it.
 
 ### Typed operands are operands, not commands
 
