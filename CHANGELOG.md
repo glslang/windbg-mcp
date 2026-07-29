@@ -72,8 +72,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   each opener's outcome is recorded (pending / landed / failed) and `session_status` takes
   an optional `session_id` to ask about one. Outcomes are written from inside the job, under
   `catch_unwind`, so a panicking transition cannot leave an open recorded as pending
-  forever; a job that never reaches the engine is recorded as failed on the caller side. The
-  history is bounded to the last few opens.
+  forever; a job that never reaches the engine is recorded as failed on the caller side.
+
+  Only *settled* outcomes are evicted when the history fills. Forgetting a pending open
+  would be worse than remembering it indefinitely: `session_status` would report it as
+  unknown, which tells the caller to open again — duplicating an attach or a launch, and
+  letting the original land afterwards and replace the target underneath them. The history
+  can therefore exceed its bound while opens are in flight, which is self-limiting, since
+  the engine runs jobs one at a time and every job settles.
 - **Tool behaviour annotations.** All 37 tools now declare a title and the
   read-only / destructive / idempotent / open-world hints, so a client can tell
   `read_memory` apart from `execute` before prompting the user. `openWorldHint` is true for

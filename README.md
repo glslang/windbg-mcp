@@ -260,9 +260,10 @@ responses. While pending, re-running the open would attach to or start a *second
 failed, opening again is the only way forward. Guessing either way is a real mistake, so the server
 tracks the outcome rather than leaving you to infer it.
 
-Only the last few opens are remembered; an id older than that reads as forgotten, which you should
-treat as gone. `session_status` does not queue on the engine thread, so it still answers while a
-parked attach holds it.
+Only the last few *settled* opens are remembered — an open still in flight is never forgotten, so an
+id `session_status` does not recognise is one that finished a while ago, and re-opening is safe.
+`session_status` does not queue on the engine thread, so it still answers while a parked attach
+holds it.
 
 ### Typed operands are operands, not commands
 
