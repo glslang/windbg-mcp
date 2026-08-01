@@ -1,8 +1,9 @@
 # Follow-ups
 
-Deferred work, in two clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in three clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
-MCP `2026-07-28` extensions (tasks, apps). Each item notes its repo, why it was deferred, and where
+MCP `2026-07-28` extensions (tasks, apps), and item 12 from the opener split
+(glslang/win-kexp#71, 2026-08-01). Each item notes its repo, why it was deferred, and where
 it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend.
 
 Items are roughly ordered by how soon they're worth doing, within each cluster.
@@ -201,3 +202,26 @@ iframe host.
   (events on a trace-position axis).
 - **Cheaper alternative, if those three ever need it:** `structuredContent` + `outputSchema`. Same
   data, lossless to the model, works in every client, no UI runtime. Do that before any HTML.
+
+## 12. [win-kexp] Validate the opener split against a live KDNET target
+
+The split that made per-opener handle commits possible (glslang/win-kexp#71) was validated on
+user-mode targets only — split launch, fused launch, split attach, via `examples/split_open.rs`.
+The two **kernel** halves ran on no hardware: `attach_local_kernel_begin`/`wait` and
+`attach_kernel_begin`/`wait`.
+
+- **What specifically needs a target:** the connection-string buffer now rides across the seam
+  inside the `PendingTarget` guard, because a KDNET link is only established during the wait and
+  DbgEng may still read the string after `AttachKernel` returns. Before the split that buffer
+  stayed alive by accident of scope, so nothing proves the engine reads it late — only that
+  assuming it doesn't is unsafe. A real attach over `net:port=...,key=...` settles it. Second,
+  `wait_for_kernel_break_in`'s bookkeeping (clear `INITIAL_BREAK`, absorb the spurious re-break,
+  map a watchdog-forced return to `KernelBreakTimeout`) all moved behind the guard and wants a
+  live break-in plus a deliberate timeout against an unreachable target.
+- **Why deferred:** no KDNET target was available. The split cannot change *whether* an attach
+  succeeds — `x_begin` makes the identical `AttachKernel` call — so the buffer lifetime is the
+  only genuinely new failure mode.
+- **Where it picks up:** `examples/kdtest.rs` already drives `attach_kernel` over KDNET; add a
+  `attach_kernel_begin` + `wait()` pass beside the existing fused one. Prefer a
+  snapshot-restorable VM, per item 1.
+- **Tracked as:** [glslang/win-kexp#73](https://github.com/glslang/win-kexp/issues/73).

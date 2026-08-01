@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every opener now commits its session handle, including the four that attach or launch.**
+  0.3.0 shipped this guarantee for `open_dump` and `open_trace` only, and documented the gap
+  for the rest: win-kexp fused the target-creating call and the wait for the initial break
+  into one `Result`, so a failure could mean "nothing happened" or "the process started /
+  the attach succeeded, then the wait failed" — indistinguishable from here, and needing
+  opposite recovery. Those four tools hedged accordingly, telling callers to check
+  `vertarget` before opening again instead of claiming a retry was safe.
+
+  win-kexp split them (glslang/win-kexp#71): each opener is now a `x_begin()` returning a
+  `PendingTarget` guard, plus a `wait()` on that guard. The guard cannot exist unless the
+  side effect succeeded, so there is finally a seam to commit at. `opened_result` hands its
+  `transition` a `commit` callback to invoke at that seam, and every opener reads the same
+  way — side effect, `commit()`, wait.
+
+  So a failed break-in wait on `attach_process`, `attach_kernel`, `attach_kernel_local` or
+  `launch` now returns the error *with* a usable `session_id`, exactly as a failed load wait
+  on a dump already did. The hedge is gone: the server knows which side of the seam a failure
+  fell on, and says so — re-open when nothing was created, never re-open when the target is
+  already there. For `launch` that is the difference between one process and two.
+
 ## [0.3.0] - 2026-08-01
 
 ### Added
