@@ -134,6 +134,23 @@ impl Server {
         self.stderr_log.lock().unwrap().join("\n")
     }
 
+    /// Waits for a line on stderr. stdout and stderr are drained by independent threads with
+    /// no ordering between them, so a bare snapshot can miss a line the server has already
+    /// written — and that race would surface as an intermittent failure on a loaded runner,
+    /// which is the worst kind of test to own.
+    fn wait_for_stderr(&self, needle: &str, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            if self.stderr().contains(needle) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn stdout_lines(&self) -> Vec<String> {
         self.stdout_log.lock().unwrap().clone()
     }
@@ -319,10 +336,10 @@ fn stdout_carries_only_json_rpc_and_logging_goes_to_stderr() {
     }
 
     // The counterpart: the startup log has to be somewhere, and that somewhere is stderr.
-    let stderr = server.stderr();
     assert!(
-        stderr.contains("windbg-mcp starting on stdio"),
-        "expected the startup log on stderr, got:\n{stderr}"
+        server.wait_for_stderr("windbg-mcp starting on stdio", STEP),
+        "expected the startup log on stderr, got:\n{}",
+        server.stderr()
     );
 }
 
@@ -674,10 +691,17 @@ fn tools_list_matches_the_recorded_wire_surface() {
 }
 
 /// Clients validate arguments against these schemas before ever calling. A `$ref` that points
-/// outside the document, or a mix of dialects, breaks strict validators — and both are things
-/// a codegen dependency can introduce without any change here.
+/// outside the document, or two dialects across one tool list, breaks strict validators — and
+/// both are things a codegen dependency can introduce without any change here.
+///
+/// On the dialect: every tool that has parameters declares `2020-12`; the one tool with no
+/// parameters at all (`attach_kernel_local`) emits a bare empty object schema with no `$schema`
+/// at all. That is schemars' emission, not something this crate chooses, and it is harmless —
+/// an empty schema constrains nothing, so there is no keyword whose meaning a dialect could
+/// change. What would *not* be harmless is two different declared dialects, so that is what is
+/// pinned here.
 #[test]
-fn tool_schemas_are_self_contained() {
+fn tool_schemas_declare_one_dialect_and_are_self_contained() {
     let mut server = Server::started();
     let response = server.request("tools/list", json!({}), STEP);
     let tools = response["result"]["tools"]
@@ -686,6 +710,7 @@ fn tool_schemas_are_self_contained() {
         .clone();
     assert!(!tools.is_empty(), "tools/list must not be empty");
 
+    let mut declared: Vec<(String, String)> = Vec::new();
     for tool in &tools {
         let name = tool["name"].as_str().unwrap_or("<unnamed>");
         let schema = &tool["inputSchema"];
@@ -693,6 +718,17 @@ fn tool_schemas_are_self_contained() {
             schema["type"], "object",
             "`{name}` input schema must be an object schema: {schema}"
         );
+
+        match schema["$schema"].as_str() {
+            Some(dialect) => declared.push((name.to_string(), dialect.to_string())),
+            // Only the constraint-free case may skip the declaration.
+            None => assert!(
+                schema["properties"]
+                    .as_object()
+                    .is_none_or(|props| props.is_empty()),
+                "`{name}` constrains arguments but declares no $schema dialect: {schema}"
+            ),
+        }
 
         let mut refs = Vec::new();
         collect_refs(schema, &mut refs);
@@ -707,6 +743,16 @@ fn tool_schemas_are_self_contained() {
                 "`{name}` has a dangling $ref `{reference}`"
             );
         }
+    }
+
+    // One dialect across the whole list. A client picks a validator per dialect; two of them
+    // in one `tools/list` means some tools validate under rules the client did not select.
+    let (first_tool, first_dialect) = declared.first().expect("some tool declares a dialect");
+    if let Some((other_tool, other)) = declared.iter().find(|(_, d)| d != first_dialect) {
+        panic!(
+            "tools/list mixes JSON Schema dialects: `{first_tool}` declares {first_dialect}, \
+             `{other_tool}` declares {other}"
+        );
     }
 }
 
@@ -801,20 +847,20 @@ fn a_dump_session_opens_reads_and_closes() {
     );
 
     // The handle is what every later call is checked against, so the open has to mint one.
+    // Anchored to the line `open_dump` actually emits (`session_id: sess-…`) rather than to the
+    // substring anywhere in the text — the tool's prose mentions `session_id` several times, and
+    // a loose match would yield a plausible-looking wrong handle whose failure surfaces later as
+    // an unrelated mismatch.
     let session_id = opened
         .lines()
-        .find_map(|l| l.split("session_id").nth(1))
-        .map(|rest| {
-            rest.trim_start_matches([':', ' ', '=', '"'])
-                .trim_end_matches(['"', ',', '.'])
-                .split_whitespace()
-                .next()
-                .unwrap_or_default()
-                .trim_end_matches(['"', ',', '.'])
-                .to_string()
-        })
+        .find_map(|line| line.trim().strip_prefix("session_id:"))
+        .map(str::trim)
         .unwrap_or_else(|| panic!("open_dump must return a session_id, got:\n{opened}"));
-    assert!(!session_id.is_empty(), "empty session_id in:\n{opened}");
+    assert!(
+        session_id.starts_with("sess-"),
+        "session handles are minted as `sess-…`, got `{session_id}` in:\n{opened}"
+    );
+    let session_id = session_id.to_string();
 
     let status = server.tool_text("session_status", json!({}), TARGET_STEP);
     assert!(
@@ -827,12 +873,20 @@ fn a_dump_session_opens_reads_and_closes() {
     // The checked-in sample is a *kernel* crash dump, so the kernel image and HAL are the
     // anchors — not `ntdll`. Symbols are not needed: the rows come from the dump's own module
     // list, which keeps this tier runnable offline.
+    //
+    // Matched as whitespace-separated tokens rather than by column position: `lm` lays out its
+    // columns from the address width and the longest module name, so a layout shift would
+    // otherwise fail here and name the wrong cause.
     let modules = server.tool_text("modules", json!({ "session_id": session_id }), TARGET_STEP);
-    for expected in ["   nt ", "   hal "] {
+    let listed: Vec<&str> = modules
+        .lines()
+        // `start end name [flags]` — the module name is the third token on a row.
+        .filter_map(|line| line.split_whitespace().nth(2))
+        .collect();
+    for expected in ["nt", "hal"] {
         assert!(
-            modules.contains(expected),
-            "the module list should include `{}`, got:\n{modules}",
-            expected.trim()
+            listed.contains(&expected),
+            "the module list should include `{expected}`, got:\n{modules}"
         );
     }
     for tool in ["registers", "backtrace"] {
