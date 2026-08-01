@@ -1414,9 +1414,9 @@ fn post_commit_failure(err: &str, session_id: &str) -> String {
     format!(
         "{err}\n\nsession_id: {session_id}\nThis failure came *after* the target was opened, \
          so the handle above names a session that exists — what failed is the wait for it to \
-         become ready. Do not open again to recover: for launch/attach that starts a second \
-         process or attaches twice. Inspect it (`execute {{ \"command\": \"vertarget\" }}`) or \
-         `end_session` first."
+         become ready. Do not open again to recover: for launch or attach, doing so would \
+         start a second process or attach a second time. Inspect it (`execute \
+         {{ \"command\": \"vertarget\" }}`) or `end_session` first."
     )
 }
 
@@ -3581,8 +3581,8 @@ mod tests {
             "must hand back the handle — re-opening is the only other way to get one"
         );
         assert!(
-            msg.contains("second process") || msg.contains("attaches twice"),
-            "must name the cost of re-running blindly"
+            msg.contains("second process") && msg.contains("attach a second time"),
+            "must name the cost of re-running blindly, for launch and attach alike"
         );
         assert!(msg.contains("vertarget"), "must say how to inspect it");
     }
