@@ -5,6 +5,7 @@
 //! hatch, returning full text); session-management tools call the typed
 //! `win-kexp` methods and then wait for the target to stop.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1401,38 +1402,22 @@ fn reject_command_breakers(field: &str, value: &str, quotes: Quotes) -> Result<(
     ))
 }
 
-/// What a *failed* transition may nonetheless have already done.
+/// The failure message for a transition that fell *after* its commit: the target is open,
+/// so the error has to carry the handle rather than swallow it.
 ///
-/// win-kexp bundles the wait for the initial break into `launch_process`, `attach_process`
-/// and the kernel attaches, so a single call both creates the side effect and waits for it.
-/// From here those are one operation: a failure can mean "nothing happened" or "the process
-/// was started / the debugger attached, and then the wait failed", and this server cannot
-/// tell which. Splitting them properly means splitting the win-kexp methods, which is a
-/// change in that crate rather than this one; until then the recovery advice must not claim
-/// more than is known, because "just open again" is how a caller ends up with two processes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum OpenSideEffect {
-    /// Loading a dump or trace. A failure leaves no target behind, so re-opening is clean.
-    None,
-    /// Attaching or launching. A failure may still have attached to, or started, a target.
-    MayHaveStartedTarget,
-}
-
-impl OpenSideEffect {
-    /// The caveat to append to a failed transition, so the failure says what is actually
-    /// known rather than asserting a clean slate.
-    fn failure_caveat(self) -> &'static str {
-        match self {
-            Self::None => "",
-            Self::MayHaveStartedTarget => {
-                "\n\nNote: this operation attaches or launches and waits for the initial break \
-                 in one step, so this failure may have left a target behind — the wait can \
-                 fail after the process was started or the attach succeeded. Check with \
-                 `execute { \"command\": \"vertarget\" }` before opening again; re-running \
-                 blindly can start a second process or attach twice."
-            }
-        }
-    }
+/// Free function so it tests without an engine, as `OpenSideEffect::failure_caveat` did
+/// before the openers were split (glslang/win-kexp#71). What it encodes is the distinction
+/// that split bought — this text must be unreachable for a failure that created nothing,
+/// because telling a caller "your session exists" when it does not strands them exactly as
+/// badly as the advice it replaced.
+fn post_commit_failure(err: &str, session_id: &str) -> String {
+    format!(
+        "{err}\n\nsession_id: {session_id}\nThis failure came *after* the target was opened, \
+         so the handle above names a session that exists — what failed is the wait for it to \
+         become ready. Do not open again to recover: for launch/attach that starts a second \
+         process or attaches twice. Inspect it (`execute {{ \"command\": \"vertarget\" }}`) or \
+         `end_session` first."
+    )
 }
 
 /// How far a session-opening job got.
@@ -1586,24 +1571,30 @@ impl WindbgServer {
     /// queued job, so no other call can be ordered across the transition.
     ///
     /// The work is split in two because the split is where correctness lives. `transition`
-    /// is the DbgEng call that actually changes the target; `report` is everything after it
-    /// — the load wait, and the diagnostic (`lm`, `vertarget`, `r`, the TTD lifetime query)
-    /// whose output the caller reads. The handle is committed *between* them, so a failure
-    /// after the target has already changed cannot cost the caller a handle for a target
-    /// that is genuinely open — which matters because the only way to get one back is to
-    /// open again, and for `launch` that spawns a second process.
+    /// opens the target; `report` is the diagnostic (`lm`, `vertarget`, `r`, the TTD
+    /// lifetime query) whose output the caller reads. The handle is committed *between*
+    /// them, so a failure after the target has already changed cannot cost the caller a
+    /// handle for a target that is genuinely open — which matters because the only way to
+    /// get one back is to open again, and for `launch` that spawns a second process.
     ///
-    /// So `transition` must be **exactly the one call that replaces the target**, and
-    /// nothing else. Anything that can fail once the target is already replaced — a
-    /// `wait_for_event` that times out very much included — belongs in `report`.
+    /// `transition` receives a `commit` callback and must invoke it **the instant the target
+    /// is created or claimed**, before anything that can still fail. Every opener therefore
+    /// reads the same way: side effect, `commit()`, then the wait. That ordering is what the
+    /// callback buys — a `wait_for_event` that times out, or an initial break that never
+    /// arrives, then fails *with* the handle rather than losing it, because by then the dump
+    /// is loaded or the process is running whatever the wait says.
+    ///
+    /// win-kexp's openers expose that seam as `x_begin()` returning a `PendingTarget` guard,
+    /// which cannot exist unless the side effect succeeded — so `commit()` between the guard
+    /// and its `wait()` is exactly the right moment, enforced by the type rather than by
+    /// convention (glslang/win-kexp#71).
     async fn opened_result<T, R>(
         &self,
-        side_effect: OpenSideEffect,
         transition: T,
         report: R,
     ) -> Result<CallToolResult, ErrorData>
     where
-        T: FnOnce(&DebugEngine) -> Result<(), String> + Send + 'static,
+        T: FnOnce(&DebugEngine, &dyn Fn()) -> Result<(), String> + Send + 'static,
         R: FnOnce(&DebugEngine) -> Result<String, String> + Send + 'static,
     {
         let id = mint_session_id();
@@ -1621,19 +1612,39 @@ impl WindbgServer {
                 // here on — including if the transition fails partway and leaves the engine
                 // holding neither the old target nor a usable new one.
                 *lock(&session) = None;
+                // Set by `commit` below. It is what lets a failure say which side of the
+                // seam it fell on: before the commit nothing was created and re-opening is
+                // correct, after it the target exists and re-opening starts a second one.
+                let committed = Cell::new(false);
+                let commit = || {
+                    *lock(&session) = Some(new_id.clone());
+                    record_open(&opens, &new_id, OpenOutcome::Landed);
+                    committed.set(true);
+                };
                 // Under `catch_unwind` for the same reason the report is: an unwind here
                 // would leave the outcome recorded as `Pending` forever, and a caller
                 // following the documented recovery would poll for a handle that is never
                 // coming.
-                let transitioned = catch_unwind(AssertUnwindSafe(|| transition(e)))
+                let transitioned = catch_unwind(AssertUnwindSafe(|| transition(e, &commit)))
                     .unwrap_or_else(|_| Err("debugger operation panicked".to_string()));
-                if let Err(err) = transitioned {
-                    let err = format!("{err}{}", side_effect.failure_caveat());
-                    record_open(&opens, &new_id, OpenOutcome::Failed(err.clone()));
-                    return Err(err);
+                // A transition that succeeded without committing would leave the caller with
+                // an open target and no handle. None do; commit defensively rather than let
+                // a future opener silently regress the guarantee.
+                if transitioned.is_ok() && !committed.get() {
+                    commit();
                 }
-                *lock(&session) = Some(new_id.clone());
-                record_open(&opens, &new_id, OpenOutcome::Landed);
+                if let Err(err) = transitioned {
+                    if !committed.get() {
+                        // Nothing was created or claimed: the slate is clean, and re-opening
+                        // is the correct recovery.
+                        record_open(&opens, &new_id, OpenOutcome::Failed(err.clone()));
+                        return Err(err);
+                    }
+                    // The target was opened and something after it failed — the wait, most
+                    // likely. The handle names a session that exists, so hand it back; making
+                    // the caller re-open to get one is how they end up with two processes.
+                    return Err(post_commit_failure(&err, &id_for_report));
+                }
                 // The target is ours from here, so a failed diagnostic still has to hand the
                 // caller their handle — otherwise they cannot use the protection this whole
                 // mechanism promises without re-running a side-effecting open.
@@ -1722,12 +1733,14 @@ impl WindbgServer {
         Parameters(args): Parameters<PathArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.opened_result(
-            OpenSideEffect::None,
-            // `open_dump` is the call that replaces the target; the load wait belongs after
-            // the commit, since a wait that times out still leaves DbgEng holding the dump.
-            move |e| e.open_dump(&args.path).map_err(es),
+            // `open_dump` is the call that replaces the target, so commit right after it:
+            // a load wait that times out still leaves DbgEng holding the dump.
+            move |e, commit| {
+                e.open_dump(&args.path).map_err(es)?;
+                commit();
+                e.wait_for_event(LOAD_WAIT_MS).map_err(es)
+            },
             |e| {
-                e.wait_for_event(LOAD_WAIT_MS).map_err(es)?;
                 // Load the WinDbg extension DLL so `!`-extension commands resolve — most
                 // importantly `!ext.analyze -v`, the crash-dump triage workhorse. A bare
                 // engine doesn't auto-load it, and even after `.load ext` the unqualified
@@ -1755,12 +1768,14 @@ impl WindbgServer {
         Parameters(args): Parameters<PathArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.opened_result(
-            OpenSideEffect::None,
-            // As in `open_dump`: the load wait sits after the commit, because a wait that
-            // times out still leaves DbgEng holding the trace.
-            move |e| e.open_trace(&args.path).map_err(es),
+            // As in `open_dump`: commit before the load wait, because a wait that times out
+            // still leaves DbgEng holding the trace.
+            move |e, commit| {
+                e.open_trace(&args.path).map_err(es)?;
+                commit();
+                e.wait_for_event(LOAD_WAIT_MS).map_err(es)
+            },
             |e| {
-                e.wait_for_event(LOAD_WAIT_MS).map_err(es)?;
                 // Check the index state *before* any data-model query: `!ttdext.index -status`
                 // only reads the on-disk .idx (never builds), whereas a `dx` on an unindexed
                 // trace can itself trigger the long in-memory index build. TtdExt reports a
@@ -1806,11 +1821,13 @@ impl WindbgServer {
     ))]
     async fn attach_kernel_local(&self) -> Result<CallToolResult, ErrorData> {
         self.opened_result(
-            OpenSideEffect::MayHaveStartedTarget,
-            |e| {
-                // attach_local_kernel breaks the target in internally (INITIAL_BREAK +
-                // an INFINITE wait, as a live kernel requires).
-                e.attach_local_kernel().map_err(es)
+            |e, commit| {
+                // The engine has claimed the local kernel once `_begin` returns; the
+                // break-in wait (INITIAL_BREAK + the INFINITE wait a live kernel requires)
+                // happens in `wait`, after the handle is ours.
+                let pending = e.attach_local_kernel_begin().map_err(es)?;
+                commit();
+                pending.wait().map_err(es)
             },
             |e| {
                 // The driver_object/device_object/irp_stack tools use kernel-extension
@@ -1838,11 +1855,14 @@ impl WindbgServer {
         Parameters(args): Parameters<ConnectionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.opened_result(
-            OpenSideEffect::MayHaveStartedTarget,
-            move |e| {
-                // attach_kernel connects, requests an initial break, and waits (INFINITE,
-                // as a live kernel requires) for the break-in — all internally.
-                e.attach_kernel(&args.connection).map_err(es)
+            move |e, commit| {
+                // `_begin` takes the connection; the KD link is dialed and the break-in
+                // awaited in `wait`. Committing between them is what stops a failed wait
+                // from looking like "nothing happened" — re-dialing a live link is not a
+                // clean retry.
+                let pending = e.attach_kernel_begin(&args.connection).map_err(es)?;
+                commit();
+                pending.wait().map_err(es)
             },
             |e| {
                 // Load kdexts.dll so the driver_object/device_object/irp_stack tools'
@@ -1907,10 +1927,13 @@ impl WindbgServer {
     ) -> Result<CallToolResult, ErrorData> {
         let pid = args.pid;
         self.opened_result(
-            OpenSideEffect::MayHaveStartedTarget,
-            move |e| {
-                // attach_process waits for the break-in internally.
-                e.attach_process(pid).map_err(es)
+            move |e, commit| {
+                // Attached once `_begin` returns; the break-in wait follows the commit, so
+                // a wait that fails cannot read as "never attached" and get retried into a
+                // second attach on the same PID.
+                let pending = e.attach_process_begin(pid).map_err(es)?;
+                commit();
+                pending.wait().map_err(es)
             },
             |e| e.execute_command("r").map_err(es),
         )
@@ -1931,10 +1954,13 @@ impl WindbgServer {
         Parameters(args): Parameters<CommandLineArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         self.opened_result(
-            OpenSideEffect::MayHaveStartedTarget,
-            move |e| {
-                // launch_process waits for the initial break internally.
-                e.launch_process(&args.command_line).map_err(es)
+            move |e, commit| {
+                // The commit point is *before* the process actually starts: CreateProcessWide
+                // is deferred into the wait. That is still the right moment — once `_begin`
+                // returns Ok the spawn is committed, so a retry from here means two processes.
+                let pending = e.launch_process_begin(&args.command_line).map_err(es)?;
+                commit();
+                pending.wait().map_err(es)
             },
             |e| e.execute_command("r").map_err(es),
         )
@@ -3539,20 +3565,26 @@ mod tests {
         assert!(!opens.iter().any(|(id, _)| id == "sess-slow"));
     }
 
-    /// A failed transition must not claim a clean slate for the operations that create the
-    /// target and wait for it in one win-kexp call. "Just open again" is how a caller ends
-    /// up with two processes.
+    /// A failure that lands after the target is open must hand the handle back and say not
+    /// to re-open. "Just open again" is how a caller ends up with two processes — before the
+    /// openers were split (glslang/win-kexp#71) this server could not tell that case from a
+    /// clean slate and had to hedge on every attach and launch; now it knows which it is.
     #[test]
-    fn side_effecting_opens_warn_that_a_failure_may_leave_a_target() {
-        let caveat = OpenSideEffect::MayHaveStartedTarget.failure_caveat();
-        assert!(caveat.contains("vertarget"), "must say how to check");
+    fn a_post_commit_failure_returns_the_handle_and_warns_against_reopening() {
+        let msg = post_commit_failure("the target never broke in", "sess-1");
         assert!(
-            caveat.contains("second process") || caveat.contains("attach twice"),
+            msg.contains("the target never broke in"),
+            "must keep the underlying error"
+        );
+        assert!(
+            msg.contains("session_id: sess-1"),
+            "must hand back the handle — re-opening is the only other way to get one"
+        );
+        assert!(
+            msg.contains("second process") || msg.contains("attaches twice"),
             "must name the cost of re-running blindly"
         );
-
-        // Loading a dump leaves nothing behind, so it says nothing extra.
-        assert!(OpenSideEffect::None.failure_caveat().is_empty());
+        assert!(msg.contains("vertarget"), "must say how to inspect it");
     }
 
     /// A burst of concurrent opens legitimately exceeds the bound while all of them are
