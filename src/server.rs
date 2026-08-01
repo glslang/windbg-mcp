@@ -1958,6 +1958,15 @@ impl WindbgServer {
                 // The commit point is *before* the process actually starts: CreateProcessWide
                 // is deferred into the wait. That is still the right moment — once `_begin`
                 // returns Ok the spawn is committed, so a retry from here means two processes.
+                //
+                // It is also not too early, which is the natural worry: only the *spawn* is
+                // deferred, not validation. CreateProcessWide resolves and checks the image
+                // synchronously, so the ways a launch fails with nothing created all land on
+                // this `?`, before the commit — verified against a live engine for a missing
+                // path (0x80070002), a directory (0x80070005), a non-PE file (0x800700C1) and
+                // an empty command line (0x80070057). A failure from `wait` below therefore
+                // means the process really was created, which is what makes the post-commit
+                // message ("a session exists, do not open again") true rather than a guess.
                 let pending = e.launch_process_begin(&args.command_line).map_err(es)?;
                 commit();
                 pending.wait().map_err(es)
