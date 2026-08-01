@@ -100,6 +100,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   symbolizes every frame, `bp module!Symbol` resolves a name), and a KDNET session puts the
   target itself across a network link, so even a raw `read_memory` is remote traffic. A
   client may be gating network consent on that hint.
+- **End-to-end smoke test** (`tests/mcp_smoke.rs`), for the two events the in-process tests
+  cannot see: a dependency moving, and the MCP spec revving. Both change the bytes on the wire
+  while the Rust API this crate compiles against stays identical, so the existing tests keep
+  passing and clients break. It spawns the built binary and speaks hand-written JSON-RPC to it,
+  asserting that stdout carries only JSON-RPC (a dependency logging there corrupts the
+  transport), that closing stdin exits the process, that every protocol revision the README
+  promises is served — including `2026-07-28`'s handshake-free `server/discover` and its rule
+  that *every* request, not just the opener, carries the `_meta` protocol keys — and that no
+  capability is advertised that this server does not implement. A golden snapshot
+  (`tests/golden/tools_list.json`) records the structural `tools/list` surface (schema dialect,
+  hints, parameter types) so a `schemars` or `rmcp` bump lands as a readable diff rather than a
+  silent client-visible change; re-record with `UPDATE_GOLDEN=1`. The protocol tier needs no
+  debugger, target, or network and runs under plain `cargo test`; a second tier
+  (`WINDBG_MCP_SMOKE_DUMP=1`) opens the checked-in sample dump through DbgEng and is the
+  automated check for a `win-kexp` regression, available in CI on manual dispatch. Runbook,
+  including the manual checklist for the live/TTD paths no runner can host, in
+  [`docs/smoke-test.md`](docs/smoke-test.md).
 
 ### Changed
 

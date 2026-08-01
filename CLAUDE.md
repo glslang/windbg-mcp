@@ -65,6 +65,12 @@ For a compile/behavior check without touching the locked release exe, use the **
 (writes `target/debug`, never locked): `cargo test` and `cargo clippy --all-targets`. The release
 build differs only in optimization and is exercised by CI on a fresh runner.
 
+`cargo test` includes `tests/mcp_smoke.rs`, which spawns the **dev** binary (via
+`CARGO_BIN_EXE_windbg-mcp`) and drives it over stdio — so it is also clear of the release lock.
+After a dependency bump (`rmcp`, `schemars`, `tokio`, `cargo update -p win-kexp`) or an MCP spec
+revision, run it and follow [`docs/smoke-test.md`](./docs/smoke-test.md); add
+`WINDBG_MCP_SMOKE_DUMP=1` to include the tier that opens the sample dump through DbgEng.
+
 ## Live kernel + driver IOCTL gotchas (learned driving HEVD over KDNET)
 
 **KDNET attach is a blocking wait, by design.** A live kernel needs `WaitForEvent(INFINITE)` (a finite

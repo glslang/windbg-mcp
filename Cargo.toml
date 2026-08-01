@@ -13,3 +13,9 @@ schemars = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# The end-to-end smoke test (`tests/mcp_smoke.rs`) drives the built binary over stdio with
+# hand-written JSON-RPC, so it needs a JSON parser and nothing else — deliberately no new
+# crates, since it is the test you reach for when a dependency has just broken something.
+[dev-dependencies]
+serde_json = "1"

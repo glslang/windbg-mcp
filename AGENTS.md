@@ -21,6 +21,8 @@ Use Rust 2024 idioms and `rustfmt` defaults. Keep DbgEng access behind the engin
 
 Add focused unit tests near the code they cover under `#[cfg(test)]`. Name tests after the behavior, for example `decode_ioctl_rejects_short_input`. Tests should run without a live debugger, kernel target, symbols, or network access unless explicitly documented. Run `cargo test` before opening a PR; run `cargo clippy --all-targets` for shared or tool-surface changes.
 
+`tests/mcp_smoke.rs` is the end-to-end smoke test: it drives the built binary over stdio with hand-written JSON-RPC, covering transport hygiene, protocol-revision negotiation, and a golden snapshot of the `tools/list` wire surface (`tests/golden/tools_list.json`). Its protocol tier runs under plain `cargo test`; the debugger tier is opt-in via `WINDBG_MCP_SMOKE_DUMP=1` and opens the checked-in sample dump. Run it after a dependency bump (`rmcp`, `schemars`, `tokio`, `win-kexp`) or an MCP spec revision — see `docs/smoke-test.md` for the runbook and the manual checklist for live/TTD paths.
+
 ## Commit & Pull Request Guidelines
 
 History uses short imperative subjects, sometimes scoped, such as `docs(hevd): make ...` or `Add set_symbol_path tool`. Keep commits focused and mention affected workflows when relevant. PRs should include a concise description, testing performed, linked issues or follow-ups, and updated docs/examples for user-visible tool changes. Include screenshots only when changing rendered documentation or workflow output.

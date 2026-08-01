@@ -63,6 +63,10 @@ cargo build --release
 
 `win-kexp` is fetched automatically as a git dependency from [`glslang/win-kexp`](https://github.com/glslang/win-kexp) — no sibling checkout needed.
 
+`cargo test` covers the unit tests plus an end-to-end smoke test that drives the built binary over
+stdio. Run it after a dependency bump or an MCP spec revision — see
+[`docs/smoke-test.md`](docs/smoke-test.md).
+
 ### Bundling the WinDbg engine
 
 Needed for two things: TTD `.run` replay (System32's engine rejects traces with `0x80070057`) and

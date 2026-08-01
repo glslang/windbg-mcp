@@ -7,6 +7,9 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Manual trigger for the smoke test's debugger tier, which reaches real DbgEng and so is
+  # kept out of the PR path. Use it after a `win-kexp` bump — see docs/smoke-test.md.
+  workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -44,6 +47,9 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      # Includes the smoke test's protocol tier (tests/mcp_smoke.rs), which drives the built
+      # binary over stdio. That tier needs no debugger, target, or network; the debugger tier
+      # is gated behind WINDBG_MCP_SMOKE_DUMP and runs in the `smoke-debugger` job below.
       - name: Test
         run: cargo test
 
@@ -56,6 +62,32 @@ jobs:
             Write-Host "Validating $f"
             Get-Content $f -Raw | ConvertFrom-Json | Out-Null
           }
+
+  smoke-debugger:
+    name: Smoke test (debugger tier)
+    # On demand only: this tier opens the sample crash dump through the runner's DbgEng, so a
+    # Windows-image change could break it for reasons unrelated to the PR under review.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Smoke test against the sample dump
+        env:
+          WINDBG_MCP_SMOKE_DUMP: "1"
+        run: cargo test --test mcp_smoke -- --nocapture
 
   docs:
     name: Documentation lint
