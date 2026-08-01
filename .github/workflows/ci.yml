@@ -12,7 +12,12 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # A superseded push or PR update should cancel its predecessor — but a manual dispatch should
+  # not take part in that at all. It shares `github.ref` with the branch's own CI (on `main`,
+  # with the push run), so a shared group would have the two cancel each other, and a repeat
+  # dispatch would kill the debugger-tier run someone had just asked for. Keying dispatches by
+  # run id gives each one a group of its own: never cancelled, never cancelling.
+  group: ci-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && github.run_id || 'auto' }}
   cancel-in-progress: true
 
 jobs:
