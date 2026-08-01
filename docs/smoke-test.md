@@ -81,8 +81,11 @@ throughout, and it needs no symbols, so it runs offline.
 only watches GitHub Actions here, so cargo bumps arrive by hand.
 
 1. `cargo test` — the protocol tier plus the existing unit tests.
-2. `WINDBG_MCP_SMOKE_DUMP=1 cargo test --test mcp_smoke` for a `win-kexp` bump, since that tier is
-   the only automated thing that touches DbgEng.
+2. For a `win-kexp` bump, add the debugger tier — the only automated thing that touches DbgEng:
+
+   ```pwsh
+   $env:WINDBG_MCP_SMOKE_DUMP = "1"; cargo test --test mcp_smoke
+   ```
 3. If the golden diff fires, read it before re-recording. A changed dialect or nullable encoding is
    a **client-visible** change and belongs in `CHANGELOG.md`, not in a silent re-record.
 

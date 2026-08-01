@@ -68,8 +68,12 @@ build differs only in optimization and is exercised by CI on a fresh runner.
 `cargo test` includes `tests/mcp_smoke.rs`, which spawns the **dev** binary (via
 `CARGO_BIN_EXE_windbg-mcp`) and drives it over stdio — so it is also clear of the release lock.
 After a dependency bump (`rmcp`, `schemars`, `tokio`, `cargo update -p win-kexp`) or an MCP spec
-revision, run it and follow [`docs/smoke-test.md`](./docs/smoke-test.md); add
-`WINDBG_MCP_SMOKE_DUMP=1` to include the tier that opens the sample dump through DbgEng.
+revision, run it and follow [`docs/smoke-test.md`](./docs/smoke-test.md). To include the tier that
+opens the sample dump through DbgEng, set the gate first (PowerShell, not `VAR=1 cmd`):
+
+```pwsh
+$env:WINDBG_MCP_SMOKE_DUMP = "1"; cargo test --test mcp_smoke
+```
 
 ## Live kernel + driver IOCTL gotchas (learned driving HEVD over KDNET)
 
