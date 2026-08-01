@@ -1,0 +1,599 @@
+{
+  "schemaDialects": [
+    "(none)",
+    "https://json-schema.org/draft/2020-12/schema"
+  ],
+  "toolCount": 37,
+  "tools": [
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "attach_kernel",
+      "params": [
+        "connection: string"
+      ],
+      "required": [
+        "connection"
+      ],
+      "title": "Attach to kernel target"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "attach_kernel_local",
+      "params": [],
+      "required": [],
+      "title": "Attach to local kernel"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "attach_process",
+      "params": [
+        "pid: integer/uint32"
+      ],
+      "required": [
+        "pid"
+      ],
+      "title": "Attach to process"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "backtrace",
+      "params": [
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Show call stack"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": false,
+        "readOnly": true
+      },
+      "name": "decode_ioctl",
+      "params": [
+        "code: string"
+      ],
+      "required": [
+        "code"
+      ],
+      "title": "Decode IOCTL control code"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "device_object",
+      "params": [
+        "device: string",
+        "session_id: string|null"
+      ],
+      "required": [
+        "device"
+      ],
+      "title": "Inspect device object"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "disassemble",
+      "params": [
+        "address: string|null",
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Disassemble"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "driver_object",
+      "params": [
+        "name: string",
+        "session_id: string|null"
+      ],
+      "required": [
+        "name"
+      ],
+      "title": "Inspect driver object"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "dx",
+      "params": [
+        "expression: string",
+        "session_id: string|null"
+      ],
+      "required": [
+        "expression"
+      ],
+      "title": "Evaluate data-model expression"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": true,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "end_session",
+      "params": [
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "End debug session"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "execute",
+      "params": [
+        "command: string",
+        "session_id: string|null"
+      ],
+      "required": [
+        "command"
+      ],
+      "title": "Run raw debugger command"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "go",
+      "params": [
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Continue execution"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": true,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "goto_position",
+      "params": [
+        "position: string",
+        "session_id: string|null"
+      ],
+      "required": [
+        "position"
+      ],
+      "title": "Go to TTD position"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": true,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "index_trace",
+      "params": [
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Build TTD trace index"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "ioctl_trace",
+      "params": [
+        "dispatch: string",
+        "session_id: string|null"
+      ],
+      "required": [
+        "dispatch"
+      ],
+      "title": "Trace dispatched IOCTLs"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "irp_stack",
+      "params": [
+        "irp: string|null",
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Dump IRP stack location"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "launch",
+      "params": [
+        "command_line: string"
+      ],
+      "required": [
+        "command_line"
+      ],
+      "title": "Launch process under debugger"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "modules",
+      "params": [
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "List modules"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "open_dump",
+      "params": [
+        "path: string"
+      ],
+      "required": [
+        "path"
+      ],
+      "title": "Open crash dump or TTD trace"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "open_trace",
+      "params": [
+        "path: string"
+      ],
+      "required": [
+        "path"
+      ],
+      "title": "Open TTD trace"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "reachable_from_dispatch",
+      "params": [
+        "address: string|null",
+        "from: string",
+        "max_depth: integer|null/uint",
+        "max_functions: integer|null/uint",
+        "module: string|null",
+        "recipe: boolean|null",
+        "rva: string|null",
+        "session_id: string|null"
+      ],
+      "required": [
+        "from"
+      ],
+      "title": "Test reachability from IOCTL dispatch"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "read_memory",
+      "params": [
+        "address: string",
+        "session_id: string|null",
+        "size: integer/uint32"
+      ],
+      "required": [
+        "address",
+        "size"
+      ],
+      "title": "Read memory"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "record_trace",
+      "params": [
+        "env: array<string>",
+        "out_dir: string",
+        "target: string",
+        "working_dir: string|null"
+      ],
+      "required": [
+        "out_dir",
+        "target"
+      ],
+      "title": "Record new TTD trace"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "registers",
+      "params": [
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Show registers"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "reverse_go",
+      "params": [
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Reverse continue (TTD)"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "run_to_address",
+      "params": [
+        "address: string",
+        "session_id: string|null",
+        "timeout_ms: integer|null/uint32"
+      ],
+      "required": [
+        "address"
+      ],
+      "title": "Run to address"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": false,
+        "readOnly": true
+      },
+      "name": "session_status",
+      "params": [
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Show current session handle"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "set_breakpoint",
+      "params": [
+        "expression: string",
+        "session_id: string|null"
+      ],
+      "required": [
+        "expression"
+      ],
+      "title": "Set breakpoint"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "set_symbol_path",
+      "params": [
+        "append: boolean|null",
+        "path: string",
+        "reload: string|null",
+        "session_id: string|null"
+      ],
+      "required": [
+        "path"
+      ],
+      "title": "Set symbol search path"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "step_back",
+      "params": [
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Step back (TTD)"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "step_into",
+      "params": [
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Step into"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "step_over",
+      "params": [
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Step over"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "step_over_back",
+      "params": [
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Step over back (TTD)"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "threads",
+      "params": [
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "List threads"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "ttd_calls",
+      "params": [
+        "function: string",
+        "session_id: string|null"
+      ],
+      "required": [
+        "function"
+      ],
+      "title": "TTD: find calls to a function"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "ttd_events",
+      "params": [
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "TTD: list trace events"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "ttd_memory",
+      "params": [
+        "address: string",
+        "mode: string|null",
+        "session_id: string|null",
+        "size: integer/uint32"
+      ],
+      "required": [
+        "address",
+        "size"
+      ],
+      "title": "TTD: find accesses to a memory range"
+    }
+  ],
+  "usesDefs": false
+}
