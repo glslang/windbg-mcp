@@ -86,6 +86,7 @@ only watches GitHub Actions here, so cargo bumps arrive by hand.
    ```pwsh
    $env:WINDBG_MCP_SMOKE_DUMP = "1"; cargo test --test mcp_smoke
    ```
+
 3. If the golden diff fires, read it before re-recording. A changed dialect or nullable encoding is
    a **client-visible** change and belongs in `CHANGELOG.md`, not in a silent re-record.
 
