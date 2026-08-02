@@ -1539,10 +1539,8 @@ impl WindbgServer {
     ) -> Result<CallToolResult, ErrorData> {
         match self.sessions.open(kind, what, op).await {
             Ok(OpenReport { id, report }) => text_result(format!(
-                "{report}
-
-session_id: {id}
-Pass this as `session_id` on later calls to route                  them to this session and to fail loudly rather than act on a different target."
+                "{report}\n\nsession_id: {id}\nPass this as `session_id` on later calls to route \
+                 them to this session and to fail loudly rather than act on a different target."
             )),
             // No worker, so no session — and no argument the model can change fixes that.
             Err(OpenError::Unavailable(m)) => Err(ErrorData::internal_error(m, None)),
@@ -1554,10 +1552,8 @@ Pass this as `session_id` on later calls to route                  them to this 
                 report_only,
             }) => tool_error(if report_only {
                 format!(
-                    "{message}
-
-session_id: {id}
-The target opened; only this follow-up report                      failed, so the handle above is valid and usable."
+                    "{message}\n\nsession_id: {id}\nThe target opened; only this follow-up report \
+                     failed, so the handle above is valid and usable."
                 )
             } else {
                 post_commit_failure(&message, &id)
@@ -1566,9 +1562,13 @@ The target opened; only this follow-up report                      failed, so th
             // still land. The handle exists from the moment the session is registered, so it can
             // be named now — which is what makes recovery via `session_status` sound.
             Err(OpenError::Timeout { id, message }) => tool_error(format!(
-                "{message}
-
-The wait was abandoned, but this open was not: it is still running                  in session `{id}`, and may still land. Ask `session_status                  {{ \"session_id\": \"{id}\" }}` — it reports whether the open is still going, how                  long it has been going, and whether that is longer than a healthy one takes. Do                  not re-run the open while it is still going, which would attach to, or start, a                  second target; `end_session {{ \"session_id\": \"{id}\" }}` ends it outright,                  terminating the worker process if it will not unwind."
+                "{message}\n\nThe wait was abandoned, but this open was not: it is still running \
+                 in session `{id}`, and may still land. Ask `session_status \
+                 {{ \"session_id\": \"{id}\" }}` — it reports whether the open is still going, \
+                 how long it has been going, and whether that is longer than a healthy one takes. \
+                 Do not re-run the open while it is still going, which would attach to, or start, \
+                 a second target; `end_session {{ \"session_id\": \"{id}\" }}` ends it outright, \
+                 terminating the worker process if it will not unwind."
             )),
         }
     }

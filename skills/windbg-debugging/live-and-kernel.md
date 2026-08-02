@@ -52,8 +52,10 @@ four at a time).
   - It costs **only that session**: other sessions and every other tool keep working.
   - **Do not re-attach.** The connection was already claimed, so a retry dials a second time.
   - `session_status` says how long it has been waiting, and whether that is past the point a
-    healthy link takes (~25s for a KDNET resync). Past that it will not return on its own —
-    `end_session { "session_id": "<id>" }` reclaims it, terminating its engine process.
+    healthy link takes (~25s for a KDNET resync). Past that, nothing on this side will end the
+    wait — but the target still can: boot the guest with debugging enabled and the attach lands
+    on its own. Use `end_session { "session_id": "<id>" }` when you choose to give up on it
+    instead; that reclaims the session by terminating its engine process.
 
   A *connected* target that doesn't break in is bounded and returns an error.
 - **TTD is user-mode only** — you cannot time-travel a kernel target. For reverse
