@@ -5,7 +5,70 @@ status. Keep entries short; link to code with `file:line` where it helps a futur
 
 ---
 
+## One process per debug session (2026-08-02, issue #61)
+
+**Context.** A live-kernel attach waits for its target with `WaitForEvent(INFINITE)` — a finite
+timeout returns `E_NOTIMPL` and never drives the KD link — and `SetInterrupt`, the one DbgEng call
+safe from another thread, cannot reach a wait that has not yet connected. So a guest that is powered
+off, not booted with debugging enabled, or pointed at the wrong host/port/key parks the attach
+**permanently**: measured on hardware at 300s with no bound and no cancellation path. With a single
+engine thread that park owned the whole server. Every other tool queued behind it, `end_session`
+included, and the only recovery was restarting the process.
+
+**Decision.** Run the MCP protocol in a supervisor process and each open target in its own engine
+worker child process (`src/engine.rs`, `src/worker.rs`, `src/proto.rs`). dbgeng.dll holds one
+debuggee session per process, so the process *is* the natural unit of a session — this is the shape
+the library already imposes, not one invented for the bug.
+
+**Why not the cheaper options.** Three cheaper-looking answers were on the table; none of them is a
+fix, though the second fell out of this one for free:
+
+- *Documenting the park in the tool description* leaves the failure in place. It is the most common
+  mistake in kernel debugging — a guest not booted in debug mode — so an agent will hit it, and
+  "restart the server" is not something an agent can do.
+- *Making the pending state age-aware* turns an indistinguishable state into actionable advice, but
+  the only action it could name was still a restart. Under process-per-session the same reporting
+  names a recovery that works, so `session_status` does it anyway: it distinguishes a KDNET link
+  still coming up (~25s) from one that has been waiting far past any healthy attach.
+- *A worker **thread** is not a substitute.* Detaching a `JoinHandle` frees nothing: the thread, its
+  stack, the `DebugEngine`, its COM objects and the claimed transport endpoint all live on blocked
+  for the life of the process, and each retry leaks another set. Only a process can be reclaimed.
+
+**What it cost.** A closure cannot cross a process boundary, so the closures that were marshalled
+onto the engine thread became serializable operations (`EngineOp`). They are deliberately
+*tool*-shaped rather than DbgEng-shaped: a tool whose work is several engine calls —
+`reachable_from_dispatch`'s call-graph walk, `run_to_address`'s resolve-then-run — must stay one
+indivisible job, or another call for the same session could interleave between the parts and the
+walk would see a target that moved underneath it.
+
+The watchdog budget also split. The supervisor now sends the caller's remaining *patience* and the
+worker derives the deadline from it, because the supervisor writes a request the moment it is
+submitted and the queueing then happens on the far side of the pipe, where only the worker can
+measure it. Computing the deadline on the supervisor's side compiles, passes the unqueued test, and
+is wrong: a command that queued for most of the budget would run a full budget *after* its caller
+gave up. That is not hypothetical — it is the bug the first cut of this change shipped, caught by
+the queue-aware test, and it is why the arithmetic lives next to the thing it arms.
+
+**What it bought beyond the bug.** `session_id` stopped meaning "detect that the target changed
+underneath you" and started meaning "route to the worker that owns this target", which retires a
+whole class of accident rather than reporting it: an `open_dump` cannot disturb a kernel attach, and
+an `end_session` for session A can no longer be ordered against an open of B, because there is
+nothing shared to order. Sessions became concurrent (bounded at `MAX_SESSIONS`, 4). And the one
+protocol-level error class shrank to "no worker could be started at all" — every other failure is
+now scoped to a session and has a next move, so it belongs in the tool result.
+
+**Status:** landed. FOLLOWUPS item 10 records what moved for items 7–9, which were written against
+the design this replaced.
+
+---
+
 ## Which tools run on the bounded-command path (2026-08-02)
+
+> **Since:** process-per-session (above, same day) moved the pieces this entry names. The bounded
+> path is now `EngineOp::BoundedCommand`, the budget arithmetic lives in `src/worker.rs`, and the
+> measurement test moved to `tests/mcp_smoke.rs`'s bounded-command tier. The coverage rule below is
+> unchanged and still the rule; what changed is that a runaway command now pins one session rather
+> than the server.
 
 **Context.** `EngineHandle::run_command` (`src/engine.rs`) runs a raw command under win-kexp's
 `execute_command_bounded`, whose watchdog `SetInterrupt`s the engine before the caller's timeout so

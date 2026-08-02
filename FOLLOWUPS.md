@@ -6,9 +6,11 @@ MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/win-kexp#71, 2026-08-01), and items 13–14 from the bounded-command coverage review
 (#46, 2026-08-02). Each item notes its repo, why it was deferred, and where
 it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
-and the 2026-08-02 entry for the one items 13–14 extend.
+and the 2026-08-02 entries for the ones items 13–14 and item 10 extend.
 
-Items are roughly ordered by how soon they're worth doing, within each cluster.
+Items are roughly ordered by how soon they're worth doing, within each cluster. **Item 10 has
+landed** (process-per-session, 2026-08-02); it is kept here rather than deleted because items 7, 8
+and 9 were all written against the single-engine design it replaced, and each now says what moved.
 
 ## 1. [win-kexp] Managed breakpoint lifecycle for `run_to_address`
 
@@ -69,33 +71,42 @@ than the human/LLM-readable recipe emitted today.
 ## 7. [win-kexp + windbg-mcp] On-demand engine interrupt
 
 Expose `SetInterrupt` as a public win-kexp method (and a `Send` handle obtainable from a
-`&DebugEngine`), then plumb it through `EngineHandle` as `interrupt()`. Today the primitive exists
+`&DebugEngine`), then plumb it through to a per-session `interrupt()`. Today the primitive exists
 but is only ever *timeout-driven*: `execute_command_bounded` (win-kexp `src/dbgeng.rs:607`) and
 `wait_for_event_bounded` (`:716`) each spawn a watchdog thread holding an `InterruptHandle` and
 Ctrl+Break the engine when a deadline passes. There is no way for a caller to ask for that now.
 
 `InterruptHandle` (`src/dbgeng.rs:115-119`) already carries the reasoning: `SetInterrupt` is the one
 DbgEng call documented as safe from another thread, so this needs no new threading model — the
-engine stays confined to its one thread (`src/engine.rs`) and the interrupt arrives from outside it,
+engine stays confined to its one thread (`src/worker.rs`) and the interrupt arrives from outside it,
 exactly as it does today.
 
+**Reshaped by item 10.** The interrupt is now a *per-session* concern: it has to reach one worker's
+engine, and it cannot travel as an ordinary op, because a worker whose engine is wedged is exactly
+the one not draining its request queue — it needs a side channel the worker's reader thread acts on.
+The urgency dropped with the same change: `end_session` already ends any call by terminating the
+session, so an interrupt is no longer the only way out of a runaway command, just the graceful one
+that keeps the target.
+
 - **Why it comes first:** it is what would give item 8's `tasks/cancel` anything to do — the spec's
-  cancellation is cooperative, so acknowledging one conforms, but a server whose engine thread is
-  blocked inside DbgEng cannot act on it at all. It stands alone too: it gives an operator a way to
-  abort a runaway `execute` before `ENGINE_CALL_TIMEOUT` (`src/main.rs:22`, 300s) elapses.
-- **A bare `interrupt()` would hit the wrong job.** `SetInterrupt` addresses the engine, meaning
-  whichever operation is *currently running* — but the job queue is FIFO with one worker
-  (`src/engine.rs`), and item 8 makes several calls in flight at once the normal case rather than
-  the exception. Cancelling a task whose job is still queued would then Ctrl+Break an unrelated
+  cancellation is cooperative, so acknowledging one conforms, but a session blocked inside DbgEng
+  cannot act on it at all *without being thrown away*. It stands alone too: it gives an operator a
+  way to abort a runaway `execute` before `ENGINE_CALL_TIMEOUT` (`src/main.rs`, 300s) elapses,
+  keeping the target that `end_session` would discard.
+- **A bare `interrupt()` would hit the wrong job.** `SetInterrupt` addresses one engine, meaning
+  whichever operation that session is *currently running* — but each session's queue is FIFO with
+  one consumer, and item 8 makes several calls in flight at once the normal case rather than the
+  exception. Cancelling a task whose job is still queued would then Ctrl+Break an unrelated
   task's running operation, and the cancelled job would go on to execute anyway when its turn came:
-  `EngineHandle::run` already documents that a timeout abandons the wait and "the job itself is
-  *not* cancelled". So the interrupt has to be bound to job identity — the engine tracks which job
+  `Sessions::call` already documents that a timeout abandons the wait and that the job itself is
+  *not* cancelled. So the interrupt has to be bound to job identity — the engine tracks which job
   is active, a cancel for a queued job drops it from the queue, and `SetInterrupt` fires only when
   the cancelled job is the running one. That is the substance of this item, not an add-on to it.
 - **Known limit, carried from win-kexp `src/dbgeng.rs:726`:** `SetInterrupt` cannot unblock a
   live-kernel wait until the target is *connected*. So the `attach_kernel` KDNET park documented in
   `CLAUDE.md` — the case that most wants cancelling — is not cancellable this way; only tearing down
-  the client or the process ends it. That limit is what motivates item 10.
+  the process ends it. That limit is what motivated item 10, which has since landed and made that
+  teardown a supported, in-band operation (`end_session`).
 
 ## 8. [windbg-mcp] Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663)
 
@@ -120,15 +131,15 @@ does not already define them, so hand-writing `call_tool` and `get_info` inside 
 
 Suggested order, chosen so the protocol work is proved before it touches DbgEng:
 
-1. `record_trace` — already off the engine thread (`spawn_blocking`, `src/server.rs:2675`), so
-   converting it is pure protocol work with no debugger risk.
+1. `record_trace` — already off any engine (`spawn_blocking`, `src/server.rs`), so converting it is
+   pure protocol work with no debugger risk.
 2. `open_dump` / `open_trace` / `index_trace` / `attach_kernel` — where the pain actually is, and
-   where the `opens` ring can shrink to a thin adapter over `tasks/get`.
+   where `session_status` can shrink to a thin adapter over `tasks/get`.
 3. `go` / `run_to_address` / `execute` — best held until item 7 lands. `tasks/cancel` is
    *cooperative* by spec: acknowledging it while the work runs on to some terminal state is
    conformant, so these are implementable without an interrupt. But for exactly these three the
-   engine thread is blocked inside DbgEng, so until item 7 there is no effort the server could
-   make — cancel would be a no-op until the operation ends on its own. Conformant, useless.
+   session's engine is blocked inside DbgEng, so until item 7 the only effort the server can make
+   is ending the session outright — a heavier answer than a cancel should be.
 
 Fast, pure tools (`decode_ioctl`, `registers`, `read_memory`, `modules`, `threads`, `disassemble`,
 `backtrace`, `session_status`) should stay synchronous.
@@ -145,7 +156,8 @@ Fast, pure tools (`decode_ioctl`, `registers`, `read_memory`, `modules`, `thread
     swapped underneath a client that believes the operation is over. Cooperative cancellation is the
     escape hatch here rather than the problem: acknowledge the request, decline to transition, and
     leave the task `working` until the engine job actually resolves. A cancel that genuinely ends the
-    wait needs item 10's worker teardown.
+    wait needs item 10's worker teardown, which has landed: `end_session` terminates the session's
+    process, so a client that genuinely wants out has a way — it just is not `tasks/cancel`.
   - **The session-handle contract needs a task-path clause.** The queued-precheck design survives
     untouched (a task's gate still runs in the same queued job, so the ordering guarantee in the
     CHANGELOG holds), but if an opener returns a task then the `session_id` arrives in the task
@@ -165,29 +177,40 @@ client for the duration of a command, so output only lands when the command ends
 - **Why deferred:** worth little before item 8 gives it somewhere to go.
 - **Does not buy concurrency.** A second client joins the *same* session and serializes on the same
   engine lock; while one thread is in `WaitForEvent`/`Execute`, calls from the other block. It would
-  swap `engine.rs`'s queue for DbgEng's internal one and gain nothing. Only item 10 delivers
-  parallelism.
+  swap the worker's queue for DbgEng's internal one and gain nothing. Concurrency *between* targets
+  came from item 10 instead.
 
-## 10. [windbg-mcp] Process-per-session, for actual concurrency
+## 10. [windbg-mcp] Process-per-session — **done** (2026-08-02, issue #61)
 
 dbgeng.dll holds **one debuggee session per process**. That is not a win-kexp limitation — it is why
-`.opendump` *replaces* the target, and why the `session_id` design exists at all (a handle that
-detects the swap, because there is nothing to swap *between*). So analysing a dump while a kernel
-attach sits parked in `WaitForEvent(INFINITE)` requires one engine process per session.
+`.opendump` *replaces* the target, and why the `session_id` design existed at all (a handle that
+detects the swap, because there was nothing to swap *between*).
 
-This is what makes item 8 pay off rather than merely report honestly: with a single engine thread a
-`working` task still owns the engine and every other tool queues behind it — the `submitted.elapsed()`
-budget arithmetic in `EngineHandle::run_command` exists because of exactly that queue. Under
-process-per-session, `session_id` stops meaning "detect that the target changed underneath you" and
-starts meaning "route to the worker that owns this target".
+Landed: the binary now runs the MCP protocol in a supervisor process (`src/engine.rs`) and each open
+target in an engine worker child process (`src/worker.rs`), talking over a line-delimited JSON
+protocol (`src/proto.rs`). `session_id` stopped meaning "detect that the target changed underneath
+you" and started meaning "route to the worker that owns this target". Sessions are concurrent (up to
+`MAX_SESSIONS`), and `end_session` can terminate a worker that will not unwind — which is what
+issue #61 needed, since a kernel attach whose target never dials in cannot be interrupted at all.
 
-- **Why deferred:** large. Needs process supervision, per-worker symbol state (`.sympath`, caches),
-  and moving the `opens` / `session_status` bookkeeping up into a supervisor. DbgEng's own remoting
-  (`.server` / `DebugConnect`) is the same shape with more moving parts — the remote session is still
-  its own engine process.
-- **Watch:** `unsafe impl Send/Sync for DebugEngine` (win-kexp `src/dbgeng.rs:164-165`) is sound
-  *because* `src/engine.rs` confines the engine to one thread. Any design that calls it from several
-  threads turns those impls from bookkeeping into a real, unchecked claim.
+What moved, for anyone picking up the items that referenced this:
+
+- The queue is **per session**, so a busy or parked session no longer blocks any other. The
+  budget arithmetic moved with it: the supervisor sends the caller's remaining *patience* and the
+  worker derives the watchdog deadline, because only the worker can measure the wait on its own
+  side of the pipe.
+- The `opens` ledger became the session registry, and `session_status` reports session *state* —
+  including how long an open has been waiting, which is what distinguishes a KDNET link that is
+  coming up from one that never will.
+- `unsafe impl Send/Sync for DebugEngine` (win-kexp `src/dbgeng.rs:164-165`) is still sound for the
+  same reason as before: `src/worker.rs` confines the engine to one thread *inside* the worker. The
+  supervisor never touches a `DebugEngine` at all, which is a stronger position than the one that
+  claim was written for.
+
+Not done, and no longer blocking anything: **per-worker symbol state**. Each worker has its own
+`.sympath` and symbol cache, which is correct (sessions are independent) but means a `set_symbol_path`
+does not carry to a session opened later. If that becomes annoying, the fix is a supervisor-held
+default applied at worker startup, not shared state.
 
 ## 11. [windbg-mcp] MCP Apps (`ui://` resources) — scoped out
 
@@ -232,12 +255,13 @@ The two **kernel** halves ran on no hardware: `attach_local_kernel_begin`/`wait`
 
 `reachable_from_dispatch` runs its whole breadth-first walk — up to `max_functions` × one `uf`
 command each — inside a *single* engine job. Both `max_functions` (default 256) and `max_depth`
-(default 32) come from the caller and are uncapped, so a large enough pair pins the engine thread
-for as long as the walk takes. That is the same wedge the bounded path fixed, arriving by a
-different route.
+(default 32) come from the caller and are uncapped, so a large enough pair pins that session's
+engine for as long as the walk takes. That is the same wedge the bounded path fixed, arriving by a
+different route — smaller now that it costs one session rather than the server, but still a session
+that answers nothing until the walk ends.
 
-- **Why the bounded path doesn't reach it:** `EngineHandle::run_command` bounds *one* command
-  string. Here no individual `uf` is the problem — the aggregate is.
+- **Why the bounded path doesn't reach it:** the bounded path bounds *one* command string. Here no
+  individual `uf` is the problem — the aggregate is.
 - **Where it picks up:** the walk already drives every disassembly through one `&mut uf` closure
   (`src/server.rs`), which is the natural place to check a deadline and stop with a partial,
   honestly-labelled verdict — "NOT REACHABLE within the budget" is already the tool's contract for

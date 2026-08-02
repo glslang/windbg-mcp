@@ -18,7 +18,10 @@ Pick one entry point:
   `bcdedit /dbgsettings` on the target, or the `windbgx -k` / `kd -k` command they use)
   and cannot be guessed — never invent a placeholder key.
 
-End with `end_session {}` before opening another target (one session at a time).
+Each of these opens a session of its own and returns a `session_id` — opening one does not close
+another, so you can keep a kernel attach live while you look at a dump. Pass the id on later calls
+to route them, and `end_session { "session_id": "<id>" }` when you are done with a target (up to
+four at a time).
 
 ## Inspect and control
 
@@ -41,10 +44,18 @@ End with `end_session {}` before opening another target (one session at a time).
   expressions.
 - **`go` is bounded by the per-call timeout** (~60s). A long-running live target may not
   reach a breakpoint within one call; on a live kernel it is force-broken at the cap.
-- **Unreachable kernel target blocks.** `attach_kernel` to a target that never establishes
-  the KDNET link waits like `kd` does (a connecting link can't be cancelled mid-handshake),
-  so confirm the target is up and the port/key are correct. A *connected* target that
-  doesn't break in is bounded and returns an error.
+- **Unreachable kernel target waits forever.** `attach_kernel` to a target that never
+  establishes the KDNET link waits like `kd` does — a connecting link can't be cancelled
+  mid-handshake — so the call reports a timeout while the attach keeps waiting. Confirm the
+  target is up, booted with debugging enabled, and pointed at this host with the right
+  port/key. Three things to know when it happens:
+  - It costs **only that session**: other sessions and every other tool keep working.
+  - **Do not re-attach.** The connection was already claimed, so a retry dials a second time.
+  - `session_status` says how long it has been waiting, and whether that is past the point a
+    healthy link takes (~25s for a KDNET resync). Past that it will not return on its own —
+    `end_session { "session_id": "<id>" }` reclaims it, terminating its engine process.
+
+  A *connected* target that doesn't break in is bounded and returns an error.
 - **TTD is user-mode only** — you cannot time-travel a kernel target. For reverse
   execution, record a user-mode trace instead (see [ttd.md](ttd.md)).
 - Symbol names need the full setup (`msdia140.dll` + `.sympath` + `.reload /f` at a stop) —

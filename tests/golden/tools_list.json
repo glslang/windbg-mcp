@@ -435,7 +435,7 @@
         "session_id: string|null"
       ],
       "required": [],
-      "title": "Show current session handle"
+      "title": "List debug sessions"
     },
     {
       "hints": {

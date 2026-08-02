@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-`windbg-mcp` is a Rust MCP server for WinDbg/DbgEng. Core code lives in `src/`: `main.rs` wires tokio and stdio transport, `server.rs` defines the MCP tool surface, `engine.rs` owns serialized DbgEng access on a worker thread, and `ttd.rs` handles Time Travel Debugging discovery and launch logic. Operational documentation is in `docs/`, agent playbooks are in `skills/windbg-debugging/`, and PowerShell examples live in `examples/`. Helper tooling such as IOCTL harness scripts is under `tools/`. Build output in `target/` is generated and should not be committed.
+`windbg-mcp` is a Rust MCP server for WinDbg/DbgEng. Core code lives in `src/`: `main.rs` selects the process role (supervisor or engine worker) and wires tokio and stdio transport, `server.rs` defines the MCP tool surface, `engine.rs` is the supervisor (session registry, worker processes, routing), `worker.rs` is the child process that owns serialized DbgEng access on a dedicated thread, `proto.rs` is the protocol between them, and `ttd.rs` handles Time Travel Debugging discovery and launch logic. Operational documentation is in `docs/`, agent playbooks are in `skills/windbg-debugging/`, and PowerShell examples live in `examples/`. Helper tooling such as IOCTL harness scripts is under `tools/`. Build output in `target/` is generated and should not be committed.
 
 ## Build, Test, and Development Commands
 
@@ -15,7 +15,7 @@ For local iteration while an MCP client may have the release executable locked, 
 
 ## Coding Style & Naming Conventions
 
-Use Rust 2024 idioms and `rustfmt` defaults. Keep DbgEng access behind the engine-thread abstraction; do not add ad hoc cross-thread calls. Prefer typed Rust APIs and structured JSON over parsing debugger text unless the command surface only exposes text. Use `snake_case` for functions, modules, fields, and tests; use `PascalCase` for types. Keep comments short and focused on non-obvious debugger behavior.
+Use Rust 2024 idioms and `rustfmt` defaults. Keep DbgEng access inside the worker process and on its engine thread; do not add ad hoc cross-thread or cross-process calls. The supervisor must never touch a `DebugEngine`. Prefer typed Rust APIs and structured JSON over parsing debugger text unless the command surface only exposes text. Use `snake_case` for functions, modules, fields, and tests; use `PascalCase` for types. Keep comments short and focused on non-obvious debugger behavior.
 
 ## Testing Guidelines
 

@@ -1,16 +1,12 @@
 //! The MCP server: a curated set of debugger tools plus a raw command passthrough.
 //!
-//! Every tool marshals its work onto the engine thread via [`EngineHandle`]. Most
-//! tools are thin wrappers over `execute_command` (the universal DbgEng escape
-//! hatch, returning full text); session-management tools call the typed
-//! `win-kexp` methods and then wait for the target to stop.
+//! Every tool routes its work to a session's worker process via [`Sessions`] — the tool decides
+//! *what* to run ([`EngineOp`]) and *which* session runs it, and [`crate::engine`] does the rest.
+//! Most tools are thin wrappers over `execute_command` (the universal DbgEng escape hatch,
+//! returning full text); session-management tools drive the typed `win-kexp` openers.
 
-use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use rmcp::ErrorData;
 use rmcp::handler::server::wrapper::Parameters;
@@ -18,35 +14,28 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use win_kexp::dbgeng::{DebugEngine, RunToOutcome};
-
-use crate::engine::{EngineError, EngineHandle};
+use crate::engine::{
+    Call, EngineError, MAX_SESSIONS, OpenError, OpenReport, SessionKind, SessionSnapshot,
+    SessionState, Sessions,
+};
+use crate::proto::{EngineOp, ReachabilityOp};
 use crate::ttd;
 
-/// How long to wait for a target to stop after open/attach/launch (ms).
-const LOAD_WAIT_MS: u32 = 60_000;
 /// How long to wait for an execution-control command (go/step/reverse) to reach its
 /// next stop (ms).
 const EXEC_WAIT_MS: u32 = 60_000;
 
-/// Counter behind [`mint_session_id`]. Only needs to be unique within this process.
-static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
+/// How long an open may sit un-landed before `session_status` stops calling it normal.
+///
+/// A KDNET link that is coming up resyncs in ~25s; a guest that is not booted in debug mode
+/// never dials at all, and the two look identical from here except for how long they have taken.
+/// Past this the report says so, because the advice diverges completely — "wait" versus "this
+/// will not return; `end_session` reclaims it".
+const OPEN_TAKING_TOO_LONG: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 pub struct WindbgServer {
-    engine: EngineHandle,
-    /// Handle identifying the debug session the engine is currently attached to, or
-    /// `None` when no target is open. See [`check_session_handle`] for why this exists
-    /// rather than letting the connection stand in for the session.
-    session: Arc<Mutex<Option<String>>>,
-    /// Recent opener outcomes, so a caller whose open timed out can find out whether it is
-    /// still pending, landed, or failed. See [`OpenOutcome`].
-    opens: Arc<Mutex<VecDeque<(String, OpenOutcome)>>>,
-}
-
-/// Maps any error to a `String` for the engine `Reply` channel.
-fn es<E: ToString>(e: E) -> String {
-    e.to_string()
+    sessions: Sessions,
 }
 
 fn text_result(s: String) -> Result<CallToolResult, ErrorData> {
@@ -59,33 +48,23 @@ fn tool_error(s: String) -> Result<CallToolResult, ErrorData> {
     Ok(CallToolResult::error(vec![ContentBlock::text(s)]))
 }
 
-/// Renders an engine outcome using the MCP error model.
+/// Renders a session-scoped engine outcome using the MCP error model.
 ///
-/// A failed *debugger operation* (bad symbol, unreadable address, target that never
-/// stopped) is feedback the model can act on, so it comes back as a tool-execution
-/// error with the text intact. Only a broken engine — the one thing no amount of
-/// retrying will fix — becomes a JSON-RPC protocol error.
+/// Everything that can go wrong here is feedback the model can act on — a failed debugger
+/// operation (bad symbol, unreadable address, a target that never stopped), a refused handle, a
+/// session whose worker is gone — so all of it comes back as a tool-execution error with the text
+/// intact, never as a JSON-RPC error the model never really sees. The one failure that is the
+/// *server's* rather than a session's is "no engine worker could be started", and only an opener
+/// can hit it; [`WindbgServer::opened`] renders that one.
 fn engine_result(r: Result<String, EngineError>) -> Result<CallToolResult, ErrorData> {
     match r {
         Ok(out) => text_result(out),
-        Err(EngineError::Debugger(m) | EngineError::Timeout(m)) => tool_error(m),
-        Err(EngineError::Unavailable(m)) => Err(ErrorData::internal_error(m, None)),
+        Err(e) => tool_error(e.to_string()),
     }
 }
 
-/// Mints a fresh session handle. Unique per process, which is all the guard needs:
-/// the handle exists to detect *replacement* of the target, not to authenticate.
-fn mint_session_id() -> String {
-    let n = SESSION_SEQ.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    format!("sess-{nanos:x}-{n}")
-}
-
 /// Parses a decimal or `0x`-prefixed hex integer.
-fn parse_u64(s: &str) -> Result<u64, String> {
+pub(crate) fn parse_u64(s: &str) -> Result<u64, String> {
     let t = s.trim();
     let parsed = if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
         u64::from_str_radix(h, 16)
@@ -95,7 +74,7 @@ fn parse_u64(s: &str) -> Result<u64, String> {
     parsed.map_err(|_| format!("invalid number: {s}"))
 }
 
-fn hexdump(base: u64, bytes: &[u8]) -> String {
+pub(crate) fn hexdump(base: u64, bytes: &[u8]) -> String {
     let mut out = String::new();
     for (i, chunk) in bytes.chunks(16).enumerate() {
         let addr = base + (i * 16) as u64;
@@ -179,7 +158,7 @@ fn decode_ioctl_text(c: u32) -> String {
 /// trailed by parens/commas ("(fffff803`3e2547f0)"). Requires >= 8 hex digits so
 /// it never mistakes a mnemonic, a short immediate, or a "module!Symbol:" label
 /// for an address.
-fn parse_windbg_addr(tok: &str) -> Option<u64> {
+pub(crate) fn parse_windbg_addr(tok: &str) -> Option<u64> {
     let cleaned: String = tok
         .trim_matches(|c| c == '(' || c == ')' || c == ',')
         .chars()
@@ -361,7 +340,7 @@ fn walk_function(block: &UfBlock, start: u64) -> Option<FnWalk> {
 /// The first address token in `lm m <module>` output is the module's live start
 /// (its base). Header lines ("Browse full module list", the "start end module"
 /// legend) have no leading address and are skipped by the >= 8 hex-digit rule.
-fn parse_lm_base(text: &str) -> Option<u64> {
+pub(crate) fn parse_lm_base(text: &str) -> Option<u64> {
     text.lines()
         .find_map(|l| l.split_whitespace().next().and_then(parse_windbg_addr))
 }
@@ -370,17 +349,17 @@ fn parse_lm_base(text: &str) -> Option<u64> {
 /// "Evaluate expression: 18446735277667370832 = fffff803`3e254750" — the address
 /// is the hex token after the `=`. Used to resolve a symbolic/backtick `from` (like
 /// `mydriver!Dispatch+0x123`) to the numeric VA the intra-function walk starts at.
-fn parse_eval(text: &str) -> Option<u64> {
+pub(crate) fn parse_eval(text: &str) -> Option<u64> {
     let rhs = text.split('=').nth(1)?;
     parse_windbg_addr(rhs.split_whitespace().next()?)
 }
 
 /// Outcome of a reachability walk. `verdict_reachable` is sound (a concrete static
 /// path exists); a false verdict is best-effort within the explored bounds.
-struct Report {
-    verdict_reachable: bool,
+pub(crate) struct Report {
+    pub(crate) verdict_reachable: bool,
     /// Resolved entry of the `from` function (None if `from` didn't disassemble).
-    from_entry: Option<u64>,
+    pub(crate) from_entry: Option<u64>,
     target: u64,
     /// Entry of the function containing `target`, when reachable.
     containing_fn: Option<u64>,
@@ -405,7 +384,7 @@ struct Report {
 /// handler scoped past a switch — the intra-function walk begins there, not at the
 /// entry, so sibling switch cases aren't spuriously reachable. `None` (unresolvable)
 /// falls back to the function entry.
-fn reachability(
+pub(crate) fn reachability(
     from: &str,
     seed_start: Option<u64>,
     target: u64,
@@ -505,12 +484,12 @@ fn reconstruct(
 }
 
 /// Formats a WinDbg-style `hi`lo` address.
-fn fmt_addr(a: u64) -> String {
+pub(crate) fn fmt_addr(a: u64) -> String {
     format!("{:08x}`{:08x}", a >> 32, a & 0xffff_ffff)
 }
 
 /// Renders a [`Report`] as the tool's text output.
-fn format_report(r: &Report) -> String {
+pub(crate) fn format_report(r: &Report) -> String {
     let mut out = String::new();
     out.push_str("IOCTL dispatch reachability\n");
     match r.from_entry {
@@ -638,7 +617,7 @@ struct BranchStep {
 /// The recipe for one function on the call path: the branch decisions between where the
 /// function is entered and where control leaves it toward the target.
 #[derive(Debug, Clone, PartialEq)]
-struct SegmentRecipe {
+pub(crate) struct SegmentRecipe {
     /// Entry (or mid-function start) the segment's walk begins at.
     start: u64,
     /// Address the segment routes to: the call/jmp site to the next hop, or the target.
@@ -885,7 +864,7 @@ fn decode_predicate(
 /// recording the on-path branch decisions. `from` disassembles the seed function (a symbol
 /// still resolves); later functions enter their callee by address. `seed_start` scopes the
 /// seed segment to a mid-function start when set.
-fn path_recipe(
+pub(crate) fn path_recipe(
     from: &str,
     seed_start: Option<u64>,
     rpt: &Report,
@@ -980,7 +959,7 @@ fn render_predicate(p: &Predicate) -> String {
 }
 
 /// Renders the path recipe, appended after [`format_report`] on a REACHABLE verdict.
-fn format_recipe(recipes: &[SegmentRecipe]) -> String {
+pub(crate) fn format_recipe(recipes: &[SegmentRecipe]) -> String {
     let mut out = String::new();
     out.push_str("\nPath recipe (input that keeps control on the path to the target)\n");
     out.push_str(
@@ -1299,57 +1278,25 @@ pub struct RunToAddressArgs {
 
 // ---- Session handles -----------------------------------------------------
 //
-// One process drives one DbgEng session, but an MCP connection is explicitly *not*
-// a session: clients may interleave unrelated requests over the same stdio process,
-// so "the target the last open_* call attached to" is not a safe thing for a tool to
-// assume. Rather than silently operating on whatever target happens to be loaded,
-// the session-creating tools mint a handle and every other tool accepts it and
-// refuses to run when it no longer matches.
+// An MCP connection is explicitly *not* a session: clients may interleave unrelated requests
+// over the same stdio process, so "the target the last open_* call attached to" is not a safe
+// thing for a tool to assume. The session-creating tools therefore mint a handle, and every tool
+// that touches a target accepts it.
 //
-// The handle is optional so existing callers keep working; supplying it is what buys
-// the guarantee that a call which does supply one can never land on a target it did
-// not open.
+// What the handle *does* changed with process-per-session. It used to be a tripwire: one engine,
+// one target, and the handle existed so a call could notice that the target had been replaced
+// underneath it. Now it **routes** — it names the worker process that holds that target — and the
+// class of accident it guarded against mostly cannot happen any more, because opening a second
+// target no longer disturbs the first. See [`crate::engine`].
 //
-// That guarantee only holds because both the check and the session transition happen
-// **on the engine thread**, inside the same queued job as the debugger call itself.
-// Checking on the async side instead would be a time-of-check/time-of-use bug: with
-// session A current, an `open_dump` for B can already be in flight while `session`
-// still reads A, so an `end_session(session_id=A)` would pass the check, queue behind
-// the open, and then close B. The engine queue is the only serialisation point that
-// orders against DbgEng access, so the gate has to live on it.
-
-/// The session-handle policy, as a pure function so it unit-tests without an engine.
-///
-/// `supplied == None` means the caller opted out of the check and accepts whatever
-/// session is current — the behaviour from before handles existed. A handle that does
-/// not match is refused rather than silently honoured, because honouring it means
-/// reading memory from, or setting breakpoints on, a target the caller never opened.
-fn check_session_handle(current: Option<&str>, supplied: Option<&str>) -> Result<(), String> {
-    let Some(want) = supplied else {
-        return Ok(());
-    };
-    match current {
-        Some(cur) if cur == want => Ok(()),
-        Some(cur) => Err(format!(
-            "stale session handle `{want}`: this server is now debugging session `{cur}`. \
-             The debug target was replaced after you opened yours — this stdio process is \
-             shared, not per-conversation. Re-open your target, or omit `session_id` to \
-             operate on whatever session is current."
-        )),
-        None => Err(format!(
-            "stale session handle `{want}`: this server has no debug session open — it was \
-             ended, or never started. Re-open your target with open_dump / open_trace / \
-             attach_process / attach_kernel / attach_kernel_local / launch."
-        )),
-    }
-}
-
-/// A poisoned lock only ever means a previous holder panicked mid-update; the value is a
-/// plain `Option<String>` and cannot be left inconsistent, so recovering beats poisoning
-/// every later tool call. The lock is never held across a debugger operation.
-fn lock(session: &Mutex<Option<String>>) -> std::sync::MutexGuard<'_, Option<String>> {
-    session.lock().unwrap_or_else(|e| e.into_inner())
-}
+// It is still optional, and omitting it still means "whatever session is current" (the newest one
+// that will still accept work). What supplying it buys is unchanged: a call that names a session
+// can never land on a target the caller did not open.
+//
+// Two seams remain, and both are inside one worker rather than across the server: `execute` and
+// `dx` can replace a session's target from underneath its own handle. That retirement is ordered
+// against the session's queue — see `engine::Gate` — for the same time-of-check/time-of-use
+// reason the old design put the check on the engine thread.
 
 /// Whether an operand may legitimately contain a double quote.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1420,70 +1367,85 @@ fn post_commit_failure(err: &str, session_id: &str) -> String {
     )
 }
 
-/// How far a session-opening job got.
-///
-/// Recorded because the per-call timeout abandons the *waiter*, not the job: a caller can
-/// stop hearing about an open that is still queued, still running, or already finished. The
-/// current session handle alone cannot tell those apart — a handle that is not yours means
-/// only "not yours", which is equally true while you wait and after you have failed. So the
-/// outcome is tracked per opener, and [`WindbgServer::session_status`] can be asked about a
-/// specific one.
-///
-/// The distinction matters because it changes what the caller should do: a `Pending` open
-/// must not be re-run (that attaches or launches a second time), while a `Failed` one has to
-/// be, since nothing else will produce a target.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum OpenOutcome {
-    /// Queued or running. The handle may still be committed.
-    Pending,
-    /// The target was opened and the handle committed. It may since have been replaced by a
-    /// later open — that is what the handle check is for — but this open did land.
-    Landed,
-    /// The open failed. This handle will never be committed; opening again is the only way
-    /// forward.
-    Failed(String),
+/// Renders a duration the way a person reads one: "8.4s", "3m12s", "1h05m".
+fn fmt_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    match secs {
+        0..=59 => format!("{:.1}s", d.as_secs_f64()),
+        60..=3599 => format!("{}m{:02}s", secs / 60, secs % 60),
+        _ => format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60),
+    }
 }
 
-/// How many opener outcomes to remember. Opens are rare and a caller only ever asks about a
-/// recent one, so a short window keeps this from growing without bound.
-const OPEN_HISTORY: usize = 8;
-
-/// Records an opener's outcome, evicting the oldest *settled* entry once [`OPEN_HISTORY`]
-/// is reached.
+/// One session, as `session_status` reports it.
 ///
-/// Settled is the important word. A `Pending` entry is an open that is still queued or
-/// running, and forgetting one is worse than remembering it forever: `session_status` would
-/// report the handle as unknown, which tells the caller to open again — and that duplicates
-/// an attach or a launch, then lets the original job land afterwards and replace the target
-/// underneath them. Avoiding exactly that is why this ledger exists.
+/// The interesting line is the one for an open that has not landed. `Attaching` means the target
+/// has been *claimed* — the dump handed over, the connection taken — and the debugger is waiting
+/// for it to break in. For a live kernel that wait is `WaitForEvent(INFINITE)` and nothing can
+/// interrupt it, so the state itself cannot say whether the link is about to come up or the guest
+/// was never booted in debug mode. **How long it has been waiting can**, which is why the
+/// duration is not decoration here: past [`OPEN_TAKING_TOO_LONG`] the report stops calling it
+/// normal and names the recovery, because the two cases need opposite responses.
 ///
-/// So the history can exceed [`OPEN_HISTORY`] while opens are in flight. That is
-/// self-limiting rather than unbounded: the engine runs jobs one at a time and every job
-/// settles, including the ones that never reach it, which settle as `Failed` on the caller
-/// side.
-fn record_open(opens: &Mutex<VecDeque<(String, OpenOutcome)>>, id: &str, outcome: OpenOutcome) {
-    let mut opens = opens.lock().unwrap_or_else(|e| e.into_inner());
-    match opens.iter_mut().find(|(known, _)| known == id) {
-        Some(slot) => slot.1 = outcome,
-        None => opens.push_back((id.to_string(), outcome)),
+/// Free function so the wording tests without a debugger.
+fn describe_session(s: &SessionSnapshot) -> String {
+    let current = if s.current { " (current)" } else { "" };
+    let mut out = format!(
+        "{}{current} — {}: {}  [engine pid {}, opened {} ago]\n",
+        s.id,
+        s.kind.label(),
+        s.what,
+        s.pid,
+        fmt_duration(s.age)
+    );
+    let waited = fmt_duration(s.in_state_for);
+    match &s.state {
+        SessionState::Opening => {
+            out.push_str(&format!(
+                "  opening for {waited}. Nothing has been created or claimed yet, so a failure \
+                 from here would leave a clean slate.\n"
+            ));
+        }
+        SessionState::Attaching => {
+            out.push_str(&format!(
+                "  the target has been created or claimed, and the debugger has been waiting \
+                 {waited} for it to break in. Do not re-run the open — that would attach to, or \
+                 start, a second target.\n"
+            ));
+            if s.kind.waits_indefinitely() {
+                if s.in_state_for >= OPEN_TAKING_TOO_LONG {
+                    out.push_str(&format!(
+                        "  [!] That is far longer than a healthy kernel attach takes (a KDNET \
+                         link that is coming up resyncs in ~25s), and this wait has no timeout \
+                         and cannot be interrupted — it will not return on its own. The usual \
+                         causes are a guest that is powered off, not booted with debugging \
+                         enabled, or pointed at a different host/port/key. Fix the target and it \
+                         will still connect; otherwise reclaim the session with `end_session \
+                         {{ \"session_id\": \"{}\" }}`, which terminates its engine process. \
+                         Nothing else on this server is affected in the meantime.\n",
+                        s.id
+                    ));
+                } else {
+                    out.push_str(
+                        "  A kernel attach waits for the target to dial in, so this is normal \
+                         while the link comes up (~25s for a KDNET resync). Ask again shortly.\n",
+                    );
+                }
+            }
+        }
+        SessionState::Open => out.push_str(&format!("  open for {waited}; ready for work.\n")),
+        SessionState::Failed(why) => out.push_str(&format!(
+            "  failed {waited} ago and never opened:\n    {why}\n  Nothing was created, so \
+             opening again is the way forward.\n"
+        )),
+        SessionState::Retired(why) => out.push_str(&format!(
+            "  the handle was retired {waited} ago: {why}. The engine process still holds a \
+             target, but not the one this handle names — calls that pass `session_id` are \
+             refused, calls that omit it still reach it.\n"
+        )),
+        SessionState::Closed(why) => out.push_str(&format!("  closed {waited} ago: {why}\n")),
     }
-    // Trimmed after an update as well as an insertion. A burst of concurrent opens is all
-    // `Pending` at first and legitimately exceeds the bound; if only insertions trimmed,
-    // the ledger would stay over it forever once that burst settled in place, holding every
-    // handle and failure string for the life of the process.
-    trim_settled_opens(&mut opens);
-}
-
-/// Evicts oldest-settled entries until the ledger is back within [`OPEN_HISTORY`], or until
-/// only pending entries are left — those are never evicted, whatever the bound says.
-fn trim_settled_opens(opens: &mut VecDeque<(String, OpenOutcome)>) {
-    while opens.len() > OPEN_HISTORY {
-        let Some(oldest_settled) = opens.iter().position(|(_, o)| *o != OpenOutcome::Pending)
-        else {
-            return;
-        };
-        opens.remove(oldest_settled);
-    }
+    out
 }
 
 /// Can this data-model expression run debugger commands?
@@ -1543,154 +1505,71 @@ fn changes_debug_target(command: &str) -> bool {
     })
 }
 
-/// Builds the deferred session check.
-///
-/// The returned closure reads the session *when it runs*, not when it is built — that is
-/// the whole point, and it is why the gate must be handed to the engine thread rather than
-/// evaluated by the caller. Free function so it tests without an engine.
-fn session_gate_for(
-    session: Arc<Mutex<Option<String>>>,
-    supplied: Option<&str>,
-) -> impl FnOnce() -> Result<(), String> + Send + 'static + use<> {
-    let supplied = supplied.map(str::to_owned);
-    move || check_session_handle(lock(&session).as_deref(), supplied.as_deref())
-}
-
 impl WindbgServer {
-    /// Builds the session gate for a caller-supplied handle. The returned closure is run
-    /// *by the engine thread*, immediately before the debugger operation it guards — see
-    /// the module note above for why checking any earlier is unsound.
-    fn session_gate(
-        &self,
-        supplied: Option<&str>,
-    ) -> impl FnOnce() -> Result<(), String> + Send + 'static + use<> {
-        session_gate_for(Arc::clone(&self.session), supplied)
+    /// Routes a call to the session the caller named — or to the current one — and runs it.
+    ///
+    /// Resolution happens here, on the async side, because under process-per-session it is a
+    /// *routing* decision and routing cannot race: an open for another target creates its own
+    /// worker and cannot be ordered against this call at all. What still has to be re-checked
+    /// at the front of the session's own queue is whether the handle survived work queued ahead
+    /// of it, and that is `engine::Gate`'s job.
+    async fn run_call(&self, session_id: Option<&str>, call: Call) -> Result<String, EngineError> {
+        let session = self.sessions.resolve(session_id)?;
+        self.sessions
+            .call(&session, call.named(session_id.is_some()))
+            .await
     }
 
-    /// Runs a session-opening operation and takes ownership of the session in the same
-    /// queued job, so no other call can be ordered across the transition.
+    /// The common case: one op, no handle retirement.
+    async fn run(&self, session_id: Option<&str>, op: EngineOp) -> Result<String, EngineError> {
+        self.run_call(session_id, Call::new(op)).await
+    }
+
+    /// Opens a target in a session of its own and renders the outcome.
     ///
-    /// The work is split in two because the split is where correctness lives. `transition`
-    /// opens the target; `report` is the diagnostic (`lm`, `vertarget`, `r`, the TTD
-    /// lifetime query) whose output the caller reads. The handle is committed *between*
-    /// them, so a failure after the target has already changed cannot cost the caller a
-    /// handle for a target that is genuinely open — which matters because the only way to
-    /// get one back is to open again, and for `launch` that spawns a second process.
-    ///
-    /// `transition` receives a `commit` callback and must invoke it **the instant the target
-    /// is created or claimed**, before anything that can still fail. Every opener therefore
-    /// reads the same way: side effect, `commit()`, then the wait. That ordering is what the
-    /// callback buys — a `wait_for_event` that times out, or an initial break that never
-    /// arrives, then fails *with* the handle rather than losing it, because by then the dump
-    /// is loaded or the process is running whatever the wait says.
-    ///
-    /// win-kexp's openers expose that seam as `x_begin()` returning a `PendingTarget` guard,
-    /// which cannot exist unless the side effect succeeded — so `commit()` between the guard
-    /// and its `wait()` is exactly the right moment, enforced by the type rather than by
-    /// convention (glslang/win-kexp#71).
-    async fn opened_result<T, R>(
+    /// Every failure mode here needs different advice, and getting it wrong is expensive — "open
+    /// again" after a launch that already spawned means two processes. [`OpenError`] carries
+    /// which one happened; the worker's milestones are what let the supervisor tell them apart
+    /// (see [`crate::proto::WorkerMessage`]).
+    async fn opened(
         &self,
-        transition: T,
-        report: R,
-    ) -> Result<CallToolResult, ErrorData>
-    where
-        T: FnOnce(&DebugEngine, &dyn Fn()) -> Result<(), String> + Send + 'static,
-        R: FnOnce(&DebugEngine) -> Result<String, String> + Send + 'static,
-    {
-        let id = mint_session_id();
-        let session = Arc::clone(&self.session);
-        let opens = Arc::clone(&self.opens);
-        let new_id = id.clone();
-        let id_for_report = id.clone();
-        // Recorded before the job is queued, so a caller who never hears back can still ask
-        // about it — the whole point is that the reply may never arrive.
-        record_open(&self.opens, &id, OpenOutcome::Pending);
-        let out = self
-            .engine
-            .run(move |e| {
-                // The target is being replaced, so every handle issued so far is stale from
-                // here on — including if the transition fails partway and leaves the engine
-                // holding neither the old target nor a usable new one.
-                *lock(&session) = None;
-                // Set by `commit` below. It is what lets a failure say which side of the
-                // seam it fell on: before the commit nothing was created and re-opening is
-                // correct, after it the target exists and re-opening starts a second one.
-                let committed = Cell::new(false);
-                let commit = || {
-                    *lock(&session) = Some(new_id.clone());
-                    record_open(&opens, &new_id, OpenOutcome::Landed);
-                    committed.set(true);
-                };
-                // Under `catch_unwind` for the same reason the report is: an unwind here
-                // would leave the outcome recorded as `Pending` forever, and a caller
-                // following the documented recovery would poll for a handle that is never
-                // coming.
-                let transitioned = catch_unwind(AssertUnwindSafe(|| transition(e, &commit)))
-                    .unwrap_or_else(|_| Err("debugger operation panicked".to_string()));
-                // A transition that succeeded without committing would leave the caller with
-                // an open target and no handle. None do; commit defensively rather than let
-                // a future opener silently regress the guarantee.
-                if transitioned.is_ok() && !committed.get() {
-                    commit();
-                }
-                if let Err(err) = transitioned {
-                    if !committed.get() {
-                        // Nothing was created or claimed: the slate is clean, and re-opening
-                        // is the correct recovery.
-                        record_open(&opens, &new_id, OpenOutcome::Failed(err.clone()));
-                        return Err(err);
-                    }
-                    // The target was opened and something after it failed — the wait, most
-                    // likely. The handle names a session that exists, so hand it back; making
-                    // the caller re-open to get one is how they end up with two processes.
-                    return Err(post_commit_failure(&err, &id_for_report));
-                }
-                // The target is ours from here, so a failed diagnostic still has to hand the
-                // caller their handle — otherwise they cannot use the protection this whole
-                // mechanism promises without re-running a side-effecting open.
-                //
-                // Caught here rather than left to the worker's outer guard: a panic in a
-                // win-kexp method (several use `.expect`) would unwind straight past the
-                // `map_err` below and strip the handle off a session that is already
-                // committed. The engine survives a caught panic either way — the thing that
-                // must not be lost is the id.
-                let reported = catch_unwind(AssertUnwindSafe(|| report(e)))
-                    .unwrap_or_else(|_| Err("debugger operation panicked".to_string()));
-                reported.map_err(|err| {
-                    format!(
-                        "{err}\n\nsession_id: {id_for_report}\nThe target opened; only this \
-                         follow-up report failed, so the handle above is valid and usable."
-                    )
-                })
-            })
-            .await;
-        match out {
-            Ok(out) => text_result(format!(
-                "{out}\n\nsession_id: {id}\nPass this as `session_id` on later calls so they \
-                 fail loudly instead of silently acting on a different target if this \
-                 server's session is replaced."
+        kind: SessionKind,
+        what: String,
+        op: EngineOp,
+    ) -> Result<CallToolResult, ErrorData> {
+        match self.sessions.open(kind, what, op).await {
+            Ok(OpenReport { id, report }) => text_result(format!(
+                "{report}
+
+session_id: {id}
+Pass this as `session_id` on later calls to route                  them to this session and to fail loudly rather than act on a different target."
             )),
-            // A timeout abandons the *wait*, not the job: this open may still be running and
-            // may still commit. The handle was minted before the job was queued, so it can be
-            // named now — which is what makes recovery via `session_status` sound. Without it
-            // the caller would only learn "some session exists" and could adopt a handle
-            // belonging to somebody else's open that landed in the meantime.
-            Err(EngineError::Timeout(msg)) => tool_error(format!(
-                "{msg}\n\nThe wait was abandoned, but this open was not: it may still be \
-                 queued behind other work, and may still run and commit the handle `{id}`. \
-                 Ask `session_status {{ \"session_id\": \"{id}\" }}` — it reports whether this \
-                 open is still pending, has landed, or has failed. Do not re-run the open \
-                 while it is pending, which would attach to, or start, a second target; once \
-                 it reports failed, re-running is the only way forward."
+            // No worker, so no session — and no argument the model can change fixes that.
+            Err(OpenError::Unavailable(m)) => Err(ErrorData::internal_error(m, None)),
+            Err(OpenError::NoRoom(m)) => tool_error(m),
+            Err(OpenError::Clean(m)) => tool_error(m),
+            Err(OpenError::PostCommit {
+                id,
+                message,
+                report_only,
+            }) => tool_error(if report_only {
+                format!(
+                    "{message}
+
+session_id: {id}
+The target opened; only this follow-up report                      failed, so the handle above is valid and usable."
+                )
+            } else {
+                post_commit_failure(&message, &id)
+            }),
+            // A timeout abandons the *wait*, not the job: this open may still be running and may
+            // still land. The handle exists from the moment the session is registered, so it can
+            // be named now — which is what makes recovery via `session_status` sound.
+            Err(OpenError::Timeout { id, message }) => tool_error(format!(
+                "{message}
+
+The wait was abandoned, but this open was not: it is still running                  in session `{id}`, and may still land. Ask `session_status                  {{ \"session_id\": \"{id}\" }}` — it reports whether the open is still going, how                  long it has been going, and whether that is longer than a healthy one takes. Do                  not re-run the open while it is still going, which would attach to, or start, a                  second target; `end_session {{ \"session_id\": \"{id}\" }}` ends it outright,                  terminating the worker process if it will not unwind."
             )),
-            Err(e) => {
-                // The job never reached the engine (the worker is gone), so nothing on that
-                // side will ever record an outcome for it.
-                if matches!(e, EngineError::Unavailable(_)) {
-                    record_open(&self.opens, &id, OpenOutcome::Failed(e.to_string()));
-                }
-                engine_result(Err(e))
-            }
         }
     }
 }
@@ -1711,16 +1590,13 @@ impl WindbgServer {
 
 #[rmcp::tool_router]
 impl WindbgServer {
-    pub fn new(engine: EngineHandle) -> Self {
-        Self {
-            engine,
-            session: Arc::new(Mutex::new(None)),
-            opens: Arc::new(Mutex::new(VecDeque::new())),
-        }
+    pub fn new(sessions: Sessions) -> Self {
+        Self { sessions }
     }
 
     /// Open a crash dump (.dmp) or a Time Travel Debugging trace (.run) and wait for it to load.
-    /// Replaces any session already open, and returns a `session_id` for later calls.
+    /// Opens a new session in its own engine process — sessions already open are left alone —
+    /// and returns a `session_id` that routes later calls to it. End it with `end_session`.
     #[rmcp::tool(annotations(
         title = "Open crash dump or TTD trace",
         read_only_hint = false,
@@ -1732,30 +1608,17 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<PathArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.opened_result(
-            // `open_dump` is the call that replaces the target, so commit right after it:
-            // a load wait that times out still leaves DbgEng holding the dump.
-            move |e, commit| {
-                e.open_dump(&args.path).map_err(es)?;
-                commit();
-                e.wait_for_event(LOAD_WAIT_MS).map_err(es)
-            },
-            |e| {
-                // Load the WinDbg extension DLL so `!`-extension commands resolve — most
-                // importantly `!ext.analyze -v`, the crash-dump triage workhorse. A bare
-                // engine doesn't auto-load it, and even after `.load ext` the unqualified
-                // `!analyze` won't resolve, so callers must use `!ext.analyze`. Best-effort:
-                // a minimal engine without a bundled `winext\` directory simply won't have
-                // ext.dll, which must not fail the open (live/dump state is still usable).
-                let _ = e.execute_command(".load ext");
-                e.execute_command("lm").map_err(es)
-            },
+        self.opened(
+            SessionKind::Dump,
+            args.path.clone(),
+            EngineOp::OpenDump { path: args.path },
         )
         .await
     }
 
     /// Open a TTD trace (.run); alias of open_dump. Enables time-travel navigation and TTD queries.
-    /// Replaces any session already open, and returns a `session_id` for later calls.
+    /// Opens a new session in its own engine process — sessions already open are left alone —
+    /// and returns a `session_id` that routes later calls to it. End it with `end_session`.
     #[rmcp::tool(annotations(
         title = "Open TTD trace",
         read_only_hint = false,
@@ -1767,51 +1630,17 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<PathArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.opened_result(
-            // As in `open_dump`: commit before the load wait, because a wait that times out
-            // still leaves DbgEng holding the trace.
-            move |e, commit| {
-                e.open_trace(&args.path).map_err(es)?;
-                commit();
-                e.wait_for_event(LOAD_WAIT_MS).map_err(es)
-            },
-            |e| {
-                // Check the index state *before* any data-model query: `!ttdext.index -status`
-                // only reads the on-disk .idx (never builds), whereas a `dx` on an unindexed
-                // trace can itself trigger the long in-memory index build. TtdExt reports a
-                // healthy, ready index as exactly "Index file loaded."; per MS guidance treat
-                // anything else (missing, out of date, corrupt, unloadable) as needing an index.
-                // A blank result means the status query itself failed — don't warn then.
-                let needs_index = {
-                    let status = e
-                        .execute_command("!ttdext.index -status")
-                        .unwrap_or_default();
-                    !status.trim().is_empty()
-                        && !status.to_ascii_lowercase().contains("index file loaded")
-                };
-                // Confirm TTD replay is active and report the trace's position span. Lifetime
-                // is cheap metadata (min/max position); the expensive indexing is triggered by
-                // Calls/Memory/Events queries, which is what the note below warns about.
-                let mut out = e
-                    .execute_command("dx @$curprocess.TTD.Lifetime")
-                    .map_err(es)?;
-                if needs_index {
-                    out.push_str(
-                        "\nNote: this trace's index is not loaded (missing, out of date, or \
-                         unusable). The first data-model query (ttd_calls/ttd_memory/ttd_events/dx) \
-                         then builds an in-memory index and can run long — let it finish before \
-                         issuing more queries. Run index_trace to (re)build a persistent .idx \
-                         (fast queries and re-opens).",
-                    );
-                }
-                Ok(out)
-            },
+        self.opened(
+            SessionKind::Trace,
+            args.path.clone(),
+            EngineOp::OpenTrace { path: args.path },
         )
         .await
     }
 
     /// Attach to the local kernel (live local kernel debugging).
-    /// Replaces any session already open, and returns a `session_id` for later calls.
+    /// Opens a new session in its own engine process — sessions already open are left alone —
+    /// and returns a `session_id` that routes later calls to it. End it with `end_session`.
     #[rmcp::tool(annotations(
         title = "Attach to local kernel",
         read_only_hint = false,
@@ -1820,29 +1649,24 @@ impl WindbgServer {
         open_world_hint = true
     ))]
     async fn attach_kernel_local(&self) -> Result<CallToolResult, ErrorData> {
-        self.opened_result(
-            |e, commit| {
-                // The engine has claimed the local kernel once `_begin` returns; the
-                // break-in wait (INITIAL_BREAK + the INFINITE wait a live kernel requires)
-                // happens in `wait`, after the handle is ours.
-                let pending = e.attach_local_kernel_begin().map_err(es)?;
-                commit();
-                pending.wait().map_err(es)
-            },
-            |e| {
-                // The driver_object/device_object/irp_stack tools use kernel-extension
-                // commands (!drvobj/!devobj/!irp) from kdexts.dll, which a bare engine does
-                // not auto-load. Best-effort, like open_dump's `.load ext`; harmless if the
-                // extension isn't bundled (those tools then report a clean "no export").
-                let _ = e.execute_command(".load kdexts");
-                e.execute_command("vertarget").map_err(es)
-            },
+        self.opened(
+            SessionKind::KernelLocal,
+            "local kernel".to_string(),
+            EngineOp::AttachKernelLocal,
         )
         .await
     }
 
     /// Attach to a kernel target over a connection string (e.g. KDNET).
-    /// Replaces any session already open, and returns a `session_id` for later calls.
+    /// Opens a new session in its own engine process — sessions already open are left alone —
+    /// and returns a `session_id` that routes later calls to it.
+    /// A live kernel attach waits for the target to dial in, and that wait has no timeout and
+    /// cannot be interrupted: if the guest is powered off, not booted with `/debug on`, or
+    /// pointed at the wrong host/port/key, this call reports a timeout and the attach keeps
+    /// waiting forever. That costs only this session — other sessions and the server are
+    /// unaffected — and `session_status` says how long it has been waiting. Recover with
+    /// `end_session`, which terminates the session's engine process; do NOT re-attach while it
+    /// is still waiting.
     #[rmcp::tool(annotations(
         title = "Attach to kernel target",
         read_only_hint = false,
@@ -1854,21 +1678,11 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<ConnectionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.opened_result(
-            move |e, commit| {
-                // `_begin` takes the connection; the KD link is dialed and the break-in
-                // awaited in `wait`. Committing between them is what stops a failed wait
-                // from looking like "nothing happened" — re-dialing a live link is not a
-                // clean retry.
-                let pending = e.attach_kernel_begin(&args.connection).map_err(es)?;
-                commit();
-                pending.wait().map_err(es)
-            },
-            |e| {
-                // Load kdexts.dll so the driver_object/device_object/irp_stack tools'
-                // !drvobj/!devobj/!irp commands resolve (see attach_kernel_local). Best-effort.
-                let _ = e.execute_command(".load kdexts");
-                e.execute_command("vertarget").map_err(es)
+        self.opened(
+            SessionKind::Kernel,
+            args.connection.clone(),
+            EngineOp::AttachKernel {
+                connection: args.connection,
             },
         )
         .await
@@ -1891,29 +1705,22 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SymbolPathArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let gate = self.session_gate(args.session_id.as_deref());
-        let append = args.append.unwrap_or(true);
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                if append {
-                    e.append_symbol_path(&args.path).map_err(es)?;
-                } else {
-                    e.set_symbol_path(&args.path).map_err(es)?;
-                }
-                // Reload so the new path takes effect (default: all deferred modules).
-                e.reload_symbols(args.reload.as_deref().unwrap_or(""))
-                    .map_err(es)?;
-                // Echo the effective path so the caller can confirm what resolved.
-                e.execute_command(".sympath").map_err(es)
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::SymbolPath {
+                    path: args.path,
+                    append: args.append.unwrap_or(true),
+                    reload: args.reload.unwrap_or_default(),
+                },
+            )
             .await;
         engine_result(out)
     }
 
     /// Attach to an existing user-mode process by PID and break in.
-    /// Replaces any session already open, and returns a `session_id` for later calls.
+    /// Opens a new session in its own engine process — sessions already open are left alone —
+    /// and returns a `session_id` that routes later calls to it. End it with `end_session`.
     #[rmcp::tool(annotations(
         title = "Attach to process",
         read_only_hint = false,
@@ -1925,23 +1732,17 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<PidArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let pid = args.pid;
-        self.opened_result(
-            move |e, commit| {
-                // Attached once `_begin` returns; the break-in wait follows the commit, so
-                // a wait that fails cannot read as "never attached" and get retried into a
-                // second attach on the same PID.
-                let pending = e.attach_process_begin(pid).map_err(es)?;
-                commit();
-                pending.wait().map_err(es)
-            },
-            |e| e.execute_command("r").map_err(es),
+        self.opened(
+            SessionKind::Process,
+            format!("pid {}", args.pid),
+            EngineOp::AttachProcess { pid: args.pid },
         )
         .await
     }
 
     /// Launch a new user-mode process under the debugger, stopping at the initial breakpoint.
-    /// Replaces any session already open, and returns a `session_id` for later calls.
+    /// Opens a new session in its own engine process — sessions already open are left alone —
+    /// and returns a `session_id` that routes later calls to it. End it with `end_session`.
     #[rmcp::tool(annotations(
         title = "Launch process under debugger",
         read_only_hint = false,
@@ -1953,45 +1754,33 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<CommandLineArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.opened_result(
-            move |e, commit| {
-                // The commit point is *before* the process actually starts: CreateProcessWide
-                // is deferred into the wait. That is still the right moment — once `_begin`
-                // returns Ok the spawn is committed, so a retry from here means two processes.
-                //
-                // It is also not too early, which is the natural worry: only the *spawn* is
-                // deferred, not validation. CreateProcessWide resolves and checks the image
-                // synchronously, so the ways a launch fails with nothing created all land on
-                // this `?`, before the commit — verified against a live engine for a missing
-                // path (0x80070002), a directory (0x80070005), a non-PE file (0x800700C1) and
-                // an empty command line (0x80070057). A failure from `wait` below therefore
-                // means the process really was created, which is what makes the post-commit
-                // message ("a session exists, do not open again") true rather than a guess.
-                let pending = e.launch_process_begin(&args.command_line).map_err(es)?;
-                commit();
-                pending.wait().map_err(es)
+        self.opened(
+            SessionKind::Launch,
+            args.command_line.clone(),
+            EngineOp::Launch {
+                command_line: args.command_line,
             },
-            |e| e.execute_command("r").map_err(es),
         )
         .await
     }
 
-    /// Report the handle of the debug session this server currently holds, and — when asked
-    /// about a specific `session_id` — what became of the open that would have committed it.
+    /// List the debug sessions this server holds — what each one is, how long it has been in
+    /// its current state, and which one a call that names no session is routed to. Pass a
+    /// `session_id` to ask about one in particular.
     ///
-    /// This exists because a per-call timeout abandons the *waiter*, not the job. A live
-    /// `attach_kernel` waits indefinitely by design, so an open reporting a timeout while it
-    /// completes moments later is normal, not exceptional; the handle it commits is one no
-    /// reply ever carried. Pass the `session_id` the timeout named and this reports whether
-    /// that open is still pending, has landed, or has failed — which is the difference
-    /// between "wait" and "open again", and re-running an attach or launch on a guess
-    /// connects or spawns a second time.
+    /// This is how you find out what happened to an open that reported a timeout. A per-call
+    /// timeout abandons the *waiter*, not the job, so an open can still be running with no reply
+    /// on its way — a live `attach_kernel` waits for its target indefinitely by design, and that
+    /// wait cannot be interrupted. The state here separates the two cases that look identical
+    /// from the outside: an open that is progressing normally, and one that has been waiting far
+    /// longer than a healthy one ever takes and is not going to finish. They need opposite
+    /// responses — wait, versus `end_session` to reclaim it — and re-running an attach or a
+    /// launch on a guess connects or spawns a second time.
     ///
-    /// Called with no argument it reports only the current handle, which answers "what is
-    /// loaded" but deliberately not "is it mine": another caller's open landing while yours
-    /// was in flight produces exactly the same answer.
+    /// Answers even while a session is parked: it reads this server's own bookkeeping and never
+    /// queues on any session's engine.
     #[rmcp::tool(annotations(
-        title = "Show current session handle",
+        title = "List debug sessions",
         read_only_hint = true,
         open_world_hint = false
     ))]
@@ -1999,81 +1788,50 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        // Deliberately *not* queued on the engine thread. The case this exists for is a
-        // parked attach holding that thread, so queueing behind it would make the tool
-        // unavailable exactly when it is needed. The cost is that it can read a moment
-        // behind an open that is still in flight, which is fine for a status query.
-        let current = lock(&self.session).clone();
-        let mut out = match &current {
-            Some(id) => format!("Current session: {id}"),
-            None => "No debug session is open.".to_string(),
-        };
+        // Deliberately never routed to a worker. The case this exists for is a session parked in
+        // an attach, so asking that worker anything would make the tool unavailable exactly when
+        // it is needed.
+        let sessions = self.sessions.snapshot();
 
         let Some(asked) = args.session_id.as_deref() else {
-            out.push_str(match current {
-                Some(_) => {
-                    "\nPass a `session_id` here to ask what became of a specific open — this \
-                     line says what is loaded, not whether it is yours."
-                }
-                None => {
-                    "\nStart one with open_dump / open_trace / attach_process / attach_kernel \
-                     / attach_kernel_local / launch."
-                }
-            });
+            if sessions.iter().all(|s| !s.state.is_live()) {
+                return text_result(
+                    "No debug session is open. Start one with open_dump / open_trace / \
+                     attach_process / attach_kernel / attach_kernel_local / launch."
+                        .to_string(),
+                );
+            }
+            let mut out = String::new();
+            for s in sessions.iter().filter(|s| s.state.is_live()) {
+                out.push_str(&describe_session(s));
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "\nEach session is its own engine process, so they do not interfere: work on one \
+                 while another is busy or parked. Up to {MAX_SESSIONS} at a time. Pass \
+                 `session_id` on a call to route it to a specific session; omit it and the \
+                 session marked (current) is used.",
+            ));
             return text_result(out);
         };
 
-        // The live session is authoritative and answered first, before the bounded history
-        // is consulted at all. The ledger can evict a settled entry while its handle is
-        // still the loaded one — a burst of pending opens pushes the oldest settled entry
-        // out — and falling through to the history would then contradict the line above:
-        // "Current session: A" followed by "A is not held, opening again is safe", which
-        // during timeout recovery is advice that duplicates an attach or a launch.
-        if current.as_deref() == Some(asked) {
-            out.push_str(&format!(
-                "\n\n`{asked}` is the session now loaded. It is yours: pass it as \
-                 `session_id` on later calls."
+        let Some(session) = sessions.iter().find(|s| s.id == asked) else {
+            return text_result(format!(
+                "`{asked}` is not a handle this server is holding. Either it was never issued \
+                 here, or it closed a while ago and has aged out of the session history. A \
+                 session that still exists is never forgotten, so opening again is safe."
             ));
-            return text_result(out);
-        }
-
-        let known = self
-            .opens
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .find(|(id, _)| id == asked)
-            .map(|(_, outcome)| outcome.clone());
-
-        out.push_str(&match known {
-            Some(OpenOutcome::Landed) => format!(
-                "\n\n`{asked}` landed, but has since been replaced by a later open. That \
-                 target is gone; calls carrying this handle will be refused. Open again."
-            ),
-            Some(OpenOutcome::Pending) => format!(
-                "\n\n`{asked}` is still pending — queued or running. Do not re-run the open, \
-                 which would attach to, or start, a second target. Ask again shortly."
-            ),
-            Some(OpenOutcome::Failed(why)) => format!(
-                "\n\n`{asked}` failed and will never be committed:\n  {why}\n\nOpening again is \
-                 how you get a target — but read the reason first, since some failures leave \
-                 one behind."
-            ),
-            // Pending opens are never evicted, so an id this server has forgotten is
-            // necessarily one that finished and aged out — never one still in flight.
-            None => format!(
-                "\n\n`{asked}` is not a handle this server is holding. Either it was never \
-                 issued here, or it settled a while ago and has aged out of the recent-open \
-                 history. It is not still in flight — those are never forgotten — so opening \
-                 again is safe."
-            ),
-        });
-        text_result(out)
+        };
+        text_result(describe_session(session))
     }
 
-    /// End the current debug session (detach/close the target) without exiting the server.
-    /// Pass `session_id` to be sure you are ending your own session and not one another
-    /// caller opened in the meantime.
+    /// End a debug session: release its target and shut down its engine process. Pass
+    /// `session_id` to be sure you are ending your own session and not another one.
+    ///
+    /// This is also the recovery for a session that is stuck. If the session does not let go
+    /// within a short grace period — a live-kernel attach whose target never dialed in cannot,
+    /// since nothing can interrupt that wait — its engine process is terminated outright. The
+    /// session ends either way, and no other session is affected.
     #[rmcp::tool(annotations(
         title = "End debug session",
         read_only_hint = false,
@@ -2085,23 +1843,12 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let gate = self.session_gate(args.session_id.as_deref());
-        let session = Arc::clone(&self.session);
-        let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                let out = e
-                    .end_session()
-                    .map(|_| "session ended".to_string())
-                    .map_err(es)?;
-                // Cleared in the same job as the teardown, so a call queued behind this one
-                // sees "no session open" rather than a handle that outlived its target.
-                *lock(&session) = None;
-                Ok(out)
-            })
-            .await;
-        engine_result(out)
+        let session_id = args.session_id.as_deref();
+        let session = match self.sessions.resolve(session_id) {
+            Ok(session) => session,
+            Err(e) => return engine_result(Err(e)),
+        };
+        engine_result(self.sessions.end(&session, session_id.is_some()).await)
     }
 
     /// Run a raw debugger command and return its full output. The universal escape hatch.
@@ -2118,25 +1865,19 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<ExecuteArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let gate = self.session_gate(args.session_id.as_deref());
-        let session = Arc::clone(&self.session);
-        let retires_session = changes_debug_target(&args.command);
-        // Both steps run on the engine thread, immediately before the command, for the same
-        // ordering reason the gate does.
-        let precheck = move || {
-            gate()?;
-            if retires_session {
-                // Dropped *before* the command runs, not after: a `.detach` that reports an
-                // error may still have detached, and a handle that outlives its target is
-                // the failure mode this whole mechanism exists to prevent.
-                *lock(&session) = None;
-            }
-            Ok(())
-        };
-        // Bounded: a runaway raw command (e.g. an unbounded `s` search) self-aborts instead
-        // of pinning the engine thread and wedging every later call.
-        let out = self.engine.run_command(args.command, precheck).await;
-        engine_result(out)
+        // Bounded: a runaway raw command (e.g. an unbounded `s` search) self-aborts instead of
+        // pinning its session's engine and wedging every later call to it.
+        let mut call = Call::new(EngineOp::BoundedCommand {
+            command: args.command.clone(),
+            patience_ms: 0,
+        });
+        if changes_debug_target(&args.command) {
+            // Retired *before* the command runs, not after: a `.detach` that reports an error
+            // may still have detached, and a handle that outlives its target is the failure
+            // mode this whole mechanism exists to prevent.
+            call = call.retiring("a raw `execute` command replaced or released the target");
+        }
+        engine_result(self.run_call(args.session_id.as_deref(), call).await)
     }
 
     /// Show the current register set.
@@ -2149,13 +1890,8 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                e.registers().map_err(es)
-            })
+            .run(args.session_id.as_deref(), EngineOp::Registers)
             .await;
         // DbgEng prints nothing for `r` when there is no live thread context (e.g. a
         // module-load break, or a bare goto_position to the very start of a trace).
@@ -2182,16 +1918,14 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<ReadMemoryArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let gate = self.session_gate(args.session_id.as_deref());
-        let size = args.size;
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                let addr = parse_u64(&args.address)?;
-                let bytes = e.read_memory(addr, size as usize).map_err(es)?;
-                Ok(hexdump(addr, &bytes))
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::ReadMemory {
+                    address: args.address,
+                    size: args.size,
+                },
+            )
             .await;
         engine_result(out)
     }
@@ -2206,13 +1940,13 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                e.execute_command("k").map_err(es)
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::Command {
+                    command: "k".to_string(),
+                },
+            )
             .await;
         engine_result(out)
     }
@@ -2227,13 +1961,13 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                e.execute_command("lm").map_err(es)
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::Command {
+                    command: "lm".to_string(),
+                },
+            )
             .await;
         engine_result(out)
     }
@@ -2248,13 +1982,13 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                e.execute_command("~").map_err(es)
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::Command {
+                    command: "~".to_string(),
+                },
+            )
             .await;
         engine_result(out)
     }
@@ -2274,17 +2008,15 @@ impl WindbgServer {
         {
             return tool_error(e);
         }
-        let gate = self.session_gate(args.session_id.as_deref());
         let cmd = match args.address {
             Some(a) => format!("u {a}"),
             None => "u".to_string(),
         };
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                e.execute_command(&cmd).map_err(es)
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::Command { command: cmd },
+            )
             .await;
         engine_result(out)
     }
@@ -2306,24 +2038,19 @@ impl WindbgServer {
         if let Err(e) = reject_command_breakers("expression", &args.expression, Quotes::Allowed) {
             return tool_error(e);
         }
-        let gate = self.session_gate(args.session_id.as_deref());
-        let session = Arc::clone(&self.session);
-        let retires_session = dx_executes_commands(&args.expression);
-        let precheck = move || {
-            gate()?;
-            if retires_session {
-                // We cannot see *which* command the data model is about to run, so the
-                // conservative reading is the only sound one: assume it replaced the target.
-                // Dropped before the expression evaluates, for the reason `execute` does.
-                *lock(&session) = None;
-            }
-            Ok(())
-        };
-        let cmd = format!("dx {}", args.expression);
         // Bounded: a data-model query that runs away (e.g. a heavy LINQ or index build on a
-        // huge trace) self-aborts rather than pinning the engine thread.
-        let out = self.engine.run_command(cmd, precheck).await;
-        engine_result(out)
+        // huge trace) self-aborts rather than pinning its session's engine.
+        let mut call = Call::new(EngineOp::BoundedCommand {
+            command: format!("dx {}", args.expression),
+            patience_ms: 0,
+        });
+        if dx_executes_commands(&args.expression) {
+            // We cannot see *which* command the data model is about to run, so the conservative
+            // reading is the only sound one: assume it replaced the target. Retired before the
+            // expression evaluates, for the reason `execute` does.
+            call = call.retiring("a `dx` expression reached debugger command execution");
+        }
+        engine_result(self.run_call(args.session_id.as_deref(), call).await)
     }
 
     /// TTD: find every call to a function across the whole trace
@@ -2342,9 +2069,15 @@ impl WindbgServer {
         if let Err(e) = reject_command_breakers("function", &args.function, Quotes::Rejected) {
             return tool_error(e);
         }
-        let gate = self.session_gate(args.session_id.as_deref());
-        let cmd = format!("dx @$cursession.TTD.Calls(\"{}\")", args.function);
-        let out = self.engine.run_command(cmd, gate).await;
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::BoundedCommand {
+                    command: format!("dx @$cursession.TTD.Calls(\"{}\")", args.function),
+                    patience_ms: 0,
+                },
+            )
+            .await;
         engine_result(out)
     }
 
@@ -2360,7 +2093,6 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<TtdMemoryArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let gate = self.session_gate(args.session_id.as_deref());
         if let Some(mode) = &args.mode
             && let Err(e) = reject_command_breakers("mode", mode, Quotes::Rejected)
         {
@@ -2380,7 +2112,15 @@ impl WindbgServer {
             ),
             _ => format!("dx @$cursession.TTD.Memory(0x{start:x}, 0x{end:x})"),
         };
-        let out = self.engine.run_command(cmd, gate).await;
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::BoundedCommand {
+                    command: cmd,
+                    patience_ms: 0,
+                },
+            )
+            .await;
         engine_result(out)
     }
 
@@ -2396,10 +2136,14 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
-            .engine
-            .run_command("dx -r2 @$curprocess.TTD.Events".to_string(), gate)
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::BoundedCommand {
+                    command: "dx -r2 @$curprocess.TTD.Events".to_string(),
+                    patience_ms: 0,
+                },
+            )
             .await;
         engine_result(out)
     }
@@ -2419,14 +2163,12 @@ impl WindbgServer {
         if let Err(e) = reject_command_breakers("expression", &args.expression, Quotes::Rejected) {
             return tool_error(e);
         }
-        let gate = self.session_gate(args.session_id.as_deref());
         let cmd = format!("bp {}", args.expression);
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                e.execute_command(&cmd).map_err(es)
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::Command { command: cmd },
+            )
             .await;
         engine_result(out)
     }
@@ -2443,13 +2185,14 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                e.execute_and_wait("g", EXEC_WAIT_MS).map_err(es)
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::CommandAndWait {
+                    command: "g".to_string(),
+                    timeout_ms: EXEC_WAIT_MS,
+                },
+            )
             .await;
         engine_result(out)
     }
@@ -2474,47 +2217,14 @@ impl WindbgServer {
         if let Err(e) = reject_command_breakers("address", &args.address, Quotes::Rejected) {
             return tool_error(e);
         }
-        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                // Resolve the target the same WinDbg-aware way as `reachable_from_dispatch`.
-                let resolve = |expr: &str| -> Option<u64> {
-                    e.execute_command(&format!("? {expr}"))
-                        .ok()
-                        .as_deref()
-                        .and_then(parse_eval)
-                        .or_else(|| parse_windbg_addr(expr))
-                        .or_else(|| parse_u64(expr).ok())
-                };
-                let target = resolve(&args.address)
-                    .ok_or_else(|| format!("could not resolve address `{}`", args.address))?;
-                let wait = args.timeout_ms.unwrap_or(EXEC_WAIT_MS);
-
-                let res = e.run_to_address(target, wait).map_err(es)?;
-                let mut msg = match res.outcome {
-                    RunToOutcome::Hit => {
-                        format!("VERDICT: HIT — execution reached {}\n", fmt_addr(target))
-                    }
-                    RunToOutcome::StoppedElsewhere { stopped_at } => format!(
-                        "VERDICT: STOPPED ELSEWHERE — stopped at {} before reaching {}\n  \
-                         (another breakpoint or exception fired first)\n",
-                        fmt_addr(stopped_at),
-                        fmt_addr(target)
-                    ),
-                    RunToOutcome::Timeout => format!(
-                        "VERDICT: TIMEOUT — did not reach {} within {wait} ms\n  \
-                         (the current input/state likely does not drive execution to this block)\n",
-                        fmt_addr(target)
-                    ),
-                };
-                if !res.output.trim().is_empty() {
-                    msg.push_str("---- debugger output ----\n");
-                    msg.push_str(&res.output);
-                }
-                Ok(msg)
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::RunToAddress {
+                    address: args.address,
+                    timeout_ms: args.timeout_ms.unwrap_or(EXEC_WAIT_MS),
+                },
+            )
             .await;
         engine_result(out)
     }
@@ -2531,13 +2241,14 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                e.execute_and_wait("p", EXEC_WAIT_MS).map_err(es)
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::CommandAndWait {
+                    command: "p".to_string(),
+                    timeout_ms: EXEC_WAIT_MS,
+                },
+            )
             .await;
         engine_result(out)
     }
@@ -2554,13 +2265,14 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                e.execute_and_wait("t", EXEC_WAIT_MS).map_err(es)
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::CommandAndWait {
+                    command: "t".to_string(),
+                    timeout_ms: EXEC_WAIT_MS,
+                },
+            )
             .await;
         engine_result(out)
     }
@@ -2579,13 +2291,14 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                e.execute_and_wait("t-", EXEC_WAIT_MS).map_err(es)
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::CommandAndWait {
+                    command: "t-".to_string(),
+                    timeout_ms: EXEC_WAIT_MS,
+                },
+            )
             .await;
         engine_result(out)
     }
@@ -2602,13 +2315,14 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                e.execute_and_wait("p-", EXEC_WAIT_MS).map_err(es)
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::CommandAndWait {
+                    command: "p-".to_string(),
+                    timeout_ms: EXEC_WAIT_MS,
+                },
+            )
             .await;
         engine_result(out)
     }
@@ -2625,13 +2339,14 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                e.execute_and_wait("g-", EXEC_WAIT_MS).map_err(es)
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::CommandAndWait {
+                    command: "g-".to_string(),
+                    timeout_ms: EXEC_WAIT_MS,
+                },
+            )
             .await;
         engine_result(out)
     }
@@ -2651,14 +2366,12 @@ impl WindbgServer {
         if let Err(e) = reject_command_breakers("position", &args.position, Quotes::Rejected) {
             return tool_error(e);
         }
-        let gate = self.session_gate(args.session_id.as_deref());
         let cmd = format!("!tt {}", args.position);
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                e.execute_command(&cmd).map_err(es)
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::Command { command: cmd },
+            )
             .await;
         engine_result(out)
     }
@@ -2687,18 +2400,18 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let gate = self.session_gate(args.session_id.as_deref());
         // Deliberately *not* on the bounded path, and the one O(trace) command that isn't —
         // see DECISIONS.md (2026-08-02). Indexing a large trace can legitimately outrun the
         // per-call timeout, but `-force` deletes an unloadable `.idx` before rebuilding it, so
         // a watchdog abort mid-rebuild can leave no usable index at all. Here the long run is
         // productive work rather than a runaway, and the engine frees itself when it finishes.
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                e.execute_command("!ttdext.index -force").map_err(es)
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::Command {
+                    command: "!ttdext.index -force".to_string(),
+                },
+            )
             .await;
         engine_result(out)
     }
@@ -2788,14 +2501,12 @@ impl WindbgServer {
         if let Err(e) = reject_command_breakers("name", &args.name, Quotes::Rejected) {
             return tool_error(e);
         }
-        let gate = self.session_gate(args.session_id.as_deref());
         let cmd = format!("!drvobj {} 7", args.name);
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                e.execute_command(&cmd).map_err(es)
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::Command { command: cmd },
+            )
             .await;
         engine_result(out)
     }
@@ -2816,14 +2527,12 @@ impl WindbgServer {
         if let Err(e) = reject_command_breakers("device", &args.device, Quotes::Rejected) {
             return tool_error(e);
         }
-        let gate = self.session_gate(args.session_id.as_deref());
         let cmd = format!("!devobj {}", args.device);
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                e.execute_command(&cmd).map_err(es)
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::Command { command: cmd },
+            )
             .await;
         engine_result(out)
     }
@@ -2845,15 +2554,13 @@ impl WindbgServer {
         {
             return tool_error(e);
         }
-        let gate = self.session_gate(args.session_id.as_deref());
         let irp = args.irp.unwrap_or_else(|| "@rdx".to_string());
         let cmd = format!("!irp {irp} 1");
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                e.execute_command(&cmd).map_err(es)
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::Command { command: cmd },
+            )
             .await;
         engine_result(out)
     }
@@ -2877,7 +2584,6 @@ impl WindbgServer {
         if let Err(e) = reject_command_breakers("dispatch", &args.dispatch, Quotes::Rejected) {
             return tool_error(e);
         }
-        let gate = self.session_gate(args.session_id.as_deref());
         // IRP in @rdx at dispatch entry (x64). CurrentStackLocation = poi(Irp+0xb8).
         // Within IO_STACK_LOCATION: OutputBufferLength +0x08, InputBufferLength +0x10,
         // IoControlCode +0x18 (Parameters union begins at +0x08).
@@ -2887,11 +2593,10 @@ impl WindbgServer {
             args.dispatch
         );
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                e.execute_command(&cmd).map_err(es)
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::Command { command: cmd },
+            )
             .await;
         engine_result(out)
     }
@@ -2924,94 +2629,19 @@ impl WindbgServer {
                 return tool_error(e);
             }
         }
-        let gate = self.session_gate(args.session_id.as_deref());
         let out = self
-            .engine
-            .run(move |e| {
-                gate()?;
-                // Resolve an address/offset expression the way `uf`/WinDbg read it:
-                // evaluate `? <expr>` first (the MASM evaluator's default base is hex, so
-                // a bare `00401234` is 0x00401234 and `module!Dispatch+0x123` resolves),
-                // then fall back to pure parsing (backtick / bare-hex, then `0x`/decimal).
-                // Applied to both the target VA and the `from` seed so a value pasted from
-                // WinDbg — a `hi`lo` backtick address or a digit-only 32-bit address — is
-                // read consistently on both sides.
-                let resolve = |expr: &str| -> Option<u64> {
-                    e.execute_command(&format!("? {expr}"))
-                        .ok()
-                        .as_deref()
-                        .and_then(parse_eval)
-                        .or_else(|| parse_windbg_addr(expr))
-                        .or_else(|| parse_u64(expr).ok())
-                };
-
-                // Resolve the target VA: an absolute address, or module+RVA rebased
-                // against the module's live base from `lm m <module>`.
-                let target = match (&args.address, &args.module, &args.rva) {
-                    // Reject conflicting target forms rather than silently ignoring one —
-                    // analysing the wrong target would give a misleading verdict.
-                    (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
-                        return Err("provide `address` OR `module`+`rva`, not both".to_string());
-                    }
-                    (Some(a), None, None) => resolve(a)
-                        .ok_or_else(|| format!("could not resolve target address `{a}`"))?,
-                    (None, Some(m), Some(r)) => {
-                        let rva =
-                            resolve(r).ok_or_else(|| format!("could not resolve rva `{r}`"))?;
-                        let lm = e.execute_command(&format!("lm m {m}")).map_err(es)?;
-                        let base = parse_lm_base(&lm).ok_or_else(|| {
-                            format!("module `{m}` not found (`lm m {m}` returned):\n{lm}")
-                        })?;
-                        base.checked_add(rva)
-                            .ok_or_else(|| "module base + rva overflowed u64".to_string())?
-                    }
-                    _ => {
-                        return Err("provide `address`, or both `module` and `rva`".to_string());
-                    }
-                };
-
-                let max_functions = args.max_functions.unwrap_or(256);
-                let max_depth = args.max_depth.unwrap_or(32);
-
-                // Resolve `from` to a numeric VA so a mid-function start (a handler scoped
-                // past a switch) is honored; `None` (unresolvable) starts at the entry.
-                let seed_start = resolve(&args.from);
-
-                // A real `uf` lists backtick addresses or at least a "module!Func:" label;
-                // error text ("Couldn't resolve...", "no code") lacks both and prunes the
-                // branch. parse_uf then discards any non-disassembly. Held in a `&mut`
-                // binding so the same disassembler drives both the walk and the recipe.
-                let mut uf = |arg: &str| match e.execute_command(&format!("uf {arg}")) {
-                    Ok(t) if t.contains('`') || t.contains(':') => Some(t),
-                    _ => None,
-                };
-
-                let rpt = reachability(
-                    &args.from,
-                    seed_start,
-                    target,
-                    max_functions,
-                    max_depth,
-                    &mut uf,
-                );
-
-                if rpt.from_entry.is_none() {
-                    return Err(format!(
-                        "could not disassemble `from` ({}): `uf` returned no function. \
-                         Check the symbol/address and that the module is loaded.",
-                        args.from
-                    ));
-                }
-
-                // On a REACHABLE verdict, re-walk the path functions to emit the directional
-                // recipe (which branch each on-path `jcc` must take, and what it tests).
-                let mut out = format_report(&rpt);
-                if rpt.verdict_reachable && args.recipe.unwrap_or(true) {
-                    let recipes = path_recipe(&args.from, seed_start, &rpt, &mut uf);
-                    out.push_str(&format_recipe(&recipes));
-                }
-                Ok(out)
-            })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::Reachability(ReachabilityOp {
+                    from: args.from,
+                    address: args.address,
+                    module: args.module,
+                    rva: args.rva,
+                    max_functions: args.max_functions.unwrap_or(256),
+                    max_depth: args.max_depth.unwrap_or(32),
+                    recipe: args.recipe.unwrap_or(true),
+                }),
+            )
             .await;
         engine_result(out)
     }
@@ -3028,6 +2658,12 @@ impl WindbgServer {
     name = "windbg-mcp",
     instructions = "Drive WinDbg/DbgEng for live user-mode, kernel, crash-dump, and Time Travel Debugging (TTD) analysis. \
 Open a dump or .run trace, attach to a process or the kernel, inspect registers/memory/stacks/modules, and set breakpoints. \
+Each open target is a separate session in its own engine process, so several can be open at once (up to 4) without \
+disturbing each other; pass the `session_id` an opener returns on later calls to route them to that target, and \
+`end_session` when done. `session_status` lists what is open and what state each session is in — ask it when an open \
+reports a timeout rather than re-running the open, which would attach or launch a second time. A live kernel attach \
+waits for its target indefinitely and cannot be interrupted; if it has been waiting far longer than a healthy link \
+takes, `end_session` reclaims that session (and only that session) by terminating its engine process. \
 Navigate a TTD trace in both directions: go/step_over/step_into forward, and reverse_go/step_over_back/step_back backward, \
 or jump with goto_position. Analyze a trace with the data-model tools ttd_calls (calls to a function), ttd_memory (accesses \
 to an address range), and ttd_events (module/thread/exception events), or run any data-model query with dx. Record new traces \
@@ -3230,11 +2866,11 @@ mod tests {
             .await
             .expect("write the discover request");
 
-        // The engine thread is never reached — discover is answered from `get_info` alone —
-        // which is what lets this run on a machine with no debugger.
+        // No session is ever opened, so no engine worker is spawned — discover is answered
+        // from `get_info` alone, which is what lets this run on a machine with no debugger.
         let service = tokio::time::timeout(
             STEP,
-            WindbgServer::new(EngineHandle::spawn(STEP)).serve(server_io),
+            WindbgServer::new(Sessions::new(STEP)).serve(server_io),
         )
         .await
         .expect("serve must not block waiting for an `initialize` that never comes")
@@ -3306,63 +2942,114 @@ mod tests {
         service.cancel().await.expect("shut the service down");
     }
 
-    // ---- Session handles -----------------------------------------------
+    // ---- What `session_status` says ------------------------------------
+    //
+    // The routing rules themselves live in `engine.rs`, with the registry that enforces them.
+    // What is checked here is the reporting: an agent acts on this text, and for a session that
+    // has not landed the right action flips entirely on how long it has been waiting.
 
+    fn snapshot(kind: SessionKind, state: SessionState, waited: Duration) -> SessionSnapshot {
+        SessionSnapshot {
+            id: "sess-1".to_string(),
+            kind,
+            what: "net:port=50000,key=1.2.3.4".to_string(),
+            pid: 4242,
+            state,
+            in_state_for: waited,
+            age: waited,
+            current: true,
+        }
+    }
+
+    /// A kernel attach that is still settling is *normal*, and saying otherwise would send an
+    /// agent off to reclaim a session that is about to come up.
     #[test]
-    fn omitted_handle_accepts_whatever_session_is_current() {
-        assert!(check_session_handle(Some("sess-1"), None).is_ok());
-        assert!(check_session_handle(None, None).is_ok());
+    fn a_young_kernel_attach_is_reported_as_normal() {
+        let out = describe_session(&snapshot(
+            SessionKind::Kernel,
+            SessionState::Attaching,
+            Duration::from_secs(10),
+        ));
+        assert!(out.contains("waiting 10.0s"), "{out}");
+        assert!(out.contains("normal"), "{out}");
+        assert!(
+            !out.contains("end_session"),
+            "a healthy attach must not be advised to reclaim itself:\n{out}"
+        );
+        // The one thing that must be said whatever the age: the target exists.
+        assert!(out.contains("Do not re-run the open"), "{out}");
+    }
+
+    /// The report issue #61 asked for. Past the point a healthy link takes, "pending" stops
+    /// being an honest answer: this wait cannot be interrupted and will not return, and the
+    /// caller needs to be told that *and* told the recovery — which now exists.
+    #[test]
+    fn a_long_parked_kernel_attach_is_reported_as_never_returning() {
+        let out = describe_session(&snapshot(
+            SessionKind::Kernel,
+            SessionState::Attaching,
+            Duration::from_secs(400),
+        ));
+        assert!(out.contains("6m40s"), "the wait must be quantified:\n{out}");
+        assert!(
+            out.contains("will not return on its own"),
+            "the caller must not be left waiting on it:\n{out}"
+        );
+        assert!(
+            out.contains("end_session") && out.contains("terminates its engine process"),
+            "the recovery must be named, and it is a process kill:\n{out}"
+        );
+        assert!(
+            out.contains("debug"),
+            "the usual cause (a guest not booted in debug mode) should be named:\n{out}"
+        );
+    }
+
+    /// The age advice is specific to a wait that cannot be interrupted. A dump load has a
+    /// finite timeout, so telling its caller the same thing would be wrong.
+    #[test]
+    fn a_slow_dump_load_is_not_told_it_will_never_return() {
+        let out = describe_session(&snapshot(
+            SessionKind::Dump,
+            SessionState::Attaching,
+            Duration::from_secs(400),
+        ));
+        assert!(!out.contains("will not return on its own"), "{out}");
+        assert!(!out.contains("KDNET"), "{out}");
+    }
+
+    /// A retired handle is the one state where "refused" and "unusable" part company, so the
+    /// report has to say both halves or the caller writes the session off.
+    #[test]
+    fn a_retired_session_is_reported_as_reachable_without_the_handle() {
+        let out = describe_session(&snapshot(
+            SessionKind::Dump,
+            SessionState::Retired("`.opendump` replaced the target".to_string()),
+            Duration::from_secs(3),
+        ));
+        assert!(out.contains("retired"), "{out}");
+        assert!(out.contains("`.opendump` replaced the target"), "{out}");
+        assert!(out.contains("calls that omit it still reach it"), "{out}");
+    }
+
+    /// A failed open must say the slate is clean — that is what makes "open again" safe advice
+    /// rather than the thing that starts a second process.
+    #[test]
+    fn a_failed_open_says_nothing_was_created() {
+        let out = describe_session(&snapshot(
+            SessionKind::Launch,
+            SessionState::Failed("0x80070002".to_string()),
+            Duration::from_secs(1),
+        ));
+        assert!(out.contains("0x80070002"), "{out}");
+        assert!(out.contains("Nothing was created"), "{out}");
     }
 
     #[test]
-    fn matching_handle_is_accepted() {
-        assert!(check_session_handle(Some("sess-1"), Some("sess-1")).is_ok());
-    }
-
-    #[test]
-    fn handle_from_a_replaced_session_is_refused() {
-        let err = check_session_handle(Some("sess-2"), Some("sess-1")).unwrap_err();
-        assert!(err.contains("sess-1"), "{err}");
-        assert!(err.contains("sess-2"), "{err}");
-    }
-
-    #[test]
-    fn handle_is_refused_once_the_session_is_ended() {
-        let err = check_session_handle(None, Some("sess-1")).unwrap_err();
-        assert!(err.contains("no debug session open"), "{err}");
-    }
-
-    /// The gate must read the session at execution time. Building it and evaluating it at
-    /// submission time — the obvious-looking caller-side check — leaves a window in which a
-    /// concurrent `open_*` replaces the target between the check and the debugger call, so
-    /// a call that passed validation still runs against the wrong session.
-    #[test]
-    fn the_gate_reads_the_session_when_it_runs_not_when_it_is_built() {
-        let session = Arc::new(Mutex::new(Some("sess-A".to_string())));
-        let gate = session_gate_for(Arc::clone(&session), Some("sess-A"));
-
-        // A concurrent open lands after the gate was built but before it runs.
-        *lock(&session) = Some("sess-B".to_string());
-
-        let err = gate().unwrap_err();
-        assert!(err.contains("sess-B"), "{err}");
-    }
-
-    #[test]
-    fn the_gate_passes_when_the_session_is_unchanged_at_execution_time() {
-        let session = Arc::new(Mutex::new(Some("sess-A".to_string())));
-        let gate = session_gate_for(Arc::clone(&session), Some("sess-A"));
-        assert!(gate().is_ok());
-    }
-
-    /// A target replaced while the caller held no handle is still their problem to opt into,
-    /// so an absent handle keeps passing whatever the session did in the meantime.
-    #[test]
-    fn an_absent_handle_still_passes_after_a_replacement() {
-        let session = Arc::new(Mutex::new(Some("sess-A".to_string())));
-        let gate = session_gate_for(Arc::clone(&session), None);
-        *lock(&session) = Some("sess-B".to_string());
-        assert!(gate().is_ok());
+    fn durations_are_rendered_at_human_scale() {
+        assert_eq!(fmt_duration(Duration::from_millis(8400)), "8.4s");
+        assert_eq!(fmt_duration(Duration::from_secs(192)), "3m12s");
+        assert_eq!(fmt_duration(Duration::from_secs(3900)), "1h05m");
     }
 
     /// The typed tools interpolate their operands into commands, and DbgEng chains on `;`.
@@ -3521,68 +3208,6 @@ mod tests {
         }
     }
 
-    /// An opener whose wait timed out has to remain answerable, because the outcome is what
-    /// tells the caller whether to keep waiting or open again — and re-opening on a guess
-    /// attaches or launches a second time.
-    #[test]
-    fn opener_outcomes_are_recorded_and_answerable() {
-        let opens = Mutex::new(VecDeque::new());
-
-        record_open(&opens, "sess-A", OpenOutcome::Pending);
-        record_open(&opens, "sess-B", OpenOutcome::Pending);
-        let read = |id: &str| {
-            opens
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|(known, _)| known == id)
-                .map(|(_, o)| o.clone())
-        };
-        assert_eq!(read("sess-A"), Some(OpenOutcome::Pending));
-
-        // An outcome replaces the pending entry in place rather than appending a second one.
-        record_open(&opens, "sess-A", OpenOutcome::Landed);
-        assert_eq!(read("sess-A"), Some(OpenOutcome::Landed));
-        assert_eq!(opens.lock().unwrap().len(), 2);
-
-        // A terminal failure is recorded too — the case that made "keep polling" wrong.
-        record_open(&opens, "sess-B", OpenOutcome::Failed("no such dump".into()));
-        assert_eq!(
-            read("sess-B"),
-            Some(OpenOutcome::Failed("no such dump".into()))
-        );
-    }
-
-    /// A pending open must survive any amount of later traffic. Forgetting one makes
-    /// `session_status` report it as unknown, which tells the caller to open again — and
-    /// that duplicates an attach or a launch, then lets the original land afterwards and
-    /// replace the target underneath them.
-    #[test]
-    fn a_pending_open_is_never_evicted() {
-        let opens = Mutex::new(VecDeque::new());
-        record_open(&opens, "sess-slow", OpenOutcome::Pending);
-        for n in 0..OPEN_HISTORY * 2 {
-            record_open(&opens, &format!("sess-{n}"), OpenOutcome::Landed);
-        }
-
-        let still_there = opens
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|(id, outcome)| id == "sess-slow" && *outcome == OpenOutcome::Pending);
-        assert!(still_there, "a pending open must outlive the history bound");
-
-        // Once it settles it becomes evictable like any other, so the history returns to
-        // its bound rather than growing forever.
-        record_open(&opens, "sess-slow", OpenOutcome::Landed);
-        for n in 0..OPEN_HISTORY {
-            record_open(&opens, &format!("later-{n}"), OpenOutcome::Landed);
-        }
-        let opens = opens.lock().unwrap();
-        assert_eq!(opens.len(), OPEN_HISTORY);
-        assert!(!opens.iter().any(|(id, _)| id == "sess-slow"));
-    }
-
     /// A failure that lands after the target is open must hand the handle back and say not
     /// to re-open. "Just open again" is how a caller ends up with two processes — before the
     /// openers were split (glslang/win-kexp#71) this server could not tell that case from a
@@ -3605,74 +3230,30 @@ mod tests {
         assert!(msg.contains("vertarget"), "must say how to inspect it");
     }
 
-    /// A burst of concurrent opens legitimately exceeds the bound while all of them are
-    /// pending. Once they settle, the ledger has to come back down — otherwise it stays over
-    /// the bound for the life of the process, holding every handle and failure string.
-    #[test]
-    fn a_settled_burst_returns_the_ledger_to_its_bound() {
-        let opens = Mutex::new(VecDeque::new());
-        let burst = OPEN_HISTORY * 2;
-        for n in 0..burst {
-            record_open(&opens, &format!("sess-{n}"), OpenOutcome::Pending);
-        }
-        assert_eq!(
-            opens.lock().unwrap().len(),
-            burst,
-            "pending opens must all be kept, even past the bound"
-        );
-
-        // They settle in place, which is the path that previously skipped trimming.
-        for n in 0..burst {
-            record_open(&opens, &format!("sess-{n}"), OpenOutcome::Landed);
-        }
-        assert_eq!(opens.lock().unwrap().len(), OPEN_HISTORY);
-    }
-
-    /// Settled history is bounded, so a long-lived server cannot accumulate outcomes forever.
-    #[test]
-    fn settled_opener_history_is_bounded_and_evicts_oldest_first() {
-        let opens = Mutex::new(VecDeque::new());
-        for n in 0..OPEN_HISTORY + 3 {
-            record_open(&opens, &format!("sess-{n}"), OpenOutcome::Landed);
-        }
-        let opens = opens.lock().unwrap();
-        assert_eq!(opens.len(), OPEN_HISTORY);
-        assert_eq!(opens.front().unwrap().0, "sess-3");
-        assert_eq!(
-            opens.back().unwrap().0,
-            format!("sess-{}", OPEN_HISTORY + 2)
-        );
-    }
-
-    #[test]
-    fn minted_handles_are_unique() {
-        let a = mint_session_id();
-        let b = mint_session_id();
-        assert_ne!(a, b);
-    }
-
     // ---- Error reporting -----------------------------------------------
 
-    /// A failed debugger operation belongs in the result (`isError: true`) so the model
-    /// can read it and correct itself; only a dead engine is a protocol error.
+    /// Every session-scoped failure belongs in the result (`isError: true`) so the model can
+    /// read it and correct itself: a bad symbol (fix the arguments), a timeout (wait, retry, or
+    /// end the session), a refused handle (name a different session, or open one), a session
+    /// whose worker is gone (open again). A JSON-RPC error would hide the text that says which.
     #[test]
-    fn debugger_failures_are_tool_errors_not_protocol_errors() {
-        let r = engine_result(Err(EngineError::Debugger("no such symbol".into())))
-            .expect("debugger failure must not surface as a protocol error");
-        assert_eq!(r.is_error, Some(true));
-
-        let err = engine_result(Err(EngineError::Unavailable("engine gone".into())))
-            .expect_err("a dead engine must surface as a protocol error");
-        assert!(err.message.contains("engine gone"));
-    }
-
-    /// A timeout is still something the model can act on (wait, retry, end the session), so
-    /// it renders like any other debugger failure rather than as a protocol error.
-    #[test]
-    fn timeouts_are_tool_errors_too() {
-        let r = engine_result(Err(EngineError::Timeout("timed out".into())))
-            .expect("a timeout must not surface as a protocol error");
-        assert_eq!(r.is_error, Some(true));
+    fn session_scoped_failures_are_tool_errors_not_protocol_errors() {
+        for e in [
+            EngineError::Debugger("no such symbol".into()),
+            EngineError::Timeout("timed out".into()),
+            EngineError::Stale("that session is closed".into()),
+            EngineError::Lost("the worker exited".into()),
+        ] {
+            let rendered = e.to_string();
+            let r = engine_result(Err(e)).expect("must not surface as a protocol error");
+            assert_eq!(r.is_error, Some(true), "{rendered}");
+            assert!(
+                r.content
+                    .iter()
+                    .any(|b| b.as_text().is_some_and(|t| t.text == rendered)),
+                "the explanation must survive: {rendered}"
+            );
+        }
     }
 
     #[test]

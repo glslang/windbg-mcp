@@ -21,11 +21,13 @@ connected MCP client holds a lock on (see [`CLAUDE.md`](../CLAUDE.md)). Whole su
 | --- | --- | --- | --- |
 | **Protocol** | always | nothing — no debugger, no target, no network | transport, revision negotiation, tool-surface drift |
 | **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump | `win-kexp` / DbgEng regressions |
+| **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
 | **Live** | manual | KDNET target, TTD engine, elevation | see [Manual checklist](#manual-checklist) |
 
 The protocol tier rides `cargo test`, so CI already runs it. The debugger tier is opt-in: it
 reaches real DbgEng and is available in CI on demand via the **Smoke test (debugger tier)** job
-(Actions → CI → *Run workflow*). The live tier is not automated — no runner has a kernel target.
+(Actions → CI → *Run workflow*). The bounded-command tier is `#[ignore]`d because it is measured in
+minutes; see below. The live tier is not automated — no runner has a kernel target.
 
 ## What it asserts, and why each one is a dependency tripwire
 
@@ -33,7 +35,9 @@ reaches real DbgEng and is available in CI on demand via the **Smoke test (debug
 appears on **stderr**. A dependency that prints a banner or a warning to stdout desynchronizes
 every client, and the client-side symptom is an unreadable parse error. Also: closing stdin exits
 the process within 20s (otherwise each client disconnect leaks a process and a DbgEng session),
-and a malformed input line does not kill the session.
+and a malformed input line does not kill the session. Under process-per-session that last one has
+teeth: a disconnect must also take every **engine worker** process with it, which the debugger tier
+checks by pid.
 
 **Protocol revisions.** Every revision the README promises — `2026-07-28`, `2025-11-25`,
 `2025-06-18`, `2025-03-26`, `2024-11-05` — is offered a handshake, served *that* revision, and can
@@ -70,8 +74,23 @@ codegen dependency can introduce them with no change here.
 session-handle contract on the wire (a stale handle is refused; the handle stops working once
 `end_session` runs). It also pins the `isError` contract against a real engine: `threads` is `~`,
 which DbgEng implements only in user mode, so on a kernel dump it must come back as a **tool error
-carrying the engine's message** — not a JSON-RPC error, and not a dead worker thread. Read-only
+carrying the engine's message** — not a JSON-RPC error, and not a dead session. Read-only
 throughout, and it needs no symbols, so it runs offline.
+
+It also covers process-per-session, which cannot be checked any other way — the claims are about
+processes, so they need real ones:
+
+- *Two sessions coexist.* Two dumps open at once, and the first handle still works after the second
+  open landed. Under the single-engine design this was impossible by construction.
+- *A kernel attach that never connects costs one session.* An `attach_kernel` at a dead port parks
+  exactly as a guest that is not in debug mode would; the test then opens a dump **while it is
+  parked** (the regression test for [#61](https://github.com/glslang/windbg-mcp/issues/61)) and
+  reclaims the parked session with `end_session`, checking by pid that the worker process is gone.
+  It skips itself if the attach fails outright instead of parking (a busy UDP port), because there
+  is nothing to assert about a park that did not happen.
+- *No worker outlives the connection.* Reads the engine pid out of `session_status`, disconnects,
+  and checks the process is gone — otherwise every disconnect leaks a debugger process, and for a
+  launch or an attach, a debuggee with it.
 
 ## When to run it
 
@@ -101,38 +120,46 @@ only watches GitHub Actions here, so cargo bumps arrive by hand.
    revision's `_meta` requirements — that is where per-request metadata rules land.
 4. Update the revision list in `README.md` and this file's list above to match what actually passes.
 
-## The bounded-command tests
+## The bounded-command tier
 
-`src/engine.rs` carries a second set of `#[ignore]`d tests, separate from this file's tiers because
-they drive `EngineHandle` in-process rather than the binary over stdio — they are about the engine
-thread, not the wire.
+A third tier in the same file, `#[ignore]`d rather than env-gated because it deliberately runs
+commands out to a watchdog deadline — minutes, not seconds. It needs the debugger tier's gate too.
 
 ```pwsh
-cargo test --bin windbg-mcp -- --ignored --nocapture --test-threads=1 engine::tests
+$env:WINDBG_MCP_SMOKE_DUMP = "1"
+cargo test --test mcp_smoke -- --ignored --nocapture --test-threads=1 bounded
 ```
 
-`--test-threads=1` is required: dbgeng holds **one debuggee session per process**, so these cannot
-overlap. They open the checked-in sample dump with an empty symbol path, so they run offline; total
-runtime is about a minute, most of it deliberate waiting.
+`--test-threads=1` is required: each test spawns a server that opens the checked-in sample dump, and
+these are timing tests that must not compete for the machine. Total runtime is a bit over a minute,
+most of it deliberate waiting. They shrink the per-call budget with
+`WINDBG_MCP_CALL_TIMEOUT_SECS`, so the arithmetic under test is the real one rather than a special
+case.
 
-- `a_runaway_command_self_aborts_and_leaves_the_engine_usable` — a `.for` loop sized to run for
-  hours is cut short by the watchdog, and the engine executes the *next* command normally. This is
+- `a_bounded_runaway_command_aborts_and_leaves_its_session_usable` — a `.for` loop sized to run for
+  hours is cut short by the watchdog, and the session executes the *next* command normally. This is
   the wedge that used to need a server restart. Proof of interruption is the loop counter left in
   `$t0`, not the clock and not the "interrupted after" note (which is appended whenever the watchdog
   *attempted* an interrupt, even one the engine ignored).
-- `a_runaway_command_queued_behind_another_job_still_beats_its_caller` — the same, from behind a
-  job that already occupies the engine thread for half the call budget. This is the half win-kexp
-  cannot cover, because the queue belongs to this crate: budgeting from the full `call_timeout`
-  instead of what remains passes every other assertion and fails here.
-- `measure_what_the_bounded_path_costs_a_quick_command` — prints what arming the watchdog costs,
-  as a distribution across three command lengths. It asserts nothing; it is the evidence behind
-  which tools take the bounded path ([`DECISIONS.md`](../DECISIONS.md), 2026-08-02), namely that
-  a bounded command is rounded up to a multiple of 200ms. Re-run it after a win-kexp watchdog
-  change — if that cost goes away, so does the reason for the split.
+- `a_bounded_command_queued_behind_another_job_still_beats_its_caller` — the same, from behind a
+  `.sleep` that occupies the session for half the call budget. This is the half win-kexp cannot
+  cover, because the queue belongs to this crate: budgeting from the patience as sent, instead of
+  from what remains after the queue wait, passes every other assertion and fails here. Two details
+  the test documents because both silently void it — `.sleep` needs a `0n` prefix (the MASM
+  evaluator's default base is hex, so a bare `30000` is 0x30000 ms), and the blocker needs a head
+  start, since two tool calls in flight at once reach the session's queue in whichever order wins
+  the race.
+- `measure_what_the_bounded_path_costs_a_quick_command` — prints what arming the watchdog costs, as
+  a distribution. It asserts nothing; it is the evidence behind which tools take the bounded path
+  ([`DECISIONS.md`](../DECISIONS.md), 2026-08-02), namely that a bounded command is rounded up to a
+  multiple of 200ms. Re-run it after a win-kexp watchdog change — if that cost goes away, so does
+  the reason for the split.
 
-The pure budget arithmetic they exercise is also unit-tested in the same module and rides
-`cargo test` everywhere, so a regression in the common case fails in CI rather than waiting for a
-manual run.
+These live with the wire tests rather than beside the arithmetic because the wiring they prove now
+spans two processes: the supervisor sends the caller's remaining patience, the worker derives the
+watchdog deadline from it, and only the shipped binary contains both halves. The arithmetic itself
+is unit-tested in `src/worker.rs` and rides `cargo test` everywhere, so a regression in the common
+case fails in CI rather than waiting for a manual run.
 
 ## Manual checklist
 

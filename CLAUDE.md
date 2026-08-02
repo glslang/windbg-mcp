@@ -8,8 +8,18 @@ surface; this file covers the non-obvious operational workflows.
 `windbg-mcp` is a Rust MCP server (stdio, `rmcp`) exposing **WinDbg/DbgEng** for live user-mode,
 kernel, crash-dump, and Time Travel Debugging (TTD) work. The low-level DbgEng bindings come from
 the sibling crate [`win-kexp`](https://github.com/glslang/win-kexp) (a **path/git dependency we grow
-ourselves** — do not add third-party DbgEng crates). Key source: `src/engine.rs` (single dedicated
-engine thread), `src/server.rs` (the MCP tools), `src/ttd.rs`, `src/main.rs`.
+ourselves** — do not add third-party DbgEng crates).
+
+**The binary has two roles.** Started normally it is the **supervisor**: MCP on stdio, no DbgEng.
+Re-executed with `--engine-worker` it owns exactly one debug session, because dbgeng.dll holds one
+debuggee session per process. Key source: `src/engine.rs` (the supervisor — session registry,
+worker supervision, routing), `src/worker.rs` (the child process and the engine thread inside it),
+`src/proto.rs` (the wire protocol between them), `src/server.rs` (the MCP tools), `src/ttd.rs`,
+`src/main.rs` (role selection).
+
+Practical consequences when debugging this server: a stack trace or log line can come from either
+role (worker logs are untagged by target and inherit the supervisor's stderr), and killing the
+supervisor leaves no workers behind — they exit when their stdin closes.
 
 ## Updating the running windbg MCP after code changes
 
@@ -38,6 +48,11 @@ To rebuild and load the new code without stopping the session:
    Claude Code). Only after this reconnect do the windbg tools run the new code.
 4. Once reconnected (the old process is gone), delete `target/release/windbg-mcp.exe.stale`. Do
    **not** delete it while the old process is still alive — it demand-pages code from that file.
+
+A worker is spawned by re-executing the supervisor's *own* image, so a supervisor running from the
+renamed `.stale` file spawns workers from it too — old code stays consistently old, which is what
+you want. It also means `.stale` can be held by more than one process: reconnecting ends the
+supervisor, and its workers exit with it, so step 4 is still just "after the reconnect".
 
 ## Changing win-kexp (the DbgEng bindings)
 
@@ -75,15 +90,32 @@ opens the sample dump through DbgEng, set the gate first (PowerShell, not `VAR=1
 $env:WINDBG_MCP_SMOKE_DUMP = "1"; cargo test --test mcp_smoke
 ```
 
+That tier now also covers the process-per-session behaviour end to end: two sessions coexisting, a
+kernel attach parked on a dead port being reclaimed by `end_session`, and no worker process
+outliving the connection. A third tier is `#[ignore]`d because it runs commands out to a watchdog
+deadline (minutes, not seconds) — run it by hand after a win-kexp watchdog change:
+
+```pwsh
+$env:WINDBG_MCP_SMOKE_DUMP = "1"
+cargo test --test mcp_smoke -- --ignored --nocapture --test-threads=1 bounded
+```
+
 ## Live kernel + driver IOCTL gotchas (learned driving HEVD over KDNET)
 
 **KDNET attach is a blocking wait, by design.** A live kernel needs `WaitForEvent(INFINITE)` (a finite
 timeout returns `E_NOTIMPL` and never drives the link). So if the target isn't reachable, the
-`attach_kernel` MCP call reports a *timeout* while the engine thread stays **parked** in the wait —
+`attach_kernel` MCP call reports a *timeout* while its **worker process** stays parked in the wait —
 it self-heals and completes the attach the moment the target actually connects. Consequences:
-- When an attach "hangs", **diagnose out-of-band** (PowerShell), never by firing more windbg tools —
-  they queue behind the parked engine thread and also time out. Check the debugger is listening
-  (`Get-NetUDPEndpoint -LocalPort 50000` → owned by `windbg-mcp.exe`) and whether any VM is running.
+- The park costs **that session only**. Other sessions and every other tool keep working, so an
+  attach that is going nowhere is no longer a reason to restart the server. `session_status` says
+  how long it has been waiting and whether that is past the point a healthy link takes;
+  `end_session` reclaims it, terminating the worker process if the wait will not unwind (it won't —
+  `SetInterrupt` cannot reach a wait that has not yet connected).
+- **Do not re-run the attach while it is still waiting.** The connection was already claimed, so a
+  retry dials a second time. End it first, or fix the target and let the original attach land.
+- Diagnosing why nothing dialed in is still out-of-band work (PowerShell): check the debugger is
+  listening (`Get-NetUDPEndpoint -LocalPort 50000` → owned by `windbg-mcp.exe`, which will be the
+  *worker* process) and whether any VM is running.
 - The **target must dial this host**: on the target, `bcdedit /dbgsettings net hostip:<debugger-ip>
   port:50000 key:<key>` — **colons, not `=`**. `hostip` must be the debugger host's current IP.
   Symbols are **not** pulled over the KD wire (see below).
