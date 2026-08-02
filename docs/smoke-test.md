@@ -22,12 +22,15 @@ connected MCP client holds a lock on (see [`CLAUDE.md`](../CLAUDE.md)). Whole su
 | **Protocol** | always | nothing — no debugger, no target, no network | transport, revision negotiation, tool-surface drift |
 | **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump | `win-kexp` / DbgEng regressions |
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
-| **Live** | manual | KDNET target, TTD engine, elevation | see [Manual checklist](#manual-checklist) |
+| **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a KDNET target you can freeze | that a kernel attach *lands*, coexists, and detaches cleanly |
+| **Live (other)** | manual | TTD engine, elevation, a test driver | see [Manual checklist](#manual-checklist) |
 
 The protocol tier rides `cargo test`, so CI already runs it. The debugger tier is opt-in: it
 reaches real DbgEng and is available in CI on demand via the **Smoke test (debugger tier)** job
-(Actions → CI → *Run workflow*). The bounded-command tier is `#[ignore]`d because it is measured in
-minutes; see below. The live tier is not automated — no runner has a kernel target.
+(Actions → CI → *Run workflow*). The bounded-command and live-kernel tiers are `#[ignore]`d — one
+is measured in minutes, the other touches another machine; see below. Neither is automated, and
+the rest of the live checklist is not either: no runner has a kernel target, a TTD engine, or
+elevation.
 
 ## What it asserts, and why each one is a dependency tripwire
 
@@ -161,6 +164,52 @@ watchdog deadline from it, and only the shipped binary contains both halves. The
 is unit-tested in `src/worker.rs` and rides `cargo test` everywhere, so a regression in the common
 case fails in CI rather than waiting for a manual run.
 
+## The live-kernel tier
+
+The only tier that touches another machine, and the last thing to run. It needs a KDNET target you
+are willing to freeze for the duration, booted with debugging enabled and dialling *this* host —
+see the KDNET gotchas in [`CLAUDE.md`](../CLAUDE.md) before diagnosing a failure.
+
+```pwsh
+$env:WINDBG_MCP_SMOKE_KERNEL = "net:port=50000,key=<w.x.y.z>"
+cargo test --test mcp_smoke -- --ignored --nocapture live_kernel
+```
+
+The connection string is the one from `bcdedit /dbgsettings` on the target (or the `kd -k` command
+you would otherwise use). It is **never** guessable, so the tier is gated on it rather than on a
+boolean — and gated on `#[ignore]` as well, so a variable left set from an earlier session cannot
+freeze a VM during an ordinary `cargo test`.
+
+Everything else about kernel attaches is proved against a *dead* port, which is the failure #61 was
+about. This is the other half — an attach that lands:
+
+- **It still lands through a worker process.** The `Committed`/`Opened` milestones cross the pipe
+  and leave the session reporting *open*, not stuck mid-attach.
+- **The KD transport endpoint belongs to the worker**, checked against `netstat -ano`. That is the
+  premise of process-per-session: a thread-based design leaves that endpoint claimed for the life
+  of the server, and every retry claims another. If this assertion ever fails, a parked session is
+  no longer reclaimable and the fix is undone.
+- **A second session works alongside it** — a dump opened and used while the kernel attach is held,
+  with the kernel session unaffected. Impossible by construction before.
+- **`end_session` detaches gracefully rather than killing the worker.** This one has teeth: DbgEng
+  leaves a detached-but-halted kernel *frozen*, so win-kexp resumes and actively detaches. A run
+  that took the kill path instead would leave the guest halted with a wedged KD stub, needing a
+  reboot. For the same reason the test body runs under `catch_unwind` — a failed assertion must
+  still detach, or a test failure costs you the VM.
+- **A disconnect releases a live kernel session rather than killing its worker.** Same hazard by
+  the path nobody watches: closing the connection is an ordinary event, and whatever sessions are
+  open at the time are whatever happened to be open. Checked against the **target's own uptime**
+  read either side of the disconnect — a halted kernel takes no clock interrupt, so its uptime
+  stands still while a released one keeps counting. Re-attaching alone proves nothing here: a
+  frozen target still answers its KD stub.
+
+The first run of this tier found a real bug — shutdown killed workers outright, so a disconnect
+froze the target — which no dump-based tier could have found, because killing a worker that holds
+a *dump* costs nothing. Both tests therefore collect their evidence and assert only after the
+target has been released: an earlier draft asserted as it went, failed at the release check, and
+left the target halted. A test for a bug that freezes a machine must not freeze the machine when
+it fails.
+
 ## Manual checklist
 
 Not automated: no runner has a kernel target, a TTD-capable engine, or elevation. Run these by hand
@@ -171,9 +220,11 @@ before a release, or when a change touches the relevant path. Drivers live in
   read registers/modules, set a breakpoint.
 - **Failure paths** — `examples/verify_fixes.ps1`: execution control with no debuggee returns a
   clean "No active debuggee" error, and a failed kernel attach is a clean error rather than a panic.
-- **Live kernel (KDNET)** — `examples/drive_kernel_test.ps1 -Connection "net:port=<n>,key=<w.x.y.z>"`:
-  attach, `bp nt!NtCreateFile`, `go` to it, resume, detach. See the KDNET gotchas in `CLAUDE.md`
-  before diagnosing a hang.
+- **Live kernel (KDNET)** — the [live-kernel tier](#the-live-kernel-tier) covers the session
+  lifecycle (attach, coexist, detach). For execution control on a real target, additionally run
+  `examples/drive_kernel_test.ps1 -Connection "net:port=<n>,key=<w.x.y.z>"`: attach,
+  `bp nt!NtCreateFile`, `go` to it, resume, detach. See the KDNET gotchas in `CLAUDE.md` before
+  diagnosing a hang.
 - **TTD replay** — needs the WinDbg store engine next to the binary (System32's engine rejects
   `.run` traces with `0x80070057`). Open a trace, then exercise `ttd_calls` / `ttd_memory` /
   `ttd_events` and reverse execution. The worked example is

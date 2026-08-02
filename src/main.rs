@@ -86,8 +86,9 @@ async fn serve() -> Result<()> {
 
     // The client disconnected. Every worker is a process holding a debug session — and, for a
     // launch or an attach, a debuggee whose fate is tied to its debugger — so none may outlive
-    // the connection that opened it.
-    sessions.shutdown();
+    // the connection that opened it. Released rather than killed: a live kernel that is merely
+    // killed is left *frozen*, which outlives the connection in the worst possible way.
+    sessions.shutdown().await;
     outcome?;
     Ok(())
 }

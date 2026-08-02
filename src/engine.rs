@@ -62,6 +62,20 @@ const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// gracefully, short enough that recovering a parked attach is not a wait.
 const END_SESSION_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// The same grace, but at shutdown, where it competes with the client's expectation that closing
+/// stdin ends the process promptly.
+///
+/// Releasing rather than killing is not tidiness here. A live kernel left detached *while halted*
+/// stays frozen — one CPU stopped, the rest spinning — so a worker killed instead of released
+/// leaves the target machine stopped and its KD stub wedged until someone reboots it. That is a
+/// far worse outcome than an extra few seconds on the way out, and a client disconnect is exactly
+/// when nobody is watching.
+///
+/// Shorter than [`END_SESSION_TIMEOUT`] because a session that cannot let go within a few seconds
+/// is one that never will, and sessions are released concurrently, so this is the whole cost
+/// rather than the cost per session.
+const SHUTDOWN_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Counter behind [`mint_session_id`]. Only needs to be unique within this process.
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -695,7 +709,7 @@ impl Sessions {
     /// under process-per-session it costs nothing else.
     pub async fn end(&self, session: &Arc<Session>, named: bool) -> Result<String, EngineError> {
         let call = Call::new(EngineOp::EndSession).named(named);
-        let (reason, message) = match self.release(session, call).await {
+        let (reason, message) = match self.release(session, call, END_SESSION_TIMEOUT).await {
             // A refused handle is the mechanism working, not a session to tear down.
             Release::Stale(why) => return Err(EngineError::Stale(why)),
             Release::Released(text) => (
@@ -747,8 +761,8 @@ impl Sessions {
     /// Asks a worker to release its target and then terminates it, without deciding *why* the
     /// session is closing — `end_session` and reclamation share the teardown but not the reason,
     /// and the reason is what the caller reads afterwards.
-    async fn release(&self, session: &Arc<Session>, call: Call) -> Release {
-        let out = match self.call_within(session, call, END_SESSION_TIMEOUT).await {
+    async fn release(&self, session: &Arc<Session>, call: Call, grace: Duration) -> Release {
+        let out = match self.call_within(session, call, grace).await {
             Err(EngineError::Stale(why)) => return Release::Stale(why),
             other => other,
         };
@@ -762,15 +776,39 @@ impl Sessions {
         }
     }
 
-    /// Terminates every worker. Called on shutdown so a disconnecting client never leaves a
-    /// debugger process — or a debuggee — behind.
-    pub fn shutdown(&self) {
-        for session in self.registry().live() {
-            session.set_state(SessionState::Closed(
-                "the server is shutting down".to_string(),
-            ));
-            session.fail_outstanding("the server is shutting down");
-            session.kill();
+    /// Ends every session, then terminates any worker that did not let go. Called when the client
+    /// disconnects, so a debugger process — or a debuggee — never outlives the connection.
+    ///
+    /// A disconnect is treated as `end_session` on everything, which is both the simplest rule to
+    /// explain and the only safe one: see [`SHUTDOWN_RELEASE_TIMEOUT`] for what killing a live
+    /// kernel outright costs. Sessions are released concurrently because they are independent
+    /// processes and the client is waiting.
+    pub async fn shutdown(&self) {
+        let live = self.registry().live();
+        if live.is_empty() {
+            return;
+        }
+        tracing::info!("shutting down: releasing {} session(s)", live.len());
+        let mut releasing = Vec::with_capacity(live.len());
+        for session in live {
+            let sessions = self.clone();
+            releasing.push(tokio::spawn(async move {
+                // Marked first so nothing new is routed to a session on its way out; the release
+                // runs as the supervisor's own teardown and so passes the gate that closes.
+                session.set_state(SessionState::Closed(
+                    "the server is shutting down".to_string(),
+                ));
+                sessions
+                    .release(
+                        &session,
+                        Call::supervisor(EngineOp::EndSession),
+                        SHUTDOWN_RELEASE_TIMEOUT,
+                    )
+                    .await;
+            }));
+        }
+        for task in releasing {
+            let _ = task.await;
         }
     }
 
@@ -822,8 +860,12 @@ impl Sessions {
         // Released the same way `end_session` releases one, so a live debuggee is let go cleanly
         // rather than dying with its debugger. As the supervisor's own teardown rather than a
         // caller's call, it runs past the gate the state above would otherwise close.
-        self.release(&victim, Call::supervisor(EngineOp::EndSession))
-            .await;
+        self.release(
+            &victim,
+            Call::supervisor(EngineOp::EndSession),
+            END_SESSION_TIMEOUT,
+        )
+        .await;
         Ok(())
     }
 
