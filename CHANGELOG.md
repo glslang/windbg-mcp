@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The bounded-command path now has a stated coverage rule, and tests that prove it works.**
+  0.3.0 routed `execute`, `dx` and the `ttd_*` tools through a watchdog that Ctrl+Breaks a
+  runaway command before it can pin the engine thread, but nothing exercised that interrupt
+  end to end, and "why these five?" had no written answer.
+
+  `src/engine.rs` gains both. The queue-aware budget arithmetic is now a pure function with
+  unit tests that ride `cargo test`; three `#[ignore]`d tests drive a real engine, proving a
+  runaway command self-aborts and leaves the engine usable — including from behind a queued
+  job, which is the half win-kexp's own tests cannot cover because the queue belongs to this
+  crate. See [`docs/smoke-test.md`](./docs/smoke-test.md).
+
+  The coverage rule, recorded in [`DECISIONS.md`](./DECISIONS.md): bound a command when its
+  cost scales with the target's size or with an arbitrary caller-supplied expression; leave
+  point queries (`k`, `lm`, `u`, `!irp`, …) unbounded. Arming the watchdog measurably rounds a
+  command's duration up to a multiple of 200ms, so bounding a 30ms query would make it a 200ms
+  one for a runaway case it does not have. `index_trace` is a deliberate exception and
+  now says so: it is O(trace), but `-force` deletes before it rebuilds, so an abort can leave no
+  usable index at all — its tool description now tells callers to wait rather than re-issue it.
+
 ### Fixed
 
 - **Every opener now commits its session handle, including the four that attach or launch.**

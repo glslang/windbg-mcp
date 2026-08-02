@@ -1,10 +1,12 @@
 # Follow-ups
 
-Deferred work, in three clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in four clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
-MCP `2026-07-28` extensions (tasks, apps), and item 12 from the opener split
-(glslang/win-kexp#71, 2026-08-01). Each item notes its repo, why it was deferred, and where
-it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend.
+MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
+(glslang/win-kexp#71, 2026-08-01), and items 13–14 from the bounded-command coverage review
+(#46, 2026-08-02). Each item notes its repo, why it was deferred, and where
+it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
+and the 2026-08-02 entry for the one items 13–14 extend.
 
 Items are roughly ordered by how soon they're worth doing, within each cluster.
 
@@ -225,3 +227,41 @@ The two **kernel** halves ran on no hardware: `attach_local_kernel_begin`/`wait`
   `attach_kernel_begin` + `wait()` pass beside the existing fused one. Prefer a
   snapshot-restorable VM, per item 1.
 - **Tracked as:** [glslang/win-kexp#73](https://github.com/glslang/win-kexp/issues/73).
+
+## 13. [windbg-mcp] A job-level deadline for `reachable_from_dispatch`
+
+`reachable_from_dispatch` runs its whole breadth-first walk — up to `max_functions` × one `uf`
+command each — inside a *single* engine job. Both `max_functions` (default 256) and `max_depth`
+(default 32) come from the caller and are uncapped, so a large enough pair pins the engine thread
+for as long as the walk takes. That is the same wedge the bounded path fixed, arriving by a
+different route.
+
+- **Why the bounded path doesn't reach it:** `EngineHandle::run_command` bounds *one* command
+  string. Here no individual `uf` is the problem — the aggregate is.
+- **Where it picks up:** the walk already drives every disassembly through one `&mut uf` closure
+  (`src/server.rs`), which is the natural place to check a deadline and stop with a partial,
+  honestly-labelled verdict — "NOT REACHABLE within the budget" is already the tool's contract for
+  an exhausted bound, so a time bound reports as a bound rather than as a new failure mode.
+  A cap on `max_functions` is the cheaper half-measure; it bounds the walk in nodes, not seconds.
+- **Why deferred:** the defaults are safe (a 256-function walk against a loaded dump is seconds),
+  so this is reachable only by a caller asking for it. Recorded by the coverage review in
+  DECISIONS.md (2026-08-02) rather than fixed there, because it needs a different mechanism than
+  the review's subject.
+
+## 14. [win-kexp] Make arming the bounded watchdog ~free
+
+`execute_command_bounded` spawns a watchdog thread that polls a `done` flag on a
+`thread::sleep(200ms)` loop, and joins it once `Execute` returns. Because the flag is set while
+that thread is mid-sleep, the join waits out the remainder — so a bounded command takes
+`ceil(d / 200ms) * 200ms`. Measured (`measure_what_the_bounded_path_costs_a_quick_command`,
+`src/engine.rs`): a 127ms command takes 201ms, a 377ms one takes 401ms, and a 0.2ms `lm` takes
+either ~0.3ms or ~200ms depending on whether it beats the watchdog thread's first poll.
+
+Parking on a condvar (or `thread::park_timeout` + `unpark`) instead of sleeping would let `done`
+wake the watchdog immediately and drop that to ~0.
+
+- **Why it matters here:** the cost is the *only* reason windbg-mcp's cheap point-query tools stay
+  off the bounded path (DECISIONS.md, 2026-08-02). Remove it and the coverage rule simplifies to
+  "bound everything except `index_trace`", with no per-call tax to weigh against a rare wedge.
+- **Why deferred:** it is a win-kexp change with its own review, and the current split is correct
+  as long as the cost stands — this is an improvement to the tradeoff, not a fix to a defect.

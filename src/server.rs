@@ -2670,6 +2670,10 @@ impl WindbgServer {
     /// is the mode that actually fixes the "index not loaded" state `open_trace` warns about.
     /// (The bundled engine exposes these via `TtdExt.dll`; `!tt.index` fails with
     /// `LoadLibrary(tt)` because there is no `tt` extension.)
+    /// On a large trace the build can outrun the per-call timeout: the call reports a timeout
+    /// while the build keeps running, and later calls queue behind it until it finishes. That
+    /// is deliberate — aborting a `-force` rebuild can leave no usable index at all. Wait and
+    /// retry rather than re-issuing it.
     #[rmcp::tool(annotations(
         title = "Build TTD trace index",
         read_only_hint = false,
@@ -2684,6 +2688,11 @@ impl WindbgServer {
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let gate = self.session_gate(args.session_id.as_deref());
+        // Deliberately *not* on the bounded path, and the one O(trace) command that isn't —
+        // see DECISIONS.md (2026-08-02). Indexing a large trace can legitimately outrun the
+        // per-call timeout, but `-force` deletes an unloadable `.idx` before rebuilding it, so
+        // a watchdog abort mid-rebuild can leave no usable index at all. Here the long run is
+        // productive work rather than a runaway, and the engine frees itself when it finishes.
         let out = self
             .engine
             .run(move |e| {

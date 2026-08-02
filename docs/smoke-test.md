@@ -101,6 +101,39 @@ only watches GitHub Actions here, so cargo bumps arrive by hand.
    revision's `_meta` requirements — that is where per-request metadata rules land.
 4. Update the revision list in `README.md` and this file's list above to match what actually passes.
 
+## The bounded-command tests
+
+`src/engine.rs` carries a second set of `#[ignore]`d tests, separate from this file's tiers because
+they drive `EngineHandle` in-process rather than the binary over stdio — they are about the engine
+thread, not the wire.
+
+```pwsh
+cargo test --bin windbg-mcp -- --ignored --nocapture --test-threads=1 engine::tests
+```
+
+`--test-threads=1` is required: dbgeng holds **one debuggee session per process**, so these cannot
+overlap. They open the checked-in sample dump with an empty symbol path, so they run offline; total
+runtime is about a minute, most of it deliberate waiting.
+
+- `a_runaway_command_self_aborts_and_leaves_the_engine_usable` — a `.for` loop sized to run for
+  hours is cut short by the watchdog, and the engine executes the *next* command normally. This is
+  the wedge that used to need a server restart. Proof of interruption is the loop counter left in
+  `$t0`, not the clock and not the "interrupted after" note (which is appended whenever the watchdog
+  *attempted* an interrupt, even one the engine ignored).
+- `a_runaway_command_queued_behind_another_job_still_beats_its_caller` — the same, from behind a
+  job that already occupies the engine thread for half the call budget. This is the half win-kexp
+  cannot cover, because the queue belongs to this crate: budgeting from the full `call_timeout`
+  instead of what remains passes every other assertion and fails here.
+- `measure_what_the_bounded_path_costs_a_quick_command` — prints what arming the watchdog costs,
+  as a distribution across three command lengths. It asserts nothing; it is the evidence behind
+  which tools take the bounded path ([`DECISIONS.md`](../DECISIONS.md), 2026-08-02), namely that
+  a bounded command is rounded up to a multiple of 200ms. Re-run it after a win-kexp watchdog
+  change — if that cost goes away, so does the reason for the split.
+
+The pure budget arithmetic they exercise is also unit-tested in the same module and rides
+`cargo test` everywhere, so a regression in the common case fails in CI rather than waiting for a
+manual run.
+
 ## Manual checklist
 
 Not automated: no runner has a kernel target, a TTD-capable engine, or elevation. Run these by hand
