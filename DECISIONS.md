@@ -57,6 +57,16 @@ nothing shared to order. Sessions became concurrent (bounded at `MAX_SESSIONS`, 
 protocol-level error class shrank to "no worker could be started at all" — every other failure is
 now scoped to a session and has a next move, so it belongs in the tool result.
 
+**Corroborated upstream.** win-kexp reached the same conclusion from the library side while this was
+in review, and now documents it on `attach_kernel` itself: *"Callers that must stay responsive (a
+server, an MCP endpoint) need a **separate process they can kill**. Moving the call to a worker
+thread and abandoning it is not a recovery"* — the thread, its stack, the `DebugEngine`, its COM
+objects and the claimed transport endpoint all live on blocked, and each retry leaks another set.
+The same commits settle a detail this server reports on: a guest that is not booted in debug mode
+**never dials in at all**, so the wait is stuck in the *connect* phase rather than in a break-in
+that failed. That is why `session_status` says a long-parked attach will not end on its own *while
+the target stays unreachable*, and equally that fixing the guest still lands it.
+
 **Status:** landed. FOLLOWUPS item 10 records what moved for items 7–9, which were written against
 the design this replaced.
 

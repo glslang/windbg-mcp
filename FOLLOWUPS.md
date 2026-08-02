@@ -12,20 +12,24 @@ Items are roughly ordered by how soon they're worth doing, within each cluster. 
 landed** (process-per-session, 2026-08-02); it is kept here rather than deleted because items 7, 8
 and 9 were all written against the single-engine design it replaced, and each now says what moved.
 
-## 1. [win-kexp] Managed breakpoint lifecycle for `run_to_address`
+## 1. [win-kexp] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
-`run_to_address` uses a one-shot `g <addr>` (WinDbg's temporary breakpoint), which DbgEng does **not**
-hand back a handle for. On a non-live timeout the target is now broken in (SetInterrupt + WaitForEvent),
-but the one-shot breakpoint at `address` can remain armed. Replace `g <addr>` with an explicitly
-managed `AddBreakpoint2` + `RemoveBreakpoint` lifecycle so the breakpoint is cleaned up deterministically
-in **all** exit paths (hit, stopped-elsewhere, timeout, error).
+`run_to_address` used a one-shot `g <addr>` (WinDbg's temporary breakpoint), which DbgEng does **not**
+hand back a handle for, so every exit but a hit could leave it armed.
 
-- **Why deferred:** the interrupt + breakpoint-teardown semantics need a live KDNET/VM kernel target to
-  validate; landing it blind risks a worse regression (hang, or clearing the caller's breakpoints).
-- **Tracked as:** [glslang/win-kexp#63](https://github.com/glslang/win-kexp/issues/63) (picks up from
-  win-kexp PR #62's `src/dbgeng.rs` review thread on the `Timeout` branch). A stale one-shot at
-  `address` is currently harmless to this API's own flow (a later `run_to`/`go` arms its own), so it is
-  low-severity until an explicit rewrite is validated on hardware.
+Fixed in win-kexp (`05df6b7`, closing
+[glslang/win-kexp#63](https://github.com/glslang/win-kexp/issues/63)) and picked up here by the pin
+bump. Building it surfaced two further defects on the same path, both of which mattered more than
+the stale breakpoint this item was filed for: the `Timeout` outcome was **unreachable** (it tested
+`GetExecutionStatus() == DEBUG_STATUS_GO`, but an expired finite wait reports `DEBUG_STATUS_BREAK`),
+so a timed-out `run_to_address` returned `0x8000FFFF` "catastrophic failure" and left the session
+with no current process — and the recovery it would have run does not work either, because a finite
+wait stops the engine pumping events and `SetInterrupt` can no longer be delivered. Every target
+type now uses the watchdog-bounded `WaitForEvent(INFINITE)` the live-kernel path already used.
+
+Nothing changed in this crate: `run_to_address` is a thin wrapper and its `RunToOutcome::Timeout`
+branch simply became reachable. The verdict text it renders was already correct for a target that
+ends up broken in.
 
 ## 2. [win-kexp] Typed write primitives
 

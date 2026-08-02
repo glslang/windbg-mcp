@@ -452,6 +452,22 @@ pub enum OpenError {
     Timeout { id: String, message: String },
 }
 
+/// A slot taken for an open that has not registered its session yet.
+///
+/// Exists so the capacity check can see opens that are still in flight, and releases the slot on
+/// drop — so an open that fails on the way (no worker, a bad path) gives it back rather than
+/// holding it for the life of the process.
+struct Slot {
+    registry: Arc<Mutex<Registry>>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
+        registry.opening = registry.opening.saturating_sub(1);
+    }
+}
+
 /// How a worker took being told to let go of its target.
 enum Release {
     /// It released the target and said so.
@@ -474,6 +490,12 @@ struct Registry {
     /// Every session this server has held, oldest first: the live ones plus a bounded tail of
     /// closed ones, kept so a caller can still ask what became of a handle.
     all: VecDeque<Arc<Session>>,
+    /// Opens that have taken a slot but have not registered a session yet.
+    ///
+    /// Without this the capacity check is blind to opens already in flight, and two of them can
+    /// each look at the same four live sessions, each conclude there is room, and each spawn —
+    /// so the bound is only enforced against sessions that finished opening.
+    opening: usize,
 }
 
 impl Registry {
@@ -642,11 +664,15 @@ impl Sessions {
         op: EngineOp,
     ) -> Result<OpenReport, OpenError> {
         debug_assert!(op.is_opener(), "open() needs an opener op");
-        self.make_room().await.map_err(OpenError::NoRoom)?;
+        // Take a slot before doing anything expensive, but do **not** reclaim anything yet — see
+        // `take_slot` and `trim_to_cap` for why those are separate.
+        let slot = self.take_slot().map_err(OpenError::NoRoom)?;
 
         let id = mint_session_id();
         let session = match self.spawn(&id, kind, what).await {
             Ok(session) => session,
+            // The slot goes back and no existing session was touched: a worker that would not
+            // start must not cost the caller a target they already had.
             Err(why) => return Err(OpenError::Unavailable(why)),
         };
         {
@@ -654,6 +680,9 @@ impl Sessions {
             registry.all.push_back(Arc::clone(&session));
             registry.trim();
         }
+        // Released only now: from here the session is counted in `all` instead, and holding both
+        // would count this open twice.
+        drop(slot);
 
         let out = self.call(&session, Call::new(op)).await;
         match out {
@@ -664,6 +693,9 @@ impl Sessions {
                 if !matches!(session.state(), SessionState::Open) {
                     session.set_state(SessionState::Open);
                 }
+                // Only now, with a target that is genuinely open, is an existing session
+                // reclaimed to pay for it.
+                self.trim_to_cap(&session).await;
                 Ok(OpenReport { id, report })
             }
             Err(EngineError::Timeout(message)) => Err(OpenError::Timeout { id, message }),
@@ -812,51 +844,101 @@ impl Sessions {
         }
     }
 
-    /// Ensures a session slot is free, reclaiming the least-recently-opened idle session if the
-    /// server is at [`MAX_SESSIONS`].
+    /// Takes a slot for a new session, or refuses the open.
     ///
-    /// Reclaiming only *idle* sessions is the whole of the policy. A session with a call in
-    /// flight — including one whose caller has already given up waiting, and including a parked
-    /// attach — is never taken, because ending it silently is how a caller loses a target they
-    /// are still using. When nothing is reclaimable the open is refused with the list, which is
-    /// a better answer than picking a victim.
-    async fn make_room(&self) -> Result<(), String> {
+    /// Deliberately **decides** without **doing**: at the limit it only checks that some session
+    /// *could* be reclaimed, and leaves the reclaiming to [`Self::trim_to_cap`] once the
+    /// replacement is real. Evicting here instead would mean a mistyped path, or a worker that
+    /// would not start, destroys a perfectly good target the caller still wanted — a failed open
+    /// must cost nothing but the attempt.
+    ///
+    /// Reclaimable means *idle*. A session with a call in flight — including one whose caller has
+    /// already given up waiting, and including a parked attach — is never taken, because ending it
+    /// silently is how a caller loses a target they are still using. When nothing is reclaimable
+    /// the open is refused with the list, which is a better answer than picking a victim.
+    fn take_slot(&self) -> Result<Slot, String> {
+        let mut registry = self.registry();
+        let live = registry.live();
+        // How many sessions would have to be reclaimed to be back at the limit once this open,
+        // and every open already in flight, has landed — against how many *can* be. Counting the
+        // opens in flight is what stops two of them spending the same idle session: the first
+        // needs one reclaimable, the second needs two.
+        let needed = (live.len() + registry.opening + 1).saturating_sub(MAX_SESSIONS);
+        let reclaimable = live.iter().filter(|s| !s.busy()).count();
+        if needed > reclaimable {
+            let listed: Vec<String> = live
+                .iter()
+                .map(|s| {
+                    let busy = if s.busy() { " — busy" } else { " — idle" };
+                    format!("  {} — {} ({}){busy}", s.id, s.kind.label(), s.what)
+                })
+                .collect();
+            let in_flight = match registry.opening {
+                0 => String::new(),
+                n => format!(
+                    " ({n} more open{} already in flight)",
+                    if n == 1 { "" } else { "s" }
+                ),
+            };
+            return Err(format!(
+                "this server holds {} debug sessions{in_flight} and none of them can be reclaimed \
+                 — a session with a call in flight is never ended to make room, and that includes \
+                 an attach still waiting for its target. So there is no room to open another:\n{}\
+                 \n\nEnd one with `end_session {{ \"session_id\": \"…\" }}` — it terminates that \
+                 session's engine worker process even if the session is parked and cannot unwind \
+                 on its own.",
+                live.len(),
+                listed.join("\n")
+            ));
+        }
+        registry.opening += 1;
+        Ok(Slot {
+            registry: Arc::clone(&self.inner),
+        })
+    }
+
+    /// Reclaims the oldest idle session if the server is over [`MAX_SESSIONS`], now that
+    /// `keeping` has actually opened and is worth paying for.
+    ///
+    /// `keeping` is excluded because it is idle the instant it opens, and with every other
+    /// session busy it would otherwise be the one reclaimed — an open that closes itself.
+    ///
+    /// May leave the server one over the limit, when the sessions that would have paid for this
+    /// one all became busy while it was opening. That is the honest outcome: the alternatives are
+    /// ending someone's live target or discarding a target that already opened. The next open
+    /// finds nothing idle and is refused, so it does not compound.
+    async fn trim_to_cap(&self, keeping: &Arc<Session>) {
         let victim = {
             let registry = self.registry();
             let live = registry.live();
-            if live.len() < MAX_SESSIONS {
-                return Ok(());
+            if live.len() <= MAX_SESSIONS {
+                return;
             }
-            match live.iter().find(|s| !s.busy()) {
-                Some(idle) => Arc::clone(idle),
+            match live.iter().find(|s| s.id != keeping.id && !s.busy()) {
+                // Marked while the registry lock is held, so a second open racing this one cannot
+                // see the same session as live-and-idle, pick it too, and free nothing.
+                Some(idle) => {
+                    idle.set_state(SessionState::Closed(format!(
+                        "reclaimed to make room for a new session — this server holds at most \
+                         {MAX_SESSIONS} at once, and this was the oldest idle one"
+                    )));
+                    Arc::clone(idle)
+                }
                 None => {
-                    let listed: Vec<String> = live
-                        .iter()
-                        .map(|s| format!("  {} — {} ({})", s.id, s.kind.label(), s.what))
-                        .collect();
-                    return Err(format!(
-                        "this server already holds {MAX_SESSIONS} debug sessions and every one \
-                         of them has a call in flight, so there is no room to open another:\n{}\n\n\
-                         End one with `end_session {{ \"session_id\": \"…\" }}` — it terminates \
-                         that session's engine worker process even if the session is parked and \
-                         cannot unwind on its own.",
-                        listed.join("\n")
-                    ));
+                    tracing::warn!(
+                        "{} sessions are open, one over the {MAX_SESSIONS} limit: nothing was \
+                         idle enough to reclaim when `{}` opened",
+                        live.len(),
+                        keeping.id
+                    );
+                    return;
                 }
             }
         };
         tracing::info!(
-            "reclaiming idle session {} to make room (at the {MAX_SESSIONS}-session limit)",
+            "reclaimed idle session {} (at the {MAX_SESSIONS}-session limit)",
             victim.id
         );
-        // Marked *before* the release, not after: the release awaits the worker, and a second
-        // open racing this one would otherwise see the same session still live and idle, pick it
-        // too, and free nothing. Closing it first takes it out of `live()` immediately, which is
-        // also what the caller who held its handle will read.
-        victim.set_state(SessionState::Closed(format!(
-            "reclaimed to make room for a new session — this server holds at most \
-             {MAX_SESSIONS} at once, and this was the oldest idle one"
-        )));
         // Released the same way `end_session` releases one, so a live debuggee is let go cleanly
         // rather than dying with its debugger. As the supervisor's own teardown rather than a
         // caller's call, it runs past the gate the state above would otherwise close.
@@ -866,7 +948,6 @@ impl Sessions {
             END_SESSION_TIMEOUT,
         )
         .await;
-        Ok(())
     }
 
     /// Starts a worker process and waits for it to report that its engine came up.
@@ -966,6 +1047,30 @@ fn stale_handle(want: &str, state: &SessionState) -> String {
         // The accepting states never reach here.
         _ => format!("session `{want}` is not accepting calls"),
     }
+}
+
+/// The job id every opener gets. `open` is the first call made against a freshly spawned session
+/// and ids start at 1, so this identifies the opener without threading it through the protocol.
+const OPENER_JOB: u64 = 1;
+
+/// Moves a session out of its opening states once the opener's result is known.
+///
+/// Normally [`Sessions::open`] does this from the reply it received; this is the same decision
+/// taken by [`reader`] when the caller's timeout means no reply was received at all. The states
+/// are the discriminator either way — `Opening` means nothing was created, `Attaching` means the
+/// target exists and the wait failed — so both paths reach the same answer.
+fn settle_open(session: &Session, result: &Result<String, EngineError>) {
+    let settled = match (session.state(), result) {
+        (SessionState::Opening | SessionState::Attaching, Ok(_)) => SessionState::Open,
+        // Nothing was created or claimed: this handle will never be usable.
+        (SessionState::Opening, Err(e)) => SessionState::Failed(e.to_string()),
+        // The target exists and something after it failed. The session stays usable — that is
+        // the whole point of committing before the wait.
+        (SessionState::Attaching, Err(_)) => SessionState::Open,
+        // Already settled, by `open` or by a worker that exited.
+        _ => return,
+    };
+    session.set_state(settled);
 }
 
 fn worker_gone(id: &str) -> String {
@@ -1095,11 +1200,19 @@ async fn reader(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&id);
-                if let Some(waiter) = waiter {
-                    // The receiver is gone when the caller's timeout fired; the send failing is
-                    // that case, and removing the entry above is what matters — it is how the
-                    // session stops counting as busy.
-                    let _ = waiter.send(result.map_err(EngineError::Debugger));
+                let Some(waiter) = waiter else { continue };
+                // A failed send means the receiver is gone: the caller's timeout fired and
+                // nobody is left to act on this result. For an ordinary call that is fine —
+                // removing the entry above is what mattered, and it is how the session stops
+                // counting as busy. For the *opener* it is not: `open` settles the session's
+                // state from its result, so with no one to run that, the session would sit in
+                // `Opening` or `Attaching` for the life of the process — `session_status` would
+                // keep reporting an open that finished long ago, and `busy()` would keep the
+                // worker from ever being reclaimed.
+                if let Err(unreceived) = waiter.send(result.map_err(EngineError::Debugger))
+                    && id == OPENER_JOB
+                {
+                    settle_open(&session, &unreceived);
                 }
             }
             // Both belong to the spawn handshake, which has already happened.
@@ -1375,22 +1488,31 @@ mod tests {
         assert!(idle.busy(), "an abandoned call still owes a reply");
     }
 
-    /// At the limit with nothing idle, an open is refused with the list rather than picking a
-    /// victim — ending someone's live target silently is the one outcome worse than failing.
-    #[tokio::test]
-    async fn opening_past_the_limit_with_no_idle_session_is_refused_with_the_list() {
+    /// Fills the registry with `count` sessions in `state`.
+    fn registry_full_of(state: SessionState) -> Sessions {
         let sessions = Sessions::new(Duration::from_secs(1));
         {
             let mut registry = sessions.registry();
             for n in 0..MAX_SESSIONS {
                 registry
                     .all
-                    .push_back(dormant(&format!("sess-busy-{n}"), SessionState::Attaching));
+                    .push_back(dormant(&format!("sess-{n}"), state.clone()));
             }
         }
-        let err = sessions.make_room().await.unwrap_err();
-        assert!(err.contains("no room"), "{err}");
-        assert!(err.contains("sess-busy-0"), "{err}");
+        sessions
+    }
+
+    /// At the limit with nothing idle, an open is refused with the list rather than picking a
+    /// victim — ending someone's live target silently is the one outcome worse than failing.
+    #[test]
+    fn opening_past_the_limit_with_no_idle_session_is_refused_with_the_list() {
+        let sessions = registry_full_of(SessionState::Attaching);
+        let err = sessions
+            .take_slot()
+            .err()
+            .expect("no idle session means no room");
+        assert!(err.contains("no room to open another"), "{err}");
+        assert!(err.contains("sess-0"), "{err}");
         assert!(err.contains("end_session"), "{err}");
     }
 
@@ -1402,7 +1524,117 @@ mod tests {
             Arc::clone(&live),
             dormant("sess-0", SessionState::Closed("x".into())),
         ]);
-        assert!(sessions.make_room().await.is_ok());
+        let slot = sessions.take_slot().expect("there is room");
+        drop(slot);
+        sessions.trim_to_cap(&live).await;
         assert_eq!(live.state(), SessionState::Open, "it was not reclaimed");
+    }
+
+    /// **A failed open must cost nothing.** Taking a slot deliberately reclaims nothing, so a
+    /// mistyped path or a worker that will not start cannot destroy a target the caller still
+    /// had — the eviction is deferred until a replacement actually exists.
+    #[test]
+    fn a_slot_that_is_never_used_reclaims_nothing() {
+        let sessions = registry_full_of(SessionState::Open);
+        let before: Vec<_> = sessions.registry().live();
+        let slot = sessions
+            .take_slot()
+            .expect("an idle session means there is room");
+        assert!(
+            before.iter().all(|s| s.state() == SessionState::Open),
+            "no session may be touched before the replacement exists"
+        );
+        // The open failed on the way, so the slot goes back.
+        drop(slot);
+        assert_eq!(sessions.registry().opening, 0);
+        assert_eq!(sessions.registry().live().len(), MAX_SESSIONS);
+    }
+
+    /// Opens already in flight count against the limit. Without that the check only sees
+    /// *finished* opens, so two concurrent ones look at the same sessions, both conclude there is
+    /// room, and the bound is enforced against neither.
+    #[test]
+    fn an_open_in_flight_takes_a_slot_from_the_next_one() {
+        let sessions = registry_full_of(SessionState::Open);
+        // One idle session, so exactly one slot can be paid for.
+        for session in sessions.registry().live().iter().skip(1) {
+            session.set_state(SessionState::Attaching);
+        }
+        let _first = sessions
+            .take_slot()
+            .expect("the idle session pays for this one");
+        assert_eq!(sessions.registry().opening, 1);
+        // Hmm — the same idle session cannot pay twice, but it is still idle, so the check has to
+        // reason about the open already in flight rather than about the sessions alone.
+        let second = sessions.take_slot();
+        assert!(
+            second.is_err(),
+            "a second concurrent open must not spend the same slot"
+        );
+    }
+
+    /// The session that just opened is never the one reclaimed to pay for itself, even when it is
+    /// the only idle one — which it always is for a moment.
+    #[tokio::test]
+    async fn a_new_session_is_not_reclaimed_to_make_room_for_itself() {
+        let sessions = Sessions::new(Duration::from_secs(1));
+        let newest = dormant("sess-new", SessionState::Open);
+        {
+            let mut registry = sessions.registry();
+            for n in 0..MAX_SESSIONS {
+                registry
+                    .all
+                    .push_back(dormant(&format!("sess-busy-{n}"), SessionState::Attaching));
+            }
+            registry.all.push_back(Arc::clone(&newest));
+        }
+        sessions.trim_to_cap(&newest).await;
+        assert_eq!(
+            newest.state(),
+            SessionState::Open,
+            "the new session reclaimed itself"
+        );
+        assert_eq!(
+            sessions.registry().live().len(),
+            MAX_SESSIONS + 1,
+            "nothing was reclaimable, so the server sits one over the limit rather than \
+             discarding a target that already opened"
+        );
+    }
+
+    // ---- settling an opener whose caller stopped waiting --------------------------
+
+    /// An opener that finishes after its caller gave up must still settle the session. Left in
+    /// `Opening`/`Attaching` it would report an open that finished long ago, and `busy()` would
+    /// keep the worker from ever being reclaimed.
+    #[test]
+    fn an_abandoned_opener_still_settles_the_session() {
+        // Nothing was created, so the handle is dead and re-opening is the way forward.
+        let clean = dormant("sess-1", SessionState::Opening);
+        settle_open(&clean, &Err(EngineError::Debugger("no such file".into())));
+        assert_eq!(clean.state(), SessionState::Failed("no such file".into()));
+        assert!(!clean.busy(), "a settled session is reclaimable");
+
+        // The target exists and the wait failed: the session stays usable, which is the whole
+        // point of committing before the wait.
+        let committed = dormant("sess-2", SessionState::Attaching);
+        settle_open(
+            &committed,
+            &Err(EngineError::Debugger("never broke in".into())),
+        );
+        assert_eq!(committed.state(), SessionState::Open);
+
+        let landed = dormant("sess-3", SessionState::Attaching);
+        settle_open(&landed, &Ok("vertarget".into()));
+        assert_eq!(landed.state(), SessionState::Open);
+    }
+
+    /// Settling is idempotent and never resurrects: a session ended while its opener was still
+    /// running stays ended.
+    #[test]
+    fn settling_never_reopens_a_session_that_is_already_over() {
+        let closed = dormant("sess-1", SessionState::Closed("ended".into()));
+        settle_open(&closed, &Ok("vertarget".into()));
+        assert_eq!(closed.state(), SessionState::Closed("ended".into()));
     }
 }
