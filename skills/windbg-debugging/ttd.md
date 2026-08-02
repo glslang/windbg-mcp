@@ -92,11 +92,12 @@ Then `ttd_calls`/`dx` by name work. To inspect a specific call, travel to it
   is the alias — match the real symbol.
 - **Never run an unbounded memory search on a trace.** A whole-address-space
   `execute { "command": "s -u 0 L?0x400000000000 …" }` sends the engine into a scan that can
-  run for minutes — and it wedges the single engine thread, so every later tool call times
-  out queued behind it. **Scope every search** to a real region: a module range (`lm`), a
-  heap segment from the PEB (`dt ntdll!_PEB @$peb ProcessHeap`), or a stack window — and
-  prefer the indexed data model (`ttd_calls`/`ttd_memory`) over raw `s`. If you do wedge it,
-  the only recovery is to kill `windbg-mcp.exe` and reconnect (`/mcp`), then re-open the trace.
+  run for minutes, and every later call to *that session* queues behind it. **Scope every
+  search** to a real region: a module range (`lm`), a heap segment from the PEB
+  (`dt ntdll!_PEB @$peb ProcessHeap`), or a stack window — and prefer the indexed data model
+  (`ttd_calls`/`ttd_memory`) over raw `s`. If you do launch one, `execute` is on the bounded
+  path so it self-aborts before your call gives up; other sessions are unaffected either way,
+  and `end_session` ends the session outright if you would rather not wait.
 - **`registers {}` empty** → no thread context at this position (a module-load break, or a
   bare `goto_position 0`). Travel to a settled position after a `go`/breakpoint, or read one
   register with `execute { "command": "r rip" }`.

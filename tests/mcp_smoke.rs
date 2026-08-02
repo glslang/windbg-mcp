@@ -10,13 +10,18 @@
 //! * **The MCP spec revved.** New revision, new required field, a capability the SDK now
 //!   advertises on our behalf that this server does not actually implement.
 //!
-//! Two tiers, so the cheap half can ride `cargo test` everywhere:
+//! Three tiers, so the cheap one can ride `cargo test` everywhere:
 //!
 //! * **Protocol** (default) — spawns the server, speaks JSON-RPC. No debugger target, no
 //!   symbols, no network.
 //! * **Target** (`WINDBG_MCP_SMOKE_DUMP=1`) — opens the sample crash dump through DbgEng, so
 //!   it needs `dbgeng.dll` and may reach a symbol server. Off by default; this is the tier
 //!   that catches a `win-kexp` regression.
+//! * **Bounded command** (`#[ignore]`d, run by hand) — deliberately runs away and waits out a
+//!   watchdog, so it is measured in minutes rather than seconds. It lives here rather than
+//!   beside the budget arithmetic in `src/engine.rs` because the two halves it proves are now
+//!   in *different processes* — the budget is computed by the supervisor and armed by the
+//!   worker — so the only place the wiring exists as a whole is the shipped binary.
 //!
 //! See `docs/smoke-test.md` for the runbook.
 
@@ -75,12 +80,23 @@ struct Server {
 
 impl Server {
     fn spawn() -> Self {
-        let mut child = Command::new(EXE)
+        Self::spawn_with(&[])
+    }
+
+    /// `env` is extra environment for the server process — the bounded-command tier uses it to
+    /// shrink the per-call budget so a runaway command aborts in seconds rather than minutes.
+    fn spawn_with(env: &[(&str, &str)]) -> Self {
+        let mut command = Command::new(EXE);
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // Deterministic logging regardless of the developer's shell.
-            .env("RUST_LOG", "info")
+            .env("RUST_LOG", "info");
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let mut child = command
             .spawn()
             .unwrap_or_else(|e| panic!("failed to spawn {EXE}: {e}"));
 
@@ -168,11 +184,19 @@ impl Server {
 
     /// Sends a request and returns the response with the matching id.
     fn request(&mut self, method: &str, params: Value, budget: Duration) -> Value {
+        let id = self.send_request(method, params);
+        self.await_id(id, method, budget)
+    }
+
+    /// Sends a request and returns its id **without waiting for the answer**, so a test can keep
+    /// driving the server while a call is still outstanding. That is the whole point of one of
+    /// the tests below: a session that will never answer must not stop the others.
+    fn send_request(&mut self, method: &str, params: Value) -> i64 {
         let id = self.next_id;
         self.next_id += 1;
         let msg = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         self.send_line(&msg);
-        self.await_id(id, method, budget)
+        id
     }
 
     fn await_id(&mut self, id: i64, what: &str, budget: Duration) -> Value {
@@ -226,7 +250,11 @@ impl Server {
 
     /// A ready-to-use session on the newest revision, for tests that are not about the opener.
     fn started() -> Self {
-        let mut server = Self::spawn();
+        Self::started_with(&[])
+    }
+
+    fn started_with(env: &[(&str, &str)]) -> Self {
+        let mut server = Self::spawn_with(env);
         server.initialize(SUPPORTED_REVISIONS[0]);
         server
     }
@@ -846,21 +874,12 @@ fn a_dump_session_opens_reads_and_closes() {
         "opening the sample dump failed — DbgEng may be missing or the dump unreadable:\n{opened}"
     );
 
-    // The handle is what every later call is checked against, so the open has to mint one.
-    // Anchored to the line `open_dump` actually emits (`session_id: sess-…`) rather than to the
-    // substring anywhere in the text — the tool's prose mentions `session_id` several times, and
-    // a loose match would yield a plausible-looking wrong handle whose failure surfaces later as
-    // an unrelated mismatch.
-    let session_id = opened
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("session_id:"))
-        .map(str::trim)
-        .unwrap_or_else(|| panic!("open_dump must return a session_id, got:\n{opened}"));
+    // The handle is what routes every later call, so the open has to mint one.
+    let session_id = session_id_of(&opened);
     assert!(
         session_id.starts_with("sess-"),
         "session handles are minted as `sess-…`, got `{session_id}` in:\n{opened}"
     );
-    let session_id = session_id.to_string();
 
     let status = server.tool_text("session_status", json!({}), TARGET_STEP);
     assert!(
@@ -913,8 +932,8 @@ fn a_dump_session_opens_reads_and_closes() {
         "the failure must explain itself: {unsupported}"
     );
 
-    // A handle from a session that is not current must be refused rather than silently
-    // answered against whatever happens to be open — the contract `check_session_handle` owns.
+    // A handle this server never issued must be refused rather than silently answered against
+    // whatever happens to be open — the contract `Sessions::resolve` owns.
     let stale = server.call_tool(
         "modules",
         json!({ "session_id": "sess-not-a-real-handle" }),
@@ -940,29 +959,529 @@ fn a_dump_session_opens_reads_and_closes() {
     );
 }
 
-/// The `isError` contract, on the wire. `engine.rs` splits debugger failures (the model can
-/// retry) from engine failures (it cannot); the first kind must arrive as a *result* flagged
-/// `isError`, never as a JSON-RPC error the model never really sees.
+/// The `session_id` a tool result carries, or a panic naming what it said instead.
+///
+/// Anchored to the line the openers actually emit (`session_id: sess-…`) rather than to the
+/// substring anywhere in the text: the tool prose mentions `session_id` several times, and a
+/// loose match would yield a plausible-looking wrong handle whose failure surfaces later as an
+/// unrelated mismatch.
+fn session_id_of(text: &str) -> String {
+    text.lines()
+        .find_map(|line| line.trim().strip_prefix("session_id:"))
+        .map(|id| id.trim().to_string())
+        .unwrap_or_else(|| panic!("expected a session_id in:\n{text}"))
+}
+
+/// Whether a process is still running. Windows-only, like everything else here.
+fn process_alive(pid: u32) -> bool {
+    let out = Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .expect("run tasklist");
+    // No match prints "INFO: No tasks are running which match…", which never contains the pid.
+    String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+}
+
+/// The `pid` `session_status` reports for a session, from its `[engine pid N, …]` line.
+fn engine_pid_of(status: &str, session_id: &str) -> u32 {
+    let line = status
+        .lines()
+        .find(|l| l.contains(session_id) && l.contains("engine pid"))
+        .unwrap_or_else(|| panic!("no engine pid reported for `{session_id}` in:\n{status}"));
+    let after = line.split("engine pid ").nth(1).expect("checked above");
+    after
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .unwrap_or_else(|e| panic!("unreadable engine pid in {line:?}: {e}"))
+}
+
+/// Sessions are independent processes, so opening a second target must not disturb the first.
+///
+/// Under the single-engine design this was impossible by construction — one process, one DbgEng
+/// session, so the second open *replaced* the first and every handle to it went stale. The whole
+/// reason sessions became processes is that a target you cannot unwind must not cost you the
+/// server; this is the same property seen from the other side.
 #[test]
-fn a_failed_debugger_operation_is_a_tool_error_not_a_protocol_error() {
-    if target_tier().is_none() {
-        return;
-    }
+fn two_sessions_coexist_and_do_not_disturb_each_other() {
+    let Some(dump) = target_tier() else { return };
     let mut server = Server::started();
 
-    // No target is open, so execution control has nothing to run.
+    let first = session_id_of(&server.tool_text("open_dump", json!({ "path": dump }), TARGET_STEP));
+    let second =
+        session_id_of(&server.tool_text("open_dump", json!({ "path": dump }), TARGET_STEP));
+    assert_ne!(first, second, "each open must get its own session");
+
+    // The claim: the first handle still names a live target after the second open landed.
+    let response = server.call_tool("modules", json!({ "session_id": first }), TARGET_STEP);
+    assert_no_error(&response, "modules on the first session");
+    assert!(
+        !is_tool_error(&response),
+        "the first session must survive a later open:\n{}",
+        text_of(&response["result"])
+    );
+
+    // Both are listed, and the newest is the one an omitted handle routes to.
+    let status = server.tool_text("session_status", json!({}), TARGET_STEP);
+    for id in [&first, &second] {
+        assert!(
+            status.contains(id.as_str()),
+            "`{id}` should be listed:\n{status}"
+        );
+    }
+    let current_line = status
+        .lines()
+        .find(|l| l.contains("(current)"))
+        .unwrap_or_else(|| panic!("some session must be current:\n{status}"));
+    assert!(
+        current_line.contains(&second),
+        "the newest session should be current, got:\n{current_line}"
+    );
+
+    // Ending one leaves the other alone — the failure mode that made `end_session` unusable as a
+    // recovery before, since there was only ever one session to end.
+    server.tool_text("end_session", json!({ "session_id": second }), TARGET_STEP);
+    let still_there = server.call_tool("modules", json!({ "session_id": first }), TARGET_STEP);
+    assert!(
+        !is_tool_error(&still_there),
+        "ending one session must not touch another:\n{}",
+        text_of(&still_there["result"])
+    );
+    let gone = server.call_tool("modules", json!({ "session_id": second }), TARGET_STEP);
+    assert!(
+        is_tool_error(&gone),
+        "the ended handle must be refused: {gone}"
+    );
+
+    server.tool_text("end_session", json!({ "session_id": first }), TARGET_STEP);
+}
+
+/// Issue #61, end to end: a kernel attach whose target never dials in waits forever, and that
+/// must cost exactly one session.
+///
+/// The wait is `WaitForEvent(INFINITE)` and nothing can interrupt it — `SetInterrupt` cannot
+/// reach a wait that is still establishing the KD link — so the only way it ends is the process
+/// ending. Before process-per-session that process was the server: every later tool call queued
+/// behind the parked wait, `end_session` included, and the only recovery was restarting the
+/// server. This asserts the two things that changed: other sessions still work, and
+/// `end_session` actually ends it.
+#[test]
+fn a_kernel_attach_that_never_connects_costs_one_session_and_can_be_ended() {
+    let Some(dump) = target_tier() else { return };
+    let mut server = Server::started();
+
+    // A KDNET connection nothing is listening on. The attach itself succeeds in milliseconds —
+    // it is the wait for the target to dial *this* host that never returns.
+    let attaching = server.send_request(
+        "tools/call",
+        json!({
+            "name": "attach_kernel",
+            "arguments": { "connection": "net:port=50007,key=1.1.1.1" },
+        }),
+    );
+
+    // Wait for it to reach the parked state rather than assuming a timing.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let parked = loop {
+        let status = server.tool_text("session_status", json!({}), STEP);
+        if status.contains("waiting") && status.contains("kernel target") {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let Some(status) = parked else {
+        // The attach failed outright instead of parking — most likely the UDP port was already
+        // taken on this host. Nothing to assert about a park that did not happen.
+        skip("attach_kernel did not reach the parked state (port 50007 busy?)");
+        return;
+    };
+    let kernel_session = status
+        .lines()
+        .find(|l| l.contains("kernel target"))
+        .map(|l| l.split_whitespace().next().unwrap_or_default().to_string())
+        .expect("the kernel session should be listed");
+
+    // The point. A parked session used to be the *server's* engine thread; now it is one worker,
+    // and everything else carries on.
+    let opened = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
+    assert_no_error(&opened, "open_dump while a kernel attach is parked");
+    assert!(
+        !is_tool_error(&opened),
+        "a parked kernel attach must not block another session:\n{}",
+        text_of(&opened["result"])
+    );
+    let dump_session = session_id_of(&text_of(&opened["result"]));
+
+    // …and the parked session reports itself honestly rather than as an ordinary pending open.
+    let asked = server.tool_text(
+        "session_status",
+        json!({ "session_id": kernel_session }),
+        STEP,
+    );
+    assert!(
+        asked.contains("Do not re-run the open"),
+        "the target exists, so re-attaching would be a second attach:\n{asked}"
+    );
+
+    // The recovery that did not exist before: `end_session` cannot be answered by a worker that
+    // is parked, so the worker is killed. It has to come back, and the process has to be gone.
+    let worker = engine_pid_of(&status, &kernel_session);
+    let ended = server.tool_text(
+        "end_session",
+        json!({ "session_id": kernel_session }),
+        Duration::from_secs(120),
+    );
+    assert!(
+        ended.contains("terminated"),
+        "a parked session ends by terminating its worker:\n{ended}"
+    );
+    assert!(
+        !process_alive(worker),
+        "the parked engine worker (pid {worker}) is still running after end_session"
+    );
+
+    // The abandoned attach call is still outstanding; its session is gone, so it must come back
+    // rather than hang forever.
+    let answer = server.await_id(attaching, "attach_kernel", Duration::from_secs(60));
+    assert_no_error(
+        &answer,
+        "the abandoned attach must be answered, not dropped",
+    );
+
+    server.tool_text(
+        "end_session",
+        json!({ "session_id": dump_session }),
+        TARGET_STEP,
+    );
+}
+
+/// A worker is a process holding a debug session — and, for a launch or an attach, a debuggee
+/// whose fate is tied to its debugger. None may outlive the client connection that opened it, or
+/// every disconnect leaks a debugger process.
+#[test]
+fn engine_workers_do_not_outlive_the_connection() {
+    let Some(dump) = target_tier() else { return };
+    let mut server = Server::started();
+    let session =
+        session_id_of(&server.tool_text("open_dump", json!({ "path": dump }), TARGET_STEP));
+    let status = server.tool_text("session_status", json!({}), TARGET_STEP);
+    let worker = engine_pid_of(&status, &session);
+    assert!(process_alive(worker), "the worker should be running");
+
+    assert_eq!(
+        server.shutdown(),
+        Some(0),
+        "clean disconnect should be a clean exit"
+    );
+
+    // The worker notices its stdin close and exits on its own; give it a moment to.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while process_alive(worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !process_alive(worker),
+        "engine worker pid {worker} outlived the connection — every disconnect would leak one"
+    );
+}
+
+/// The `isError` contract, on the wire. A failure the model can act on must arrive as a *result*
+/// flagged `isError`, never as a JSON-RPC error the model never really sees.
+///
+/// Both halves are exercised: a call with no session at all (refused by the supervisor, which now
+/// knows there is nowhere to route it) and a command a real engine rejects.
+#[test]
+fn a_failed_debugger_operation_is_a_tool_error_not_a_protocol_error() {
+    let Some(dump) = target_tier() else { return };
+    let mut server = Server::started();
+
+    // Nothing is open, so there is no session to route to. That is the model's to fix — by
+    // opening one — so it belongs in the result, with the list of tools that would.
     let response = server.call_tool("go", json!({}), TARGET_STEP);
     assert_no_error(
         &response,
-        "go with no debuggee (a debugger failure is a tool result, not a protocol error)",
+        "go with no session (a routing failure is a tool result, not a protocol error)",
     );
     assert!(
         is_tool_error(&response),
-        "a failed debugger operation must set isError, got {response}"
+        "a call with no session must set isError, got {response}"
     );
     let text = text_of(&response["result"]);
     assert!(
-        !text.trim().is_empty(),
+        text.contains("open_dump"),
         "a tool error must explain itself so the model can correct: {response}"
     );
+
+    // And the other half: a real engine failure, carrying the engine's own text. `~` is
+    // user-mode-only, so DbgEng rejects it against this kernel dump.
+    let session_id =
+        session_id_of(&server.tool_text("open_dump", json!({ "path": dump }), TARGET_STEP));
+    let unsupported = server.call_tool("threads", json!({ "session_id": session_id }), TARGET_STEP);
+    assert_no_error(&unsupported, "threads on a kernel dump");
+    assert!(
+        is_tool_error(&unsupported),
+        "a command DbgEng cannot run must set isError, got {unsupported}"
+    );
+    assert!(
+        !text_of(&unsupported["result"]).trim().is_empty(),
+        "the failure must explain itself: {unsupported}"
+    );
+
+    // The session survives its own failed command — a worker that died on a bad command would
+    // turn every tool error into a lost target.
+    let after = server.call_tool("modules", json!({ "session_id": session_id }), TARGET_STEP);
+    assert!(
+        !is_tool_error(&after),
+        "the session must survive a failed command:\n{}",
+        text_of(&after["result"])
+    );
+}
+
+// ---- tier 3: the bounded-command path -----------------------------------------
+//
+// These deliberately run a command that would take hours and wait for a watchdog to cut it short,
+// so they are `#[ignore]`d rather than gated by an env var — they cost minutes, and no CI runner
+// should pay that on every push:
+//
+//     $env:WINDBG_MCP_SMOKE_DUMP = "1"
+//     cargo test --test mcp_smoke -- --ignored --nocapture --test-threads=1 bounded
+//
+// win-kexp proves the primitive (`execute_command_bounded` aborts a runaway command, and the next
+// command survives it). What is unproven *there* is this server's wiring of it, and that wiring is
+// now split across two processes: the supervisor computes the budget from what is left of the
+// caller's timeout after queue wait, and the worker arms the watchdog with it. Only the shipped
+// binary contains both halves, which is why these moved out of `src/engine.rs`.
+
+/// A deliberately runaway command: a tight `.for` in the expression evaluator, which is genuinely
+/// CPU-bound and polls for Ctrl+Break exactly as a real runaway command does.
+///
+/// A broad `s` memory search — the wedge that motivated all of this — is the wrong probe despite
+/// being the motivating case: it skips unmapped ranges, so even a whole-address-space search
+/// returns almost immediately on this dump. The `.for` also leaves its progress in `$t0`, which is
+/// what proves the interruption.
+///
+/// Sized to run for hours, so "did not finish" cannot mean "finished early on a fast host".
+const RUNAWAY_ITERATIONS: u64 = 0x4000_0000;
+
+fn runaway_command(counter: &str) -> String {
+    format!(
+        ".for (r {counter} = 0; @{counter} < 0x{RUNAWAY_ITERATIONS:x}; r {counter} = @{counter} + 1) {{ }}"
+    )
+}
+
+/// Reads a user pseudo-register (`$t0`, `$t1`) as a number from `r $tN` output. `None` if the
+/// engine printed something unexpected, so a caller can tell "unreadable" from "zero".
+fn pseudo_register(text: &str, name: &str) -> Option<u64> {
+    text.split_whitespace()
+        .find_map(|tok| tok.strip_prefix(&format!("{name}=")))
+        .and_then(|v| u64::from_str_radix(&v.replace('`', ""), 16).ok())
+}
+
+/// The whole point of the bounded path, end to end through the shipped binary: a command that
+/// would run for hours comes back to the caller *as a result* (not as a timeout), and the session
+/// is usable afterwards.
+#[test]
+#[ignore = "runs a command out to the watchdog deadline; run manually with --ignored"]
+fn a_bounded_runaway_command_aborts_and_leaves_its_session_usable() {
+    let Some(dump) = target_tier() else { return };
+    // 30s of call budget leaves the watchdog its 15s floor, which keeps the test short while
+    // still exercising the real arithmetic rather than a special case.
+    let mut server = Server::started_with(&[("WINDBG_MCP_CALL_TIMEOUT_SECS", "30")]);
+    let session =
+        session_id_of(&server.tool_text("open_dump", json!({ "path": dump }), TARGET_STEP));
+
+    let started = Instant::now();
+    let response = server.call_tool(
+        "execute",
+        json!({ "command": runaway_command("$t0"), "session_id": session }),
+        Duration::from_secs(120),
+    );
+    let elapsed = started.elapsed();
+    assert_no_error(&response, "a bounded runaway command");
+    let out = text_of(&response["result"]);
+    assert!(
+        !is_tool_error(&response),
+        "a bounded runaway command must return a result, not a timeout ({elapsed:?}):\n{out}"
+    );
+
+    // Proof of interruption is the loop counter, not the clock and not the note: the note is
+    // appended whenever the watchdog *attempted* an interrupt, so an interrupt the engine ignored
+    // would still produce it.
+    let counter = server.tool_text(
+        "execute",
+        json!({ "command": "r $t0", "session_id": session }),
+        TARGET_STEP,
+    );
+    let t0 = pseudo_register(&counter, "$t0")
+        .unwrap_or_else(|| panic!("could not read $t0 back from:\n{counter}"));
+    println!(
+        "bounded command returned after {elapsed:?}, $t0 = {t0:#x} of {RUNAWAY_ITERATIONS:#x}"
+    );
+    assert!(t0 > 0, "the loop never started ($t0 = {t0:#x})");
+    assert!(
+        t0 < RUNAWAY_ITERATIONS,
+        "the loop ran to completion ($t0 = {t0:#x}) — the watchdog did not cut it short, so the \
+         rest of this test would prove nothing"
+    );
+    assert!(
+        out.contains("interrupted after"),
+        "no interruption note despite a loop that stopped short:\n{out}"
+    );
+
+    // The wedge itself. Before the bounded path this is where every later call timed out, and
+    // the only recovery was restarting the server.
+    let after = server.call_tool("modules", json!({ "session_id": session }), TARGET_STEP);
+    assert!(
+        !is_tool_error(&after),
+        "the session was not freed by the abort — this is the wedge:\n{}",
+        text_of(&after["result"])
+    );
+    server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
+}
+
+/// The queue-aware half of the budget, which is the part that has no equivalent in win-kexp: a
+/// bounded command that spent most of the call budget waiting its turn must still abort *before*
+/// its caller's timeout, not one full budget after it was dequeued.
+///
+/// Budgeting from the full call timeout instead of the remainder passes every assertion in the
+/// test above and fails here — the command would abort well after the caller had already given
+/// up, with the session pinned in between.
+///
+/// The queue is per-session now, so the blocker has to be sent to the *same* session. A job in
+/// another session would not queue behind anything, which is the whole point of the change.
+#[test]
+#[ignore = "runs a command out to the watchdog deadline; run manually with --ignored"]
+fn a_bounded_command_queued_behind_another_job_still_beats_its_caller() {
+    let Some(dump) = target_tier() else { return };
+    const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+    const QUEUE_WAIT: Duration = Duration::from_secs(30);
+
+    let mut server = Server::started_with(&[("WINDBG_MCP_CALL_TIMEOUT_SECS", "60")]);
+    let session =
+        session_id_of(&server.tool_text("open_dump", json!({ "path": dump }), TARGET_STEP));
+
+    // Occupy the session for a known time, then queue the runaway behind it. `.sleep` blocks the
+    // engine exactly the way a long command does, and unlike a calibrated spin its duration does
+    // not depend on the host — which matters, because the arithmetic under test is about *how
+    // long* the wait was.
+    //
+    // `0n` is not decoration: the MASM evaluator's default base is **hex**, so a bare `.sleep
+    // 30000` sleeps for 0x30000 ms — three and a half minutes, not thirty seconds.
+    let blocker = server.send_request(
+        "tools/call",
+        json!({
+            "name": "execute",
+            "arguments": {
+                "command": format!(".sleep 0n{}", QUEUE_WAIT.as_millis()),
+                "session_id": session,
+            },
+        }),
+    );
+
+    // Two tool calls in flight at once are dispatched concurrently and reach the session's queue
+    // in whichever order wins the race, so "sent first" is not "queued first". This test needs
+    // the blocker to be the one holding the engine — with the order reversed it silently becomes
+    // the unqueued case and proves nothing — so give it a head start it cannot lose.
+    std::thread::sleep(Duration::from_secs(3));
+
+    let started = Instant::now();
+    let response = server.call_tool(
+        "execute",
+        json!({ "command": runaway_command("$t0"), "session_id": session }),
+        Duration::from_secs(240),
+    );
+    let elapsed = started.elapsed();
+    let out = text_of(&response["result"]);
+    assert_no_error(&response, "a queued bounded runaway command");
+    assert!(
+        out.contains("interrupted after"),
+        "the queued command was not interrupted after {elapsed:?}:\n{out}"
+    );
+    // The premise: it really did wait behind the blocker. Without this the test would quietly
+    // degrade into the unqueued case — which passes the assertion below for the wrong reason —
+    // if `.sleep` ever stopped blocking or the head start stopped being enough.
+    assert!(
+        elapsed > QUEUE_WAIT.mul_f32(0.6),
+        "the runaway did not queue behind the blocker ({elapsed:?}) — this run proves nothing \
+         about the queue-aware budget"
+    );
+    // And the claim.
+    assert!(
+        elapsed < CALL_TIMEOUT,
+        "the abort landed after the caller's {CALL_TIMEOUT:?} timeout ({elapsed:?}) — the \
+         watchdog budget did not account for the {QUEUE_WAIT:?} spent queued"
+    );
+
+    let _ = server.await_id(blocker, "the blocking command", Duration::from_secs(120));
+    server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
+}
+
+/// What the bounded path *costs* a command that was never going to run away — the evidence behind
+/// the coverage split in `DECISIONS.md` (2026-08-02), kept as a test so a win-kexp change to the
+/// watchdog can be re-measured rather than re-argued.
+///
+/// The cost is not a constant overhead but a **quantization**: win-kexp's watchdog thread checks
+/// its `done` flag, then sleeps 200ms, so a command takes `ceil(d / 200ms) * 200ms`. The tax on a
+/// point query is best read as: anything that takes 1–200ms now takes 200ms.
+///
+/// Prints rather than asserts. The cost belongs to win-kexp's watchdog, not to this crate, and a
+/// threshold pinned here would fail on an unrelated host difference. Measured through the tool
+/// surface, so the numbers now include this server's own per-call overhead — one IPC round trip
+/// on top of what the in-process version measured, which is the number a caller actually sees.
+#[test]
+#[ignore = "a measurement, not an assertion; run manually with --ignored --nocapture"]
+fn measure_what_the_bounded_path_costs_a_quick_command() {
+    let Some(dump) = target_tier() else { return };
+    const ROUNDS: usize = 20;
+
+    let mut server = Server::started();
+    let session =
+        session_id_of(&server.tool_text("open_dump", json!({ "path": dump }), TARGET_STEP));
+
+    /// min / median / max, because a mean hides the two modes entirely.
+    fn spread(mut samples: Vec<Duration>) -> String {
+        samples.sort();
+        format!(
+            "min {:?}, median {:?}, max {:?}",
+            samples[0],
+            samples[samples.len() / 2],
+            samples[samples.len() - 1]
+        )
+    }
+
+    // `modules` is `lm` on the unbounded path; `execute` runs whatever it is given on the bounded
+    // one. Same engine, same session, one difference: the watchdog.
+    for (label, command) in [
+        ("lm", "lm".to_string()),
+        (
+            ".for (short)",
+            ".for (r $t0 = 0; @$t0 < 0x4e20; r $t0 = @$t0 + 1) { }".to_string(),
+        ),
+    ] {
+        let mut unbounded = Vec::with_capacity(ROUNDS);
+        let mut bounded = Vec::with_capacity(ROUNDS);
+        for _ in 0..ROUNDS {
+            let t = Instant::now();
+            server.tool_text("modules", json!({ "session_id": session }), TARGET_STEP);
+            unbounded.push(t.elapsed());
+
+            let t = Instant::now();
+            server.tool_text(
+                "execute",
+                json!({ "command": command.clone(), "session_id": session }),
+                TARGET_STEP,
+            );
+            bounded.push(t.elapsed());
+        }
+        println!("`{label}` x{ROUNDS}");
+        println!("   unbounded (`modules` / lm): {}", spread(unbounded));
+        println!("   bounded   (`execute`):      {}", spread(bounded));
+    }
+
+    server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
 }

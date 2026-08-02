@@ -180,10 +180,10 @@ any sense" indeed.
 ## Pitfalls (learned the hard way)
 
 - **Never run an unbounded memory search on a TTD trace.** `s -u 0 L?0x400000000000 …` sends the engine
-  into a multi-minute scan that can't be interrupted through the MCP layer — it wedges the engine thread
-  and every later call times out behind it. **Scope every search** to a real region (a module range, a
-  heap segment from the PEB `ProcessHeaps`, a stack window), and prefer `ttd_calls`/`ttd_memory` over raw
-  `s`.
+  into a multi-minute scan, and every later call to that session queues behind it. **Scope every search**
+  to a real region (a module range, a heap segment from the PEB `ProcessHeaps`, a stack window), and
+  prefer `ttd_calls`/`ttd_memory` over raw `s`. `execute` is on the bounded path, so a scan that runs
+  away self-aborts rather than pinning the session indefinitely, and only that session is affected.
 - **`registers` can read empty at a module-load break** — use `execute { "r rip" }` and travel to a
   settled position before relying on context.
 - **The WinDbg `.for` radix bites.** With the default radix `10` means `0x10`; write loop bounds

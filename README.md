@@ -11,18 +11,41 @@ An [MCP](https://modelcontextprotocol.io) server that exposes **WinDbg/DbgEng** 
 **user-mode**, **kernel-mode**, **crash-dump**, and **Time Travel Debugging (TTD)** workflows.
 
 The low-level engine bindings live in [`win-kexp`](https://github.com/glslang/win-kexp)
-(`src/dbgeng.rs`); this crate adds a dedicated engine thread and the `rmcp` tool surface on top.
+(`src/dbgeng.rs`); this crate adds process-per-session engine supervision and the `rmcp` tool
+surface on top.
 
 ## Architecture
 
-- **`engine.rs`** — DbgEng requires serialized, single-thread access (`WaitForEvent` must run on the
-  session-owning thread), so the `DebugEngine` is created on, and confined to, one OS worker thread.
-  Async tool handlers marshal closures onto it via an `mpsc` channel with `oneshot` replies and a
-  per-call timeout. A `catch_unwind` guard turns a panic in one operation into a failed call rather
-  than a dead thread.
+**One debug session per process.** dbgeng.dll holds a single debuggee session per process — that is
+why `.opendump` *replaces* the target rather than opening a second one — so this server runs the MCP
+protocol in a **supervisor** process and each open target in its own **engine worker** child
+process. Two things follow, and they are why it is built this way:
+
+- **A session that cannot be unwound costs a process, not the server.** A live-kernel attach waits
+  for its target with `WaitForEvent(INFINITE)`, and nothing can interrupt a wait that has not yet
+  connected — so a guest that never dials in blocks forever. That blocks one worker, which
+  `end_session` can terminate. It used to block the server's only engine thread, and the only
+  recovery was restarting the server.
+- **Sessions are concurrent.** Triage a crash dump while a kernel attach is live; keep a TTD trace
+  open while you look at another. Up to four at once.
+
+- **`engine.rs`** — the supervisor: the session registry, worker spawn/teardown, and the routing
+  that turns a `session_id` into "which worker". Each session has one queue with one consumer, so
+  calls against a session are serialized and ordered even though sessions are not.
+- **`worker.rs`** — the child process. The `DebugEngine` is created on, and confined to, one OS
+  thread inside it (DbgEng requires serialized, single-thread access, and `WaitForEvent` must run on
+  the session-owning thread). A `catch_unwind` guard turns a panic in one operation into a failed
+  call rather than a dead session.
+- **`proto.rs`** — the line-delimited JSON protocol between the two. A closure cannot cross a
+  process boundary, so what used to be closures marshalled onto the engine thread are now
+  serializable operations — deliberately *tool*-shaped rather than DbgEng-shaped, so a tool that is
+  several engine calls (`reachable_from_dispatch`'s call-graph walk) stays one indivisible job.
 - **`server.rs`** — the MCP tools (see below), built with `rmcp`'s `#[tool_router]`/`#[tool_handler]`.
 - **`ttd.rs`** — locates `TTD.exe` and launches trace recording.
-- **`main.rs`** — tokio + stdio transport. **Logs go to stderr** (stdout is the JSON-RPC channel).
+- **`main.rs`** — role selection (supervisor or worker), tokio + stdio transport. **Logs go to
+  stderr** (stdout is the JSON-RPC channel); workers inherit the supervisor's stderr, so everything
+  lands in the same place. Workers never outlive the connection: they are terminated on shutdown,
+  and exit on their own when their stdin closes.
 
 **MCP protocol revision:** built on `rmcp` 3.x, this server accepts every revision that SDK knows —
 `2026-07-28` and the `initialize`-handshake ("legacy") era before it (`2025-11-25`, `2025-06-18`,
@@ -212,62 +235,54 @@ gh attestation verify <zip> --repo glslang/windbg-mcp `
 | Driver IOCTL | `decode_ioctl`, `driver_object`, `device_object`, `irp_stack`, `ioctl_trace`, `reachable_from_dispatch` |
 | Raw     | `execute` — run any debugger command, returns full text output |
 
-### Session handles
+### Sessions and session handles
 
 The six Session tools that open a target (`open_dump`, `open_trace`, `attach_kernel_local`,
-`attach_kernel`, `attach_process`, `launch`) return a **`session_id`**. Every tool that touches the
-debug target accepts it as an optional argument and refuses to run if it no longer matches the
-session the engine is attached to.
+`attach_kernel`, `attach_process`, `launch`) each create a **session** — one engine worker process
+holding one target — and return a **`session_id`**. Every tool that touches a target accepts that id
+as an optional argument, and it is what **routes** the call to the right worker.
 
-This matters because one server process drives one DbgEng session, while an MCP connection is *not*
-a session: a client may interleave unrelated requests over the same stdio process. Without a handle,
-a `read_memory` issued after someone else's `open_dump` silently reads the wrong target. Passing
-`session_id` turns that into a visible error instead.
+Sessions are independent. Opening a second target does not disturb the first, a call against one
+does not queue behind work in another, and ending one leaves the rest alone. Up to `4` at once; at
+the limit a new open reclaims the oldest **idle** session, and if every session has a call in flight
+the open is refused with the list rather than picking a victim. Sessions end when you `end_session`
+them or when the client disconnects — nothing is left running afterwards.
 
-The check runs **on the engine thread**, in the same queued job as the debugger call it guards.
-That ordering is what makes it sound: checking on the caller side would leave a window in which a
-concurrently-issued `open_dump` is queued ahead of a call that already passed validation, so the
-call would still execute against the replaced target.
+Omit `session_id` and a call goes to the **current** session: the most recently opened one that will
+still accept work. That is the pre-handle behaviour and it still holds. What supplying the id buys
+is that the call can never land on a target you did not open — it fails loudly instead.
+`decode_ioctl` (pure) and `record_trace` (independent of any debug session) do not take one.
 
-The guarantee is *detection, not exclusion*: the opening tools deliberately take no `session_id`, so
-holding a handle does not stop another caller replacing your target — it guarantees that any later
-call of yours which supplies the handle fails loudly instead of acting on a target you did not open.
+`session_status` lists every session — what it is, what state it is in, how long it has been there,
+and which one is current — or reports on one you name. It never queues on any worker, so it answers
+even while a session is parked.
 
-Two caveats, both in the command hatches. The typed tools announce their own transitions, but
-`execute` can replace the target directly (`.opendump`, `.attach`, `.detach`, `.kill`, `.restart`,
-`.abandon`, `.remote`, `q`/`qd`/`qq`), and those commands retire the current handle. `dx` is the
-second hatch: the data model reaches `Debugger.Utility.Control.ExecuteCommand`, which runs any
-command, so an expression that touches command execution retires the handle too — conservatively,
-since the command it runs is a runtime string this server never sees.
+**Recovering a session that is stuck.** A per-call timeout abandons the *wait*, not the job, so a
+call that reports a timeout may still be running. The case that matters is `attach_kernel`: it waits
+for the target to dial in with no timeout, and DbgEng cannot interrupt a wait that has not yet
+connected — so a guest that is powered off, not booted with debugging enabled, or pointed at the
+wrong host/port/key never arrives, and that wait never ends. `session_status` distinguishes a link
+that is still coming up (normal, ~25s for a KDNET resync) from one that has been waiting far longer
+than a healthy attach ever takes. For the second, `end_session` is the recovery: it asks the worker
+to let go, and terminates the worker process if it will not. Do **not** re-run the open while it is
+still waiting — the target was already claimed, so that would attach a second time.
+
+Two caveats, both in the command hatches, and both now confined to a single session. The typed tools
+announce their own transitions, but `execute` can replace its session's target directly
+(`.opendump`, `.attach`, `.detach`, `.kill`, `.restart`, `.abandon`, `.remote`, `q`/`qd`/`qq`), and
+those commands **retire** that session's handle: calls passing it are refused, while calls that pass
+no id still reach the worker. `dx` is the second hatch — the data model reaches
+`Debugger.Utility.Control.ExecuteCommand`, which runs any command, so an expression that touches
+command execution retires the handle too, conservatively, since the command it runs is a runtime
+string this server never sees.
 
 Both matches are deliberately biased toward retiring: over-matching costs one re-open,
 under-matching would let a stale handle through. Neither can be exhaustive — DbgEng has more ways to
 reach the target than a name list can enumerate, and the data model is extensible — so inside
 `execute` and `dx` a handle is a strong hint rather than a guarantee. Everywhere else it is a
-guarantee.
-
-The argument is optional — omit it and a call operates on whatever session is current, exactly as
-before. `decode_ioctl` (pure) and `record_trace` (independent of the debug session) do not take it.
-
-If an open times out, do not open again — recover instead. The per-call timeout abandons the *wait*,
-not the job, so the open may still be running and may still commit a handle no reply carried. A live
-`attach_kernel` is the case that matters: it waits indefinitely by design, so a call reporting a
-timeout while the attach completes moments later is normal (see *Limitations & notes*).
-
-A timed-out open therefore names the handle it *would* commit, and **`session_status`** answers for
-it: pass that id and it reports whether the open is still **pending**, has **landed**, or has
-**failed**.
-
-That three-way answer is the point. The current handle alone cannot distinguish them — "not yours"
-is equally true while you wait and after you have failed — and the two cases need opposite
-responses. While pending, re-running the open would attach to or start a *second* target. Once
-failed, opening again is the only way forward. Guessing either way is a real mistake, so the server
-tracks the outcome rather than leaving you to infer it.
-
-Only the last few *settled* opens are remembered — an open still in flight is never forgotten, so an
-id `session_status` does not recognise is one that finished a while ago, and re-opening is safe.
-`session_status` does not queue on the engine thread, so it still answers while a parked attach
-holds it.
+guarantee, and it is enforced at the front of that session's queue, after everything queued ahead of
+it: checking on the caller's side would leave a window in which an `execute { ".opendump …" }`
+already queued ahead retires the handle between a caller's check and its call.
 
 ### Typed operands are operands, not commands
 
@@ -287,10 +302,11 @@ command list — it is annotated destructive and retires the handle when a comma
 
 ### Error reporting
 
-A failed *debugger operation* — an unresolvable symbol, an unreadable address, a target that never
-stopped — comes back as a normal tool result with `isError: true` and the debugger's own text, so
-the model can read it and correct itself. Only a dead engine thread is reported as a JSON-RPC
-protocol error.
+Anything scoped to a session comes back as a normal tool result with `isError: true` and the text
+intact, so the model can read it and correct itself: a failed *debugger operation* (an unresolvable
+symbol, an unreadable address, a target that never stopped), a refused handle, a timeout, a session
+whose worker is gone. Each has a next move. The only JSON-RPC protocol error is the one failure that
+is the server's rather than a session's — no engine worker could be started at all.
 
 The forward (`go`/`step_over`/`step_into`) and reverse (`reverse_go`/`step_over_back`/`step_back`)
 control tools mirror a debugger UI's F9/F8/F7 and Shift+F9/F8/F7, so an agent can drive a trace in
@@ -335,14 +351,16 @@ timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressio
   (after a `go`/breakpoint, not straight off a `!tt`) so the module's PDB is matched and loaded.
   With those, e.g. `ttd_calls("ucrtbase!__stdio_common_vfprintf")` returns the exact call count.
   Without symbols, the data model, navigation, and memory reads still work — query by address.
-- **One debug session, one command at a time.** A single engine instance runs on a dedicated
-  thread and processes operations serially. Issue tool calls **sequentially — await each result
-  before sending the next**; the server does not order concurrent in-flight requests, so pipelining
-  them (firing several calls before their results return) can run a command before the one that
-  establishes its state (a call racing ahead of `open_dump` fails with `0x80040205`), and is
-  meaningless for stateful, order-dependent debugger commands anyway. Standard MCP clients already
-  serialize call→result, so this is only a concern for custom/batched callers. End a session with
-  `end_session` before opening another target.
+- **One command at a time per session.** Sessions run concurrently, but each one is a single engine
+  processing operations serially, so a call against a busy session waits its turn. Issue tool calls
+  for a given session **sequentially — await each result before sending the next**: the server does
+  not order concurrent in-flight requests against each other, so pipelining them (firing several
+  calls before their results return) can run a command before the one that establishes its state,
+  and is meaningless for stateful, order-dependent debugger commands anyway. Standard MCP clients
+  already serialize call→result, so this is only a concern for custom/batched callers.
+- **Sessions are a bounded resource.** Each is a process holding a dump, a trace, or a live target,
+  and at most `4` are open at once. `end_session` when you are done with one rather than relying on
+  the oldest idle session being reclaimed.
 - TTD **replay** (`open_trace`) needs `TTDReplay.dll` discoverable but **not** elevation; TTD
   **recording** (`record_trace`) needs `TTD.exe` **and** Administrator. `record_trace` captures the
   recorder's startup output to `<out_dir>\ttd_record.log` and watches it briefly, so a fast failure

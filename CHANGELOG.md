@@ -9,16 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Each debug session now runs in its own engine process, and a session that cannot be unwound
+  can be reclaimed** ([#61](https://github.com/glslang/windbg-mcp/issues/61)).
+
+  A live kernel attach waits for its target with `WaitForEvent(INFINITE)`, and DbgEng cannot
+  interrupt a wait that has not yet connected. So a guest that is powered off, not booted with
+  debugging enabled, or pointed at the wrong host/port/key parked the attach forever — measured on
+  hardware at 300s with no bound and no cancellation path. With one engine thread that park owned
+  the server: every later tool call queued behind it, `end_session` included, and the only recovery
+  was restarting the process. Since the most common mistake in kernel debugging is exactly "the
+  guest is not in debug mode", an agent driving this server hit it routinely.
+
+  The server now runs MCP in a supervisor process and each open target in its own engine worker
+  child process. The park costs one worker, and **`end_session` terminates it** — asking the worker
+  to let go first, killing it if it will not. That is the in-band recovery that did not exist.
+
+  What this changes for callers:
+
+  - **Sessions are concurrent and no longer replace each other.** Triage a crash dump while a kernel
+    attach is live; keep two traces open at once. Up to four; at the limit a new open reclaims the
+    oldest *idle* session, and refuses with the list if every session is busy. The opener tools no
+    longer say "replaces any session already open", because they do not.
+  - **`session_id` routes rather than merely detects.** It names the worker holding your target, so
+    another caller's open cannot invalidate your handle — the accident the handle was built to
+    report is now largely impossible rather than merely visible.
+  - **`session_status` lists every session**, with what state each is in and how long it has been
+    there. For an attach that has not landed, that duration is the whole signal: a KDNET link
+    still coming up (~25s) and one that will never come up were previously indistinguishable, and
+    they need opposite responses. Past the point a healthy attach takes it says so, and names the
+    recovery. It still never queues on any worker, so it answers while a session is parked.
+  - **Nothing outlives the connection.** Workers are terminated on shutdown and exit on their own
+    when their stdin closes, so a disconnect cannot leak a debugger process — or a debuggee.
+  - Failures scoped to a session (a debugger error, a timeout, a refused handle, a worker that
+    died) are all tool errors with their text intact. The only JSON-RPC protocol error left is
+    "no engine worker could be started at all".
+
+  Reasoning, and why the two cheaper mitigations were not the fix, in
+  [`DECISIONS.md`](./DECISIONS.md). The smoke test's debugger tier now covers the reported case end
+  to end: an attach parked on a dead port, another session opened alongside it, and `end_session`
+  reclaiming it.
+
 - **The bounded-command path now has a stated coverage rule, and tests that prove it works.**
   0.3.0 routed `execute`, `dx` and the `ttd_*` tools through a watchdog that Ctrl+Breaks a
   runaway command before it can pin the engine thread, but nothing exercised that interrupt
   end to end, and "why these five?" had no written answer.
 
-  `src/engine.rs` gains both. The queue-aware budget arithmetic is now a pure function with
-  unit tests that ride `cargo test`; three `#[ignore]`d tests drive a real engine, proving a
-  runaway command self-aborts and leaves the engine usable — including from behind a queued
-  job, which is the half win-kexp's own tests cannot cover because the queue belongs to this
-  crate. See [`docs/smoke-test.md`](./docs/smoke-test.md).
+  It gains both. The queue-aware budget arithmetic is a pure function with unit tests that ride
+  `cargo test` (`src/worker.rs`, next to the watchdog it arms); three `#[ignore]`d tests drive a
+  real engine through the shipped binary, proving a runaway command self-aborts and leaves its
+  session usable — including from behind a queued job, which is the half win-kexp's own tests
+  cannot cover because the queue belongs to this crate. See
+  [`docs/smoke-test.md`](./docs/smoke-test.md).
 
   The coverage rule, recorded in [`DECISIONS.md`](./DECISIONS.md): bound a command when its
   cost scales with the target's size or with an arbitrary caller-supplied expression; leave

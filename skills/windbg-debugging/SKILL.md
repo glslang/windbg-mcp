@@ -44,24 +44,30 @@ a bare `execute`, which only sets the run state and doesn't move the target.
 
 ## Cross-cutting gotchas (apply to every workflow)
 
-- **One debug session, and one command at a time** (single engine instance, run serially on
-  one thread). End a session with `end_session` before opening another target. Issue tool calls
-  **sequentially — await each result before the next**: concurrent in-flight requests aren't
-  ordered, so a pipelined call can run before `open_dump` establishes a target and fail with
+- **One command at a time per session.** Each session is its own engine process, so sessions run
+  independently — but within one, work is serial. Issue tool calls for a session **sequentially —
+  await each result before the next**: concurrent in-flight requests aren't ordered against each
+  other, so a pipelined call can run before `open_dump` establishes a target and fail with
   `0x80040205`, and pipelining stateful debugger commands is unsafe regardless. (Normal MCP
   clients serialize call→result; this only bites custom/batched callers.)
 - **Carry the `session_id`.** The tools that open a target return one; pass it on every later
-  call. The server process is shared, so another caller can replace the target underneath you —
-  with the handle that becomes a clear "stale session handle" error instead of a `read_memory`
-  that quietly returns someone else's memory. Omitting it means "whatever session is current".
-  If an open **times out**, do not retry it — that connects or spawns a second time. The timeout
-  abandons the wait, not the job, so the open may still land; the message names the `session_id`
-  it would commit. Ask `session_status { "session_id": "<that id>" }` — it reports **pending**,
-  **landed**, or **failed**. While pending, do not re-run the open (that attaches or launches a
-  second time); once failed, re-running is the only way forward.
+  call — it routes the call to that target's engine. Omitting it means "whatever session is
+  current" (the newest one still accepting work), which is fine when you only have one and a
+  silent wrong-target read when you have more.
+- **Opening a target does not close the ones you have.** Up to four sessions at once, so you can
+  triage a dump while a kernel attach is live. `end_session` when you are done with one; at the
+  limit a new open reclaims the oldest *idle* session, and refuses if every session is busy.
+- **If an open times out, do not retry it** — that connects or spawns a *second* time. The timeout
+  abandons the wait, not the job, so the open may still land. Ask `session_status
+  { "session_id": "<the id the timeout named>" }`: it says what state the session is in and how
+  long it has been there. For a kernel attach that distinction is the whole thing — a link still
+  coming up (~25s) looks identical to a guest that will never dial in, and only the elapsed time
+  tells them apart. Past that point the report says so, and `end_session` reclaims the session,
+  terminating its engine process if the wait will not unwind. It never affects your other sessions.
 - **A failed debugger operation comes back as a normal tool result**, flagged as an error and
   carrying the debugger's own text — read it and adjust (wrong symbol, unmapped address, target
-  still running). Only a dead engine surfaces as a transport-level protocol error.
+  still running). So do a refused handle and a session whose engine died; all of them are things
+  you can act on. Only "no engine could be started at all" is a transport-level protocol error.
 - **Symbol *names* (`module!func`) need three things together:** (a) `msdia140.dll`
   bundled next to the binary, (b) a symbol path (`execute` →
   `.sympath srv*C:\ProgramData\Dbg\sym*https://msdl.microsoft.com/download/symbols`), and
