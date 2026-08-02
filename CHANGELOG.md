@@ -38,16 +38,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     still coming up (~25s) and one that will never come up were previously indistinguishable, and
     they need opposite responses. Past the point a healthy attach takes it says so, and names the
     recovery. It still never queues on any worker, so it answers while a session is parked.
-  - **Nothing outlives the connection.** Workers are terminated on shutdown and exit on their own
-    when their stdin closes, so a disconnect cannot leak a debugger process — or a debuggee.
+  - **Nothing outlives the connection, and nothing is left halted.** A disconnect ends every
+    session the way `end_session` does — released, then terminated if it will not let go — so it
+    cannot leak a debugger process, a debuggee, or (the one that bites) a *frozen kernel target*:
+    DbgEng leaves a detached-but-halted kernel stopped, so a worker killed outright would take the
+    target machine down with the connection.
   - Failures scoped to a session (a debugger error, a timeout, a refused handle, a worker that
     died) are all tool errors with their text intact. The only JSON-RPC protocol error left is
     "no engine worker could be started at all".
 
   Reasoning, and why the two cheaper mitigations were not the fix, in
-  [`DECISIONS.md`](./DECISIONS.md). The smoke test's debugger tier now covers the reported case end
-  to end: an attach parked on a dead port, another session opened alongside it, and `end_session`
-  reclaiming it.
+  [`DECISIONS.md`](./DECISIONS.md). The smoke test's debugger tier covers the reported case end to
+  end — an attach parked on a dead port, another session opened alongside it, and `end_session`
+  reclaiming it — and a new live-kernel tier drives a real KDNET target through attach, coexistence
+  and detach, checking against the target's own uptime that a disconnect leaves it *running*.
 
 - **The bounded-command path now has a stated coverage rule, and tests that prove it works.**
   0.3.0 routed `execute`, `dx` and the `ttd_*` tools through a watchdog that Ctrl+Breaks a

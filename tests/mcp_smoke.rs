@@ -22,11 +22,16 @@
 //!   beside the budget arithmetic in `src/engine.rs` because the two halves it proves are now
 //!   in *different processes* — the budget is computed by the supervisor and armed by the
 //!   worker — so the only place the wiring exists as a whole is the shipped binary.
+//! * **Live kernel** (`#[ignore]`d **and** `WINDBG_MCP_SMOKE_KERNEL=<connection string>`) — a
+//!   real KDNET target. The only tier that touches another machine, and the only one that can
+//!   prove a kernel attach still *lands* and lets go cleanly rather than merely parks. Run it
+//!   last, on its own.
 //!
 //! See `docs/smoke-test.md` for the runbook.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex};
@@ -1484,4 +1489,361 @@ fn measure_what_the_bounded_path_costs_a_quick_command() {
     }
 
     server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
+}
+
+// ---- tier 4: a live KDNET kernel target ---------------------------------------
+//
+// The only tier that touches another machine. Everything above proves the *parked* half of a
+// kernel attach — a connection nothing answers — which is the failure #61 was about, but says
+// nothing about the half that has to keep working: an attach that actually lands, drives a real
+// target through a worker process, and lets go of it cleanly.
+//
+// Doubly gated, because running it by accident has consequences on a machine that is not this
+// one. `#[ignore]` keeps it out of every default run, and it needs a connection string only the
+// operator has:
+//
+//     $env:WINDBG_MCP_SMOKE_KERNEL = "net:port=50000,key=<w.x.y.z>"
+//     cargo test --test mcp_smoke -- --ignored --nocapture live_kernel
+//
+// Run it **last**, on its own, as the final step of the manual checklist: it is the only tier
+// whose blast radius includes a VM you care about.
+//
+// Remote (KDNET) only. `attach_kernel_local` is a different code path with a different failure
+// mode, it needs Secure Boot off to be attachable at all, and a frozen local kernel is the host
+// you are testing from.
+
+/// The connection string for the live-kernel tier, or `None` when it is off.
+fn kernel_tier() -> Option<String> {
+    match std::env::var("WINDBG_MCP_SMOKE_KERNEL") {
+        Ok(connection) if !connection.trim().is_empty() => Some(connection.trim().to_string()),
+        _ => {
+            skip(
+                "set WINDBG_MCP_SMOKE_KERNEL=\"net:port=<n>,key=<w.x.y.z>\" to run the \
+                 live-kernel tier",
+            );
+            None
+        }
+    }
+}
+
+/// The `port=` field of a KDNET connection string.
+fn kdnet_port(connection: &str) -> Option<u16> {
+    connection
+        .split(',')
+        .find_map(|field| field.trim().strip_prefix("port="))
+        .and_then(|port| port.trim().parse().ok())
+}
+
+/// `System Uptime` out of `.time` output, e.g. `0 days 0:05:31.599`.
+///
+/// A halted kernel's uptime does not advance — no CPU is running to take the clock interrupt — so
+/// this is the one signal that distinguishes a target that was *left running* from one that was
+/// merely left reachable. Returns `None` if the shape is not what this expects, so a caller can
+/// tell "did not advance" from "could not tell".
+fn system_uptime(time_output: &str) -> Option<Duration> {
+    let value = time_output
+        .lines()
+        .find_map(|line| line.split_once("System Uptime:"))?
+        .1
+        .trim();
+    let (days, hms) = match value.split_once("day") {
+        Some((days, rest)) => (
+            days.trim().parse::<u64>().ok()?,
+            rest.trim_start_matches('s').trim(),
+        ),
+        None => (0, value),
+    };
+    let mut parts = hms.split(':');
+    let hours: u64 = parts.next()?.trim().parse().ok()?;
+    let minutes: u64 = parts.next()?.trim().parse().ok()?;
+    let seconds: f64 = parts.next()?.trim().parse().ok()?;
+    Some(Duration::from_secs_f64(
+        (days * 86_400 + hours * 3_600 + minutes * 60) as f64 + seconds,
+    ))
+}
+
+/// Whether `pid` owns a UDP endpoint on `port`, per `netstat -ano`.
+fn owns_udp_port(pid: u32, port: u16) -> bool {
+    let out = Command::new("netstat")
+        .args(["-ano", "-p", "UDP"])
+        .output()
+        .expect("run netstat");
+    // `  UDP    0.0.0.0:50000    *:*    1234` — local address second, owning pid last.
+    String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+        let local = line.split_whitespace().nth(1).unwrap_or_default();
+        let owner = line.split_whitespace().last().unwrap_or_default();
+        local.ends_with(&format!(":{port}")) && owner == pid.to_string()
+    })
+}
+
+/// A live KDNET session, end to end: attach, work, coexist with another session, detach cleanly.
+///
+/// The claims that need a real target, and that the dead-port test cannot make:
+///
+/// * an attach that **lands** still works through a worker process — the `Committed`/`Opened`
+///   milestones cross the pipe and leave the session `Open` rather than stuck mid-attach;
+/// * the KD transport endpoint belongs to the **worker**, which is the premise of the whole fix.
+///   A thread-based design leaves that endpoint claimed for the life of the server, and each
+///   retry claims another;
+/// * a second session works *alongside* a live kernel attach — impossible by construction before
+///   — checked here on the target it matters most for;
+/// * `end_session` takes the **graceful** path on a live kernel. That is not tidiness: DbgEng
+///   leaves a detached-but-halted kernel frozen, so win-kexp resumes and *actively* detaches. A
+///   session that fell through to the worker kill instead would leave the guest halted — one CPU
+///   stopped, the rest spinning — and its KD stub wedged until a reboot.
+///
+/// Which is also why the body runs under `catch_unwind`: from the attach onward the target is
+/// broken in and stays that way until the session ends, so a panic that skipped the detach would
+/// leave someone's VM frozen because a test failed.
+#[test]
+#[ignore = "needs a live KDNET target and its connection string; run manually, last"]
+fn a_live_kernel_session_attaches_coexists_and_detaches_cleanly() {
+    let Some(connection) = kernel_tier() else {
+        return;
+    };
+    let mut server = Server::started();
+
+    let attached = server.call_tool(
+        "attach_kernel",
+        json!({ "connection": connection }),
+        TARGET_STEP,
+    );
+    assert_no_error(&attached, "attach_kernel");
+    let report = text_of(&attached["result"]);
+    assert!(
+        !is_tool_error(&attached),
+        "the attach did not land. The target must be booted with debugging enabled and dialling \
+         this host, and the KD transport is single-owner — if WinDbg's EngHost already holds the \
+         port, nothing else can attach:\n{report}"
+    );
+    let session = session_id_of(&report);
+    // `vertarget`, run by the opener inside the worker.
+    assert!(
+        report.contains("Kernel"),
+        "the post-attach report should be `vertarget` output naming the kernel:\n{report}"
+    );
+
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        // The milestones made it across: not still "attaching", which is where a parked one sits.
+        let status = server.tool_text("session_status", json!({ "session_id": session }), STEP);
+        assert!(
+            status.contains("ready for work"),
+            "a landed attach must report as open, not mid-attach:\n{status}"
+        );
+
+        // The transport lives in the worker — the process `end_session` can terminate.
+        if let Some(port) = kdnet_port(&connection) {
+            let worker = engine_pid_of(&status, &session);
+            assert!(
+                owns_udp_port(worker, port),
+                "UDP {port} is not owned by the engine worker (pid {worker}) — if the KD endpoint \
+                 belonged to the server instead, a session that cannot unwind could not be \
+                 reclaimed, which is the whole premise of running sessions in their own processes"
+            );
+        }
+
+        // A routed call reaches the right worker, and the target is real.
+        let modules = server.tool_text("modules", json!({ "session_id": session }), TARGET_STEP);
+        let listed: Vec<&str> = modules
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(2))
+            .collect();
+        assert!(
+            listed.contains(&"nt"),
+            "the kernel image should be in the module list:\n{modules}"
+        );
+        let registers =
+            server.tool_text("registers", json!({ "session_id": session }), TARGET_STEP);
+        assert!(
+            registers.contains("rip="),
+            "a broken-in kernel should have a thread context:\n{registers}"
+        );
+
+        // The payoff, on the target it matters most for: another session opened and used while a
+        // live kernel attach is held, and the kernel session untouched by it.
+        if std::path::Path::new(SAMPLE_DUMP).exists() {
+            let opened = server.call_tool("open_dump", json!({ "path": SAMPLE_DUMP }), TARGET_STEP);
+            assert_no_error(&opened, "open_dump alongside a live kernel session");
+            assert!(
+                !is_tool_error(&opened),
+                "opening a dump must not be blocked by a live kernel session:\n{}",
+                text_of(&opened["result"])
+            );
+            let dump_session = session_id_of(&text_of(&opened["result"]));
+            let after = server.call_tool("modules", json!({ "session_id": session }), TARGET_STEP);
+            assert!(
+                !is_tool_error(&after),
+                "the kernel session must survive another session being opened:\n{}",
+                text_of(&after["result"])
+            );
+            server.tool_text(
+                "end_session",
+                json!({ "session_id": dump_session }),
+                TARGET_STEP,
+            );
+        } else {
+            eprintln!("NOTE: sample dump missing, skipping the second-session check");
+        }
+    }));
+
+    // Always, whatever happened above — the target is frozen until this runs.
+    let ended = server.call_tool("end_session", json!({ "session_id": session }), TARGET_STEP);
+    let ended_text = text_of(&ended["result"]);
+    if let Err(panic) = outcome {
+        eprintln!("detached after the failure below:\n{ended_text}");
+        resume_unwind(panic);
+    }
+
+    assert_no_error(&ended, "end_session on a live kernel");
+    assert!(
+        !ended_text.contains("terminated"),
+        "the worker was killed instead of detaching — DbgEng leaves a detached-but-halted kernel \
+         frozen, so this would have left the target stopped and its KD stub wedged:\n{ended_text}"
+    );
+    assert!(
+        ended_text.contains("closed"),
+        "end_session should report the session closed:\n{ended_text}"
+    );
+    println!("live kernel session detached cleanly:\n{ended_text}");
+}
+
+/// Disconnecting with a live kernel session open must **release** it, not kill its worker.
+///
+/// This is the same hazard as the detach above, arriving by the path nobody is watching. A client
+/// disconnect is an ordinary event — closing a laptop lid ends one — and the sessions it finds are
+/// whatever happened to be open. Killing a worker that holds a broken-in kernel leaves the target
+/// halted: DbgEng needs the resume-and-active-detach that only a real teardown performs.
+///
+/// Caught by running this tier for the first time: shutdown killed workers outright, so a
+/// disconnect froze the target machine. The dump-based tier could never have found it — killing a
+/// worker that holds a *dump* costs nothing at all.
+///
+/// The proof is the target's own **uptime**, read either side of the disconnect. A halted kernel
+/// takes no clock interrupt, so its uptime stands still; a released one keeps counting. Re-attaching
+/// alone would not show this — a frozen target still answers its KD stub — which is exactly the
+/// trap that made the bug survive a first round of manual checking.
+#[test]
+#[ignore = "needs a live KDNET target and its connection string; run manually, last"]
+fn disconnecting_releases_a_live_kernel_session_rather_than_killing_it() {
+    let Some(connection) = kernel_tier() else {
+        return;
+    };
+
+    let mut server = Server::started();
+    let attached = server.call_tool(
+        "attach_kernel",
+        json!({ "connection": connection }),
+        TARGET_STEP,
+    );
+    assert_no_error(&attached, "attach_kernel");
+    assert!(
+        !is_tool_error(&attached),
+        "the attach did not land:\n{}",
+        text_of(&attached["result"])
+    );
+    let status = server.tool_text("session_status", json!({}), STEP);
+    let session = session_id_of(&text_of(&attached["result"]));
+    let worker = engine_pid_of(&status, &session);
+    let before = system_uptime(&server.tool_text(
+        "execute",
+        json!({ "command": ".time", "session_id": session }),
+        TARGET_STEP,
+    ));
+
+    // --- act, and *collect* rather than assert -------------------------------------------
+    //
+    // Nothing below panics until the target has been re-attached and detached again. Asserting
+    // as it goes reads better and is wrong here: the first version of this test failed at the
+    // release check and left the target halted, because the recovery came after the assertion.
+    // A test for a bug that freezes a machine must not freeze the machine when it fails.
+
+    // Disconnect the way a client does: close stdin and let the server wind itself up. No
+    // `end_session` — that is the whole point. The log is captured before `shutdown` consumes
+    // the harness, since what it says is half the evidence.
+    let log = Arc::clone(&server.stderr_log);
+    let exit = server.shutdown();
+
+    // The stderr reader is a separate thread draining a pipe the process just closed, so poll
+    // rather than snapshot — a bare read races the drain and fails intermittently.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let stderr = loop {
+        let stderr = log.lock().unwrap().join("\n");
+        if stderr.contains("releasing 1 session") || Instant::now() >= deadline {
+            break stderr;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while process_alive(worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let worker_gone = !process_alive(worker);
+
+    // Give the target time to visibly run, if it is running at all.
+    const RUNNING_FOR: Duration = Duration::from_secs(4);
+    std::thread::sleep(RUNNING_FOR);
+
+    // Re-attach: needed to read the uptime again, and it is also how the target gets left
+    // detached and running rather than broken in.
+    let mut again = Server::started();
+    let reattached = again.call_tool(
+        "attach_kernel",
+        json!({ "connection": connection }),
+        TARGET_STEP,
+    );
+    let report = text_of(&reattached["result"]);
+    let landed = reattached["error"].is_null() && !is_tool_error(&reattached);
+    let (after, ended) = if landed {
+        let session = session_id_of(&report);
+        let after = system_uptime(&again.tool_text(
+            "execute",
+            json!({ "command": ".time", "session_id": session }),
+            TARGET_STEP,
+        ));
+        // The release. From here the target is running again whatever the assertions say.
+        let ended = again.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
+        (after, ended)
+    } else {
+        (None, String::new())
+    };
+
+    // --- now assert ----------------------------------------------------------------------
+    assert_eq!(exit, Some(0), "a disconnect should still be a clean exit");
+    assert!(
+        stderr.contains("releasing 1 session"),
+        "the disconnect should have *released* the kernel session, not killed its worker — a \
+         killed worker leaves the target halted:\n{stderr}"
+    );
+    assert!(
+        worker_gone,
+        "engine worker pid {worker} outlived the connection"
+    );
+    assert!(
+        landed,
+        "the target was not reattachable after a disconnect — the previous session did not let go \
+         of it cleanly, and this run could not put it back:\n{report}"
+    );
+    assert!(
+        !ended.contains("terminated"),
+        "the final detach must be graceful, or the target is left frozen:\n{ended}"
+    );
+    match (before, after) {
+        (Some(before), Some(after)) => {
+            let ran_for = after.saturating_sub(before);
+            println!("target uptime advanced {ran_for:?} across a {RUNNING_FOR:?} disconnect");
+            assert!(
+                ran_for >= RUNNING_FOR / 2,
+                "the target's uptime barely moved across the disconnect ({ran_for:?} over \
+                 {RUNNING_FOR:?}) — it was left halted, which is what killing a worker that holds \
+                 a broken-in kernel does instead of releasing it"
+            );
+        }
+        // Not a failure: the check is only as good as `.time`'s shape, and the release itself is
+        // asserted above. Say so loudly rather than pass quietly on the weaker claim.
+        _ => eprintln!(
+            "NOTE: could not read System Uptime either side of the disconnect, so this run \
+             proved only that the session was released and the target stayed reachable"
+        ),
+    }
 }

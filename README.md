@@ -44,8 +44,11 @@ process. Two things follow, and they are why it is built this way:
 - **`ttd.rs`** — locates `TTD.exe` and launches trace recording.
 - **`main.rs`** — role selection (supervisor or worker), tokio + stdio transport. **Logs go to
   stderr** (stdout is the JSON-RPC channel); workers inherit the supervisor's stderr, so everything
-  lands in the same place. Workers never outlive the connection: they are terminated on shutdown,
-  and exit on their own when their stdin closes.
+  lands in the same place. Workers never outlive the connection: a disconnect ends every session
+  the same way `end_session` does — released, then terminated if it will not let go — and a worker
+  exits on its own if its stdin closes. Releasing rather than killing matters for a live kernel:
+  DbgEng leaves a detached-but-halted kernel *frozen*, so a worker killed outright would leave the
+  target machine stopped.
 
 **MCP protocol revision:** built on `rmcp` 3.x, this server accepts every revision that SDK knows —
 `2026-07-28` and the `initialize`-handshake ("legacy") era before it (`2025-11-25`, `2025-06-18`,
@@ -246,7 +249,8 @@ Sessions are independent. Opening a second target does not disturb the first, a 
 does not queue behind work in another, and ending one leaves the rest alone. Up to `4` at once; at
 the limit a new open reclaims the oldest **idle** session, and if every session has a call in flight
 the open is refused with the list rather than picking a victim. Sessions end when you `end_session`
-them or when the client disconnects — nothing is left running afterwards.
+them or when the client disconnects — a disconnect is treated as `end_session` on everything, so
+no debugger process is left behind and no target is left halted.
 
 Omit `session_id` and a call goes to the **current** session: the most recently opened one that will
 still accept work. That is the pre-handle behaviour and it still holds. What supplying the id buys
