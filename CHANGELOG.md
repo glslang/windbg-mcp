@@ -38,11 +38,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     still coming up (~25s) and one that will never come up were previously indistinguishable, and
     they need opposite responses. Past the point a healthy attach takes it says so, and names the
     recovery. It still never queues on any worker, so it answers while a session is parked.
-  - **Nothing outlives the connection, and nothing is left halted.** A disconnect ends every
-    session the way `end_session` does — released, then terminated if it will not let go — so it
-    cannot leak a debugger process, a debuggee, or (the one that bites) a *frozen kernel target*:
-    DbgEng leaves a detached-but-halted kernel stopped, so a worker killed outright would take the
-    target machine down with the connection.
+  - **Nothing outlives the connection.** A disconnect ends every session the way `end_session`
+    does: each is asked to release its target, and terminated only if it will not let go within a
+    few seconds. So it cannot leak a debugger process or a debuggee.
+
+    Releasing rather than killing matters most for a live kernel, because DbgEng leaves a
+    detached-but-*halted* kernel stopped — a worker killed outright takes the target machine down
+    with the connection. The graceful path is what a disconnect normally takes, and the live-kernel
+    tier checks against the target's own uptime that it does. The residual risk is a session that
+    cannot let go in time — one busy in a long `go`, say — which is terminated, and for a live
+    kernel that does leave the target halted. Ending such a session with `end_session` first (it
+    allows a longer grace) is the way to avoid it.
   - Failures scoped to a session (a debugger error, a timeout, a refused handle, a worker that
     died) are all tool errors with their text intact. The only JSON-RPC protocol error left is
     "no engine worker could be started at all".

@@ -45,10 +45,11 @@ process. Two things follow, and they are why it is built this way:
 - **`main.rs`** — role selection (supervisor or worker), tokio + stdio transport. **Logs go to
   stderr** (stdout is the JSON-RPC channel); workers inherit the supervisor's stderr, so everything
   lands in the same place. Workers never outlive the connection: a disconnect ends every session
-  the same way `end_session` does — released, then terminated if it will not let go — and a worker
-  exits on its own if its stdin closes. Releasing rather than killing matters for a live kernel:
-  DbgEng leaves a detached-but-halted kernel *frozen*, so a worker killed outright would leave the
-  target machine stopped.
+  the same way `end_session` does — asked to release its target, and terminated only if it will not
+  let go within a few seconds — and a worker exits on its own if its stdin closes. Releasing rather
+  than killing matters for a live kernel, because DbgEng leaves a detached-but-halted kernel
+  *frozen*: a session still busy when the client disconnects is terminated, and that does leave the
+  target stopped, so end a live kernel session explicitly rather than relying on the disconnect.
 
 **MCP protocol revision:** built on `rmcp` 3.x, this server accepts every revision that SDK knows —
 `2026-07-28` and the `initialize`-handshake ("legacy") era before it (`2025-11-25`, `2025-06-18`,
@@ -249,8 +250,10 @@ Sessions are independent. Opening a second target does not disturb the first, a 
 does not queue behind work in another, and ending one leaves the rest alone. Up to `4` at once; at
 the limit a new open reclaims the oldest **idle** session, and if every session has a call in flight
 the open is refused with the list rather than picking a victim. Sessions end when you `end_session`
-them or when the client disconnects — a disconnect is treated as `end_session` on everything, so
-no debugger process is left behind and no target is left halted.
+them or when the client disconnects — a disconnect is treated as `end_session` on everything, so no
+debugger process is left behind. It gives each session a shorter grace than `end_session` does,
+though, so end a live kernel session explicitly if you can: one still busy at disconnect is
+terminated, and a terminated kernel session leaves its target halted.
 
 Omit `session_id` and a call goes to the **current** session: the most recently opened one that will
 still accept work. That is the pre-handle behaviour and it still holds. What supplying the id buys
