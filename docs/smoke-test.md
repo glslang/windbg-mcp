@@ -22,7 +22,7 @@ connected MCP client holds a lock on (see [`CLAUDE.md`](../CLAUDE.md)). Whole su
 | **Protocol** | always | nothing — no debugger, no target, no network | transport, revision negotiation, tool-surface drift |
 | **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump | `win-kexp` / DbgEng regressions |
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
-| **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a KDNET target you can freeze | that a kernel attach *lands*, coexists, and detaches cleanly |
+| **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a KDNET target you can freeze | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect |
 | **Live (other)** | manual | TTD engine, elevation, a test driver | see [Manual checklist](#manual-checklist) |
 
 The protocol tier rides `cargo test`, so CI already runs it. The debugger tier is opt-in: it
@@ -172,8 +172,12 @@ see the KDNET gotchas in [`CLAUDE.md`](../CLAUDE.md) before diagnosing a failure
 
 ```pwsh
 $env:WINDBG_MCP_SMOKE_KERNEL = "net:port=50000,key=<w.x.y.z>"
-cargo test --test mcp_smoke -- --ignored --nocapture live_kernel
+cargo test --test mcp_smoke -- --ignored --nocapture --test-threads=1 live_kernel
 ```
+
+`--test-threads=1` is required, not tidiness: the filter matches **two** tests, and the KD
+transport is single-owner, so run in parallel the second attach fails and can leave the target
+halted.
 
 The connection string is the one from `bcdedit /dbgsettings` on the target (or the `kd -k` command
 you would otherwise use). It is **never** guessable, so the tier is gated on it rather than on a

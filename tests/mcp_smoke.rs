@@ -1503,7 +1503,7 @@ fn measure_what_the_bounded_path_costs_a_quick_command() {
 // operator has:
 //
 //     $env:WINDBG_MCP_SMOKE_KERNEL = "net:port=50000,key=<w.x.y.z>"
-//     cargo test --test mcp_smoke -- --ignored --nocapture live_kernel
+//     cargo test --test mcp_smoke -- --ignored --nocapture --test-threads=1 live_kernel
 //
 // Run it **last**, on its own, as the final step of the manual checklist: it is the only tier
 // whose blast radius includes a VM you care about.
@@ -1526,12 +1526,33 @@ fn kernel_tier() -> Option<String> {
     }
 }
 
-/// The `port=` field of a KDNET connection string.
+/// The `port=` field of a KDNET connection string such as `net:port=50000,key=w.x.y.z`.
+///
+/// The transport prefix sits on the *first* field (`net:port=50000`), not in front of the whole
+/// string, so matching `port=` against the raw field silently misses — and a `None` here skips the
+/// UDP-ownership assertion rather than failing it, which is how the first version of this went
+/// unnoticed through several runs.
 fn kdnet_port(connection: &str) -> Option<u16> {
     connection
         .split(',')
+        .filter_map(|field| field.rsplit(':').next())
         .find_map(|field| field.trim().strip_prefix("port="))
         .and_then(|port| port.trim().parse().ok())
+}
+
+/// Pinned in the default tier, because the failure it guards against is a *silent skip*: the
+/// assertion it feeds is conditional on `Some`, so a parser that stops matching takes the proof
+/// with it and every run still passes.
+#[test]
+fn a_kdnet_connection_string_yields_its_port() {
+    assert_eq!(kdnet_port("net:port=50000,key=1.1.1.1"), Some(50000));
+    assert_eq!(kdnet_port("net:port=50005,key=a.b.c.d,foo=1"), Some(50005));
+    // Spacing and field order are the caller's business, not ours.
+    assert_eq!(kdnet_port("net: port=50000 , key=x"), Some(50000));
+    assert_eq!(kdnet_port("net:key=1.1.1.1,port=50000"), Some(50000));
+    // Transports with no port at all must not produce a bogus one.
+    assert_eq!(kdnet_port("com:pipe,port=\\\\.\\pipe\\kd"), None);
+    assert_eq!(kdnet_port("net:key=1.1.1.1"), None);
 }
 
 /// `System Uptime` out of `.time` output, e.g. `0 days 0:05:31.599`.
@@ -1617,13 +1638,17 @@ fn a_live_kernel_session_attaches_coexists_and_detaches_cleanly() {
          port, nothing else can attach:\n{report}"
     );
     let session = session_id_of(&report);
-    // `vertarget`, run by the opener inside the worker.
-    assert!(
-        report.contains("Kernel"),
-        "the post-attach report should be `vertarget` output naming the kernel:\n{report}"
-    );
 
+    // Everything from here runs under `catch_unwind`, because the target is now broken in and
+    // stays that way until the detach below — including the `vertarget` check, which has no
+    // business being the one assertion that can leave a machine frozen.
     let outcome = catch_unwind(AssertUnwindSafe(|| {
+        // `vertarget`, run by the opener inside the worker.
+        assert!(
+            report.contains("Kernel"),
+            "the post-attach report should be `vertarget` output naming the kernel:\n{report}"
+        );
+
         // The milestones made it across: not still "attaching", which is where a parked one sits.
         let status = server.tool_text("session_status", json!({ "session_id": session }), STEP);
         assert!(
@@ -1761,7 +1786,9 @@ fn disconnecting_releases_a_live_kernel_session_rather_than_killing_it() {
     // `end_session` — that is the whole point. The log is captured before `shutdown` consumes
     // the harness, since what it says is half the evidence.
     let log = Arc::clone(&server.stderr_log);
-    let exit = server.shutdown();
+    // `shutdown` panics if the server does not exit in 20s, and the kernel is broken in right
+    // now — so even this is collected rather than allowed to propagate.
+    let exit = catch_unwind(AssertUnwindSafe(|| server.shutdown()));
 
     // The stderr reader is a separate thread draining a pipe the process just closed, so poll
     // rather than snapshot — a bare read races the drain and fails intermittently.
@@ -1809,7 +1836,10 @@ fn disconnecting_releases_a_live_kernel_session_rather_than_killing_it() {
     };
 
     // --- now assert ----------------------------------------------------------------------
-    assert_eq!(exit, Some(0), "a disconnect should still be a clean exit");
+    match exit {
+        Ok(code) => assert_eq!(code, Some(0), "a disconnect should still be a clean exit"),
+        Err(panic) => resume_unwind(panic),
+    }
     assert!(
         stderr.contains("releasing 1 session"),
         "the disconnect should have *released* the kernel session, not killed its worker — a \

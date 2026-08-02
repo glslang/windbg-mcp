@@ -618,6 +618,18 @@ impl Sessions {
         budget: Duration,
     ) -> Result<String, EngineError> {
         let id = session.next_id.fetch_add(1, Ordering::Relaxed);
+        self.call_as(session, call, budget, id).await
+    }
+
+    /// [`Self::call_within`] with the job id chosen by the caller, which only the opener does —
+    /// see [`OPENER_JOB`].
+    async fn call_as(
+        &self,
+        session: &Arc<Session>,
+        call: Call,
+        budget: Duration,
+        id: u64,
+    ) -> Result<String, EngineError> {
         let (tx, rx) = oneshot::channel();
         // Registered before the job is queued, so the session counts as busy from the moment the
         // call is submitted rather than from the moment it is written to the worker.
@@ -684,7 +696,11 @@ impl Sessions {
         // would count this open twice.
         drop(slot);
 
-        let out = self.call(&session, Call::new(op)).await;
+        // On the reserved job id, so `reader` can still recognise this open if the caller's
+        // timeout means nobody is left to settle it.
+        let out = self
+            .call_as(&session, Call::new(op), self.call_timeout, OPENER_JOB)
+            .await;
         match out {
             Ok(report) => {
                 // Defensive: a worker that answered without reporting `Opened` still produced a
@@ -722,6 +738,11 @@ impl Sessions {
                         if !report_only {
                             session.set_state(SessionState::Open);
                         }
+                        // It failed, but it left a live session behind, so it still has to pay
+                        // for its slot. Skipping this is how the limit stops being one: the
+                        // sessions retained this way are idle, so they go on satisfying the
+                        // capacity check for the *next* open, and the count climbs.
+                        self.trim_to_cap(&session).await;
                         Err(OpenError::PostCommit {
                             id,
                             message: e.to_string(),
@@ -897,57 +918,67 @@ impl Sessions {
         })
     }
 
-    /// Reclaims the oldest idle session if the server is over [`MAX_SESSIONS`], now that
+    /// Reclaims idle sessions until the server is back within [`MAX_SESSIONS`], now that
     /// `keeping` has actually opened and is worth paying for.
+    ///
+    /// Runs from **every** path that leaves a live session behind — a landed open, and an open
+    /// that failed after committing but kept its target. Only reconciling on success is how the
+    /// limit stops being one: a session retained by a post-commit failure is *idle*, so it goes
+    /// on satisfying [`Self::take_slot`] for the next open, and the count climbs.
+    ///
+    /// Reclaims as many as it takes rather than one per call, because an overage can outlive the
+    /// open that caused it: if every candidate was busy at the time, that debt is still owed once
+    /// they go idle, and taking one victim per open would just carry it forever.
     ///
     /// `keeping` is excluded because it is idle the instant it opens, and with every other
     /// session busy it would otherwise be the one reclaimed — an open that closes itself.
-    ///
-    /// May leave the server one over the limit, when the sessions that would have paid for this
-    /// one all became busy while it was opening. That is the honest outcome: the alternatives are
-    /// ending someone's live target or discarding a target that already opened. The next open
-    /// finds nothing idle and is refused, so it does not compound.
     async fn trim_to_cap(&self, keeping: &Arc<Session>) {
-        let victim = {
-            let registry = self.registry();
-            let live = registry.live();
-            if live.len() <= MAX_SESSIONS {
-                return;
-            }
-            match live.iter().find(|s| s.id != keeping.id && !s.busy()) {
-                // Marked while the registry lock is held, so a second open racing this one cannot
-                // see the same session as live-and-idle, pick it too, and free nothing.
-                Some(idle) => {
-                    idle.set_state(SessionState::Closed(format!(
-                        "reclaimed to make room for a new session — this server holds at most \
-                         {MAX_SESSIONS} at once, and this was the oldest idle one"
-                    )));
-                    Arc::clone(idle)
-                }
-                None => {
-                    tracing::warn!(
-                        "{} sessions are open, one over the {MAX_SESSIONS} limit: nothing was \
-                         idle enough to reclaim when `{}` opened",
-                        live.len(),
-                        keeping.id
-                    );
-                    return;
-                }
-            }
-        };
-        tracing::info!(
-            "reclaimed idle session {} (at the {MAX_SESSIONS}-session limit)",
-            victim.id
-        );
-        // Released the same way `end_session` releases one, so a live debuggee is let go cleanly
-        // rather than dying with its debugger. As the supervisor's own teardown rather than a
-        // caller's call, it runs past the gate the state above would otherwise close.
-        self.release(
-            &victim,
-            Call::supervisor(EngineOp::EndSession),
-            END_SESSION_TIMEOUT,
-        )
-        .await;
+        while let Some(victim) = self.claim_overage_victim(keeping) {
+            tracing::info!(
+                "reclaimed idle session {} (at the {MAX_SESSIONS}-session limit)",
+                victim.id
+            );
+            // Released the same way `end_session` releases one, so a live debuggee is let go
+            // cleanly rather than dying with its debugger. As the supervisor's own teardown
+            // rather than a caller's call, it runs past the gate the marking above closed.
+            self.release(
+                &victim,
+                Call::supervisor(EngineOp::EndSession),
+                END_SESSION_TIMEOUT,
+            )
+            .await;
+        }
+        let over = self.registry().live().len();
+        if over > MAX_SESSIONS {
+            // The honest outcome when nothing is reclaimable: the alternatives are ending
+            // someone's live target or discarding one that already opened. It does not compound —
+            // `take_slot` refuses the next open — and the debt is settled by a later call here
+            // once something goes idle.
+            tracing::warn!(
+                "{over} sessions are open, over the {MAX_SESSIONS} limit: nothing was idle \
+                 enough to reclaim when `{}` opened",
+                keeping.id
+            );
+        }
+    }
+
+    /// Marks and hands back the oldest idle session while the registry is over the cap.
+    ///
+    /// Separate from [`Self::trim_to_cap`] so the registry lock is never held across the release
+    /// that follows. The marking happens *under* the lock, so a second open racing this one
+    /// cannot see the same session as live-and-idle, pick it too, and free nothing.
+    fn claim_overage_victim(&self, keeping: &Arc<Session>) -> Option<Arc<Session>> {
+        let registry = self.registry();
+        let live = registry.live();
+        if live.len() <= MAX_SESSIONS {
+            return None;
+        }
+        let idle = live.iter().find(|s| s.id != keeping.id && !s.busy())?;
+        idle.set_state(SessionState::Closed(format!(
+            "reclaimed to make room for a new session — this server holds at most \
+             {MAX_SESSIONS} at once, and this was the oldest idle one"
+        )));
+        Some(Arc::clone(idle))
     }
 
     /// Starts a worker process and waits for it to report that its engine came up.
@@ -1008,7 +1039,8 @@ impl Sessions {
             created: Instant::now(),
             state: Mutex::new((SessionState::Opening, Instant::now())),
             tx,
-            next_id: AtomicU64::new(1),
+            // Job ids start *past* the opener's, which is reserved — see [`OPENER_JOB`].
+            next_id: AtomicU64::new(OPENER_JOB + 1),
             waiters: Arc::clone(&waiters),
             child: Mutex::new(Some(child)),
         });
@@ -1022,7 +1054,12 @@ impl Sessions {
             Arc::clone(&waiters),
             self.call_timeout,
         ));
-        tokio::spawn(reader(Arc::downgrade(&session), lines, waiters));
+        tokio::spawn(reader(
+            Arc::downgrade(&session),
+            lines,
+            waiters,
+            self.clone(),
+        ));
         Ok(session)
     }
 }
@@ -1049,8 +1086,16 @@ fn stale_handle(want: &str, state: &SessionState) -> String {
     }
 }
 
-/// The job id every opener gets. `open` is the first call made against a freshly spawned session
-/// and ids start at 1, so this identifies the opener without threading it through the protocol.
+/// The job id **reserved** for a session's opener.
+///
+/// It is reserved rather than inferred. Inferring it from "the opener is the first call, and ids
+/// start at 1" looks safe — `open` registers the session and submits the opener with no `await`
+/// between — but it is not: a session is routable the moment it is registered (`Opening` and
+/// `Attaching` both accept calls), so a tool call on another runtime thread can slip in and take
+/// id 1 first. The opener would then get id 2, [`reader`] would stop recognising it, and the
+/// settling that keeps a timed-out open from stranding its session would silently never run.
+///
+/// So `next_id` starts *past* this value and only [`Sessions::open`] ever uses it.
 const OPENER_JOB: u64 = 1;
 
 /// Moves a session out of its opening states once the opener's result is known.
@@ -1059,7 +1104,9 @@ const OPENER_JOB: u64 = 1;
 /// taken by [`reader`] when the caller's timeout means no reply was received at all. The states
 /// are the discriminator either way — `Opening` means nothing was created, `Attaching` means the
 /// target exists and the wait failed — so both paths reach the same answer.
-fn settle_open(session: &Session, result: &Result<String, EngineError>) {
+/// Returns whether the session was left **live** — its worker still holds a target, so it still
+/// owes its slot and capacity has to be reconciled against it.
+fn settle_open(session: &Session, result: &Result<String, EngineError>) -> bool {
     let settled = match (session.state(), result) {
         (SessionState::Opening | SessionState::Attaching, Ok(_)) => SessionState::Open,
         // Nothing was created or claimed: this handle will never be usable.
@@ -1068,9 +1115,17 @@ fn settle_open(session: &Session, result: &Result<String, EngineError>) {
         // the whole point of committing before the wait.
         (SessionState::Attaching, Err(_)) => SessionState::Open,
         // Already settled, by `open` or by a worker that exited.
-        _ => return,
+        _ => return false,
     };
+    let live = settled.is_live();
     session.set_state(settled);
+    if !live {
+        // The same teardown `open` does on a clean failure. Without it the worker survives
+        // holding DbgEng — and a `Failed` session is excluded from `live()`, so `shutdown` would
+        // not collect it either; it would linger until the whole server exits.
+        session.kill();
+    }
+    live
 }
 
 fn worker_gone(id: &str) -> String {
@@ -1176,6 +1231,7 @@ async fn reader(
     session: Weak<Session>,
     mut lines: Lines<BufReader<ChildStdout>>,
     waiters: Waiters,
+    sessions: Sessions,
 ) {
     while let Some(message) = next_message(&mut lines).await {
         let Some(session) = session.upgrade() else {
@@ -1211,8 +1267,14 @@ async fn reader(
                 // worker from ever being reclaimed.
                 if let Err(unreceived) = waiter.send(result.map_err(EngineError::Debugger))
                     && id == OPENER_JOB
+                    && settle_open(&session, &unreceived)
                 {
-                    settle_open(&session, &unreceived);
+                    // It settled *live*, so it owes the slot it took — the same reconciliation
+                    // `open` runs, which nobody is left here to run for it. Spawned rather than
+                    // awaited: reclaiming waits on another session's worker, and this task has
+                    // its own worker's messages to keep draining.
+                    let sessions = sessions.clone();
+                    tokio::spawn(async move { sessions.trim_to_cap(&session).await });
                 }
             }
             // Both belong to the spawn handshake, which has already happened.
@@ -1634,7 +1696,83 @@ mod tests {
     #[test]
     fn settling_never_reopens_a_session_that_is_already_over() {
         let closed = dormant("sess-1", SessionState::Closed("ended".into()));
-        settle_open(&closed, &Ok("vertarget".into()));
+        assert!(!settle_open(&closed, &Ok("vertarget".into())));
         assert_eq!(closed.state(), SessionState::Closed("ended".into()));
+    }
+
+    /// Whether a settled opener still owes its slot is exactly whether it left a live session —
+    /// that is what tells the caller to reconcile capacity, and a wrong answer here either leaks
+    /// a slot or reclaims a session nothing paid for.
+    #[test]
+    fn settling_reports_whether_the_session_survived() {
+        let kept = dormant("sess-1", SessionState::Attaching);
+        assert!(
+            settle_open(&kept, &Err(EngineError::Debugger("never broke in".into()))),
+            "the target exists, so the session lives and owes its slot"
+        );
+        let lost = dormant("sess-2", SessionState::Opening);
+        assert!(
+            !settle_open(&lost, &Err(EngineError::Debugger("no such file".into()))),
+            "nothing was created, so there is no session to pay for"
+        );
+    }
+
+    // ---- reconciling capacity -----------------------------------------------------
+
+    /// Reclaims *until* the server is back at the limit, not once per call.
+    ///
+    /// An overage can outlive the open that caused it — if every candidate was busy at the time,
+    /// the debt is still owed once they go idle. Taking one victim per open would carry it
+    /// forever: six live sessions would become five on the next open, then six, then five.
+    #[tokio::test]
+    async fn reclaiming_clears_the_whole_overage_not_one_session_per_open() {
+        let sessions = Sessions::new(Duration::from_secs(1));
+        let keeping = dormant("sess-keep", SessionState::Open);
+        {
+            let mut registry = sessions.registry();
+            for n in 0..MAX_SESSIONS + 2 {
+                registry
+                    .all
+                    .push_back(dormant(&format!("sess-{n}"), SessionState::Open));
+            }
+            registry.all.push_back(Arc::clone(&keeping));
+        }
+        assert_eq!(sessions.registry().live().len(), MAX_SESSIONS + 3);
+
+        sessions.trim_to_cap(&keeping).await;
+
+        assert_eq!(
+            sessions.registry().live().len(),
+            MAX_SESSIONS,
+            "the whole overage should be cleared in one pass"
+        );
+        assert_eq!(
+            keeping.state(),
+            SessionState::Open,
+            "the session being kept is never a victim"
+        );
+    }
+
+    /// Busy sessions are still never taken, so an overage that cannot be paid for is left
+    /// standing rather than settled by ending someone's live target.
+    #[tokio::test]
+    async fn reclaiming_leaves_an_overage_it_cannot_pay_for() {
+        let sessions = Sessions::new(Duration::from_secs(1));
+        let keeping = dormant("sess-keep", SessionState::Open);
+        {
+            let mut registry = sessions.registry();
+            for n in 0..MAX_SESSIONS {
+                registry
+                    .all
+                    .push_back(dormant(&format!("sess-busy-{n}"), SessionState::Attaching));
+            }
+            registry.all.push_back(Arc::clone(&keeping));
+        }
+        sessions.trim_to_cap(&keeping).await;
+        assert_eq!(
+            sessions.registry().live().len(),
+            MAX_SESSIONS + 1,
+            "nothing was reclaimable, so the overage stands"
+        );
     }
 }

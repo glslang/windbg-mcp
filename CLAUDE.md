@@ -101,14 +101,18 @@ cargo test --test mcp_smoke -- --ignored --nocapture --test-threads=1 bounded
 ```
 
 A fourth tier drives a **real KDNET target** through a full session lifecycle — attach, work
-alongside a second session, detach gracefully. It is gated on the connection string (which nobody
-can guess) *and* `#[ignore]`d, so a stale variable can never freeze a VM during an ordinary
-`cargo test`. Run it last, on its own:
+alongside a second session, detach gracefully — and separately checks that a client *disconnect*
+releases a live kernel session rather than killing its worker. It is gated on the connection string
+(which nobody can guess) *and* `#[ignore]`d, so a stale variable can never freeze a VM during an
+ordinary `cargo test`. Run it last, on its own:
 
 ```pwsh
 $env:WINDBG_MCP_SMOKE_KERNEL = "net:port=50000,key=<w.x.y.z>"
-cargo test --test mcp_smoke -- --ignored --nocapture live_kernel
+cargo test --test mcp_smoke -- --ignored --nocapture --test-threads=1 live_kernel
 ```
+
+`--test-threads=1` is not optional: the filter matches **two** tests, and the KD transport is
+single-owner, so in parallel the second attach fails and can leave the target halted.
 
 ## Live kernel + driver IOCTL gotchas (learned driving HEVD over KDNET)
 
