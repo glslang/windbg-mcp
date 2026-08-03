@@ -161,7 +161,20 @@ pub fn run() -> ! {
     tracing::info!("worker: supervisor is gone; releasing the target before exit");
     let (ack, released) = mpsc::channel();
     if tx.send(Job::Release(ack)).is_ok() {
-        let _ = released.recv_timeout(ABRUPT_EXIT_RELEASE);
+        // Whichever way this ends the process does, but *which* way is the difference between a
+        // target let go and a target still attached to a debugger that no longer exists. Silence
+        // here would leave that to be inferred from a guest that never came back.
+        match released.recv_timeout(ABRUPT_EXIT_RELEASE) {
+            Ok(()) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => tracing::warn!(
+                "worker: the engine did not finish releasing within {ABRUPT_EXIT_RELEASE:?} \
+                 (parked in DbgEng, most likely); exiting anyway, so a live kernel target may be \
+                 left halted"
+            ),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                tracing::error!("worker: the engine thread is gone, so nothing released the target")
+            }
+        }
     }
     std::process::exit(0);
 }
@@ -193,7 +206,22 @@ fn engine_thread(rx: mpsc::Receiver<Job>) {
             // stop waiting. Best-effort by nature: if the engine never reaches this, the main
             // thread times out and exits anyway.
             Job::Release(ack) => {
-                let _ = catch_unwind(AssertUnwindSafe(|| engine.end_session()));
+                // Reported here rather than handed back: the main thread's only move is to exit
+                // either way, and this is where the reason still exists. So the ack means
+                // "finished trying", not "succeeded" — what the main thread waits for is
+                // permission to stop waiting.
+                match catch_unwind(AssertUnwindSafe(|| engine.end_session())) {
+                    Ok(Ok(_)) => tracing::info!("worker: target released"),
+                    Ok(Err(e)) => tracing::error!(
+                        "worker: the debugger refused to release the target ({}); a live kernel \
+                         target may be left halted",
+                        es(e)
+                    ),
+                    Err(_) => tracing::error!(
+                        "worker: releasing the target panicked; a live kernel target may be left \
+                         halted"
+                    ),
+                }
                 let _ = ack.send(());
                 continue;
             }

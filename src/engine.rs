@@ -1021,13 +1021,42 @@ impl Sessions {
                 session.set_state(SessionState::Closed(
                     "the server is shutting down".to_string(),
                 ));
-                sessions
+                let outcome = sessions
                     .release(
                         &session,
                         Call::supervisor(EngineOp::EndSession),
                         SHUTDOWN_RELEASE_TIMEOUT,
                     )
                     .await;
+                // `end_session` renders this for its caller. Shutdown has no caller — the client
+                // has already gone — so the log is the only place it can land, and it is exactly
+                // where an operator looks after finding a guest that did not come back.
+                match outcome {
+                    Release::Released(_) => {
+                        tracing::info!("shutting down: session {} released its target", session.id)
+                    }
+                    Release::AlreadyGone => tracing::info!(
+                        "shutting down: session {}'s worker had already exited",
+                        session.id
+                    ),
+                    Release::Parked => tracing::warn!(
+                        "shutting down: session {} did not let go within {SHUTDOWN_RELEASE_TIMEOUT:?} \
+                         and its worker (pid {}) was terminated — a live kernel target may be left \
+                         halted",
+                        session.id,
+                        session.pid
+                    ),
+                    Release::Refused(why) => tracing::warn!(
+                        "shutting down: session {} reported an error releasing its target ({why}); \
+                         its worker (pid {}) was terminated anyway",
+                        session.id,
+                        session.pid
+                    ),
+                    Release::Stale(why) => tracing::info!(
+                        "shutting down: session {} was already settled ({why})",
+                        session.id
+                    ),
+                }
             }));
         }
         for task in releasing {
