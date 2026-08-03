@@ -1035,9 +1035,17 @@ impl Sessions {
                     Release::Released(_) => {
                         tracing::info!("shutting down: session {} released its target", session.id)
                     }
-                    Release::AlreadyGone => tracing::info!(
-                        "shutting down: session {}'s worker had already exited",
-                        session.id
+                    // Not the benign reading it looks like. This walk only covers sessions that
+                    // still *own* a worker handle, and releasing one takes that handle away — so
+                    // a session cannot reach here because it was already released. It reaches
+                    // here because its worker died with nobody having released anything, which
+                    // leaves the target in the same unconfirmed state `Parked` does.
+                    Release::AlreadyGone => tracing::warn!(
+                        "shutting down: session {}'s worker (pid {}) was gone before it could be \
+                         asked to release — it crashed or was terminated, so nothing detached its \
+                         target and a live kernel may be left halted",
+                        session.id,
+                        session.pid
                     ),
                     Release::Parked => tracing::warn!(
                         "shutting down: session {} did not let go within {SHUTDOWN_RELEASE_TIMEOUT:?} \
