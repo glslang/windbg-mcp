@@ -289,6 +289,16 @@ impl Server {
         text_of(&response["result"])
     }
 
+    /// Terminates the supervisor outright, giving it no chance to run its own shutdown.
+    ///
+    /// Stdin is *not* closed first — that would be the graceful path this is the opposite of. The
+    /// point is to leave the workers with nothing but their own stdin reaching EOF as the dead
+    /// supervisor's handles are closed.
+    fn kill_supervisor(mut self) {
+        self.child.kill().expect("terminate the supervisor");
+        self.child.wait().expect("reap the supervisor");
+    }
+
     /// Closes stdin and waits for exit, returning the exit code.
     fn shutdown(mut self) -> Option<i32> {
         drop(self.stdin.take());
@@ -1191,7 +1201,9 @@ fn engine_workers_do_not_outlive_the_connection() {
         "clean disconnect should be a clean exit"
     );
 
-    // The worker notices its stdin close and exits on its own; give it a moment to.
+    // Two ways it can be gone, and this asserts only the outcome: shutdown asked it to release
+    // and then ended it, or — for a worker shutdown never saw — its own stdin closed as the
+    // supervisor exited. Either way, no process is left behind.
     let deadline = Instant::now() + Duration::from_secs(20);
     while process_alive(worker) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
@@ -1199,6 +1211,43 @@ fn engine_workers_do_not_outlive_the_connection() {
     assert!(
         !process_alive(worker),
         "engine worker pid {worker} outlived the connection — every disconnect would leak one"
+    );
+}
+
+/// A worker whose supervisor died without saying goodbye still lets go and exits.
+///
+/// This is the mechanism the whole teardown story now rests on. The supervisor does not terminate
+/// its workers when it goes — `Sessions::spawn` deliberately does not set `kill_on_drop` — because
+/// killing pre-empts the release: a worker the supervisor never got round to asking (one that
+/// registered after shutdown had walked the registry, say) would die with its target still
+/// attached, and a live kernel left attached-but-halted is a machine that needs rebooting.
+///
+/// So the guarantee is the worker's own: stdin reaching EOF means "the supervisor is gone", and it
+/// asks its engine to release before exiting, bounded. Killed outright here, the supervisor
+/// contributes nothing — no shutdown, no `EndSession`, not even a clean stdin close — which is
+/// exactly the case where nothing else can stand in.
+#[test]
+fn a_worker_lets_go_and_exits_when_its_supervisor_is_killed_outright() {
+    let Some(dump) = target_tier() else { return };
+    let mut server = Server::started();
+    let session =
+        session_id_of(&server.tool_text("open_dump", json!({ "path": dump }), TARGET_STEP));
+    let status = server.tool_text("session_status", json!({}), TARGET_STEP);
+    let worker = engine_pid_of(&status, &session);
+    assert!(process_alive(worker), "the worker should be running");
+
+    server.kill_supervisor();
+
+    // Generous against the worker's own release budget (`ABRUPT_EXIT_RELEASE`, 5s), because what
+    // is under test is that it exits at all without being killed, not how fast.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while process_alive(worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !process_alive(worker),
+        "engine worker pid {worker} outlived a killed supervisor — with nothing terminating it, \
+         EOF on its stdin is the only thing that ends it, and it did not"
     );
 }
 
