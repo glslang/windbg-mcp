@@ -79,9 +79,24 @@ const SHUTDOWN_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How many times shutdown re-checks for workers registered while it was running.
 ///
 /// One round can miss an open that was between spawning its worker and registering it when the
-/// client disconnected. Two suffice — new opens are refused before the first round — and the
-/// third is only there so a bug in that reasoning costs a bounded wait rather than a hang.
-const SHUTDOWN_ROUNDS: usize = 3;
+/// client disconnected. Two is one round plus a retry, which is all that reasoning needs — new
+/// opens are refused before the first — and it keeps the worst case (each round waiting out
+/// [`SHUTDOWN_RELEASE_TIMEOUT`]) inside the budget a client allows for the process to exit.
+const SHUTDOWN_ROUNDS: usize = 2;
+
+/// How long shutdown will wait for an open that was *already admitted* to register its worker,
+/// when there is nothing else left to release.
+///
+/// It cannot simply stop: such an open holds no target only until it registers, and it opens one
+/// immediately afterwards. Bounded rather than waiting out the worker handshake in full, because
+/// a client that has disconnected is entitled to see the process go — and a worker that has not
+/// registered by then still holds nothing, so what it costs is an ungraceful kill of an engine
+/// with no target.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(2);
+
+/// How often that drain re-checks. Short: registration follows the worker's handshake by
+/// microseconds, so this is nearly always one poll.
+const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
 
 /// Counter behind [`mint_session_id`]. Only needs to be unique within this process.
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -631,9 +646,18 @@ impl Registry {
     /// never evicted — forgetting one would report its handle as unknown, and the advice that
     /// follows from "unknown" is "open again", which for an attach or a launch means a second
     /// target.
+    ///
+    /// Nor is one that still owns a worker, whatever its state says. A session claimed for
+    /// reclamation is `Closed` at once and released in the background, and evicting it in that
+    /// window would take it out of [`Self::owning_workers`] — so a disconnect would no longer
+    /// find it, the release would be cancelled with the runtime, and `kill_on_drop` would finish
+    /// the worker without the `EndSession` a halted kernel needs.
     fn trim(&mut self) {
         while self.all.len() > CLOSED_HISTORY + MAX_SESSIONS {
-            let Some(oldest_settled) = self.all.iter().position(|s| !s.state().is_live()) else {
+            let evictable = self.all.iter().position(|s| {
+                !s.state().is_live() && s.child.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+            });
+            let Some(oldest_settled) = evictable else {
                 return;
             };
             self.all.remove(oldest_settled);
@@ -979,16 +1003,31 @@ impl Sessions {
         // Rounds rather than one pass, because an open already past the gate can still register
         // while the first round runs. It terminates: nothing new can be admitted, so each round
         // finds only what the previous one raced with, and in practice the second is empty.
+        let drain_by = Instant::now() + SHUTDOWN_DRAIN;
         for _ in 0..SHUTDOWN_ROUNDS {
             // Every session that still *owns a worker*, not every live one. A session claimed for
             // reclamation is already `Closed` while its release runs in the background, and a
             // disconnect in that window would otherwise drop the runtime, cancel that release,
             // and let `kill_on_drop` terminate the worker — the same halted target by another
             // route. Releasing one twice is harmless; missing one is not.
-            let owners = self.registry().owning_workers();
-            if owners.is_empty() {
-                return;
-            }
+            let owners = loop {
+                let (owners, opening) = {
+                    let registry = self.registry();
+                    (registry.owning_workers(), registry.opening)
+                };
+                if !owners.is_empty() {
+                    break owners;
+                }
+                // Nothing to release *yet* is not the same as nothing to release. An open
+                // admitted before the gate closed may still be waiting for its worker's
+                // handshake, so it is not in the registry to be found — and it holds no target
+                // only until it registers, at which point it opens one immediately. Returning
+                // here would leave exactly that worker to `kill_on_drop`.
+                if opening == 0 || Instant::now() >= drain_by {
+                    return;
+                }
+                tokio::time::sleep(SHUTDOWN_POLL).await;
+            };
             tracing::info!("shutting down: releasing {} session(s)", owners.len());
             let mut releasing = Vec::with_capacity(owners.len());
             for session in owners {
@@ -1959,6 +1998,49 @@ mod tests {
         // And once the worker is gone there is nothing left to collect.
         reclaimed.kill();
         assert!(sessions.registry().owning_workers().is_empty());
+    }
+
+    /// History eviction must not forget a session whose worker is still being released.
+    ///
+    /// A reclaimed session is `Closed` at once and released in the background. Evicting it in that
+    /// window takes it out of `owning_workers`, so a disconnect no longer finds it, the release is
+    /// cancelled with the runtime, and `kill_on_drop` finishes the worker without the
+    /// `EndSession` a halted kernel needs.
+    #[tokio::test]
+    async fn history_eviction_keeps_a_session_that_still_owns_a_worker() {
+        let sessions = Sessions::new(Duration::from_secs(1));
+        let releasing = dormant(
+            "sess-releasing",
+            SessionState::Closed("reclaimed".to_string()),
+        );
+        let child = Command::new("cmd")
+            .args(["/c", "ping", "-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn a stand-in child");
+        *releasing.child.lock().unwrap() = Some(child);
+        {
+            let mut registry = sessions.registry();
+            registry.all.push_back(Arc::clone(&releasing));
+            // Far past the history bound, so trimming has every reason to take it.
+            for n in 0..(CLOSED_HISTORY + MAX_SESSIONS) * 2 {
+                registry.all.push_back(dormant(
+                    &format!("sess-{n}"),
+                    SessionState::Closed("x".into()),
+                ));
+            }
+            registry.trim();
+        }
+        assert!(
+            sessions
+                .registry()
+                .owning_workers()
+                .iter()
+                .any(|s| s.id == "sess-releasing"),
+            "a session mid-release was evicted, so shutdown could no longer find its worker"
+        );
+        releasing.kill();
     }
 
     /// A retired handle must not be mistaken for a committed target.
