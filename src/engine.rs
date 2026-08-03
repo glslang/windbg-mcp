@@ -26,7 +26,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -174,6 +174,43 @@ impl SessionKind {
     }
 }
 
+/// How far a session's opener got, tracked **independently of the session state**.
+///
+/// The state cannot answer this on its own, because it encodes two different things: how the open
+/// is progressing *and* whether the handle still names what it was issued for. A command queued
+/// behind the open retires the handle, and that retirement — correctly — outranks the opener's
+/// own transitions. But it also erases the difference between "nothing was created" and "the
+/// target exists", and those need opposite recovery advice: re-open, versus do not re-open or you
+/// will start a second one.
+///
+/// Monotonic, and only ever advanced by the worker's milestones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+enum OpenPhase {
+    /// Nothing has been created or claimed. A failure here leaves a clean slate.
+    Started = 0,
+    /// The target exists. Re-running the open would attach a second time, or start a second
+    /// process.
+    Committed = 1,
+    /// The target is loaded and stopped; only the follow-up diagnostic was left.
+    Opened = 2,
+}
+
+impl OpenPhase {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Started,
+            1 => Self::Committed,
+            _ => Self::Opened,
+        }
+    }
+
+    /// Whether the target exists — the question the recovery advice turns on.
+    fn committed(self) -> bool {
+        self >= Self::Committed
+    }
+}
+
 /// Where a session is in its life.
 ///
 /// The three opening states are the distinction issue #61 could not draw: a `Pending` open looked
@@ -241,6 +278,8 @@ pub struct Session {
     /// Whether `open` has finished with this session and told its caller about it. Until then it
     /// is not reclaimable however idle it looks — see [`Session::busy`].
     delivered: AtomicBool,
+    /// How far the opener got, as [`OpenPhase`]. Separate from the state on purpose.
+    phase: AtomicU8,
     child: Mutex<Option<Child>>,
 }
 
@@ -283,6 +322,16 @@ impl Session {
             *slot = (next, Instant::now());
         }
         slot.0.clone()
+    }
+
+    /// How far the opener got. See [`OpenPhase`] for why this is not read off the state.
+    fn phase(&self) -> OpenPhase {
+        OpenPhase::from_u8(self.phase.load(Ordering::Acquire))
+    }
+
+    /// Advances the opener's phase. Monotonic, so a milestone can never walk it backwards.
+    fn reach(&self, phase: OpenPhase) {
+        self.phase.fetch_max(phase as u8, Ordering::AcqRel);
     }
 
     /// How long the session has been in its current state.
@@ -763,38 +812,43 @@ impl Sessions {
             }
             Err(EngineError::Timeout(message)) => Err(OpenError::Timeout { id, message }),
             Err(e) => {
-                // Which side of the seam the failure fell on is recorded in the state the
-                // worker's milestones left behind — see `SessionState`.
-                match session.state() {
-                    // Nothing was created or claimed, and the worker has nothing to hold.
-                    SessionState::Opening => {
-                        let message = e.to_string();
-                        session.set_state(SessionState::Failed(message.clone()));
-                        session.kill();
-                        Err(OpenError::Clean(message))
+                let message = e.to_string();
+                let state = session.state();
+                // Which side of the seam the failure fell on is the **phase**, never the state.
+                // The state also carries handle validity, so a command queued behind the open can
+                // retire it and erase the distinction — and answering "your session exists" for
+                // an open that created nothing strands the caller exactly as badly as the advice
+                // this seam replaced.
+                if !session.phase().committed() {
+                    settle_uncommitted(&session, &message);
+                    // A retired session is still live: a queued command owns that worker now, so
+                    // it keeps its slot and has to pay for it.
+                    if state.is_live() {
+                        self.reconcile_capacity(&session);
                     }
-                    // The worker died during the open. Whatever it had claimed went with the
+                    Err(OpenError::Clean(message))
+                } else if !state.is_live() {
+                    // The worker died after committing. Whatever it had claimed went with the
                     // process, so there is no session to hand back and no reason to warn against
                     // opening again — that is now the only way forward.
-                    state if !state.is_live() => Err(OpenError::Clean(e.to_string())),
-                    // The target exists and the wait failed; or it opened and only the
-                    // diagnostic failed. Either way the session stays: making the caller
-                    // re-open to get a handle is how they end up with two processes.
-                    state => {
-                        let report_only = matches!(state, SessionState::Open);
-                        // Same rule as the success path: `Retired` outranks this normalisation.
-                        promote_opened(&session);
-                        // It failed, but it left a live session behind, so it still has to pay
-                        // for its slot. Skipping this is how the limit stops being one: the
-                        // sessions retained this way are idle, so they go on satisfying the
-                        // capacity check for the *next* open, and the count climbs.
-                        self.reconcile_capacity(&session);
-                        Err(OpenError::PostCommit {
-                            id,
-                            message: e.to_string(),
-                            report_only,
-                        })
-                    }
+                    Err(OpenError::Clean(message))
+                } else {
+                    // The target exists and the wait failed; or it opened and only the diagnostic
+                    // failed. Either way the session stays: making the caller re-open to get a
+                    // handle is how they end up with two processes.
+                    let report_only = session.phase() == OpenPhase::Opened;
+                    // Same rule as the success path: `Retired` outranks this normalisation.
+                    promote_opened(&session);
+                    // It failed, but it left a live session behind, so it still has to pay for
+                    // its slot. Skipping this is how the limit stops being one: the sessions
+                    // retained this way are idle, so they go on satisfying the capacity check for
+                    // the *next* open, and the count climbs.
+                    self.reconcile_capacity(&session);
+                    Err(OpenError::PostCommit {
+                        id,
+                        message,
+                        report_only,
+                    })
                 }
             }
         };
@@ -1114,6 +1168,7 @@ impl Sessions {
             next_id: AtomicU64::new(OPENER_JOB + 1),
             waiters: Arc::clone(&waiters),
             delivered: AtomicBool::new(false),
+            phase: AtomicU8::new(OpenPhase::Started as u8),
             child: Mutex::new(Some(child)),
         });
 
@@ -1192,28 +1247,48 @@ fn promote_opened(session: &Session) {
 
 /// Returns whether the session was left **live** — its worker still holds a target, so it still
 /// owes its slot and capacity has to be reconciled against it.
+/// Settles a session whose opener failed **without creating anything**, and ends its worker
+/// unless something else has claimed it.
+///
+/// The exception is the whole reason this is a function rather than two lines: a target-changing
+/// command queued behind the open retires the handle *and* takes the worker over, and that worker
+/// may be about to hold a target of its own. Killing it because this open failed would discard
+/// something the caller explicitly asked for. So a retired session keeps its worker and its
+/// (retired) handle; only the open's own caller is told the slate is clean, which it is.
+fn settle_uncommitted(session: &Session, why: &str) {
+    if matches!(session.state(), SessionState::Retired(_)) {
+        return;
+    }
+    session.set_state(SessionState::Failed(why.to_string()));
+    session.kill();
+}
+
 fn settle_open(session: &Session, result: &Result<String, EngineError>) -> bool {
+    // The same discriminator `open` uses, and for the same reason: the *phase* says whether a
+    // target was created, while the state may since have been retired by a command queued behind
+    // the open.
+    if result.is_err() && !session.phase().committed() {
+        // Nothing was created, so the handle will never be usable — unless something else has
+        // taken the worker over, which `settle_uncommitted` is the arbiter of.
+        settle_uncommitted(
+            session,
+            &result
+                .as_ref()
+                .err()
+                .map_or(String::new(), |e| e.to_string()),
+        );
+        return session.state().is_live();
+    }
     // Decided and applied under one lock, for the reason `update_state` gives: `pump` can retire
     // this session from another task, and that must outrank a decision taken a moment earlier.
-    let settled = session.update_state(|state| match (state, result) {
-        (SessionState::Opening | SessionState::Attaching, Ok(_)) => Some(SessionState::Open),
-        // Nothing was created or claimed: this handle will never be usable.
-        (SessionState::Opening, Err(e)) => Some(SessionState::Failed(e.to_string())),
-        // The target exists and something after it failed. The session stays usable — that is
-        // the whole point of committing before the wait.
-        (SessionState::Attaching, Err(_)) => Some(SessionState::Open),
-        // Already settled, by `open` or by a worker that exited — or retired by a command queued
-        // behind the open, which stands.
-        _ => None,
+    let settled = session.update_state(|state| {
+        // The target exists, so the session stays usable whichever way the open ended — that is
+        // the whole point of committing before the wait. Retired and already-settled states are
+        // left exactly as they are.
+        matches!(state, SessionState::Opening | SessionState::Attaching)
+            .then_some(SessionState::Open)
     });
-    let live = settled.is_live();
-    if !live {
-        // The same teardown `open` does on a clean failure. Without it the worker survives
-        // holding DbgEng — and a `Failed` session is excluded from `live()`, so `shutdown` would
-        // not collect it either; it would linger until the whole server exits.
-        session.kill();
-    }
-    live
+    settled.is_live()
 }
 
 fn worker_gone(id: &str) -> String {
@@ -1326,14 +1401,21 @@ async fn reader(
             return;
         };
         match message {
-            // Both milestones are conditional transitions, so both go through `update_state`:
-            // a check-then-set would let a retirement land in the gap and be overwritten.
+            // Each milestone records the opener's phase *and* moves the state. The phase is what
+            // survives a retirement landing in between, and it is what the recovery advice reads.
+            //
+            // Both state moves are conditional transitions, so both go through `update_state`:
+            // a check-then-set would let that retirement be overwritten.
             WorkerMessage::Committed { .. } => {
+                session.reach(OpenPhase::Committed);
                 session.update_state(|state| {
                     matches!(state, SessionState::Opening).then_some(SessionState::Attaching)
                 });
             }
-            WorkerMessage::Opened { .. } => promote_opened(&session),
+            WorkerMessage::Opened { .. } => {
+                session.reach(OpenPhase::Opened);
+                promote_opened(&session);
+            }
             WorkerMessage::Done { id, result } => {
                 let waiter = waiters
                     .lock()
@@ -1483,6 +1565,13 @@ mod tests {
     /// which is all these need: they never submit a call.
     fn dormant(id: &str, state: SessionState) -> Arc<Session> {
         let (tx, _rx) = mpsc::unbounded_channel();
+        // The phase a session in this state would really have reached. They are separate fields
+        // for good reason, but a double whose phase contradicts its state would prove nothing.
+        let phase = match state {
+            SessionState::Opening => OpenPhase::Started,
+            SessionState::Attaching => OpenPhase::Committed,
+            _ => OpenPhase::Opened,
+        };
         Arc::new(Session {
             id: id.to_string(),
             kind: SessionKind::Dump,
@@ -1495,6 +1584,7 @@ mod tests {
             waiters: Arc::new(Mutex::new(HashMap::new())),
             // Test doubles stand in for sessions their callers already hold.
             delivered: AtomicBool::new(true),
+            phase: AtomicU8::new(phase as u8),
             child: Mutex::new(None),
         })
     }
@@ -1771,6 +1861,44 @@ mod tests {
         let landed = dormant("sess-3", SessionState::Attaching);
         settle_open(&landed, &Ok("vertarget".into()));
         assert_eq!(landed.state(), SessionState::Open);
+    }
+
+    /// A retired handle must not be mistaken for a committed target.
+    ///
+    /// When a target-changing command is queued behind an opener that has not created anything
+    /// yet, `pump` retires the session while the phase is still `Started`. `Retired` is live, so
+    /// reading commitment off the state would call that a post-commit failure and tell the caller
+    /// their session exists and not to re-open — for an open that created nothing. That is the
+    /// exact false claim `post_commit_failure` documents as unreachable.
+    ///
+    /// The worker still goes untouched, though: the queued command has taken it over and may be
+    /// about to give it a target of its own.
+    #[test]
+    fn a_retirement_is_not_mistaken_for_a_created_target() {
+        let retired = dormant(
+            "sess-1",
+            SessionState::Retired("`.opendump` queued behind the open".to_string()),
+        );
+        // The state says live, the phase says nothing was created. The phase is the truth.
+        retired
+            .phase
+            .store(OpenPhase::Started as u8, Ordering::Release);
+        assert!(!retired.phase().committed());
+
+        let live = settle_open(&retired, &Err(EngineError::Debugger("no target".into())));
+        assert!(
+            matches!(retired.state(), SessionState::Retired(_)),
+            "the worker belongs to the queued command now, so it is not ours to fail or kill"
+        );
+        assert!(live, "it still holds a worker, so it still owes its slot");
+
+        // Without a retirement in the way, the same failure ends the session and its worker.
+        let plain = dormant("sess-2", SessionState::Opening);
+        assert!(!settle_open(
+            &plain,
+            &Err(EngineError::Debugger("no such file".into()))
+        ));
+        assert_eq!(plain.state(), SessionState::Failed("no such file".into()));
     }
 
     /// Settling is idempotent and never resurrects: a session ended while its opener was still
