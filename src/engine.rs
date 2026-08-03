@@ -633,11 +633,20 @@ impl Sessions {
         let (tx, rx) = oneshot::channel();
         // Registered before the job is queued, so the session counts as busy from the moment the
         // call is submitted rather than from the moment it is written to the worker.
-        session
-            .waiters
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(id, tx);
+        //
+        // Under the *registry* lock, which is not this map's lock and is not about this map: it is
+        // what `claim_overage_victim` holds while it decides a session is idle and closes it.
+        // Without taking it here, a call could become in-flight in the gap between that decision
+        // and the close, and reclamation would then end a session the caller had just started
+        // using. Held only across the insert; the send below is outside it.
+        {
+            let _reclamation = self.registry();
+            session
+                .waiters
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(id, tx);
+        }
         let queued = session.tx.send(Job {
             id,
             op: call.op,
@@ -677,7 +686,7 @@ impl Sessions {
     ) -> Result<OpenReport, OpenError> {
         debug_assert!(op.is_opener(), "open() needs an opener op");
         // Take a slot before doing anything expensive, but do **not** reclaim anything yet — see
-        // `take_slot` and `trim_to_cap` for why those are separate.
+        // `take_slot` and `reconcile_capacity` for why those are separate.
         let slot = self.take_slot().map_err(OpenError::NoRoom)?;
 
         let id = mint_session_id();
@@ -706,9 +715,14 @@ impl Sessions {
                 // Defensive: a worker that answered without reporting `Opened` still produced a
                 // usable target, and leaving the session mid-open would make every later call
                 // read as "still attaching".
-                if !matches!(session.state(), SessionState::Open) {
-                    session.set_state(SessionState::Open);
-                }
+                //
+                // Promoted *only* from the opening states, never from `Retired`. A
+                // target-changing `execute` can be queued behind an open — through an unnamed
+                // call, or a handle read from `session_status` — and `pump` retires the session
+                // when it forwards that command. Normalising to `Open` here would undo that
+                // while the command is still on its way to the worker, and the handle would go
+                // on certifying a target it no longer names.
+                promote_opened(&session);
                 // Only now, with a target that is genuinely open, is an existing session
                 // reclaimed to pay for it — and not on this caller's clock: reclaiming waits on
                 // *other* sessions' workers, each up to `END_SESSION_TIMEOUT`, and serially when
@@ -738,9 +752,8 @@ impl Sessions {
                     // re-open to get a handle is how they end up with two processes.
                     state => {
                         let report_only = matches!(state, SessionState::Open);
-                        if !report_only {
-                            session.set_state(SessionState::Open);
-                        }
+                        // Same rule as the success path: `Retired` outranks this normalisation.
+                        promote_opened(&session);
                         // It failed, but it left a live session behind, so it still has to pay
                         // for its slot. Skipping this is how the limit stops being one: the
                         // sessions retained this way are idle, so they go on satisfying the
@@ -871,7 +884,7 @@ impl Sessions {
     /// Takes a slot for a new session, or refuses the open.
     ///
     /// Deliberately **decides** without **doing**: at the limit it only checks that some session
-    /// *could* be reclaimed, and leaves the reclaiming to [`Self::trim_to_cap`] once the
+    /// *could* be reclaimed, and leaves the reclaiming to [`Self::reconcile_capacity`] once the
     /// replacement is real. Evicting here instead would mean a mistyped path, or a worker that
     /// would not start, destroys a perfectly good target the caller still wanted — a failed open
     /// must cost nothing but the attempt.
@@ -935,21 +948,23 @@ impl Sessions {
     ///
     /// `keeping` is excluded because it is idle the instant it opens, and with every other
     /// session busy it would otherwise be the one reclaimed — an open that closes itself.
-    async fn trim_to_cap(&self, keeping: &Arc<Session>) {
+    ///
+    /// **Claims synchronously, releases in the background**, and the split is load-bearing in both
+    /// directions. Claiming is a lock and a state write, so doing it on the caller's thread costs
+    /// nothing and means the *next* `take_slot` sees the victims already gone — deferring it would
+    /// let a concurrent open count them as reclaimable a second time, admit itself on capacity
+    /// that was already spent, and end up reclaimed by the first open's own reconciliation.
+    /// Releasing, by contrast, waits on another session's worker for up to
+    /// [`END_SESSION_TIMEOUT`] each and serially when more than one is owed, and nobody opening a
+    /// target should wait for unrelated sessions to finish ending.
+    fn reconcile_capacity(&self, keeping: &Arc<Session>) {
+        let mut victims = Vec::new();
         while let Some(victim) = self.claim_overage_victim(keeping) {
             tracing::info!(
                 "reclaimed idle session {} (at the {MAX_SESSIONS}-session limit)",
                 victim.id
             );
-            // Released the same way `end_session` releases one, so a live debuggee is let go
-            // cleanly rather than dying with its debugger. As the supervisor's own teardown
-            // rather than a caller's call, it runs past the gate the marking above closed.
-            self.release(
-                &victim,
-                Call::supervisor(EngineOp::EndSession),
-                END_SESSION_TIMEOUT,
-            )
-            .await;
+            victims.push(victim);
         }
         let over = self.registry().live().len();
         if over > MAX_SESSIONS {
@@ -963,26 +978,31 @@ impl Sessions {
                 keeping.id
             );
         }
-    }
-
-    /// [`Self::trim_to_cap`], off the caller's clock.
-    ///
-    /// Every path that reconciles capacity does so on behalf of a session that has *already*
-    /// opened, so none of them should make anyone wait for other sessions to be released — a
-    /// release is bounded by [`END_SESSION_TIMEOUT`] each, and serial when more than one is owed.
-    /// The accounting is unaffected: the victim is marked under the registry lock the moment it is
-    /// claimed, so a concurrent open sees it gone immediately either way.
-    fn reconcile_capacity(&self, keeping: &Arc<Session>) {
+        if victims.is_empty() {
+            return;
+        }
         let sessions = self.clone();
-        let keeping = Arc::clone(keeping);
-        tokio::spawn(async move { sessions.trim_to_cap(&keeping).await });
+        tokio::spawn(async move {
+            for victim in victims {
+                // Released the same way `end_session` releases one, so a live debuggee is let go
+                // cleanly rather than dying with its debugger. As the supervisor's own teardown
+                // rather than a caller's call, it runs past the gate the claim already closed.
+                sessions
+                    .release(
+                        &victim,
+                        Call::supervisor(EngineOp::EndSession),
+                        END_SESSION_TIMEOUT,
+                    )
+                    .await;
+            }
+        });
     }
 
     /// Marks and hands back the oldest idle session while the registry is over the cap.
     ///
-    /// Separate from [`Self::trim_to_cap`] so the registry lock is never held across the release
-    /// that follows. The marking happens *under* the lock, so a second open racing this one
-    /// cannot see the same session as live-and-idle, pick it too, and free nothing.
+    /// Separate from [`Self::reconcile_capacity`] so the registry lock is never held across the
+    /// release that follows. The marking happens *under* the lock, so a second open racing this
+    /// one cannot see the same session as live-and-idle, pick it too, and free nothing.
     fn claim_overage_victim(&self, keeping: &Arc<Session>) -> Option<Arc<Session>> {
         let registry = self.registry();
         let live = registry.live();
@@ -1120,6 +1140,22 @@ const OPENER_JOB: u64 = 1;
 /// taken by [`reader`] when the caller's timeout means no reply was received at all. The states
 /// are the discriminator either way — `Opening` means nothing was created, `Attaching` means the
 /// target exists and the wait failed — so both paths reach the same answer.
+/// Moves a session that is still opening to [`SessionState::Open`], and leaves every other state
+/// alone.
+///
+/// The states it refuses to touch are the point. `Retired` in particular must survive: a
+/// target-changing command queued behind the open retires the session as `pump` forwards it, and
+/// an opener finishing afterwards must not undo that — the handle would then certify a target the
+/// queued command is about to replace.
+fn promote_opened(session: &Session) {
+    if matches!(
+        session.state(),
+        SessionState::Opening | SessionState::Attaching
+    ) {
+        session.set_state(SessionState::Open);
+    }
+}
+
 /// Returns whether the session was left **live** — its worker still holds a target, so it still
 /// owes its slot and capacity has to be reconciled against it.
 fn settle_open(session: &Session, result: &Result<String, EngineError>) -> bool {
@@ -1601,7 +1637,7 @@ mod tests {
         ]);
         let slot = sessions.take_slot().expect("there is room");
         drop(slot);
-        sessions.trim_to_cap(&live).await;
+        sessions.reconcile_capacity(&live);
         assert_eq!(live.state(), SessionState::Open, "it was not reclaimed");
     }
 
@@ -1663,7 +1699,7 @@ mod tests {
             }
             registry.all.push_back(Arc::clone(&newest));
         }
-        sessions.trim_to_cap(&newest).await;
+        sessions.reconcile_capacity(&newest);
         assert_eq!(
             newest.state(),
             SessionState::Open,
@@ -1732,11 +1768,51 @@ mod tests {
 
     // ---- reconciling capacity -----------------------------------------------------
 
-    /// Reclaims *until* the server is back at the limit, not once per call.
+    /// An opener finishing must not undo a retirement that happened while it ran.
+    ///
+    /// A target-changing `execute` can be queued behind an open, and `pump` retires the session
+    /// as it forwards that command — before the worker has run it, and possibly before the opener
+    /// has even answered. Normalising the session back to `Open` afterwards would leave the handle
+    /// certifying a target the queued command is about to replace, which is the one thing the
+    /// handle is supposed to make impossible.
+    #[test]
+    fn an_opener_that_finishes_does_not_un_retire_its_session() {
+        let retired = dormant(
+            "sess-1",
+            SessionState::Retired("`.opendump` queued behind the open".to_string()),
+        );
+        promote_opened(&retired);
+        assert!(
+            matches!(retired.state(), SessionState::Retired(_)),
+            "retirement outranks the opener's normalisation, got {:?}",
+            retired.state()
+        );
+
+        // The states it *is* for.
+        for state in [SessionState::Opening, SessionState::Attaching] {
+            let opening = dormant("sess-2", state.clone());
+            promote_opened(&opening);
+            assert_eq!(opening.state(), SessionState::Open, "from {state:?}");
+        }
+
+        // And it never resurrects a settled one.
+        let closed = dormant("sess-3", SessionState::Closed("ended".to_string()));
+        promote_opened(&closed);
+        assert_eq!(closed.state(), SessionState::Closed("ended".to_string()));
+    }
+
+    /// Reclaims *until* the server is back at the limit, not once per call — and does the
+    /// claiming **synchronously**, which is the half that keeps the accounting honest.
     ///
     /// An overage can outlive the open that caused it — if every candidate was busy at the time,
     /// the debt is still owed once they go idle. Taking one victim per open would carry it
     /// forever: six live sessions would become five on the next open, then six, then five.
+    ///
+    /// That the count is already correct when this returns is the point of claiming before
+    /// spawning the releases: a concurrent open would otherwise still see the victims as live and
+    /// idle, count them as capacity a second time, and admit itself on room that was already
+    /// spent — only to be reclaimed by this reconciliation moments later, handing its caller a
+    /// `session_id` that was stale on arrival.
     #[tokio::test]
     async fn reclaiming_clears_the_whole_overage_not_one_session_per_open() {
         let sessions = Sessions::new(Duration::from_secs(1));
@@ -1752,7 +1828,7 @@ mod tests {
         }
         assert_eq!(sessions.registry().live().len(), MAX_SESSIONS + 3);
 
-        sessions.trim_to_cap(&keeping).await;
+        sessions.reconcile_capacity(&keeping);
 
         assert_eq!(
             sessions.registry().live().len(),
@@ -1781,7 +1857,7 @@ mod tests {
             }
             registry.all.push_back(Arc::clone(&keeping));
         }
-        sessions.trim_to_cap(&keeping).await;
+        sessions.reconcile_capacity(&keeping);
         assert_eq!(
             sessions.registry().live().len(),
             MAX_SESSIONS + 1,
