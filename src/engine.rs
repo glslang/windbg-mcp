@@ -26,7 +26,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -238,6 +238,9 @@ pub struct Session {
     /// for a call whose caller already gave up, which is precisely when a session must not be
     /// reclaimed as idle.
     waiters: Waiters,
+    /// Whether `open` has finished with this session and told its caller about it. Until then it
+    /// is not reclaimable however idle it looks — see [`Session::busy`].
+    delivered: AtomicBool,
     child: Mutex<Option<Child>>,
 }
 
@@ -256,11 +259,30 @@ impl Session {
     /// already stopped owning a worker, so a milestone arriving from a worker being torn down
     /// cannot undo the teardown.
     fn set_state(&self, next: SessionState) {
+        self.update_state(|_| Some(next));
+    }
+
+    /// Recomputes the state *from itself*, under a single lock acquisition, and reports where it
+    /// ended up. `next` returns `None` to leave it alone.
+    ///
+    /// The atomicity is the whole point, and check-then-set through two acquisitions is not good
+    /// enough: `pump` retires a session from another task the instant it forwards a
+    /// target-changing command, so a transition that decided on a state it no longer holds would
+    /// overwrite that retirement — and the handle would go on certifying a target the queued
+    /// command is about to replace. Every conditional transition goes through here for that
+    /// reason, not for tidiness.
+    fn update_state(
+        &self,
+        next: impl FnOnce(&SessionState) -> Option<SessionState>,
+    ) -> SessionState {
         let mut slot = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if !slot.0.is_live() {
-            return;
+            return slot.0.clone();
         }
-        *slot = (next, Instant::now());
+        if let Some(next) = next(&slot.0) {
+            *slot = (next, Instant::now());
+        }
+        slot.0.clone()
     }
 
     /// How long the session has been in its current state.
@@ -272,14 +294,22 @@ impl Session {
             .elapsed()
     }
 
-    /// Whether the worker owes a reply, or is still opening. An idle session is one that can be
-    /// reclaimed to make room without abandoning work in flight.
+    /// Whether the worker owes a reply, is still opening, or has not been handed to its caller
+    /// yet. An idle session is one that can be reclaimed to make room without abandoning work in
+    /// flight.
+    ///
+    /// That last clause covers a window nothing else does. A session goes idle the moment its
+    /// opener's waiter is removed — before `open` has returned the handle — so with two opens
+    /// admitted at the limit, the later one's reconciliation could reclaim the earlier one and
+    /// its caller would be handed a `session_id` that was already `Closed`. Undelivered means
+    /// in flight as far as anyone outside is concerned.
     fn busy(&self) -> bool {
-        !self
-            .waiters
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .is_empty()
+        !self.delivered.load(Ordering::Acquire)
+            || !self
+                .waiters
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty()
             || matches!(
                 self.state(),
                 SessionState::Opening | SessionState::Attaching
@@ -710,7 +740,7 @@ impl Sessions {
         let out = self
             .call_as(&session, Call::new(op), self.call_timeout, OPENER_JOB)
             .await;
-        match out {
+        let outcome = match out {
             Ok(report) => {
                 // Defensive: a worker that answered without reporting `Opened` still produced a
                 // usable target, and leaving the session mid-open would make every later call
@@ -767,7 +797,12 @@ impl Sessions {
                     }
                 }
             }
-        }
+        };
+        // The caller is about to be told about this session, whatever the outcome. Until that
+        // moment it is not reclaimable however idle it looks — otherwise a concurrent open's
+        // reconciliation can close it in the gap, and this returns a handle that is already dead.
+        session.delivered.store(true, Ordering::Release);
+        outcome
     }
 
     /// Ends a session: asks the worker to release its target, then terminates it.
@@ -1078,6 +1113,7 @@ impl Sessions {
             // Job ids start *past* the opener's, which is reserved — see [`OPENER_JOB`].
             next_id: AtomicU64::new(OPENER_JOB + 1),
             waiters: Arc::clone(&waiters),
+            delivered: AtomicBool::new(false),
             child: Mutex::new(Some(child)),
         });
 
@@ -1148,29 +1184,29 @@ const OPENER_JOB: u64 = 1;
 /// an opener finishing afterwards must not undo that — the handle would then certify a target the
 /// queued command is about to replace.
 fn promote_opened(session: &Session) {
-    if matches!(
-        session.state(),
-        SessionState::Opening | SessionState::Attaching
-    ) {
-        session.set_state(SessionState::Open);
-    }
+    session.update_state(|state| {
+        matches!(state, SessionState::Opening | SessionState::Attaching)
+            .then_some(SessionState::Open)
+    });
 }
 
 /// Returns whether the session was left **live** — its worker still holds a target, so it still
 /// owes its slot and capacity has to be reconciled against it.
 fn settle_open(session: &Session, result: &Result<String, EngineError>) -> bool {
-    let settled = match (session.state(), result) {
-        (SessionState::Opening | SessionState::Attaching, Ok(_)) => SessionState::Open,
+    // Decided and applied under one lock, for the reason `update_state` gives: `pump` can retire
+    // this session from another task, and that must outrank a decision taken a moment earlier.
+    let settled = session.update_state(|state| match (state, result) {
+        (SessionState::Opening | SessionState::Attaching, Ok(_)) => Some(SessionState::Open),
         // Nothing was created or claimed: this handle will never be usable.
-        (SessionState::Opening, Err(e)) => SessionState::Failed(e.to_string()),
+        (SessionState::Opening, Err(e)) => Some(SessionState::Failed(e.to_string())),
         // The target exists and something after it failed. The session stays usable — that is
         // the whole point of committing before the wait.
-        (SessionState::Attaching, Err(_)) => SessionState::Open,
-        // Already settled, by `open` or by a worker that exited.
-        _ => return false,
-    };
+        (SessionState::Attaching, Err(_)) => Some(SessionState::Open),
+        // Already settled, by `open` or by a worker that exited — or retired by a command queued
+        // behind the open, which stands.
+        _ => None,
+    });
     let live = settled.is_live();
-    session.set_state(settled);
     if !live {
         // The same teardown `open` does on a clean failure. Without it the worker survives
         // holding DbgEng — and a `Failed` session is excluded from `live()`, so `shutdown` would
@@ -1290,19 +1326,14 @@ async fn reader(
             return;
         };
         match message {
+            // Both milestones are conditional transitions, so both go through `update_state`:
+            // a check-then-set would let a retirement land in the gap and be overwritten.
             WorkerMessage::Committed { .. } => {
-                if matches!(session.state(), SessionState::Opening) {
-                    session.set_state(SessionState::Attaching);
-                }
+                session.update_state(|state| {
+                    matches!(state, SessionState::Opening).then_some(SessionState::Attaching)
+                });
             }
-            WorkerMessage::Opened { .. } => {
-                if matches!(
-                    session.state(),
-                    SessionState::Opening | SessionState::Attaching
-                ) {
-                    session.set_state(SessionState::Open);
-                }
-            }
+            WorkerMessage::Opened { .. } => promote_opened(&session),
             WorkerMessage::Done { id, result } => {
                 let waiter = waiters
                     .lock()
@@ -1462,6 +1493,8 @@ mod tests {
             tx,
             next_id: AtomicU64::new(1),
             waiters: Arc::new(Mutex::new(HashMap::new())),
+            // Test doubles stand in for sessions their callers already hold.
+            delivered: AtomicBool::new(true),
             child: Mutex::new(None),
         })
     }
@@ -1840,6 +1873,49 @@ mod tests {
             SessionState::Open,
             "the session being kept is never a victim"
         );
+    }
+
+    /// A session that has opened but whose caller has not been told about it yet must not be
+    /// reclaimed, however idle it looks.
+    ///
+    /// It goes idle the moment its opener's waiter is removed, which is *before* `open` returns
+    /// the handle. With two opens admitted at the limit, the later one's reconciliation would
+    /// otherwise pick the earlier one — and that caller would be handed a `session_id` that was
+    /// already `Closed`.
+    #[tokio::test]
+    async fn a_session_not_yet_handed_to_its_caller_is_never_reclaimed() {
+        let sessions = Sessions::new(Duration::from_secs(1));
+        let undelivered = dormant("sess-just-opened", SessionState::Open);
+        undelivered.delivered.store(false, Ordering::Release);
+        let keeping = dormant("sess-keep", SessionState::Open);
+        {
+            let mut registry = sessions.registry();
+            for n in 0..MAX_SESSIONS - 1 {
+                registry
+                    .all
+                    .push_back(dormant(&format!("sess-busy-{n}"), SessionState::Attaching));
+            }
+            registry.all.push_back(Arc::clone(&undelivered));
+            registry.all.push_back(Arc::clone(&keeping));
+        }
+        assert!(
+            undelivered.busy(),
+            "an undelivered session counts as in flight"
+        );
+
+        sessions.reconcile_capacity(&keeping);
+
+        assert_eq!(
+            undelivered.state(),
+            SessionState::Open,
+            "the session whose caller is still waiting for its handle was reclaimed"
+        );
+
+        // Once its caller has it, it is an ordinary idle session and can pay for the next open.
+        undelivered.delivered.store(true, Ordering::Release);
+        assert!(!undelivered.busy());
+        sessions.reconcile_capacity(&keeping);
+        assert!(!undelivered.state().is_live(), "now it is reclaimable");
     }
 
     /// Busy sessions are still never taken, so an overage that cannot be paid for is left
