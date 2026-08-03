@@ -964,17 +964,25 @@ fn a_dump_session_opens_reads_and_closes() {
     );
 }
 
-/// The `session_id` a tool result carries, or a panic naming what it said instead.
+/// The `session_id` a tool result carries, if it carries one.
 ///
 /// Anchored to the line the openers actually emit (`session_id: sess-…`) rather than to the
 /// substring anywhere in the text: the tool prose mentions `session_id` several times, and a
 /// loose match would yield a plausible-looking wrong handle whose failure surfaces later as an
 /// unrelated mismatch.
-fn session_id_of(text: &str) -> String {
+///
+/// A **failed** opener can carry one too, and that is the case worth remembering: an open that
+/// fails *after* claiming its target hands the handle back deliberately, because the session
+/// exists and needs cleaning up. So cleanup must key on this, never on `isError`.
+fn maybe_session_id(text: &str) -> Option<String> {
     text.lines()
         .find_map(|line| line.trim().strip_prefix("session_id:"))
         .map(|id| id.trim().to_string())
-        .unwrap_or_else(|| panic!("expected a session_id in:\n{text}"))
+}
+
+/// [`maybe_session_id`], for a call that must have opened something.
+fn session_id_of(text: &str) -> String {
+    maybe_session_id(text).unwrap_or_else(|| panic!("expected a session_id in:\n{text}"))
 }
 
 /// Whether a process is still running. Windows-only, like everything else here.
@@ -1629,20 +1637,30 @@ fn a_live_kernel_session_attaches_coexists_and_detaches_cleanly() {
         json!({ "connection": connection }),
         TARGET_STEP,
     );
-    assert_no_error(&attached, "attach_kernel");
     let report = text_of(&attached["result"]);
-    assert!(
-        !is_tool_error(&attached),
-        "the attach did not land. The target must be booted with debugging enabled and dialling \
-         this host, and the KD transport is single-owner — if WinDbg's EngHost already holds the \
-         port, nothing else can attach:\n{report}"
-    );
-    let session = session_id_of(&report);
+    // Whether there is anything to clean up is decided by the *handle*, not by `isError`: an
+    // attach that claims its target and then fails the wait comes back as a tool error carrying a
+    // valid `session_id`, and that session is live, halted, and needs detaching just as much as a
+    // successful one. Nothing below panics until that has happened.
+    let Some(session) = maybe_session_id(&report) else {
+        assert_no_error(&attached, "attach_kernel");
+        panic!(
+            "the attach did not land, and left no session behind. The target must be booted with \
+             debugging enabled and dialling this host, and the KD transport is single-owner — if \
+             WinDbg's EngHost already holds the port, nothing else can attach:\n{report}"
+        );
+    };
 
     // Everything from here runs under `catch_unwind`, because the target is now broken in and
     // stays that way until the detach below — including the `vertarget` check, which has no
     // business being the one assertion that can leave a machine frozen.
     let outcome = catch_unwind(AssertUnwindSafe(|| {
+        assert_no_error(&attached, "attach_kernel");
+        assert!(
+            !is_tool_error(&attached),
+            "the attach reported a failure but left a session behind, so it claimed the target \
+             and then failed — the detach below still has to run:\n{report}"
+        );
         // `vertarget`, run by the opener inside the worker.
         assert!(
             report.contains("Kernel"),
@@ -1760,14 +1778,18 @@ fn disconnecting_releases_a_live_kernel_session_rather_than_killing_it() {
         json!({ "connection": connection }),
         TARGET_STEP,
     );
+    let report = text_of(&attached["result"]);
+    // As above: a tool error can still carry a live session, so refuse to bail before there is
+    // something to bail on. From here the disconnect is the release, so nothing needs a detach —
+    // but the assertion order still has to survive an attach that half-failed.
     assert_no_error(&attached, "attach_kernel");
+    let session = maybe_session_id(&report)
+        .unwrap_or_else(|| panic!("the attach left no session behind:\n{report}"));
     assert!(
         !is_tool_error(&attached),
-        "the attach did not land:\n{}",
-        text_of(&attached["result"])
+        "the attach claimed its target and then failed; this test needs one that landed:\n{report}"
     );
     let status = server.tool_text("session_status", json!({}), STEP);
-    let session = session_id_of(&text_of(&attached["result"]));
     let worker = engine_pid_of(&status, &session);
     let before = system_uptime(&server.tool_text(
         "execute",
@@ -1821,18 +1843,22 @@ fn disconnecting_releases_a_live_kernel_session_rather_than_killing_it() {
     );
     let report = text_of(&reattached["result"]);
     let landed = reattached["error"].is_null() && !is_tool_error(&reattached);
-    let (after, ended) = if landed {
-        let session = session_id_of(&report);
-        let after = system_uptime(&again.tool_text(
-            "execute",
-            json!({ "command": ".time", "session_id": session }),
-            TARGET_STEP,
-        ));
-        // The release. From here the target is running again whatever the assertions say.
-        let ended = again.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
-        (after, ended)
-    } else {
-        (None, String::new())
+    // Keyed on the handle, not on `landed`: a re-attach that claimed the target and then failed
+    // its wait comes back as a tool error *with* a session, and skipping the release for it would
+    // leave the target halted — the one thing this test exists to catch.
+    let (after, ended) = match maybe_session_id(&report) {
+        Some(session) => {
+            let after = system_uptime(&again.tool_text(
+                "execute",
+                json!({ "command": ".time", "session_id": session }),
+                TARGET_STEP,
+            ));
+            // The release. From here the target is running again whatever the assertions say.
+            let ended =
+                again.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
+            (after, ended)
+        }
+        None => (None, String::new()),
     };
 
     // --- now assert ----------------------------------------------------------------------
