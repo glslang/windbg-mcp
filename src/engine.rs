@@ -602,6 +602,21 @@ impl Registry {
             .collect()
     }
 
+    /// Sessions that still have a worker process, whatever their state says.
+    ///
+    /// Not the same set as [`Self::live`], and shutdown needs this one. A session claimed for
+    /// reclamation is marked `Closed` immediately but its worker is released in the background, so
+    /// between those two points it is not live and still owns a process — and a client
+    /// disconnecting in that window would drop the runtime, cancel the release, and take the
+    /// worker down by `kill_on_drop` without the `EndSession` that leaves a kernel target running.
+    fn owning_workers(&self) -> Vec<Arc<Session>> {
+        self.all
+            .iter()
+            .filter(|s| s.child.lock().unwrap_or_else(|e| e.into_inner()).is_some())
+            .cloned()
+            .collect()
+    }
+
     /// Drops the oldest settled sessions once the history bound is exceeded. Live sessions are
     /// never evicted — forgetting one would report its handle as unknown, and the advice that
     /// follows from "unknown" is "open again", which for an attach or a launch means a second
@@ -820,10 +835,13 @@ impl Sessions {
                 // an open that created nothing strands the caller exactly as badly as the advice
                 // this seam replaced.
                 if !session.phase().committed() {
-                    settle_uncommitted(&session, &message);
-                    // A retired session is still live: a queued command owns that worker now, so
-                    // it keeps its slot and has to pay for it.
-                    if state.is_live() {
+                    // Whether this still owes a slot is what `settle_uncommitted` reports, not
+                    // what `state` said a moment ago: a session that has just been failed and
+                    // killed owns nothing, and reconciling on its behalf would evict somebody
+                    // else's idle target to pay for a session that no longer exists.
+                    if settle_uncommitted(&session, &message) {
+                        // Retired: a queued command owns that worker now, so it keeps its slot
+                        // and has to pay for it.
                         self.reconcile_capacity(&session);
                     }
                     Err(OpenError::Clean(message))
@@ -942,17 +960,24 @@ impl Sessions {
     /// kernel outright costs. Sessions are released concurrently because they are independent
     /// processes and the client is waiting.
     pub async fn shutdown(&self) {
-        let live = self.registry().live();
-        if live.is_empty() {
+        // Every session that still *owns a worker*, not every live one. A session claimed for
+        // reclamation is already `Closed` while its release runs in the background, and a
+        // disconnect in that window would otherwise drop the runtime, cancel that release, and
+        // let `kill_on_drop` terminate the worker — leaving a kernel target halted, which is the
+        // one outcome this whole path exists to avoid. Releasing one twice is harmless; missing
+        // one is not.
+        let owners = self.registry().owning_workers();
+        if owners.is_empty() {
             return;
         }
-        tracing::info!("shutting down: releasing {} session(s)", live.len());
-        let mut releasing = Vec::with_capacity(live.len());
-        for session in live {
+        tracing::info!("shutting down: releasing {} session(s)", owners.len());
+        let mut releasing = Vec::with_capacity(owners.len());
+        for session in owners {
             let sessions = self.clone();
             releasing.push(tokio::spawn(async move {
                 // Marked first so nothing new is routed to a session on its way out; the release
                 // runs as the supervisor's own teardown and so passes the gate that closes.
+                // A session already closed keeps the reason it closed for.
                 session.set_state(SessionState::Closed(
                     "the server is shutting down".to_string(),
                 ));
@@ -1248,36 +1273,34 @@ fn promote_opened(session: &Session) {
 /// Returns whether the session was left **live** — its worker still holds a target, so it still
 /// owes its slot and capacity has to be reconciled against it.
 /// Settles a session whose opener failed **without creating anything**, and ends its worker
-/// unless something else has claimed it.
+/// unless something else has claimed it. Returns whether the session survived — which is to say,
+/// whether it still owns a worker and therefore still owes its slot.
 ///
 /// The exception is the whole reason this is a function rather than two lines: a target-changing
 /// command queued behind the open retires the handle *and* takes the worker over, and that worker
 /// may be about to hold a target of its own. Killing it because this open failed would discard
 /// something the caller explicitly asked for. So a retired session keeps its worker and its
 /// (retired) handle; only the open's own caller is told the slate is clean, which it is.
-fn settle_uncommitted(session: &Session, why: &str) {
+fn settle_uncommitted(session: &Session, why: &str) -> bool {
     if matches!(session.state(), SessionState::Retired(_)) {
-        return;
+        return true;
     }
     session.set_state(SessionState::Failed(why.to_string()));
     session.kill();
+    false
 }
 
 fn settle_open(session: &Session, result: &Result<String, EngineError>) -> bool {
     // The same discriminator `open` uses, and for the same reason: the *phase* says whether a
     // target was created, while the state may since have been retired by a command queued behind
     // the open.
-    if result.is_err() && !session.phase().committed() {
+    if let Err(e) = result
+        && !session.phase().committed()
+    {
         // Nothing was created, so the handle will never be usable — unless something else has
-        // taken the worker over, which `settle_uncommitted` is the arbiter of.
-        settle_uncommitted(
-            session,
-            &result
-                .as_ref()
-                .err()
-                .map_or(String::new(), |e| e.to_string()),
-        );
-        return session.state().is_live();
+        // taken the worker over, which `settle_uncommitted` is the arbiter of, and which is also
+        // what decides whether a slot is still owed.
+        return settle_uncommitted(session, &e.to_string());
     }
     // Decided and applied under one lock, for the reason `update_state` gives: `pump` can retire
     // this session from another task, and that must outrank a decision taken a moment earlier.
@@ -1861,6 +1884,49 @@ mod tests {
         let landed = dormant("sess-3", SessionState::Attaching);
         settle_open(&landed, &Ok("vertarget".into()));
         assert_eq!(landed.state(), SessionState::Open);
+    }
+
+    /// Shutdown is keyed on owning a worker, not on being live.
+    ///
+    /// A session claimed for reclamation is `Closed` immediately while its release runs in the
+    /// background. A disconnect landing in that window must still collect it: otherwise the
+    /// runtime is dropped, the release is cancelled, and `kill_on_drop` terminates the worker
+    /// without the `EndSession` that leaves a kernel target running.
+    #[tokio::test]
+    async fn shutdown_collects_a_session_whose_release_is_still_in_flight() {
+        let sessions = Sessions::new(Duration::from_secs(1));
+        let reclaimed = dormant("sess-reclaimed", SessionState::Open);
+        // A stand-in for the worker: any child process will do, since what is under test is
+        // which sessions the registry hands to shutdown, not what the process is.
+        let child = Command::new("cmd")
+            .args(["/c", "ping", "-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn a stand-in child");
+        *reclaimed.child.lock().unwrap() = Some(child);
+        // Claimed for reclamation: closed already, release still to come.
+        reclaimed.set_state(SessionState::Closed("reclaimed".to_string()));
+        sessions.registry().all.push_back(Arc::clone(&reclaimed));
+
+        assert!(
+            sessions.registry().live().is_empty(),
+            "a claimed victim is not live, which is why keying shutdown on `live` missed it"
+        );
+        assert_eq!(
+            sessions
+                .registry()
+                .owning_workers()
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sess-reclaimed"],
+            "it still owns a worker, so shutdown has to collect it"
+        );
+
+        // And once the worker is gone there is nothing left to collect.
+        reclaimed.kill();
+        assert!(sessions.registry().owning_workers().is_empty());
     }
 
     /// A retired handle must not be mistaken for a committed target.
