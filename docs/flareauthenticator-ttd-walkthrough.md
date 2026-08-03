@@ -180,7 +180,8 @@ any sense" indeed.
 ## Pitfalls (learned the hard way)
 
 - **Never run an unbounded memory search on a TTD trace.** `s -u 0 L?0x400000000000 …` sends the engine
-  into a multi-minute scan, and every later call to that session queues behind it. **Scope every search**
+  into a multi-minute scan, and every later *engine* call for that session queues behind it
+  (`session_status` still answers, and `end_session` still reclaims). **Scope every search**
   to a real region (a module range, a heap segment from the PEB `ProcessHeaps`, a stack window), and
   prefer `ttd_calls`/`ttd_memory` over raw `s`. `execute` is on the bounded path, so a scan that runs
   away self-aborts rather than pinning the session indefinitely, and only that session is affected.

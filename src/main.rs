@@ -49,7 +49,7 @@ fn main() -> Result<()> {
     // Read the role before anything else: a worker has no use for a tokio runtime, and its
     // engine thread must be free to block in DbgEng indefinitely.
     let is_worker = std::env::args().any(|arg| arg == worker::WORKER_FLAG);
-    init_logging(is_worker);
+    init_logging();
     if is_worker {
         worker::run();
     }
@@ -62,18 +62,19 @@ fn main() -> Result<()> {
 
 /// stdout is the JSON-RPC transport, so all logging must go to stderr. A worker's stderr is
 /// inherited from the supervisor, so both roles' logs land in the same place an MCP client
-/// already reads — tagged, so they can be told apart.
-fn init_logging(is_worker: bool) {
-    let builder = tracing_subscriber::fmt()
+/// already reads.
+///
+/// Targets stay on for both, which is what tells them apart: a worker's records carry
+/// `windbg_mcp::worker`, the supervisor's `windbg_mcp::engine` and friends. Suppressing them for
+/// workers — the first cut here — identified a worker only by the *absence* of a field, which is
+/// no help at all when two processes are interleaving lines in one stream.
+fn init_logging() {
+    tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        );
-    if is_worker {
-        builder.with_target(false).init();
-    } else {
-        builder.init();
-    }
+        )
+        .init();
 }
 
 async fn serve() -> Result<()> {
