@@ -6,7 +6,7 @@ MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/win-kexp#71, 2026-08-01), and items 13–14 from the bounded-command coverage review
 (#46, 2026-08-02). Each item notes its repo, why it was deferred, and where
 it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
-and the 2026-08-02 entries for the ones items 13–14 and item 10 extend.
+and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
 Items are roughly ordered by how soon they're worth doing, within each cluster. **Item 10 has
 landed** (process-per-session, 2026-08-02); it is kept here rather than deleted because items 7, 8

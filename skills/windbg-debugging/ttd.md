@@ -92,7 +92,7 @@ Then `ttd_calls`/`dx` by name work. To inspect a specific call, travel to it
   is the alias — match the real symbol.
 - **Never run an unbounded memory search on a trace.** A whole-address-space
   `execute { "command": "s -u 0 L?0x400000000000 …" }` sends the engine into a scan that can
-  run for minutes, and every later call to *that session* queues behind it. **Scope every
+  run for minutes, and every later engine call for that session queues behind it. **Scope every
   search** to a real region: a module range (`lm`), a heap segment from the PEB
   (`dt ntdll!_PEB @$peb ProcessHeap`), or a stack window — and prefer the indexed data model
   (`ttd_calls`/`ttd_memory`) over raw `s`. If you do launch one, `execute` is on the bounded

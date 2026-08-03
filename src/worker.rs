@@ -77,11 +77,27 @@ fn watchdog_budget_ms(patience: Duration, queued: Duration) -> u32 {
         .min(u32::MAX as u128) as u32
 }
 
+/// How long the worker gives its engine to let go of the target when the supervisor disappears
+/// without saying goodbye — a Ctrl+C, a crash, anything that is not a clean disconnect.
+///
+/// Short, because this is a process on its way out and the engine may be parked in a wait that
+/// will never end. Long enough for an idle engine to resume and detach a live kernel, which is
+/// the case that matters: exiting without it leaves the target machine halted.
+const ABRUPT_EXIT_RELEASE: Duration = Duration::from_secs(5);
+
+/// What the stdin reader hands to the engine thread.
+enum Job {
+    /// A request from the supervisor, stamped when it was read.
+    Run(Instant, WorkerRequest),
+    /// The supervisor is gone: release the target and acknowledge.
+    Release(mpsc::Sender<()>),
+}
+
 /// Runs this process as an engine worker. Never returns.
 pub fn run() -> ! {
     // Each request is stamped when it is *read*, so the engine thread can tell how long it then
     // waited its turn — the half of the watchdog budget only this process can measure.
-    let (tx, rx) = mpsc::channel::<(Instant, WorkerRequest)>();
+    let (tx, rx) = mpsc::channel::<Job>();
     // Reported rather than panicked: the supervisor is waiting for `Ready` or `Fatal`, and a
     // panic here would give it neither — it would see only "the worker exited before it was
     // ready" and lose the reason.
@@ -103,7 +119,7 @@ pub fn run() -> ! {
         }
         match serde_json::from_str::<WorkerRequest>(&line) {
             Ok(request) => {
-                if tx.send((Instant::now(), request)).is_err() {
+                if tx.send(Job::Run(Instant::now(), request)).is_err() {
                     break; // the engine thread is gone; nothing can run any more
                 }
             }
@@ -118,13 +134,26 @@ pub fn run() -> ! {
     }
 
     // stdin closed: the supervisor ended this session, or died. Either way this process has no
-    // reason to exist. Exit rather than join — the engine thread may be parked in DbgEng
+    // reason to exist.
+    //
+    // On the clean path the supervisor has already had this session release its target, so the
+    // engine has nothing left to do. On the other one — Ctrl+C, a crash, anything that kills the
+    // supervisor without it running its own shutdown — nobody has, and exiting here would leave a
+    // live kernel *halted*, because DbgEng needs an explicit resume-and-detach. So ask for one,
+    // bounded: an idle engine obliges in milliseconds, a parked one never will, and either way
+    // this process is gone within `ABRUPT_EXIT_RELEASE`.
+    //
+    // Bounded and then abandoned, never joined: the engine thread may be blocked in DbgEng
     // forever, and this is precisely the case where that must not hold anything up.
+    let (ack, released) = mpsc::channel();
+    if tx.send(Job::Release(ack)).is_ok() {
+        let _ = released.recv_timeout(ABRUPT_EXIT_RELEASE);
+    }
     std::process::exit(0);
 }
 
 /// Owns the [`DebugEngine`] for the life of the process and runs one op at a time.
-fn engine_thread(rx: mpsc::Receiver<(Instant, WorkerRequest)>) {
+fn engine_thread(rx: mpsc::Receiver<Job>) {
     // `DebugEngine::new()` panics if the engine can't be created (dbgeng.dll not discoverable,
     // most likely). Report it and exit instead of accepting requests that can only fail: the
     // supervisor is waiting for exactly one of these two messages before it registers a
@@ -142,7 +171,19 @@ fn engine_thread(rx: mpsc::Receiver<(Instant, WorkerRequest)>) {
     };
     emit(&WorkerMessage::Ready);
 
-    while let Ok((arrived, request)) = rx.recv() {
+    while let Ok(job) = rx.recv() {
+        let (arrived, request) = match job {
+            Job::Run(arrived, request) => (arrived, request),
+            // The supervisor is gone. Let go of the target before this process does, so a live
+            // kernel is left running rather than halted, then acknowledge so the main thread can
+            // stop waiting. Best-effort by nature: if the engine never reaches this, the main
+            // thread times out and exits anyway.
+            Job::Release(ack) => {
+                let _ = catch_unwind(AssertUnwindSafe(|| engine.end_session()));
+                let _ = ack.send(());
+                continue;
+            }
+        };
         // Measured here, at the front of the queue: this is the wait only this process can see,
         // and the bounded path needs it to size the watchdog.
         let queued = arrived.elapsed();

@@ -1453,15 +1453,23 @@ async fn reader(
             //
             // Both state moves are conditional transitions, so both go through `update_state`:
             // a check-then-set would let that retirement be overwritten.
-            WorkerMessage::Committed { .. } => {
+            // Matched on the reserved opener id, so the contract that only an opener reports
+            // milestones is enforced here rather than assumed to hold for ever.
+            WorkerMessage::Committed { id } if id == OPENER_JOB => {
                 session.reach(OpenPhase::Committed);
                 session.update_state(|state| {
                     matches!(state, SessionState::Opening).then_some(SessionState::Attaching)
                 });
             }
-            WorkerMessage::Opened { .. } => {
+            WorkerMessage::Opened { id } if id == OPENER_JOB => {
                 session.reach(OpenPhase::Opened);
                 promote_opened(&session);
+            }
+            WorkerMessage::Committed { id } | WorkerMessage::Opened { id } => {
+                tracing::warn!(
+                    "session {}: job {id} reported an opener milestone",
+                    session.id
+                );
             }
             WorkerMessage::Done { id, result } => {
                 let waiter = waiters
