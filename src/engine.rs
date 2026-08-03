@@ -76,6 +76,19 @@ const END_SESSION_TIMEOUT: Duration = Duration::from_secs(20);
 /// rather than the cost per session.
 const SHUTDOWN_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// `CREATE_NEW_PROCESS_GROUP`, which every worker is spawned with.
+///
+/// An interactive Ctrl+C is delivered to *every* process attached to the console, and a child
+/// inherits its parent's process group — so without this a worker takes the default console
+/// handler and terminates on the spot, before its stdin closes and before it can release its
+/// target. That is precisely the halted kernel this design exists to avoid, arriving by the one
+/// route where the supervisor cannot help: its own default handler ends it, so it never reaches
+/// [`Sessions::shutdown`].
+///
+/// With the flag, Ctrl+C is disabled for the worker's group. The supervisor still dies, its handles
+/// still close, and the worker meets the EOF path that knows how to let go.
+const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
 /// Counter behind [`mint_session_id`]. Only needs to be unique within this process.
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -1018,7 +1031,13 @@ impl Sessions {
             }));
         }
         for task in releasing {
-            let _ = task.await;
+            // A panic in here is not a correctness gap — the worker still has its own EOF teardown
+            // to fall back on — but it is the difference between a target released and a target
+            // released by the five-second best effort, and an operator should not have to infer
+            // that from a frozen guest.
+            if let Err(e) = task.await {
+                tracing::error!("shutting down: a session's release task failed: {e}");
+            }
         }
     }
 
@@ -1208,6 +1227,11 @@ impl Sessions {
             // machine left halted. So EOF is the teardown, on every route out — clean shutdown,
             // Ctrl+C, or a crash — and [`Session::kill`] is the deliberate one, used only once a
             // release has been asked for and refused, or on a worker known to hold nothing.
+            //
+            // Which is why the worker also gets its own process group: see
+            // [`CREATE_NEW_PROCESS_GROUP`]. EOF cannot be the teardown if a console Ctrl+C ends the
+            // worker before its stdin ever closes.
+            .creation_flags(CREATE_NEW_PROCESS_GROUP)
             .spawn()
             .map_err(|e| format!("could not start an engine worker ({}): {e}", exe.display()))?;
 
