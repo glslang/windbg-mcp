@@ -209,17 +209,35 @@ try {
     $supervisorExited = $server.WaitForExit($budget)
     Note "supervisor exited: $supervisorExited"
 
-    # Completes when the last holder of that stderr pipe closes it -- the worker.
-    [void]$stderr.Wait($budget)
-    $log = $stderr.Result
-    if ($null -eq $log) { $log = "" }
-
+    # The worker's own pid is the signal to wait on, not the stderr task. A worker that never
+    # exits is a *result* this script has to report, and waiting on the transcript first would
+    # mean waiting on a pipe that worker is still holding open -- so the regression this exists to
+    # catch would hang it instead of failing it.
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     while ((Get-Process -Id $workerPid -ErrorAction SilentlyContinue) -and [DateTime]::UtcNow -lt $deadline) {
         Start-Sleep -Milliseconds 100
     }
     $workerGone = -not (Get-Process -Id $workerPid -ErrorAction SilentlyContinue)
     Note "worker gone: $workerGone"
+
+    if (-not $workerGone) {
+        # It still holds the write end, so the transcript cannot be read while it lives. The
+        # verdict is already recorded, so end it -- the log is worth more than the process.
+        Note "worker outlived the budget; ending it so its output can still be read"
+        Stop-Process -Id $workerPid -Force -ErrorAction SilentlyContinue
+    }
+
+    # Completes when the last holder of that stderr pipe closes it -- the worker. Never touch
+    # .Result unless Wait said so: on a task that has not completed, reading it blocks with no
+    # timeout at all, which would swallow the verdict this script exists to produce.
+    $log = ""
+    if ($stderr.Wait(5000)) {
+        $log = $stderr.Result
+        if ($null -eq $log) { $log = "" }
+    }
+    else {
+        Note "stderr never closed, so no transcript is available to read"
+    }
 
     # The discriminator. A worker killed by the Ctrl+C never reaches this line; one that met EOF
     # logs it before asking its engine to detach.
@@ -229,11 +247,23 @@ try {
         Note "  | $line"
     }
 
-    if ($supervisorExited -and $workerGone -and $released) {
+    # Named individually, because the three failures want different reactions and a single
+    # catch-all message sends you looking at the wrong one.
+    $reasons = New-Object System.Collections.ArrayList
+    if (-not $supervisorExited) {
+        [void]$reasons.Add("the supervisor survived the Ctrl+C, so nothing was actually tested")
+    }
+    if (-not $released) {
+        [void]$reasons.Add("the worker never logged the release, so it was killed before it could detach")
+    }
+    if (-not $workerGone) {
+        [void]$reasons.Add("the worker outlived its budget rather than exiting on EOF")
+    }
+    if ($reasons.Count -eq 0) {
         Note "VERDICT: PASS"
     }
     else {
-        Note "VERDICT: FAIL -- a worker that does not log the release was killed before it could detach"
+        Note "VERDICT: FAIL -- $($reasons -join '; ')"
     }
 }
 catch {
