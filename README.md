@@ -45,11 +45,13 @@ process. Two things follow, and they are why it is built this way:
 - **`main.rs`** — role selection (supervisor or worker), tokio + stdio transport. **Logs go to
   stderr** (stdout is the JSON-RPC channel); workers inherit the supervisor's stderr, so everything
   lands in the same place. Workers never outlive the connection: a disconnect ends every session
-  the same way `end_session` does — asked to release its target, and terminated only if it will not
-  let go within a few seconds — and a worker exits on its own if its stdin closes. Releasing rather
-  than killing matters for a live kernel, because DbgEng leaves a detached-but-halted kernel
-  *frozen*: a session still busy when the client disconnects is terminated, and that does leave the
-  target stopped, so end a live kernel session explicitly rather than relying on the disconnect.
+  the same way `end_session` does — each worker is asked to release its target, and is terminated
+  only if it does not let go within a few seconds — and a worker exits on its own if its stdin
+  closes. Which of those two happens matters for a live kernel. DbgEng leaves a detached-but-halted
+  kernel *frozen*, so a worker that releases its target leaves the machine running, while a worker
+  that is terminated leaves it stopped. A session still busy at disconnect is the one that gets
+  terminated, so end a live kernel session with `end_session` rather than relying on the
+  disconnect.
 
 **MCP protocol revision:** built on `rmcp` 3.x, this server accepts every revision that SDK knows —
 `2026-07-28` and the `initialize`-handshake ("legacy") era before it (`2025-11-25`, `2025-06-18`,

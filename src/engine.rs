@@ -710,8 +710,11 @@ impl Sessions {
                     session.set_state(SessionState::Open);
                 }
                 // Only now, with a target that is genuinely open, is an existing session
-                // reclaimed to pay for it.
-                self.trim_to_cap(&session).await;
+                // reclaimed to pay for it — and not on this caller's clock: reclaiming waits on
+                // *other* sessions' workers, each up to `END_SESSION_TIMEOUT`, and serially when
+                // the overage is more than one. The caller is owed the handle for a target that
+                // is already open.
+                self.reconcile_capacity(&session);
                 Ok(OpenReport { id, report })
             }
             Err(EngineError::Timeout(message)) => Err(OpenError::Timeout { id, message }),
@@ -742,7 +745,7 @@ impl Sessions {
                         // for its slot. Skipping this is how the limit stops being one: the
                         // sessions retained this way are idle, so they go on satisfying the
                         // capacity check for the *next* open, and the count climbs.
-                        self.trim_to_cap(&session).await;
+                        self.reconcile_capacity(&session);
                         Err(OpenError::PostCommit {
                             id,
                             message: e.to_string(),
@@ -960,6 +963,19 @@ impl Sessions {
                 keeping.id
             );
         }
+    }
+
+    /// [`Self::trim_to_cap`], off the caller's clock.
+    ///
+    /// Every path that reconciles capacity does so on behalf of a session that has *already*
+    /// opened, so none of them should make anyone wait for other sessions to be released — a
+    /// release is bounded by [`END_SESSION_TIMEOUT`] each, and serial when more than one is owed.
+    /// The accounting is unaffected: the victim is marked under the registry lock the moment it is
+    /// claimed, so a concurrent open sees it gone immediately either way.
+    fn reconcile_capacity(&self, keeping: &Arc<Session>) {
+        let sessions = self.clone();
+        let keeping = Arc::clone(keeping);
+        tokio::spawn(async move { sessions.trim_to_cap(&keeping).await });
     }
 
     /// Marks and hands back the oldest idle session while the registry is over the cap.
@@ -1270,11 +1286,8 @@ async fn reader(
                     && settle_open(&session, &unreceived)
                 {
                     // It settled *live*, so it owes the slot it took — the same reconciliation
-                    // `open` runs, which nobody is left here to run for it. Spawned rather than
-                    // awaited: reclaiming waits on another session's worker, and this task has
-                    // its own worker's messages to keep draining.
-                    let sessions = sessions.clone();
-                    tokio::spawn(async move { sessions.trim_to_cap(&session).await });
+                    // `open` runs, which nobody is left here to run for it.
+                    sessions.reconcile_capacity(&session);
                 }
             }
             // Both belong to the spawn handshake, which has already happened.
