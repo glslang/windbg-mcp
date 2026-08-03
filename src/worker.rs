@@ -213,7 +213,14 @@ fn emit(message: &WorkerMessage) {
     };
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
-    let _ = writeln!(stdout, "{line}");
+    // Leading newline, not just a trailing one. DbgEng's own output reaches the supervisor through
+    // `IDebugOutputCallbacks` and never comes this way, but an extension DLL that writes to the
+    // console directly does — and if it left its last line *unterminated*, a trailing-newline-only
+    // message would be appended to that text and arrive as one unparseable line. The supervisor
+    // skips what it cannot parse, so the reply would be lost outright: the caller times out, its
+    // waiter is never removed, and the session stays busy and unreclaimable for good. Opening with
+    // a newline terminates whatever came before, so a message always starts its own line.
+    let _ = write!(stdout, "\n{line}\n");
     let _ = stdout.flush();
 }
 
