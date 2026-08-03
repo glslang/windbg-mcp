@@ -227,6 +227,13 @@ before a release, or when a change touches the relevant path. Drivers live in
 
 - **Live user-mode** — `examples/test_usermode.ps1`: launch `cmd.exe` under the debugger, break in,
   read registers/modules, set a breakpoint.
+- **Ctrl+C teardown** — `examples/ctrl_c_teardown.ps1`: a console Ctrl+C must leave a worker time
+  to release its target, not kill it where it stands. Unattended, and it needs no target beyond the
+  sample dump — but it is here rather than in `cargo test` because Ctrl+C cannot be aimed: the
+  script runs the whole scenario in a console of its own, since an event sent to the test runner's
+  console would take the runner with it. Self-checking (`PASS`/`FAIL`, exit 0/1/2); what it reads
+  is whether the worker logged the release before exiting, because the worker process is gone
+  either way. Run it when anything touches worker spawning or the EOF teardown.
 - **Failure paths** — `examples/verify_fixes.ps1`: execution control with no debuggee returns a
   clean "No active debuggee" error, and a failed kernel attach is a clean error rather than a panic.
 - **Live kernel (KDNET)** — the [live-kernel tier](#the-live-kernel-tier) covers the session
