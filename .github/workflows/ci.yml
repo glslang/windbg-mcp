@@ -7,8 +7,8 @@ on:
   push:
     branches: [main]
   pull_request:
-  # Manual trigger for the smoke test's debugger tier, which reaches real DbgEng and so is
-  # kept out of the PR path. Use it after a `win-kexp` bump — see docs/smoke-test.md.
+  # Kept for re-running a tier by hand — the debugger tier after a flaky runner, say. It is no
+  # longer what gates that tier; see the `smoke-debugger` job.
   workflow_dispatch:
 
 concurrency:
@@ -70,9 +70,18 @@ jobs:
 
   smoke-debugger:
     name: Smoke test (debugger tier)
-    # On demand only: this tier opens the sample crash dump through the runner's DbgEng, so a
-    # Windows-image change could break it for reasons unrelated to the PR under review.
-    if: github.event_name == 'workflow_dispatch'
+    # Runs on every push and PR, not on demand.
+    #
+    # It was on-demand while the risk (a Windows-image change breaking it for reasons unrelated
+    # to the PR under review) outweighed what it covered. Process-per-session changed that side
+    # of the scale: this tier is now the only automated check of the properties the architecture
+    # exists for — two sessions coexisting, a parked attach being reclaimed while another session
+    # works, no engine worker outliving the connection — and none of those depend on the image.
+    # It needs no symbols and no network, and the dump it opens is checked in.
+    #
+    # The risk it was hedging against is still real, and the answer to it is that a runner whose
+    # DbgEng cannot open a checked-in dump is something this repo wants to hear about: it breaks
+    # users the same way. If that happens, pin the failure here rather than in a bug report.
     runs-on: windows-latest
     timeout-minutes: 20
     steps:

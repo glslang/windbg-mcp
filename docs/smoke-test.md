@@ -25,12 +25,12 @@ connected MCP client holds a lock on (see [`CLAUDE.md`](../CLAUDE.md)). Whole su
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a KDNET target you can freeze | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect |
 | **Live (other)** | manual | TTD engine, elevation, a test driver | see [Manual checklist](#manual-checklist) |
 
-The protocol tier rides `cargo test`, so CI already runs it. The debugger tier is opt-in: it
-reaches real DbgEng and is available in CI on demand via the **Smoke test (debugger tier)** job
-(Actions → CI → *Run workflow*). The bounded-command and live-kernel tiers are `#[ignore]`d — one
-is measured in minutes, the other touches another machine; see below. Neither is automated, and
-the rest of the live checklist is not either: no runner has a kernel target, a TTD engine, or
-elevation.
+The protocol tier rides `cargo test`, so CI already runs it. The debugger tier is opt-in
+*locally* but runs on every push and PR in CI, as the **Smoke test (debugger tier)** job — it is
+the only automated check of the properties process-per-session exists for, and it needs no symbols
+and no network. The bounded-command and live-kernel tiers are `#[ignore]`d — one is measured in
+minutes, the other touches another machine; see below. Neither is automated, and the rest of the
+live checklist is not either: no runner has a kernel target, a TTD engine, or elevation.
 
 ## What it asserts, and why each one is a dependency tripwire
 
@@ -103,7 +103,8 @@ processes, so they need real ones:
 only watches GitHub Actions here, so cargo bumps arrive by hand.
 
 1. `cargo test` — the protocol tier plus the existing unit tests.
-2. For a `win-kexp` bump, add the debugger tier — the only automated thing that touches DbgEng:
+2. For a `win-kexp` bump, add the debugger tier locally too — CI runs it on the PR, but a local
+   run tells you sooner:
 
    ```pwsh
    $env:WINDBG_MCP_SMOKE_DUMP = "1"; cargo test --test mcp_smoke
