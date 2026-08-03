@@ -31,7 +31,10 @@ process. Two things follow, and they are why it is built this way:
 
 - **`engine.rs`** — the supervisor: the session registry, worker spawn/teardown, and the routing
   that turns a `session_id` into "which worker". Each session has one queue with one consumer, so
-  calls against a session are serialized and ordered even though sessions are not.
+  calls against a session are *serialized* — one runs at a time, and the one running finishes
+  before the next starts. Serialized is not ordered: two calls submitted before either has
+  answered reach that queue in whichever order wins the race, so await each result before sending
+  the next call that depends on it.
 - **`worker.rs`** — the child process. The `DebugEngine` is created on, and confined to, one OS
   thread inside it (DbgEng requires serialized, single-thread access, and `WaitForEvent` must run on
   the session-owning thread). A `catch_unwind` guard turns a panic in one operation into a failed
