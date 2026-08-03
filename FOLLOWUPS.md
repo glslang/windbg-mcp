@@ -211,10 +211,17 @@ What moved, for anyone picking up the items that referenced this:
   supervisor never touches a `DebugEngine` at all, which is a stronger position than the one that
   claim was written for.
 
-Not done, and no longer blocking anything: **per-worker symbol state**. Each worker has its own
-`.sympath` and symbol cache, which is correct (sessions are independent) but means a `set_symbol_path`
-does not carry to a session opened later. If that becomes annoying, the fix is a supervisor-held
-default applied at worker startup, not shared state.
+Not done, and no longer blocking anything: **per-worker symbol state** —
+[#66](https://github.com/glslang/windbg-mcp/issues/66). Each worker has its own `.sympath` and symbol
+cache, which is correct (sessions are independent) but means a `set_symbol_path` does not carry to a
+session opened later. The fix is a supervisor-held default applied at worker startup, not shared
+state between running workers.
+
+Two ordering details the review of #62 raised and that PR deliberately left alone, both filed:
+[#64](https://github.com/glslang/windbg-mcp/issues/64) (`end_session` keeps accepting calls while it
+tears the session down — the fix wants the `Gate` treatment `retires` already has) and
+[#65](https://github.com/glslang/windbg-mcp/issues/65) (the worker protocol shares stdout with
+anything the engine prints; mitigated, not structurally prevented).
 
 ## 11. [windbg-mcp] MCP Apps (`ui://` resources) — scoped out
 
