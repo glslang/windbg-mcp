@@ -1058,7 +1058,9 @@ impl Sessions {
                     ),
                     ShutdownNote::Refused(why) => tracing::warn!(
                         "shutting down: session {} reported an error releasing its target ({why}); \
-                         its worker (pid {}) was terminated anyway",
+                         its worker (pid {}) was terminated anyway — and terminating a debugger \
+                         does not resume and detach for it, so a live kernel target may be left \
+                         halted",
                         session.id,
                         session.pid
                     ),
@@ -1456,7 +1458,9 @@ enum ShutdownNote<'a> {
     Released,
     /// Another teardown released it first; this attempt's failure is a consequence, not news.
     ReleasedElsewhere,
-    /// The engine answered and refused. The worker went anyway.
+    /// The engine answered and refused. The worker went anyway — which for a live kernel leaves
+    /// the target no better off than [`Self::Unreleased`], since terminating a debugger does not
+    /// resume and detach for it. Kept separate because the engine's reason is the lead here.
     Refused(&'a str),
     /// Nothing reported releasing the target, so it may still be attached. The string says what
     /// this attempt saw, since the two ways of getting here need different investigation.
