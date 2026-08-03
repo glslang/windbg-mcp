@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-08-03
+
 ### Changed
 
 - **Each debug session now runs in its own engine process, and a session that cannot be unwound
@@ -422,7 +424,8 @@ Initial release, packaged as a single-plugin Claude Code marketplace.
 - Crash-dump `!analyze` support via automatic WinDbg extension DLL loading.
 - Windows CI (format, clippy, build, test) and walkthrough docs with sample dumps.
 
-[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/glslang/windbg-mcp/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/glslang/windbg-mcp/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/glslang/windbg-mcp/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/glslang/windbg-mcp/compare/v0.1.3...v0.2.0
