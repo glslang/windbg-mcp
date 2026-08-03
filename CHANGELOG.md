@@ -25,6 +25,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now only ever deliberate: after a release was asked for and refused, or on a worker known to
   hold nothing.
 
+  Workers are also spawned into their **own process group**, without which EOF could not be the
+  teardown at all on one route: an interactive Ctrl+C goes to every process sharing the console,
+  and a child inherits its parent's group, so a worker took the default console handler and died
+  where it stood — no stdin close, no release. It is the route where the server can help least,
+  since its own default handler ends it before it can run any shutdown, and it is the one a
+  developer driving this from a terminal hits by reflex.
+
   The way shutdown could miss a worker is closed too. An open that was admitted before the client
   disconnected, and whose worker finished its handshake after shutdown had walked the registry,
   used to register anyway and be handed its opener — starting an attach nobody was left to end.

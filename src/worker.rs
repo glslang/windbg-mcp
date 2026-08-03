@@ -149,8 +149,16 @@ pub fn run() -> ! {
     // bounded: an idle engine obliges in milliseconds, a parked one never will, and either way
     // this process is gone within `ABRUPT_EXIT_RELEASE`.
     //
+    // Ctrl+C only reaches this path because a worker is spawned into its own process group
+    // (`engine::CREATE_NEW_PROCESS_GROUP`). Without that it would be delivered here too, and the
+    // default console handler would end this process where it stands — no EOF, no release.
+    //
     // Bounded and then abandoned, never joined: the engine thread may be blocked in DbgEng
     // forever, and this is precisely the case where that must not hold anything up.
+    //
+    // Logged because it is otherwise invisible: this is the teardown nobody asked for, and an
+    // operator looking at a target that came back fine wants to see which path did it.
+    tracing::info!("worker: supervisor is gone; releasing the target before exit");
     let (ack, released) = mpsc::channel();
     if tx.send(Job::Release(ack)).is_ok() {
         let _ = released.recv_timeout(ABRUPT_EXIT_RELEASE);
