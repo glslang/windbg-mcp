@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A worker the server never got round to releasing now lets go by itself, rather than being
+  killed with its target still attached** ([#67](https://github.com/glslang/windbg-mcp/issues/67)).
+
+  Workers were spawned with tokio's `kill_on_drop`, so the last act of a supervisor on its way out
+  was to `TerminateProcess` every worker handle it still held. For a session shutdown had already
+  released that is harmless. For one it *missed* it is the whole failure: the worker is killed
+  before it can detach, and a live kernel left attached-but-halted is a target machine stopped
+  until someone reboots it. Belt-and-braces that cut the braces.
+
+  A worker has handled this on its own since 0.4.0 — its stdin reaching EOF means "the supervisor
+  is gone", and it asks its engine to release the target before exiting, bounded at five seconds —
+  so the fix is to stop pre-empting it. `kill_on_drop` is gone; EOF is the teardown on every route
+  out, including a Ctrl+C or a crash where there is no supervisor left to do anything. Killing is
+  now only ever deliberate: after a release was asked for and refused, or on a worker known to
+  hold nothing.
+
+  The way shutdown could miss a worker is closed too. An open that was admitted before the client
+  disconnected, and whose worker finished its handshake after shutdown had walked the registry,
+  used to register anyway and be handed its opener — starting an attach nobody was left to end.
+  Registration now re-checks, under the same lock that closes the gate, so such an open is refused
+  and its (target-less) worker ended. That makes the set of workers to release one that cannot
+  grow behind shutdown's snapshot, so the timed drain that used to approximate the same guarantee
+  is gone with it.
+
 ## [0.4.0] - 2026-08-03
 
 ### Changed

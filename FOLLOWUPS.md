@@ -217,6 +217,12 @@ cache, which is correct (sessions are independent) but means a `set_symbol_path`
 session opened later. The fix is a supervisor-held default applied at worker startup, not shared
 state between running workers.
 
+Fixed since, from the same review: [#67](https://github.com/glslang/windbg-mcp/issues/67) — workers
+were spawned with `kill_on_drop`, so a worker shutdown missed was terminated with its target still
+attached. `kill_on_drop` is gone (EOF on the worker's stdin is now the only teardown, which it
+already handled), and registration re-checks the shutdown gate so the missable window is closed
+rather than merely survivable.
+
 Two ordering details the review of #62 raised and that PR deliberately left alone, both filed:
 [#64](https://github.com/glslang/windbg-mcp/issues/64) (`end_session` keeps accepting calls while it
 tears the session down — the fix wants the `Gate` treatment `retires` already has) and

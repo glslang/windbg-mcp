@@ -136,6 +136,12 @@ pub fn run() -> ! {
     // stdin closed: the supervisor ended this session, or died. Either way this process has no
     // reason to exist.
     //
+    // This is the *only* thing that ends a worker the supervisor did not explicitly kill — it does
+    // not set `kill_on_drop`, deliberately (`engine::Sessions::spawn`). So the path below has to
+    // be unconditional, and is: whatever the engine thread is doing, and whether or not it ever
+    // picks the release up, this process exits within `ABRUPT_EXIT_RELEASE`. Nothing upstream
+    // needs a backstop for a worker that "does not exit on EOF", because there is no such worker.
+    //
     // On the clean path the supervisor has already had this session release its target, so the
     // engine has nothing left to do. On the other one — Ctrl+C, a crash, anything that kills the
     // supervisor without it running its own shutdown — nobody has, and exiting here would leave a

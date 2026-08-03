@@ -76,28 +76,6 @@ const END_SESSION_TIMEOUT: Duration = Duration::from_secs(20);
 /// rather than the cost per session.
 const SHUTDOWN_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How many times shutdown re-checks for workers registered while it was running.
-///
-/// One round can miss an open that was between spawning its worker and registering it when the
-/// client disconnected. Two is one round plus a retry, which is all that reasoning needs — new
-/// opens are refused before the first — and it keeps the worst case (each round waiting out
-/// [`SHUTDOWN_RELEASE_TIMEOUT`]) inside the budget a client allows for the process to exit.
-const SHUTDOWN_ROUNDS: usize = 2;
-
-/// How long shutdown will wait for an open that was *already admitted* to register its worker,
-/// when there is nothing else left to release.
-///
-/// It cannot simply stop: such an open holds no target only until it registers, and it opens one
-/// immediately afterwards. Bounded rather than waiting out the worker handshake in full, because
-/// a client that has disconnected is entitled to see the process go — and a worker that has not
-/// registered by then still holds nothing, so what it costs is an ungraceful kill of an engine
-/// with no target.
-const SHUTDOWN_DRAIN: Duration = Duration::from_secs(2);
-
-/// How often that drain re-checks. Short: registration follows the worker's handshake by
-/// microseconds, so this is nearly always one poll.
-const SHUTDOWN_POLL: Duration = Duration::from_millis(50);
-
 /// Counter behind [`mint_session_id`]. Only needs to be unique within this process.
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -536,7 +514,8 @@ pub struct OpenReport {
 pub enum OpenError {
     /// No worker could be started, so no session exists and none could.
     Unavailable(String),
-    /// Every session slot is taken by work in flight.
+    /// Refused without opening anything: every session slot is taken by work in flight, or the
+    /// connection is going away. The message says which.
     NoRoom(String),
     /// The open failed before anything was created or claimed. The slate is clean and opening
     /// again is the correct recovery.
@@ -632,8 +611,9 @@ impl Registry {
     /// Not the same set as [`Self::live`], and shutdown needs this one. A session claimed for
     /// reclamation is marked `Closed` immediately but its worker is released in the background, so
     /// between those two points it is not live and still owns a process — and a client
-    /// disconnecting in that window would drop the runtime, cancel the release, and take the
-    /// worker down by `kill_on_drop` without the `EndSession` that leaves a kernel target running.
+    /// disconnecting in that window would drop the runtime and cancel that release, leaving the
+    /// worker to fall back on noticing its own stdin close: a bounded best effort, where an
+    /// orderly `EndSession` was there for the asking.
     fn owning_workers(&self) -> Vec<Arc<Session>> {
         self.all
             .iter()
@@ -649,9 +629,10 @@ impl Registry {
     ///
     /// Nor is one that still owns a worker, whatever its state says. A session claimed for
     /// reclamation is `Closed` at once and released in the background, and evicting it in that
-    /// window would take it out of [`Self::owning_workers`] — so a disconnect would no longer
-    /// find it, the release would be cancelled with the runtime, and `kill_on_drop` would finish
-    /// the worker without the `EndSession` a halted kernel needs.
+    /// window would take it out of [`Self::owning_workers`] — so a disconnect would no longer find
+    /// it, the release would be cancelled with the runtime, and the worker would be left to let go
+    /// on its own rather than being asked properly, which is the weaker of the two guarantees a
+    /// halted kernel can be given.
     fn trim(&mut self) {
         while self.all.len() > CLOSED_HISTORY + MAX_SESSIONS {
             let evictable = self.all.iter().position(|s| {
@@ -824,10 +805,12 @@ impl Sessions {
             // start must not cost the caller a target they already had.
             Err(why) => return Err(OpenError::Unavailable(why)),
         };
-        {
-            let mut registry = self.registry();
-            registry.all.push_back(Arc::clone(&session));
-            registry.trim();
+        if let Err(why) = self.admit(&session) {
+            // Refused *before* the opener was written, so this worker is `Ready` and holds
+            // nothing at all — no dump, no trace, no attach. There is no target to release and so
+            // nothing for its stdin closing to accomplish; killing it is the whole teardown.
+            session.kill();
+            return Err(OpenError::NoRoom(why));
         }
         // Released only now: from here the session is counted in `all` instead, and holding both
         // would count this open twice.
@@ -994,63 +977,48 @@ impl Sessions {
     /// kernel outright costs. Sessions are released concurrently because they are independent
     /// processes and the client is waiting.
     pub async fn shutdown(&self) {
-        // Refuse new opens first, so the set being walked stops growing. Without this an open
-        // that was between spawning its worker and registering it when the client disconnected
-        // registers *after* the snapshot below, and its worker is never released — for a live
-        // kernel, that is a target left halted.
-        self.registry().closing = true;
-
-        // Rounds rather than one pass, because an open already past the gate can still register
-        // while the first round runs. It terminates: nothing new can be admitted, so each round
-        // finds only what the previous one raced with, and in practice the second is empty.
-        let drain_by = Instant::now() + SHUTDOWN_DRAIN;
-        for _ in 0..SHUTDOWN_ROUNDS {
-            // Every session that still *owns a worker*, not every live one. A session claimed for
-            // reclamation is already `Closed` while its release runs in the background, and a
-            // disconnect in that window would otherwise drop the runtime, cancel that release,
-            // and let `kill_on_drop` terminate the worker — the same halted target by another
-            // route. Releasing one twice is harmless; missing one is not.
-            let owners = loop {
-                let (owners, opening) = {
-                    let registry = self.registry();
-                    (registry.owning_workers(), registry.opening)
-                };
-                if !owners.is_empty() {
-                    break owners;
-                }
-                // Nothing to release *yet* is not the same as nothing to release. An open
-                // admitted before the gate closed may still be waiting for its worker's
-                // handshake, so it is not in the registry to be found — and it holds no target
-                // only until it registers, at which point it opens one immediately. Returning
-                // here would leave exactly that worker to `kill_on_drop`.
-                if opening == 0 || Instant::now() >= drain_by {
-                    return;
-                }
-                tokio::time::sleep(SHUTDOWN_POLL).await;
-            };
-            tracing::info!("shutting down: releasing {} session(s)", owners.len());
-            let mut releasing = Vec::with_capacity(owners.len());
-            for session in owners {
-                let sessions = self.clone();
-                releasing.push(tokio::spawn(async move {
-                    // Marked first so nothing new is routed to a session on its way out; the
-                    // release runs as the supervisor's own teardown and so passes the gate that
-                    // closes. A session already closed keeps the reason it closed for.
-                    session.set_state(SessionState::Closed(
-                        "the server is shutting down".to_string(),
-                    ));
-                    sessions
-                        .release(
-                            &session,
-                            Call::supervisor(EngineOp::EndSession),
-                            SHUTDOWN_RELEASE_TIMEOUT,
-                        )
-                        .await;
-                }));
-            }
-            for task in releasing {
-                let _ = task.await;
-            }
+        // Closing the gate and taking the snapshot under **one** lock acquisition is what makes
+        // one pass enough. [`Self::admit`] re-checks `closing` under this same lock after its
+        // worker's handshake, so every open is on one side or the other of this moment: either it
+        // registered first and is in `owners`, or it registers never and is refused. The set
+        // cannot grow behind this snapshot, which is what earlier versions used a timed drain to
+        // approximate.
+        //
+        // Every session that still *owns a worker*, not every live one. A session claimed for
+        // reclamation is already `Closed` while its release runs in the background, and a
+        // disconnect in that window would otherwise drop the runtime and cancel that release,
+        // leaving the worker to notice its own stdin close — a five-second best-effort where an
+        // orderly release was available. Releasing one twice is harmless; missing one is not.
+        let owners = {
+            let mut registry = self.registry();
+            registry.closing = true;
+            registry.owning_workers()
+        };
+        if owners.is_empty() {
+            return;
+        }
+        tracing::info!("shutting down: releasing {} session(s)", owners.len());
+        let mut releasing = Vec::with_capacity(owners.len());
+        for session in owners {
+            let sessions = self.clone();
+            releasing.push(tokio::spawn(async move {
+                // Marked first so nothing new is routed to a session on its way out; the release
+                // runs as the supervisor's own teardown and so passes the gate that closes. A
+                // session already closed keeps the reason it closed for.
+                session.set_state(SessionState::Closed(
+                    "the server is shutting down".to_string(),
+                ));
+                sessions
+                    .release(
+                        &session,
+                        Call::supervisor(EngineOp::EndSession),
+                        SHUTDOWN_RELEASE_TIMEOUT,
+                    )
+                    .await;
+            }));
+        }
+        for task in releasing {
+            let _ = task.await;
         }
     }
 
@@ -1069,11 +1037,7 @@ impl Sessions {
     fn take_slot(&self) -> Result<Slot, String> {
         let mut registry = self.registry();
         if registry.closing {
-            return Err(
-                "this server is shutting down — the client disconnected, and every session is \
-                 being released. Nothing more can be opened on this connection."
-                    .to_string(),
-            );
+            return Err(shutting_down());
         }
         let live = registry.live();
         // How many sessions would have to be reclaimed to be back at the limit once this open,
@@ -1197,6 +1161,30 @@ impl Sessions {
         Some(Arc::clone(idle))
     }
 
+    /// Registers a worker that has just come up — or refuses it, because the connection it was
+    /// opened for is gone.
+    ///
+    /// This is a *second* reading of the same gate [`Self::take_slot`] checked, and the gap
+    /// between them is the point: an open spends a whole worker handshake there, up to
+    /// [`WORKER_READY_TIMEOUT`], and the client can disconnect in the middle of it. By then
+    /// [`Self::shutdown`] has walked the registry and will not walk it again, so registering here
+    /// would hand a target to a worker nobody is left to release — and for a live kernel attach
+    /// that commits before the process goes, a target left halted.
+    ///
+    /// Refusing is what makes shutdown's single pass sound. Both take the registry lock, so an
+    /// open is on one side or the other of the moment `closing` is set: it either registers first
+    /// and is found by the snapshot, or is refused here. There is no interleaving in which a
+    /// worker holding a target goes unseen.
+    fn admit(&self, session: &Arc<Session>) -> Result<(), String> {
+        let mut registry = self.registry();
+        if registry.closing {
+            return Err(shutting_down());
+        }
+        registry.all.push_back(Arc::clone(session));
+        registry.trim();
+        Ok(())
+    }
+
     /// Starts a worker process and waits for it to report that its engine came up.
     async fn spawn(
         &self,
@@ -1211,7 +1199,15 @@ impl Sessions {
             .stdout(Stdio::piped())
             // Worker logs join the server's own, which is where an MCP client looks for them.
             .stderr(Stdio::inherit())
-            .kill_on_drop(true)
+            // Deliberately **not** `kill_on_drop`, and the absence is load-bearing. Dropping this
+            // handle — or the whole process exiting — closes the worker's stdin, and a worker
+            // reads that EOF as "the supervisor is gone" and asks its engine to release the target
+            // before it exits, bounded (`worker::run`). Terminating on drop pre-empts exactly
+            // that: a worker this server never got round to releasing would die by
+            // `TerminateProcess` with its target still attached, which for a live kernel means a
+            // machine left halted. So EOF is the teardown, on every route out — clean shutdown,
+            // Ctrl+C, or a crash — and [`Session::kill`] is the deliberate one, used only once a
+            // release has been asked for and refused, or on a worker known to hold nothing.
             .spawn()
             .map_err(|e| format!("could not start an engine worker ({}): {e}", exe.display()))?;
 
@@ -1375,6 +1371,16 @@ fn settle_open(session: &Session, result: &Result<String, EngineError>) -> bool 
             .then_some(SessionState::Open)
     });
     settled.is_live()
+}
+
+/// Why an open is refused once the client has disconnected.
+///
+/// Shared by the two gates that refuse it — before a worker is spawned, and again after it comes
+/// up — so the answer cannot drift depending on which one the caller raced.
+fn shutting_down() -> String {
+    "this server is shutting down — the client disconnected, and every session is being released. \
+     Nothing more can be opened on this connection."
+        .to_string()
 }
 
 fn worker_gone(id: &str) -> String {
@@ -1957,12 +1963,58 @@ mod tests {
         assert_eq!(landed.state(), SessionState::Open);
     }
 
+    /// The gap `admit` exists to close: a worker that finishes its handshake after the client has
+    /// gone must never be registered.
+    ///
+    /// `take_slot` let this open through while the connection was alive, and it then spent a whole
+    /// worker handshake — up to `WORKER_READY_TIMEOUT`, against a `SHUTDOWN_RELEASE_TIMEOUT` of
+    /// five seconds — before reaching this point. Registering now would send it an opener, and for
+    /// a kernel attach that commits, the process would exit with a target halted.
+    #[tokio::test]
+    async fn a_worker_that_comes_up_after_the_client_has_gone_is_not_registered() {
+        let sessions = Sessions::new(Duration::from_secs(1));
+        // Nothing to release, so this is the whole of shutdown: close the gate.
+        sessions.shutdown().await;
+
+        let late = dormant("sess-late", SessionState::Opening);
+        let refused = sessions
+            .admit(&late)
+            .expect_err("a worker that came up after the disconnect must be refused");
+        assert!(
+            refused.contains("shutting down"),
+            "the refusal has to say why: {refused}"
+        );
+        assert!(
+            sessions.registry().all.is_empty(),
+            "a refused worker must leave nothing behind for `owning_workers` to have missed"
+        );
+    }
+
+    /// And the ordinary path still registers, which is what makes the refusal above a gate rather
+    /// than a wall.
+    #[tokio::test]
+    async fn a_worker_that_comes_up_on_a_live_connection_is_registered() {
+        let sessions = Sessions::new(Duration::from_secs(1));
+        let session = dormant("sess-1", SessionState::Opening);
+        sessions.admit(&session).expect("a live connection admits");
+        assert_eq!(
+            sessions
+                .registry()
+                .all
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sess-1"]
+        );
+    }
+
     /// Shutdown is keyed on owning a worker, not on being live.
     ///
     /// A session claimed for reclamation is `Closed` immediately while its release runs in the
     /// background. A disconnect landing in that window must still collect it: otherwise the
-    /// runtime is dropped, the release is cancelled, and `kill_on_drop` terminates the worker
-    /// without the `EndSession` that leaves a kernel target running.
+    /// runtime is dropped, the release is cancelled, and the worker is left to notice its stdin
+    /// close and let go on its own — best effort, when the orderly `EndSession` a halted kernel
+    /// wants was available.
     #[tokio::test]
     async fn shutdown_collects_a_session_whose_release_is_still_in_flight() {
         let sessions = Sessions::new(Duration::from_secs(1));
@@ -2004,8 +2056,8 @@ mod tests {
     ///
     /// A reclaimed session is `Closed` at once and released in the background. Evicting it in that
     /// window takes it out of `owning_workers`, so a disconnect no longer finds it, the release is
-    /// cancelled with the runtime, and `kill_on_drop` finishes the worker without the
-    /// `EndSession` a halted kernel needs.
+    /// cancelled with the runtime, and the worker is left to let go on its own instead of being
+    /// asked — the weaker guarantee, for the target that can least afford it.
     #[tokio::test]
     async fn history_eviction_keeps_a_session_that_still_owns_a_worker() {
         let sessions = Sessions::new(Duration::from_secs(1));
