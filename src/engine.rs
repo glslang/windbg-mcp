@@ -570,6 +570,7 @@ impl Drop for Slot {
 }
 
 /// How a worker took being told to let go of its target.
+#[derive(Debug)]
 enum Release {
     /// It released the target and said so.
     Released(String),
@@ -1046,44 +1047,28 @@ impl Sessions {
                 // `end_session` renders this for its caller. Shutdown has no caller — the client
                 // has already gone — so the log is the only place it can land, and it is exactly
                 // where an operator looks after finding a guest that did not come back.
-                match outcome {
-                    Release::Released(_) => {
+                match shutdown_note(&outcome, session.released.load(Ordering::SeqCst)) {
+                    ShutdownNote::Released => {
                         tracing::info!("shutting down: session {} released its target", session.id)
                     }
-                    // `AlreadyGone` is two different events wearing one name, and they want
-                    // opposite reactions. A session being reclaimed releases in the background,
-                    // and this walk deliberately collects it mid-flight; if that release lands
-                    // first it fails this one out of its wait with `Lost`, which arrives here
-                    // looking exactly like a worker that crashed. `released` is what separates
-                    // them — see the field.
-                    Release::AlreadyGone if session.released.load(Ordering::SeqCst) => {
-                        tracing::info!(
-                            "shutting down: session {}'s target was released by a teardown already \
-                             in flight",
-                            session.id
-                        )
-                    }
-                    Release::AlreadyGone => tracing::warn!(
-                        "shutting down: session {}'s worker (pid {}) was gone before it could be \
-                         asked to release, and no other teardown reported releasing it — so \
-                         nothing detached its target and a live kernel may be left halted",
-                        session.id,
-                        session.pid
+                    ShutdownNote::ReleasedElsewhere => tracing::info!(
+                        "shutting down: session {}'s target was released by a teardown already in \
+                         flight",
+                        session.id
                     ),
-                    Release::Parked => tracing::warn!(
-                        "shutting down: session {} did not let go within {SHUTDOWN_RELEASE_TIMEOUT:?} \
-                         and its worker (pid {}) was terminated — a live kernel target may be left \
-                         halted",
-                        session.id,
-                        session.pid
-                    ),
-                    Release::Refused(why) => tracing::warn!(
+                    ShutdownNote::Refused(why) => tracing::warn!(
                         "shutting down: session {} reported an error releasing its target ({why}); \
                          its worker (pid {}) was terminated anyway",
                         session.id,
                         session.pid
                     ),
-                    Release::Stale(why) => tracing::info!(
+                    ShutdownNote::Unreleased(what) => tracing::warn!(
+                        "shutting down: session {} (pid {}) {what}, and no teardown reported \
+                         releasing its target — so a live kernel target may be left halted",
+                        session.id,
+                        session.pid
+                    ),
+                    ShutdownNote::Settled(why) => tracing::info!(
                         "shutting down: session {} was already settled ({why})",
                         session.id
                     ),
@@ -1456,6 +1441,58 @@ fn settle_open(session: &Session, result: &Result<String, EngineError>) -> bool 
             .then_some(SessionState::Open)
     });
     settled.is_live()
+}
+
+/// What a session's teardown should be reported as at shutdown.
+///
+/// Separate from [`Release`] because a release attempt reports *its own* fate, and that is not the
+/// same question as what became of the target. Two teardowns can be racing for one session — a
+/// reclamation releasing in the background and a disconnect collecting it mid-flight — and only
+/// the winner is told it worked. The loser sees a timeout, a `Lost`, or a debugger error, none of
+/// which mean the target is still attached.
+#[derive(Debug, PartialEq, Eq)]
+enum ShutdownNote<'a> {
+    /// This attempt released the target.
+    Released,
+    /// Another teardown released it first; this attempt's failure is a consequence, not news.
+    ReleasedElsewhere,
+    /// The engine answered and refused. The worker went anyway.
+    Refused(&'a str),
+    /// Nothing reported releasing the target, so it may still be attached. The string says what
+    /// this attempt saw, since the two ways of getting here need different investigation.
+    Unreleased(&'static str),
+    /// There was nothing to tear down.
+    Settled(&'a str),
+}
+
+/// Reads one session's teardown, given what its own attempt returned and whether *any* teardown
+/// got a successful `EndSession` out of that worker.
+///
+/// The rule is one line: a success anywhere outranks this attempt's failure. Every non-success
+/// outcome says only that *we* did not get a confirmation — `Parked` that our clock ran out,
+/// `AlreadyGone` that another teardown failed us out of our wait, `Refused` that the engine had
+/// nothing left to release and said so — and each of those is exactly what winning teardown
+/// leaves behind.
+///
+/// What this cannot do is close the race, only stop misreading it: `released` is set a moment
+/// before the losing waiter is failed, so a teardown that succeeds *while* this is being read
+/// still logs as unreleased. Fixing that means shutdown waiting on another teardown's clock
+/// rather than its own, which is a trade the five-second grace exists to refuse. A warning that
+/// is occasionally early is the acceptable end of that; one that fires when nothing is wrong is
+/// not, because the next real one gets ignored.
+fn shutdown_note(outcome: &Release, released: bool) -> ShutdownNote<'_> {
+    match outcome {
+        Release::Released(_) => ShutdownNote::Released,
+        Release::Stale(why) => ShutdownNote::Settled(why),
+        _ if released => ShutdownNote::ReleasedElsewhere,
+        Release::Parked => ShutdownNote::Unreleased(
+            "did not let go within the grace and its worker was terminated",
+        ),
+        Release::AlreadyGone => {
+            ShutdownNote::Unreleased("had no worker left to ask — it crashed, or was terminated")
+        }
+        Release::Refused(why) => ShutdownNote::Refused(why),
+    }
 }
 
 /// Why an open is refused once the client has disconnected.
@@ -2047,6 +2084,64 @@ mod tests {
         let landed = dormant("sess-3", SessionState::Attaching);
         settle_open(&landed, &Ok("vertarget".into()));
         assert_eq!(landed.state(), SessionState::Open);
+    }
+
+    /// A teardown that lost the race must not report a halted target.
+    ///
+    /// All three ways this attempt can fail are also what a *winning* concurrent teardown leaves
+    /// behind: it fails our waiter out with `Lost`, or beats our clock, or leaves the engine with
+    /// nothing to release and an error to say so. Warning on any of them would mean warning that
+    /// a live kernel may be halted at the moment another teardown cleanly detached it.
+    #[test]
+    fn a_release_that_landed_elsewhere_outranks_this_attempt_failing() {
+        for outcome in [
+            Release::Parked,
+            Release::AlreadyGone,
+            Release::Refused("the engine said no".to_string()),
+        ] {
+            assert_eq!(
+                shutdown_note(&outcome, true),
+                ShutdownNote::ReleasedElsewhere,
+                "{outcome:?} with the target already released is not a halted-kernel warning"
+            );
+        }
+    }
+
+    /// And with nothing else having released it, those same outcomes are the warning.
+    #[test]
+    fn nothing_having_released_the_target_is_what_deserves_the_warning() {
+        assert!(matches!(
+            shutdown_note(&Release::Parked, false),
+            ShutdownNote::Unreleased(_)
+        ));
+        assert!(matches!(
+            shutdown_note(&Release::AlreadyGone, false),
+            ShutdownNote::Unreleased(_)
+        ));
+        // The two say different things, because they need different investigation.
+        assert_ne!(
+            shutdown_note(&Release::Parked, false),
+            shutdown_note(&Release::AlreadyGone, false)
+        );
+        // A refusal is its own outcome: the engine answered, it just said no, and the reason is
+        // the useful part.
+        assert_eq!(
+            shutdown_note(&Release::Refused("bad handle".to_string()), false),
+            ShutdownNote::Refused("bad handle")
+        );
+    }
+
+    /// The outcomes that are already unambiguous are not touched by the flag.
+    #[test]
+    fn a_release_this_attempt_made_reads_the_same_either_way() {
+        let released = Release::Released("session ended".to_string());
+        // `true` is the normal case here: this very release is what set the flag.
+        assert_eq!(shutdown_note(&released, true), ShutdownNote::Released);
+        assert_eq!(shutdown_note(&released, false), ShutdownNote::Released);
+        assert_eq!(
+            shutdown_note(&Release::Stale("already closed".to_string()), false),
+            ShutdownNote::Settled("already closed")
+        );
     }
 
     /// The gap `admit` exists to close: a worker that finishes its handshake after the client has

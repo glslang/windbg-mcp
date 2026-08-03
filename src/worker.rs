@@ -160,7 +160,14 @@ pub fn run() -> ! {
     // operator looking at a target that came back fine wants to see which path did it.
     tracing::info!("worker: supervisor is gone; releasing the target before exit");
     let (ack, released) = mpsc::channel();
-    if tx.send(Job::Release(ack)).is_ok() {
+    if tx.send(Job::Release(ack)).is_err() {
+        // The engine thread died before this could be asked, so nothing was even attempted --
+        // a different failure from the two below, and the only one where no release was tried
+        // at all.
+        tracing::error!(
+            "worker: the engine thread is gone, so nothing was asked to release the target"
+        );
+    } else {
         // Whichever way this ends the process does, but *which* way is the difference between a
         // target let go and a target still attached to a debugger that no longer exists. Silence
         // here would leave that to be inferred from a guest that never came back.
