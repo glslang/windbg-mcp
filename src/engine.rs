@@ -293,6 +293,14 @@ pub struct Session {
     delivered: AtomicBool,
     /// How far the opener got, as [`OpenPhase`]. Separate from the state on purpose.
     phase: AtomicU8,
+    /// Whether *some* teardown got a successful `EndSession` out of this worker.
+    ///
+    /// Exists because two teardowns can race for one session — a reclamation releasing in the
+    /// background and a disconnect arriving mid-flight — and only the winner is told it worked.
+    /// The loser is failed out of its wait with [`EngineError::Lost`], which is indistinguishable
+    /// from the worker having crashed. This is what tells those two apart, and the difference is
+    /// "the target was let go" versus "a live kernel may be sitting halted".
+    released: AtomicBool,
     child: Mutex<Option<Child>>,
 }
 
@@ -972,6 +980,13 @@ impl Sessions {
             Err(EngineError::Stale(why)) => return Release::Stale(why),
             other => other,
         };
+        // Recorded **before** `fail_outstanding`, and the order is the whole point: that call is
+        // what turns another teardown's wait on this same session into `Lost`, so the flag has to
+        // be visible by the time anyone is failed out of it. Reordering these two lines silently
+        // restores a warning that says a target may be halted when it was just released.
+        if out.is_ok() {
+            session.released.store(true, Ordering::SeqCst);
+        }
         session.fail_outstanding(&format!("session `{}` was ended", session.id));
         session.kill();
         match out {
@@ -1035,15 +1050,23 @@ impl Sessions {
                     Release::Released(_) => {
                         tracing::info!("shutting down: session {} released its target", session.id)
                     }
-                    // Not the benign reading it looks like. This walk only covers sessions that
-                    // still *own* a worker handle, and releasing one takes that handle away — so
-                    // a session cannot reach here because it was already released. It reaches
-                    // here because its worker died with nobody having released anything, which
-                    // leaves the target in the same unconfirmed state `Parked` does.
+                    // `AlreadyGone` is two different events wearing one name, and they want
+                    // opposite reactions. A session being reclaimed releases in the background,
+                    // and this walk deliberately collects it mid-flight; if that release lands
+                    // first it fails this one out of its wait with `Lost`, which arrives here
+                    // looking exactly like a worker that crashed. `released` is what separates
+                    // them — see the field.
+                    Release::AlreadyGone if session.released.load(Ordering::SeqCst) => {
+                        tracing::info!(
+                            "shutting down: session {}'s target was released by a teardown already \
+                             in flight",
+                            session.id
+                        )
+                    }
                     Release::AlreadyGone => tracing::warn!(
                         "shutting down: session {}'s worker (pid {}) was gone before it could be \
-                         asked to release — it crashed or was terminated, so nothing detached its \
-                         target and a live kernel may be left halted",
+                         asked to release, and no other teardown reported releasing it — so \
+                         nothing detached its target and a live kernel may be left halted",
                         session.id,
                         session.pid
                     ),
@@ -1317,6 +1340,7 @@ impl Sessions {
             waiters: Arc::clone(&waiters),
             delivered: AtomicBool::new(false),
             phase: AtomicU8::new(OpenPhase::Started as u8),
+            released: AtomicBool::new(false),
             child: Mutex::new(Some(child)),
         });
 
@@ -1746,6 +1770,7 @@ mod tests {
             // Test doubles stand in for sessions their callers already hold.
             delivered: AtomicBool::new(true),
             phase: AtomicU8::new(phase as u8),
+            released: AtomicBool::new(false),
             child: Mutex::new(None),
         })
     }
