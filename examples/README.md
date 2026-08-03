@@ -26,6 +26,12 @@ so build the server first: `cargo build --release`. For symbol resolution, set
 - **`verify_fixes.ps1`** — regression checks: `go`/step with no debuggee returns a
   clean "No active debuggee" error (no process crash), and a failed kernel attach is a
   clean error (no panic). The kernel-attach check needs a real KDNET key filled in.
+- **`ctrl_c_teardown.ps1`** — checks that a console Ctrl+C lets an engine worker release its
+  target instead of killing it mid-session. Unlike the others this one is a *test*: it prints
+  `PASS`/`FAIL` and exits 0/1 (2 if inconclusive), needs nothing but the checked-in sample dump,
+  and runs the scenario in a console of its own because Ctrl+C reaches every process on a console —
+  including, otherwise, your shell. `-Exe ..\target\debug\windbg-mcp.exe` to test a working-tree
+  build.
 - **`sweep_ioctls.ps1`** — driver IOCTL sweep, **host side** (see
   [`driver-ioctl.md`](../skills/windbg-debugging/driver-ioctl.md)). Attaches over KDNET,
   prints the driver's dispatch table (`driver_object`) and load base, and — given the
