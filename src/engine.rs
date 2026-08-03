@@ -76,6 +76,13 @@ const END_SESSION_TIMEOUT: Duration = Duration::from_secs(20);
 /// rather than the cost per session.
 const SHUTDOWN_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How many times shutdown re-checks for workers registered while it was running.
+///
+/// One round can miss an open that was between spawning its worker and registering it when the
+/// client disconnected. Two suffice — new opens are refused before the first round — and the
+/// third is only there so a bug in that reasoning costs a bounded wait rather than a hang.
+const SHUTDOWN_ROUNDS: usize = 3;
+
 /// Counter behind [`mint_session_id`]. Only needs to be unique within this process.
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -575,6 +582,9 @@ struct Registry {
     /// each look at the same four live sessions, each conclude there is room, and each spawn —
     /// so the bound is only enforced against sessions that finished opening.
     opening: usize,
+    /// Set once the client has disconnected. Refuses new opens, so the set of workers to release
+    /// stops growing while shutdown is walking it.
+    closing: bool,
 }
 
 impl Registry {
@@ -960,38 +970,48 @@ impl Sessions {
     /// kernel outright costs. Sessions are released concurrently because they are independent
     /// processes and the client is waiting.
     pub async fn shutdown(&self) {
-        // Every session that still *owns a worker*, not every live one. A session claimed for
-        // reclamation is already `Closed` while its release runs in the background, and a
-        // disconnect in that window would otherwise drop the runtime, cancel that release, and
-        // let `kill_on_drop` terminate the worker — leaving a kernel target halted, which is the
-        // one outcome this whole path exists to avoid. Releasing one twice is harmless; missing
-        // one is not.
-        let owners = self.registry().owning_workers();
-        if owners.is_empty() {
-            return;
-        }
-        tracing::info!("shutting down: releasing {} session(s)", owners.len());
-        let mut releasing = Vec::with_capacity(owners.len());
-        for session in owners {
-            let sessions = self.clone();
-            releasing.push(tokio::spawn(async move {
-                // Marked first so nothing new is routed to a session on its way out; the release
-                // runs as the supervisor's own teardown and so passes the gate that closes.
-                // A session already closed keeps the reason it closed for.
-                session.set_state(SessionState::Closed(
-                    "the server is shutting down".to_string(),
-                ));
-                sessions
-                    .release(
-                        &session,
-                        Call::supervisor(EngineOp::EndSession),
-                        SHUTDOWN_RELEASE_TIMEOUT,
-                    )
-                    .await;
-            }));
-        }
-        for task in releasing {
-            let _ = task.await;
+        // Refuse new opens first, so the set being walked stops growing. Without this an open
+        // that was between spawning its worker and registering it when the client disconnected
+        // registers *after* the snapshot below, and its worker is never released — for a live
+        // kernel, that is a target left halted.
+        self.registry().closing = true;
+
+        // Rounds rather than one pass, because an open already past the gate can still register
+        // while the first round runs. It terminates: nothing new can be admitted, so each round
+        // finds only what the previous one raced with, and in practice the second is empty.
+        for _ in 0..SHUTDOWN_ROUNDS {
+            // Every session that still *owns a worker*, not every live one. A session claimed for
+            // reclamation is already `Closed` while its release runs in the background, and a
+            // disconnect in that window would otherwise drop the runtime, cancel that release,
+            // and let `kill_on_drop` terminate the worker — the same halted target by another
+            // route. Releasing one twice is harmless; missing one is not.
+            let owners = self.registry().owning_workers();
+            if owners.is_empty() {
+                return;
+            }
+            tracing::info!("shutting down: releasing {} session(s)", owners.len());
+            let mut releasing = Vec::with_capacity(owners.len());
+            for session in owners {
+                let sessions = self.clone();
+                releasing.push(tokio::spawn(async move {
+                    // Marked first so nothing new is routed to a session on its way out; the
+                    // release runs as the supervisor's own teardown and so passes the gate that
+                    // closes. A session already closed keeps the reason it closed for.
+                    session.set_state(SessionState::Closed(
+                        "the server is shutting down".to_string(),
+                    ));
+                    sessions
+                        .release(
+                            &session,
+                            Call::supervisor(EngineOp::EndSession),
+                            SHUTDOWN_RELEASE_TIMEOUT,
+                        )
+                        .await;
+                }));
+            }
+            for task in releasing {
+                let _ = task.await;
+            }
         }
     }
 
@@ -1009,6 +1029,13 @@ impl Sessions {
     /// the open is refused with the list, which is a better answer than picking a victim.
     fn take_slot(&self) -> Result<Slot, String> {
         let mut registry = self.registry();
+        if registry.closing {
+            return Err(
+                "this server is shutting down — the client disconnected, and every session is \
+                 being released. Nothing more can be opened on this connection."
+                    .to_string(),
+            );
+        }
         let live = registry.live();
         // How many sessions would have to be reclaimed to be back at the limit once this open,
         // and every open already in flight, has landed — against how many *can* be. Counting the
@@ -1250,12 +1277,6 @@ fn stale_handle(want: &str, state: &SessionState) -> String {
 /// So `next_id` starts *past* this value and only [`Sessions::open`] ever uses it.
 const OPENER_JOB: u64 = 1;
 
-/// Moves a session out of its opening states once the opener's result is known.
-///
-/// Normally [`Sessions::open`] does this from the reply it received; this is the same decision
-/// taken by [`reader`] when the caller's timeout means no reply was received at all. The states
-/// are the discriminator either way — `Opening` means nothing was created, `Attaching` means the
-/// target exists and the wait failed — so both paths reach the same answer.
 /// Moves a session that is still opening to [`SessionState::Open`], and leaves every other state
 /// alone.
 ///
@@ -1270,8 +1291,6 @@ fn promote_opened(session: &Session) {
     });
 }
 
-/// Returns whether the session was left **live** — its worker still holds a target, so it still
-/// owes its slot and capacity has to be reconciled against it.
 /// Settles a session whose opener failed **without creating anything**, and ends its worker
 /// unless something else has claimed it. Returns whether the session survived — which is to say,
 /// whether it still owns a worker and therefore still owes its slot.
@@ -1290,6 +1309,11 @@ fn settle_uncommitted(session: &Session, why: &str) -> bool {
     false
 }
 
+/// Settles a session from its opener's result when nobody is left to do it — the caller's timeout
+/// fired, so [`Sessions::open`] never saw the reply.
+///
+/// Returns whether the session was left **live**: its worker still holds a target, so it still
+/// owes its slot and capacity has to be reconciled against it.
 fn settle_open(session: &Session, result: &Result<String, EngineError>) -> bool {
     // The same discriminator `open` uses, and for the same reason: the *phase* says whether a
     // target was created, while the state may since have been retired by a command queued behind

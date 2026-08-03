@@ -42,6 +42,14 @@ pub const WORKER_FLAG: &str = "--engine-worker";
 /// sessions live in their own process.
 const LOAD_WAIT_MS: u32 = 60_000;
 
+/// Most bytes a single `read_memory` will fetch.
+///
+/// A guard against exhausting the worker, not a judgement about what is useful: the buffer costs
+/// this much and the hexdump built from it costs roughly four times more, so an unbounded `size`
+/// is an out-of-memory away from losing the session. 1 MiB is far past any real inspection —
+/// which renders as some 65,000 lines of hex — while leaving no plausible caller short.
+const MAX_READ_BYTES: usize = 1024 * 1024;
+
 /// How much of the caller's remaining patience the watchdog keeps for itself: it Ctrl+Breaks the
 /// engine this long before the caller's wait expires, so the interrupt has time to land, `Execute`
 /// has time to unwind, and this worker is free again before the tool call reports its timeout.
@@ -74,10 +82,18 @@ pub fn run() -> ! {
     // Each request is stamped when it is *read*, so the engine thread can tell how long it then
     // waited its turn — the half of the watchdog budget only this process can measure.
     let (tx, rx) = mpsc::channel::<(Instant, WorkerRequest)>();
-    thread::Builder::new()
+    // Reported rather than panicked: the supervisor is waiting for `Ready` or `Fatal`, and a
+    // panic here would give it neither — it would see only "the worker exited before it was
+    // ready" and lose the reason.
+    if let Err(e) = thread::Builder::new()
         .name("dbgeng".into())
         .spawn(move || engine_thread(rx))
-        .expect("failed to spawn dbgeng thread");
+    {
+        emit(&WorkerMessage::Fatal {
+            message: format!("could not start the engine thread: {e}"),
+        });
+        std::process::exit(1);
+    }
 
     let stdin = std::io::stdin();
     for line in stdin.lock().lines() {
@@ -91,7 +107,13 @@ pub fn run() -> ! {
                     break; // the engine thread is gone; nothing can run any more
                 }
             }
-            Err(e) => tracing::error!("worker: unreadable request ({e}): {line}"),
+            // The line itself is never logged. An `AttachKernel` request carries the KD
+            // connection string, key and all, and this worker's stderr is the supervisor's —
+            // which is to say, the MCP client's log.
+            Err(e) => tracing::error!(
+                "worker: unreadable request ({e}); {} bytes, discarded",
+                line.len()
+            ),
         }
     }
 
@@ -306,6 +328,17 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<S
         EngineOp::Registers => e.registers().map_err(es),
         EngineOp::ReadMemory { address, size } => {
             let addr = parse_u64(&address)?;
+            // Bounded before the allocation, not after. `size` arrives from the caller as a bare
+            // `u32`, and a large one costs that many bytes here plus a hexdump several times
+            // larger — enough to take the worker down with an OOM, which costs the caller their
+            // whole session for a number a model can produce by accident.
+            if size as usize > MAX_READ_BYTES {
+                return Err(format!(
+                    "`size` is {size} bytes; this tool reads at most {MAX_READ_BYTES}. Read the \
+                     range you need in pieces, or use `execute` with a `db`/`dd` command if you \
+                     want the debugger's own paging."
+                ));
+            }
             let bytes = e.read_memory(addr, size as usize).map_err(es)?;
             Ok(hexdump(addr, &bytes))
         }
