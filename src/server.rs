@@ -1561,9 +1561,12 @@ impl WindbgServer {
             // A timeout abandons the *wait*, not the job: this open may still be running and may
             // still land. The handle exists from the moment the session is registered, so it can
             // be named now — which is what makes recovery via `session_status` sound.
+            // The `session_id:` line is the same one a successful open emits, deliberately: this
+            // is the result a caller most needs to get a handle *out* of, and prose alone would
+            // make it the one opener outcome they cannot parse the id from.
             Err(OpenError::Timeout { id, message }) => tool_error(format!(
-                "{message}\n\nThe wait was abandoned, but this open was not: it is still running \
-                 in session `{id}`, and may still land. Ask `session_status \
+                "{message}\n\nsession_id: {id}\nThe wait was abandoned, but this open was not: it \
+                 is still running in the session above, and may still land. Ask `session_status \
                  {{ \"session_id\": \"{id}\" }}` — it reports whether the open is still going, \
                  how long it has been going, and whether that is longer than a healthy one takes. \
                  Do not re-run the open while it is still going, which would attach to, or start, \
