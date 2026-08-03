@@ -161,9 +161,13 @@ case.
 
 These live with the wire tests rather than beside the arithmetic because the wiring they prove now
 spans two processes: the supervisor sends the caller's remaining patience, the worker derives the
-watchdog deadline from it, and only the shipped binary contains both halves. The arithmetic itself
-is unit-tested in `src/worker.rs` and rides `cargo test` everywhere, so a regression in the common
-case fails in CI rather than waiting for a manual run.
+watchdog deadline from it, and only the shipped binary contains both halves.
+
+Each half is unit-tested where it lives, and both ride `cargo test` everywhere — so a regression in
+the common case fails in CI rather than waiting for a manual run. What is sent is
+`remaining_patience_ms` in [`src/engine.rs`](../src/engine.rs); what is derived from it is
+`watchdog_budget_ms` in [`src/worker.rs`](../src/worker.rs). The tests above are what checks that
+the two agree across the pipe, which is the part neither module can prove alone.
 
 ## The live-kernel tier
 
