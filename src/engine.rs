@@ -2010,6 +2010,16 @@ mod tests {
     /// too, so a refactor that stops matching fails loudly instead of quietly checking nothing.
     #[test]
     fn every_process_spawn_in_this_crate_takes_the_spawn_lock() {
+        // Assembled at run time rather than written as literals, because this function is *in* the
+        // source it reads. Written out, the two lines below would each match themselves: the
+        // matcher would count as a spawn site, and — the guard's name being on the line above it —
+        // as a *guarded* one. The floor asserted at the end would then be satisfied by the checker
+        // itself, which is the one line that cannot stop matching, and a real spawn site could drop
+        // out of the marker with nothing to notice. Splitting them keeps the checker invisible to
+        // itself, which is what leaves the floor counting only real spawns.
+        let a_spawn = [".spawn", "()"].concat();
+        let the_guard = ["spawn_", "guard()"].concat();
+
         let mut sites = 0;
         let mut unguarded = Vec::new();
         for file in rust_sources(&PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/src"))) {
@@ -2025,10 +2035,10 @@ mod tests {
                 if code.starts_with("fn ") || code.contains(" fn ") {
                     guarded = false;
                 }
-                if code.contains("spawn_guard()") {
+                if code.contains(&the_guard) {
                     guarded = true;
                 }
-                if code.contains(".spawn()") {
+                if code.contains(&a_spawn) {
                     sites += 1;
                     if !guarded {
                         unguarded.push(format!("{}:{}", file.display(), n + 1));
@@ -2038,7 +2048,9 @@ mod tests {
         }
         assert!(
             unguarded.is_empty(),
-            "these spawn a process without holding `engine::spawn_guard()` in the same function, \
+            // `engine::spawn_guard` without its parentheses, for the reason above: written in
+            // full it would be one more line the checker sees as a guard.
+            "these spawn a process without holding `engine::spawn_guard` in the same function, \
              so a child started there can inherit a worker's protocol channel and keep it from \
              ever reporting EOF: {unguarded:?}"
         );
