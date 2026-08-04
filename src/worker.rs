@@ -18,13 +18,14 @@
 //! and waiting for it would recreate the very wedge this design removes.
 
 use std::io::{BufRead, BufReader, PipeReader, PipeWriter, Write};
-use std::os::windows::io::{FromRawHandle, RawHandle};
+use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use win_kexp::dbgeng::{DebugEngine, RunToOutcome};
+use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
 use crate::proto::{EngineOp, ReachabilityOp, WorkerMessage, WorkerRequest};
 use crate::server::{
@@ -63,6 +64,18 @@ fn channel_handles(args: &[String]) -> Result<(usize, usize), String> {
         }
     };
     Ok((value(REQUESTS_FLAG)?, value(MESSAGES_FLAG)?))
+}
+
+/// Clears `HANDLE_FLAG_INHERIT` on a handle this process inherited, so no child of *this* process
+/// gets a copy in turn. The supervisor's side of the same flag is `engine::inheritable`.
+fn stop_inheriting(handle: RawHandle) -> std::io::Result<()> {
+    // SAFETY: the handle is owned by this process for the rest of its life, and this only changes
+    // a flag on it.
+    let ok = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// How long to wait for a target to stop after open/attach/launch (ms).
@@ -144,6 +157,23 @@ pub fn run(args: &[String]) -> ! {
     // its EOF.
     let requests = unsafe { PipeReader::from_raw_handle(requests as RawHandle) };
     let messages = unsafe { PipeWriter::from_raw_handle(messages as RawHandle) };
+    // The inheritable flag came with them and has done its job; carrying it further is how the
+    // channel would escape this process. DbgEng creates children of its own — a launched debuggee,
+    // whatever an extension shells out to — and one that inherited the message end would keep that
+    // pipe from reporting EOF after this worker exits, which is exactly the signal the supervisor
+    // settles a session on. Warned about rather than fatal: the channel itself still works, and
+    // the risk only materializes if something is spawned here at all.
+    for (what, handle) in [
+        ("requests", requests.as_raw_handle()),
+        ("messages", messages.as_raw_handle()),
+    ] {
+        if let Err(e) = stop_inheriting(handle) {
+            tracing::warn!(
+                "worker: could not stop the {what} channel being inherited ({e}); a process this \
+                 debugger starts could hold it open past this worker's exit"
+            );
+        }
+    }
     // Installed before the engine thread exists, so nothing can reach `emit` without a channel.
     let _ = MESSAGES.set(Mutex::new(messages));
 
