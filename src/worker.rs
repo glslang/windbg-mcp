@@ -2,7 +2,8 @@
 //!
 //! dbgeng.dll holds **one debuggee session per process**, so a session is a process here rather
 //! than a thread. The supervisor ([`crate::engine`]) spawns one of these per open target and
-//! talks to it over stdin/stdout ([`crate::proto`]).
+//! talks to it over a private pair of inherited pipes ([`crate::proto`]) — *not* over this
+//! process's standard handles, which anything linked into it may write to.
 //!
 //! Inside the worker the old confinement rules still apply — DbgEng wants serialized,
 //! single-threaded access, and `WaitForEvent` must run on the session-owning thread — so the
@@ -12,13 +13,14 @@
 //! watchdog cannot reach a wait that is still establishing the link). That used to park the
 //! server's only engine thread; here it parks this process, which the supervisor can kill.
 //!
-//! Which is why the stdin reader lives on the *main* thread and exits the process outright on
+//! Which is why the request reader lives on the *main* thread and exits the process outright on
 //! EOF instead of joining the engine thread: at EOF the engine thread may be parked forever,
 //! and waiting for it would recreate the very wedge this design removes.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, BufReader, PipeReader, PipeWriter, Write};
+use std::os::windows::io::{FromRawHandle, RawHandle};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::mpsc;
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,6 +35,35 @@ use crate::server::{
 /// The argument that turns this executable into a worker. Not a documented CLI: the supervisor
 /// re-executes itself with it, and nothing else should.
 pub const WORKER_FLAG: &str = "--engine-worker";
+
+/// The flags carrying this worker's two ends of the protocol channel, as raw handle values:
+/// requests to read, messages to write ([`crate::proto`]).
+///
+/// Even less of a CLI than [`WORKER_FLAG`]. A handle number means nothing outside the process
+/// that inherited it, so these are only ever valid in the child the supervisor spawned with them.
+pub const REQUESTS_FLAG: &str = "--requests-handle=";
+pub const MESSAGES_FLAG: &str = "--messages-handle=";
+
+/// Reads the two inherited handle values off the command line.
+///
+/// There is deliberately no fallback to stdin/stdout when they are missing. Falling back is the
+/// exposure this channel exists to remove — a worker that quietly spoke the protocol over its
+/// standard handles again would be back to sharing them with whatever an extension DLL prints.
+fn channel_handles(args: &[String]) -> Result<(usize, usize), String> {
+    let value = |flag: &str| {
+        let raw = args
+            .iter()
+            .find_map(|arg| arg.strip_prefix(flag))
+            .ok_or_else(|| format!("no `{flag}<handle>` on the command line"))?;
+        match raw.parse::<usize>() {
+            // A null handle is not a channel: it would fail every read or write, silently, for
+            // the life of the process.
+            Ok(0) | Err(_) => Err(format!("`{flag}{raw}` is not a usable handle value")),
+            Ok(handle) => Ok(handle),
+        }
+    };
+    Ok((value(REQUESTS_FLAG)?, value(MESSAGES_FLAG)?))
+}
 
 /// How long to wait for a target to stop after open/attach/launch (ms).
 ///
@@ -85,7 +116,7 @@ fn watchdog_budget_ms(patience: Duration, queued: Duration) -> u32 {
 /// the case that matters: exiting without it leaves the target machine halted.
 const ABRUPT_EXIT_RELEASE: Duration = Duration::from_secs(5);
 
-/// What the stdin reader hands to the engine thread.
+/// What the request reader hands to the engine thread.
 enum Job {
     /// A request from the supervisor, stamped when it was read.
     Run(Instant, WorkerRequest),
@@ -94,7 +125,28 @@ enum Job {
 }
 
 /// Runs this process as an engine worker. Never returns.
-pub fn run() -> ! {
+pub fn run(args: &[String]) -> ! {
+    let (requests, messages) = match channel_handles(args) {
+        Ok(handles) => handles,
+        Err(why) => {
+            // Nothing can be *reported*: the channel a supervisor would be listening on is the
+            // very thing that is missing. So this goes to stderr, and the exit is what the
+            // supervisor reads — its end of the channel closes and it says the worker exited
+            // before it was ready, which is exactly what happened.
+            tracing::error!("worker: {why}; this executable is not meant to be run by hand");
+            std::process::exit(2);
+        }
+    };
+    // SAFETY: these are the two handles the supervisor created for this process and passed on the
+    // command line, inherited by `CreateProcess` and owned by nothing else here — the supervisor
+    // closed its copies as soon as the spawn returned (`engine::spawn_worker`). Wrapping them
+    // takes that ownership; they close when this process does, which is what gives the supervisor
+    // its EOF.
+    let requests = unsafe { PipeReader::from_raw_handle(requests as RawHandle) };
+    let messages = unsafe { PipeWriter::from_raw_handle(messages as RawHandle) };
+    // Installed before the engine thread exists, so nothing can reach `emit` without a channel.
+    let _ = MESSAGES.set(Mutex::new(messages));
+
     // Each request is stamped when it is *read*, so the engine thread can tell how long it then
     // waited its turn — the half of the watchdog budget only this process can measure.
     let (tx, rx) = mpsc::channel::<Job>();
@@ -111,8 +163,7 @@ pub fn run() -> ! {
         std::process::exit(1);
     }
 
-    let stdin = std::io::stdin();
-    for line in stdin.lock().lines() {
+    for line in BufReader::new(requests).lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
             continue;
@@ -133,8 +184,8 @@ pub fn run() -> ! {
         }
     }
 
-    // stdin closed: the supervisor ended this session, or died. Either way this process has no
-    // reason to exist.
+    // The request channel closed: the supervisor ended this session, or died. Either way this
+    // process has no reason to exist.
     //
     // This is the *only* thing that ends a worker the supervisor did not explicitly kill — it does
     // not set `kill_on_drop`, deliberately (`engine::Sessions::spawn`). So the path below has to
@@ -243,34 +294,76 @@ fn engine_thread(rx: mpsc::Receiver<Job>) {
             execute(&engine, request.id, request.op, queued)
         }))
         .unwrap_or_else(|_| Err("debugger operation panicked".to_string()));
-        emit(&WorkerMessage::Done {
-            id: request.id,
-            result,
-        });
+        let id = request.id;
+        // A `Done` is what removes the supervisor's waiter, so one that never arrives costs the
+        // caller its session rather than its result: the call times out, the waiter stays, and
+        // the session counts as busy — and so stays unreclaimable — for the life of the server.
+        // The channel now makes corruption impossible, but delivery is still worth insisting on.
+        if let Emit::Unencodable = emit(&WorkerMessage::Done { id, result }) {
+            // The result could not be serialized, so send one that cannot fail to be: plain text
+            // in the same shape. The caller loses the output, not the session.
+            emit(&WorkerMessage::Done {
+                id,
+                result: Err(
+                    "the debugger's result could not be encoded for the supervisor".to_string(),
+                ),
+            });
+        }
+        // `Unwritable` gets no retry, and needs none: the supervisor holds the only read end, so
+        // a channel that will not take a write means it is gone — its request channel has closed
+        // too, and the teardown at the end of `run` is already on its way. The supervisor fails
+        // every outstanding call out when this process exits, which answers this caller.
     }
 }
 
-/// Writes one message to stdout. Only the engine thread writes, so the lock is uncontended;
-/// it is taken anyway because `Stdout` is shared and a torn line would desynchronize the
-/// supervisor's reader.
-fn emit(message: &WorkerMessage) {
-    let Ok(line) = serde_json::to_string(message) else {
-        // Every variant is plain data, so this cannot happen — but a worker that dies silently
-        // here would look to the supervisor like an engine crash.
+/// The channel this worker writes its messages on: its end of the pipe the supervisor is reading
+/// ([`crate::proto`]). One per process and for the life of the process, installed by [`run`]
+/// before anything exists that could emit.
+///
+/// Global for the same reason stdout was: `emit` is reached from the engine thread, from inside
+/// an opener's milestones, and from the main thread's startup path, and threading a handle
+/// through all of that would buy nothing — there is exactly one channel, and no code path may
+/// choose a different one.
+static MESSAGES: OnceLock<Mutex<PipeWriter>> = OnceLock::new();
+
+/// What became of a message [`emit`] was asked to send.
+enum Emit {
+    Sent,
+    /// It could not be serialized. Every variant is plain data, so this is a bug rather than a
+    /// condition — but see the `Done` path in [`engine_thread`] for why it is still handled.
+    Unencodable,
+    /// It could not be written. The supervisor holds the only read end, so this means it is gone
+    /// or going, and the request channel is at EOF or about to be.
+    Unwritable,
+}
+
+/// Writes one message on the protocol channel.
+///
+/// The whole message is one `write_all` under one lock, and the channel is private to this pair
+/// of processes, so a message always arrives as its own line. Nothing else here holds the handle,
+/// and an anonymous pipe has no name for anything else to open — which is what makes framing a
+/// matter of what this function does rather than of what nobody else happens to print.
+fn emit(message: &WorkerMessage) -> Emit {
+    let Ok(mut line) = serde_json::to_string(message) else {
         tracing::error!("worker: could not encode {message:?}");
-        return;
+        return Emit::Unencodable;
     };
-    let stdout = std::io::stdout();
-    let mut stdout = stdout.lock();
-    // Leading newline, not just a trailing one. DbgEng's own output reaches the supervisor through
-    // `IDebugOutputCallbacks` and never comes this way, but an extension DLL that writes to the
-    // console directly does — and if it left its last line *unterminated*, a trailing-newline-only
-    // message would be appended to that text and arrive as one unparseable line. The supervisor
-    // skips what it cannot parse, so the reply would be lost outright: the caller times out, its
-    // waiter is never removed, and the session stays busy and unreclaimable for good. Opening with
-    // a newline terminates whatever came before, so a message always starts its own line.
-    let _ = write!(stdout, "\n{line}\n");
-    let _ = stdout.flush();
+    line.push('\n');
+    let Some(channel) = MESSAGES.get() else {
+        tracing::error!("worker: no protocol channel to write {message:?} on");
+        return Emit::Unwritable;
+    };
+    let mut channel = channel.lock().unwrap_or_else(|e| e.into_inner());
+    match channel
+        .write_all(line.as_bytes())
+        .and_then(|()| channel.flush())
+    {
+        Ok(()) => Emit::Sent,
+        Err(e) => {
+            tracing::error!("worker: could not write to the protocol channel ({e})");
+            Emit::Unwritable
+        }
+    }
 }
 
 /// Runs one op against this worker's engine. `queued` is how long it waited its turn here, which
@@ -494,7 +587,9 @@ where
     T: FnOnce(&dyn Fn()) -> Result<(), String>,
     R: FnOnce() -> Result<String, String>,
 {
-    transition(&|| emit(&WorkerMessage::Committed { id }))?;
+    transition(&|| {
+        emit(&WorkerMessage::Committed { id });
+    })?;
     emit(&WorkerMessage::Opened { id });
     report()
 }
@@ -614,6 +709,56 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- the protocol channel this worker was handed -------------------------------
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// The ordinary case: the supervisor's command line, read back as the two handles.
+    #[test]
+    fn the_channel_is_read_off_the_command_line() {
+        let handles = channel_handles(&args(&[
+            "windbg-mcp.exe",
+            WORKER_FLAG,
+            "--requests-handle=132",
+            "--messages-handle=140",
+        ]));
+        assert_eq!(handles, Ok((132, 140)));
+    }
+
+    /// Every way the pair can be missing or unusable is refused, and none of them may fall back
+    /// to a standard handle: a worker that quietly spoke the protocol over stdout again would be
+    /// back to sharing it with whatever an extension prints, which is the whole exposure.
+    #[test]
+    fn a_worker_without_a_usable_channel_is_refused() {
+        for line in [
+            // Started by hand, with no channel at all.
+            args(&["windbg-mcp.exe", WORKER_FLAG]),
+            // Half a channel is no channel.
+            args(&["windbg-mcp.exe", WORKER_FLAG, "--requests-handle=132"]),
+            args(&["windbg-mcp.exe", WORKER_FLAG, "--messages-handle=140"]),
+            // Present but unusable: a null handle fails every read and write, silently.
+            args(&[
+                "windbg-mcp.exe",
+                WORKER_FLAG,
+                "--requests-handle=0",
+                "--messages-handle=140",
+            ]),
+            args(&[
+                "windbg-mcp.exe",
+                WORKER_FLAG,
+                "--requests-handle=132",
+                "--messages-handle=oops",
+            ]),
+        ] {
+            assert!(
+                channel_handles(&line).is_err(),
+                "accepted a command line that carries no usable channel: {line:?}"
+            );
+        }
+    }
 
     // The watchdog budget, as arithmetic. What it is *wired to* needs a real engine and a real
     // target, and lives in `tests/mcp_smoke.rs`'s bounded-command tier — the wiring now spans two

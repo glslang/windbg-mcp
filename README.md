@@ -42,14 +42,18 @@ process. Two things follow, and they are why it is built this way:
 - **`proto.rs`** — the line-delimited JSON protocol between the two. A closure cannot cross a
   process boundary, so what used to be closures marshalled onto the engine thread are now
   serializable operations — deliberately *tool*-shaped rather than DbgEng-shaped, so a tool that is
-  several engine calls (`reachable_from_dispatch`'s call-graph walk) stays one indivisible job.
+  several engine calls (`reachable_from_dispatch`'s call-graph walk) stays one indivisible job. It
+  travels on a pair of anonymous pipes the worker inherits, not on its standard handles: an
+  extension DLL that prints to the console writes to the worker's stdout, which is drained into the
+  log and carries nothing else.
 - **`server.rs`** — the MCP tools (see below), built with `rmcp`'s `#[tool_router]`/`#[tool_handler]`.
 - **`ttd.rs`** — locates `TTD.exe` and launches trace recording.
 - **`main.rs`** — role selection (supervisor or worker), tokio + stdio transport. **Logs go to
   stderr** (stdout is the JSON-RPC channel); workers inherit the supervisor's stderr, so everything
   lands in the same place. Workers never outlive the connection: a disconnect asks every session
   to release its target — all of them concurrently — waits **five seconds**, and terminates only
-  the workers that have not finished by then; a worker also exits on its own if its stdin closes.
+  the workers that have not finished by then; a worker also exits on its own once its request
+  channel closes.
   Which of those two endings a session gets matters for a live kernel. DbgEng leaves a
   detached-but-halted kernel *frozen*, so a worker that releases its target leaves the machine
   running, while a worker that is terminated leaves it stopped. Five seconds is enough for an

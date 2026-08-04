@@ -292,8 +292,8 @@ impl Server {
     /// Terminates the supervisor outright, giving it no chance to run its own shutdown.
     ///
     /// Stdin is *not* closed first — that would be the graceful path this is the opposite of. The
-    /// point is to leave the workers with nothing but their own stdin reaching EOF as the dead
-    /// supervisor's handles are closed.
+    /// point is to leave the workers with nothing but EOF on their own request channels, as the
+    /// dead supervisor's handles are closed.
     fn kill_supervisor(mut self) {
         self.child.kill().expect("terminate the supervisor");
         self.child.wait().expect("reap the supervisor");
@@ -1202,8 +1202,8 @@ fn engine_workers_do_not_outlive_the_connection() {
     );
 
     // Two ways it can be gone, and this asserts only the outcome: shutdown asked it to release
-    // and then ended it, or — for a worker shutdown never saw — its own stdin closed as the
-    // supervisor exited. Either way, no process is left behind.
+    // and then ended it, or — for a worker shutdown never saw — its own request channel closed as
+    // the supervisor exited. Either way, no process is left behind.
     let deadline = Instant::now() + Duration::from_secs(20);
     while process_alive(worker) && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
@@ -1222,10 +1222,10 @@ fn engine_workers_do_not_outlive_the_connection() {
 /// registered after shutdown had walked the registry, say) would die with its target still
 /// attached, and a live kernel left attached-but-halted is a machine that needs rebooting.
 ///
-/// So the guarantee is the worker's own: stdin reaching EOF means "the supervisor is gone", and it
-/// asks its engine to release before exiting, bounded. Killed outright here, the supervisor
-/// contributes nothing — no shutdown, no `EndSession`, not even a clean stdin close — which is
-/// exactly the case where nothing else can stand in.
+/// So the guarantee is the worker's own: EOF on its request channel means "the supervisor is
+/// gone", and it asks its engine to release before exiting, bounded. Killed outright here, the
+/// supervisor contributes nothing — no shutdown, no `EndSession`, not even a channel closed
+/// cleanly — which is exactly the case where nothing else can stand in.
 #[test]
 fn a_worker_lets_go_and_exits_when_its_supervisor_is_killed_outright() {
     let Some(dump) = target_tier() else { return };
@@ -1247,7 +1247,7 @@ fn a_worker_lets_go_and_exits_when_its_supervisor_is_killed_outright() {
     assert!(
         !process_alive(worker),
         "engine worker pid {worker} outlived a killed supervisor — with nothing terminating it, \
-         EOF on its stdin is the only thing that ends it, and it did not"
+         EOF on its request channel is the only thing that ends it, and it did not"
     );
 }
 

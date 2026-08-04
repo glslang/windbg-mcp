@@ -24,18 +24,21 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::path::PathBuf;
+use std::io::{BufRead, PipeReader, PipeWriter, Write};
+use std::os::windows::io::AsRawHandle;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot};
+use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
 use crate::proto::{EngineOp, WorkerMessage, WorkerRequest};
-use crate::worker::WORKER_FLAG;
+use crate::worker::{MESSAGES_FLAG, REQUESTS_FLAG, WORKER_FLAG};
 
 /// How many sessions may be open at once.
 ///
@@ -80,10 +83,10 @@ const SHUTDOWN_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// An interactive Ctrl+C is delivered to *every* process attached to the console, and a child
 /// inherits its parent's process group — so without this a worker takes the default console
-/// handler and terminates on the spot, before its stdin closes and before it can release its
-/// target. That is precisely the halted kernel this design exists to avoid, arriving by the one
-/// route where the supervisor cannot help: its own default handler ends it, so it never reaches
-/// [`Sessions::shutdown`].
+/// handler and terminates on the spot, before its request channel closes and before it can
+/// release its target. That is precisely the halted kernel this design exists to avoid, arriving
+/// by the one route where the supervisor cannot help: its own default handler ends it, so it never
+/// reaches [`Sessions::shutdown`].
 ///
 /// With the flag, Ctrl+C is disabled for the worker's group. The supervisor still dies, its handles
 /// still close, and the worker meets the EOF path that knows how to let go.
@@ -634,8 +637,8 @@ impl Registry {
     /// reclamation is marked `Closed` immediately but its worker is released in the background, so
     /// between those two points it is not live and still owns a process — and a client
     /// disconnecting in that window would drop the runtime and cancel that release, leaving the
-    /// worker to fall back on noticing its own stdin close: a bounded best effort, where an
-    /// orderly `EndSession` was there for the asking.
+    /// worker to fall back on noticing its own request channel close: a bounded best effort,
+    /// where an orderly `EndSession` was there for the asking.
     fn owning_workers(&self) -> Vec<Arc<Session>> {
         self.all
             .iter()
@@ -830,7 +833,7 @@ impl Sessions {
         if let Err(why) = self.admit(&session) {
             // Refused *before* the opener was written, so this worker is `Ready` and holds
             // nothing at all — no dump, no trace, no attach. There is no target to release and so
-            // nothing for its stdin closing to accomplish; killing it is the whole teardown.
+            // nothing for its channel closing to accomplish; killing it is the whole teardown.
             session.kill();
             return Err(OpenError::NoRoom(why));
         }
@@ -1023,8 +1026,9 @@ impl Sessions {
         // Every session that still *owns a worker*, not every live one. A session claimed for
         // reclamation is already `Closed` while its release runs in the background, and a
         // disconnect in that window would otherwise drop the runtime and cancel that release,
-        // leaving the worker to notice its own stdin close — a five-second best-effort where an
-        // orderly release was available. Releasing one twice is harmless; missing one is not.
+        // leaving the worker to notice its own request channel close — a five-second best-effort
+        // where an orderly release was available. Releasing one twice is harmless; missing one is
+        // not.
         let owners = {
             let mut registry = self.registry();
             registry.closing = true;
@@ -1266,37 +1270,29 @@ impl Sessions {
         what: String,
     ) -> Result<Arc<Session>, String> {
         let exe = worker_exe()?;
-        let mut child = Command::new(&exe)
-            .arg(WORKER_FLAG)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // Worker logs join the server's own, which is where an MCP client looks for them.
-            .stderr(Stdio::inherit())
-            // Deliberately **not** `kill_on_drop`, and the absence is load-bearing. Dropping this
-            // handle — or the whole process exiting — closes the worker's stdin, and a worker
-            // reads that EOF as "the supervisor is gone" and asks its engine to release the target
-            // before it exits, bounded (`worker::run`). Terminating on drop pre-empts exactly
-            // that: a worker this server never got round to releasing would die by
-            // `TerminateProcess` with its target still attached, which for a live kernel means a
-            // machine left halted. So EOF is the teardown, on every route out — clean shutdown,
-            // Ctrl+C, or a crash — and [`Session::kill`] is the deliberate one, used only once a
-            // release has been asked for and refused, or on a worker known to hold nothing.
-            //
-            // Which is why the worker also gets its own process group: see
-            // [`CREATE_NEW_PROCESS_GROUP`]. EOF cannot be the teardown if a console Ctrl+C ends the
-            // worker before its stdin ever closes.
-            .creation_flags(CREATE_NEW_PROCESS_GROUP)
-            .spawn()
+        let (mut child, channel) = spawn_worker(&exe)
             .map_err(|e| format!("could not start an engine worker ({}): {e}", exe.display()))?;
 
-        let stdin = child.stdin.take().ok_or("engine worker has no stdin")?;
         let stdout = child.stdout.take().ok_or("engine worker has no stdout")?;
         let pid = child.id().unwrap_or(0);
-        let mut lines = BufReader::new(stdout).lines();
+        // Drained from the start, before the handshake: a worker that prints during startup must
+        // not be able to block on a full pipe on its way to `Ready`.
+        tokio::spawn(log_stray_output(id.to_string(), stdout));
+        let mut messages = match read_messages(id.to_string(), channel.messages) {
+            Ok(messages) => messages,
+            Err(e) => {
+                // Nothing has been asked of this worker yet, so it holds no target: killing it is
+                // the whole teardown.
+                let _ = child.start_kill();
+                return Err(format!(
+                    "could not start a reader for an engine worker's messages: {e}"
+                ));
+            }
+        };
 
         // Nothing is registered until the worker says its engine exists. A session that cannot
         // debug is worse than no session: it would accept calls and fail every one.
-        match tokio::time::timeout(WORKER_READY_TIMEOUT, next_message(&mut lines)).await {
+        match tokio::time::timeout(WORKER_READY_TIMEOUT, messages.recv()).await {
             Ok(Some(WorkerMessage::Ready)) => {}
             Ok(Some(WorkerMessage::Fatal { message })) => {
                 let _ = child.start_kill();
@@ -1338,18 +1334,31 @@ impl Sessions {
             child: Mutex::new(Some(child)),
         });
 
-        // Both tasks hold a `Weak`, so a session dropped from the registry takes its worker's
+        // Both halves hold a `Weak`, so a session dropped from the registry takes its worker's
         // plumbing with it rather than keeping the Arc alive forever.
-        tokio::spawn(pump(
-            Arc::downgrade(&session),
-            rx,
-            stdin,
-            Arc::clone(&waiters),
-            self.call_timeout,
-        ));
+        let pumping = std::thread::Builder::new()
+            .name(format!("reqs-{id}"))
+            // A pump parks on its queue, and a session keeps its queue for as long as the registry
+            // remembers it — a dozen at the outside — so keep the stack small. The loop serializes
+            // one request and writes it; there is no deep call graph to leave room for.
+            .stack_size(256 * 1024)
+            .spawn({
+                let session = Arc::downgrade(&session);
+                let waiters = Arc::clone(&waiters);
+                let call_timeout = self.call_timeout;
+                move || pump(session, rx, channel.requests, waiters, call_timeout)
+            });
+        if let Err(e) = pumping {
+            // Nothing has been submitted yet, so this worker holds no target either. Killing it
+            // also frees the reader thread, whose pipe closes with the process.
+            session.kill();
+            return Err(format!(
+                "could not start a writer for an engine worker's requests: {e}"
+            ));
+        }
         tokio::spawn(reader(
             Arc::downgrade(&session),
-            lines,
+            messages,
             waiters,
             self.clone(),
         ));
@@ -1537,22 +1546,200 @@ fn worker_exe() -> Result<PathBuf, String> {
         .map_err(|e| format!("cannot locate this executable to spawn an engine worker: {e}"))
 }
 
-/// Reads the next well-formed message, skipping anything else on the worker's stdout.
+/// The supervisor's ends of one worker's protocol channel.
 ///
-/// Skipping rather than failing is deliberate: DbgEng output reaches this server through
-/// `IDebugOutputCallbacks`, but an extension that writes to the console directly would otherwise
-/// desynchronize the stream permanently. A logged line costs nothing; a dead session costs a
-/// target.
-async fn next_message(lines: &mut Lines<BufReader<ChildStdout>>) -> Option<WorkerMessage> {
+/// Two anonymous pipes rather than the worker's standard handles, because those are shared with
+/// everything else loaded into that process — see [`crate::proto`] for what a stray `printf` used
+/// to cost. Anonymous, so there is no name for anything outside this pair of processes to open:
+/// the only way to reach either pipe is the handle the child inherited.
+struct Channel {
+    /// Requests down to the worker.
+    requests: PipeWriter,
+    /// Messages up from it.
+    messages: PipeReader,
+}
+
+/// Serializes worker spawns, so an inheritable handle reaches only the child it was made for.
+///
+/// A handle marked inheritable is inherited by **every** process created while it is marked, and
+/// `CreateProcess` cannot narrow that without a full `STARTUPINFOEX` handle list. Two overlapping
+/// opens would therefore cross-inherit each other's channel ends, and the damage is concrete: a
+/// worker holding another worker's *write* end keeps that pipe from ever reporting EOF, so the
+/// supervisor would never learn that the other worker had exited — [`reader`]'s tail would not
+/// run, and the calls that worker owed replies to would wait for ever.
+///
+/// std holds a lock of its own across the same window for the stdio handles it prepares, which is
+/// the same reasoning applied to the same hazard; this one covers the handles std knows nothing
+/// about. Nothing else in this process spawns children, so between them the window is closed.
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+/// Marks a handle inheritable, so the child gets a copy of it.
+fn inheritable(handle: &impl AsRawHandle) -> std::io::Result<()> {
+    // SAFETY: the handle is borrowed from an owner that outlives the call, and this only changes
+    // a flag on it.
+    let ok = unsafe {
+        SetHandleInformation(
+            handle.as_raw_handle(),
+            HANDLE_FLAG_INHERIT,
+            HANDLE_FLAG_INHERIT,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Starts a worker process with a protocol channel of its own.
+///
+/// Marking, spawning and closing all happen under [`SPAWN_LOCK`], which is the whole of what
+/// keeps this channel private: a handle is inheritable from the moment it is marked until it is
+/// closed, and every process created in between gets a copy. The supervisor's copies of the
+/// child's ends go at the end of that window for a second reason too — one left open on the
+/// request side would mean the worker never sees the EOF that tells it the supervisor is gone,
+/// and one left open on the message side would mean the supervisor never sees the EOF that tells
+/// it the worker exited.
+fn spawn_worker(exe: &Path) -> std::io::Result<(Child, Channel)> {
+    let (their_requests, our_requests) = std::io::pipe()?;
+    let (our_messages, their_messages) = std::io::pipe()?;
+
+    let _one_spawn_at_a_time = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    inheritable(&their_requests)?;
+    inheritable(&their_messages)?;
+    let child = Command::new(exe)
+        .arg(WORKER_FLAG)
+        .arg(format!(
+            "{REQUESTS_FLAG}{}",
+            their_requests.as_raw_handle() as usize
+        ))
+        .arg(format!(
+            "{MESSAGES_FLAG}{}",
+            their_messages.as_raw_handle() as usize
+        ))
+        // Emphatically **not** inherited: this server's stdin is the MCP transport, and a worker
+        // holding it could consume the client's requests. Nothing of ours is read from it either
+        // — the protocol has its own channel — so there is nothing for it to be.
+        .stdin(Stdio::null())
+        // Piped and drained into the log (`log_stray_output`). This is where an extension DLL
+        // that prints to the console lands, and it is now only a log: nothing of the protocol
+        // comes this way.
+        .stdout(Stdio::piped())
+        // Worker logs join the server's own, which is where an MCP client looks for them.
+        .stderr(Stdio::inherit())
+        // Deliberately **not** `kill_on_drop`, and the absence is load-bearing. Dropping the
+        // request channel — or the whole process exiting — closes the worker's end of it, and a
+        // worker reads that EOF as "the supervisor is gone" and asks its engine to release the
+        // target before it exits, bounded (`worker::run`). Terminating on drop pre-empts exactly
+        // that: a worker this server never got round to releasing would die by `TerminateProcess`
+        // with its target still attached, which for a live kernel means a machine left halted. So
+        // EOF is the teardown, on every route out — clean shutdown, Ctrl+C, or a crash — and
+        // [`Session::kill`] is the deliberate one, used only once a release has been asked for
+        // and refused, or on a worker known to hold nothing.
+        //
+        // Which is why the worker also gets its own process group: see
+        // [`CREATE_NEW_PROCESS_GROUP`]. EOF cannot be the teardown if a console Ctrl+C ends the
+        // worker before its channel ever closes.
+        .creation_flags(CREATE_NEW_PROCESS_GROUP)
+        .spawn()?;
+    // Explicitly, and before the lock is released rather than at the end of the function: the
+    // child has its copies, and these are the ones that would otherwise stay inheritable — and
+    // hold both pipes open — for as long as this scope lasted.
+    drop(their_requests);
+    drop(their_messages);
+    drop(_one_spawn_at_a_time);
+
+    Ok((
+        child,
+        Channel {
+            requests: our_requests,
+            messages: our_messages,
+        },
+    ))
+}
+
+/// Reads one worker's messages off the channel, on a thread of its own.
+///
+/// A thread rather than a task because an anonymous pipe cannot be read asynchronously on Windows
+/// — it is not an overlapped handle, so there is nothing to register with the runtime's poller.
+/// Detached rather than joined, for the same reason `kill_on_drop` is not set: this thread is
+/// parked in a read that ends when the worker exits, and the supervisor must never wait on that.
+///
+/// Parsing happens here so the task side only ever sees well-formed messages. A line that does
+/// not parse is a bug in this program now, not a stray `printf` from an extension — those go to
+/// the worker's stdout, which no longer carries protocol.
+fn read_messages(
+    id: String,
+    pipe: PipeReader,
+) -> std::io::Result<mpsc::UnboundedReceiver<WorkerMessage>> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    std::thread::Builder::new()
+        .name(format!("msgs-{id}"))
+        .spawn(move || {
+            for line in std::io::BufReader::new(pipe).lines() {
+                let Ok(line) = line else { break };
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<WorkerMessage>(&line) {
+                    Ok(message) => {
+                        if tx.send(message).is_err() {
+                            break; // nobody is left to route it to
+                        }
+                    }
+                    Err(e) => tracing::error!(
+                        "session {id}: unreadable message from its engine worker ({e}): {}",
+                        clipped(&line)
+                    ),
+                }
+            }
+        })?;
+    Ok(rx)
+}
+
+/// How much of a line from a worker to put in the log before clipping it. Generous enough for a
+/// real diagnostic, small enough that a runaway extension cannot bury the log in one line.
+const LOGGED_LINE_LIMIT: usize = 2048;
+
+/// One line as it should appear in the log: clipped, and honest about what was clipped.
+fn clipped(line: &str) -> String {
+    let mut out: String = line.chars().take(LOGGED_LINE_LIMIT).collect();
+    if out.len() < line.len() {
+        out.push_str(&format!("… ({} bytes in all)", line.len()));
+    }
+    out
+}
+
+/// Drains a worker's stdout into the log.
+///
+/// Nothing of ours writes there — the protocol has its own channel — so anything that arrives was
+/// printed by something else inside that process: an extension DLL writing to the console is the
+/// case that motivated all of this. Logged rather than discarded because it is the only place
+/// that output can now be seen, and drained rather than left because an unread pipe fills at a
+/// few dozen KiB and the *next* write blocks the engine thread inside DbgEng.
+async fn log_stray_output(id: String, stdout: ChildStdout) {
+    let mut stdout = BufReader::new(stdout);
+    let mut line = Vec::new();
     loop {
-        let line = lines.next_line().await.ok().flatten()?;
-        if line.trim().is_empty() {
+        line.clear();
+        // Bytes and then a lossy decode, not `lines()`. Whatever prints here is not ours and owes
+        // us no encoding — an extension writing in the console's code page is not UTF-8 — and a
+        // decode error must not be able to end this loop. Stopping the drain is the one outcome
+        // that matters: the pipe would fill, and the next write would block the engine thread
+        // inside DbgEng, which is a session lost to output nobody even wanted.
+        match stdout.read_until(b'\n', &mut line).await {
+            // EOF, or a broken pipe: the worker is gone and there is nothing left to drain.
+            Ok(0) | Err(_) => return,
+            Ok(_) => {}
+        }
+        let text = String::from_utf8_lossy(&line);
+        let text = text.trim_end_matches(['\r', '\n']);
+        if text.trim().is_empty() {
             continue;
         }
-        match serde_json::from_str::<WorkerMessage>(&line) {
-            Ok(message) => return Some(message),
-            Err(_) => tracing::warn!("engine worker wrote a line that is not a message: {line}"),
-        }
+        tracing::info!(
+            "session {id}: its engine worker wrote to stdout: {}",
+            clipped(text)
+        );
     }
 }
 
@@ -1562,14 +1749,21 @@ async fn next_message(lines: &mut Lines<BufReader<ChildStdout>>) -> Option<Worke
 /// written as they arrive rather than one-per-reply on purpose: a job whose caller has given up
 /// is still running in the worker, and blocking the queue behind it would stop `end_session` from
 /// ever reaching the worker at all.
-async fn pump(
+///
+/// Runs on a thread rather than as a task, because the request channel is an anonymous pipe and
+/// those cannot be written asynchronously on Windows. A blocking write on a runtime thread is the
+/// one thing that could not be allowed here: the whole design is about a stuck session costing a
+/// process, not the server.
+fn pump(
     session: Weak<Session>,
     mut rx: mpsc::UnboundedReceiver<Job>,
-    mut stdin: ChildStdin,
+    mut requests: PipeWriter,
     waiters: Waiters,
     call_timeout: Duration,
 ) {
-    while let Some(job) = rx.recv().await {
+    // No runtime on this thread, so this really blocks — which is what lets the write below do
+    // the same without stalling anything else.
+    while let Some(job) = rx.blocking_recv() {
         let Some(session) = session.upgrade() else {
             return;
         };
@@ -1605,7 +1799,11 @@ async fn pump(
             continue;
         };
         line.push('\n');
-        if stdin.write_all(line.as_bytes()).await.is_err() || stdin.flush().await.is_err() {
+        if requests
+            .write_all(line.as_bytes())
+            .and_then(|()| requests.flush())
+            .is_err()
+        {
             // The worker is gone. The reader task sees the same thing and settles the session;
             // this job is simply the first to notice.
             answer(Err(EngineError::Lost(worker_gone(&session.id))));
@@ -1615,13 +1813,16 @@ async fn pump(
 }
 
 /// Consumes one worker's messages: milestones move the session's state, results answer callers.
+///
+/// Fed by [`read_messages`]'s thread, so this side stays on the runtime — settling a session
+/// touches the registry and the worker's process handle, which is where both belong.
 async fn reader(
     session: Weak<Session>,
-    mut lines: Lines<BufReader<ChildStdout>>,
+    mut messages: mpsc::UnboundedReceiver<WorkerMessage>,
     waiters: Waiters,
     sessions: Sessions,
 ) {
-    while let Some(message) = next_message(&mut lines).await {
+    while let Some(message) = messages.recv().await {
         let Some(session) = session.upgrade() else {
             return;
         };
@@ -1676,7 +1877,9 @@ async fn reader(
             WorkerMessage::Ready | WorkerMessage::Fatal { .. } => {}
         }
     }
-    // stdout closed: the worker exited, for whatever reason.
+    // The channel closed: the worker exited, for whatever reason. Nothing else can close it —
+    // the worker's end of it is held by nobody but that process, and the reader thread runs until
+    // it reads EOF — so this is the worker's death, not a message that failed to parse.
     let Some(session) = session.upgrade() else {
         return;
     };
@@ -1691,6 +1894,67 @@ async fn reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- the worker's protocol channel --------------------------------------------
+
+    /// The property the private channel exists for: a worker's stdout is not the protocol.
+    ///
+    /// `cmd.exe` is the stand-in, and a good one. Handed a worker's command line it makes nothing
+    /// of it, prints its banner and a promptless line to stdout, reads EOF on the null stdin and
+    /// exits — a process that writes to its standard handles, leaves the last line unterminated,
+    /// and never says a word on the channel. That is the exact shape of the hazard: it used to be
+    /// an extension's `printf` swallowing the reply written after it.
+    ///
+    /// What the supervisor has to conclude is "this worker said nothing, then exited", because
+    /// that is what settles the session and fails its callers out ([`reader`]'s tail). Reading
+    /// the banner as a message would be the old corruption; never reaching EOF would be the
+    /// supervisor holding a copy of the child's end open, and either one leaves a session waiting
+    /// for a reply that is not coming.
+    #[tokio::test]
+    async fn a_workers_stdout_is_not_its_protocol_channel() {
+        use tokio::io::AsyncReadExt;
+
+        let (mut child, channel) =
+            spawn_worker(Path::new("cmd.exe")).expect("spawn a stand-in worker");
+        let mut stdout = child.stdout.take().expect("a worker's stdout is piped");
+        let mut printed = String::new();
+        tokio::time::timeout(Duration::from_secs(10), stdout.read_to_string(&mut printed))
+            .await
+            .expect("the stand-in's stdout closed within 10s")
+            .expect("read the stand-in's stdout");
+        assert!(
+            !printed.trim().is_empty(),
+            "the stand-in printed nothing to stdout, so this test would pass whatever the \
+             channel did with it"
+        );
+
+        let mut messages =
+            read_messages("sess-stand-in".to_string(), channel.messages).expect("read messages");
+        let heard = tokio::time::timeout(Duration::from_secs(10), messages.recv()).await;
+        assert!(
+            matches!(heard, Ok(None)),
+            "expected silence and then EOF on the channel, got {heard:?} — either stdout reached \
+             the protocol, or the channel never reported the worker's exit, which is what a \
+             supervisor's own copy of the child's end left open looks like"
+        );
+        let _ = child.wait().await;
+    }
+
+    /// A worker line reaches the log clipped, and says how much was left out. An extension in a
+    /// loop must not be able to bury the log under one line.
+    #[test]
+    fn a_long_line_from_a_worker_is_clipped_before_it_is_logged() {
+        let short = "a stray printf";
+        assert_eq!(clipped(short), short);
+
+        let long = "x".repeat(LOGGED_LINE_LIMIT * 3);
+        let clipped = clipped(&long);
+        assert!(clipped.len() < long.len(), "a long line was logged whole");
+        assert!(
+            clipped.contains(&format!("{} bytes in all", long.len())),
+            "the clipped line does not say how much there was: {clipped}"
+        );
+    }
 
     // ---- what the worker is told about the caller's deadline ----------------------
 
@@ -2204,9 +2468,9 @@ mod tests {
     ///
     /// A session claimed for reclamation is `Closed` immediately while its release runs in the
     /// background. A disconnect landing in that window must still collect it: otherwise the
-    /// runtime is dropped, the release is cancelled, and the worker is left to notice its stdin
-    /// close and let go on its own — best effort, when the orderly `EndSession` a halted kernel
-    /// wants was available.
+    /// runtime is dropped, the release is cancelled, and the worker is left to notice its request
+    /// channel close and let go on its own — best effort, when the orderly `EndSession` a halted
+    /// kernel wants was available.
     #[tokio::test]
     async fn shutdown_collects_a_session_whose_release_is_still_in_flight() {
         let sessions = Sessions::new(Duration::from_secs(1));

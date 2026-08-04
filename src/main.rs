@@ -48,10 +48,13 @@ fn call_timeout() -> Duration {
 fn main() -> Result<()> {
     // Read the role before anything else: a worker has no use for a tokio runtime, and its
     // engine thread must be free to block in DbgEng indefinitely.
-    let is_worker = std::env::args().any(|arg| arg == worker::WORKER_FLAG);
+    let args: Vec<String> = std::env::args().collect();
+    let is_worker = args.iter().any(|arg| arg == worker::WORKER_FLAG);
     init_logging();
     if is_worker {
-        worker::run();
+        // The rest of the command line is the worker's half of the protocol channel — two
+        // inherited pipe handles, which is why a worker started by hand cannot get anywhere.
+        worker::run(&args);
     }
 
     tokio::runtime::Builder::new_multi_thread()

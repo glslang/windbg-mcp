@@ -5,12 +5,13 @@
 .DESCRIPTION
     The supervisor does not terminate its workers when it goes: killing pre-empts the release,
     and a live kernel left attached-but-halted is a machine that needs rebooting. Instead a
-    worker treats stdin EOF as "the supervisor is gone" and asks its engine to let go first.
+    worker treats EOF on its request channel as "the supervisor is gone" and asks its engine to
+    let go first.
 
     Ctrl+C is the route where that guarantee is hardest to keep. It is delivered to every process
     attached to the console, and a child inherits its parent's process group -- so without
     CREATE_NEW_PROCESS_GROUP the worker takes the default console handler and dies where it
-    stands, before its stdin ever closes. It is also the route where the supervisor can help
+    stands, before that channel ever closes. It is also the route where the supervisor can help
     least: its *own* default handler ends it, so it never runs its shutdown.
 
     This script reproduces exactly that and checks the worker still let go.

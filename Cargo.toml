@@ -13,3 +13,6 @@ schemars = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Only for the handle plumbing behind the supervisor↔worker channel (see `engine::spawn_worker`):
+# marking a pipe end inheritable is the one thing std cannot express.
+windows-sys = { version = "0.61", features = ["Win32_Foundation"] }

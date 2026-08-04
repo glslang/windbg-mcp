@@ -908,6 +908,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "win-kexp",
+ "windows-sys",
 ]
 
 [[package]]
