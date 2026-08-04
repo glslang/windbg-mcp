@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-08-04
+
 ### Fixed
 
 - **A worker the server never got round to releasing now lets go by itself, rather than being
@@ -30,7 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a child inherits its parent's group, so a worker took the default console handler and died
   where it stood — no stdin close, no release. It is the route where the server can help least,
   since its own default handler ends it before it can run any shutdown, and it is the one a
-  developer driving this from a terminal hits by reflex.
+  developer driving this from a terminal hits by reflex. Driven rather than argued:
+  `examples/ctrl_c_teardown.ps1` fires a real Ctrl+C into a console of its own — Ctrl+C cannot be
+  aimed, so a test that sends one from `cargo test` takes the runner with it — and checks the
+  worker logged its release before exiting. It fails against a build with that one flag removed.
 
   The way shutdown could miss a worker is closed too. An open that was admitted before the client
   disconnected, and whose worker finished its handshake after shutdown had walked the registry,
@@ -39,6 +44,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and its (target-less) worker ended. That makes the set of workers to release one that cannot
   grow behind shutdown's snapshot, so the timed drain that used to approximate the same guarantee
   is gone with it.
+
+- **A teardown now says what became of each target, instead of claiming more than it knows.**
+
+  Every release outcome was discarded by whoever was its only witness. At shutdown the client has
+  already disconnected, so the log is the only place one can land — and the outcome most worth
+  hearing, a worker terminated without ever unwinding, was exactly the silent one. The worker
+  discarded as much on its side: its engine's error releasing the target, whether the release
+  finished at all, and whether it was even asked.
+
+  All of them are reported now, and read by a single rule: a successful release **anywhere**
+  outranks this attempt's failure. Two teardowns can race for one session — a reclamation
+  releasing in the background, a disconnect collecting it mid-flight — and only the winner is told
+  it worked. The loser sees a timeout, a lost worker, or a debugger error, none of which mean the
+  target is still attached. Without that rule the new warning would have fired at the very moment
+  another teardown cleanly detached, which is how the next real one gets ignored.
+
+  `end_session` also stops telling a caller "nothing is left attached" when the debugger *refused*
+  to release. DbgEng resumes and detaches a live kernel as part of releasing it, and that is the
+  step that just failed — so terminating the worker afterwards leaves the guest halted, and the
+  one caller who most needed to go and check was told there was nothing to check. Dumps and traces
+  are named separately, since for those the old sentence was true.
 
 ## [0.4.0] - 2026-08-03
 
@@ -457,7 +483,8 @@ Initial release, packaged as a single-plugin Claude Code marketplace.
 - Crash-dump `!analyze` support via automatic WinDbg extension DLL loading.
 - Windows CI (format, clippy, build, test) and walkthrough docs with sample dumps.
 
-[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/glslang/windbg-mcp/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/glslang/windbg-mcp/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/glslang/windbg-mcp/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/glslang/windbg-mcp/compare/v0.2.0...v0.2.1
