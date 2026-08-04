@@ -1559,19 +1559,33 @@ struct Channel {
     messages: PipeReader,
 }
 
-/// Serializes worker spawns, so an inheritable handle reaches only the child it was made for.
+/// Serializes **every** process this server creates, so an inheritable handle reaches only the
+/// child it was made for. Held by [`spawn_worker`], by the TTD recorder ([`crate::ttd`]), and by
+/// the stand-in children the tests below spawn — every `spawn()` in this process, without
+/// exception, because that is what the guarantee is made of.
 ///
 /// A handle marked inheritable is inherited by **every** process created while it is marked, and
-/// `CreateProcess` cannot narrow that without a full `STARTUPINFOEX` handle list. Two overlapping
-/// opens would therefore cross-inherit each other's channel ends, and the damage is concrete: a
-/// worker holding another worker's *write* end keeps that pipe from ever reporting EOF, so the
-/// supervisor would never learn that the other worker had exited — [`reader`]'s tail would not
-/// run, and the calls that worker owed replies to would wait for ever.
+/// `CreateProcess` cannot narrow that without a full `STARTUPINFOEX` handle list. So the hazard is
+/// not "two opens racing" but "anything at all starting during the marking window". Two overlapping
+/// opens would cross-inherit each other's channel ends; a `record_trace` landing there would hand
+/// them to `TTD.exe`, which then outlives the whole recording. Either way the damage is the same
+/// and it is concrete: a process holding a worker's *message write end* keeps that pipe from ever
+/// reporting EOF, so the supervisor never learns that worker exited — [`reader`]'s tail does not
+/// run, the calls it owed replies to wait for ever, and the session can never be reclaimed.
 ///
 /// std holds a lock of its own across the same window for the stdio handles it prepares, which is
 /// the same reasoning applied to the same hazard; this one covers the handles std knows nothing
-/// about. Nothing else in this process spawns children, so between them the window is closed.
+/// about. **A new `Command::spawn` anywhere in this crate has to take it** — see [`spawn_guard`].
 static SPAWN_LOCK: Mutex<()> = Mutex::new(());
+
+/// Claims [`SPAWN_LOCK`] for the caller's own `spawn()`. Hold it across the call and no longer.
+///
+/// Every process creation in this server goes through here, including ones that have nothing to do
+/// with debug sessions: the flag is a property of the *process*, not of the spawn that set it, so a
+/// child started for any reason during the window inherits whatever is marked.
+pub(crate) fn spawn_guard() -> std::sync::MutexGuard<'static, ()> {
+    SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// Marks a handle inheritable, so the child gets a copy of it.
 fn inheritable(handle: &impl AsRawHandle) -> std::io::Result<()> {
@@ -1603,7 +1617,7 @@ fn spawn_worker(exe: &Path) -> std::io::Result<(Child, Channel)> {
     let (their_requests, our_requests) = std::io::pipe()?;
     let (our_messages, their_messages) = std::io::pipe()?;
 
-    let _one_spawn_at_a_time = SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _one_spawn_at_a_time = spawn_guard();
     inheritable(&their_requests)?;
     inheritable(&their_messages)?;
     let child = Command::new(exe)
@@ -1719,27 +1733,67 @@ fn clipped(line: &str) -> String {
 async fn log_stray_output(id: String, stdout: ChildStdout) {
     let mut stdout = BufReader::new(stdout);
     let mut line = Vec::new();
-    loop {
-        line.clear();
-        // Bytes and then a lossy decode, not `lines()`. Whatever prints here is not ours and owes
-        // us no encoding — an extension writing in the console's code page is not UTF-8 — and a
-        // decode error must not be able to end this loop. Stopping the drain is the one outcome
-        // that matters: the pipe would fill, and the next write would block the engine thread
-        // inside DbgEng, which is a session lost to output nobody even wanted.
-        match stdout.read_until(b'\n', &mut line).await {
-            // EOF, or a broken pipe: the worker is gone and there is nothing left to drain.
-            Ok(0) | Err(_) => return,
-            Ok(_) => {}
-        }
+    while let Some(dropped) = next_capped_line(&mut stdout, &mut line).await {
+        // A lossy decode, not `lines()`. Whatever prints here is not ours and owes us no encoding
+        // — an extension writing in the console's code page is not UTF-8 — and a decode error
+        // must not be able to end this loop. Stopping the drain is the one outcome that matters:
+        // the pipe would fill, and the next write would block the engine thread inside DbgEng,
+        // which is a session lost to output nobody even wanted.
         let text = String::from_utf8_lossy(&line);
         let text = text.trim_end_matches(['\r', '\n']);
-        if text.trim().is_empty() {
+        if text.trim().is_empty() && dropped == 0 {
             continue;
         }
+        let dropped = if dropped > 0 {
+            format!(" [+{dropped} further bytes on this line, discarded]")
+        } else {
+            String::new()
+        };
         tracing::info!(
-            "session {id}: its engine worker wrote to stdout: {}",
+            "session {id}: its engine worker wrote to stdout: {}{dropped}",
             clipped(text)
         );
+    }
+}
+
+/// Reads the next line into `line`, keeping at most [`LOGGED_LINE_LIMIT`] bytes of it and
+/// reporting how many were thrown away. `None` at EOF or on a broken pipe.
+///
+/// The cap is the point, and it is not about the log. Draining a worker's stdout moves the cost of
+/// runaway output off the worker — where a full pipe blocked the engine thread — and onto the
+/// supervisor, which is only an improvement if what arrives is bounded: reading to a newline that
+/// never comes would let one session's noisy extension grow this buffer until the whole server
+/// runs out of memory, and take every other session with it. [`clipped`] bounds what is *logged*,
+/// which is a different thing and too late.
+async fn next_capped_line<R: tokio::io::AsyncBufRead + Unpin>(
+    stdout: &mut R,
+    line: &mut Vec<u8>,
+) -> Option<usize> {
+    line.clear();
+    let mut dropped = 0usize;
+    loop {
+        // `fill_buf`/`consume` rather than `read_until`, because this has to decide what to keep
+        // *before* it is buffered.
+        let (consumed, complete) = {
+            let chunk = stdout.fill_buf().await.ok()?;
+            if chunk.is_empty() {
+                // EOF. A last line with no terminator is still a line worth logging.
+                return (!line.is_empty() || dropped > 0).then_some(dropped);
+            }
+            let (upto, complete) = match chunk.iter().position(|&b| b == b'\n') {
+                Some(at) => (at + 1, true),
+                None => (chunk.len(), false),
+            };
+            let room = LOGGED_LINE_LIMIT.saturating_sub(line.len());
+            let kept = upto.min(room);
+            line.extend_from_slice(&chunk[..kept]);
+            dropped += upto - kept;
+            (upto, complete)
+        };
+        stdout.consume(consumed);
+        if complete {
+            return Some(dropped);
+        }
     }
 }
 
@@ -1940,6 +1994,51 @@ mod tests {
         let _ = child.wait().await;
     }
 
+    /// Draining a worker's stdout moves runaway output off the worker, where a full pipe blocked
+    /// the engine thread, and onto the supervisor — which is only an improvement if what arrives
+    /// is bounded. So the cap is applied to what is *buffered*, not just to what is logged: a
+    /// line with no newline in sight must not be able to grow this buffer until the server runs
+    /// out of memory and takes every other session with it.
+    ///
+    /// Read through an 8-byte buffer, so the cap has to hold across many small chunks — a pipe
+    /// hands over whatever has arrived, not whole lines.
+    #[tokio::test]
+    async fn a_line_from_a_worker_is_capped_before_it_is_buffered() {
+        let mut input = b"short\n".to_vec();
+        let overrun = LOGGED_LINE_LIMIT * 3;
+        input.extend(std::iter::repeat_n(b'x', overrun));
+        input.push(b'\n');
+        input.extend_from_slice(b"a last line, unterminated");
+        let mut stdout = BufReader::with_capacity(8, &input[..]);
+        let mut line = Vec::new();
+
+        assert_eq!(next_capped_line(&mut stdout, &mut line).await, Some(0));
+        assert_eq!(line, b"short\n");
+
+        let dropped = next_capped_line(&mut stdout, &mut line)
+            .await
+            .expect("the long line");
+        assert_eq!(
+            line.len(),
+            LOGGED_LINE_LIMIT,
+            "the buffer grew past the cap, so a worker printing without newlines is unbounded"
+        );
+        assert_eq!(
+            dropped,
+            overrun + 1 - LOGGED_LINE_LIMIT,
+            "the discarded bytes are miscounted, so the log would understate what was dropped"
+        );
+
+        // EOF ends a line rather than losing it: an unterminated last line is still output.
+        assert_eq!(next_capped_line(&mut stdout, &mut line).await, Some(0));
+        assert_eq!(line, b"a last line, unterminated");
+        assert_eq!(
+            next_capped_line(&mut stdout, &mut line).await,
+            None,
+            "the drain must end at EOF"
+        );
+    }
+
     /// A worker line reaches the log clipped, and says how much was left out. An extension in a
     /// loop must not be able to bury the log under one line.
     #[test]
@@ -2085,6 +2184,25 @@ mod tests {
             released: AtomicBool::new(false),
             child: Mutex::new(None),
         })
+    }
+
+    /// A long-lived child to stand in for a worker, where what is under test is which sessions own
+    /// a process rather than what that process is.
+    ///
+    /// Under [`spawn_guard`] like every other spawn here, and for a reason these tests can hit:
+    /// `cargo test` runs them as threads of one process, alongside
+    /// [`a_workers_stdout_is_not_its_protocol_channel`], which marks a channel inheritable. A
+    /// stand-in created inside that window would inherit the stand-in worker's message write end
+    /// and hold it for its full 30 seconds — the pipe would never report EOF, and that test would
+    /// fail waiting for it. The hazard is process-wide; so is the rule.
+    fn stand_in_child() -> Child {
+        let _one_spawn_at_a_time = spawn_guard();
+        Command::new("cmd")
+            .args(["/c", "ping", "-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn a stand-in child")
     }
 
     fn registry_of(sessions: &[Arc<Session>]) -> Sessions {
@@ -2477,12 +2595,7 @@ mod tests {
         let reclaimed = dormant("sess-reclaimed", SessionState::Open);
         // A stand-in for the worker: any child process will do, since what is under test is
         // which sessions the registry hands to shutdown, not what the process is.
-        let child = Command::new("cmd")
-            .args(["/c", "ping", "-n", "30", "127.0.0.1"])
-            .stdout(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn a stand-in child");
+        let child = stand_in_child();
         *reclaimed.child.lock().unwrap() = Some(child);
         // Claimed for reclamation: closed already, release still to come.
         reclaimed.set_state(SessionState::Closed("reclaimed".to_string()));
@@ -2521,12 +2634,7 @@ mod tests {
             "sess-releasing",
             SessionState::Closed("reclaimed".to_string()),
         );
-        let child = Command::new("cmd")
-            .args(["/c", "ping", "-n", "30", "127.0.0.1"])
-            .stdout(Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .expect("spawn a stand-in child");
+        let child = stand_in_child();
         *releasing.child.lock().unwrap() = Some(child);
         {
             let mut registry = sessions.registry();

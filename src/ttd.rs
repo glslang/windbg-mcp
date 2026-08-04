@@ -125,9 +125,17 @@ pub fn record_launch(
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to launch TTD.exe: {e}"))?;
+    // Under the server's spawn lock, like every other process this server creates. Nothing here
+    // wants an inherited handle — but a worker being spawned at this moment has its protocol
+    // channel marked inheritable, and marking is process-wide: a recorder started inside that
+    // window would inherit that worker's message write end and, since it outlives the whole
+    // recording, keep the pipe from ever reporting EOF when the worker exits. That session would
+    // then never settle. See `engine::SPAWN_LOCK`.
+    let mut child = {
+        let _one_spawn_at_a_time = crate::engine::spawn_guard();
+        cmd.spawn()
+    }
+    .map_err(|e| format!("failed to launch TTD.exe: {e}"))?;
 
     let pid = child.id();
 
