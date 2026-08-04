@@ -95,6 +95,12 @@ processes, so they need real ones:
   and checks the process is gone — otherwise every disconnect leaks a debugger process, and for a
   launch or an attach, a debuggee with it.
 
+This tier is also the only end-to-end check of the **protocol channel** — the inherited pipe pair a
+worker speaks on ([`proto.rs`](../src/proto.rs)). Handles are passed on the worker's command line
+and inherited across the spawn, so a mistake there is not a compile error: the worker simply never
+answers, and every test here that opens a target fails at once. Run it after touching
+`engine::spawn_worker` or `worker::run`.
+
 ## When to run it
 
 ### A dependency moved

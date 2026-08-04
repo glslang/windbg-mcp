@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The supervisor↔worker protocol has a channel of its own, so nothing a worker prints can cost a
+  session** ([#65](https://github.com/glslang/windbg-mcp/issues/65)).
+
+  The protocol used to ride the worker's stdin and stdout — the same stdout any code in that
+  process can write to. DbgEng's own output never lands there (it is captured through
+  `IDebugOutputCallbacks`), but an extension DLL that prints to the console directly does, and an
+  *unterminated* stray line swallowed the message written after it. The supervisor drops what it
+  cannot parse, and only a `Done` removes a waiter, so the cost of one stray `printf` was not a
+  lost line but a lost session: the call timed out, its waiter stayed, and the session counted as
+  busy — and so could never be reclaimed — for the life of the server. 0.4.1 mitigated this by
+  opening each message with a newline; the property was still a convention about who prints where.
+
+  Each worker now gets a pair of anonymous pipes, created by the supervisor and inherited across
+  the spawn: requests down one, messages up the other. An anonymous pipe has no name to open and
+  is reachable only through an inherited handle, so nothing outside that pair of processes can
+  write on it — "stray output cannot corrupt a reply" is a property of the plumbing rather than of
+  what happens to be loaded. The worker's stdout is now only a log: it is drained into the
+  server's stderr with the session it came from, which is also the first time an extension's
+  console output has been visible at all. Its stdin is `NUL` — never inherited, since the
+  supervisor's stdin is the MCP transport.
+
+  What the channel cannot make impossible is a `Done` that is never written, and that is the half
+  that strands a waiter, so it is answered directly: a result that cannot be encoded is replaced
+  by one that says so, and a channel that cannot be written to means the supervisor is gone — its
+  exit fails every outstanding call out. Teardown is unchanged in substance: EOF on the request
+  channel now means what EOF on stdin meant, and a worker still releases its target before it
+  exits.
+
 ## [0.4.1] - 2026-08-04
 
 ### Fixed

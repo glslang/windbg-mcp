@@ -6,11 +6,23 @@
 //! a closure cannot cross a process boundary, so the closures became the variants of
 //! [`EngineOp`].
 //!
-//! One line of JSON per message in each direction: requests down the worker's stdin, messages
-//! up its stdout. Line-delimited rather than length-prefixed so that a stray write to the
-//! worker's stdout — DbgEng output is captured through `IDebugOutputCallbacks`, but nothing
-//! *guarantees* every extension behaves — corrupts one line the supervisor can log and skip,
-//! rather than desynchronizing the stream permanently.
+//! One line of JSON per message in each direction, on a **channel of the protocol's own**: a pair
+//! of anonymous pipes the supervisor creates and the worker inherits, requests down one and
+//! messages up the other. The worker's standard handles carry none of it.
+//!
+//! That is a correctness property, not tidiness. The channel used to be the worker's stdin and
+//! stdout, which is the same stdout any code in that process can write to — DbgEng's own output
+//! is captured through `IDebugOutputCallbacks` and never lands there, but an extension DLL that
+//! prints to the console directly does. A stray *unterminated* line then swallowed the message
+//! written after it, and the supervisor drops what it cannot parse: the reply is lost, and since
+//! only a `Done` removes a waiter, the caller times out and its session stays busy — and so
+//! unreclaimable — for the life of the server. One stray `printf` cost a session permanently.
+//!
+//! An anonymous pipe has no name to open and is reachable only through an inherited handle, so
+//! nothing outside this pair of processes can write on it, and inside the worker nothing but
+//! `worker::emit` holds it. "Stray output cannot corrupt a reply" is therefore a
+//! property of the plumbing rather than a convention about who prints where — which is what lets
+//! the framing stay line-delimited and cheap.
 
 use serde::{Deserialize, Serialize};
 
