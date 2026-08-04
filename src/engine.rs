@@ -1994,6 +1994,77 @@ mod tests {
         let _ = child.wait().await;
     }
 
+    /// The rule [`SPAWN_LOCK`] rests on, checked against the source rather than asserted in a doc
+    /// comment: **no process is created in this crate without [`spawn_guard`] held**.
+    ///
+    /// It is checked this way because the rule is the kind that decays silently and expensively.
+    /// A handle is inheritable process-wide from the moment it is marked, so a spawn added
+    /// anywhere — a new tool that shells out, another recorder — can hand a worker's channel end
+    /// to a process that outlives it, and the pipe then never reports EOF: the session never
+    /// settles, its callers never hear back, and nothing about the new code looks wrong. The
+    /// first cut of this very change missed two existing spawn sites (`ttd::record`, the
+    /// stand-ins below), which is the evidence that a comment is not enough.
+    ///
+    /// `.spawn()` with empty parentheses is a reliable marker for a *process* spawn here: a
+    /// thread spawn always takes a closure, and `tokio::spawn` a future. The count is asserted
+    /// too, so a refactor that stops matching fails loudly instead of quietly checking nothing.
+    #[test]
+    fn every_process_spawn_in_this_crate_takes_the_spawn_lock() {
+        let mut sites = 0;
+        let mut unguarded = Vec::new();
+        for file in rust_sources(&PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/src"))) {
+            let text = std::fs::read_to_string(&file).expect("read a source file");
+            // Reset at each function, so "guarded" means guarded *here* rather than anywhere
+            // earlier in the file. Comments are skipped: prose about a `fn` is not one.
+            let mut guarded = false;
+            for (n, line) in text.lines().enumerate() {
+                let code = line.trim_start();
+                if code.starts_with("//") {
+                    continue;
+                }
+                if code.starts_with("fn ") || code.contains(" fn ") {
+                    guarded = false;
+                }
+                if code.contains("spawn_guard()") {
+                    guarded = true;
+                }
+                if code.contains(".spawn()") {
+                    sites += 1;
+                    if !guarded {
+                        unguarded.push(format!("{}:{}", file.display(), n + 1));
+                    }
+                }
+            }
+        }
+        assert!(
+            unguarded.is_empty(),
+            "these spawn a process without holding `engine::spawn_guard()` in the same function, \
+             so a child started there can inherit a worker's protocol channel and keep it from \
+             ever reporting EOF: {unguarded:?}"
+        );
+        assert!(
+            sites >= 3,
+            "expected to find the known process spawns (the worker, the TTD recorder, the test \
+             stand-in) and found {sites} — the marker no longer matches, so this test is checking \
+             nothing"
+        );
+    }
+
+    /// Every `.rs` file under a directory, recursively — so a spawn added in a new submodule is
+    /// checked rather than silently skipped.
+    fn rust_sources(dir: &PathBuf) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        for entry in std::fs::read_dir(dir).expect("read the source directory") {
+            let path = entry.expect("read a directory entry").path();
+            if path.is_dir() {
+                found.extend(rust_sources(&path));
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                found.push(path);
+            }
+        }
+        found
+    }
+
     /// Draining a worker's stdout moves runaway output off the worker, where a full pipe blocked
     /// the engine thread, and onto the supervisor — which is only an improvement if what arrives
     /// is bounded. So the cap is applied to what is *buffered*, not just to what is logged: a
