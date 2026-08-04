@@ -1,11 +1,11 @@
 # Follow-ups
 
-Deferred work, in four clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in five clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
-(glslang/win-kexp#71, 2026-08-01), and items 13–14 from the bounded-command coverage review
-(#46, 2026-08-02). Each item notes its repo, why it was deferred, and where
-it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
+(glslang/win-kexp#71, 2026-08-01), items 13–14 from the bounded-command coverage review
+(#46, 2026-08-02), and item 15 from the private worker channel (#65 / #72, 2026-08-04). Each item
+notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
 Items are roughly ordered by how soon they're worth doing, within each cluster. **Item 10 has
@@ -306,3 +306,35 @@ wake the watchdog immediately and drop that to ~0.
   "bound everything except `index_trace`", with no per-call tax to weigh against a rare wedge.
 - **Why deferred:** it is a win-kexp change with its own review, and the current split is correct
   as long as the cost stands — this is an improvement to the tradeoff, not a fix to a defect.
+
+## 15. [windbg-mcp] Make handle inheritance a property of the spawn, not of the process
+
+The worker protocol channel (#65, landed in #72) is a pair of anonymous pipes whose child ends are
+marked inheritable across the spawn. Marking is **process-wide for as long as it lasts**:
+`CreateProcess` inherits every inheritable handle, and cannot be told "only these" without a
+`STARTUPINFOEX` handle list (`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`). So "only this worker gets these
+handles" is currently kept by serializing *every* process this server creates — `spawn_worker`, the
+TTD recorder, the test stand-ins — through `engine::spawn_guard`.
+
+A handle list would make it structural: the spawn names what it passes, nothing else is inherited,
+and no other spawn site needs to know the rule exists.
+
+- **What it costs today:** the rule is conventional. A spawn added anywhere — a new tool that shells
+  out, another recorder — silently reopens the hole, and the failure is quiet and expensive: a
+  process holding a worker's *message write end* keeps that pipe from ever reporting EOF, so the
+  supervisor never learns the worker exited, `reader`'s tail never runs, the calls it owed replies
+  to wait for ever, and the session can never be reclaimed. The first cut of #72 missed two existing
+  spawn sites, which is how much the convention is worth unaided.
+- **Why deferred:** doing it now means leaving `std::process::Command` for a raw `CreateProcessW`,
+  and with it tokio's `Child` — process reaping, `start_kill`, `id()` — all of which
+  `Session::kill` and shutdown depend on. That is a large, risk-bearing rewrite for a hazard the
+  lock already covers.
+- **Where it picks up:** std already has the API, unstable — `CommandExt::raw_attribute` +
+  `ProcThreadAttributeList` ([rust-lang/rust#114854](https://github.com/rust-lang/rust/issues/114854))
+  — and tokio exposes the inner command through `Command::as_std_mut()`, so on stabilization this
+  is a handful of lines in `spawn_worker` with tokio's `Child` intact. **That stabilization is the
+  trigger**; there is no reason to hand-roll it first.
+- **Meanwhile:** `every_process_spawn_in_this_crate_takes_the_spawn_lock` (`src/engine.rs`) reads
+  the crate's own source and fails if a `.spawn()` appears without `spawn_guard` held in the same
+  function. The convention is pinned rather than merely documented, which is what makes this an
+  improvement to *how* the property is held rather than a fix to a live hole.
