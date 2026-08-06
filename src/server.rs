@@ -18,7 +18,7 @@ use crate::engine::{
     Call, EngineError, MAX_SESSIONS, OpenError, OpenReport, SessionKind, SessionSnapshot,
     SessionState, Sessions,
 };
-use crate::proto::{EngineOp, ReachabilityOp};
+use crate::proto::{EngineOp, PoolOp, ReachabilityOp};
 use crate::ttd;
 
 /// How long to wait for an execution-control command (go/step/reverse) to reach its
@@ -1180,6 +1180,76 @@ pub struct SymbolPathArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct PoolFindTagArgs {
+    /// Pool tag to find: 1..4 ASCII bytes, e.g. "Tgsm". This is the tag as the debugger
+    /// *displays* it — the tag bytes in memory order. A driver whose source passes the C
+    /// literal 'msgT' therefore appears here as "Tgsm", not "msgT".
+    pub tag: String,
+    /// Restrict to one allocator: true = paged only, false = nonpaged only. Omit for both.
+    #[serde(default)]
+    pub paged: Option<bool>,
+    /// Force a fresh walk instead of reusing this session's cached snapshot (default false).
+    /// Walking every pool page is expensive, so a snapshot is cached and reused; pass this
+    /// after letting the target run, when the cached view describes a target that has moved.
+    #[serde(default)]
+    pub refresh: Option<bool>,
+    /// Maximum rows to print (default 64).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct PoolChunkArgs {
+    /// Address to locate, in any form the debugger prints or accepts: a backtick address
+    /// ("ffffc00f`6ec02f90"), a bare hex run, "0x"-hex, or decimal. A bare run of 8+ hex
+    /// digits is read as hex, following WinDbg's convention.
+    pub address: String,
+    /// Force a fresh walk instead of reusing this session's cached snapshot (default false).
+    #[serde(default)]
+    pub refresh: Option<bool>,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct PoolCensusArgs {
+    /// Force a fresh walk instead of reusing this session's cached snapshot (default false).
+    #[serde(default)]
+    pub refresh: Option<bool>,
+    /// Maximum tags to print (default 40).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct PoolDiagnosticsArgs {
+    /// Case-insensitive substring to narrow the diagnostics to, e.g. a heap address
+    /// ("ffff8c8f0d300000") or a phrase ("cannot fully discover heap"). Omit for all.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Maximum lines to print (default 60).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Force a fresh walk instead of reusing this session's cached snapshot (default false).
+    #[serde(default)]
+    pub refresh: Option<bool>,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct DriverObjectArgs {
     /// Driver object name, e.g. "mydriver" or "\\Driver\\mydriver".
     pub name: String,
@@ -1716,6 +1786,128 @@ impl WindbgServer {
                     append: args.append.unwrap_or(true),
                     reload: args.reload.unwrap_or_default(),
                 },
+            )
+            .await;
+        engine_result(out)
+    }
+
+    /// Find every **allocated** kernel pool chunk carrying a tag, with its size, allocator
+    /// and backend. Needs a broken-in x64 kernel target.
+    /// This walks the pool's own descriptors rather than shelling out to `!poolused`, so the
+    /// result is structured and consistent with `pool_chunk`/`pool_census`.
+    /// Only allocated chunks are indexed by tag — a freed chunk's tag is not reliably
+    /// preserved by the allocator, so this never reports freed memory. To ask whether one
+    /// specific address has been freed, use `pool_chunk`.
+    #[rmcp::tool(annotations(
+        title = "Find pool chunks by tag",
+        read_only_hint = true,
+        destructive_hint = false,
+        idempotent_hint = true,
+        open_world_hint = true
+    ))]
+    async fn pool_find_tag(
+        &self,
+        Parameters(args): Parameters<PoolFindTagArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::Pool(PoolOp::FindTag {
+                    tag: args.tag,
+                    paged: args.paged,
+                    refresh: args.refresh.unwrap_or(false),
+                    limit: args.limit.unwrap_or(64) as usize,
+                }),
+            )
+            .await;
+        engine_result(out)
+    }
+
+    /// Identify the pool chunk containing an address, **with its immediate neighbours**.
+    /// Needs a broken-in x64 kernel target.
+    /// This is the use-after-free question: it reports whether the chunk is still Allocated
+    /// or has been freed, and what now borders it — which is what decides whether a pointer
+    /// the target still holds is dangling, and what a reclaim would land next to.
+    /// "Not in the snapshot" and "free" are reported differently: a free hole inside a walked
+    /// region comes back as a chunk whose state is not Allocated, while an address outside
+    /// every region is reported as uncovered.
+    #[rmcp::tool(annotations(
+        title = "Locate a pool chunk by address",
+        read_only_hint = true,
+        destructive_hint = false,
+        idempotent_hint = true,
+        open_world_hint = true
+    ))]
+    async fn pool_chunk(
+        &self,
+        Parameters(args): Parameters<PoolChunkArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::Pool(PoolOp::Chunk {
+                    address: args.address,
+                    refresh: args.refresh.unwrap_or(false),
+                }),
+            )
+            .await;
+        engine_result(out)
+    }
+
+    /// The pool walk's own diagnostics, verbatim, optionally narrowed by substring.
+    /// Needs a broken-in x64 kernel target.
+    /// Use this when a chunk you can see with `!pool` does not appear in `pool_find_tag`
+    /// or `pool_chunk`. A real walk emits tens of thousands of diagnostics across a
+    /// hundred-plus categories, so the summaries the other tools print are necessarily
+    /// truncated — and the one line explaining a specific heap is reliably not in the
+    /// truncated head. Filter by a heap address or a phrase to get at it.
+    #[rmcp::tool(annotations(
+        title = "Filter pool walk diagnostics",
+        read_only_hint = true,
+        destructive_hint = false,
+        idempotent_hint = true,
+        open_world_hint = true
+    ))]
+    async fn pool_diagnostics(
+        &self,
+        Parameters(args): Parameters<PoolDiagnosticsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::Pool(PoolOp::Diagnostics {
+                    filter: args.filter,
+                    refresh: args.refresh.unwrap_or(false),
+                    limit: args.limit.unwrap_or(60) as usize,
+                }),
+            )
+            .await;
+        engine_result(out)
+    }
+
+    /// Per-tag census of the kernel pool: allocation counts and bytes, heaviest first.
+    /// Needs a broken-in x64 kernel target.
+    /// The structured answer to what `!poolused` renders as text, taken from the same walk
+    /// as `pool_find_tag` and `pool_chunk` so the three cannot disagree. Useful for spotting
+    /// which tag a driver's allocations are landing under before querying it by name.
+    #[rmcp::tool(annotations(
+        title = "Census pool usage by tag",
+        read_only_hint = true,
+        destructive_hint = false,
+        idempotent_hint = true,
+        open_world_hint = true
+    ))]
+    async fn pool_census(
+        &self,
+        Parameters(args): Parameters<PoolCensusArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::Pool(PoolOp::Census {
+                    refresh: args.refresh.unwrap_or(false),
+                    limit: args.limit.unwrap_or(40) as usize,
+                }),
             )
             .await;
         engine_result(out)
