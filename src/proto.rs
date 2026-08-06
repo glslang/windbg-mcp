@@ -96,6 +96,10 @@ pub enum EngineOp {
         timeout_ms: u32,
     },
     Reachability(ReachabilityOp),
+    /// A pool query. Like [`Self::Reachability`] this is one indivisible job: a query may have
+    /// to walk every pool page, and letting another call for the same session interleave would
+    /// let the walk describe a target that moved underneath it.
+    Pool(PoolOp),
     /// Release the target. The supervisor tears the worker down afterwards — under
     /// process-per-session a worker outlives its target for no reason.
     EndSession,
@@ -127,6 +131,44 @@ pub struct ReachabilityOp {
     pub max_functions: usize,
     pub max_depth: usize,
     pub recipe: bool,
+}
+
+/// The pool tools' arguments, after the supervisor has applied its defaults.
+///
+/// One variant per question rather than one op with optional fields: the three answers have
+/// different shapes, and a caller that asked for a census should not be able to get a chunk
+/// lookup back because a field defaulted.
+///
+/// `refresh` forces a fresh walk of the pool. It is off by default because walking every pool
+/// page is expensive enough that repeating it per query would make the tools unusable — the
+/// snapshot is cached per session and invalidated when the debugger reports the session
+/// changed. Pass it after resuming the target, when the cached view is a photograph of a
+/// target that has since moved.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum PoolOp {
+    /// Every *allocated* chunk carrying `tag`.
+    FindTag {
+        tag: String,
+        /// `Some(true)` paged only, `Some(false)` nonpaged only, `None` both.
+        paged: Option<bool>,
+        refresh: bool,
+        limit: usize,
+    },
+    /// The chunk containing `address`, with its immediate neighbours.
+    Chunk { address: String, refresh: bool },
+    /// Per-tag totals across the whole snapshot, heaviest consumer first.
+    Census { refresh: bool, limit: usize },
+    /// The walk's own diagnostics, verbatim, optionally narrowed to a substring.
+    ///
+    /// A real walk emits tens of thousands of these across a hundred-plus categories, so
+    /// the summaries the other tools print necessarily truncate. When a specific heap or
+    /// address is under suspicion, the one line that explains it is reliably *not* in the
+    /// truncated head — hence a filter rather than a bigger cap.
+    Diagnostics {
+        filter: Option<String>,
+        refresh: bool,
+        limit: usize,
+    },
 }
 
 /// A request down the worker's stdin. `id` is echoed on every message the op produces.

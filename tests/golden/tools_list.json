@@ -3,7 +3,7 @@
     "(none)",
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 37,
+  "toolCount": 41,
   "tools": [
     {
       "hints": {
@@ -314,6 +314,77 @@
         "path"
       ],
       "title": "Open TTD trace"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": true,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "pool_census",
+      "params": [
+        "limit: integer|null/uint32",
+        "refresh: boolean|null",
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Census pool usage by tag"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": true,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "pool_chunk",
+      "params": [
+        "address: string",
+        "refresh: boolean|null",
+        "session_id: string|null"
+      ],
+      "required": [
+        "address"
+      ],
+      "title": "Locate a pool chunk by address"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": true,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "pool_diagnostics",
+      "params": [
+        "filter: string|null",
+        "limit: integer|null/uint32",
+        "refresh: boolean|null",
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Filter pool walk diagnostics"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": true,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "pool_find_tag",
+      "params": [
+        "limit: integer|null/uint32",
+        "paged: boolean|null",
+        "refresh: boolean|null",
+        "session_id: string|null",
+        "tag: string"
+      ],
+      "required": [
+        "tag"
+      ],
+      "title": "Find pool chunks by tag"
     },
     {
       "hints": {
