@@ -768,17 +768,16 @@ fn pool(e: &DebugEngine, args: PoolOp) -> Result<String, String> {
             let address = parse_pool_addr(&address)?;
             match query::chunk_at(e, address, refresh).map_err(es)? {
                 Some(found) => Ok(render_chunk(address, &found)),
-                // "Not in the snapshot" and "free" are different answers, and conflating them
-                // would be the difference between "this pointer is dangling" and "this pointer
-                // never pointed at pool".
+                // "Not in the snapshot" and "free" are different answers, and reporting this one
+                // as free would manufacture a dangling pointer out of a gap in the walk.
                 None => {
                     let mut out = format!(
                         "{} is not covered by the pool snapshot.\n\nThat is not the same as \
-                         \"free\": a free hole inside a walked region comes back as a chunk \
-                         whose state is not Allocated. An address outside every region is \
-                         either not pool at all, or sits in a region this walk did not reach. \
-                         If the target has run since the snapshot was taken, retry with \
-                         refresh=true.",
+                         \"free\": a free hole inside a walked region comes back as a chunk in \
+                         an explicitly free state (ReusableFree or CachedFree). An address \
+                         outside every region is either not pool at all, or sits in a region \
+                         this walk did not reach. If the target has run since the snapshot was \
+                         taken, retry with refresh=true.",
                         fmt_addr(address)
                     );
                     append_walk_report(&mut out, e);
