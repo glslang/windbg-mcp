@@ -27,5 +27,9 @@ target
 node_modules/
 package-lock.json
 
+# MSVC C build artifacts (examples/messagemanager exploit)
+*.obj
+*.exe
+
 # Local Claude Code config
 .claude/
