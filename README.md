@@ -356,15 +356,17 @@ timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressio
   bounds. If the dispatch uses a `switch(IoControlCode)` jump table (common), pass the specific
   handler VA as `from` to scope past it, or confirm dynamically with a breakpoint + `go`.
 - The **kernel pool** tools (`pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics`) walk the allocator's own
-  descriptors through win-kexp rather than shelling out to `!pool`/`!poolused`, so all three read
+  descriptors through win-kexp rather than shelling out to `!pool`/`!poolused`, so all four read
   one snapshot and cannot disagree with each other. They need a **broken-in x64 kernel** target.
   Walking every pool page is expensive, so the snapshot is **cached per session** and reused; pass
   `refresh: true` after letting the target run, or you are reading a photograph of a target that has
   since moved. Two semantics worth knowing: only *allocated* chunks are indexed by tag (a freed
   chunk's tag is not reliably preserved, so `pool_find_tag` never reports freed memory — ask about a
   specific address with `pool_chunk` instead), and `pool_chunk` distinguishes "free hole inside a
-  walked region" (a chunk whose state is not `Allocated`) from "address not covered by the snapshot"
-  — the difference between a dangling pointer and one that never pointed at pool. `pool_chunk` also
+  walked region" (a chunk in an explicitly free state — `ReusableFree` or `CachedFree`) from
+  "address not covered by the snapshot" — the difference between a dangling pointer and one that
+  never pointed at pool. A span reported `Unreadable` is neither: that is the walk's own limit
+  (a Verifier guard page reads that way), not evidence the allocator freed anything. `pool_chunk` also
   reports the **neighbouring** chunks, which is what tells you what a reclaim would land next to. `pool_diagnostics` returns the walk's own diagnostics filtered by substring: a real walk emits tens of thousands across a hundred-plus categories, so any per-call summary truncates and the one line explaining a specific heap is never in the truncated head — filter by a heap address or a phrase to reach it.
 - **Crash-dump triage uses `!ext.analyze -v`**, not `!analyze` — the bundled engine only resolves
   the module-qualified form (see *Bundling the WinDbg engine*). On a **partial minidump**, reads of

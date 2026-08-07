@@ -666,17 +666,17 @@ fn summarize_diagnostics(lines: &[String]) -> Vec<(String, usize)> {
 ///
 /// A *nonempty* result looks self-explanatory in a way an empty one does not, which is what
 /// makes it the more dangerous of the two: "3 allocations, 0x138 bytes total" reads as the
-/// whole set whether the walk covered the whole pool or a corner of it. `find_tag` can only
-/// report what the walk indexed, so under partial coverage that count is a floor. Saying so is
-/// the difference between "there are three of these" and "these are the three I could see".
+/// whole set whether the walk covered the whole pool or a corner of it. Every list here is
+/// drawn from what the walk indexed, so under partial coverage a count is a floor. Saying so
+/// is the difference between "there are three of these" and "these are the three I could see".
 fn coverage_caveat(report: &query::PoolSnapshotReport) -> Option<String> {
     if report.complete {
         return None;
     }
     Some(format!(
-        "\n--- pool walk ---\ncoverage: INCOMPLETE - the walk reached {} chunk(s) but not \
-         everything it set out to, so the count above is a floor, not a total; there may be \
-         more. `pool_diagnostics` says what it could not reach.\n",
+        "\n--- pool walk ---\ncoverage: INCOMPLETE - the walk reached {} chunk(s), but not \
+         everything it set out to. What is listed above is therefore a floor, not a total: \
+         there may be more the walk never saw.\n",
         report.total_chunks
     ))
 }
@@ -943,6 +943,11 @@ fn render_diagnostics(
             matching.len() - limit
         ));
     }
+    // "2 of 2 diagnostics" is an exact-looking claim about a walk that may have stopped before
+    // whole heaps. The empty branch above already says which; a nonempty one owes the same.
+    if let Some(caveat) = coverage_caveat(report) {
+        out.push_str(&caveat);
+    }
     out
 }
 
@@ -1177,13 +1182,17 @@ mod tests {
         assert!(select_diagnostics(&lines, Some("no such text")).is_empty());
     }
 
-    fn report(complete: bool) -> query::PoolSnapshotReport {
+    fn report_with(complete: bool, diagnostics: &[&str]) -> query::PoolSnapshotReport {
         query::PoolSnapshotReport {
             total_chunks: 4211,
             allocated_chunks: 3007,
             complete,
-            diagnostics: Vec::new(),
+            diagnostics: diagnostics.iter().map(|line| line.to_string()).collect(),
         }
+    }
+
+    fn report(complete: bool) -> query::PoolSnapshotReport {
+        report_with(complete, &[])
     }
 
     /// A found-something answer carries its own count, and that count is only a total if the
@@ -1203,6 +1212,30 @@ mod tests {
     #[test]
     fn a_complete_walk_adds_no_caveat() {
         assert_eq!(coverage_caveat(&report(true)), None);
+    }
+
+    /// The filtered list has the same failure mode as a tag result: "1 of 2 diagnostic(s)" is
+    /// an exact-looking claim, and a walk that stopped before whole heaps never produced the
+    /// diagnostics those heaps would have emitted.
+    #[test]
+    fn filtered_diagnostics_carry_the_coverage_state() {
+        let lines = [
+            "cannot fully discover heap 0xffff8c8f0d300000: read failed",
+            "LFH slot 0xffffb28ac16fcf30+0xe0 would cross a page",
+        ];
+        let rendered = render_diagnostics(&report_with(false, &lines), Some("heap"), 10);
+        assert!(
+            rendered.contains("cannot fully discover heap"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("INCOMPLETE"), "{rendered}");
+
+        let rendered = render_diagnostics(&report_with(true, &lines), Some("heap"), 10);
+        assert!(
+            rendered.contains("cannot fully discover heap"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("INCOMPLETE"), "{rendered}");
     }
 
     // ---- pool address parsing ------------------------------------------------------
