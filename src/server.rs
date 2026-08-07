@@ -1179,6 +1179,14 @@ pub struct SymbolPathArgs {
     pub session_id: Option<String>,
 }
 
+/// Most rows or lines a pool tool will render in one response.
+///
+/// The worker builds the whole reply as a single `String` before it crosses the pipe, so an
+/// unbounded `limit` is a request to allocate a snapshot-sized buffer — hundreds of thousands
+/// of chunks, or ~19k diagnostic lines on an idle machine. Clamping costs a caller nothing
+/// they can act on; a worker killed mid-session costs them the session.
+const MAX_POOL_ROWS: u32 = 2000;
+
 #[derive(Deserialize, JsonSchema)]
 pub struct PoolFindTagArgs {
     /// Pool tag to find: 1..4 ASCII bytes, e.g. "Tgsm". This is the tag as the debugger
@@ -1816,7 +1824,7 @@ impl WindbgServer {
                     tag: args.tag,
                     paged: args.paged,
                     refresh: args.refresh.unwrap_or(false),
-                    limit: args.limit.unwrap_or(64) as usize,
+                    limit: args.limit.unwrap_or(64).min(MAX_POOL_ROWS) as usize,
                 }),
             )
             .await;
@@ -1878,7 +1886,7 @@ impl WindbgServer {
                 EngineOp::Pool(PoolOp::Diagnostics {
                     filter: args.filter,
                     refresh: args.refresh.unwrap_or(false),
-                    limit: args.limit.unwrap_or(60) as usize,
+                    limit: args.limit.unwrap_or(60).min(MAX_POOL_ROWS) as usize,
                 }),
             )
             .await;
@@ -1906,7 +1914,7 @@ impl WindbgServer {
                 args.session_id.as_deref(),
                 EngineOp::Pool(PoolOp::Census {
                     refresh: args.refresh.unwrap_or(false),
-                    limit: args.limit.unwrap_or(40) as usize,
+                    limit: args.limit.unwrap_or(40).min(MAX_POOL_ROWS) as usize,
                 }),
             )
             .await;

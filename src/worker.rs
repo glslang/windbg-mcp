@@ -838,12 +838,21 @@ fn render_chunk(address: u64, found: &query::PoolNeighbourhood) -> String {
     if found.previous.is_none() && found.next.is_none() {
         out.push_str("\n(no neighbouring chunks in the same heap)\n");
     }
-    if chunk.state != PoolState::Allocated {
-        out.push_str(&format!(
+    match chunk.state {
+        PoolState::Allocated => {}
+        // Only these two mean the allocator actually released the chunk.
+        PoolState::ReusableFree | PoolState::CachedFree => out.push_str(&format!(
             "\nThis chunk is {:?}, not Allocated: any pointer the target still holds to it is a \
              use-after-free.\n",
             chunk.state
-        ));
+        )),
+        // `Unreadable` is a limit of the walk, not a fact about lifetime — a Verifier guard
+        // page reads exactly this way. Calling it a use-after-free would turn "could not
+        // read" into a verdict, which is the one mistake this tool must not make.
+        PoolState::Unreadable => out.push_str(
+            "\nThis span could not be read, so its state is unknown. That is a limit of the \
+             walk, not evidence that the allocator freed it.\n",
+        ),
     }
     if chunk.heap.special {
         out.push_str(
@@ -881,9 +890,14 @@ fn render_diagnostics(
     };
     if matching.is_empty() {
         return format!(
-            "No diagnostics{scope}.\n\nThe walk emitted {} diagnostic(s) in total over {} \
+            "No diagnostics{scope}.\n\nThe walk was {}. It emitted {} diagnostic(s) in total over {} \
              chunk(s) ({} allocated). If you expected a match, check the spelling — the \
              filter is a plain case-insensitive substring, not a pattern.",
+            if report.complete {
+                "complete"
+            } else {
+                "INCOMPLETE"
+            },
             report.diagnostics.len(),
             report.total_chunks,
             report.allocated_chunks
