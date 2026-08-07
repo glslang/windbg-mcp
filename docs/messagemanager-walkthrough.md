@@ -184,26 +184,47 @@ Each value cross-checks against the debugger: `x nt!PsInitialSystemProcess` prin
 `0xfffff806777c5ab0`, and `lm` gives the same driver base — so the leak plumbing is sound before a
 single byte of the driver is corrupted.
 
-## 6. From UAF to SYSTEM — the plan
+## 6. From UAF to SYSTEM — how far the primitives reach
 
-With a leak and a freed-but-referenced 0x68 chunk, the chain is:
+The intended payoff is **data-only** — the mitigations rule out anything else. CR4 on this box is
+`0xb50ef8`: **SMEP, SMAP, and CET all on**. So a ROP chain to clear CR4 is a dead end (CET faults
+the `ret`s, and there's no instruction-pointer control to begin with — the bug yields *data* writes,
+and kCFG guards indirect calls). The only viable model is to never execute attacker code:
 
-1. **Reclaim** the freed `Tgsm` chunk with a NonPaged spray controlled at `+0x08`/`+0x10` — the
-   `Flink`/`Blink` the Flush unlink writes. (This is the open engineering problem: most medium-IL
-   NonPaged sprays carry a header at the front. The reclaim is *measured* with `pool_find_tag` /
-   `pool_chunk` rather than assumed — the reason the tooling exists.)
-2. **Write-what-where** via the `+0x08` LIST_ENTRY unlink in Flush: `[Blink]=Flink` (with collateral
-   `[Flink+8]=Blink`, so both must be writable — it writes a *pointer*, not an arbitrary value).
-3. **Bootstrap R/W** by setting `KTHREAD.PreviousMode` (`+0x232`) to 0, which makes
+1. **Write-what-where** via the `+0x08` LIST_ENTRY unlink in Flush/SetData: `[Blink]=Flink` with
+   collateral `[Flink+8]=Blink` — it writes a *pointer* to an attacker address, so both operands
+   must be writable kernel addresses.
+2. **Bootstrap R/W** by writing `KTHREAD.PreviousMode` (`+0x232`) to 0, which makes
    `Nt{Read,Write}VirtualMemory` operate on kernel addresses.
-4. **Token steal:** read the System process's token via `PsInitialSystemProcess` and write it into
-   this process's `_EPROCESS.Token` (`+0x248`). The alternative one-shot — swap the token pointer
-   directly with the unlink, collateral landing harmlessly on `_TOKEN+0x08` (SourceIdentifier) —
-   needs the System token *value*, i.e. one kernel read, which is why the PreviousMode bootstrap
-   comes first.
+3. **Token steal:** read the System process's token via `PsInitialSystemProcess` (ntos + 0xFC5AB0)
+   and write it into this process's `_EPROCESS.Token` (`+0x248`).
 
-Stages 1 (leaks) and the full driver reverse are done and validated live; stages 2–3 (reclaim and
-token steal) are in progress.
+Every step of that is worked out and the addresses are all in hand (§5). **What is *not* solved is
+step 0 — the reclaim**, and it turns out to be the whole game:
+
+> The MESSAGE keeps its exploitable fields **low**: RefCount `+0x00`, the unlink LIST_ENTRY
+> `+0x08`/`+0x10`, the arbitrary-free Buffer `+0x18`. To weaponise the freed chunk, an attacker
+> has to reclaim it with a NonPaged (`NonPagedPoolNx`, 0x70 bucket) spray whose **attacker bytes
+> land at those offsets**. Every standard medium-IL primitive fails, and it fails *systemically*:
+
+| Reclaim spray | Measured with the pool tools | Verdict |
+|---|---|---|
+| Pipe write-data (`NpFr`) | `DATA_QUEUE_ENTRY` header is **0x30**; payload begins at chunk +0x30 | misses every field |
+| I/O ring registered buffers | bytes are read as `{Address, Length}`, and `Address` is **validated as user memory** | can't carry a kernel target |
+| Mailslot (MSFS) | FILE_OBJECT → FCB data queue is **empty**; msfs keeps no separate message chunk | no chunk to reclaim |
+
+The pattern is the point: every list-managed NonPaged object carries a `LIST_ENTRY`/header of ≥0x10
+before its first attacker-controlled byte — *above* exactly where this bug needs control. So the
+exploit's difficulty isn't the driver bug (a textbook locking UAF) or the mitigations (data-only
+sidesteps them); it's finding a **verbatim NonPaged reclaim** at this size. That is a genuine,
+open research question.
+
+**What this walkthrough establishes, then, is exploit*ability*, not a shell:** the UAF is confirmed
+and reproducible (§3), control of the freed chunk is *demonstrated* (the pipe reclaim lands
+attacker bytes in it — just at the wrong offset), and the two forward primitives — the unlink
+write-what-where and an **unconditional** arbitrary-free (`SetData` frees `msg+0x18` before it
+reallocates) — are pinned to exact instructions (§3). The reclaim, and the double-free →
+type-confusion route that would sidestep the offset problem, are where the work continues.
 
 ## Gotchas recap
 
@@ -216,3 +237,9 @@ token steal) are in progress.
 - **`!analyze` can misname the faulting module** — trust the bugcheck banner and `IP_IN_PAGED_CODE`.
 - **Verifier special pool hides a driver from naive walkers** — it needs a page-granular decoder;
   `pool_find_tag` handles it, and shows the guard page as an `Unreadable` neighbour.
+- **A full pool walk is expensive on a *live* KDNET target** — `pool_find_tag`/`pool_census`
+  traverse every free tree node-by-node over the wire, and a live target mutates the lists under
+  the walk (stale pointers get chased, diagnostics balloon), so the call can exceed the engine
+  timeout and stall follow-ups. On a dump it's cheap. To find one object on a live target, prefer
+  the targeted route (`!handle`/FILE_OBJECT/`dps`) over a tag walk; the snapshot is cached per
+  session, so pay the walk once.
