@@ -247,7 +247,7 @@ gh attestation verify <zip> --repo glslang/windbg-mcp `
 | TTD nav | `step_back` (`t-`), `step_over_back` (`p-`), `reverse_go` (`g-`), `goto_position` (`!tt`) |
 | TTD analysis | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
 | Driver IOCTL | `decode_ioctl`, `driver_object`, `device_object`, `irp_stack`, `ioctl_trace`, `reachable_from_dispatch` |
-| Kernel pool | `pool_find_tag`, `pool_chunk`, `pool_census` |
+| Kernel pool | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics` |
 | Raw     | `execute` — run any debugger command, returns full text output |
 
 ### Sessions and session handles
@@ -355,7 +355,7 @@ timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressio
   exists, and the path is reported), while `NOT REACHABLE` is best-effort within the explored
   bounds. If the dispatch uses a `switch(IoControlCode)` jump table (common), pass the specific
   handler VA as `from` to scope past it, or confirm dynamically with a breakpoint + `go`.
-- The **kernel pool** tools (`pool_find_tag`, `pool_chunk`, `pool_census`) walk the allocator's own
+- The **kernel pool** tools (`pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics`) walk the allocator's own
   descriptors through win-kexp rather than shelling out to `!pool`/`!poolused`, so all three read
   one snapshot and cannot disagree with each other. They need a **broken-in x64 kernel** target.
   Walking every pool page is expensive, so the snapshot is **cached per session** and reused; pass
@@ -365,7 +365,7 @@ timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressio
   specific address with `pool_chunk` instead), and `pool_chunk` distinguishes "free hole inside a
   walked region" (a chunk whose state is not `Allocated`) from "address not covered by the snapshot"
   — the difference between a dangling pointer and one that never pointed at pool. `pool_chunk` also
-  reports the **neighbouring** chunks, which is what tells you what a reclaim would land next to.
+  reports the **neighbouring** chunks, which is what tells you what a reclaim would land next to. `pool_diagnostics` returns the walk's own diagnostics filtered by substring: a real walk emits tens of thousands across a hundred-plus categories, so any per-call summary truncates and the one line explaining a specific heap is never in the truncated head — filter by a heap address or a phrase to reach it.
 - **Crash-dump triage uses `!ext.analyze -v`**, not `!analyze` — the bundled engine only resolves
   the module-qualified form (see *Bundling the WinDbg engine*). On a **partial minidump**, reads of
   pages that weren't captured raise `An unexpected exception was raised (0x80040205)` rather than a
