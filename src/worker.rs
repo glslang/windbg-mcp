@@ -661,6 +661,26 @@ fn summarize_diagnostics(lines: &[String]) -> Vec<(String, usize)> {
     grouped
 }
 
+/// The caveat an answer needs when the walk that produced it did not finish, or `None` when
+/// it did — so a healthy answer stays quiet.
+///
+/// A *nonempty* result looks self-explanatory in a way an empty one does not, which is what
+/// makes it the more dangerous of the two: "3 allocations, 0x138 bytes total" reads as the
+/// whole set whether the walk covered the whole pool or a corner of it. `find_tag` can only
+/// report what the walk indexed, so under partial coverage that count is a floor. Saying so is
+/// the difference between "there are three of these" and "these are the three I could see".
+fn coverage_caveat(report: &query::PoolSnapshotReport) -> Option<String> {
+    if report.complete {
+        return None;
+    }
+    Some(format!(
+        "\n--- pool walk ---\ncoverage: INCOMPLETE - the walk reached {} chunk(s) but not \
+         everything it set out to, so the count above is a floor, not a total; there may be \
+         more. `pool_diagnostics` says what it could not reach.\n",
+        report.total_chunks
+    ))
+}
+
 /// Appends what the walk itself managed, so an empty answer explains itself.
 ///
 /// Without this, an empty result is ambiguous in the worst way: "the pool holds no such
@@ -737,6 +757,10 @@ fn pool(e: &DebugEngine, args: PoolOp) -> Result<String, String> {
             let mut out = render_find_tag(&tag, filter, &spans, limit);
             if spans.is_empty() {
                 append_walk_report(&mut out, e);
+            } else if let Ok(report) = query::snapshot_report(e, false)
+                && let Some(caveat) = coverage_caveat(&report)
+            {
+                out.push_str(&caveat);
             }
             Ok(out)
         }
@@ -1151,6 +1175,34 @@ mod tests {
         assert_eq!(select_diagnostics(&lines, Some("cross a page")).len(), 1);
         assert_eq!(select_diagnostics(&lines, None).len(), 3);
         assert!(select_diagnostics(&lines, Some("no such text")).is_empty());
+    }
+
+    fn report(complete: bool) -> query::PoolSnapshotReport {
+        query::PoolSnapshotReport {
+            total_chunks: 4211,
+            allocated_chunks: 3007,
+            complete,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    /// A found-something answer carries its own count, and that count is only a total if the
+    /// walk finished. Left unsaid, "3 allocations" from a walk that reached a fraction of the
+    /// pool reads as "there are exactly 3".
+    #[test]
+    fn an_incomplete_walk_says_so_even_when_it_found_something() {
+        let caveat = coverage_caveat(&report(false)).expect("an incomplete walk must be flagged");
+        assert!(caveat.contains("INCOMPLETE"), "{caveat}");
+        assert!(caveat.contains("4211"), "{caveat}");
+        // Not merely "incomplete": the caller has to know which way the number is wrong.
+        assert!(caveat.contains("floor"), "{caveat}");
+    }
+
+    /// The other half: a complete walk must not decorate every answer with a warning, or the
+    /// warning stops meaning anything on the walk that matters.
+    #[test]
+    fn a_complete_walk_adds_no_caveat() {
+        assert_eq!(coverage_caveat(&report(true)), None);
     }
 
     // ---- pool address parsing ------------------------------------------------------
