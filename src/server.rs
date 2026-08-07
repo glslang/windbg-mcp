@@ -1838,9 +1838,11 @@ impl WindbgServer {
     /// the target still holds is dangling, and what a reclaim would land next to.
     /// "Not in the snapshot" and "free" are reported differently: a free hole inside a walked
     /// region comes back as a chunk in an explicitly free state (`ReusableFree` or
-    /// `CachedFree`), while an address outside every region is reported as uncovered. A third
-    /// state, `Unreadable`, is neither — it means the walk could not read the span (a Verifier
-    /// guard page reads exactly this way), so it says nothing about whether the chunk is live.
+    /// `CachedFree`), while an address outside every region is reported as uncovered — which
+    /// means it is not pool *or* the walk never reached it, so check the coverage the result
+    /// prints before reading it as "never was pool". A third state, `Unreadable`, is neither:
+    /// the walk could not read the span (a Verifier guard page reads exactly this way), so it
+    /// says nothing about whether the chunk is live.
     #[rmcp::tool(annotations(
         title = "Locate a pool chunk by address",
         read_only_hint = true,
