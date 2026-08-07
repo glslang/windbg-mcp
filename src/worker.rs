@@ -674,9 +674,18 @@ fn summarize_diagnostics(lines: &[String]) -> Vec<(String, usize)> {
 fn append_walk_report(out: &mut String, e: &DebugEngine) {
     match query::snapshot_report(e, false) {
         Ok(report) => {
+            // `complete` is not implied by an empty diagnostics list: a walk can end
+            // partway through without saying anything. Report it explicitly, or a caller
+            // reads a truncated snapshot as a healthy one.
             out.push_str(&format!(
-                "\n--- pool walk ---\nchunks walked: {} ({} allocated)\n",
-                report.total_chunks, report.allocated_chunks
+                "\n--- pool walk ---\nchunks walked: {} ({} allocated), coverage: {}\n",
+                report.total_chunks,
+                report.allocated_chunks,
+                if report.complete {
+                    "complete"
+                } else {
+                    "INCOMPLETE - the walk did not reach everything it set out to"
+                }
             ));
             if report.diagnostics.is_empty() {
                 out.push_str("the walk reported no diagnostics.\n");
