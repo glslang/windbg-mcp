@@ -2365,6 +2365,88 @@ fn a_census_table_yields_its_heaviest_tag() {
     ));
 }
 
+/// The walk's stated diagnostic total, and the per-category counts printed beneath it.
+fn diagnostic_counts(report: &str) -> Option<(usize, Vec<usize>)> {
+    let total = report.lines().find_map(|line| {
+        let (count, _) = line.split_once(" diagnostic(s) in ")?;
+        count.trim().parse::<usize>().ok()
+    })?;
+    let categories = report
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim_start();
+            let digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+            // `x` and two spaces, or a `0x1f40` in some other table would read as a category.
+            (!digits.is_empty() && trimmed[digits.len()..].starts_with("x  "))
+                .then(|| digits.parse().ok())
+                .flatten()
+        })
+        .collect();
+    Some((total, categories))
+}
+
+/// A walk's diagnostic total has to account for the categories printed beneath it.
+///
+/// The arithmetic is trivial — a sum is at least the part of it you can see — and it is exactly
+/// what broke. The total used to be the number of *lines that survived* the walk's collapsing, so
+/// a real run printed "71 diagnostic(s)" above a category reading "5621x" (#77): a statement about
+/// this code's own truncation, rendered as a measurement of the target. Fixtures cannot catch it
+/// because nothing collapses until a category floods, so this live tier is the only place the two
+/// numbers are ever far enough apart to disagree.
+fn assert_diagnostic_total_covers_its_categories(report: &str) {
+    if report.contains("the walk reported no diagnostics.") {
+        return;
+    }
+    let (total, categories) = diagnostic_counts(report)
+        .unwrap_or_else(|| panic!("no diagnostic summary to check in:\n{report}"));
+    assert!(
+        !categories.is_empty(),
+        "a diagnostic total with no categories under it means this parser stopped matching, and \
+         a check that silently matches nothing is not a check:\n{report}"
+    );
+    let listed: usize = categories.iter().sum();
+    assert!(
+        total >= listed,
+        "the walk reported {total} diagnostic(s) but the categories under it account for {listed} \
+         — so the total is counting something other than the messages the walk emitted, and a \
+         reader takes it for a property of the target (#77):\n{report}"
+    );
+}
+
+/// Pinned in the default tier for the same reason as the census parser above: the live check it
+/// feeds is the *only* one that can see this fault, so a parser that quietly stops matching would
+/// take the proof with it and leave the live run passing.
+#[test]
+fn a_walk_report_yields_its_diagnostic_counts() {
+    let report = "--- pool walk ---\nchunks walked: 413279 (234110 allocated), coverage: \
+                  INCOMPLETE - the walk did not reach everything it set out to\n\
+                  7731 diagnostic(s) in 24 categories:\n\
+                  \x205621x  rejecting implausible LFH metadata at #\n\
+                  \x201770x  cannot read LFH subsegment # sparse virtual range at #\n\
+                  \nlast 12 of the 71 kept verbatim (the rest are in the counts above):\n\
+                  \x20 rejecting implausible LFH metadata at 0xffff8c8f0de00260\n";
+
+    let (total, categories) = diagnostic_counts(report).expect("the summary is right there");
+    assert_eq!(total, 7731);
+    assert_eq!(categories, vec![5621, 1770]);
+    // The verbatim example carries an address, not a count, and must not be read as a category.
+    assert_diagnostic_total_covers_its_categories(report);
+
+    // The shape of the bug: a total that counted surviving lines instead of messages.
+    let understated = report.replace("7731 diagnostic(s)", "71 diagnostic(s)");
+    assert!(
+        std::panic::catch_unwind(|| assert_diagnostic_total_covers_its_categories(&understated))
+            .is_err(),
+        "the check has to reject the very output that motivated it"
+    );
+
+    // A quiet walk has nothing to reconcile, and must not be made to fail for it.
+    assert_diagnostic_total_covers_its_categories(
+        "--- pool walk ---\nchunks walked: 5 (4 allocated), coverage: complete\n\
+         the walk reported no diagnostics.\n",
+    );
+}
+
 /// A pool walk over a live kernel: the query that used to take the session with it.
 ///
 /// This is the tier the budget in glslang/win-kexp#88 was written for, and the only one that can
@@ -2556,6 +2638,7 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
                 .collect::<Vec<_>>()
                 .join("\n");
             println!("why the walk fell short:\n{report}");
+            assert_diagnostic_total_covers_its_categories(&report);
         }
 
         match heaviest_census_tag(&census) {

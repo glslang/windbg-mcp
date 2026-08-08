@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 
 use win_kexp::dbgeng::{DebugEngine, RunToOutcome};
 use win_kexp::pool::query::{self, PoolPageFilter};
-use win_kexp::pool::{PoolSpan, PoolState};
+use win_kexp::pool::{DiagnosticShape, PoolDiagnostics, PoolSpan, PoolState};
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
 use crate::proto::{EngineOp, PoolOp, ReachabilityOp, WorkerMessage, WorkerRequest};
@@ -630,35 +630,26 @@ fn parse_pool_addr(text: &str) -> Result<u64, String> {
     parse_windbg_addr(text).map_or_else(|| parse_u64(text), Ok)
 }
 
-/// Replaces the variable parts of a diagnostic — addresses and indices — so that lines
-/// describing the same *kind* of problem collapse together.
+/// The walk's own diagnostic categories, commonest first.
 ///
-/// A hex-looking run has to be at least 4 characters to count, or short decimal counts
-/// ("depth is 16") would be blanked too and lines that differ meaningfully would merge.
-fn diagnostic_category(line: &str) -> String {
-    line.split_whitespace()
-        .map(|word| {
-            let trimmed = word.trim_matches(|c: char| !c.is_ascii_alphanumeric());
-            let hexish = trimmed.len() >= 4 && trimmed.chars().all(|c| c.is_ascii_hexdigit());
-            if trimmed.starts_with("0x") || hexish {
-                "<addr>"
-            } else {
-                word
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
+/// The grouping is the walk's, not ours: it collapses floods as it goes and keeps a total per
+/// category, so re-deriving categories here would count the *sample* it kept — off by two
+/// orders of magnitude on a live target — and report that as a fact about the pool. Only the
+/// ordering is a presentation choice, and it belongs on this side.
+/// "1 category" / "24 categories" — the irregular plural shows up in every rendering here.
+fn categories_phrase(count: usize) -> String {
+    format!("{count} categor{}", if count == 1 { "y" } else { "ies" })
 }
 
-/// Groups diagnostics by category, commonest first.
-fn summarize_diagnostics(lines: &[String]) -> Vec<(String, usize)> {
-    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-    for line in lines {
-        *counts.entry(diagnostic_category(line)).or_default() += 1;
-    }
-    let mut grouped: Vec<_> = counts.into_iter().collect();
-    grouped.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    grouped
+fn diagnostic_categories(diagnostics: &PoolDiagnostics) -> Vec<&DiagnosticShape> {
+    let mut categories: Vec<&DiagnosticShape> = diagnostics.shapes().iter().collect();
+    categories.sort_by(|left, right| {
+        right
+            .total
+            .cmp(&left.total)
+            .then_with(|| left.shape.cmp(&right.shape))
+    });
+    categories
 }
 
 /// The caveat an answer needs when the walk that produced it did not finish, or `None` when
@@ -690,52 +681,68 @@ fn coverage_caveat(report: &query::PoolSnapshotReport) -> Option<String> {
 /// The diagnostics are *categorised* rather than listed: a real walk emits tens of
 /// thousands, and the first forty of those are a sample of whichever heap happened to be
 /// walked first, not of the problem. Counts per category say which failures actually
-/// dominate; one verbatim example per category keeps the concrete address available.
+/// dominate; the verbatim tail keeps concrete addresses available.
 fn append_walk_report(out: &mut String, e: &DebugEngine) {
     match query::snapshot_report(e, false) {
-        Ok(report) => {
-            // `complete` is not implied by an empty diagnostics list: a walk can end
-            // partway through without saying anything. Report it explicitly, or a caller
-            // reads a truncated snapshot as a healthy one.
-            out.push_str(&format!(
-                "\n--- pool walk ---\nchunks walked: {} ({} allocated), coverage: {}\n",
-                report.total_chunks,
-                report.allocated_chunks,
-                if report.complete {
-                    "complete"
-                } else {
-                    "INCOMPLETE - the walk did not reach everything it set out to"
-                }
-            ));
-            if report.diagnostics.is_empty() {
-                out.push_str("the walk reported no diagnostics.\n");
-                return;
-            }
-            let grouped = summarize_diagnostics(&report.diagnostics);
-            out.push_str(&format!(
-                "{} diagnostic(s) in {} categor{}:\n",
-                report.diagnostics.len(),
-                grouped.len(),
-                if grouped.len() == 1 { "y" } else { "ies" }
-            ));
-            for (category, count) in grouped.iter().take(25) {
-                out.push_str(&format!("  {count:>7}x  {category}\n"));
-            }
-            if grouped.len() > 25 {
-                out.push_str(&format!("  ... {} more categories\n", grouped.len() - 25));
-            }
-            // The last few verbatim: heaps are walked in order, so the tail is where the
-            // most recently discovered ones (special pool included) report.
-            out.push_str("\nlast 12 verbatim:\n");
-            let tail = report.diagnostics.len().saturating_sub(12);
-            for line in report.diagnostics.iter().skip(tail) {
-                out.push_str("  ");
-                out.push_str(line);
-                out.push('\n');
-            }
-        }
+        Ok(report) => out.push_str(&render_walk_report(&report)),
         Err(error) => out.push_str(&format!("\n(could not summarise the walk: {error})\n")),
     }
+}
+
+/// The body of [`append_walk_report`], split out so the counts can be tested without an engine.
+fn render_walk_report(report: &query::PoolSnapshotReport) -> String {
+    // `complete` is not implied by an empty diagnostics list: a walk can end partway
+    // through without saying anything. Report it explicitly, or a caller reads a truncated
+    // snapshot as a healthy one.
+    let mut out = format!(
+        "\n--- pool walk ---\nchunks walked: {} ({} allocated), coverage: {}\n",
+        report.total_chunks,
+        report.allocated_chunks,
+        if report.complete {
+            "complete"
+        } else {
+            "INCOMPLETE - the walk did not reach everything it set out to"
+        }
+    );
+    if report.diagnostics.is_empty() {
+        out.push_str("the walk reported no diagnostics.\n");
+        return out;
+    }
+    let categories = diagnostic_categories(&report.diagnostics);
+    out.push_str(&format!(
+        "{} diagnostic(s) in {}:\n",
+        report.diagnostics.emitted(),
+        categories_phrase(categories.len())
+    ));
+    for category in categories.iter().take(25) {
+        out.push_str(&format!(
+            "  {:>7}x  {}\n",
+            category.total,
+            category.shape.trim()
+        ));
+    }
+    if categories.len() > 25 {
+        out.push_str(&format!(
+            "  ... {} more categories\n",
+            categories.len() - 25
+        ));
+    }
+    // The last few verbatim: heaps are walked in order, so the tail is where the most
+    // recently discovered ones (special pool included) report. These are only the messages
+    // the walk kept — a capped sample per category — so say so, or "last 12" reads as the
+    // tail of everything rather than the tail of the sample.
+    let examples = report.diagnostics.examples();
+    let shown = examples.len().min(12);
+    out.push_str(&format!(
+        "\nlast {shown} of the {} kept verbatim (the rest are in the counts above):\n",
+        examples.len()
+    ));
+    for line in examples.iter().skip(examples.len() - shown) {
+        out.push_str("  ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 fn pool(e: &DebugEngine, args: PoolOp) -> Result<String, String> {
@@ -888,30 +895,52 @@ fn render_chunk(address: u64, found: &query::PoolNeighbourhood) -> String {
     out
 }
 
-/// Selects the diagnostics matching `filter` (case-insensitive substring), verbatim.
-fn select_diagnostics<'a>(lines: &'a [String], filter: Option<&str>) -> Vec<&'a String> {
+/// Whether `text` contains `needle`, case-insensitively; every text matches no needle.
+fn matches_filter(text: &str, needle: Option<&str>) -> bool {
+    needle.is_none_or(|needle| text.to_ascii_lowercase().contains(needle))
+}
+
+/// Selects the messages the walk kept verbatim that match `filter`.
+fn select_examples<'a>(diagnostics: &'a PoolDiagnostics, filter: Option<&str>) -> Vec<&'a String> {
     let needle = filter.map(str::to_ascii_lowercase);
-    lines
+    diagnostics
+        .examples()
         .iter()
-        .filter(|line| {
-            needle
-                .as_ref()
-                .is_none_or(|needle| line.to_ascii_lowercase().contains(needle.as_str()))
-        })
+        .filter(|line| matches_filter(line, needle.as_deref()))
         .collect()
 }
 
+/// Selects the categories whose shape matches `filter`, commonest first.
+fn select_categories<'a>(
+    diagnostics: &'a PoolDiagnostics,
+    filter: Option<&str>,
+) -> Vec<&'a DiagnosticShape> {
+    let needle = filter.map(str::to_ascii_lowercase);
+    diagnostic_categories(diagnostics)
+        .into_iter()
+        .filter(|category| matches_filter(&category.shape, needle.as_deref()))
+        .collect()
+}
+
+/// Lists the walk's complaints: the verbatim ones it kept, then what the counts say.
+///
+/// Both halves are needed and neither substitutes for the other. The walk keeps only a
+/// handful of messages per category, so the verbatim list is where a concrete address can be
+/// found and is *not* where volume can be read; the categories carry the real totals and have
+/// had their addresses generalised away. Printing only the first would answer "how many of
+/// these were there?" with the size of a sample.
 fn render_diagnostics(
     report: &query::PoolSnapshotReport,
     filter: Option<&str>,
     limit: usize,
 ) -> String {
-    let matching = select_diagnostics(&report.diagnostics, filter);
+    let examples = select_examples(&report.diagnostics, filter);
+    let categories = select_categories(&report.diagnostics, filter);
     let scope = match filter {
         Some(filter) => format!(" matching \"{filter}\""),
         None => String::new(),
     };
-    if matching.is_empty() {
+    if examples.is_empty() && categories.is_empty() {
         return format!(
             "No diagnostics{scope}.\n\nThe walk was {}. It emitted {} diagnostic(s) in total over {} \
              chunk(s) ({} allocated). If you expected a match, check the spelling — the \
@@ -921,26 +950,54 @@ fn render_diagnostics(
             } else {
                 "INCOMPLETE"
             },
-            report.diagnostics.len(),
+            report.diagnostics.emitted(),
             report.total_chunks,
             report.allocated_chunks
         );
     }
     let mut out = format!(
-        "{} of {} diagnostic(s){scope}:\n\n",
-        matching.len(),
-        report.diagnostics.len()
+        "The walk emitted {} diagnostic(s) in {}.\n\n",
+        report.diagnostics.emitted(),
+        categories_phrase(report.diagnostics.shapes().len())
     );
-    for line in matching.iter().take(limit) {
-        out.push_str("  ");
-        out.push_str(line);
-        out.push('\n');
-    }
-    if matching.len() > limit {
+    if !examples.is_empty() {
         out.push_str(&format!(
-            "\n... {} more match; raise `limit` to see them.\n",
-            matching.len() - limit
+            "{} of {} kept verbatim{scope} (the walk keeps a few per category, so this is a \
+             sample — the counts below are the volume):\n\n",
+            examples.len(),
+            report.diagnostics.examples().len()
         ));
+        for line in examples.iter().take(limit) {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
+        if examples.len() > limit {
+            out.push_str(&format!(
+                "\n... {} more match; raise `limit` to see them.\n",
+                examples.len() - limit
+            ));
+        }
+    }
+    if !categories.is_empty() {
+        out.push_str(&format!(
+            "\n{}{scope}, commonest first — the count is every message of that shape, not just \
+             the ones kept above:\n\n",
+            categories_phrase(categories.len())
+        ));
+        for category in categories.iter().take(limit) {
+            out.push_str(&format!(
+                "  {:>7}x  {}\n",
+                category.total,
+                category.shape.trim()
+            ));
+        }
+        if categories.len() > limit {
+            out.push_str(&format!(
+                "\n... {} more; raise `limit` to see them.\n",
+                categories_phrase(categories.len() - limit)
+            ));
+        }
     }
     // "2 of 2 diagnostics" is an exact-looking claim about a walk that may have stopped before
     // whole heaps. The empty branch above already says which; a nonempty one owes the same.
@@ -1126,61 +1183,6 @@ mod tests {
 
     // ---- pool walk diagnostics ------------------------------------------------------
 
-    /// Addresses vary per boot and per heap; the *kind* of failure is what a reader needs.
-    #[test]
-    fn diagnostic_categories_collapse_addresses() {
-        assert_eq!(
-            diagnostic_category("unreadable VS free tree node 0xbb3b57d239731c20: sparse"),
-            "unreadable VS free tree node <addr> sparse"
-        );
-        assert_eq!(
-            diagnostic_category("rejecting descriptor 19 at 0xffff8c8f0de00260 with bad sig"),
-            "rejecting descriptor 19 at <addr> with bad sig"
-        );
-    }
-
-    /// Short numbers are meaningful ("depth is 16") and must survive, or lines that differ
-    /// in a real way would be merged into one category.
-    #[test]
-    fn short_numbers_are_not_treated_as_addresses() {
-        assert_eq!(
-            diagnostic_category("VS list depth is 16, but only 1 entries were readable"),
-            "VS list depth is 16, but only 1 entries were readable"
-        );
-    }
-
-    #[test]
-    fn diagnostics_group_by_category_commonest_first() {
-        let lines = vec![
-            "unreadable VS free tree node 0xaaaaaaaaaaaaaaaa: sparse".to_string(),
-            "unreadable VS free tree node 0xbbbbbbbbbbbbbbbb: sparse".to_string(),
-            "unreadable VS free tree node 0xcccccccccccccccc: sparse".to_string(),
-            "per-session paged heaps are not included".to_string(),
-        ];
-        let grouped = summarize_diagnostics(&lines);
-        assert_eq!(grouped.len(), 2);
-        assert_eq!(grouped[0].1, 3);
-        assert!(grouped[0].0.contains("<addr>"));
-        assert_eq!(grouped[1].1, 1);
-    }
-
-    #[test]
-    fn diagnostics_filter_is_a_case_insensitive_substring() {
-        let lines = vec![
-            "cannot fully discover heap 0xffff8c8f0d300000: read failed".to_string(),
-            "LFH slot 0xffffb28ac16fcf30+0xe0 would cross a page".to_string(),
-            "rejecting page segment 0xdeadbeef with invalid signature".to_string(),
-        ];
-        // The whole point: find the one line about a specific heap among the noise.
-        let hits = select_diagnostics(&lines, Some("FFFF8C8F0D300000"));
-        assert_eq!(hits.len(), 1);
-        assert!(hits[0].starts_with("cannot fully discover heap"));
-
-        assert_eq!(select_diagnostics(&lines, Some("cross a page")).len(), 1);
-        assert_eq!(select_diagnostics(&lines, None).len(), 3);
-        assert!(select_diagnostics(&lines, Some("no such text")).is_empty());
-    }
-
     fn report_with(complete: bool, diagnostics: &[&str]) -> query::PoolSnapshotReport {
         query::PoolSnapshotReport {
             total_chunks: 4211,
@@ -1188,6 +1190,126 @@ mod tests {
             complete,
             diagnostics: diagnostics.iter().map(|line| line.to_string()).collect(),
         }
+    }
+
+    /// A flood of one complaint plus one of another — a live walk in miniature. The flood is
+    /// deliberately larger than the walk's verbatim cap, which is the whole difficulty.
+    fn flooded_report() -> query::PoolSnapshotReport {
+        let mut lines: Vec<String> = (0..500)
+            .map(|node| format!("unreadable VS free tree node {node:#018x}: sparse"))
+            .collect();
+        lines.push("per-session paged heaps are not included".to_string());
+        query::PoolSnapshotReport {
+            total_chunks: 4211,
+            allocated_chunks: 3007,
+            complete: false,
+            diagnostics: lines.into_iter().collect(),
+        }
+    }
+
+    #[test]
+    fn diagnostics_group_by_category_commonest_first() {
+        let report = report_with(
+            true,
+            &[
+                "unreadable VS free tree node 0xaaaaaaaaaaaaaaaa: sparse",
+                "unreadable VS free tree node 0xbbbbbbbbbbbbbbbb: sparse",
+                "unreadable VS free tree node 0xcccccccccccccccc: sparse",
+                "per-session paged heaps are not included",
+            ],
+        );
+        let categories = diagnostic_categories(&report.diagnostics);
+        assert_eq!(categories.len(), 2);
+        assert_eq!(categories[0].total, 3);
+        assert!(
+            categories[0]
+                .shape
+                .starts_with("unreadable VS free tree node")
+        );
+        assert_eq!(categories[1].total, 1);
+    }
+
+    /// The count in the header is the walk's, not the length of the sample the walk kept.
+    ///
+    /// Measured on a live 26100 kernel this read "71 diagnostic(s)" for a walk that made
+    /// ~7,700 complaints, because the number came from counting the surviving lines. It
+    /// describes the collapsing and reads as a fact about the pool (glslang/windbg-mcp#77).
+    #[test]
+    fn the_walk_report_counts_what_the_walk_emitted() {
+        let report = flooded_report();
+        let kept = report.diagnostics.examples().len();
+        assert!(
+            kept < 501,
+            "the fixture must exercise the cap, or it proves nothing: {kept} kept"
+        );
+
+        let rendered = render_walk_report(&report);
+        assert!(
+            rendered.contains("501 diagnostic(s) in 2 categories"),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains(&format!("{kept} diagnostic(s)")),
+            "the sample size must not be presented as the walk's count: {rendered}"
+        );
+    }
+
+    /// Every category's count is the true one, and no count is hidden behind a placeholder —
+    /// the two remaining faults from the same cause. Before, the collapse summaries arrived
+    /// as ordinary lines, so they were re-grouped into categories of their own and their
+    /// counts blanked by this side's address-masking (`and 492 more` → `and <addr> more`).
+    #[test]
+    fn categories_are_findings_not_collapse_summaries() {
+        let rendered = render_walk_report(&flooded_report());
+        assert!(rendered.contains("500x"), "{rendered}");
+        assert!(
+            !rendered.contains("more like"),
+            "a collapse summary must not appear as a category: {rendered}"
+        );
+        assert!(
+            !rendered.contains("<addr>"),
+            "nothing may mask a count: {rendered}"
+        );
+    }
+
+    #[test]
+    fn diagnostics_filter_is_a_case_insensitive_substring() {
+        let report = report_with(
+            true,
+            &[
+                "cannot fully discover heap 0xffff8c8f0d300000: read failed",
+                "LFH slot 0xffffb28ac16fcf30+0xe0 would cross a page",
+                "rejecting page segment 0xdeadbeef with invalid signature",
+            ],
+        );
+        // The whole point: find the one line about a specific heap among the noise.
+        let hits = select_examples(&report.diagnostics, Some("FFFF8C8F0D300000"));
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].starts_with("cannot fully discover heap"));
+
+        assert_eq!(
+            select_examples(&report.diagnostics, Some("cross a page")).len(),
+            1
+        );
+        assert_eq!(select_examples(&report.diagnostics, None).len(), 3);
+        assert!(select_examples(&report.diagnostics, Some("no such text")).is_empty());
+    }
+
+    /// An address only ever appears in a kept message — the categories have had theirs
+    /// generalised away — so a filter that finds one must still not leave the reader
+    /// believing the sample is the volume.
+    #[test]
+    fn a_filtered_listing_reports_the_walk_not_the_sample() {
+        let report = flooded_report();
+        let rendered = render_diagnostics(&report, Some("free tree node"), 10);
+        assert!(
+            rendered.contains("501 diagnostic(s)"),
+            "the walk's own count is missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("500x"),
+            "the matching category owes its true total: {rendered}"
+        );
     }
 
     fn report(complete: bool) -> query::PoolSnapshotReport {
