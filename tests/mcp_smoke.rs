@@ -1883,11 +1883,25 @@ fn disconnecting_releases_a_live_kernel_session_rather_than_killing_it() {
     );
     let status = server.tool_text("session_status", json!({}), STEP);
     let worker = engine_pid_of(&status, &session);
-    let before = system_uptime(&server.tool_text(
+    // `call_tool`, for the reason the block below spells out: at this point the target is broken
+    // in and the release is still several steps away, so a panic here would leave it halted. The
+    // uptime is a nice-to-have — the comparison at the end already reports honestly when it could
+    // not be read — and nothing worth freezing a machine over.
+    let timed = server.call_tool(
         "execute",
         json!({ "command": ".time", "session_id": session }),
         TARGET_STEP,
-    ));
+    );
+    let before = if is_tool_error(&timed) {
+        eprintln!(
+            "NOTE: `.time` failed before the disconnect, so the uptime comparison cannot be \
+             made:\n{}",
+            text_of(&timed["result"])
+        );
+        None
+    } else {
+        system_uptime(&text_of(&timed["result"]))
+    };
 
     // --- act, and *collect* rather than assert -------------------------------------------
     //
@@ -1938,19 +1952,35 @@ fn disconnecting_releases_a_live_kernel_session_rather_than_killing_it() {
     // Keyed on the handle, not on `landed`: a re-attach that claimed the target and then failed
     // its wait comes back as a tool error *with* a session, and skipping the release for it would
     // leave the target halted — the one thing this test exists to catch.
-    let (after, ended) = match maybe_session_id(&report) {
+    let (after, ended, released) = match maybe_session_id(&report) {
         Some(session) => {
-            let after = system_uptime(&again.tool_text(
+            // `call_tool`, not `tool_text`. This `.time` is *expected* to fail on the very path
+            // the handle-keyed match above exists for — a re-attach that claimed the target and
+            // then failed its wait answers nothing — and `tool_text` is strict now, so a panic
+            // here would skip the release below and leave the target halted. That is the failure
+            // this whole test exists to detect, arriving through the test itself.
+            let timed = again.call_tool(
                 "execute",
                 json!({ "command": ".time", "session_id": session }),
                 TARGET_STEP,
-            ));
+            );
+            let after = if is_tool_error(&timed) {
+                eprintln!(
+                    "NOTE: `.time` failed on the re-attached session, so the uptime comparison \
+                     below cannot be made:\n{}",
+                    text_of(&timed["result"])
+                );
+                None
+            } else {
+                system_uptime(&text_of(&timed["result"]))
+            };
             // The release. From here the target is running again whatever the assertions say.
-            let ended =
-                again.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
-            (after, ended)
+            let released =
+                again.call_tool("end_session", json!({ "session_id": session }), TARGET_STEP);
+            let ended = text_of(&released["result"]);
+            (after, ended, Some(released))
         }
-        None => (None, String::new()),
+        None => (None, String::new(), None),
     };
 
     // --- now assert ----------------------------------------------------------------------
@@ -1972,10 +2002,12 @@ fn disconnecting_releases_a_live_kernel_session_rather_than_killing_it() {
         "the target was not reattachable after a disconnect — the previous session did not let go \
          of it cleanly, and this run could not put it back:\n{report}"
     );
-    assert!(
-        !ended.contains("terminated"),
-        "the final detach must be graceful, or the target is left frozen:\n{ended}"
-    );
+    // The same three ways a detach goes wrong as the other live tiers, rather than the one.
+    if let Some(released) = &released
+        && let Some(why) = ungraceful_detach(released, &ended)
+    {
+        panic!("the final detach must be graceful, or the target is left frozen — {why}");
+    }
     match (before, after) {
         (Some(before), Some(after)) => {
             let ran_for = after.saturating_sub(before);
