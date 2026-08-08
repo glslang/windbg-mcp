@@ -283,11 +283,29 @@ impl Server {
         )
     }
 
-    /// The text a tool call produced, whether it succeeded or reported a tool error.
+    /// The text of a tool call that **worked**, for the callers that only proceed if it did.
+    ///
+    /// Strict about `isError`, not just about protocol errors, and that is the whole point. This
+    /// used to hand back a tool error's text as readily as a result, which reads as harmless —
+    /// the text is still there to assert on — and is not: a *failed* call also returns in
+    /// milliseconds, and its text contains none of the phrases a happy-path assertion looks for.
+    /// So a caller measuring how long something took gets a number produced by nothing happening,
+    /// and a caller branching on content takes the `else`. Both were live in the pool tier: a
+    /// walk that never ran satisfied its deadline in 6.8ms, and a lookup that had errored was
+    /// reported as proof that the tag existed.
+    ///
+    /// A test that *expects* a failure has always used [`Self::call_tool`] with [`is_tool_error`],
+    /// which is the right way round: the dangerous reading should be the one you have to spell out.
     fn tool_text(&mut self, name: &str, args: Value, budget: Duration) -> String {
         let response = self.call_tool(name, args, budget);
         assert_no_error(&response, &format!("tools/call {name}"));
-        text_of(&response["result"])
+        let text = text_of(&response["result"]);
+        assert!(
+            !is_tool_error(&response),
+            "`{name}` reported a tool error, so nothing that follows is measuring what it \
+             thinks:\n{text}"
+        );
+        text
     }
 
     /// Terminates the supervisor outright, giving it no chance to run its own shutdown.
@@ -856,6 +874,34 @@ fn bad_calls_are_rejected_without_killing_the_session() {
     assert!(
         text.contains("METHOD_BUFFERED"),
         "the session must still work after bad calls, got:\n{text}"
+    );
+}
+
+/// The harness's own guard, pinned because losing it is silent and expensive.
+///
+/// `tool_text` used to hand back a tool error's text like any other result. Nothing failed when
+/// it did — the caller carried on with a string that merely lacked whatever it was about to look
+/// for, so an assertion on *content* took its else-branch and an assertion on *elapsed time*
+/// measured a call that did nothing and passed comfortably. Both happened in the live pool tier.
+///
+/// `go` with no session open is the cheapest real tool error: a routing failure, which this
+/// server deliberately reports as a result rather than a protocol error.
+#[test]
+fn tool_text_refuses_to_hand_back_a_failed_call() {
+    let mut server = Server::started();
+
+    // The panic below is the expected result, so its message and the `RUST_BACKTRACE` note are
+    // muted — printed, they read exactly like a failure in a test that passed. The hook is
+    // process-wide for the moment it is swapped, which is the price of not crying wolf.
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let refused = catch_unwind(AssertUnwindSafe(|| server.tool_text("go", json!({}), STEP)));
+    std::panic::set_hook(previous);
+
+    assert!(
+        refused.is_err(),
+        "tool_text returned the text of a failed call; every caller of it treats what it \
+         returns as an answer"
     );
 }
 
@@ -1981,6 +2027,23 @@ const ABSENT_TAG: &str = "Zq7x";
 /// and a walk that fails afterwards would be telling us something new.
 const POOL_ROOT_SYMBOL: &str = "nt!ExPoolState";
 
+/// One symbol store for the whole repo, with the public server upstream of it.
+///
+/// A bare `srv*` expands to `cache*;SRV*<msdl>`, and that `cache*` resolves beside the **debugger
+/// binary** — so a release build and the dev build this harness spawns keep separate caches.
+/// Measured while diagnosing exactly that: `target/release/sym` held both kernel PDBs, including
+/// the live target's, while `target/debug/sym` did not exist at all. The tier was failing on a
+/// machine that already had the symbols it needed, and would have gone on failing until it
+/// re-downloaded them into a second cache.
+///
+/// Naming one store fixes it in both directions: what a release run has already fetched is found,
+/// and what this fetches is kept where the next run of either build will find it.
+const SHARED_SYMBOL_STORE: &str = concat!(
+    "srv*",
+    env!("CARGO_MANIFEST_DIR"),
+    "/target/release/sym*https://msdl.microsoft.com/download/symbols"
+);
+
 /// Gets full `nt` type information in front of the walker, and returns the transcript.
 ///
 /// The walker decodes segment-heap internals — `_EX_POOL_HEAP_MANAGER_STATE`, the page-range
@@ -1988,23 +2051,23 @@ const POOL_ROOT_SYMBOL: &str = "nt!ExPoolState";
 /// which a fresh attach force-loads. Symbols are never fetched over the KD wire either, so this is
 /// entirely about *this* host.
 ///
-/// `.symfix+` rather than `.symfix`, so a host that already has a curated symbol path keeps it and
-/// gains the public store, rather than having it replaced by this test. `.sympath` is echoed back
-/// because a failure here is almost always the path, and guessing at it from a bare "missing
-/// symbols" is how the last two runs of this were spent.
+/// `.sympath+` adds [`SHARED_SYMBOL_STORE`] rather than replacing anything, so a host with a
+/// curated path keeps it. `!sym noisy` wraps the reload because a failed symbol load is otherwise
+/// **completely silent** — three runs of this tier were spent on a `.reload /f nt` that printed
+/// nothing and loaded nothing, which is indistinguishable from success until something asks for a
+/// symbol. The rest is read back so a failure is a reading rather than a guess.
 fn load_kernel_symbols(server: &mut Server, session: &str) -> String {
     let mut transcript = String::new();
-    // `lm m nt` is the line that settles it — "(pdb symbols)" and a path, or "(deferred)" and
-    // nothing loaded. Note the store these land in belongs to the *debugger binary*: `srv*`
-    // expands to `cache*;SRV*<msdl>`, and the default cache sits beside the exe. The harness
-    // spawns the **dev** build, so it does not inherit whatever a release build has cached, and
-    // the first run against a given kernel has to download that build's PDB.
+    // `lm m nt` is the line that settles it: "(pdb symbols)" and a path, or "(export symbols)"
+    // and the walker has nothing to decode with.
     for command in [
-        ".symfix+",
-        ".reload /f nt",
-        ".sympath",
-        "lm m nt",
-        &format!("x {POOL_ROOT_SYMBOL}"),
+        "!sym noisy".to_string(),
+        format!(".sympath+ {SHARED_SYMBOL_STORE}"),
+        ".reload /f nt".to_string(),
+        "!sym quiet".to_string(),
+        ".sympath".to_string(),
+        "lm m nt".to_string(),
+        format!("x {POOL_ROOT_SYMBOL}"),
     ] {
         let call = server.call_tool(
             "execute",
@@ -2157,12 +2220,16 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
         // pool failure with no way to tell whether the path, the reload, or the walker was at
         // fault.
         let symbols = load_kernel_symbols(&mut server, &session);
+        // Keyed on `lm` reporting a PDB, not on the absence of an error string. `x` against an
+        // unresolved symbol prints *nothing at all* — no "Couldn't resolve", no diagnostic — so
+        // an earlier version of this check passed a run in which nothing had loaded and let the
+        // failure surface three calls later as an unexplained pool error.
         assert!(
-            !symbols.contains("Couldn't resolve") && !symbols.contains("[FAILED]"),
-            "this host cannot resolve {POOL_ROOT_SYMBOL}, so the pool walker has nothing to \
-             decode with and this tier can prove nothing. Symbols are never fetched over the KD \
-             wire — fix *this* machine's symbol path (a reachable store, and a local cache it \
-             can write to) and re-run.\n{symbols}"
+            symbols.contains("pdb symbols"),
+            "`nt` loaded without a PDB, so the pool walker has no types to decode with and this \
+             tier can prove nothing. Symbols are never fetched over the KD wire — this is about \
+             *this* machine reaching a store that carries the target build's ntkrnlmp.pdb.\
+             \n{symbols}"
         );
 
         // A forced walk. `refresh` is the expensive path and the one that wedged; nothing is
