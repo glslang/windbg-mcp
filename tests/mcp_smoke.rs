@@ -1974,12 +1974,55 @@ const NOT_QUEUED: Duration = Duration::from_secs(30);
 /// If it ever collides the test says so and stays honest rather than failing; change it then.
 const ABSENT_TAG: &str = "Zq7x";
 
-/// Microsoft's public symbol store, appended so the walker can resolve `nt`'s private types.
+/// The global the pool walker needs before it can read anything: the allocator's root.
 ///
-/// The pool walker decodes segment-heap internals — `_EX_POOL_HEAP_MANAGER_STATE`,
-/// `_HEAP_PAGE_RANGE_DESCRIPTOR`, the VS and LFH headers — and none of that is in the public
-/// export table. Without full type information every pool query fails before it reads a byte.
-const MS_SYMBOL_SERVER: &str = "srv*https://msdl.microsoft.com/download/symbols";
+/// It is not an export, so resolving it is the cheapest honest proof that full `nt` symbols are
+/// actually in hand — and it is the exact name the walker fails on, so a probe that passes here
+/// and a walk that fails afterwards would be telling us something new.
+const POOL_ROOT_SYMBOL: &str = "nt!ExPoolState";
+
+/// Gets full `nt` type information in front of the walker, and returns the transcript.
+///
+/// The walker decodes segment-heap internals — `_EX_POOL_HEAP_MANAGER_STATE`, the page-range
+/// descriptors, the VS and LFH headers — none of which is in the public export table, and none of
+/// which a fresh attach force-loads. Symbols are never fetched over the KD wire either, so this is
+/// entirely about *this* host.
+///
+/// `.symfix+` rather than `.symfix`, so a host that already has a curated symbol path keeps it and
+/// gains the public store, rather than having it replaced by this test. `.sympath` is echoed back
+/// because a failure here is almost always the path, and guessing at it from a bare "missing
+/// symbols" is how the last two runs of this were spent.
+fn load_kernel_symbols(server: &mut Server, session: &str) -> String {
+    let mut transcript = String::new();
+    // `lm m nt` is the line that settles it — "(pdb symbols)" and a path, or "(deferred)" and
+    // nothing loaded. Note the store these land in belongs to the *debugger binary*: `srv*`
+    // expands to `cache*;SRV*<msdl>`, and the default cache sits beside the exe. The harness
+    // spawns the **dev** build, so it does not inherit whatever a release build has cached, and
+    // the first run against a given kernel has to download that build's PDB.
+    for command in [
+        ".symfix+",
+        ".reload /f nt",
+        ".sympath",
+        "lm m nt",
+        &format!("x {POOL_ROOT_SYMBOL}"),
+    ] {
+        let call = server.call_tool(
+            "execute",
+            json!({ "command": command, "session_id": session }),
+            TARGET_STEP,
+        );
+        let failed = if is_tool_error(&call) {
+            " [FAILED]"
+        } else {
+            ""
+        };
+        transcript.push_str(&format!(
+            "\n$ {command}{failed}\n{}\n",
+            text_of(&call["result"]).trim()
+        ));
+    }
+    transcript
+}
 
 /// What `pool_census` had to say about the heaviest tag it found.
 ///
@@ -2109,20 +2152,17 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         assert_no_error(&attached, "attach_kernel");
 
-        // The walker needs full nt type information — `_EX_POOL_HEAP_MANAGER_STATE` and the rest
-        // of the allocator's private types — and a fresh attach does not force-load it. This is
-        // the documented precondition; doing it here rather than assuming it is what lets the
-        // tier set up its own target. Symbols are never fetched over the KD wire, so this is
-        // about *this* host's symbol path, not the target's.
-        server.tool_text(
-            "set_symbol_path",
-            json!({ "path": MS_SYMBOL_SERVER, "append": true, "session_id": session }),
-            TARGET_STEP,
-        );
-        let reloaded = server.tool_text(
-            "execute",
-            json!({ "command": ".reload /f nt", "session_id": session }),
-            TARGET_STEP,
+        // The documented precondition, satisfied rather than assumed — and then *checked*.
+        // Asking for symbols and carrying on regardless is what made the previous run report a
+        // pool failure with no way to tell whether the path, the reload, or the walker was at
+        // fault.
+        let symbols = load_kernel_symbols(&mut server, &session);
+        assert!(
+            !symbols.contains("Couldn't resolve") && !symbols.contains("[FAILED]"),
+            "this host cannot resolve {POOL_ROOT_SYMBOL}, so the pool walker has nothing to \
+             decode with and this tier can prove nothing. Symbols are never fetched over the KD \
+             wire — fix *this* machine's symbol path (a reachable store, and a local cache it \
+             can write to) and re-run.\n{symbols}"
         );
 
         // A forced walk. `refresh` is the expensive path and the one that wedged; nothing is
@@ -2142,10 +2182,9 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
         assert!(
             !is_tool_error(&walk),
             "the pool walk failed outright, so nothing below would be measuring a walk. If this \
-             names missing kernel pool symbols, this host cannot resolve full type information \
-             for `nt`; the walker needs it and it is never fetched over the KD wire. Fix the \
-             symbol path and re-run — the tier proves nothing without it.\n{absent}\n\n\
-             `.reload /f nt` had said:\n{reloaded}"
+             names missing kernel pool symbols after the probe above resolved, then the walker \
+             wants type information the public store does not carry, which is a different \
+             problem from an unset symbol path.\n{absent}\n\nsymbol setup said:{symbols}"
         );
         println!("a forced pool walk over a live kernel returned in {walked_for:?}");
         assert!(
