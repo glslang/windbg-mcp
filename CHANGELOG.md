@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-08
+
+### Added
+
+- **Four tools that read the kernel pool from the allocator's own descriptors** —
+  `pool_find_tag`, `pool_chunk`, `pool_census` and `pool_diagnostics`, on a broken-in x64 kernel
+  target (38 → 42 tools).
+
+  They go through win-kexp's descriptor walk rather than shelling out to `!pool`/`!poolused` and
+  parsing the text back, so the answers are structured and all four read **one** snapshot — they
+  cannot disagree with each other. Walking every committed pool page is expensive, so that
+  snapshot is cached per session and reused; pass `refresh: true` after letting the target run, or
+  you are reading a photograph of a target that has since moved.
+
+  Two distinctions the tools keep deliberately, each of them the difference between an answer and
+  a guess:
+
+  - **`pool_find_tag` reports only *allocated* chunks.** A freed chunk's tag is not reliably
+    preserved by the allocator, so listing freed ones would be inventing data. To ask whether one
+    specific address has been freed, ask `pool_chunk` about it.
+  - **`pool_chunk` separates a free hole inside a walked region from an address the snapshot never
+    covered.** The first — an explicitly free state, `ReusableFree` or `CachedFree` — is the
+    finding that a pointer the target still holds is dangling. The second is not its opposite: a
+    region the walk never reached looks exactly like memory that was never pool, so the coverage
+    the result prints has to be read before concluding anything from it. A third outcome,
+    `Unreadable`, is neither — a Verifier guard page reads exactly that way — and says nothing
+    about whether the allocator freed anything. `pool_chunk` also reports the **neighbouring**
+    chunks, which is what tells you what a reclaim would land next to.
+
+  `pool_diagnostics` exists because a real walk emits tens of thousands of diagnostics across a
+  hundred-plus categories: any per-call summary necessarily truncates, and the one line explaining
+  a specific heap is reliably not in the truncated head. A plain substring filter located a
+  special-pool misclassification in one call, and disproved a wrong hypothesis in another — which
+  is the part that saved the most time.
+
+  What holds the set together is that **a walk states its own coverage**, and every result carries
+  the walk's own state — chunks seen, diagnostics grouped by category — whenever it comes back
+  empty. An incomplete walk is the ordinary outcome on a live kernel rather than a defect (paged
+  pool is partly on disk, so `sparse virtual range` diagnostics are physics), which is exactly why
+  "the pool holds no such chunk" and "the walk reached almost none of the pool" must not render
+  identically. Letting them hid a real bug for three rounds. The walk is also bounded and gives
+  the session back at its ceiling, so a query cannot leave every later call to that session queued
+  behind it.
+
+  Measured against Server 26100 over KDNET by the live-kernel smoke tier
+  ([`docs/smoke-test.md`](./docs/smoke-test.md)): a forced walk returns in ~52s of its 120s
+  budget, indexes 530,680 chunks of which 306,227 are allocated, and reports INCOMPLETE. Those
+  figures are what they are because of glslang/win-kexp#92, which corrected the reading of
+  `_HEAP_PAGE_RANGE_DESCRIPTOR.RangeFlags`: bit `0x01` is ALLOCATED, set on every unit of every
+  allocated range, not "this is an LFH subsegment". Read as LFH it sent VS subsegments, plain
+  page-range and large allocations, and Verifier special pool through the LFH decoder, which
+  refused them and dropped each range at region creation — so a walk quietly omitted about a fifth
+  of the pool. The same fix accounts for the walk now costing twice as long: those regions are
+  decoded rather than discarded.
+
+  Known limitation: a pool call takes win-kexp's default 120s walk budget rather than the caller's
+  own deadline ([#75](https://github.com/glslang/windbg-mcp/issues/75)). With the default 300s
+  call timeout the walk finishes well inside it, but a server run with
+  `WINDBG_MCP_CALL_TIMEOUT_SECS` set below the walk's cost will time the call out while the engine
+  keeps walking.
+
+- **A walkthrough for those tools on a real bug**: MessageManager, a CTF driver's pool
+  use-after-free, driven end to end over a live KDNET kernel with no PDB
+  ([`docs/messagemanager-walkthrough.md`](./docs/messagemanager-walkthrough.md)). Unlike the HEVD
+  and mountmgr tours it is not about *reaching* an IOCTL but about watching a freed chunk get
+  reclaimed — and about the four places a new OS release had moved the furniture under the pool
+  walker, because a walker that silently returns "empty" is worse than no walker at all. It claims
+  what it demonstrates and no more: a confirmed UAF, freed-chunk control, and two pinned forward
+  primitives, with SMEP/SMAP/CET ruling out anything but a data-only payoff and the reclaim left
+  as where the work continues. `examples/messagemanager/` holds the client that drives the
+  driver's IOCTLs from the target VM, since the server cannot issue `DeviceIoControl` itself.
+
 ## [0.4.2] - 2026-08-05
 
 ### Fixed
@@ -515,7 +587,8 @@ Initial release, packaged as a single-plugin Claude Code marketplace.
 - Crash-dump `!analyze` support via automatic WinDbg extension DLL loading.
 - Windows CI (format, clippy, build, test) and walkthrough docs with sample dumps.
 
-[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.4.2...HEAD
+[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/glslang/windbg-mcp/compare/v0.4.2...v0.5.0
 [0.4.2]: https://github.com/glslang/windbg-mcp/compare/v0.4.1...v0.4.2
 [0.4.1]: https://github.com/glslang/windbg-mcp/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/glslang/windbg-mcp/compare/v0.3.0...v0.4.0
