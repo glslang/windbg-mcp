@@ -1974,52 +1974,88 @@ const NOT_QUEUED: Duration = Duration::from_secs(30);
 /// If it ever collides the test says so and stays honest rather than failing; change it then.
 const ABSENT_TAG: &str = "Zq7x";
 
-/// The heaviest tag in `pool_census` output, or `None` if the shape is not what this expects.
+/// What `pool_census` had to say about the heaviest tag it found.
 ///
-/// `None` skips the cross-check rather than failing it: a tag whose bytes are not printable
-/// renders as something this has no business guessing at, and a walk that reached nothing has no
-/// heaviest tag at all. The caller tells those two apart.
-fn heaviest_census_tag(census: &str) -> Option<String> {
+/// Three outcomes, not two, and collapsing the last two is a real bug: "the census listed
+/// nothing" is a claim about the *pool* and worth asserting on, while "the heaviest tag does not
+/// render unambiguously" is a fact about **rendering** that says nothing about the walk. Treating
+/// the second as the first fails a perfectly healthy run whose busiest tag happens to be binary.
+enum HeaviestTag {
+    /// A tag that can be handed straight back to `pool_find_tag`.
+    Queryable(String),
+    /// A tag is listed, but this test cannot reconstruct the bytes behind it. `display_tag`
+    /// maps every unprintable byte to `.` — and a literal `.` to the same thing — so a rendering
+    /// containing one could have come from either.
+    Ambiguous,
+    /// The census listed no allocated chunk at all.
+    NothingListed,
+}
+
+/// The heaviest tag in `pool_census` output.
+fn heaviest_census_tag(census: &str) -> HeaviestTag {
     let mut lines = census
         .lines()
         .skip_while(|line| !(line.starts_with("tag ") && line.contains("allocs")));
-    lines.next()?;
-    let tag = lines
-        .find(|line| !line.trim().is_empty())?
-        .split_whitespace()
-        .next()?;
-    // Only a tag this test can hand straight back to `pool_find_tag`.
-    let usable = (1..=4).contains(&tag.len())
-        && tag
-            .bytes()
-            .all(|byte| byte.is_ascii_graphic() && byte != b'.');
-    usable.then(|| tag.to_string())
+    if lines.next().is_none() {
+        return HeaviestTag::NothingListed;
+    }
+    let Some(row) = lines.find(|line| !line.trim().is_empty()) else {
+        return HeaviestTag::NothingListed;
+    };
+    // A fixed-width column, read as one. Splitting on whitespace looks equivalent and is not:
+    // `display_tag` keeps spaces, so a real tag like `Ntf ` would come back as `Ntf`, which is a
+    // *different* four bytes — the cross-check below would then query a tag nobody allocated and
+    // blame the walk for not finding it. Every rendering is exactly four characters.
+    let tag: String = row.chars().take(4).collect();
+    if tag.chars().count() != 4 || tag.contains('.') {
+        return HeaviestTag::Ambiguous;
+    }
+    HeaviestTag::Queryable(tag)
 }
 
-/// Pinned in the default tier, because the failure it guards against is a *silent skip*: every
-/// assertion it feeds is conditional on `Some`, so a parser that stops matching takes the proof
-/// with it and the live run still passes.
+/// Pinned in the default tier, because the failure it guards against is a *silent skip*: the
+/// cross-check it feeds only runs on `Queryable`, so a parser that stops matching takes the proof
+/// with it and the live run still passes. The three-way split matters just as much — collapsing
+/// `Ambiguous` into `NothingListed` turns an unremarkable target into a test failure.
 #[test]
 fn a_census_table_yields_its_heaviest_tag() {
-    let census = "3 distinct tag(s) allocated, heaviest first.\n\n\
-                  tag      allocs        bytes  nonpaged   paged\n\
-                  MmSt        912       0x1f40       912       0\n\
-                  Tgsm          4         0x1a0         4       0\n\
-                  \n--- pool walk ---\nchunks walked: 5 (4 allocated), coverage: complete\n";
-    assert_eq!(heaviest_census_tag(census).as_deref(), Some("MmSt"));
+    const HEADER: &str = "tag      allocs        bytes  nonpaged   paged";
+    let table = |rows: &str| {
+        format!(
+            "3 distinct tag(s) allocated, heaviest first.\n\n{HEADER}\n{rows}\n\
+             \n--- pool walk ---\nchunks walked: 5 (4 allocated), coverage: complete\n"
+        )
+    };
 
-    // A walk that found nothing has no heaviest tag, and neither branch may invent one.
-    assert_eq!(
+    assert!(matches!(
+        heaviest_census_tag(&table(
+            "MmSt        912       0x1f40       912       0\n\
+             Tgsm          4         0x1a0         4       0"
+        )),
+        HeaviestTag::Queryable(tag) if tag == "MmSt"
+    ));
+
+    // A three-byte tag is rendered padded with the space it actually contains, and `parse_tag`
+    // takes it straight back. Splitting on whitespace would hand `pool_find_tag` the three-byte
+    // `Ntf` instead — a different tag, which nothing allocated, blamed on the walk.
+    assert!(matches!(
+        heaviest_census_tag(&table("Ntf         912       0x1f40       912       0")),
+        HeaviestTag::Queryable(tag) if tag == "Ntf "
+    ));
+
+    // A walk that found nothing has no heaviest tag, and nothing may invent one.
+    assert!(matches!(
         heaviest_census_tag("The pool snapshot contains no allocated chunks."),
-        None
-    );
-    // Unprintable tag bytes render as something we cannot hand back to `pool_find_tag`.
-    assert_eq!(
-        heaviest_census_tag(
-            "tag      allocs        bytes  nonpaged   paged\n....          1          0x10         1       0\n"
-        ),
-        None
-    );
+        HeaviestTag::NothingListed
+    ));
+
+    // Unprintable tag bytes render as `.`, and so does a literal `.` — the rendering cannot be
+    // turned back into bytes. That is a fact about rendering, not about the pool, so it must not
+    // read as "the walk found nothing".
+    assert!(matches!(
+        heaviest_census_tag(&table("Nt.f        912       0x1f40       912       0")),
+        HeaviestTag::Ambiguous
+    ));
 }
 
 /// A pool walk over a live kernel: the query that used to take the session with it.
@@ -2132,7 +2168,7 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
             // What one tool saw, the other has to find. Only meaningful when the walk completed:
             // an incomplete snapshot is deliberately not cached, so these would be two separate
             // walks of a moving target and could honestly disagree.
-            Some(tag) if complete => {
+            HeaviestTag::Queryable(tag) if complete => {
                 let cached = Instant::now();
                 let found = server.tool_text(
                     "pool_find_tag",
@@ -2152,11 +2188,17 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
                 );
                 println!("`{tag}` found again from the cached snapshot in {reuse:?}");
             }
-            Some(tag) => eprintln!(
+            HeaviestTag::Queryable(tag) => eprintln!(
                 "NOTE: the walk was incomplete, so the census/find_tag cross-check on `{tag}` was \
                  skipped — those would be two different walks"
             ),
-            None => assert!(
+            // Not a failure, and not evidence about the walk: plenty of drivers use tag bytes
+            // that do not render, and the busiest allocator on this target may be one of them.
+            HeaviestTag::Ambiguous => eprintln!(
+                "NOTE: the heaviest tag does not render unambiguously, so the census/find_tag \
+                 cross-check was skipped"
+            ),
+            HeaviestTag::NothingListed => assert!(
                 !complete,
                 "a walk reporting itself complete on a live kernel, with no allocated chunk at \
                  all, is not credible:\n{census}"
