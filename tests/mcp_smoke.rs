@@ -24,8 +24,9 @@
 //!   worker — so the only place the wiring exists as a whole is the shipped binary.
 //! * **Live kernel** (`#[ignore]`d **and** `WINDBG_MCP_SMOKE_KERNEL=<connection string>`) — a
 //!   real KDNET target. The only tier that touches another machine, and the only one that can
-//!   prove a kernel attach still *lands* and lets go cleanly rather than merely parks. Run it
-//!   last, on its own.
+//!   prove a kernel attach still *lands* and lets go cleanly rather than merely parks, or that a
+//!   pool walk stays inside its budget when every page it reads crosses a wire. Run it last, on
+//!   its own.
 //!
 //! See `docs/smoke-test.md` for the runbook.
 
@@ -1951,4 +1952,228 @@ fn disconnecting_releases_a_live_kernel_session_rather_than_killing_it() {
              proved only that the session was released and the target stayed reachable"
         ),
     }
+}
+
+/// How long a pool query may take before the budget it carries has failed to do its job.
+///
+/// win-kexp's `DEFAULT_WALK_BUDGET` is 120s and this server currently takes that default (#75),
+/// so the walk is bounded there; the slack covers the reads already in flight when the deadline
+/// passes, the render, and the round trip. Deliberately well under `TARGET_STEP`, so a breach
+/// fails *here* with a diagnosis rather than as an opaque harness timeout.
+const POOL_CEILING: Duration = Duration::from_secs(170);
+
+/// How long a call made *after* a walk returned may wait.
+///
+/// Generous by an order of magnitude — `registers` on a broken-in kernel is one `r` over the
+/// wire. The failure this catches is not slowness, it is **queueing**: a walk that outlived its
+/// caller leaves the engine busy, and everything behind it waits out the rest of the walk.
+const NOT_QUEUED: Duration = Duration::from_secs(30);
+
+/// A tag no allocator will have used, so answering has to walk the whole pool.
+///
+/// If it ever collides the test says so and stays honest rather than failing; change it then.
+const ABSENT_TAG: &str = "Zq7x";
+
+/// The heaviest tag in `pool_census` output, or `None` if the shape is not what this expects.
+///
+/// `None` skips the cross-check rather than failing it: a tag whose bytes are not printable
+/// renders as something this has no business guessing at, and a walk that reached nothing has no
+/// heaviest tag at all. The caller tells those two apart.
+fn heaviest_census_tag(census: &str) -> Option<String> {
+    let mut lines = census
+        .lines()
+        .skip_while(|line| !(line.starts_with("tag ") && line.contains("allocs")));
+    lines.next()?;
+    let tag = lines
+        .find(|line| !line.trim().is_empty())?
+        .split_whitespace()
+        .next()?;
+    // Only a tag this test can hand straight back to `pool_find_tag`.
+    let usable = (1..=4).contains(&tag.len())
+        && tag
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && byte != b'.');
+    usable.then(|| tag.to_string())
+}
+
+/// Pinned in the default tier, because the failure it guards against is a *silent skip*: every
+/// assertion it feeds is conditional on `Some`, so a parser that stops matching takes the proof
+/// with it and the live run still passes.
+#[test]
+fn a_census_table_yields_its_heaviest_tag() {
+    let census = "3 distinct tag(s) allocated, heaviest first.\n\n\
+                  tag      allocs        bytes  nonpaged   paged\n\
+                  MmSt        912       0x1f40       912       0\n\
+                  Tgsm          4         0x1a0         4       0\n\
+                  \n--- pool walk ---\nchunks walked: 5 (4 allocated), coverage: complete\n";
+    assert_eq!(heaviest_census_tag(census).as_deref(), Some("MmSt"));
+
+    // A walk that found nothing has no heaviest tag, and neither branch may invent one.
+    assert_eq!(
+        heaviest_census_tag("The pool snapshot contains no allocated chunks."),
+        None
+    );
+    // Unprintable tag bytes render as something we cannot hand back to `pool_find_tag`.
+    assert_eq!(
+        heaviest_census_tag(
+            "tag      allocs        bytes  nonpaged   paged\n....          1          0x10         1       0\n"
+        ),
+        None
+    );
+}
+
+/// A pool walk over a live kernel: the query that used to take the session with it.
+///
+/// This is the tier the budget in glslang/win-kexp#88 was written for, and the only one that can
+/// exercise it. Against the checked-in dump a walk is local memory and finishes in well under a
+/// second, so every assertion below would pass for the wrong reason. Against a live KDNET target
+/// it is every committed pool page over the wire — which is where the walk ran for minutes, the
+/// tool call timed out, and the engine kept going, leaving the session unusable until it was
+/// killed. Killing a worker that holds a broken-in kernel leaves the guest halted.
+///
+/// What that means for the assertions: the interesting one is *not* that a chunk was found. It is
+/// that the call **came back**, that the session took work **immediately afterwards**, and that
+/// whatever came back said how much of the pool it had actually seen. A truncated walk is an
+/// acceptable outcome here, and an expected one on a busy kernel, so this asserts that coverage is
+/// **stated** — never that it is total. Asserting completeness would fail on exactly the targets
+/// this exists to cover.
+///
+/// Runs under `catch_unwind` for the reason every test in this tier does: from the attach onward
+/// the target is broken in, and a panic that skipped the detach would leave someone's VM frozen.
+#[test]
+#[ignore = "needs a live KDNET target and its connection string; run manually, last"]
+fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
+    let Some(connection) = kernel_tier() else {
+        return;
+    };
+    let mut server = Server::started();
+
+    let attached = server.call_tool(
+        "attach_kernel",
+        json!({ "connection": connection }),
+        TARGET_STEP,
+    );
+    let report = text_of(&attached["result"]);
+    let Some(session) = maybe_session_id(&report) else {
+        assert_no_error(&attached, "attach_kernel");
+        panic!(
+            "the attach did not land, and left no session behind. The target must be booted with \
+             debugging enabled and dialling this host, and the KD transport is single-owner:\n\
+             {report}"
+        );
+    };
+
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        assert_no_error(&attached, "attach_kernel");
+
+        // A forced walk. `refresh` is the expensive path and the one that wedged; nothing is
+        // cached this early anyway, but asking for it says so rather than relying on it.
+        let started = Instant::now();
+        let absent = server.tool_text(
+            "pool_find_tag",
+            json!({ "tag": ABSENT_TAG, "refresh": true, "session_id": session }),
+            TARGET_STEP,
+        );
+        let walked_for = started.elapsed();
+        println!("a forced pool walk over a live kernel returned in {walked_for:?}");
+        assert!(
+            walked_for < POOL_CEILING,
+            "the walk took {walked_for:?}, past the {POOL_CEILING:?} its budget should hold it \
+             to — either the deadline is not enforced, or some loop in the walk is not polling it"
+        );
+
+        // The engine is free the moment the walk returns. Before the budget it was not: the
+        // caller's timeout fired, the walk carried on, and this call waited out the remainder.
+        let follow_up = Instant::now();
+        let registers =
+            server.tool_text("registers", json!({ "session_id": session }), TARGET_STEP);
+        let waited = follow_up.elapsed();
+        assert!(
+            registers.contains("rip="),
+            "the session should still be a broken-in kernel after a pool walk:\n{registers}"
+        );
+        assert!(
+            waited < NOT_QUEUED,
+            "a call made after the walk returned waited {waited:?} — it queued behind an engine \
+             that was still walking, which is the failure the budget exists to prevent"
+        );
+
+        // An empty answer has to say what the walk managed, or "no such chunk" and "the walk
+        // reached almost none of the pool" are the same sentence.
+        if absent.contains("No allocated chunks carry tag") {
+            assert!(
+                absent.contains("--- pool walk ---") && absent.contains("chunks walked:"),
+                "an empty result must carry the walk's own coverage:\n{absent}"
+            );
+        } else {
+            eprintln!(
+                "NOTE: `{ABSENT_TAG}` exists on this target, so the empty-answer check was \
+                 skipped. Change ABSENT_TAG."
+            );
+        }
+
+        // The census is the state of the walk, so it carries the report whatever it found.
+        let census = server.tool_text(
+            "pool_census",
+            json!({ "session_id": session, "limit": 8 }),
+            TARGET_STEP,
+        );
+        assert!(
+            census.contains("--- pool walk ---") && census.contains("chunks walked:"),
+            "the census must always report the walk behind it:\n{census}"
+        );
+        let complete = census.contains("coverage: complete");
+        println!(
+            "the census reports this walk {}",
+            if complete { "complete" } else { "INCOMPLETE" }
+        );
+
+        match heaviest_census_tag(&census) {
+            // What one tool saw, the other has to find. Only meaningful when the walk completed:
+            // an incomplete snapshot is deliberately not cached, so these would be two separate
+            // walks of a moving target and could honestly disagree.
+            Some(tag) if complete => {
+                let cached = Instant::now();
+                let found = server.tool_text(
+                    "pool_find_tag",
+                    json!({ "tag": tag, "session_id": session }),
+                    TARGET_STEP,
+                );
+                let reuse = cached.elapsed();
+                assert!(
+                    found.contains(&format!("tag `{tag}`")) && found.contains("allocation(s)"),
+                    "the census called `{tag}` the heaviest tag, so find_tag must find it in the \
+                     same snapshot:\n{found}"
+                );
+                assert!(
+                    reuse < walked_for,
+                    "a second query took {reuse:?} against the first walk's {walked_for:?} — a \
+                     complete snapshot is meant to be cached and reused, not walked again"
+                );
+                println!("`{tag}` found again from the cached snapshot in {reuse:?}");
+            }
+            Some(tag) => eprintln!(
+                "NOTE: the walk was incomplete, so the census/find_tag cross-check on `{tag}` was \
+                 skipped — those would be two different walks"
+            ),
+            None => assert!(
+                !complete,
+                "a walk reporting itself complete on a live kernel, with no allocated chunk at \
+                 all, is not credible:\n{census}"
+            ),
+        }
+    }));
+
+    // Always, whatever happened above — the target is frozen until this runs.
+    let ended = server.call_tool("end_session", json!({ "session_id": session }), TARGET_STEP);
+    let ended_text = text_of(&ended["result"]);
+    if let Err(panic) = outcome {
+        eprintln!("detached after the failure below:\n{ended_text}");
+        resume_unwind(panic);
+    }
+    assert_no_error(&ended, "end_session after a pool walk");
+    assert!(
+        !ended_text.contains("terminated"),
+        "the worker was killed instead of detaching, which leaves the target halted:\n{ended_text}"
+    );
 }
