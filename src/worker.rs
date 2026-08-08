@@ -945,6 +945,11 @@ fn split_row_budget(limit: usize, examples: usize, categories: usize) -> (usize,
 /// found and is *not* where volume can be read; the categories carry the real totals and have
 /// had their addresses generalised away. Printing only the first would answer "how many of
 /// these were there?" with the size of a sample.
+///
+/// That trade has a sharp edge, and it is the reason for the note in the examples branch: the
+/// two halves are filtered independently and an address can only ever match the first, so a
+/// filter that finds its heap gets no counts at all — and must be told that rather than
+/// pointed at a volume the response does not contain.
 fn render_diagnostics(
     report: &query::PoolSnapshotReport,
     filter: Option<&str>,
@@ -979,8 +984,8 @@ fn render_diagnostics(
     let (example_rows, category_rows) = split_row_budget(limit, examples.len(), categories.len());
     if !examples.is_empty() {
         out.push_str(&format!(
-            "{} of {} kept verbatim{scope} (the walk keeps a few per category, so this is a \
-             sample — the counts below are the volume):\n\n",
+            "{} of {} kept verbatim{scope} (the walk keeps only a few per category, so this is \
+             a sample):\n\n",
             examples.len(),
             report.diagnostics.examples().len()
         ));
@@ -995,11 +1000,25 @@ fn render_diagnostics(
                 examples.len() - example_rows
             ));
         }
+        // A filter naming a concrete value is the documented case — "an address
+        // (ffff8c8f0d300000)" — and it is exactly the one that cannot match a category, because
+        // generalising those values away is what lets a category carry a count. Promising the
+        // volume anyway would repeat #77's mistake in the header: pointing at a number that is
+        // not there, and leaving a capped sample as the only figure on the page.
+        if categories.is_empty() && filter.is_some() {
+            out.push_str(&format!(
+                "\nNo category matches{scope}, so there is no volume to report for it. A \
+                 category is the message with its numbers generalised away, which is what lets \
+                 it carry a count — so a filter naming a concrete value can only ever match the \
+                 verbatim sample above. Filter on the wording instead, or drop the filter, to \
+                 see how often this kind of complaint occurred.\n"
+            ));
+        }
     }
     if !categories.is_empty() {
         out.push_str(&format!(
             "\n{}{scope}, commonest first — the count is every message of that shape, not just \
-             the ones kept above:\n\n",
+             the ones kept verbatim:\n\n",
             categories_phrase(categories.len())
         ));
         for category in categories.iter().take(category_rows) {
@@ -1380,6 +1399,46 @@ mod tests {
 
         // Nothing is truncated when both halves already fit.
         assert_eq!(split_row_budget(60, 5, 3), (5, 3));
+    }
+
+    /// Filtering by a concrete address — the tool's own documented example — can match a kept
+    /// message but never a category, because generalising numbers away is exactly what lets a
+    /// category carry a count. So this is the one shape of request that legitimately has no
+    /// volume to report, and it must say so rather than promise one: a header pointing at
+    /// counts that were never rendered leaves a capped sample as the only figure on the page,
+    /// which is #77's mistake moved into the prose.
+    #[test]
+    fn an_address_filter_admits_it_has_no_volume_to_report() {
+        let report = report_with(
+            true,
+            &[
+                "cannot fully discover heap 0xffff8c8f0d300000: read failed",
+                "LFH slot 0xffffb28ac16fcf30+0xe0 would cross a page",
+            ],
+        );
+        let rendered = render_diagnostics(&report, Some("ffff8c8f0d300000"), 10);
+        assert!(
+            rendered.contains("cannot fully discover heap"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("No category matches"),
+            "an example-only match must say the volume is missing: {rendered}"
+        );
+        // And it must point somewhere: "no counts" without a way to get them is a dead end.
+        assert!(
+            rendered.contains("Filter on the wording instead"),
+            "{rendered}"
+        );
+
+        // The wording filter is the one that *can* answer it, and must not carry the note.
+        let rendered = render_diagnostics(&report, Some("discover heap"), 10);
+        assert!(rendered.contains("1 category"), "{rendered}");
+        assert!(!rendered.contains("No category matches"), "{rendered}");
+
+        // Nor may an unfiltered listing, which has every category by definition.
+        let rendered = render_diagnostics(&report, None, 10);
+        assert!(!rendered.contains("No category matches"), "{rendered}");
     }
 
     /// An address only ever appears in a kept message — the categories have had theirs
