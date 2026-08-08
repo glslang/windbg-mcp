@@ -244,9 +244,14 @@ about. This is the other half — an attach that lands:
   came back **states its own coverage**. A truncated walk is a perfectly good outcome here, and the
   expected one on a busy kernel — so the test never asserts the walk was complete, only that it said
   which it was, and it prints the walk's own diagnostic categories when it fell short, which is the
-  part worth reading. **Measured against Server 26100 over KDNET: a forced walk returned in 21.9s
-  and reported INCOMPLETE.** That is well inside the 120s budget, so on that target the coverage
-  gap is not the deadline — and scoping the walk (glslang/win-kexp#89) would not change it.
+  part worth reading. **Measured against Server 26100 over KDNET: a forced walk returned in ~20s,
+  indexed 413k chunks (234k allocated), and reported INCOMPLETE.** That is well inside the 120s
+  budget, so on that target the coverage gap is not the deadline — and scoping the walk
+  (glslang/win-kexp#89) would not change it. Expect INCOMPLETE on any live kernel: paged pool is
+  partly on disk, so `sparse virtual range` diagnostics are physics rather than a defect, and the
+  coverage caveat is doing its job. The categories that are *not* explained that way are worth
+  reading — this run showed ~5.6k LFH subsegments rejected as implausible
+  (glslang/win-kexp#90), and the diagnostic total itself is currently understated (#77).
   Where the walk *does* complete it also checks the snapshot was cached rather than
   re-walked, and that `pool_census` and `pool_find_tag` agree about the heaviest tag in it. That
   last comparison additionally needs the census to expose a tag that renders unambiguously: pool
