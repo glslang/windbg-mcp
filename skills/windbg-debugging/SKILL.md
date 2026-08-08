@@ -69,12 +69,23 @@ a bare `execute`, which only sets the run state and doesn't move the target.
   still running). So do a refused handle and a session whose engine died; all of them are things
   you can act on. Only "no engine could be started at all" is a transport-level protocol error.
 - **Symbol *names* (`module!func`) need three things together:** (a) `msdia140.dll`
-  bundled next to the binary, (b) a symbol path (`execute` →
-  `.sympath srv*C:\ProgramData\Dbg\sym*https://msdl.microsoft.com/download/symbols`), and
+  bundled next to the binary, (b) a symbol path **naming a local cache** (`execute` →
+  `.sympath+ srv*C:\ProgramData\Dbg\sym*https://msdl.microsoft.com/download/symbols`), and
   (c) a `.reload /f` at a *stopped* position (after a `go`/breakpoint, **not** straight off
   a `goto_position`/`!tt`). Without these you silently get export symbols only and
   `module!name` lookups fail. Address-based queries, navigation, and memory reads still
   work without symbols — query by address.
+- **A symbol path with no local cache downloads nothing, silently.** A bare `srv*` or a
+  plain `.symfix` expands to `cache*;SRV*<msdl>`, where `cache*` is not a directory — the
+  server element is skipped rather than used, and the result is identical to a PDB that does
+  not exist. Under `!sym noisy`, `DBGHELP: <mod>.pdb - file not found` with **no `SYMSRV:`
+  line above it** means nothing was ever asked, so it is the path at fault, not the network:
+  re-running will not fix it. Verify with `lm m <mod>` (`(pdb symbols)` vs `(export
+  symbols)`) — never with `x <mod>!<sym>`, which prints *nothing* when unresolved, so its
+  silence proves nothing. Details in [setup.md](setup.md).
+- **The pool tools need *private* `nt` types, not exports** — they decode segment-heap
+  internals, so `missing kernel pool symbols (ExPoolState)` is a symbol problem on *this*
+  host (symbols never come over the KD wire), not a statement about the target's pool.
 - **`!`-extension commands need the WinDbg `winext\` extensions bundled** next to the engine
   ([setup.md](setup.md)) **and** the module-qualified form: use `!ext.analyze -v`, not bare
   `!analyze` (which this engine resolves to *"No export analyze found"* even after `.load ext`).

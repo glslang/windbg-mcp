@@ -223,15 +223,14 @@ about. This is the other half — an attach that lands:
   that is in the export table, so without them every pool query fails before reading a byte.
   Symbols are never fetched over the KD wire. The test runs `.symfix+` and `.reload /f nt` itself
   under `!sym noisy` and prints `!lmi nt`, `lm m nt` and `x nt!ExPoolState` when it cannot get
-  them. Two traps live here. The symbol *cache* belongs to the debugger binary — a bare `srv*`
-  expands to `cache*;SRV*<msdl>`, and that cache sits beside the exe — so the dev build the harness
-  spawns does not inherit what a release build downloaded; the tier names one shared store to avoid
-  that. And a symbol server can only be queried by PDB **GUID**, read from the image's debug
-  directory: if that cannot be read, `!sym noisy` shows `ntkrnlmp.pdb - file not found` with no
-  `SYMSRV:` line above it, which is a lookup that never happened rather than a download that
-  failed. Where you already have a symbol path that works for the target, set
-  `WINDBG_MCP_SMOKE_SYMBOLS` to it and the tier will use that instead. `pool_find_tag` with
-  `refresh` then walks every
+  them. The trap worth knowing: **`.symfix` and a bare `srv*` name no local cache** — both expand
+  to `cache*;SRV*<msdl>`, where `cache*` is not a directory. A symbol-server element with no usable
+  downstream store is skipped, and a skipped element reads exactly like an absent PDB:
+  `DBGHELP: ntkrnlmp.pdb - file not found`, with no `SYMSRV:` line above it because nothing was
+  ever asked. So the tier passes an explicit cache to `.symfix+`, and reloads with a bare
+  `.reload /f` rather than `.reload /f nt`, which rests on the `nt` alias resolving. Where you
+  already have a symbol path that works for the target, set `WINDBG_MCP_SMOKE_SYMBOLS` to it and
+  that is used instead. `pool_find_tag` with `refresh` then walks every
   committed pool page, which over KDNET is the query that used to run for minutes past its caller's
   timeout and leave everything behind it queued. Only this tier can show it: against the sample dump
   the same walk is local memory and finishes in well under a second, so the assertions would pass
