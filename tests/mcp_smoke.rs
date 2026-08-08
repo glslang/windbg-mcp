@@ -2027,26 +2027,21 @@ const ABSENT_TAG: &str = "Zq7x";
 /// and a walk that fails afterwards would be telling us something new.
 const POOL_ROOT_SYMBOL: &str = "nt!ExPoolState";
 
-/// One symbol store for the whole repo, with the public server upstream of it.
+/// Where downloaded PDBs are kept — named explicitly, because the default is not a path.
 ///
-/// A bare `srv*` expands to `cache*;SRV*<msdl>`, and that `cache*` resolves beside the **debugger
-/// binary** — so a release build and the dev build this harness spawns keep separate caches.
-/// Measured while diagnosing exactly that: `target/release/sym` held both kernel PDBs, including
-/// the live target's, while `target/debug/sym` did not exist at all. The tier was failing on a
-/// machine that already had the symbols it needed, and would have gone on failing until it
-/// re-downloaded them into a second cache.
+/// `.symfix` and a bare `srv*` both expand to `cache*;SRV*<msdl>`, and that `cache*` names no
+/// directory at all. A symbol *server* element with no usable downstream store is skipped, and a
+/// skipped element looks exactly like an absent PDB: `DBGHELP: ntkrnlmp.pdb - file not found`,
+/// with no `SYMSRV:` line above it because nothing was ever asked. Four runs of this tier were
+/// spent reading that as evidence about the target. `.symfix+ <cache>` is the documented spelling.
 ///
-/// Naming one store fixes it in both directions: what a release run has already fetched is found,
-/// and what this fetches is kept where the next run of either build will find it.
-/// Backslashes throughout: `CARGO_MANIFEST_DIR` supplies them and a downstream *store* path is
-/// not a place to find out whether DbgHelp minds the mixed separators the obvious spelling gives.
-const SHARED_SYMBOL_STORE: &str = concat!(
-    "srv*",
-    env!("CARGO_MANIFEST_DIR"),
-    "\\target\\release\\sym*https://msdl.microsoft.com/download/symbols"
-);
+/// `target\release\sym` rather than somewhere fresh: this repo's release builds have been caching
+/// there already, so a dev run finds what a release run fetched instead of filling a second store.
+/// Backslashes throughout — a store path is not the place to find out how DbgHelp feels about
+/// mixed separators.
+const SYMBOL_CACHE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "\\target\\release\\sym");
 
-/// A symbol path the operator knows works for this target, overriding [`SHARED_SYMBOL_STORE`].
+/// A symbol path the operator knows works for this target, overriding [`SYMBOL_CACHE`].
 ///
 /// Getting a kernel's PDB onto a debugging host is an environment problem — a reachable store, a
 /// proxy, the right build — and one this test is in no position to solve. Where it has already
@@ -2060,20 +2055,31 @@ const SYMBOLS_ENV: &str = "WINDBG_MCP_SMOKE_SYMBOLS";
 /// which a fresh attach force-loads. Symbols are never fetched over the KD wire either, so this is
 /// entirely about *this* host.
 ///
-/// `.sympath+` adds [`SHARED_SYMBOL_STORE`] rather than replacing anything, so a host with a
-/// curated path keeps it. `!sym noisy` wraps the reload because a failed symbol load is otherwise
-/// **completely silent** — three runs of this tier were spent on a `.reload /f nt` that printed
-/// nothing and loaded nothing, which is indistinguishable from success until something asks for a
-/// symbol. The rest is read back so a failure is a reading rather than a guess.
+/// Both forms *append*, so a host with a curated path keeps it. `!sym noisy` wraps the reload
+/// because a failed symbol load is otherwise **completely silent** — several runs of this tier
+/// were spent on a `.reload` that printed nothing and loaded nothing, which is indistinguishable
+/// from success until something asks for a symbol.
+///
+/// `.reload /f` unqualified, not `.reload /f nt`: it re-reads the module list rather than resting
+/// on the `nt` alias resolving, which is the more reliable instruction on a live kernel and the
+/// one that does not quietly do nothing when the alias is the part that is wrong.
 fn load_kernel_symbols(server: &mut Server, session: &str) -> String {
     let mut transcript = String::new();
+    // DbgHelp will create the store, but only once it has decided to use it; making it first
+    // removes one way for a symbol-server element to be quietly unusable.
+    let _ = std::fs::create_dir_all(SYMBOL_CACHE);
+    // An operator-supplied path is a whole path spec and goes in as one; the default is a cache
+    // directory for `.symfix+`, which builds the canonical `SRV*<cache>*<msdl>` around it.
+    let set_path = match std::env::var(SYMBOLS_ENV) {
+        Ok(path) if !path.trim().is_empty() => format!(".sympath+ {}", path.trim()),
+        _ => format!(".symfix+ {SYMBOL_CACHE}"),
+    };
     // `lm m nt` is the line that settles it: "(pdb symbols)" and a path, or "(export symbols)"
     // and the walker has nothing to decode with.
-    let store = std::env::var(SYMBOLS_ENV).unwrap_or_else(|_| SHARED_SYMBOL_STORE.to_string());
     for command in [
         "!sym noisy".to_string(),
-        format!(".sympath+ {store}"),
-        ".reload /f nt".to_string(),
+        set_path,
+        ".reload /f".to_string(),
         "!sym quiet".to_string(),
         // `!lmi` is the one that says whether an identity was available at all: it prints the
         // debug directory's PDB name, GUID and age when the image headers could be read, and

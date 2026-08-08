@@ -124,11 +124,51 @@ Symbol *names* fail silently without all three of:
    can't parse any PDB (`dia error 0x8007007e`) and falls back to *export* symbols, so
    `module!name` lookups fail even with the right PDB cached. `symsrv.dll` is needed to
    read a symbol-store cache.
-2. **A symbol path:** `execute` →
-   `.sympath srv*C:\ProgramData\Dbg\sym*https://msdl.microsoft.com/download/symbols`
+2. **A symbol path that names a local cache:** `execute` →
+   `.sympath+ srv*C:\ProgramData\Dbg\sym*https://msdl.microsoft.com/download/symbols`,
+   or equivalently `.symfix+ C:\ProgramData\Dbg\sym`. **The cache is not optional** — see
+   below.
 3. **A `.reload /f` at a stopped position** (after a `go`/breakpoint, not off a bare
    `!tt`). Confirm with `execute` → `lm m <mod>`: `(pdb symbols)` means it worked,
    `(export symbols)` means it didn't.
+
+### The cache is the part that is easy to omit and impossible to spot
+
+A bare `srv*`, or `.symfix` with no directory after it, expands to
+`cache*;SRV*https://msdl.microsoft.com/download/symbols` — and that `cache*` names no
+directory. A symbol-server element with no downstream store is **skipped**, not used, so
+nothing is ever downloaded and nothing says so. The result is indistinguishable from a PDB
+that does not exist:
+
+```text
+$ !sym noisy
+$ .reload /f
+DBGHELP: ntkrnlmp.pdb - file not found
+DBGHELP: nt - export symbols
+```
+
+Read that pair carefully: `file not found` with **no `SYMSRV:` line above it** means no
+symbol server was queried at all. A download that failed would have logged the attempt. So
+this is a *path* problem, not a network or availability problem, and re-running will not fix
+it. Always give a cache directory.
+
+Two more things that mislead here:
+
+- `.reload /f` unqualified re-reads the whole module list. `.reload /f nt` rests on the `nt`
+  alias resolving and can quietly do nothing when that is the part that is wrong.
+- `x <mod>!<symbol>` prints **nothing at all** for an unresolved name — no error, no
+  diagnostic. Its silence is not confirmation. `lm m <mod>` is the check that answers.
+
+Symbols are never fetched from the target over the KD wire, so all of this is about the
+**debugging host**, whatever the target is.
+
+### Kernel pool tools need *private* `nt` types
+
+`pool_find_tag`, `pool_census`, `pool_chunk` and `pool_diagnostics` decode segment-heap
+internals (`_EX_POOL_HEAP_MANAGER_STATE`, the page-range descriptors, the VS and LFH
+headers). Exports are not enough. Without full type information every pool query fails up
+front with `missing kernel pool symbols (ExPoolState); run '.reload /f nt' and retry` — which
+is a symbol problem on this host, not a statement about the target's pool.
 
 Offline / no symbols? Navigation, memory reads, disassembly, and the data model still work
 — query by address instead of by name.
