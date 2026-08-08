@@ -187,8 +187,8 @@ cargo test --test mcp_smoke -- --ignored --nocapture --test-threads=1 live_kerne
 ```
 
 `--test-threads=1` is required, not tidiness: the filter matches **three** tests, and the KD
-transport is single-owner, so run in parallel the later attaches fail and can leave the target
-halted.
+transport is single-owner. Run them in parallel and the later attaches fail, which can leave the
+target halted.
 
 The connection string is the one from `bcdedit /dbgsettings` on the target (or the `kd -k` command
 you would otherwise use). It is **never** guessable, so the tier is gated on it rather than on a
@@ -226,7 +226,11 @@ about. This is the other half — an attach that lands:
   came back **states its own coverage**. A truncated walk is a perfectly good outcome here, and the
   expected one on a busy kernel — so the test never asserts the walk was complete, only that it said
   which it was. Where the walk *does* complete it also checks the snapshot was cached rather than
-  re-walked, and that `pool_census` and `pool_find_tag` agree about the heaviest tag in it.
+  re-walked, and that `pool_census` and `pool_find_tag` agree about the heaviest tag in it. That
+  last comparison additionally needs the census to expose a tag that renders unambiguously: pool
+  tags are four raw bytes, unprintable ones render as `.` — and so does a literal `.` — so a tag
+  containing one cannot be turned back into the bytes it came from. That is a fact about rendering
+  and says nothing about the walk, so it skips the comparison with a note rather than failing.
 
 The first run of this tier found a real bug — shutdown killed workers outright, so a disconnect
 froze the target — which no dump-based tier could have found, because killing a worker that holds
