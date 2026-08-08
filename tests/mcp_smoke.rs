@@ -2401,6 +2401,19 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
             "the census reports this walk {}",
             if complete { "complete" } else { "INCOMPLETE" }
         );
+        // An incomplete walk is an acceptable outcome, but "incomplete" on its own is not a
+        // finding — the categories are. The census already carries them, so printing that
+        // section costs nothing and turns a run of this tier into a measurement of the target
+        // rather than a pass. Measured 21.9s and INCOMPLETE against Server 26100, which is well
+        // inside the budget: on that target the coverage gap is *not* the deadline.
+        if !complete {
+            let report: String = census
+                .lines()
+                .skip_while(|line| !line.starts_with("--- pool walk ---"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            println!("why the walk fell short:\n{report}");
+        }
 
         match heaviest_census_tag(&census) {
             // What one tool saw, the other has to find. Only meaningful when the walk completed:
