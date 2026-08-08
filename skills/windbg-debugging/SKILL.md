@@ -72,7 +72,8 @@ a bare `execute`, which only sets the run state and doesn't move the target.
   `symsrv.dll` bundled next to the binary, (b) a symbol path — set it with the
   **`set_symbol_path`** tool (`srv*C:\ProgramData\Dbg\sym*https://msdl.microsoft.com/download/symbols`,
   `append: true`), which goes through the DbgEng API and so avoids `.sympath` swallowing the
-  rest of the command line — and (c) a `.reload /f` at a *stopped* position (after a
+  rest of the command line — and (c) a module-qualified `.reload /f <mod>` at a *stopped*
+  position (bare `.reload /f` walks every loaded module, which on a live kernel is slow) (after a
   `go`/breakpoint, **not** straight off a `goto_position`/`!tt`). Without these you silently
   get export symbols only and `module!name` lookups fail. Address-based queries, navigation,
   and memory reads still work without symbols — query by address.
