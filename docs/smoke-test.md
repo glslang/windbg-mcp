@@ -244,17 +244,25 @@ about. This is the other half — an attach that lands:
   came back **states its own coverage**. A truncated walk is a perfectly good outcome here, and the
   expected one on a busy kernel — so the test never asserts the walk was complete, only that it said
   which it was, and it prints the walk's own diagnostic categories when it fell short, which is the
-  part worth reading. **Measured against Server 26100 over KDNET: a forced walk returned in ~20s,
-  indexed 413k chunks (234k allocated), and reported INCOMPLETE.** That is well inside the 120s
-  budget, so on that target the coverage gap is not the deadline — which is why scoping the walk
-  to one side of the pool was closed unbuilt (glslang/win-kexp#89): it would have bought a faster
-  query at the cost of a cache that keys on scope, against four-fold headroom that already exists.
+  part worth reading. **Measured against Server 26100 over KDNET: a forced walk returned in ~52s,
+  indexed 530,680 chunks (306,227 allocated), and reported INCOMPLETE.** That is still inside the
+  120s budget, so on that target the coverage gap is not the deadline — which is why scoping the
+  walk to one side of the pool was closed unbuilt (glslang/win-kexp#89): it would have bought a
+  faster query at the cost of a cache that keys on scope, against better than two-fold headroom
+  that already exists. That margin is worth re-reading rather than assuming: the same walk cost
+  ~24s and reached 437k chunks before glslang/win-kexp#92, so a walk gets *slower* as it gets more
+  correct, and the next such fix spends the remaining headroom too.
   Expect INCOMPLETE on any live kernel: paged pool is
   partly on disk, so `sparse virtual range` diagnostics are physics rather than a defect, and the
   coverage caveat is doing its job. The categories that are *not* explained that way are worth
-  reading — this run showed ~5.6k LFH subsegments rejected as implausible
-  (glslang/win-kexp#90). Read the per-category counts as the volume: the walk keeps only a
-  handful of messages per category verbatim, so the list of examples is a sample and its length
+  reading, and this tier is where that paid: a run showing ~5.6k LFH subsegments rejected as
+  implausible (glslang/win-kexp#90) was not the walker being careful but the walker misreading
+  `_HEAP_PAGE_RANGE_DESCRIPTOR.RangeFlags` bit `0x01` as "LFH subsegment" when it means ALLOCATED,
+  which sent VS, large and special-pool ranges through the LFH decoder to be refused and dropped.
+  glslang/win-kexp#92 fixed the reading; that category should now be **absent**, and its return
+  would mean a regression rather than a busy kernel. Read the per-category counts as the volume:
+  the walk keeps only a handful of messages per category verbatim, so the list of examples is a
+  sample and its length
   says nothing about how much the walk complained. The header total is the walk's own count
   (#77) — before that fix it was the length of the sample, which understated a real run by two
   orders of magnitude.
