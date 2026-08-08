@@ -2041,6 +2041,65 @@ const POOL_ROOT_SYMBOL: &str = "nt!ExPoolState";
 /// mixed separators.
 const SYMBOL_CACHE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "\\target\\release\\sym");
 
+/// The debugging engine a debugger process needs *beside its own exe*.
+///
+/// `dbgeng.dll` exists in System32, so a binary without these still opens targets, runs commands
+/// and passes almost every test here — it just cannot do symbols. `symsrv.dll` is what reads a
+/// symbol *store*, and `msdia140.dll` is what parses a PDB once found; without them a PDB sitting
+/// in the cache is reported as `file not found`, complete with a SYMSRV error summary blaming the
+/// store. Which is what four runs of this tier were actually looking at.
+const ENGINE_DLLS: [&str; 6] = [
+    "dbgeng.dll",
+    "dbghelp.dll",
+    "dbgcore.dll",
+    "dbgmodel.dll",
+    "msdia140.dll",
+    "symsrv.dll",
+];
+
+/// Puts the engine beside the binary this harness spawns, copying from a release build if needed.
+///
+/// `setup.md` has the operator copy these next to the **release** binary, because that is what the
+/// plugin runs. The harness spawns the **dev** build, and nothing had ever put them there — so the
+/// tiers that need symbols could not work from a `cargo test` at all, and said so in a way that
+/// pointed at the target instead.
+///
+/// Returns what it did, for the transcript. A failure here is reported by the caller rather than
+/// panicking, since the tier's own message explains what is missing far better than a copy error.
+fn ensure_engine_beside_test_binary() -> String {
+    let Some(dir) = std::path::Path::new(EXE).parent() else {
+        return "cannot locate the test binary's directory".into();
+    };
+    let missing: Vec<&str> = ENGINE_DLLS
+        .iter()
+        .copied()
+        .filter(|dll| !dir.join(dll).exists())
+        .collect();
+    if missing.is_empty() {
+        return format!("engine already beside {}", dir.display());
+    }
+    // The release tree is where `setup.md` has them put, so it is the one place worth looking.
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target\\release");
+    let mut copied = Vec::new();
+    for dll in &missing {
+        match std::fs::copy(source.join(dll), dir.join(dll)) {
+            Ok(_) => copied.push(*dll),
+            Err(error) => {
+                return format!(
+                    "{} is not beside {} and could not be copied from {}: {error}. Follow the \
+                     engine-bundling step in skills/windbg-debugging/setup.md — without \
+                     symsrv.dll a symbol store cannot be read at all, and without msdia140.dll a \
+                     PDB cannot be parsed once found.",
+                    dll,
+                    dir.display(),
+                    source.display()
+                );
+            }
+        }
+    }
+    format!("copied {} into {}", copied.join(", "), dir.display())
+}
+
 /// A symbol path the operator knows works for this target, overriding [`SYMBOL_CACHE`].
 ///
 /// Getting a kernel's PDB onto a debugging host is an environment problem — a reachable store, a
@@ -2216,6 +2275,10 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
     let Some(connection) = kernel_tier() else {
         return;
     };
+    // Before the server starts, because the engine is loaded when the worker does. This is the
+    // only tier that needs symbols, and so the only one that ever noticed they were impossible.
+    let engine = ensure_engine_beside_test_binary();
+    println!("engine: {engine}");
     let mut server = Server::started();
 
     let attached = server.call_tool(
@@ -2248,14 +2311,14 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
         assert!(
             symbols.contains("pdb symbols"),
             "`nt` loaded without a PDB, so the pool walker has no types to decode with and this \
-             tier can prove nothing about it.\n\nThis is an environment problem, not a \
-             regression: symbols are never fetched over the KD wire, so it is about *this* \
-             machine getting the target build's ntkrnlmp.pdb. Read the transcript below — \
-             `DBGHELP: ntkrnlmp.pdb - file not found` with no `SYMSRV:` line above it means no \
-             symbol server was queried at all, which happens when the image's debug directory \
-             could not be read and there is no GUID to look one up by; `!lmi nt` says which. If \
-             you have a symbol path that works for this target, set {SYMBOLS_ENV} to it and \
-             re-run.\n{symbols}"
+             tier can prove nothing about it.\n\nSymbols never cross the KD wire, so this is \
+             always about *this* machine. Read `!lmi nt` below first: `Symbol Type: EXPORT - PDB \
+             not found` **with a CODEVIEW GUID present** means the identity was known and the \
+             lookup still failed — which is the engine, not the target and not the path. That is \
+             what `symsrv.dll` (reads a symbol store) and `msdia140.dll` (parses the PDB) are \
+             for, and this run reports them as: {engine}. A CODEVIEW line that is *absent* is \
+             the other failure, and a different fix. If you have a symbol path known to work \
+             here, set {SYMBOLS_ENV} to it.\n{symbols}"
         );
 
         // A forced walk. `refresh` is the expensive path and the one that wedged; nothing is

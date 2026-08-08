@@ -223,7 +223,12 @@ about. This is the other half — an attach that lands:
   that is in the export table, so without them every pool query fails before reading a byte.
   Symbols are never fetched over the KD wire. The test runs `.symfix+` and `.reload /f nt` itself
   under `!sym noisy` and prints `!lmi nt`, `lm m nt` and `x nt!ExPoolState` when it cannot get
-  them. The trap worth knowing: **`.symfix` and a bare `srv*` name no local cache** — both expand
+  them. **The harness spawns the *dev* binary, and the engine DLLs live beside the release one**
+  — `setup.md` has you copy them there, because that is what the plugin runs. Without
+  `symsrv.dll` a symbol store cannot be read at all and without `msdia140.dll` a PDB cannot be
+  parsed, so a PDB already sitting in the cache comes back as `file not found`. The tier copies
+  them across from `target\release` before starting the server, and says so. The other trap:
+  **`.symfix` and a bare `srv*` name no local cache** — both expand
   to `cache*;SRV*<msdl>`, where `cache*` is not a directory. A symbol-server element with no usable
   downstream store is skipped, and a skipped element reads exactly like an absent PDB:
   `DBGHELP: ntkrnlmp.pdb - file not found`, with no `SYMSRV:` line above it because nothing was

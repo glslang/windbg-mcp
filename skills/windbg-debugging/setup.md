@@ -152,6 +152,29 @@ symbol server was queried at all. A download that failed would have logged the a
 this is a *path* problem, not a network or availability problem, and re-running will not fix
 it. Always give a cache directory.
 
+### …but check the engine before blaming the path
+
+The same `file not found` appears when the PDB **is** in the cache and the engine simply
+cannot read it. `dbgeng.dll` exists in System32, so a binary with no DLLs beside it opens
+targets and runs commands quite happily — it just has no `symsrv.dll` to read a symbol store
+and no `msdia140.dll` to parse a PDB. The error summary then blames the store
+(`invalid UNC store`, `pingme.txt` missing) even though the store is fine.
+
+`!lmi <mod>` separates the two, and is worth running before changing any path:
+
+```text
+Debug Data Dirs: Type  Size     VA  Pointer
+             CODEVIEW    25, 54ea8,   54ea8 RSDS - GUID: {3E0BF93D-...-9CDCB8C7}
+               Age: 1, Pdb: ntkrnlmp.pdb
+    Symbol Type: EXPORT   - PDB not found
+```
+
+A **CODEVIEW line with a GUID** means the identity was read from the image and the lookup
+still failed — engine or store, not the target. The store directory for that PDB is the GUID
+with the age appended (`3E0BF93D…9CDCB8C71`), so you can check by hand whether it is already
+cached. **No CODEVIEW line** is the other failure: the image headers could not be read, and
+no symbol server can be queried without them.
+
 Two more things that mislead here:
 
 - `.reload /f` unqualified re-reads the whole module list. `.reload /f nt` rests on the `nt`
