@@ -1974,6 +1974,13 @@ const NOT_QUEUED: Duration = Duration::from_secs(30);
 /// If it ever collides the test says so and stays honest rather than failing; change it then.
 const ABSENT_TAG: &str = "Zq7x";
 
+/// Microsoft's public symbol store, appended so the walker can resolve `nt`'s private types.
+///
+/// The pool walker decodes segment-heap internals — `_EX_POOL_HEAP_MANAGER_STATE`,
+/// `_HEAP_PAGE_RANGE_DESCRIPTOR`, the VS and LFH headers — and none of that is in the public
+/// export table. Without full type information every pool query fails before it reads a byte.
+const MS_SYMBOL_SERVER: &str = "srv*https://msdl.microsoft.com/download/symbols";
+
 /// What `pool_census` had to say about the heaviest tag it found.
 ///
 /// Three outcomes, not two, and collapsing the last two is a real bug: "the census listed
@@ -2102,15 +2109,44 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         assert_no_error(&attached, "attach_kernel");
 
+        // The walker needs full nt type information — `_EX_POOL_HEAP_MANAGER_STATE` and the rest
+        // of the allocator's private types — and a fresh attach does not force-load it. This is
+        // the documented precondition; doing it here rather than assuming it is what lets the
+        // tier set up its own target. Symbols are never fetched over the KD wire, so this is
+        // about *this* host's symbol path, not the target's.
+        server.tool_text(
+            "set_symbol_path",
+            json!({ "path": MS_SYMBOL_SERVER, "append": true, "session_id": session }),
+            TARGET_STEP,
+        );
+        let reloaded = server.tool_text(
+            "execute",
+            json!({ "command": ".reload /f nt", "session_id": session }),
+            TARGET_STEP,
+        );
+
         // A forced walk. `refresh` is the expensive path and the one that wedged; nothing is
         // cached this early anyway, but asking for it says so rather than relying on it.
         let started = Instant::now();
-        let absent = server.tool_text(
+        let walk = server.call_tool(
             "pool_find_tag",
             json!({ "tag": ABSENT_TAG, "refresh": true, "session_id": session }),
             TARGET_STEP,
         );
         let walked_for = started.elapsed();
+        let absent = text_of(&walk["result"]);
+        // Before the timing, because a call that *failed* also returns fast: the first live run
+        // of this test measured 6.8ms and passed every deadline assertion below, having never
+        // walked a single page. A tool error is text like any other to `tool_text`, so nothing
+        // here may be believed until this holds.
+        assert!(
+            !is_tool_error(&walk),
+            "the pool walk failed outright, so nothing below would be measuring a walk. If this \
+             names missing kernel pool symbols, this host cannot resolve full type information \
+             for `nt`; the walker needs it and it is never fetched over the KD wire. Fix the \
+             symbol path and re-run — the tier proves nothing without it.\n{absent}\n\n\
+             `.reload /f nt` had said:\n{reloaded}"
+        );
         println!("a forced pool walk over a live kernel returned in {walked_for:?}");
         assert!(
             walked_for < POOL_CEILING,
@@ -2135,7 +2171,9 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
         );
 
         // An empty answer has to say what the walk managed, or "no such chunk" and "the walk
-        // reached almost none of the pool" are the same sentence.
+        // reached almost none of the pool" are the same sentence. Reachable only because the
+        // call succeeded — the first live run took this branch on an *error* text and announced
+        // that the tag existed, inventing a fact about the pool out of a failure to look at it.
         if absent.contains("No allocated chunks carry tag") {
             assert!(
                 absent.contains("--- pool walk ---") && absent.contains("chunks walked:"),
@@ -2143,16 +2181,21 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
             );
         } else {
             eprintln!(
-                "NOTE: `{ABSENT_TAG}` exists on this target, so the empty-answer check was \
-                 skipped. Change ABSENT_TAG."
+                "NOTE: `{ABSENT_TAG}` really is allocated on this target, so the empty-answer \
+                 check was skipped. Change ABSENT_TAG."
             );
         }
 
         // The census is the state of the walk, so it carries the report whatever it found.
-        let census = server.tool_text(
+        let census_call = server.call_tool(
             "pool_census",
             json!({ "session_id": session, "limit": 8 }),
             TARGET_STEP,
+        );
+        let census = text_of(&census_call["result"]);
+        assert!(
+            !is_tool_error(&census_call),
+            "pool_census failed:\n{census}"
         );
         assert!(
             census.contains("--- pool walk ---") && census.contains("chunks walked:"),
@@ -2170,12 +2213,17 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
             // walks of a moving target and could honestly disagree.
             HeaviestTag::Queryable(tag) if complete => {
                 let cached = Instant::now();
-                let found = server.tool_text(
+                let call = server.call_tool(
                     "pool_find_tag",
                     json!({ "tag": tag, "session_id": session }),
                     TARGET_STEP,
                 );
                 let reuse = cached.elapsed();
+                let found = text_of(&call["result"]);
+                assert!(
+                    !is_tool_error(&call),
+                    "looking up the census's own heaviest tag `{tag}` failed:\n{found}"
+                );
                 assert!(
                     found.contains(&format!("tag `{tag}`")) && found.contains("allocation(s)"),
                     "the census called `{tag}` the heaviest tag, so find_tag must find it in the \
