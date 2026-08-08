@@ -217,7 +217,16 @@ about. This is the other half — an attach that lands:
   read either side of the disconnect — a halted kernel takes no clock interrupt, so its uptime
   stands still while a released one keeps counting. Re-attaching alone proves nothing here: a
   frozen target still answers its KD stub.
-- **A pool walk is bounded and gives the session back.** `pool_find_tag` with `refresh` walks every
+- **A pool walk is bounded and gives the session back.** Needs **full `nt` symbols on this host**,
+  which is a real precondition rather than a formality: the walker decodes segment-heap internals
+  (`_EX_POOL_HEAP_MANAGER_STATE`, the page-range descriptors, the VS and LFH headers) and none of
+  that is in the export table, so without them every pool query fails before reading a byte.
+  Symbols are never fetched over the KD wire. The test runs `.symfix+` and `.reload /f nt` itself
+  and prints `.sympath`, `lm m nt` and `x nt!ExPoolState` when it cannot get them — but note the
+  symbol *cache* belongs to the debugger binary, and the harness spawns the **dev** build, so it
+  does not inherit whatever a release build has already downloaded. The first run against a given
+  kernel build therefore has to fetch that build's `ntkrnlmp.pdb`, and needs a symbol path that can
+  reach a store. `pool_find_tag` with `refresh` then walks every
   committed pool page, which over KDNET is the query that used to run for minutes past its caller's
   timeout and leave everything behind it queued. Only this tier can show it: against the sample dump
   the same walk is local memory and finishes in well under a second, so the assertions would pass
