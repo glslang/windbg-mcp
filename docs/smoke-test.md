@@ -221,21 +221,20 @@ about. This is the other half — an attach that lands:
   which is a real precondition rather than a formality: the walker decodes segment-heap internals
   (`_EX_POOL_HEAP_MANAGER_STATE`, the page-range descriptors, the VS and LFH headers) and none of
   that is in the export table, so without them every pool query fails before reading a byte.
-  Symbols are never fetched over the KD wire. The test runs `.symfix+` and `.reload /f nt` itself
-  under `!sym noisy` and prints `!lmi nt`, `lm m nt` and `x nt!ExPoolState` when it cannot get
-  them. **The harness spawns the *dev* binary, and the engine DLLs live beside the release one**
-  — `setup.md` has you copy them there, because that is what the plugin runs. Without
-  `symsrv.dll` a symbol store cannot be read at all and without `msdia140.dll` a PDB cannot be
-  parsed, so a PDB already sitting in the cache comes back as `file not found`. The tier copies
-  them across from `target\release` before starting the server, and says so. The other trap:
-  **`.symfix` and a bare `srv*` name no local cache** — both expand
-  to `cache*;SRV*<msdl>`, where `cache*` is not a directory. A symbol-server element with no usable
-  downstream store is skipped, and a skipped element reads exactly like an absent PDB:
-  `DBGHELP: ntkrnlmp.pdb - file not found`, with no `SYMSRV:` line above it because nothing was
-  ever asked. So the tier passes an explicit cache to `.symfix+`, and reloads with a bare
-  `.reload /f` rather than `.reload /f nt`, which rests on the `nt` alias resolving. Where you
-  already have a symbol path that works for the target, set `WINDBG_MCP_SMOKE_SYMBOLS` to it and
-  that is used instead. `pool_find_tag` with `refresh` then walks every
+  Symbols are never fetched over the KD wire. The tier sets a path with `set_symbol_path` — the
+  typed tool, so `.sympath`'s line-swallowing cannot bite — pointed at a store under
+  `target\release\sym` that dev and release builds share, then reloads under `!sym noisy` and
+  prints `!lmi nt`, `lm m nt` and `x nt!ExPoolState` when it cannot get them.
+  **The trap that actually bit: the harness spawns the *dev* binary, and the engine DLLs live
+  beside the release one** — `setup.md` has you copy them there, because that is what the plugin
+  runs. `dbgeng.dll` is in System32, so the dev binary opens targets and runs commands perfectly;
+  it just has no `symsrv.dll` to read a symbol store and no `msdia140.dll` to parse a PDB, so a
+  PDB already sitting in the cache comes back as `file not found` with the error summary blaming
+  the store. The tier copies the engine across before starting the server, and says so. It also
+  reloads with a bare `.reload /f` rather than `.reload /f nt`, which rests on the `nt` alias
+  resolving. Where you already have a symbol path that works for the target, set
+  `WINDBG_MCP_SMOKE_SYMBOLS` to it and that is used instead. `pool_find_tag` with `refresh` then
+  walks every
   committed pool page, which over KDNET is the query that used to run for minutes past its caller's
   timeout and leave everything behind it queued. Only this tier can show it: against the sample dump
   the same walk is local memory and finishes in well under a second, so the assertions would pass

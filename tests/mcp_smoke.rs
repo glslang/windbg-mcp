@@ -886,23 +886,17 @@ fn bad_calls_are_rejected_without_killing_the_session() {
 ///
 /// `go` with no session open is the cheapest real tool error: a routing failure, which this
 /// server deliberately reports as a result rather than a protocol error.
+///
+/// `#[should_panic]` rather than `catch_unwind`: catching it means muting the panic hook, so that
+/// a passing test does not print what reads as a failure — and that hook is **process-wide**, so
+/// any other test panicking in the same moment would lose its message and backtrace while still
+/// failing. The attribute buys the same guarantee with none of that, and `expected` stops it
+/// passing on an unrelated panic such as the server failing to start.
 #[test]
+#[should_panic(expected = "reported a tool error")]
 fn tool_text_refuses_to_hand_back_a_failed_call() {
     let mut server = Server::started();
-
-    // The panic below is the expected result, so its message and the `RUST_BACKTRACE` note are
-    // muted — printed, they read exactly like a failure in a test that passed. The hook is
-    // process-wide for the moment it is swapped, which is the price of not crying wolf.
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let refused = catch_unwind(AssertUnwindSafe(|| server.tool_text("go", json!({}), STEP)));
-    std::panic::set_hook(previous);
-
-    assert!(
-        refused.is_err(),
-        "tool_text returned the text of a failed call; every caller of it treats what it \
-         returns as an answer"
-    );
+    server.tool_text("go", json!({}), STEP);
 }
 
 // ---- tier 2: a real debugger target -------------------------------------------
@@ -2015,6 +2009,17 @@ const POOL_CEILING: Duration = Duration::from_secs(170);
 /// caller leaves the engine busy, and everything behind it waits out the rest of the walk.
 const NOT_QUEUED: Duration = Duration::from_secs(30);
 
+/// How long this *harness* waits on a pool call — deliberately longer than the server's own.
+///
+/// `TARGET_STEP` is 240s and the server gives an engine call 300s, so a walk that ran away would
+/// have the harness give up first. That is the wrong order here. The client panicking while the
+/// walk is still running means the `end_session` in the cleanup queues behind it, misses its grace
+/// period, and the worker is **killed** — which on a broken-in kernel leaves the guest halted. On
+/// the exact failure path this test exists to detect, that would freeze the machine it is
+/// diagnosing. Waiting past the server's own timeout lets it answer first, so the cleanup always
+/// runs against an idle engine.
+const POOL_CALL_BUDGET: Duration = Duration::from_secs(330);
+
 /// A tag no allocator will have used, so answering has to walk the whole pool.
 ///
 /// If it ever collides the test says so and stays honest rather than failing; change it then.
@@ -2026,6 +2031,10 @@ const ABSENT_TAG: &str = "Zq7x";
 /// actually in hand — and it is the exact name the walker fails on, so a probe that passes here
 /// and a walk that fails afterwards would be telling us something new.
 const POOL_ROOT_SYMBOL: &str = "nt!ExPoolState";
+
+/// The `x` that resolves [`POOL_ROOT_SYMBOL`], as one string so its output can be told apart
+/// from every other command's by comparing against the command that produced it.
+const POOL_ROOT_PROBE: &str = "x nt!ExPoolState";
 
 /// Where downloaded PDBs are kept — named explicitly, because the default is not a path.
 ///
@@ -2122,49 +2131,78 @@ const SYMBOLS_ENV: &str = "WINDBG_MCP_SMOKE_SYMBOLS";
 /// `.reload /f` unqualified, not `.reload /f nt`: it re-reads the module list rather than resting
 /// on the `nt` alias resolving, which is the more reliable instruction on a live kernel and the
 /// one that does not quietly do nothing when the alias is the part that is wrong.
-fn load_kernel_symbols(server: &mut Server, session: &str) -> String {
-    let mut transcript = String::new();
+fn load_kernel_symbols(server: &mut Server, session: &str) -> KernelSymbols {
     // DbgHelp will create the store, but only once it has decided to use it; making it first
     // removes one way for a symbol-server element to be quietly unusable.
     let _ = std::fs::create_dir_all(SYMBOL_CACHE);
-    // An operator-supplied path is a whole path spec and goes in as one; the default is a cache
-    // directory for `.symfix+`, which builds the canonical `SRV*<cache>*<msdl>` around it.
-    let set_path = match std::env::var(SYMBOLS_ENV) {
-        Ok(path) if !path.trim().is_empty() => format!(".sympath+ {}", path.trim()),
-        _ => format!(".symfix+ {SYMBOL_CACHE}"),
-    };
-    // `lm m nt` is the line that settles it: "(pdb symbols)" and a path, or "(export symbols)"
-    // and the walker has nothing to decode with.
+    let path = std::env::var(SYMBOLS_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            format!("srv*{SYMBOL_CACHE}*https://msdl.microsoft.com/download/symbols")
+        });
+
+    // The typed tool, not `.sympath+` through `execute`: it goes through DbgEng's
+    // Append/SetSymbolPath, so it cannot fall foul of `.sympath` swallowing the rest of the
+    // command line — the quirk this repo documents and works around everywhere else.
+    let configured = server.call_tool(
+        "set_symbol_path",
+        json!({ "path": path, "append": true, "session_id": session }),
+        TARGET_STEP,
+    );
+    let mut transcript = format!(
+        "\n$ set_symbol_path append={path}{}\n{}\n",
+        if is_tool_error(&configured) {
+            " [FAILED]"
+        } else {
+            ""
+        },
+        text_of(&configured["result"]).trim()
+    );
+
+    let mut probe = String::new();
     for command in [
-        "!sym noisy".to_string(),
-        set_path,
-        ".reload /f".to_string(),
-        "!sym quiet".to_string(),
-        // `!lmi` is the one that says whether an identity was available at all: it prints the
-        // debug directory's PDB name, GUID and age when the image headers could be read, and
-        // says so when they could not. Without that identity a symbol *server* cannot be
-        // queried — only a filename search, which is what "ntkrnlmp.pdb - file not found" with
-        // no `SYMSRV:` line above it means.
-        "!lmi nt".to_string(),
-        "lm m nt".to_string(),
-        format!("x {POOL_ROOT_SYMBOL}"),
+        "!sym noisy",
+        ".reload /f",
+        "!sym quiet",
+        // `!lmi` says whether an identity was available at all: it prints the debug directory's
+        // PDB name, GUID and age when the image headers could be read, and says so when they
+        // could not. The two failures look identical without it.
+        "!lmi nt",
+        // The line that settles whether a PDB actually loaded.
+        "lm m nt",
+        POOL_ROOT_PROBE,
     ] {
         let call = server.call_tool(
             "execute",
             json!({ "command": command, "session_id": session }),
             TARGET_STEP,
         );
+        let output = text_of(&call["result"]);
         let failed = if is_tool_error(&call) {
             " [FAILED]"
         } else {
             ""
         };
-        transcript.push_str(&format!(
-            "\n$ {command}{failed}\n{}\n",
-            text_of(&call["result"]).trim()
-        ));
+        transcript.push_str(&format!("\n$ {command}{failed}\n{}\n", output.trim()));
+        if command == POOL_ROOT_PROBE {
+            // Everything DbgEng echoes back is the command itself; what is left is the answer.
+            // `x` prints *nothing* for a name it cannot resolve, so the remainder being empty is
+            // the whole signal — and checking the transcript for the symbol's name instead would
+            // match the echo and pass regardless.
+            probe = output.replace(command, "").trim().to_string();
+        }
     }
-    transcript
+    KernelSymbols { transcript, probe }
+}
+
+/// What [`load_kernel_symbols`] managed, kept apart so each can be checked on its own terms.
+struct KernelSymbols {
+    /// Everything that was run and what it said — the failure message's whole value.
+    transcript: String,
+    /// `x <pool root>` with the echoed command removed: empty means it did not resolve.
+    probe: String,
 }
 
 /// What `pool_census` had to say about the heaviest tag it found.
@@ -2304,21 +2342,31 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
         // pool failure with no way to tell whether the path, the reload, or the walker was at
         // fault.
         let symbols = load_kernel_symbols(&mut server, &session);
+        let transcript = &symbols.transcript;
         // Keyed on `lm` reporting a PDB, not on the absence of an error string. `x` against an
         // unresolved symbol prints *nothing at all* — no "Couldn't resolve", no diagnostic — so
         // an earlier version of this check passed a run in which nothing had loaded and let the
         // failure surface three calls later as an unexplained pool error.
         assert!(
-            symbols.contains("pdb symbols"),
+            transcript.contains("pdb symbols"),
             "`nt` loaded without a PDB, so the pool walker has no types to decode with and this \
              tier can prove nothing about it.\n\nSymbols never cross the KD wire, so this is \
              always about *this* machine. Read `!lmi nt` below first: `Symbol Type: EXPORT - PDB \
              not found` **with a CODEVIEW GUID present** means the identity was known and the \
-             lookup still failed — which is the engine, not the target and not the path. That is \
-             what `symsrv.dll` (reads a symbol store) and `msdia140.dll` (parses the PDB) are \
-             for, and this run reports them as: {engine}. A CODEVIEW line that is *absent* is \
-             the other failure, and a different fix. If you have a symbol path known to work \
-             here, set {SYMBOLS_ENV} to it.\n{symbols}"
+             lookup still failed — which is the engine or the store, not the target. That is what \
+             `symsrv.dll` (reads a symbol store) and `msdia140.dll` (parses the PDB) are for, and \
+             this run reports them as: {engine}. A CODEVIEW line that is *absent* is the other \
+             failure, and a different fix. If you have a symbol path known to work here, set \
+             {SYMBOLS_ENV} to it.\n{transcript}"
+        );
+        // A PDB for `nt` is necessary and not sufficient: the walker wants this *private* global,
+        // and a public-only PDB would satisfy the check above while leaving every pool query to
+        // fail. Checked on the probe's own output, since searching the whole transcript for the
+        // name would match the echoed command and pass no matter what.
+        assert!(
+            !symbols.probe.is_empty(),
+            "`nt` has a PDB but {POOL_ROOT_SYMBOL} did not resolve, so the pool walker still has \
+             nothing to start from — the PDB may lack private symbols.\n{transcript}"
         );
 
         // A forced walk. `refresh` is the expensive path and the one that wedged; nothing is
@@ -2327,7 +2375,7 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
         let walk = server.call_tool(
             "pool_find_tag",
             json!({ "tag": ABSENT_TAG, "refresh": true, "session_id": session }),
-            TARGET_STEP,
+            POOL_CALL_BUDGET,
         );
         let walked_for = started.elapsed();
         let absent = text_of(&walk["result"]);
@@ -2340,7 +2388,7 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
             "the pool walk failed outright, so nothing below would be measuring a walk. If this \
              names missing kernel pool symbols after the probe above resolved, then the walker \
              wants type information the public store does not carry, which is a different \
-             problem from an unset symbol path.\n{absent}\n\nsymbol setup said:{symbols}"
+             problem from an unset symbol path.\n{absent}\n\nsymbol setup said:{transcript}"
         );
         println!("a forced pool walk over a live kernel returned in {walked_for:?}");
         assert!(
@@ -2382,11 +2430,18 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
         }
 
         // The census is the state of the walk, so it carries the report whatever it found.
+        //
+        // Timed, because it runs *between* the walk and the reuse check below and would otherwise
+        // hide the very regression that check is for: if the walk's snapshot were discarded, this
+        // call would quietly take a fresh one and cache *that*, and the later `reuse < walked_for`
+        // would still pass while proving nothing about the original walk.
+        let census_started = Instant::now();
         let census_call = server.call_tool(
             "pool_census",
             json!({ "session_id": session, "limit": 8 }),
-            TARGET_STEP,
+            POOL_CALL_BUDGET,
         );
+        let census_took = census_started.elapsed();
         let census = text_of(&census_call["result"]);
         assert!(
             !is_tool_error(&census_call),
@@ -2420,11 +2475,19 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
             // an incomplete snapshot is deliberately not cached, so these would be two separate
             // walks of a moving target and could honestly disagree.
             HeaviestTag::Queryable(tag) if complete => {
+                // The census had to come off the cached snapshot too, or the reuse below is
+                // measured against a snapshot *it* took rather than the walk's.
+                assert!(
+                    census_took < walked_for,
+                    "the census took {census_took:?} against the walk's {walked_for:?}, so it \
+                     walked again rather than reusing the completed snapshot — anything the \
+                     reuse check says after that is about the census's walk, not the first one"
+                );
                 let cached = Instant::now();
                 let call = server.call_tool(
                     "pool_find_tag",
                     json!({ "tag": tag, "session_id": session }),
-                    TARGET_STEP,
+                    POOL_CALL_BUDGET,
                 );
                 let reuse = cached.elapsed();
                 let found = text_of(&call["result"]);
@@ -2470,6 +2533,14 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
         resume_unwind(panic);
     }
     assert_no_error(&ended, "end_session after a pool walk");
+    // A tool error here reports a session that could not be released — a worker that exited or
+    // crashed, say — and its text need not contain "terminated", so the check below would pass
+    // having confirmed no graceful detach at all. The target can be left halted by exactly that.
+    assert!(
+        !is_tool_error(&ended),
+        "end_session reported a failure, so no graceful detach was confirmed and the target may \
+         still be halted:\n{ended_text}"
+    );
     assert!(
         !ended_text.contains("terminated"),
         "the worker was killed instead of detaching, which leaves the target halted:\n{ended_text}"
