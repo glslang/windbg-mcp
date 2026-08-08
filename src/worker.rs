@@ -922,6 +922,22 @@ fn select_categories<'a>(
         .collect()
 }
 
+/// Splits `limit` rows between the two halves of a diagnostics listing.
+///
+/// `limit` bounds the whole reply — the worker builds it as one `String` before it crosses the
+/// pipe — so the two sections share one budget rather than each taking it in full.
+///
+/// Spending it in print order would be simpler and is wrong: a flood of examples would take
+/// the lot and drop the category counts entirely, which is the very number this listing exists
+/// to report. So each half is offered half the budget and hands back what it does not need.
+/// Every shape contributes at least one example, so the categories are never the more numerous
+/// half — in practice this means "the categories in full, the examples take the rest", and the
+/// even split only bites on a target with an unusual number of distinct complaints.
+fn split_row_budget(limit: usize, examples: usize, categories: usize) -> (usize, usize) {
+    let for_examples = examples.min((limit / 2).max(limit.saturating_sub(categories)));
+    (for_examples, categories.min(limit - for_examples))
+}
+
 /// Lists the walk's complaints: the verbatim ones it kept, then what the counts say.
 ///
 /// Both halves are needed and neither substitutes for the other. The walk keeps only a
@@ -960,6 +976,7 @@ fn render_diagnostics(
         report.diagnostics.emitted(),
         categories_phrase(report.diagnostics.shapes().len())
     );
+    let (example_rows, category_rows) = split_row_budget(limit, examples.len(), categories.len());
     if !examples.is_empty() {
         out.push_str(&format!(
             "{} of {} kept verbatim{scope} (the walk keeps a few per category, so this is a \
@@ -967,15 +984,15 @@ fn render_diagnostics(
             examples.len(),
             report.diagnostics.examples().len()
         ));
-        for line in examples.iter().take(limit) {
+        for line in examples.iter().take(example_rows) {
             out.push_str("  ");
             out.push_str(line);
             out.push('\n');
         }
-        if examples.len() > limit {
+        if examples.len() > example_rows {
             out.push_str(&format!(
                 "\n... {} more match; raise `limit` to see them.\n",
-                examples.len() - limit
+                examples.len() - example_rows
             ));
         }
     }
@@ -985,17 +1002,17 @@ fn render_diagnostics(
              the ones kept above:\n\n",
             categories_phrase(categories.len())
         ));
-        for category in categories.iter().take(limit) {
+        for category in categories.iter().take(category_rows) {
             out.push_str(&format!(
                 "  {:>7}x  {}\n",
                 category.total,
                 category.shape.trim()
             ));
         }
-        if categories.len() > limit {
+        if categories.len() > category_rows {
             out.push_str(&format!(
                 "\n... {} more; raise `limit` to see them.\n",
-                categories_phrase(categories.len() - limit)
+                categories_phrase(categories.len() - category_rows)
             ));
         }
     }
@@ -1293,6 +1310,76 @@ mod tests {
         );
         assert_eq!(select_examples(&report.diagnostics, None).len(), 3);
         assert!(select_examples(&report.diagnostics, Some("no such text")).is_empty());
+    }
+
+    /// A report with far more of both halves than any budget will print.
+    ///
+    /// The shapes are told apart by *wording*, not by a number: the walk generalises every
+    /// number-bearing token, so `complaint 1` and `complaint 2` would be one shape and the
+    /// fixture would quietly collapse to a single category.
+    fn crowded_report() -> query::PoolSnapshotReport {
+        let lines: Vec<String> = ('a'..='i')
+            .flat_map(|first| ('a'..='j').map(move |second| format!("{first}{second}")))
+            .flat_map(|kind| {
+                (0..20).map(move |node| format!("cannot read {kind} at node {node:#018x}"))
+            })
+            .collect();
+        query::PoolSnapshotReport {
+            total_chunks: 4211,
+            allocated_chunks: 3007,
+            complete: true,
+            diagnostics: lines.into_iter().collect(),
+        }
+    }
+
+    /// Counts the rendered diagnostic rows — verbatim messages and category counts alike.
+    fn rendered_rows(rendered: &str) -> usize {
+        rendered
+            .lines()
+            .filter(|line| line.starts_with("  ") && !line.trim().is_empty())
+            .count()
+    }
+
+    /// `limit` bounds the whole reply, not each section of it.
+    ///
+    /// The worker builds the reply as one `String` before it crosses the pipe, which is why
+    /// `MAX_POOL_ROWS` exists at all — an unbounded listing is a request to allocate a
+    /// snapshot-sized buffer, and a worker killed mid-session costs the caller the session.
+    /// Two sections that each restart the budget quietly double the ceiling the clamp was
+    /// chosen to enforce.
+    #[test]
+    fn the_row_limit_bounds_the_whole_listing() {
+        let report = crowded_report();
+        for limit in [1, 7, 60, 200] {
+            let rendered = render_diagnostics(&report, None, limit);
+            let rows = rendered_rows(&rendered);
+            assert!(
+                rows <= limit,
+                "limit {limit} produced {rows} rows:\n{rendered}"
+            );
+        }
+
+        // And it must still spend the budget rather than hoard it: a listing that prints two
+        // rows under a limit of 60 satisfies the bound above and is useless.
+        let rendered = render_diagnostics(&report, None, 60);
+        assert_eq!(rendered_rows(&rendered), 60, "{rendered}");
+    }
+
+    /// Neither half may be squeezed out by the other. The categories carry the counts, so a
+    /// flood of verbatim examples taking the whole budget would reintroduce #77 one level up:
+    /// a listing whose only visible numbers describe the sample.
+    #[test]
+    fn both_halves_of_the_listing_get_a_share() {
+        let (examples, categories) = split_row_budget(60, 900, 90);
+        assert!(examples > 0 && categories > 0, "{examples}, {categories}");
+        assert_eq!(examples + categories, 60);
+
+        // The common shape: few categories, many examples. The categories fit whole and the
+        // examples take everything left, rather than each half being held to half.
+        assert_eq!(split_row_budget(60, 71, 24), (36, 24));
+
+        // Nothing is truncated when both halves already fit.
+        assert_eq!(split_row_budget(60, 5, 3), (5, 3));
     }
 
     /// An address only ever appears in a kept message — the categories have had theirs
