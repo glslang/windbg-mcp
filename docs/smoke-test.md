@@ -231,8 +231,9 @@ about. This is the other half — an attach that lands:
   it just has no `symsrv.dll` to read a symbol store and no `msdia140.dll` to parse a PDB, so a
   PDB already sitting in the cache comes back as `file not found` with the error summary blaming
   the store. The tier copies the engine across before starting the server, and says so. It also
-  reloads with a bare `.reload /f` rather than `.reload /f nt`, which rests on the `nt` alias
-  resolving. Where you already have a symbol path that works for the target, set
+  reloads with a bare `.reload /f`, which is slower than `.reload /f nt` but is the form measured
+  working end to end here and takes the module name out of the set of things a failure could be.
+  Where you already have a symbol path that works for the target, set
   `WINDBG_MCP_SMOKE_SYMBOLS` to it and that is used instead. `pool_find_tag` with `refresh` then
   walks every
   committed pool page, which over KDNET is the query that used to run for minutes past its caller's

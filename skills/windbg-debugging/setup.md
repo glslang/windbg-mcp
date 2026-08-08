@@ -131,8 +131,10 @@ Symbol *names* fail silently without all three of:
    explicitly is *recommended*, not required — `.symfix` with no argument uses the `sym`
    subdirectory of the debugger's installation directory — but an explicit path is
    predictable and lets several binaries share one store.
-3. **A `.reload /f` at a stopped position** (after a `go`/breakpoint, not off a bare
-   `!tt`). Confirm with `execute` → `lm m <mod>`: `(pdb symbols)` means it worked,
+3. **A `.reload /f <mod>` at a stopped position** (after a `go`/breakpoint, not off a bare
+   `!tt`), module-qualified so it fetches the PDB you actually want rather than walking
+   every loaded module. Under `!sym noisy` when it does not work, so the search is
+   visible. Confirm with `execute` → `lm m <mod>`: `(pdb symbols)` means it worked,
    `(export symbols)` means it didn't.
 
 ### Check the engine before blaming the path
@@ -169,8 +171,9 @@ no symbol server can be queried without them.
 
 Two more things that mislead here:
 
-- `.reload /f` unqualified re-reads the whole module list. `.reload /f nt` rests on the `nt`
-  alias resolving and can quietly do nothing when that is the part that is wrong.
+- `.reload /f <mod>` fetches one module's PDB; bare `.reload /f` walks every loaded module,
+  which on a live kernel is a couple of hundred of them and correspondingly slow. Reach for
+  the unqualified form only to rule the module name out as the variable.
 - `x <mod>!<symbol>` prints **nothing at all** for an unresolved name — no error, no
   diagnostic. Its silence is not confirmation. `lm m <mod>` is the check that answers.
 

@@ -1984,6 +1984,19 @@ fn disconnecting_releases_a_live_kernel_session_rather_than_killing_it() {
     };
 
     // --- now assert ----------------------------------------------------------------------
+    //
+    // The detach first, before the disconnect's own outcome and before any earlier failure is
+    // propagated. Every one of those would otherwise mask it, and a masked ungraceful detach is a
+    // machine left halted — the loudest fact available and the only one needing action now. The
+    // failures below are all diagnosis, and they keep.
+    if let Some(released) = &released
+        && let Some(why) = ungraceful_detach(released, &ended)
+    {
+        panic!(
+            "THE TARGET MAY STILL BE HALTED — the final detach was not graceful: {why}\n\n\
+             Anything else this run has to say is below; check the machine first."
+        );
+    }
     match exit {
         Ok(code) => assert_eq!(code, Some(0), "a disconnect should still be a clean exit"),
         Err(panic) => resume_unwind(panic),
@@ -2002,12 +2015,6 @@ fn disconnecting_releases_a_live_kernel_session_rather_than_killing_it() {
         "the target was not reattachable after a disconnect — the previous session did not let go \
          of it cleanly, and this run could not put it back:\n{report}"
     );
-    // The same three ways a detach goes wrong as the other live tiers, rather than the one.
-    if let Some(released) = &released
-        && let Some(why) = ungraceful_detach(released, &ended)
-    {
-        panic!("the final detach must be graceful, or the target is left frozen — {why}");
-    }
     match (before, after) {
         (Some(before), Some(after)) => {
             let ran_for = after.saturating_sub(before);
@@ -2043,16 +2050,33 @@ const POOL_CEILING: Duration = Duration::from_secs(170);
 /// caller leaves the engine busy, and everything behind it waits out the rest of the walk.
 const NOT_QUEUED: Duration = Duration::from_secs(30);
 
+/// What the pool tier's server is told its per-call timeout is, rather than inheriting one.
+///
+/// Comfortably above win-kexp's 120s walk budget, so a walk that behaves is never cut off, and
+/// below [`POOL_CALL_BUDGET`] so the server is always the one to answer first.
+const SERVER_CALL_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// How long this *harness* waits on a pool call — deliberately longer than the server's own.
 ///
-/// `TARGET_STEP` is 240s and the server gives an engine call 300s, so a walk that ran away would
-/// have the harness give up first. That is the wrong order here. The client panicking while the
-/// walk is still running means the `end_session` in the cleanup queues behind it, misses its grace
-/// period, and the worker is **killed** — which on a broken-in kernel leaves the guest halted. On
-/// the exact failure path this test exists to detect, that would freeze the machine it is
-/// diagnosing. Waiting past the server's own timeout lets it answer first, so the cleanup always
-/// runs against an idle engine.
+/// `TARGET_STEP` is 240s, below the server's timeout, so a walk that ran away would have the
+/// harness give up first. That is the wrong order here. The client panicking while the walk is
+/// still running means the `end_session` in the cleanup queues behind it, misses its grace period,
+/// and the worker is **killed** — which on a broken-in kernel leaves the guest halted. On the
+/// exact failure path this test exists to detect, that would freeze the machine it is diagnosing.
+///
+/// The ordering only holds if the server's timeout is known, which is why the test pins
+/// [`SERVER_CALL_TIMEOUT`] rather than letting an operator's `WINDBG_MCP_CALL_TIMEOUT_SECS`
+/// through: a short value times out mid-walk and a long one puts the harness first again.
 const POOL_CALL_BUDGET: Duration = Duration::from_secs(330);
+
+/// What a query served from a cached snapshot may take.
+///
+/// A fixed bound rather than a fraction of the first walk's time, because two live walks vary and
+/// a second one that happened to be quicker would satisfy a relative comparison while having
+/// re-walked the entire pool — proving the opposite of what it claims. A cached answer is a lookup
+/// over an in-memory index and does not touch the wire at all; the measured walk it is being told
+/// apart from is ~20s.
+const CACHED_QUERY_CEILING: Duration = Duration::from_secs(5);
 
 /// A tag no allocator will have used, so answering has to walk the whole pool.
 ///
@@ -2069,6 +2093,9 @@ const POOL_ROOT_SYMBOL: &str = "nt!ExPoolState";
 /// The `x` that resolves [`POOL_ROOT_SYMBOL`], as one string so its output can be told apart
 /// from every other command's by comparing against the command that produced it.
 const POOL_ROOT_PROBE: &str = "x nt!ExPoolState";
+
+/// The `lm` that reports what `nt` loaded, kept as one string for the same reason.
+const LOADED_MODULE_PROBE: &str = "lm m nt";
 
 /// Where downloaded PDBs are kept — named explicitly, because the default is not a path.
 ///
@@ -2162,9 +2189,13 @@ const SYMBOLS_ENV: &str = "WINDBG_MCP_SMOKE_SYMBOLS";
 /// were spent on a `.reload` that printed nothing and loaded nothing, which is indistinguishable
 /// from success until something asks for a symbol.
 ///
-/// `.reload /f` unqualified, not `.reload /f nt`: it re-reads the module list rather than resting
-/// on the `nt` alias resolving, which is the more reliable instruction on a live kernel and the
-/// one that does not quietly do nothing when the alias is the part that is wrong.
+/// `.reload /f` unqualified, not `.reload /f nt`. The original reason was wrong — `.reload /f nt`
+/// looked like it "quietly did nothing" when the actual fault was a missing `symsrv.dll`, and the
+/// module name was never the variable. It stays unqualified anyway, for a smaller reason: this is
+/// a manual tier run against one machine, the unqualified form is what was measured working end to
+/// end, and it removes the module name from the set of things a future failure here could be. The
+/// cost is a slower run, which nothing on this path is optimising for. Anywhere symbol *speed*
+/// matters, `.reload /f <mod>` is the right instruction — see `skills/windbg-debugging/setup.md`.
 fn load_kernel_symbols(server: &mut Server, session: &str) -> KernelSymbols {
     // DbgHelp will create the store, but only once it has decided to use it; making it first
     // removes one way for a symbol-server element to be quietly unusable.
@@ -2196,6 +2227,7 @@ fn load_kernel_symbols(server: &mut Server, session: &str) -> KernelSymbols {
     );
 
     let mut probe = String::new();
+    let mut loaded = String::new();
     for command in [
         "!sym noisy",
         ".reload /f",
@@ -2205,7 +2237,7 @@ fn load_kernel_symbols(server: &mut Server, session: &str) -> KernelSymbols {
         // could not. The two failures look identical without it.
         "!lmi nt",
         // The line that settles whether a PDB actually loaded.
-        "lm m nt",
+        LOADED_MODULE_PROBE,
         POOL_ROOT_PROBE,
     ] {
         let call = server.call_tool(
@@ -2220,15 +2252,22 @@ fn load_kernel_symbols(server: &mut Server, session: &str) -> KernelSymbols {
             ""
         };
         transcript.push_str(&format!("\n$ {command}{failed}\n{}\n", output.trim()));
-        if command == POOL_ROOT_PROBE {
-            // Everything DbgEng echoes back is the command itself; what is left is the answer.
-            // `x` prints *nothing* for a name it cannot resolve, so the remainder being empty is
-            // the whole signal — and checking the transcript for the symbol's name instead would
-            // match the echo and pass regardless.
-            probe = output.replace(command, "").trim().to_string();
+        // Each answer kept apart from the echoed command that produced it, and from every other
+        // command's output. Searching the whole transcript conflates them: `x`'s echo contains
+        // the symbol name whether or not it resolved, and `.reload /f` loads *every* module, so a
+        // `(pdb symbols)` anywhere in it says nothing about `nt`.
+        let answer = output.replace(command, "").trim().to_string();
+        match command {
+            POOL_ROOT_PROBE => probe = answer,
+            LOADED_MODULE_PROBE => loaded = answer,
+            _ => {}
         }
     }
-    KernelSymbols { transcript, probe }
+    KernelSymbols {
+        transcript,
+        probe,
+        loaded,
+    }
 }
 
 /// What [`load_kernel_symbols`] managed, kept apart so each can be checked on its own terms.
@@ -2237,6 +2276,9 @@ struct KernelSymbols {
     transcript: String,
     /// `x <pool root>` with the echoed command removed: empty means it did not resolve.
     probe: String,
+    /// `lm m nt` with the echo removed, so `(pdb symbols)` is read about **`nt`** and not about
+    /// whichever of the couple of hundred modules `.reload /f` also touched.
+    loaded: String,
 }
 
 /// What `pool_census` had to say about the heaviest tag it found.
@@ -2351,7 +2393,16 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
     // only tier that needs symbols, and so the only one that ever noticed they were impossible.
     let engine = ensure_engine_beside_test_binary();
     println!("engine: {engine}");
-    let mut server = Server::started();
+    // Pinned, not inherited. Every cleanup-safety argument here rests on the server's own call
+    // timeout sitting *below* `POOL_CALL_BUDGET`, so that the server answers first and the
+    // `end_session` below never queues behind a running walk. `WINDBG_MCP_CALL_TIMEOUT_SECS` is an
+    // operational knob an operator may well have set, and either direction breaks that ordering: a
+    // short value times out mid-walk, a value above the harness budget puts the harness first
+    // again. Both end with the worker killed and the kernel left halted.
+    let mut server = Server::started_with(&[(
+        "WINDBG_MCP_CALL_TIMEOUT_SECS",
+        &SERVER_CALL_TIMEOUT.as_secs().to_string(),
+    )]);
 
     let attached = server.call_tool(
         "attach_kernel",
@@ -2382,7 +2433,7 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
         // an earlier version of this check passed a run in which nothing had loaded and let the
         // failure surface three calls later as an unexplained pool error.
         assert!(
-            transcript.contains("pdb symbols"),
+            symbols.loaded.contains("pdb symbols"),
             "`nt` loaded without a PDB, so the pool walker has no types to decode with and this \
              tier can prove nothing about it.\n\nSymbols never cross the KD wire, so this is \
              always about *this* machine. Read `!lmi nt` below first: `Symbol Type: EXPORT - PDB \
@@ -2415,8 +2466,10 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
         let absent = text_of(&walk["result"]);
         // Before the timing, because a call that *failed* also returns fast: the first live run
         // of this test measured 6.8ms and passed every deadline assertion below, having never
-        // walked a single page. A tool error is text like any other to `tool_text`, so nothing
-        // here may be believed until this holds.
+        // walked a single page. Both kinds of failure, because they look nothing alike from here:
+        // a JSON-RPC error carries no `result` at all, so `is_tool_error` reads false and an
+        // empty `absent` would sail through every check that follows.
+        assert_no_error(&walk, "pool_find_tag on a live kernel");
         assert!(
             !is_tool_error(&walk),
             "the pool walk failed outright, so nothing below would be measuring a walk. If this \
@@ -2477,6 +2530,7 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
         );
         let census_took = census_started.elapsed();
         let census = text_of(&census_call["result"]);
+        assert_no_error(&census_call, "pool_census on a live kernel");
         assert!(
             !is_tool_error(&census_call),
             "pool_census failed:\n{census}"
@@ -2511,11 +2565,17 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
             HeaviestTag::Queryable(tag) if complete => {
                 // The census had to come off the cached snapshot too, or the reuse below is
                 // measured against a snapshot *it* took rather than the walk's.
+                //
+                // Against a fixed bound, not against `walked_for`: two live walks vary, and a
+                // second one that happened to be quicker than the first would satisfy a relative
+                // comparison while having re-walked the whole pool. A cached answer is a lookup
+                // over an in-memory index and is not in the same order of magnitude.
                 assert!(
-                    census_took < walked_for,
-                    "the census took {census_took:?} against the walk's {walked_for:?}, so it \
-                     walked again rather than reusing the completed snapshot — anything the \
-                     reuse check says after that is about the census's walk, not the first one"
+                    census_took < CACHED_QUERY_CEILING,
+                    "the census took {census_took:?}, past the {CACHED_QUERY_CEILING:?} a lookup \
+                     over a cached snapshot should need, so it walked again rather than reusing \
+                     the completed one — anything the reuse check says after that is about the \
+                     census's walk, not the first one"
                 );
                 let cached = Instant::now();
                 let call = server.call_tool(
@@ -2535,9 +2595,10 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
                      same snapshot:\n{found}"
                 );
                 assert!(
-                    reuse < walked_for,
-                    "a second query took {reuse:?} against the first walk's {walked_for:?} — a \
-                     complete snapshot is meant to be cached and reused, not walked again"
+                    reuse < CACHED_QUERY_CEILING,
+                    "a second query took {reuse:?}, past the {CACHED_QUERY_CEILING:?} a cached \
+                     lookup should need — a complete snapshot is meant to be reused, not walked \
+                     again (the first walk, for scale, took {walked_for:?})"
                 );
                 println!("`{tag}` found again from the cached snapshot in {reuse:?}");
             }
