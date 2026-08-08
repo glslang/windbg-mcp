@@ -68,27 +68,24 @@ a bare `execute`, which only sets the run state and doesn't move the target.
   carrying the debugger's own text — read it and adjust (wrong symbol, unmapped address, target
   still running). So do a refused handle and a session whose engine died; all of them are things
   you can act on. Only "no engine could be started at all" is a transport-level protocol error.
-- **Symbol *names* (`module!func`) need three things together:** (a) `msdia140.dll`
-  bundled next to the binary, (b) a symbol path **naming a local cache** (`execute` →
-  `.sympath+ srv*C:\ProgramData\Dbg\sym*https://msdl.microsoft.com/download/symbols`), and
-  (c) a `.reload /f` at a *stopped* position (after a `go`/breakpoint, **not** straight off
-  a `goto_position`/`!tt`). Without these you silently get export symbols only and
-  `module!name` lookups fail. Address-based queries, navigation, and memory reads still
-  work without symbols — query by address.
-- **A symbol path with no local cache downloads nothing, silently.** A bare `srv*` or a
-  plain `.symfix` expands to `cache*;SRV*<msdl>`, where `cache*` is not a directory — the
-  server element is skipped rather than used, and the result is identical to a PDB that does
-  not exist. Under `!sym noisy`, `DBGHELP: <mod>.pdb - file not found` with **no `SYMSRV:`
-  line above it** means nothing was ever asked, so it is the path at fault, not the network:
-  re-running will not fix it. Verify with `lm m <mod>` (`(pdb symbols)` vs `(export
-  symbols)`) — never with `x <mod>!<sym>`, which prints *nothing* when unresolved, so its
-  silence proves nothing. Details in [setup.md](setup.md).
-- **Before blaming the path, check the engine.** The identical `file not found` appears when
-  the PDB *is* cached and there is no `symsrv.dll`/`msdia140.dll` beside the binary to read
-  and parse it — `dbgeng.dll` is in System32, so a bare binary works for everything except
-  symbols. `!lmi <mod>` settles it: a **CODEVIEW line with a GUID** plus
-  `Symbol Type: EXPORT` means the identity was known and the lookup still failed, so it is
-  the engine or the store, not the target. No CODEVIEW line is the opposite problem.
+- **Symbol *names* (`module!func`) need three things together:** (a) `msdia140.dll` and
+  `symsrv.dll` bundled next to the binary, (b) a symbol path — set it with the
+  **`set_symbol_path`** tool (`srv*C:\ProgramData\Dbg\sym*https://msdl.microsoft.com/download/symbols`,
+  `append: true`), which goes through the DbgEng API and so avoids `.sympath` swallowing the
+  rest of the command line — and (c) a `.reload /f` at a *stopped* position (after a
+  `go`/breakpoint, **not** straight off a `goto_position`/`!tt`). Without these you silently
+  get export symbols only and `module!name` lookups fail. Address-based queries, navigation,
+  and memory reads still work without symbols — query by address.
+- **`file not found` for a PDB usually means the engine, not the path.** `dbgeng.dll` is in
+  System32, so a binary with no DLLs beside it opens targets and runs commands happily — it
+  just has no `symsrv.dll` to read a symbol store and no `msdia140.dll` to parse a PDB, and
+  the error summary then blames the store (`invalid UNC store`, `pingme.txt`) while the PDB
+  sits in it. `!lmi <mod>` settles it: a **CODEVIEW line with a GUID** plus
+  `Symbol Type: EXPORT` means the identity was known and the lookup still failed — engine or
+  store, not the target. **No CODEVIEW line** is the opposite problem, and a different fix.
+  Verify with `lm m <mod>` (`(pdb symbols)` vs `(export symbols)`) — never with
+  `x <mod>!<sym>`, which prints *nothing* when unresolved, so its silence proves nothing.
+  Details in [setup.md](setup.md).
 - **The pool tools need *private* `nt` types, not exports** — they decode segment-heap
   internals, so `missing kernel pool symbols (ExPoolState)` is a symbol problem on *this*
   host (symbols never come over the KD wire), not a statement about the target's pool.

@@ -124,41 +124,33 @@ Symbol *names* fail silently without all three of:
    can't parse any PDB (`dia error 0x8007007e`) and falls back to *export* symbols, so
    `module!name` lookups fail even with the right PDB cached. `symsrv.dll` is needed to
    read a symbol-store cache.
-2. **A symbol path that names a local cache:** `execute` →
-   `.sympath+ srv*C:\ProgramData\Dbg\sym*https://msdl.microsoft.com/download/symbols`,
-   or equivalently `.symfix+ C:\ProgramData\Dbg\sym`. **The cache is not optional** — see
-   below.
+2. **A symbol path:** use the **`set_symbol_path`** tool with
+   `srv*C:\ProgramData\Dbg\sym*https://msdl.microsoft.com/download/symbols` and
+   `append: true`. It goes through DbgEng's `Append/SetSymbolPath`, so it avoids
+   `.sympath`'s habit of swallowing the rest of the command line. Naming the cache
+   explicitly is *recommended*, not required — `.symfix` with no argument uses the `sym`
+   subdirectory of the debugger's installation directory — but an explicit path is
+   predictable and lets several binaries share one store.
 3. **A `.reload /f` at a stopped position** (after a `go`/breakpoint, not off a bare
    `!tt`). Confirm with `execute` → `lm m <mod>`: `(pdb symbols)` means it worked,
    `(export symbols)` means it didn't.
 
-### The cache is the part that is easy to omit and impossible to spot
+### Check the engine before blaming the path
 
-A bare `srv*`, or `.symfix` with no directory after it, expands to
-`cache*;SRV*https://msdl.microsoft.com/download/symbols` — and that `cache*` names no
-directory. A symbol-server element with no downstream store is **skipped**, not used, so
-nothing is ever downloaded and nothing says so. The result is indistinguishable from a PDB
-that does not exist:
+**This is the one that actually bit, and the path is the tempting explanation.** The same
+`file not found` appears when the PDB *is* in the cache and the engine simply cannot read
+it. `dbgeng.dll` exists in System32, so a binary with no DLLs beside it opens targets and
+runs commands quite happily — it just has no `symsrv.dll` to read a symbol store and no
+`msdia140.dll` to parse a PDB. Under `!sym noisy` you get:
 
 ```text
-$ !sym noisy
-$ .reload /f
 DBGHELP: ntkrnlmp.pdb - file not found
 DBGHELP: nt - export symbols
 ```
 
-Read that pair carefully: `file not found` with **no `SYMSRV:` line above it** means no
-symbol server was queried at all. A download that failed would have logged the attempt. So
-this is a *path* problem, not a network or availability problem, and re-running will not fix
-it. Always give a cache directory.
-
-### …but check the engine before blaming the path
-
-The same `file not found` appears when the PDB **is** in the cache and the engine simply
-cannot read it. `dbgeng.dll` exists in System32, so a binary with no DLLs beside it opens
-targets and runs commands quite happily — it just has no `symsrv.dll` to read a symbol store
-and no `msdia140.dll` to parse a PDB. The error summary then blames the store
-(`invalid UNC store`, `pingme.txt` missing) even though the store is fine.
+with **no `SYMSRV:` line above it**, and an error summary blaming the store (`invalid UNC
+store`, `pingme.txt` missing) when the store is fine and the PDB is sitting in it. Nothing
+in that output points at the engine, which is why it is worth knowing.
 
 `!lmi <mod>` separates the two, and is worth running before changing any path:
 
