@@ -253,7 +253,11 @@ about. This is the other half — an attach that lands:
   partly on disk, so `sparse virtual range` diagnostics are physics rather than a defect, and the
   coverage caveat is doing its job. The categories that are *not* explained that way are worth
   reading — this run showed ~5.6k LFH subsegments rejected as implausible
-  (glslang/win-kexp#90), and the diagnostic total itself is currently understated (#77).
+  (glslang/win-kexp#90). Read the per-category counts as the volume: the walk keeps only a
+  handful of messages per category verbatim, so the list of examples is a sample and its length
+  says nothing about how much the walk complained. The header total is the walk's own count
+  (#77) — before that fix it was the length of the sample, which understated a real run by two
+  orders of magnitude.
   Where the walk *does* complete it also checks the snapshot was cached rather than
   re-walked, and that `pool_census` and `pool_find_tag` agree about the heaviest tag in it. That
   last comparison additionally needs the census to expose a tag that renders unambiguously: pool
