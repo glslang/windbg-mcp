@@ -243,7 +243,11 @@ about. This is the other half — an attach that lands:
   next call is served **immediately** rather than waiting out the rest of a walk, and that whatever
   came back **states its own coverage**. A truncated walk is a perfectly good outcome here, and the
   expected one on a busy kernel — so the test never asserts the walk was complete, only that it said
-  which it was. Where the walk *does* complete it also checks the snapshot was cached rather than
+  which it was, and it prints the walk's own diagnostic categories when it fell short, which is the
+  part worth reading. **Measured against Server 26100 over KDNET: a forced walk returned in 21.9s
+  and reported INCOMPLETE.** That is well inside the 120s budget, so on that target the coverage
+  gap is not the deadline — and scoping the walk (glslang/win-kexp#89) would not change it.
+  Where the walk *does* complete it also checks the snapshot was cached rather than
   re-walked, and that `pool_census` and `pool_find_tag` agree about the heaviest tag in it. That
   last comparison additionally needs the census to expose a tag that renders unambiguously: pool
   tags are four raw bytes, unprintable ones render as `.` — and so does a literal `.` — so a tag
