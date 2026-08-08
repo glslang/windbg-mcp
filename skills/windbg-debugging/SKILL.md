@@ -83,6 +83,12 @@ a bare `execute`, which only sets the run state and doesn't move the target.
   re-running will not fix it. Verify with `lm m <mod>` (`(pdb symbols)` vs `(export
   symbols)`) — never with `x <mod>!<sym>`, which prints *nothing* when unresolved, so its
   silence proves nothing. Details in [setup.md](setup.md).
+- **Before blaming the path, check the engine.** The identical `file not found` appears when
+  the PDB *is* cached and there is no `symsrv.dll`/`msdia140.dll` beside the binary to read
+  and parse it — `dbgeng.dll` is in System32, so a bare binary works for everything except
+  symbols. `!lmi <mod>` settles it: a **CODEVIEW line with a GUID** plus
+  `Symbol Type: EXPORT` means the identity was known and the lookup still failed, so it is
+  the engine or the store, not the target. No CODEVIEW line is the opposite problem.
 - **The pool tools need *private* `nt` types, not exports** — they decode segment-heap
   internals, so `missing kernel pool symbols (ExPoolState)` is a symbol problem on *this*
   host (symbols never come over the KD wire), not a statement about the target's pool.
