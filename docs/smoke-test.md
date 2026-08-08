@@ -186,8 +186,8 @@ $env:WINDBG_MCP_SMOKE_KERNEL = "net:port=50000,key=<w.x.y.z>"
 cargo test --test mcp_smoke -- --ignored --nocapture --test-threads=1 live_kernel
 ```
 
-`--test-threads=1` is required, not tidiness: the filter matches **two** tests, and the KD
-transport is single-owner, so run in parallel the second attach fails and can leave the target
+`--test-threads=1` is required, not tidiness: the filter matches **three** tests, and the KD
+transport is single-owner, so run in parallel the later attaches fail and can leave the target
 halted.
 
 The connection string is the one from `bcdedit /dbgsettings` on the target (or the `kd -k` command
@@ -217,6 +217,16 @@ about. This is the other half — an attach that lands:
   read either side of the disconnect — a halted kernel takes no clock interrupt, so its uptime
   stands still while a released one keeps counting. Re-attaching alone proves nothing here: a
   frozen target still answers its KD stub.
+- **A pool walk is bounded and gives the session back.** `pool_find_tag` with `refresh` walks every
+  committed pool page, which over KDNET is the query that used to run for minutes past its caller's
+  timeout and leave everything behind it queued. Only this tier can show it: against the sample dump
+  the same walk is local memory and finishes in well under a second, so the assertions would pass
+  for the wrong reason. The claims are that the call **returns** inside its budget, that the very
+  next call is served **immediately** rather than waiting out the rest of a walk, and that whatever
+  came back **states its own coverage**. A truncated walk is a perfectly good outcome here, and the
+  expected one on a busy kernel — so the test never asserts the walk was complete, only that it said
+  which it was. Where the walk *does* complete it also checks the snapshot was cached rather than
+  re-walked, and that `pool_census` and `pool_find_tag` agree about the heaviest tag in it.
 
 The first run of this tier found a real bug — shutdown killed workers outright, so a disconnect
 froze the target — which no dump-based tier could have found, because killing a worker that holds
