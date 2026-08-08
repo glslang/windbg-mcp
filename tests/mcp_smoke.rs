@@ -1822,17 +1822,19 @@ fn a_live_kernel_session_attaches_coexists_and_detaches_cleanly() {
     // Always, whatever happened above — the target is frozen until this runs.
     let ended = server.call_tool("end_session", json!({ "session_id": session }), TARGET_STEP);
     let ended_text = text_of(&ended["result"]);
-    if let Err(panic) = outcome {
-        eprintln!("detached after the failure below:\n{ended_text}");
-        resume_unwind(panic);
+    // Same ordering as the pool tier, and for the same reason: resuming the original panic first
+    // would skip every check below it, so a failed detach is masked exactly when the machine is
+    // most likely to be sitting halted. A caught panic has already printed itself.
+    match (outcome, ungraceful_detach(&ended, &ended_text)) {
+        (Err(_), Some(why)) => panic!(
+            "THE TARGET MAY STILL BE HALTED — {why}\n\nThis run had already failed, for the \
+             reason printed above; that is what to investigate, but check the machine first."
+        ),
+        (Err(panic), None) => resume_unwind(panic),
+        (Ok(()), Some(why)) => panic!("{why}"),
+        (Ok(()), None) => {}
     }
 
-    assert_no_error(&ended, "end_session on a live kernel");
-    assert!(
-        !ended_text.contains("terminated"),
-        "the worker was killed instead of detaching — DbgEng leaves a detached-but-halted kernel \
-         frozen, so this would have left the target stopped and its KD stub wedged:\n{ended_text}"
-    );
     assert!(
         ended_text.contains("closed"),
         "end_session should report the session closed:\n{ended_text}"
@@ -2528,21 +2530,52 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
     // Always, whatever happened above — the target is frozen until this runs.
     let ended = server.call_tool("end_session", json!({ "session_id": session }), TARGET_STEP);
     let ended_text = text_of(&ended["result"]);
-    if let Err(panic) = outcome {
-        eprintln!("detached after the failure below:\n{ended_text}");
-        resume_unwind(panic);
+    let ungraceful = ungraceful_detach(&ended, &ended_text);
+
+    // Four outcomes, and the ordering is the point. A panic caught here has *already* printed its
+    // own message and location — `catch_unwind` does not suppress the hook — so leading with the
+    // target costs nothing and puts the fact needing action first. The alternative, resuming the
+    // original panic and letting the detach checks below go unrun, hides a halted machine behind
+    // whichever assertion happened to fail earlier.
+    match (outcome, ungraceful) {
+        (Err(_), Some(why)) => panic!(
+            "THE TARGET MAY STILL BE HALTED — {why}\n\nThis run had already failed, for the \
+             reason printed above; that is what to investigate, but check the machine first."
+        ),
+        (Err(panic), None) => {
+            eprintln!("the target was released cleanly despite the failure above");
+            resume_unwind(panic);
+        }
+        (Ok(()), Some(why)) => panic!("{why}"),
+        (Ok(()), None) => {}
     }
-    assert_no_error(&ended, "end_session after a pool walk");
-    // A tool error here reports a session that could not be released — a worker that exited or
-    // crashed, say — and its text need not contain "terminated", so the check below would pass
-    // having confirmed no graceful detach at all. The target can be left halted by exactly that.
-    assert!(
-        !is_tool_error(&ended),
-        "end_session reported a failure, so no graceful detach was confirmed and the target may \
-         still be halted:\n{ended_text}"
-    );
-    assert!(
-        !ended_text.contains("terminated"),
-        "the worker was killed instead of detaching, which leaves the target halted:\n{ended_text}"
-    );
+}
+
+/// Why a detach cannot be called graceful, or `None` when it can.
+///
+/// Three ways to fail and they are easy to conflate. A protocol error means the call did not
+/// arrive; a *tool* error means it did and the session could not be released — a worker that
+/// exited or crashed, whose text need not contain "terminated" — and "terminated" itself means the
+/// worker was killed. Only the last was checked for a long time, so the first two passed as clean
+/// detaches. All three leave a broken-in kernel halted, which is the one outcome this tier must
+/// never report as success.
+fn ungraceful_detach(ended: &Value, text: &str) -> Option<String> {
+    if !ended["error"].is_null() {
+        return Some(format!(
+            "end_session was answered with a JSON-RPC error, so nothing released the target: {}",
+            ended["error"]
+        ));
+    }
+    if is_tool_error(ended) {
+        return Some(format!(
+            "end_session reported a failure, so no graceful detach was confirmed:\n{text}"
+        ));
+    }
+    if text.contains("terminated") {
+        return Some(format!(
+            "the worker was killed instead of detaching, and DbgEng leaves a detached-but-halted \
+             kernel frozen:\n{text}"
+        ));
+    }
+    None
 }
