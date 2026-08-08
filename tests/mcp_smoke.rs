@@ -2038,11 +2038,20 @@ const POOL_ROOT_SYMBOL: &str = "nt!ExPoolState";
 ///
 /// Naming one store fixes it in both directions: what a release run has already fetched is found,
 /// and what this fetches is kept where the next run of either build will find it.
+/// Backslashes throughout: `CARGO_MANIFEST_DIR` supplies them and a downstream *store* path is
+/// not a place to find out whether DbgHelp minds the mixed separators the obvious spelling gives.
 const SHARED_SYMBOL_STORE: &str = concat!(
     "srv*",
     env!("CARGO_MANIFEST_DIR"),
-    "/target/release/sym*https://msdl.microsoft.com/download/symbols"
+    "\\target\\release\\sym*https://msdl.microsoft.com/download/symbols"
 );
+
+/// A symbol path the operator knows works for this target, overriding [`SHARED_SYMBOL_STORE`].
+///
+/// Getting a kernel's PDB onto a debugging host is an environment problem — a reachable store, a
+/// proxy, the right build — and one this test is in no position to solve. Where it has already
+/// been solved, this is how to say so.
+const SYMBOLS_ENV: &str = "WINDBG_MCP_SMOKE_SYMBOLS";
 
 /// Gets full `nt` type information in front of the walker, and returns the transcript.
 ///
@@ -2060,12 +2069,18 @@ fn load_kernel_symbols(server: &mut Server, session: &str) -> String {
     let mut transcript = String::new();
     // `lm m nt` is the line that settles it: "(pdb symbols)" and a path, or "(export symbols)"
     // and the walker has nothing to decode with.
+    let store = std::env::var(SYMBOLS_ENV).unwrap_or_else(|_| SHARED_SYMBOL_STORE.to_string());
     for command in [
         "!sym noisy".to_string(),
-        format!(".sympath+ {SHARED_SYMBOL_STORE}"),
+        format!(".sympath+ {store}"),
         ".reload /f nt".to_string(),
         "!sym quiet".to_string(),
-        ".sympath".to_string(),
+        // `!lmi` is the one that says whether an identity was available at all: it prints the
+        // debug directory's PDB name, GUID and age when the image headers could be read, and
+        // says so when they could not. Without that identity a symbol *server* cannot be
+        // queried — only a filename search, which is what "ntkrnlmp.pdb - file not found" with
+        // no `SYMSRV:` line above it means.
+        "!lmi nt".to_string(),
         "lm m nt".to_string(),
         format!("x {POOL_ROOT_SYMBOL}"),
     ] {
@@ -2227,9 +2242,14 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
         assert!(
             symbols.contains("pdb symbols"),
             "`nt` loaded without a PDB, so the pool walker has no types to decode with and this \
-             tier can prove nothing. Symbols are never fetched over the KD wire — this is about \
-             *this* machine reaching a store that carries the target build's ntkrnlmp.pdb.\
-             \n{symbols}"
+             tier can prove nothing about it.\n\nThis is an environment problem, not a \
+             regression: symbols are never fetched over the KD wire, so it is about *this* \
+             machine getting the target build's ntkrnlmp.pdb. Read the transcript below — \
+             `DBGHELP: ntkrnlmp.pdb - file not found` with no `SYMSRV:` line above it means no \
+             symbol server was queried at all, which happens when the image's debug directory \
+             could not be read and there is no GUID to look one up by; `!lmi nt` says which. If \
+             you have a symbol path that works for this target, set {SYMBOLS_ENV} to it and \
+             re-run.\n{symbols}"
         );
 
         // A forced walk. `refresh` is the expensive path and the one that wedged; nothing is

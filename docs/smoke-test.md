@@ -222,11 +222,16 @@ about. This is the other half — an attach that lands:
   (`_EX_POOL_HEAP_MANAGER_STATE`, the page-range descriptors, the VS and LFH headers) and none of
   that is in the export table, so without them every pool query fails before reading a byte.
   Symbols are never fetched over the KD wire. The test runs `.symfix+` and `.reload /f nt` itself
-  and prints `.sympath`, `lm m nt` and `x nt!ExPoolState` when it cannot get them — but note the
-  symbol *cache* belongs to the debugger binary, and the harness spawns the **dev** build, so it
-  does not inherit whatever a release build has already downloaded. The first run against a given
-  kernel build therefore has to fetch that build's `ntkrnlmp.pdb`, and needs a symbol path that can
-  reach a store. `pool_find_tag` with `refresh` then walks every
+  under `!sym noisy` and prints `!lmi nt`, `lm m nt` and `x nt!ExPoolState` when it cannot get
+  them. Two traps live here. The symbol *cache* belongs to the debugger binary — a bare `srv*`
+  expands to `cache*;SRV*<msdl>`, and that cache sits beside the exe — so the dev build the harness
+  spawns does not inherit what a release build downloaded; the tier names one shared store to avoid
+  that. And a symbol server can only be queried by PDB **GUID**, read from the image's debug
+  directory: if that cannot be read, `!sym noisy` shows `ntkrnlmp.pdb - file not found` with no
+  `SYMSRV:` line above it, which is a lookup that never happened rather than a download that
+  failed. Where you already have a symbol path that works for the target, set
+  `WINDBG_MCP_SMOKE_SYMBOLS` to it and the tier will use that instead. `pool_find_tag` with
+  `refresh` then walks every
   committed pool page, which over KDNET is the query that used to run for minutes past its caller's
   timeout and leave everything behind it queued. Only this tier can show it: against the sample dump
   the same walk is local memory and finishes in well under a second, so the assertions would pass
