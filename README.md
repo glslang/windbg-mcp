@@ -365,8 +365,10 @@ It works off a **parse**, not a text scan: the string is split once into the str
 syntax has, and a secret parameter's value is simply never rendered. The parse is total — every
 byte lands in exactly one field, so an unredacted render reproduces the input exactly — which is
 what makes "the key cannot get out" checkable rather than a matter of having anticipated every
-delimiter. Whitespace, line breaks and repeated separators around a parameter change which field
-text lands in; they cannot change which parameter owns it.
+delimiter. Whitespace **between** parameters is refused rather than interpreted (it reads as either
+a missing comma or a stray space, and each leaks the key under the other reading), so a connection
+carrying any is rejected up front and reported as `<connection redacted>` in full; whitespace around
+the whole string is trimmed as the paste artefact it is.
 
 ### Typed operands are operands, not commands
 

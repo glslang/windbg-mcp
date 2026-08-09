@@ -33,12 +33,24 @@ happened to look, and four rounds of that is the evidence: nobody could hold the
 once, so the review found what review happens to find. The parse replaces that question with one
 anybody can check mechanically.
 
+**Whitespace is refused, not interpreted.** It is the one character class with two readings, and
+each leaks under the other: in `net:port=50000 key=1.2.3.4` (a missing comma) the space *separates*
+two parameters, and reading it as filler swallows `key=` into `port`'s value unmasked; in
+`net:port=1,key= 1.2.3.4` (a stray space) it is *filler*, and reading it as a separator leaves
+`key` empty and turns the key into a bare flag. The scanner picked the first reading and leaked the
+second; the first cut of this parse picked the second and leaked the first — which is the evidence
+that nothing in the string says which was meant. So a connection carrying interior whitespace is
+refused by `is_dialable`, and `redact` reports one as `<connection redacted>` in full rather than
+guessing. It costs a readable label for a string that is refused anyway; the label exists to tell
+two targets apart, and no version of that is worth disclosing a key for. (The outer trim runs
+first, so a pasted string with a trailing newline is still fine.)
+
 **The unredacted render is `cfg(test)`.** `Secrets::Keep` does not exist in a release build — a
 build that could produce an unredacted render would be a build with a second way to print a key.
 The totality check needs it; nothing else may have it.
 
-**Status.** Implemented, no behaviour change intended: every redaction test from #81 passes
-unchanged, including the four regression cases, alongside the new totality tests.
+**Status.** Implemented. Every redaction test from #81 passes unchanged, including the four
+regression cases, alongside the totality tests and the ambiguity ones.
 
 ---
 
