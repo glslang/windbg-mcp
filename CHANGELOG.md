@@ -21,10 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `attach_kernel` now takes **exactly one** of `connection` (unchanged, still supported for a target
   nothing is configured for) or `profile`, a non-secret name this process resolves from
   `WINDBG_MCP_PROFILE_<NAME>` in its environment or from `%USERPROFILE%\.windbg-mcp\profiles.json`
-  (`WINDBG_MCP_PROFILES` overrides the path). Sources are re-read per attach, so adding a profile
-  does not mean restarting the client. Passing both, or neither, is a tool error naming the
-  alternative, and the "neither" case lists the profiles this host has — which is what lets an agent
-  find one instead of asking the user for a string it would then have to keep.
+  (`WINDBG_MCP_PROFILES` overrides the path; environment-variable names are matched
+  case-insensitively, as Windows matches them). The **file** is re-read on every attach, so adding
+  a profile to it takes effect immediately — an environment variable is read from the server's own
+  environment at startup, so it belongs in the client's server definition and needs a restart to
+  change. Passing both selectors, or neither, is a tool error naming the alternative, and the
+  "neither" case lists the profiles this host has — which is what lets an agent find one instead of
+  asking the user for a string it would then have to keep.
 
   The exclusivity is enforced at runtime rather than in the schema: an untagged `oneOf` renders as a
   schema composition clients handle unevenly, the same reason `session_id` is repeated per tool
@@ -50,11 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entry whose name is not a name is skipped and located, never quoted, because the way that happens
   is an entry written the wrong way round.
 
-- **An engine worker is spawned without the profile variables.** It is told the one connection it
-  is opening over its private pipe and resolves nothing itself, so `WINDBG_MCP_PROFILE_*` and
-  `WINDBG_MCP_PROFILES` are stripped from its environment — a `launch`ed debuggee inherits its
-  worker's environment, and a debuggee is exactly the untrusted program that must not receive every
-  configured kernel key.
+- **Neither process this server creates inherits the profile variables.** An engine worker is told
+  the one connection it is opening over its private pipe and resolves nothing itself, and the TTD
+  recorder needs no connection at all — so `WINDBG_MCP_PROFILE_*` and `WINDBG_MCP_PROFILES` are
+  stripped from both. What each of them then launches is the reason: a `launch`ed debuggee inherits
+  its worker's environment, and `TTD.exe` hands its own to the recorded target. Those are precisely
+  the untrusted programs that must not receive every configured kernel key.
 
 ## [0.5.0] - 2026-08-08
 

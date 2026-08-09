@@ -47,12 +47,14 @@ is the load-bearing part: an agent that cannot discover a profile name asks the 
 answers with a connection string, and the key is in the transcript after all.
 
 **Where the resolved value is allowed to go.** Only into the op sent down one worker's private
-pipe. The worker is spawned *without* `WINDBG_MCP_PROFILE_*` in its environment
-(`engine::spawn_worker`), which matters for the process after it: `launch` runs an arbitrary binary
-under the debugger, that binary inherits its worker's environment, and a debuggee is the least
-trustworthy process this server ever creates. Resolution happens in the supervisor for a second
-reason too — a selector the caller must fix is refused before any worker is spawned, so a typo
-costs a message rather than a session to end.
+pipe. Both processes this server creates are spawned *without* `WINDBG_MCP_PROFILE_*` in their
+environment — the engine worker (`engine::spawn_worker`) and the TTD recorder (`ttd::record_launch`)
+— and what matters is the process after each of them: `launch` runs an arbitrary binary under the
+debugger and `TTD.exe` launches the recorded target, both inheriting the environment they were
+given. Those are the least trustworthy processes in any of these workflows, and frequently the
+whole reason for the session. Resolution happens in the supervisor for a second reason too — a
+selector the caller must fix is refused before any worker is spawned, so a typo costs a message
+rather than a session to end.
 
 **Configured names are validated on the way in, not on the way out.** A name is *rendered* — in
 the profile list, in a session label, in a collision report — so a name that is not one never

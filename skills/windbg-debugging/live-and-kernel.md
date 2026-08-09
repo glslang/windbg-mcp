@@ -20,19 +20,22 @@ Pick one entry point:
   2. **Don't?** Call `attach_kernel {}` with no arguments. The refusal lists the profiles this
      host has, so you never have to guess a name or ask the user for anything.
   3. **No profile covers the target?** **Ask the user to create one** — do not ask for a
-     connection string. Give them both options and let them pick:
+     connection string. Ask for the **file**, which is the only route that works mid-session:
 
-     ```pwsh
-     # a) permanent, in %USERPROFILE%\.windbg-mcp\profiles.json
-     #    { "ctf-vm": "net:port=50000,key=<w.x.y.z>" }
-     # b) this session only
-     $env:WINDBG_MCP_PROFILE_CTF_VM = "net:port=50000,key=<w.x.y.z>"
+     ```jsonc
+     // %USERPROFILE%\.windbg-mcp\profiles.json — create it if it isn't there
+     { "ctf-vm": "net:port=50000,key=<w.x.y.z>" }
      ```
 
      The values come from the target's KDNET setup (`bcdedit /dbgsettings` on the target, or
      the `windbgx -k` / `kd -k` command they already use) — you cannot guess them, and must
-     never invent a placeholder key. Profiles are re-read on every attach, so once they say
-     it's saved, go straight to step 1: **nothing needs restarting**.
+     never invent a placeholder key. The file is re-read on **every** attach, so the moment
+     they say it's saved, go to step 1; nothing needs restarting.
+
+     Do **not** offer `$env:WINDBG_MCP_PROFILE_…` as the fix for right now. The server reads
+     its *own* environment, fixed when it started, so a variable set in the user's shell after
+     that changes nothing until the server restarts. It is worth mentioning only as the way to
+     configure a profile permanently in the MCP client's server definition.
   4. **Only if the user declines** — a one-off target, or they'd rather not configure anything
      — fall back to `attach_kernel { "connection": "net:port=<n>,key=<w.x.y.z>" }`. Say plainly
      that the key will then be in the transcript, so it is their call, not a silent default.

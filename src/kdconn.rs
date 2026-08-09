@@ -312,11 +312,14 @@ impl Profiles {
         format!(
             "Profiles are resolved by this server, on this host: from `{PROFILE_ENV_PREFIX}<NAME>` \
              in its environment {file}. Names are matched case-insensitively, with `-` and `_` \
-             equivalent.\n\nThis server cannot add one, but the user can, and that is the better \
-             ask than a connection string: adding `{{ \"<name>\": \"net:port=<n>,key=<w.x.y.z>\" }}` \
-             to that file (or setting `{PROFILE_ENV_PREFIX}<NAME>`) lets every later attach name it \
-             instead, and the key stays on this host. Profiles are re-read per attach, so nothing \
-             needs restarting.{notes}"
+             equivalent.\n\nThis server cannot add one, but the user can, and asking them for that \
+             beats asking for a connection string — every later attach then names it, and the key \
+             stays on this host. **The file is the one to ask for now**: it is re-read on every \
+             attach, so adding `{{ \"<name>\": \"net:port=<n>,key=<w.x.y.z>\" }}` to it works \
+             immediately. A `{PROFILE_ENV_PREFIX}<NAME>` variable is read from *this process's* \
+             environment, which was fixed when it started — setting one in a shell now changes \
+             nothing until this server is restarted, so that route is for the MCP client's server \
+             definition rather than for right now.{notes}"
         )
     }
 

@@ -199,16 +199,12 @@ messages, tool calls, context snapshots and compaction summaries. Configure the 
 **this host** instead and `attach_kernel { "profile": "<name>" }` names it without the key ever
 entering the request.
 
-Either source works; the environment is checked first, then the file.
+Either source works; the environment is checked first, then the file. **They differ in when a
+change takes effect**, which decides which one to reach for:
 
-**Environment**, in whatever launches the MCP server (the variable's suffix is the profile name,
-lowercased — this defines `ctf_vm`, and `ctf-vm` resolves to it too):
-
-```pwsh
-$env:WINDBG_MCP_PROFILE_CTF_VM = "net:port=50000,key=1.2.3.4"
-```
-
-**File** — `%USERPROFILE%\.windbg-mcp\profiles.json`, or wherever `WINDBG_MCP_PROFILES` points:
+**File** — `%USERPROFILE%\.windbg-mcp\profiles.json`, or wherever `WINDBG_MCP_PROFILES` points.
+Re-read on **every attach**, so an edit works immediately, with nothing restarted. This is the one
+to add a profile to mid-session:
 
 ```json
 {
@@ -216,6 +212,18 @@ $env:WINDBG_MCP_PROFILE_CTF_VM = "net:port=50000,key=1.2.3.4"
   "lab":    "net:port=50001,key=5.6.7.8"
 }
 ```
+
+**Environment**, in whatever launches the MCP server — the client's server definition, or the shell
+the client itself was started from. The variable's suffix is the profile name, lowercased, so this
+defines `ctf_vm` (and `ctf-vm` resolves to it too):
+
+```pwsh
+$env:WINDBG_MCP_PROFILE_CTF_VM = "net:port=50000,key=1.2.3.4"
+```
+
+The server reads its *own* environment, which was fixed when it started, so setting this in a shell
+alongside a running server changes nothing until that server is restarted. Use it for a profile you
+want configured permanently; use the file for one you want now.
 
 This file holds keys: keep it out of every repository, and out of any directory that gets synced
 or shared. Names are matched case-insensitively with `-`, `_` and `.` equivalent, and the sources

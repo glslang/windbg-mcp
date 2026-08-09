@@ -117,8 +117,17 @@ pub fn record_launch(
         .arg(target)
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
+    // Configured kernel connections do not reach the recorder. TTD.exe launches `target` with
+    // this environment inherited, and the recorded target is an arbitrary binary — frequently the
+    // least trustworthy program on the machine, which is usually *why* it is being recorded. Same
+    // scrub as `engine::spawn_worker`, for the same reason: this is the other process this server
+    // creates, and nothing about recording needs a KDNET key.
+    for name in crate::kdconn::env_names() {
+        cmd.env_remove(name);
+    }
     // Pass through the validated environment (e.g. an anti-analysis env guard) and cwd to the
-    // recorded target. TTD.exe launches `target` with this environment inherited.
+    // recorded target. TTD.exe launches `target` with this environment inherited. Applied after
+    // the scrub above, so an entry the caller passed deliberately still wins.
     for (key, val) in parsed_env {
         cmd.env(key, val);
     }
