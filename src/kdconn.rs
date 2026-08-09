@@ -49,6 +49,10 @@ const SECRET_PARAMS: &[&str] = &["key", "password"];
 /// a mask that preserved length would leak the key's shape.
 const MASK: &str = "<redacted>";
 
+/// How long a profile name may be. Generous for a name, short enough that nothing anyone would
+/// mistake for a connection string or a pasted secret gets in under it.
+const NAME_LIMIT: usize = 64;
+
 /// A kernel connection string, with the secret sealed in.
 ///
 /// `Debug` and `Display` both render [`redact`]ed, which is the point: this type exists so that
@@ -132,11 +136,30 @@ pub fn redact(connection: &str) -> String {
     }
 }
 
+/// Which of the two sources a profile came from. Carried so that a name defined twice can say
+/// whether that was the documented environment-over-file override or a collision inside one
+/// source, which are opposite things to tell an operator.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Source {
+    Env,
+    File,
+}
+
+impl Source {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Env => "the environment",
+            Self::File => "the profile file",
+        }
+    }
+}
+
 /// One configured profile, keyed in [`Profiles`] by its normalized name but remembering the name
 /// as it was actually written — that is what an operator will recognise in an error.
 struct Profile {
     name: String,
     connection: Connection,
+    source: Source,
 }
 
 /// The kernel connection profiles configured on this host.
@@ -145,10 +168,12 @@ struct Profile {
 /// restarting the server (and, more to the point, does not mean restarting the MCP client).
 pub struct Profiles {
     entries: BTreeMap<String, Profile>,
-    /// A profile file that exists but could not be used. Kept rather than raised immediately: it
-    /// must not break an attach that passes `connection` and needs no profiles at all, but it also
-    /// must not make a typo'd file look identical to "no such profile".
-    problem: Option<String>,
+    /// What had to be refused while reading the sources: a file that could not be parsed, an
+    /// entry whose name is not a name, a second spelling of a name already taken. Reported when a
+    /// lookup fails rather than raised at read time — none of it should break an attach that
+    /// passes `connection` and wants no profiles at all, but a misconfiguration must not look
+    /// identical to "no such profile" either.
+    notes: Vec<String>,
     /// Where a profile file would be read from, for the "how do I configure one" advice. `None`
     /// only when the host has no `USERPROFILE`, which on Windows means something is very wrong.
     file: Option<PathBuf>,
@@ -162,27 +187,68 @@ impl Profiles {
     /// server's process is a deliberate override of a file that is shared with every other
     /// process the user runs.
     pub fn from_host() -> Self {
-        let mut entries = from_env(std::env::vars());
-
         let file = profiles_file();
-        let mut problem = None;
-        match file.as_deref().map(read_profile_file) {
+        let mut profiles = Self {
+            entries: BTreeMap::new(),
+            notes: Vec::new(),
+            file,
+        };
+        for (name, connection) in env_entries(std::env::vars()) {
+            profiles.admit(name, &connection, Source::Env);
+        }
+        match profiles.file.as_deref().map(read_profile_file) {
             Some(Ok(from_file)) => {
                 for (name, connection) in from_file {
-                    entries.entry(normalize(&name)).or_insert(Profile {
-                        name,
-                        connection: Connection::new(connection),
-                    });
+                    profiles.admit(name, &connection, Source::File);
                 }
             }
-            Some(Err(why)) => problem = Some(why),
+            Some(Err(why)) => profiles.notes.push(why),
             None => {}
         }
+        profiles
+    }
 
-        Self {
-            entries,
-            problem,
-            file,
+    /// Takes one configured entry, or records why it could not.
+    ///
+    /// **Both sources go through here**, and the validation is the reason. A name is *displayed* —
+    /// in [`Self::listed`], in a session label, in an unknown-profile error — so a name that is
+    /// not a name must never reach the map: the likeliest way to get one is an entry written the
+    /// wrong way round, which makes the JSON *key* the connection string. A rejection is therefore
+    /// counted and located, never quoted.
+    fn admit(&mut self, name: String, connection: &str, source: Source) {
+        if !is_profile_name(&name) {
+            self.notes.push(format!(
+                "an entry in {} was skipped: its name is not one (letters, digits, `-`, `_` or \
+                 `.`, up to {NAME_LIMIT} characters). It is not repeated here, because the usual \
+                 cause is an entry written the wrong way round — which would make the name a \
+                 connection string.",
+                source.label()
+            ));
+            return;
+        }
+        match self.entries.entry(normalize(&name)) {
+            std::collections::btree_map::Entry::Occupied(taken) => {
+                let kept = taken.get();
+                // Environment over file is the documented precedence, not a mistake. Two
+                // spellings within *one* source are: they are the same profile once `-`, `_` and
+                // `.` are treated alike, one of them silently wins, and the cost of not saying so
+                // is an operator dialling a name that reaches a different machine.
+                if kept.source == source {
+                    self.notes.push(format!(
+                        "`{name}` in {} is ignored: `{}` was read first and the two are one name \
+                         once `-`, `_` and `.` are treated alike.",
+                        source.label(),
+                        kept.name
+                    ));
+                }
+            }
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(Profile {
+                    name,
+                    connection: Connection::new(connection),
+                    source,
+                });
+            }
         }
     }
 
@@ -190,22 +256,15 @@ impl Profiles {
     /// environment, which in edition 2024 is `unsafe` and races every other test in the binary.
     #[cfg(test)]
     fn from_pairs(pairs: &[(&str, &str)]) -> Self {
-        Self {
-            entries: pairs
-                .iter()
-                .map(|(name, connection)| {
-                    (
-                        normalize(name),
-                        Profile {
-                            name: (*name).to_string(),
-                            connection: Connection::new(*connection),
-                        },
-                    )
-                })
-                .collect(),
-            problem: None,
+        let mut profiles = Self {
+            entries: BTreeMap::new(),
+            notes: Vec::new(),
             file: Some(PathBuf::from(r"C:\Users\test\.windbg-mcp\profiles.json")),
+        };
+        for (name, connection) in pairs {
+            profiles.admit((*name).to_string(), connection, Source::File);
         }
+        profiles
     }
 
     fn get(&self, name: &str) -> Option<&Profile> {
@@ -213,7 +272,8 @@ impl Profiles {
     }
 
     /// The configured names, as they were written. Names are not secrets — that is the whole
-    /// point of them — so they are safe to put in an error a client will keep.
+    /// point of them, and [`Self::admit`] is what makes sure a name is one — so they are safe to
+    /// put in an error a client will keep.
     fn names(&self) -> Vec<&str> {
         self.entries.values().map(|p| p.name.as_str()).collect()
     }
@@ -227,14 +287,18 @@ impl Profiles {
             ),
             None => format!("or from a JSON file named by {PROFILES_FILE_ENV}"),
         };
-        let problem = match &self.problem {
-            Some(why) => format!("\n\nThe profile file could not be read: {why}"),
-            None => String::new(),
+        let notes = match self.notes.as_slice() {
+            [] => String::new(),
+            notes => format!(
+                "\n\nThe configuration was read with problems, which may be why the profile you \
+                 want is missing:\n- {}",
+                notes.join("\n- ")
+            ),
         };
         format!(
             "Profiles are resolved by this server, on this host: from `{PROFILE_ENV_PREFIX}<NAME>` \
              in its environment {file}. Names are matched case-insensitively, with `-` and `_` \
-             equivalent. Ask the user to add one — this server cannot.{problem}"
+             equivalent. Ask the user to add one — this server cannot.{notes}"
         )
     }
 
@@ -247,34 +311,41 @@ impl Profiles {
     }
 }
 
-/// The profiles a set of environment variables defines.
+/// Every environment variable this module reads, by name.
+///
+/// Public so [`crate::engine`] can strip them from a worker's environment. A worker is told the
+/// one connection it is opening, down its private pipe, and resolves nothing itself — so it has no
+/// use for any of these, and a `launch`ed debuggee inherits the worker's environment in turn.
+/// Handing an untrusted program every configured kernel key is the outcome being avoided.
+pub fn env_names() -> Vec<String> {
+    env_names_in(std::env::vars_os().filter_map(|(key, _)| key.into_string().ok()))
+}
+
+/// The filter behind [`env_names`], over a supplied set so it can be tested against fixed input
+/// rather than against whatever the developer's shell happens to hold.
+fn env_names_in(keys: impl Iterator<Item = String>) -> Vec<String> {
+    keys.filter(|key| key.starts_with(PROFILE_ENV_PREFIX) || key == PROFILES_FILE_ENV)
+        .collect()
+}
+
+/// The (name, connection) pairs a set of environment variables defines.
 ///
 /// Split out from [`Profiles::from_host`] so the mapping is testable: `std::env::set_var` is
 /// `unsafe` in edition 2024 and mutates state every other test in this binary shares, so the only
 /// way to prove `WINDBG_MCP_PROFILE_CTF_VM` defines the profile `ctf-vm` is to hand the scan its
 /// variables rather than the process's.
-fn from_env(vars: impl Iterator<Item = (String, String)>) -> BTreeMap<String, Profile> {
-    let mut entries = BTreeMap::new();
-    for (key, value) in vars {
-        let Some(suffix) = key.strip_prefix(PROFILE_ENV_PREFIX) else {
-            continue;
-        };
+fn env_entries(vars: impl Iterator<Item = (String, String)>) -> Vec<(String, String)> {
+    vars.filter_map(|(key, value)| {
+        let suffix = key.strip_prefix(PROFILE_ENV_PREFIX)?;
         if suffix.is_empty() || value.trim().is_empty() {
-            continue;
+            return None;
         }
         // The variable's own suffix *is* the profile's name, lowercased — an environment variable
         // cannot carry a hyphen, so `WINDBG_MCP_PROFILE_CTF_VM` lists as `ctf_vm`. Asking for
         // `ctf-vm` still finds it: both normalize to the same key.
-        let name = suffix.to_ascii_lowercase();
-        entries.insert(
-            normalize(&name),
-            Profile {
-                name,
-                connection: Connection::new(value.trim()),
-            },
-        );
-    }
-    entries
+        Some((suffix.to_ascii_lowercase(), value.trim().to_string()))
+    })
+    .collect()
 }
 
 /// Where the profile file lives on this host.
@@ -316,7 +387,8 @@ fn read_profile_file(path: &Path) -> Result<BTreeMap<String, String>, String> {
     for (name, value) in object {
         let connection = value.as_str().ok_or_else(|| {
             format!(
-                "profile `{name}` in {} must be a string (its connection string)",
+                "{} in {} must be a string (its connection string)",
+                referred_to_as(name),
                 path.display()
             )
         })?;
@@ -429,13 +501,30 @@ fn resolve(name: &str, profiles: &Profiles) -> Result<Selected, String> {
     }
 }
 
-/// Whether this is a profile name rather than something else that got put in the field.
+/// Whether this is a profile name rather than something else that got put where one belongs.
+///
+/// The charset is what makes a name safe to *render*: no `=`, so a connection string cannot pass;
+/// no line breaks, so nothing configured here can inject a line into a tool result.
 fn is_profile_name(name: &str) -> bool {
     !name.is_empty()
-        && name.len() <= 64
+        && name.len() <= NAME_LIMIT
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// How a configured entry is referred to in a message.
+///
+/// A name that is not a name is *located*, never quoted: the likeliest reason a JSON key fails
+/// [`is_profile_name`] is an entry written the wrong way round, which makes the key the connection
+/// string — and quoting it would put the key in the transcript this whole module exists to keep it
+/// out of.
+fn referred_to_as(name: &str) -> String {
+    if is_profile_name(name) {
+        format!("profile `{name}`")
+    } else {
+        "an entry whose name is not a profile name".to_string()
+    }
 }
 
 #[cfg(test)]
@@ -566,6 +655,24 @@ mod tests {
         }
     }
 
+    /// What a worker's environment has to be stripped of. Everything this module reads, and
+    /// nothing else — a worker still needs `PATH`, `SystemRoot` and the rest to run at all.
+    #[test]
+    fn the_variables_a_worker_must_not_inherit_are_this_modules_own() {
+        let names = env_names_in(
+            [
+                "WINDBG_MCP_PROFILE_CTF_VM",
+                "WINDBG_MCP_PROFILES",
+                "WINDBG_MCP_CALL_TIMEOUT_SECS",
+                "PATH",
+                "WINDBG_MCP_SMOKE_KERNEL",
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+        assert_eq!(names, ["WINDBG_MCP_PROFILE_CTF_VM", "WINDBG_MCP_PROFILES"]);
+    }
+
     /// The environment half of the same claim, on the real scan: a variable defines a profile
     /// under its own spelling, and the hyphenated name a person would type finds it anyway.
     #[test]
@@ -578,17 +685,70 @@ mod tests {
         ]
         .map(|(k, v)| (k.to_string(), v.to_string()));
 
-        let profiles = Profiles {
-            entries: from_env(vars.into_iter()),
-            problem: None,
+        let mut profiles = Profiles {
+            entries: BTreeMap::new(),
+            notes: Vec::new(),
             file: None,
         };
+        for (name, connection) in env_entries(vars.into_iter()) {
+            profiles.admit(name, &connection, Source::Env);
+        }
         assert_eq!(profiles.names(), ["ctf_vm"]);
         for asked in ["ctf-vm", "ctf_vm", "CTF-VM"] {
             let selected =
                 resolve(asked, &profiles).unwrap_or_else(|e| panic!("{asked} should resolve: {e}"));
             assert_eq!(selected.connection.expose(), FAKE);
         }
+    }
+
+    /// A configured *name* is rendered — in the profile list, in a session label — so a name that
+    /// is not a name must not get in. The way that happens in practice is an entry written the
+    /// wrong way round, which makes the JSON key the connection string; admitting it would print
+    /// a key out of the very error that says the entry is wrong.
+    #[test]
+    fn a_configured_entry_whose_name_is_not_a_name_is_refused_without_being_quoted() {
+        let profiles = Profiles::from_pairs(&[
+            ("ctf-vm", FAKE),
+            (FAKE, "net:port=1,key=9.9.9.9"),
+            ("has\na newline", "net:port=2,key=8.8.8.8"),
+        ]);
+        assert_eq!(profiles.names(), ["ctf-vm"]);
+
+        let err = resolve("typo", &profiles).unwrap_err();
+        assert!(err.contains("its name is not one"), "{err}");
+        for leaked in [FAKE_KEY, "9.9.9.9", "8.8.8.8", "port=1", "\n a newline"] {
+            assert!(!err.contains(leaked), "the note quoted `{leaked}`:\n{err}");
+        }
+    }
+
+    /// Two spellings of one name inside a single source are a collision, not an override: one
+    /// silently wins, and the cost of not saying so is an operator dialling a name that reaches a
+    /// different machine. Environment-over-file *is* the documented precedence and stays quiet.
+    #[test]
+    fn two_spellings_of_one_name_in_one_source_are_reported() {
+        let profiles =
+            Profiles::from_pairs(&[("ctf-vm", FAKE), ("ctf.vm", "net:port=1,key=9.9.9.9")]);
+        assert_eq!(profiles.names(), ["ctf-vm"], "the first read wins");
+        let err = resolve("nope", &profiles).unwrap_err();
+        assert!(
+            err.contains("`ctf.vm`") && err.contains("is ignored"),
+            "the shadowed spelling has to be named, or it looks configured:\n{err}"
+        );
+        assert!(!err.contains("9.9.9.9"), "{err}");
+
+        let mut override_case = Profiles {
+            entries: BTreeMap::new(),
+            notes: Vec::new(),
+            file: None,
+        };
+        override_case.admit("ctf_vm".into(), FAKE, Source::Env);
+        override_case.admit("ctf-vm".into(), "net:port=1,key=9.9.9.9", Source::File);
+        assert_eq!(override_case.entries.len(), 1);
+        assert!(
+            override_case.notes.is_empty(),
+            "the environment overriding the file is documented behaviour, not a problem: {:?}",
+            override_case.notes
+        );
     }
 
     #[test]

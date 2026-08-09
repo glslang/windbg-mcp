@@ -46,7 +46,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Errors on the profile path never echo a value either. A connection string typed into `profile` —
   the one mistake that would defeat the whole feature — is refused by naming the shape a profile
-  name has, not by quoting back what it was handed.
+  name has, not by quoting back what it was handed. The same applies to a *configured* name: an
+  entry whose name is not a name is skipped and located, never quoted, because the way that happens
+  is an entry written the wrong way round.
+
+- **An engine worker is spawned without the profile variables.** It is told the one connection it
+  is opening over its private pipe and resolves nothing itself, so `WINDBG_MCP_PROFILE_*` and
+  `WINDBG_MCP_PROFILES` are stripped from its environment — a `launch`ed debuggee inherits its
+  worker's environment, and a debuggee is exactly the untrusted program that must not receive every
+  configured kernel key.
 
 ## [0.5.0] - 2026-08-08
 

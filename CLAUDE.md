@@ -125,8 +125,15 @@ the connection inside the server (`src/kdconn.rs`), so the target's debug key ne
 argument — and therefore never in the session transcript, where one key previously ended up
 replicated across hundreds of records. `attach_kernel {}` lists the profiles this host has.
 Configure one with `WINDBG_MCP_PROFILE_<NAME>` or `%USERPROFILE%\.windbg-mcp\profiles.json`; raw
-`connection` still works for a target nothing is configured for. The live smoke tier below keeps
-using `WINDBG_MCP_SMOKE_KERNEL` because that variable *is* the local configuration.
+`connection` still works for a target nothing is configured for. Note the live smoke tier below is
+one of those: `WINDBG_MCP_SMOKE_KERNEL` is a raw connection string, passed straight to
+`attach_kernel { "connection": … }`, and is deliberately *not* a profile — the tier has to exercise
+the explicit path, and it is a variable in a developer's own shell rather than something a client
+ever sees.
+
+A worker process does **not** inherit `WINDBG_MCP_PROFILE_*` (`engine::spawn_worker` strips them):
+it is told the one connection it is opening over its private pipe, and a `launch`ed debuggee would
+otherwise inherit every configured key on the host.
 
 **KDNET attach is a blocking wait, by design.** A live kernel needs `WaitForEvent(INFINITE)` (a finite
 timeout returns `E_NOTIMPL` and never drives the link). So if the target isn't reachable, the

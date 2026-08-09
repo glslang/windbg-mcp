@@ -999,6 +999,12 @@ fn an_unknown_profile_is_refused_with_the_names_that_exist_but_no_values() {
         "the refusal echoed the key it was handed:\n{text}"
     );
 
+    // One more round trip before reading the log. stderr is drained by a thread of its own with
+    // no ordering against the transport, so a line the server wrote while handling the call above
+    // may still be in the pipe — and an assertion that something is *absent* passes on a line
+    // nobody has read yet. The response to this call orders the server past both refusals.
+    server.tool_text("session_status", json!({}), STEP);
+
     // The whole point, restated over the transport itself: nothing carrying that key was ever
     // written to the client, and nothing to the log either.
     assert!(
@@ -1424,6 +1430,9 @@ fn a_profile_attach_names_its_target_without_disclosing_the_key() {
     );
     // The abandoned attach is still outstanding; its session is gone, so it has to be answered.
     server.await_id(attaching, "attach_kernel", Duration::from_secs(60));
+    // A round trip after the teardown, for the same reason as in the protocol tier: the log is
+    // drained by an unordered thread, and a negative assertion passes on a line nobody read yet.
+    server.tool_text("session_status", json!({}), STEP);
 
     assert!(
         !server.stdout_lines().iter().any(|l| l.contains(key)),
