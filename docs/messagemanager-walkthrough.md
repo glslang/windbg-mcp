@@ -318,6 +318,12 @@ debugger-free exploit.
 This run exposed several improvements that would remove orchestration risk without hiding the
 debugger mechanics.
 
+The checked-in [CTF regression runner](../examples/messagemanager/ctf_regression.ps1) automates the
+safe subset available today: it deploys a benign retained-message fixture over WinRM and proves the
+real driver, structured pool query, session reuse, and detach path through the MCP wire protocol.
+See the [smoke-test runbook](smoke-test.md#messagemanager-ctf-regression). It deliberately does not
+run the race or the debugger-assisted control-flow handoff; those remain disposable-VM proof steps.
+
 ### MCP server
 
 1. **Nonblocking continue with an execution handle.** `go` currently waits for the next stop. Add

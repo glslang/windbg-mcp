@@ -23,6 +23,7 @@ connected MCP client holds a lock on (see [`CLAUDE.md`](../CLAUDE.md)). Whole su
 | **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump | `win-kexp` / DbgEng regressions |
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a KDNET target you can freeze | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect |
+| **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
 | **Live (other)** | manual | TTD engine, elevation, a test driver | see [Manual checklist](#manual-checklist) |
 
 The protocol tier rides `cargo test`, so CI already runs it. The debugger tier is opt-in
@@ -279,6 +280,41 @@ a *dump* costs nothing. Both tests therefore collect their evidence and assert o
 target has been released: an earlier draft asserted as it went, failed at the release check, and
 left the target halted. A test for a bug that freezes a machine must not freeze the machine when
 it fails.
+
+## MessageManager CTF regression
+
+[`examples/messagemanager/ctf_regression.ps1`](../examples/messagemanager/ctf_regression.ps1)
+turns the MessageManager challenge into a repeatable live regression fixture. It builds a benign
+mode of `mm_exploit.c`, copies it to the VM over WinRM, and waits until the process has retained real
+`Tgsm` messages. It then runs the ignored Rust test through the shipped stdio MCP transport. The
+test attaches over KDNET, checks that `MessageManager.sys` is loaded, finds the retained allocations
+with `pool_find_tag`, verifies the session still serves a register request, and always attempts
+`end_session` before reporting an assertion failure.
+
+Prerequisites are a disposable VM with the challenge driver installed and running, PowerShell
+remoting enabled, a working KDNET connection back to the host, the host MSVC Build Tools path used
+by `build.cmd`, and full `nt` symbols. From the repository root:
+
+```pwsh
+$credential = Get-Credential
+$env:WINDBG_MCP_SMOKE_KERNEL = 'net:port=50000,key=<w.x.y.z>'
+$env:WINDBG_MCP_SMOKE_SYMBOLS = 'srv*C:\symbols*https://msdl.microsoft.com/download/symbols'
+.\examples\messagemanager\ctf_regression.ps1 `
+    -TargetHost ctf-vm -Credential $credential
+```
+
+The PowerShell runner owns the extra `WINDBG_MCP_SMOKE_CTF=1` gate and sets it only after the
+fixture reports ready. The fixture does not run the race or corrupt pool metadata; it uses the
+driver's ordinary Create/SetData/Delete operations to give the pool tools a stable, challenge-
+specific population. Its stop file requests orderly deletion after KD detaches, with forced process
+termination only as a timeout fallback.
+
+Host artifacts go under ignored `target\ctf-regression\`. The timestamped transcript records
+fixture and Cargo output but replaces the complete KDNET connection and any `key=` value; the
+`PSCredential` is passed directly to `New-PSSession` and is never serialized. Remote fixture files
+are removed by default. If the target is halted or has crashed, cleanup cannot reach it: recover the
+VM, remove the named remote directory if necessary, and treat the transcript's detach warning as
+the primary failure before rerunning.
 
 ## Manual checklist
 
