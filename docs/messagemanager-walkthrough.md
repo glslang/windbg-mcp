@@ -274,10 +274,10 @@ the selected target through the normal I/O manager indirect call.
 
 The captured proof was:
 
-The sanitized [plain-text MCP transcript](../examples/messagemanager/rip-proof-transcript.txt) keeps
-the decisive commands and output. A reconstructed [asciicast v2 recording](../examples/messagemanager/rip-proof.cast)
-animates the same captured events; its timing is illustrative because live recording was not enabled
-for the original run.
+The [curated MCP proof record](../examples/messagemanager/rip-proof-transcript.txt) identifies the
+live binary and distinguishes transcribed output from canonicalized commands and post-run annotations.
+A reconstructed [asciicast v2 recording](../examples/messagemanager/rip-proof.cast) animates the same
+captured events; its timing is illustrative because live recording was not enabled for the original run.
 
 ```text
 rip=fffff803`aa6fa240  nt!DbgBreakPointWithStatus

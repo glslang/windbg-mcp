@@ -4,10 +4,22 @@ MessageManager KD-assisted RIP proof transcript
 Captured: 2026-08-09 (Europe/London)
 Target: Windows Server build 26100.32995, 4 logical processors
 Harness: mm_exploit.exe rip 1 1024 0 4096
+Live proof binary SHA-256:
+  962D86CA177D4E4E999BA8EA97F2B2B6677D97A21F836707BCD728727B42566F
 Scope: CTF VM. KDNET key and guest credentials are intentionally omitted.
 
-This is the decisive MCP/DbgEng transcript, reduced only by removing repeated
-transport logs and duplicate stack frames. Addresses are boot-specific.
+This is a curated proof record, not a byte-for-byte terminal capture. Debugger
+output blocks and guest log lines are transcribed from the decisive MCP/DbgEng
+run. Lines beginning with `>>>` canonicalize the MCP/WinDbg actions, prose
+between blocks is post-run annotation, and repeated transport logs and duplicate
+stack frames were removed. Addresses are boot-specific.
+
+The exact source snapshot for the live binary was not committed; the SHA-256
+above identifies that artifact. It used the same race and trigger control flow
+as the checked-in harness, which subsequently changed only in comments and
+diagnostic wording. That includes changing the legacy final line reproduced
+verbatim below to "no natural stale-handle reclaim this run". Those edits do not
+affect the breakpoint or dispatch sequence documented here.
 
 1. Deterministic race
 ---------------------
@@ -106,9 +118,10 @@ Call Site: MessageManager+0x1560
 nt!NtDeviceIoControlFile+0x5e
 nt!KiSystemServiceCopyEnd+0x25
 
-The harness now releases its separate CREATE trigger thread on CPU 3. The stale
-caller executes the first unlink store, installs DbgBreakPointWithStatus in the
-CREATE dispatch slot, and parks at the reciprocal store.
+Before entering the stale-SetData loop, the harness has already signalled its
+separate CREATE trigger thread on CPU 3. KD then stops the stale caller on CPU 0;
+that caller executes the first unlink store, installs DbgBreakPointWithStatus in
+the CREATE dispatch slot, and parks at the reciprocal store.
 
 5. Controlled RIP
 -----------------
@@ -166,7 +179,7 @@ Guest-side final lines:
 [rip] released 512 recent Event blocks after the target free
 [rip] 1024/1024 exact-0x68 Tfub buffers retained; signalling KD via CreateFile
 [rip] starting concurrent CreateFile trigger before stale SetData
-[rip] no stale handle reclaimed this run
+[rip] no stale handle reclaimed this run; reboot/retry with larger counts
 
 That final message is expected: the direct RIP proof does not use PreviousMode,
 so the harness's legacy kernel-read probe cannot report a natural reclaim.
