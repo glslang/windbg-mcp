@@ -105,9 +105,13 @@ impl fmt::Debug for Connection {
 /// preceding delimiter and the `=`, and a value runs to the next `,`/`;`/whitespace. That means an
 /// `=` **inside** a masked value is consumed with it rather than restarting the scan — which is
 /// the case a naive split-on-`=` gets wrong, and it gets it wrong by emitting the tail of a key.
+///
+/// **All** ASCII whitespace is a boundary, line breaks included. Anything narrower is a way to
+/// defeat this: `net:port=1,\r\nkey=…` would parse as a parameter called `"\r\nkey"`, match no
+/// secret, and hand the key straight back through the session label.
 pub fn redact(connection: &str) -> String {
-    const NAME_DELIMS: &[char] = &[',', ';', ':', '=', ' ', '\t'];
-    const VALUE_DELIMS: &[char] = &[',', ';', ' ', '\t'];
+    let name_delim = |c: char| matches!(c, ',' | ';' | ':' | '=') || c.is_ascii_whitespace();
+    let value_delim = |c: char| matches!(c, ',' | ';') || c.is_ascii_whitespace();
 
     let mut out = String::with_capacity(connection.len());
     let mut rest = connection;
@@ -117,13 +121,13 @@ pub fn redact(connection: &str) -> String {
             return out;
         };
         let (head, tail) = rest.split_at(eq);
-        // All the delimiters are ASCII, so a byte index past one is a char boundary.
-        let name = &head[head.rfind(NAME_DELIMS).map_or(0, |i| i + 1)..];
+        // Every delimiter above is ASCII, so a byte index just past one is a char boundary.
+        let name = &head[head.rfind(name_delim).map_or(0, |i| i + 1)..];
         out.push_str(head);
         out.push('=');
         let value = &tail[1..];
         if SECRET_PARAMS.iter().any(|p| p.eq_ignore_ascii_case(name)) {
-            let end = value.find(VALUE_DELIMS).unwrap_or(value.len());
+            let end = value.find(value_delim).unwrap_or(value.len());
             // An empty value has nothing to mask, and masking it would invent a secret that is
             // not there — the honest rendering of `key=` is `key=`.
             if end > 0 {
@@ -216,6 +220,16 @@ impl Profiles {
     /// wrong way round, which makes the JSON *key* the connection string. A rejection is therefore
     /// counted and located, never quoted.
     fn admit(&mut self, name: String, connection: &str, source: Source) {
+        if is_profile_name(&name) && !is_dialable(connection) {
+            // Named, because the name passed its own check and so is safe to print — and the
+            // operator needs to know *which* entry to go and fix. The value stays unquoted.
+            self.notes.push(format!(
+                "profile `{name}` in {} was skipped: its connection string contains a control \
+                 character, which no connection string does.",
+                source.label()
+            ));
+            return;
+        }
         if !is_profile_name(&name) {
             self.notes.push(format!(
                 "an entry in {} was skipped: its name is not one (letters, digits, `-`, `_` or \
@@ -298,7 +312,11 @@ impl Profiles {
         format!(
             "Profiles are resolved by this server, on this host: from `{PROFILE_ENV_PREFIX}<NAME>` \
              in its environment {file}. Names are matched case-insensitively, with `-` and `_` \
-             equivalent. Ask the user to add one — this server cannot.{notes}"
+             equivalent.\n\nThis server cannot add one, but the user can, and that is the better \
+             ask than a connection string: adding `{{ \"<name>\": \"net:port=<n>,key=<w.x.y.z>\" }}` \
+             to that file (or setting `{PROFILE_ENV_PREFIX}<NAME>`) lets every later attach name it \
+             instead, and the key stays on this host. Profiles are re-read per attach, so nothing \
+             needs restarting.{notes}"
         )
     }
 
@@ -324,8 +342,24 @@ pub fn env_names() -> Vec<String> {
 /// The filter behind [`env_names`], over a supplied set so it can be tested against fixed input
 /// rather than against whatever the developer's shell happens to hold.
 fn env_names_in(keys: impl Iterator<Item = String>) -> Vec<String> {
-    keys.filter(|key| key.starts_with(PROFILE_ENV_PREFIX) || key == PROFILES_FILE_ENV)
-        .collect()
+    keys.filter(|key| {
+        profile_env_suffix(key).is_some() || key.eq_ignore_ascii_case(PROFILES_FILE_ENV)
+    })
+    .collect()
+}
+
+/// The profile name an environment variable defines, if it defines one.
+///
+/// Matched **case-insensitively**, because Windows environment-variable names are: a variable set
+/// as `$env:Windbg_Mcp_Profile_Ctf` is stored and enumerated with that spelling, and a
+/// case-sensitive test would then miss it twice over — the profile would not resolve, *and* the
+/// variable would survive [`env_names`]'s scrubbing into every worker and every launched debuggee.
+/// The second is the one that matters: a name we fail to recognise is still a key in the
+/// environment.
+fn profile_env_suffix(key: &str) -> Option<&str> {
+    let (head, suffix) = key.split_at_checked(PROFILE_ENV_PREFIX.len())?;
+    head.eq_ignore_ascii_case(PROFILE_ENV_PREFIX)
+        .then_some(suffix)
 }
 
 /// The (name, connection) pairs a set of environment variables defines.
@@ -336,7 +370,7 @@ fn env_names_in(keys: impl Iterator<Item = String>) -> Vec<String> {
 /// variables rather than the process's.
 fn env_entries(vars: impl Iterator<Item = (String, String)>) -> Vec<(String, String)> {
     vars.filter_map(|(key, value)| {
-        let suffix = key.strip_prefix(PROFILE_ENV_PREFIX)?;
+        let suffix = profile_env_suffix(&key)?;
         if suffix.is_empty() || value.trim().is_empty() {
             return None;
         }
@@ -450,7 +484,16 @@ pub fn select(connection: Option<String>, profile: Option<String>) -> Result<Sel
                 .to_string(),
         ),
         (Some(connection), None) => {
-            let connection = Connection::new(connection.trim());
+            let connection = connection.trim();
+            if !is_dialable(connection) {
+                return Err(
+                    "`connection` contains a control character, which no connection string does. \
+                     It is not repeated here, in case it carries a key. Pass it on one line, e.g. \
+                     \"net:port=50000,key=<w.x.y.z>\"."
+                        .to_string(),
+                );
+            }
+            let connection = Connection::new(connection);
             Ok(Selected {
                 label: connection.redacted(),
                 connection,
@@ -499,6 +542,19 @@ fn resolve(name: &str, profiles: &Profiles) -> Result<Selected, String> {
             profiles.how_to_configure()
         )),
     }
+}
+
+/// Whether this is a connection string this server will dial.
+///
+/// Deliberately a low bar — DbgEng owns the syntax, and reimplementing it here would reject
+/// transports nobody here has heard of — but a **control character** is never part of one, and
+/// letting one through costs more than the check. The label built from a connection goes into
+/// `session_status`'s multi-line report, so an embedded line break can forge a session line in a
+/// report a model then reasons about. ([`redact`] treats line breaks as parameter boundaries, so
+/// this is no longer also the difference between a masked key and a disclosed one — but it was,
+/// and the cheapest way to keep it from becoming that again is to refuse the input.)
+fn is_dialable(connection: &str) -> bool {
+    !connection.is_empty() && !connection.chars().any(char::is_control)
 }
 
 /// Whether this is a profile name rather than something else that got put where one belongs.
@@ -581,6 +637,21 @@ mod tests {
         let out = redact("net:port=1,password=ab=cd=ef,target=host");
         assert_eq!(out, "net:port=1,password=<redacted>,target=host");
         assert!(!out.contains("cd"), "{out}");
+    }
+
+    /// A line break before a secret parameter must not smuggle it past the scan. With only space
+    /// and tab as boundaries the name parsed as `"\r\nkey"`, matched nothing, and the key came
+    /// back through the session label — the one output redaction exists to keep clean.
+    #[test]
+    fn redaction_treats_every_ascii_whitespace_as_a_parameter_boundary() {
+        for gap in ["\r\n", "\n", "\r", "\t", " ", "\x0c"] {
+            let out = redact(&format!("net:port=1,{gap}key={FAKE_KEY}"));
+            assert!(
+                !out.contains(FAKE_KEY),
+                "gap {gap:?} defeated redaction: {out}"
+            );
+            assert!(out.contains("key=<redacted>"), "gap {gap:?}: {out}");
+        }
     }
 
     #[test]
@@ -671,6 +742,60 @@ mod tests {
             .map(String::from),
         );
         assert_eq!(names, ["WINDBG_MCP_PROFILE_CTF_VM", "WINDBG_MCP_PROFILES"]);
+    }
+
+    /// Windows environment-variable names are case-insensitive but keep the spelling they were
+    /// created with, so `$env:Windbg_Mcp_Profile_Ctf` enumerates exactly like that. A
+    /// case-sensitive test would miss it twice: the profile would not resolve, *and* the variable
+    /// would survive the scrubbing into every worker and every launched debuggee — a key we chose
+    /// not to recognise is still a key in the environment.
+    #[test]
+    fn environment_names_are_matched_the_way_windows_matches_them() {
+        let spellings = [
+            "WINDBG_MCP_PROFILE_CTF",
+            "Windbg_Mcp_Profile_Ctf",
+            "windbg_mcp_profile_ctf",
+        ];
+        for spelling in spellings {
+            let vars = [(spelling.to_string(), FAKE.to_string())];
+            assert_eq!(
+                env_entries(vars.into_iter()),
+                [("ctf".to_string(), FAKE.to_string())],
+                "{spelling} should define the profile `ctf`"
+            );
+            assert_eq!(
+                env_names_in([spelling.to_string()].into_iter()),
+                [spelling],
+                "{spelling} must be scrubbed from a worker's environment"
+            );
+        }
+        assert_eq!(
+            env_names_in([String::from("windbg_mcp_profiles")].into_iter()),
+            ["windbg_mcp_profiles"]
+        );
+    }
+
+    /// A control character is in no connection string, and the label built from one lands in
+    /// `session_status`'s multi-line report — where a line break can forge a session line.
+    #[test]
+    fn a_connection_carrying_a_control_character_is_refused_without_being_echoed() {
+        let err = select(Some(format!("net:port=1,\nkey={FAKE_KEY}")), None).unwrap_err();
+        assert!(err.contains("control character"), "{err}");
+        assert!(!err.contains(FAKE_KEY), "{err}");
+
+        // Same gate on the configured path: the entry is named (its name passed its own check)
+        // and the value is not.
+        let profiles = Profiles::from_pairs(&[
+            ("ctf-vm", FAKE),
+            ("broken", &format!("net:\nkey={FAKE_KEY}")),
+        ]);
+        assert_eq!(profiles.names(), ["ctf-vm"]);
+        let err = resolve("broken", &profiles).unwrap_err();
+        assert!(
+            err.contains("`broken`") && err.contains("control character"),
+            "{err}"
+        );
+        assert!(!err.contains(FAKE_KEY), "{err}");
     }
 
     /// The environment half of the same claim, on the real scan: a variable defines a profile

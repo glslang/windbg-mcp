@@ -70,11 +70,14 @@ a bare `execute`, which only sets the run state and doesn't move the target.
   you can act on. Only "no engine could be started at all" is a transport-level protocol error.
 - **Attach a KDNET kernel target by `profile`, not by connection string.** A connection string
   carries the target's debug key, and once it arrives as a tool argument it is in the transcript
-  for good. `attach_kernel { "profile": "<name>" }` has the server resolve it locally instead;
-  `attach_kernel {}` with no arguments lists the profiles this host has, so you never have to
-  guess a name or ask the user for a secret you don't need. Fall back to
-  `attach_kernel { "connection": "…" }` only when no profile covers the target — and never invent
-  a key. [setup.md](setup.md) covers configuring one.
+  for good. `attach_kernel { "profile": "<name>" }` has the server resolve it locally instead, and
+  `attach_kernel {}` with no arguments lists the profiles this host has — so you never have to
+  guess a name. **If none covers the target, ask the user to create a profile rather than asking
+  for the connection string**; they can set `WINDBG_MCP_PROFILE_<NAME>` or add a line to
+  `%USERPROFILE%\.windbg-mcp\profiles.json`, and it is picked up on the next attach with nothing
+  restarted. Only if they decline is `attach_kernel { "connection": "…" }` the answer — and say
+  that puts the key in the transcript, so it is their call. Never invent a key.
+  [live-and-kernel.md](live-and-kernel.md) has the exact wording to give them.
 - **Symbol *names* (`module!func`) need three things together:** (a) `msdia140.dll` and
   `symsrv.dll` bundled next to the binary, (b) a symbol path — set it with the
   **`set_symbol_path`** tool (`srv*C:\ProgramData\Dbg\sym*https://msdl.microsoft.com/download/symbols`,

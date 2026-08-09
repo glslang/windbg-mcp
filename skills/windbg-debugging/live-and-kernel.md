@@ -13,22 +13,34 @@ Pick one entry point:
 - **Attach to a running process.** `attach_process { "pid": 1234 }` — breaks in.
 - **Local kernel.** `attach_kernel_local {}` — breaks in and returns `vertarget`.
 - **Remote kernel (KDNET).** `attach_kernel` — connects, breaks in, and returns `vertarget`.
-  Takes **exactly one** of two ways to name the target, in this order of preference:
-  1. `attach_kernel { "profile": "<name>" }` — a connection configured on the debugger host,
-     which the server resolves locally. **Prefer this.** A connection string carries the
-     target's debug key, and a key that arrives as a tool argument is in the transcript for
-     good. Don't know the names? Call `attach_kernel {}` with no arguments — the refusal lists
-     the profiles this host has, so you never have to guess one.
-  2. `attach_kernel { "connection": "net:port=<n>,key=<w.x.y.z>" }` — the raw string, for a
-     target no profile covers. **Ask the user for the actual connection string**; the port and
-     key come from the target's KDNET setup (`bcdedit /dbgsettings` on the target, or the
-     `windbgx -k` / `kd -k` command they use) and cannot be guessed — never invent a
-     placeholder key. Worth telling the user a profile would keep it out of the transcript next
-     time ([setup.md](setup.md)).
+  A connection string carries the target's **debug key**, and a key that arrives as a tool
+  argument is in this conversation's transcript for good — copied on through context snapshots
+  and summaries. So the order below is not a style preference; step 3 is the one to get right.
+  1. **Know the profile name?** `attach_kernel { "profile": "<name>" }`. Done.
+  2. **Don't?** Call `attach_kernel {}` with no arguments. The refusal lists the profiles this
+     host has, so you never have to guess a name or ask the user for anything.
+  3. **No profile covers the target?** **Ask the user to create one** — do not ask for a
+     connection string. Give them both options and let them pick:
+
+     ```pwsh
+     # a) permanent, in %USERPROFILE%\.windbg-mcp\profiles.json
+     #    { "ctf-vm": "net:port=50000,key=<w.x.y.z>" }
+     # b) this session only
+     $env:WINDBG_MCP_PROFILE_CTF_VM = "net:port=50000,key=<w.x.y.z>"
+     ```
+
+     The values come from the target's KDNET setup (`bcdedit /dbgsettings` on the target, or
+     the `windbgx -k` / `kd -k` command they already use) — you cannot guess them, and must
+     never invent a placeholder key. Profiles are re-read on every attach, so once they say
+     it's saved, go straight to step 1: **nothing needs restarting**.
+  4. **Only if the user declines** — a one-off target, or they'd rather not configure anything
+     — fall back to `attach_kernel { "connection": "net:port=<n>,key=<w.x.y.z>" }`. Say plainly
+     that the key will then be in the transcript, so it is their call, not a silent default.
 
   Passing both, or neither, is refused. So is a connection string put in `profile` by mistake —
   and it is not echoed back. Sessions report their connection with the key masked
   (`net:port=50000,key=<redacted>`), so `session_status` still tells two kernel targets apart.
+  Full configuration details: [setup.md](setup.md).
 
 Each of these opens a session of its own and returns a `session_id` — opening one does not close
 another, so you can keep a kernel attach live while you look at a dump. Pass the id on later calls
