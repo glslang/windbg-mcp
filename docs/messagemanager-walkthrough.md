@@ -224,6 +224,9 @@ The reliable race uses one target MESSAGE and four CPUs. `run_to_address` stops 
 register holding the candidate equals the saved target; an assertion aborts and restores every
 temporary byte if a different list node hits first.
 
+The flush worker runs on CPU 0. The setter and its targeted reschedule storm share CPU 1, the TLB
+storm runs on CPU 2, and CPU 3 is reserved for the later concurrent CREATE trigger.
+
 Before opening the driver, the harness verifies that the calling thread's primary processor group
 and the process, system, and thread affinity masks all expose CPUs 0–3. Each race, window-extension,
 and CREATE-trigger worker must then be pinned successfully before its start gate is released; an
