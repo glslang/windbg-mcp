@@ -1,16 +1,17 @@
-# MessageManager: a pool UAF, and what it takes to see it
+# MessageManager: from a pool UAF to KD-assisted RIP control
 
 A tour of the **MessageManager** CTF driver on a **live KDNET kernel** (Windows Server 26100),
 driven end to end with windbg-mcp. Unlike the [HEVD](hevd-ioctl-walkthrough.md) and
 [mountmgr](driver-ioctl-walkthrough.md) tours — which are about *reaching* an IOCTL — this one is
-about a **use-after-free in the kernel pool**, and the tooling you need to watch a freed chunk get
-reclaimed. There is **no PDB**, so everything is `module+RVA`.
+about a **use-after-free in the kernel pool**, measuring candidate reclaims, and proving controlled
+kernel RIP with a debugger-assisted handoff when natural grooming misses. There is **no PDB**, so
+everything is `module+RVA`.
 
-> **The thesis.** The bug is a garden-variety locking mistake. The interesting part is that
-> *observing* it on Windows 26100 meant fixing the pool walker in four separate places where a new
-> OS release had quietly moved the furniture — because a pool walker that silently returns "empty"
-> is worse than no walker at all. This is the story of both: the driver's UAF, and the four
-> breakages between a walker that worked on 22H2 and one that tells the truth on 26100.
+> **The thesis.** The bug is a garden-variety locking mistake. The interesting parts are proving
+> what the allocator actually did on Windows 26100, extending the tiny refcount race without losing
+> the target object, and separating a natural reclaim from a debugger-assisted control-flow proof.
+> A pool walker that silently returns "empty" is worse than no walker at all, so this also records
+> the four fixes needed before the 26100 measurements could be trusted.
 
 The four kernel-pool tools this walkthrough leans on (`pool_find_tag`, `pool_chunk`, `pool_census`,
 `pool_diagnostics`) were built for exactly this target; see the
@@ -184,47 +185,185 @@ Each value cross-checks against the debugger: `x nt!PsInitialSystemProcess` prin
 `0xfffff806777c5ab0`, and `lm` gives the same driver base — so the leak plumbing is sound before a
 single byte of the driver is corrupted.
 
-## 6. From UAF to SYSTEM — how far the primitives reach
+## 6. Measure grooming before trusting it
 
-The intended payoff is **data-only** — the mitigations rule out anything else. CR4 on this box is
-`0xb50ef8`: **SMEP, SMAP, and CET all on**. So a ROP chain to clear CR4 is a dead end (CET faults
-the `ret`s, and there's no instruction-pointer control to begin with — the bug yields *data* writes,
-and kCFG guards indirect calls). The only viable model is to never execute attacker code:
+Create asks `ExAllocatePool2` for `0x68` bytes with `POOL_FLAG_NON_PAGED` (`0x40`) and tag `Tgsm`.
+On this build `!pool` shows an `0x80` physical LFH block; the structured walker reports `0x70`
+usable bytes. That distinction matters: matching the requested length is not proof that two call
+sites draw from the same LFH allocation context.
 
-1. **Write-what-where** via the `+0x08` LIST_ENTRY unlink in Flush/SetData: `[Blink]=Flink` with
-   collateral `[Flink+8]=Blink` — it writes a *pointer* to an attacker address, so both operands
-   must be writable kernel addresses.
-2. **Bootstrap R/W** by writing `KTHREAD.PreviousMode` (`+0x232`) to 0, which makes
-   `Nt{Read,Write}VirtualMemory` operate on kernel addresses.
-3. **Token steal:** read the System process's token via `PsInitialSystemProcess` (ntos + 0xFC5AB0)
-   and write it into this process's `_EPROCESS.Token` (`+0x248`).
+The `rip` harness in `examples/messagemanager/mm_exploit.c` creates the race target on CPU 0, keeps
+candidate allocations alive, and lets the pool tools answer the only useful grooming question:
+**did this exact address change from `ReusableFree` to attacker-controlled?** The measurements on
+Windows Server 26100.32995 were:
 
-Every step of that is worked out and the addresses are all in hand (§5). **What is *not* solved is
-step 0 — the reclaim**, and it turns out to be the whole game:
-
-> The MESSAGE keeps its exploitable fields **low**: RefCount `+0x00`, the unlink LIST_ENTRY
-> `+0x08`/`+0x10`, the arbitrary-free Buffer `+0x18`. To weaponise the freed chunk, an attacker
-> has to reclaim it with a NonPaged (`NonPagedPoolNx`, 0x70 bucket) spray whose **attacker bytes
-> land at those offsets**. Every standard medium-IL primitive fails, and it fails *systemically*:
-
-| Reclaim spray | Measured with the pool tools | Verdict |
+| Candidate | Live measurement | Result |
 |---|---|---|
-| Pipe write-data (`NpFr`) | `DATA_QUEUE_ENTRY` header is **0x30**; payload begins at chunk +0x30 | misses every field |
-| I/O ring registered buffers | bytes are read as `{Address, Length}`, and `Address` is **validated as user memory** | can't carry a kernel target |
-| Mailslot (MSFS) | FILE_OBJECT → FCB data queue is **empty**; msfs keeps no separate message chunk | no chunk to reclaim |
+| NPFS write-data (`NpFr`) | physical blocks were `0xa0`; payload followed an NPFS header | wrong bucket and offset |
+| Pending METHOD_BUFFERED requests (`IoSB`) | 784/1024 exact-`0x68` SystemBuffers stayed parked | target remained `ReusableFree` |
+| Event objects | requested `0x68` and appeared in mixed `0x80` LFH blocks near `Tgsm` | useful density groom, unreliable reclaim |
+| Retained SetData buffers (`Tfub`) | 1024 exact-`0x68` driver copies | target remained free: SetData uses `POOL_FLAG_PAGED` (`0x100`) |
+| SetData with KD-patched tag and flags | `Tgsm` plus `POOL_FLAG_NON_PAGED` (`0x40`) | still missed; call-site/subsegment selection remained different |
 
-The pattern is the point: every list-managed NonPaged object carries a `LIST_ENTRY`/header of ≥0x10
-before its first attacker-controlled byte — *above* exactly where this bug needs control. So the
-exploit's difficulty isn't the driver bug (a textbook locking UAF) or the mitigations (data-only
-sidesteps them); it's finding a **verbatim NonPaged reclaim** at this size. That is a genuine,
-open research question.
+`pool_census` established the population, `pool_find_tag` found the candidate classes, and
+`pool_chunk(refresh=true)` gave the final per-address verdict. The tools do not mutate or groom
+pool state; they prevent a plausible-looking spray count from being mistaken for a reclaim.
 
-**What this walkthrough establishes, then, is exploit*ability*, not a shell:** the UAF is confirmed
-and reproducible (§3), control of the freed chunk is *demonstrated* (the pipe reclaim lands
-attacker bytes in it — just at the wrong offset), and the two forward primitives — the unlink
-write-what-where and an **unconditional** arbitrary-free (`SetData` frees `msg+0x18` before it
-reallocates) — are pinned to exact instructions (§3). The reclaim, and the double-free →
-type-confusion route that would sidestep the offset problem, are where the work continues.
+The [SSTIC 2020 pool-overflow work](https://www.sstic.org/2020/presentation/pool_overflow_exploitation_since_windows_10_19h1/)
+is applicable to the allocator model: LFH subsegments, affinity slots, and free-bitmap randomisation
+explain why density and CPU placement matter. Its aligned-chunk-confusion overflow is not this
+driver's UAF primitive, though, and the live address checks above disprove a size-only translation
+of that technique. For short race windows, the reschedule/TLB-pressure ideas are closer to
+[Project Zero's tiny-race work](https://googleprojectzero.blogspot.com/2022/03/racing-against-clock-hitting-tiny.html)
+and [ExpRace](https://www.usenix.org/system/files/sec21-lee-yoochan.pdf); here KD makes the final
+experiment deterministic instead of pretending the scheduler trick is reliable.
+
+## 7. Deterministic UAF and debugger-assisted handoff
+
+The reliable race uses one target MESSAGE and four CPUs. `run_to_address` stops only when the
+register holding the candidate equals the saved target; an assertion aborts and restores every
+temporary byte if a different list node hits first.
+
+1. Stop the SetData caller at the unlink (`MessageManager+0x16e4`), set the target refcount to 3,
+   and replace the first four unlink bytes with `jmp $`.
+2. Let Flush reach `+0x1502`. Its `lock xadd -1` changes the same object from 3 to 2.
+3. Restore the unlink and let SetData reach `+0x1706`; its final decrement leaves 1.
+4. Let Flush reach `+0x151b`, immediately before it frees that exact object; continuing toward the
+   first post-free allocation performs the free. In the successful run the target was
+   `ffff9a04'94a74010`; `!pool` showed the physical `0x80` `Tgsm` block.
+
+Natural grooming still did not return that address. To validate the downstream UAF and control-flow
+chain independently of allocator luck, KD stopped after the first post-free `ExAllocatePool2` at
+`SetData+0x1668`. The real return was `ffff9a04'94895f10`; KD deliberately changed `RAX` to the
+freed target before the driver stored the pointer and copied the `0x68`-byte fake MESSAGE.
+
+That is a **debugger-assisted handoff, not a standalone reclaim**. It leaks the real allocation and
+does not mark the target allocated in LFH metadata, so the VM must be rebooted after the experiment.
+Keeping this boundary explicit is important: the handoff proves the object layout, stale lookup,
+unlink primitive, and final indirect call; it does not claim a production-quality pool spray.
+
+## 8. Direct RIP control without `PreviousMode`
+
+The first post-UAF attempt used the usual data-only bootstrap: set fake `Flink` to a writable kernel
+anchor ending in `0x0800`, set fake `Blink` to `KTHREAD.PreviousMode`, and let the unlink's second
+store make the low byte zero. Windows 26100.32995 immediately bugchecked with `0x1F9`,
+`PREVIOUS_MODE_MISMATCH`, on return to user mode. The installed 26100 WDK names that stop code in
+`bugcodes.h`; this route is mitigated on the tested build and is not a SYSTEM primitive here.
+
+RIP control can instead be proved before the vulnerable syscall returns. The unlink at
+`MessageManager+0x16e4` is:
+
+```text
++0x16ef  mov qword ptr [rax],rcx       ; [Blink]   = Flink
++0x16f2  mov qword ptr [rcx+8],rax     ; [Flink+8] = Blink
+```
+
+At the synchronization `IRP_MJ_CREATE`, KD derives
+`&DriverObject->MajorFunction[IRP_MJ_CREATE]` from `DeviceObject` and rewrites the fake:
+
+```text
+fake.Flink = nt!DbgBreakPointWithStatus
+fake.Blink = &DriverObject->MajorFunction[IRP_MJ_CREATE]
+```
+
+The first unlink store therefore installs a kCFG-valid kernel export in the dispatch slot. The
+reciprocal store would try to write into read-only kernel code, so KD temporarily changes `+0x16f2`
+to `jmp $`. A second harness thread, pinned to CPU 3, continuously opens `\\.\MessageDevice`; the
+stale SetData caller remains on CPU 0. Once the dispatch pointer changes, the trigger thread reaches
+the selected target through the normal I/O manager indirect call.
+
+The captured proof was:
+
+The sanitized [plain-text MCP transcript](../examples/messagemanager/rip-proof-transcript.txt) keeps
+the decisive commands and output. A reconstructed [asciicast v2 recording](../examples/messagemanager/rip-proof.cast)
+animates the same captured events; its timing is illustrative because live recording was not enabled
+for the original run.
+
+```text
+rip=fffff803`aa6fa240  nt!DbgBreakPointWithStatus
+THREAD ffff9a04`93426080  Cid 0da0.0a2c  RUNNING on processor 3
+Owning Process ffff9a04`93d4b440  Image: mm_exploit.exe
+
+nt!DbgBreakPointWithStatus
+nt!IopfCallDriver+0x5b
+nt!IofCallDriver+0x13
+nt!IopParseDevice+0x73b
+nt!NtCreateFile+0x79
+
+MM_PROOF_PROCESS_OK
+MM_PROOF_CONCURRENT_THREAD_OK
+```
+
+The stale caller was a different thread (`ffff9a04'94017080`) in the same process, stopped at
+`MessageManager+0x1560` on CPU 0. After capture, KD restored the CREATE slot to
+`MessageManager+0x1210`, changed the reciprocal store to NOPs so the parked caller could pass it,
+redirected the trigger to the original CREATE handler, and finally restored the original
+`48 89 41 08` bytes. A final read verified both the dispatch pointer and instruction bytes before a
+clean reboot discarded the intentionally corrupted free chunk.
+
+This establishes controlled kernel RIP on the challenge build. It remains a debugger-assisted CTF
+proof because the exact LFH reclaim is not natural; it makes no claim of privilege escalation or a
+debugger-free exploit.
+
+## 9. Streamlining the next kernel CTF
+
+This run exposed several improvements that would remove orchestration risk without hiding the
+debugger mechanics.
+
+### MCP server
+
+1. **Nonblocking continue with an execution handle.** `go` currently waits for the next stop. Add
+   `continue_async`, `wait_for_stop`, and `break_in` so an agent can arm KD, launch the guest process,
+   and then await a stop without relying on guest `Sleep` or a second ad-hoc client.
+2. **Transactional breakpoint scripts.** A tool should accept ordered steps such as “run here,
+   assert `rbx == target`, patch these bytes, run there” plus a rollback block. The worker can restore
+   code, clear breakpoints, and report the last completed step even if a command, transport, or client
+   fails. This is safer than cleanup hidden in PowerShell conditionals.
+3. **Named debugger variables.** Keep host-side names (`target_message`, `create_slot`,
+   `original_create`) and materialise them only when issuing a command. WinDbg `$tN` registers are a
+   scarce global namespace; the first proof cleanup failed because an assertion helper reused
+   `$t2`–`$t4`.
+4. **Streamed, sanitized transcripts.** Emit each tool request, verdict, stop reason, register delta,
+   and rollback action as JSONL while the batch is running, with connection strings redacted. An
+   optional asciicast sink would make the recording in this directory live rather than reconstructed.
+5. **Structured conditional breakpoints.** Extend `run_to_address` with register/memory predicates
+   and on-hit reads. Returning `wrong-object` as a normal verdict would replace the current pattern
+   of stopping first and running a separate assertion command.
+6. **Pool-address watch mode.** After one full walk, track a selected chunk across stops and report
+   state/tag/subsegment changes without refreshing the entire pool. Include requested size, usable
+   size, physical block size, pool flags, LFH subsegment, affinity slot, and whether the allocation
+   context changed. That data is exactly what distinguished `Tgsm`, `IoSB`, `Even`, and `Tfub` here.
+7. **Command-level error attribution.** Split semicolon command batches internally and return the
+   failing subcommand plus completed mutations. DbgEng's `0x80040205` otherwise hides whether a
+   preceding restore happened.
+8. **Explicit resume-and-detach verification.** `end_session` should report the final target state
+   and, for live KD, optionally verify that the guest clock advances. A `continue_and_detach` tool
+   would make WinRM handoffs predictable.
+
+### Target VM
+
+1. **Guest coordinator service.** Bake in a minimal authenticated lab service that can create the
+   harness suspended, return PID/TID and image hash, then resume it on a host command. It should also
+   expose log-tail and clean reboot operations. This replaces timing guesses without weakening the
+   challenge driver.
+2. **Checkpoint lifecycle.** Keep a named clean snapshot and automate
+   `revert → boot → health check → run → collect dump/log → revert`. The forced handoff deliberately
+   violates LFH metadata, so snapshot rollback is the correct cleanup boundary.
+3. **Stable debug/remoting network.** Use a dedicated KDNET adapter, fixed guest address or DHCP
+   reservation, baked-in WinRM firewall rules, and a health probe that compares the guest's leaked
+   kernel base with KD's `vertarget` before a run.
+4. **Two verifier profiles.** Maintain a fast exploit profile with Driver Verifier off and a triage
+   profile with Special Pool/pool tracking enabled. Record the active profile in every transcript;
+   verifier changes both allocator behaviour and crash timing.
+5. **Deterministic topology.** Pin the VM to four fixed vCPUs, disable CPU hot-add/dynamic topology,
+   and keep memory size constant. The harness assumes CPUs 0/1 for the victim race and 2/3 for
+   pressure/trigger threads.
+6. **Crash artefact collection.** Configure kernel or active-memory dumps, retain the most recent
+   dump across reboot, and copy the bugcheck code/parameters plus harness hash into a small manifest.
+   The `0x1F9` result was much easier to classify once it could be tied to the exact build.
+7. **Build identity and secret hygiene.** Print the driver/harness SHA-256 and OS build at launch,
+   but keep KD keys and credentials in host credential storage rather than scripts, logs, snapshots,
+   or the repository.
 
 ## Gotchas recap
 
@@ -232,6 +371,18 @@ type-confusion route that would sidestep the offset problem, are where the work 
 - **The whole guest freezes while broken in** — the KD link only runs the target in bursts between
   break-ins, too short for a WinRM round-trip. For guest-side work, `end_session` to detach fully,
   then re-attach to observe. Release with `end_session`, never a process kill (it wedges the KD stub).
+- **Guest `Sleep` is not a reliable host-side launch delay under KD** — interrupt time barely
+  advances while the guest is stopped. Arm `run_to_address` first and launch the harness through a
+  separate remoting call instead of guessing a delay.
+- **`PREVIOUS_MODE_MISMATCH` is enforced on this build** — zeroing `KTHREAD.PreviousMode` and
+  returning through the syscall boundary bugchecks with `0x1F9`; do not present that legacy
+  bootstrap as a working 26100 privilege-escalation primitive.
+- **Debugger pseudo-registers are scratch state** — assertion helpers use `$t2` through `$t4`.
+  Derive cleanup pointers again from live registers or reserve pseudo-registers the helper cannot
+  clobber.
+- **A forced allocation return is not pool metadata** — after the KD-assisted handoff, restore code
+  and dispatch pointers, capture the proof, and reboot the disposable VM before LFH reuses the
+  intentionally corrupted free chunk.
 - **A pool walker that "sees nothing" is not proof of an empty pool** — treat "rejected everything"
   as an error; the tools surface walk coverage (`complete`) and diagnostics for exactly this.
 - **`!analyze` can misname the faulting module** — trust the bugcheck banner and `IP_IN_PAGED_CODE`.
