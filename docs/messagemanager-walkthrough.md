@@ -224,6 +224,11 @@ The reliable race uses one target MESSAGE and four CPUs. `run_to_address` stops 
 register holding the candidate equals the saved target; an assertion aborts and restores every
 temporary byte if a different list node hits first.
 
+Before opening the driver, the harness verifies that the calling thread's primary processor group
+and the process, system, and thread affinity masks all expose CPUs 0–3. Each race, window-extension,
+and CREATE-trigger worker must then be pinned successfully before its start gate is released; an
+affinity-restricted launch fails instead of silently running the experiment with co-scheduled threads.
+
 1. Stop the SetData caller at the unlink (`MessageManager+0x16e4`), set the target refcount to 3,
    and replace the first four unlink bytes with `jmp $`.
 2. Let Flush reach `+0x1502`. Its `lock xadd -1` changes the same object from 3 to 2.
