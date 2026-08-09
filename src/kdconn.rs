@@ -248,15 +248,35 @@ fn split_transport(connection: &str) -> (&str, &str) {
 ///   separator, `key` has an empty value and `1.2.3.4` becomes a bare flag, rendered verbatim.
 ///
 /// Nothing in the string says which was meant. So rather than pick — the choice this has now been
-/// wrong about in both directions — an ambiguous connection is reported as [`OPAQUE`] and keeps
-/// none of its detail. It costs a readable label for a string that [`is_dialable`] refuses anyway,
-/// which is the trade worth making: the label exists to tell two targets apart, and there is no
-/// version of that worth disclosing a key for.
+/// wrong about in both directions — a connection carrying any [`is_ambiguous`] character is
+/// reported as [`OPAQUE`] and keeps none of its detail. It costs a readable label for a string
+/// that [`is_dialable`] refuses anyway, which is the trade worth making: the label exists to tell
+/// two targets apart, and there is no version of that worth disclosing a key for.
 fn redact(connection: &str) -> String {
-    if connection.chars().any(char::is_whitespace) {
+    if connection.chars().any(is_ambiguous) {
         return OPAQUE.to_string();
     }
     Parsed::of(connection).render(Secrets::Mask)
+}
+
+/// A character with no unambiguous place *between* the parameters of a connection string.
+///
+/// The single rule behind both gates, and they have to agree: [`is_dialable`] decides whether a
+/// connection may be dialled at all, [`redact`] whether one may be rendered in detail, and a
+/// character that only one of them refuses is a character that reaches the parse from the route
+/// the other guards. That gap is not theoretical — `trim` strips whitespace only, so a name of
+/// `"\u{0}key"` compares equal to nothing and its value is emitted verbatim, which is the same
+/// failure the whitespace refusal exists to prevent.
+///
+/// - **Whitespace** reads as either a separator or filler, and each leaks under the other (see
+///   [`redact`]).
+/// - A **control character** belongs to no parameter, and would let a label forge a line in
+///   `session_status`'s multi-line report.
+///
+/// Applied to the *interior* only: callers trim first, so a pasted string with a trailing newline
+/// is fine.
+fn is_ambiguous(c: char) -> bool {
+    c.is_whitespace() || c.is_control()
 }
 
 /// Which of the two sources a profile came from. Carried so that a name defined twice can say
@@ -701,21 +721,14 @@ fn once_each(profile: &Profile) -> String {
 /// Whether this is a connection string this server will dial.
 ///
 /// Deliberately a low bar — DbgEng owns the syntax, and reimplementing it here would reject
-/// transports nobody here has heard of — but two kinds of character are never part of one, and
-/// each costs more to allow than to refuse. Checked after the outer trim, so a pasted string with
-/// a trailing newline is still fine; this is about what sits *between* the parameters.
+/// transports nobody here has heard of — refusing exactly what [`is_ambiguous`] describes, which
+/// is the same rule [`redact`] renders by. The two must agree: a character only one of them
+/// refuses reaches the parse by whichever route the other guards.
 ///
-/// - A **control character** would let the label forge a line in `session_status`'s multi-line
-///   report, which a model then reasons about.
-/// - **Whitespace** makes the parameter boundaries ambiguous, and [`redact`] documents why that
-///   ambiguity cannot be resolved safely in either direction. A connection carrying it is
-///   reported opaquely rather than in detail, so refusing it up front is also the only way the
-///   caller learns *why* their label went blank.
+/// Refusing here *as well as* rendering opaquely there is what lets a caller learn why their
+/// label would otherwise have gone blank.
 fn is_dialable(connection: &str) -> bool {
-    !connection.is_empty()
-        && !connection
-            .chars()
-            .any(|c| c.is_control() || c.is_whitespace())
+    !connection.is_empty() && !connection.chars().any(is_ambiguous)
 }
 
 /// Whether this is a profile name rather than something else that got put where one belongs.
@@ -1101,7 +1114,15 @@ mod tests {
             format!("net:port=1,key\t={FAKE_KEY}"),
             format!("net:port=1,key={FAKE_KEY} target=host"),
             format!("net:port=1,\r\nkey={FAKE_KEY}"),
+            // Control characters that are *not* whitespace. `trim` does not strip these, so a
+            // guard that refused only whitespace would let `"\u{0}key"` through the parse as a
+            // name matching no secret — and emit the value whole. The two gates share one rule
+            // precisely so this cannot differ between them.
+            format!("net:port=1,\u{0}key={FAKE_KEY}"),
+            format!("net:port=1,\u{7f}key={FAKE_KEY}"),
+            format!("net:port=1,key\u{1}={FAKE_KEY}"),
         ] {
+            assert!(!is_dialable(&ambiguous), "should be refused: {ambiguous:?}");
             let out = redact(&ambiguous);
             assert!(!out.contains(FAKE_KEY), "{ambiguous:?} leaked: {out}");
             assert_eq!(out, OPAQUE, "for {ambiguous:?}");

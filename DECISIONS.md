@@ -45,6 +45,12 @@ guessing. It costs a readable label for a string that is refused anyway; the lab
 two targets apart, and no version of that is worth disclosing a key for. (The outer trim runs
 first, so a pasted string with a trailing newline is still fine.)
 
+**Both gates read one predicate**, `is_ambiguous` — whitespace or a control character. They have to
+agree: a character only one of them refuses is a character that reaches the parse by whichever route
+the other guards, and the first cut of this had exactly that gap. `trim` strips whitespace only, so
+a name of `"\u{0}key"` compared equal to nothing and its value was emitted whole — the same failure
+the whitespace refusal was added to prevent, one character class over.
+
 **The unredacted render is `cfg(test)`.** `Secrets::Keep` does not exist in a release build — a
 build that could produce an unredacted render would be a build with a second way to print a key.
 The totality check needs it; nothing else may have it.
