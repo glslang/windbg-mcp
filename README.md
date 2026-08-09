@@ -338,10 +338,15 @@ $env:WINDBG_MCP_PROFILE_CTF_VM = "net:port=50000,key=1.2.3.4"
 ```
 
 Keep that file out of any repository — it holds keys, and it is deliberately machine-local. Names
-are matched case-insensitively with `-`, `_` and `.` equivalent, and they are re-read on every
-attach, so adding one does not mean restarting the client. `attach_kernel` with **neither** selector
-answers with the names this host has, which is how an agent discovers them without ever asking the
-user for a string.
+are matched case-insensitively with `-`, `_` and `.` equivalent (as are the environment-variable
+names themselves, since Windows matches those that way).
+
+The two sources differ in **when a change lands**. The file is re-read on every attach, so adding a
+profile to it works immediately with nothing restarted — that is the one to edit mid-session. An
+environment variable is read from the server's own environment, fixed when the process started, so
+it belongs in the MCP client's server definition and takes a server restart to change.
+`attach_kernel` with **neither** selector answers with the names this host has, which is how an
+agent discovers them without ever asking the user for a string.
 
 Configured profiles stay in the supervisor: an engine worker is spawned **without** the
 `WINDBG_MCP_PROFILE_*` variables, and is told only the one connection it is opening, over its

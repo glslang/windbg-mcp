@@ -73,10 +73,12 @@ a bare `execute`, which only sets the run state and doesn't move the target.
   for good. `attach_kernel { "profile": "<name>" }` has the server resolve it locally instead, and
   `attach_kernel {}` with no arguments lists the profiles this host has — so you never have to
   guess a name. **If none covers the target, ask the user to create a profile rather than asking
-  for the connection string**; they can set `WINDBG_MCP_PROFILE_<NAME>` or add a line to
-  `%USERPROFILE%\.windbg-mcp\profiles.json`, and it is picked up on the next attach with nothing
-  restarted. Only if they decline is `attach_kernel { "connection": "…" }` the answer — and say
-  that puts the key in the transcript, so it is their call. Never invent a key.
+  for the connection string** — specifically to add a line to `%USERPROFILE%\.windbg-mcp\profiles.json`,
+  which is re-read on every attach, so it works with nothing restarted. (A
+  `WINDBG_MCP_PROFILE_<NAME>` variable is read from the server's own environment at startup, so
+  setting one in a shell now does nothing until the server restarts — don't offer it as the
+  immediate fix.) Only if they decline is `attach_kernel { "connection": "…" }` the answer — and
+  say that puts the key in the transcript, so it is their call. Never invent a key.
   [live-and-kernel.md](live-and-kernel.md) has the exact wording to give them.
 - **Symbol *names* (`module!func`) need three things together:** (a) `msdia140.dll` and
   `symsrv.dll` bundled next to the binary, (b) a symbol path — set it with the
