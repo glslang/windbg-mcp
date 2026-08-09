@@ -95,61 +95,141 @@ impl fmt::Debug for Connection {
     }
 }
 
+/// Whether a rendering of a connection string may include its secrets.
+///
+/// `Keep` exists **only under `cfg(test)`**, and that is the point rather than an accident: the
+/// unredacted render is how "the parse lost nothing" is checked, and a build that could produce
+/// one would be a build with a second way to print a key. There is no such build.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Secrets {
+    #[cfg(test)]
+    Keep,
+    Mask,
+}
+
+/// A connection string, split into the parts DbgEng's syntax actually has: a transport prefix
+/// (`net:`) and a list of comma- or semicolon-separated parameters, each `name=value` or a bare
+/// flag.
+///
+/// **This exists so that redaction is a property of the structure rather than of a scanner.** The
+/// previous implementation walked the raw string deciding, at each `=`, where a name began and a
+/// value ended — and every delimiter it did not anticipate was a way to make a secret parameter
+/// unrecognisable (`,\r\nkey=…` parsed as a parameter named `"\r\nkey"`) or a value invisible
+/// (`key= …` measured as empty, and the remainder then emitted whole). Four such holes were found
+/// in review, each individually small, and the reason there were four is that the scanner had no
+/// invariant to violate.
+///
+/// The parse has one, and it is what the fix rests on: **it is total.** Every byte of the input
+/// lands in exactly one field — prefix, name, value, or separator — so rendering with
+/// [`Secrets::Keep`] reproduces the input exactly, which the tests assert over a generated corpus
+/// as well as the awkward cases. Given that, redaction is no longer a hunt: a value is emitted
+/// only from a `value` field, and a `value` field belonging to a secret parameter is never emitted
+/// at all. Decoration around it — whitespace, line breaks, repeated separators — changes which
+/// *field* text lands in, and cannot change which parameter owns it, because the boundaries are
+/// the two structural ones DbgEng itself uses: the separators between items, and the first `=`
+/// within one.
+struct Parsed<'a> {
+    /// The transport, `net:` included, or empty. Never a parameter, so never a secret.
+    prefix: &'a str,
+    params: Vec<Param<'a>>,
+}
+
+/// One item of a connection string.
+struct Param<'a> {
+    /// The name as written, whitespace and all. Compared trimmed, rendered verbatim.
+    name: &'a str,
+    /// Everything after the first `=`, including any gap before the value proper. `None` for a
+    /// bare flag (`com:port=com1,pipe`), which has no value to hide.
+    value: Option<&'a str>,
+    /// The separator that ended this item, or `None` for the last one. Kept so the render is a
+    /// faithful reproduction rather than a re-formatting.
+    end: Option<char>,
+}
+
+impl<'a> Param<'a> {
+    fn of(item: &'a str, end: Option<char>) -> Self {
+        match item.split_once('=') {
+            Some((name, value)) => Self {
+                name,
+                value: Some(value),
+                end,
+            },
+            None => Self {
+                name: item,
+                value: None,
+                end,
+            },
+        }
+    }
+
+    fn is_secret(&self) -> bool {
+        SECRET_PARAMS
+            .iter()
+            .any(|p| p.eq_ignore_ascii_case(self.name.trim()))
+    }
+
+    fn render(&self, secrets: Secrets, out: &mut String) {
+        out.push_str(self.name);
+        if let Some(value) = self.value {
+            out.push('=');
+            // A value that is blank has nothing to hide, and masking it would invent a secret
+            // that is not there — the honest rendering of `key=` is `key=`.
+            let hide = secrets == Secrets::Mask && self.is_secret() && !value.trim().is_empty();
+            out.push_str(if hide { MASK } else { value });
+        }
+        if let Some(end) = self.end {
+            out.push(end);
+        }
+    }
+}
+
+impl<'a> Parsed<'a> {
+    fn of(connection: &'a str) -> Self {
+        let (prefix, rest) = split_transport(connection);
+        let mut params = Vec::new();
+        let mut start = 0;
+        for (at, c) in rest.char_indices() {
+            if matches!(c, ',' | ';') {
+                params.push(Param::of(&rest[start..at], Some(c)));
+                start = at + c.len_utf8();
+            }
+        }
+        // Always one final item, empty if the string ended on a separator — which is what keeps
+        // the render faithful for `net:port=1,`.
+        params.push(Param::of(&rest[start..], None));
+        Self { prefix, params }
+    }
+
+    fn render(&self, secrets: Secrets) -> String {
+        let mut out = String::with_capacity(self.prefix.len() + 32);
+        out.push_str(self.prefix);
+        for param in &self.params {
+            param.render(secrets, &mut out);
+        }
+        out
+    }
+}
+
+/// Splits the transport prefix from the parameter list.
+///
+/// The `:` counts only *before* the first `=`. After one it is inside a value — `key=a:b` is a
+/// parameter, not a transport called `key=a` — and treating it as a separator would put half a
+/// value in the prefix, where nothing is ever masked.
+fn split_transport(connection: &str) -> (&str, &str) {
+    let before_first_value = connection.find('=').unwrap_or(connection.len());
+    match connection[..before_first_value].rfind(':') {
+        Some(at) => connection.split_at(at + 1),
+        None => ("", connection),
+    }
+}
+
 /// Masks the secret parameters of a connection string, leaving everything else readable.
 ///
 /// `net:port=50000,key=1.2.3.4` → `net:port=50000,key=<redacted>`. The transport and the port are
 /// what let a person tell two sessions apart, and neither is a secret, so this masks *values* and
-/// never the whole string.
-///
-/// Scans for `<name>=`, decides on the name, and skips the value: a name is what sits between the
-/// preceding delimiter and the `=`, and a value runs to the next `,`/`;`/whitespace. That means an
-/// `=` **inside** a masked value is consumed with it rather than restarting the scan — which is
-/// the case a naive split-on-`=` gets wrong, and it gets it wrong by emitting the tail of a key.
-///
-/// **All** ASCII whitespace is a boundary, line breaks included, and whitespace between the `=`
-/// and the value is skipped rather than read as an empty value. Both are ways this has been
-/// defeated: `net:port=1,\r\nkey=…` parsed as a parameter called `"\r\nkey"` and matched no
-/// secret, and `key= …` measured a zero-length value and masked nothing. Each ended with the key
-/// back in the session label, which is the one place it must never be.
+/// never the whole string. See [`Parsed`] for why it goes through a parse rather than a scan.
 pub fn redact(connection: &str) -> String {
-    let name_delim = |c: char| matches!(c, ',' | ';' | ':' | '=') || c.is_ascii_whitespace();
-    let value_delim = |c: char| matches!(c, ',' | ';') || c.is_ascii_whitespace();
-
-    let mut out = String::with_capacity(connection.len());
-    let mut rest = connection;
-    loop {
-        let Some(eq) = rest.find('=') else {
-            out.push_str(rest);
-            return out;
-        };
-        let (head, tail) = rest.split_at(eq);
-        // Every delimiter above is ASCII, so a byte index just past one is a char boundary.
-        let name = &head[head.rfind(name_delim).map_or(0, |i| i + 1)..];
-        out.push_str(head);
-        out.push('=');
-        let value = &tail[1..];
-        if SECRET_PARAMS.iter().any(|p| p.eq_ignore_ascii_case(name)) {
-            // Whitespace *after* the `=` is a gap before the value, not the value being empty —
-            // and whitespace is a value delimiter, so failing to skip it is how `key= 1.2.3.4`
-            // came out whole: the value measured zero length, nothing was masked, and the rest of
-            // the string (key included) was then emitted verbatim by the no-more-`=` exit.
-            let gap = value.len()
-                - value
-                    .trim_start_matches(|c: char| c.is_ascii_whitespace())
-                    .len();
-            let (spacing, value) = value.split_at(gap);
-            out.push_str(spacing);
-            let end = value.find(value_delim).unwrap_or(value.len());
-            // A genuinely empty value has nothing to mask, and masking it would invent a secret
-            // that is not there — the honest rendering of `key=` is `key=`.
-            if end > 0 {
-                out.push_str(MASK);
-            }
-            rest = &value[end..];
-        } else {
-            rest = value;
-        }
-    }
+    Parsed::of(connection).render(Secrets::Mask)
 }
 
 /// Which of the two sources a profile came from. Carried so that a name defined twice can say
@@ -595,9 +675,9 @@ fn once_each(profile: &Profile) -> String {
 /// transports nobody here has heard of — but a **control character** is never part of one, and
 /// letting one through costs more than the check. The label built from a connection goes into
 /// `session_status`'s multi-line report, so an embedded line break can forge a session line in a
-/// report a model then reasons about. ([`redact`] treats line breaks as parameter boundaries, so
-/// this is no longer also the difference between a masked key and a disclosed one — but it was,
-/// and the cheapest way to keep it from becoming that again is to refuse the input.)
+/// report a model then reasons about. ([`Parsed`] handles line breaks structurally, so this is no
+/// longer also the difference between a masked key and a disclosed one — but it was, and the
+/// cheapest way to keep it from becoming that again is to refuse the input.)
 fn is_dialable(connection: &str) -> bool {
     !connection.is_empty() && !connection.chars().any(char::is_control)
 }
@@ -640,6 +720,105 @@ mod tests {
     #[test]
     fn redaction_masks_the_key_and_keeps_the_rest() {
         assert_eq!(redact(FAKE), "net:port=50000,key=<redacted>");
+    }
+
+    /// The invariant the whole design rests on: **the parse is total.** Every byte of the input
+    /// lands in exactly one field, so rendering it back with secrets kept reproduces the input
+    /// character for character.
+    ///
+    /// This is what makes redaction structural rather than anticipatory. If a decoration existed
+    /// that the parse silently dropped or duplicated, its bytes would be unaccounted for — and an
+    /// unaccounted-for byte is precisely how a scanner leaks half a key. Asserted here over the
+    /// awkward shapes rather than the tidy ones, including every input that was a bug.
+    #[test]
+    fn the_parse_accounts_for_every_byte_of_its_input() {
+        let cases = [
+            FAKE,
+            "",
+            ":",
+            "=",
+            ",",
+            "key",
+            "key=",
+            "net:port=1,key=",
+            "net:port=1,",
+            "net:port=1,,key=x",
+            "net:port=1;key=x",
+            "com:port=com1,baud=115200,pipe,reconnect",
+            "npipe:server=box,pipe=dbg,password=hunter2",
+            "net:port=1,key=a=b=c,target=host",
+            "net:port=1,key=a:b,target=host",
+            "net:port=1,\r\nkey= 1.2.3.4  ,target=host",
+            "  net:port=1 , key = 1.2.3.4 ",
+            "key=1.2.3.4",
+            "no-parameters-at-all",
+            "ünïcödé:port=1,key=1.2.3.4",
+        ];
+        for case in cases {
+            assert_eq!(
+                Parsed::of(case).render(Secrets::Keep),
+                case,
+                "the parse lost or invented bytes for {case:?}"
+            );
+        }
+    }
+
+    /// The same invariant over a generated corpus, with both halves of the actual claim checked:
+    /// a secret parameter never survives redaction, and a non-secret one always does.
+    ///
+    /// Both directions matter. Leaking is the failure this module exists to prevent; over-masking
+    /// is the failure that would make a redacted label useless for telling two targets apart, and
+    /// the tempting over-broad fixes (mask anything that looks like a value) fail exactly here.
+    /// The decorations are the ones that defeated the previous scanner, permuted around the two
+    /// positions they can occupy.
+    #[test]
+    fn no_decoration_around_a_parameter_changes_which_parameter_it_is() {
+        const GAPS: &[&str] = &["", " ", "\t", "\r\n", "   "];
+        const SEPARATORS: &[char] = &[',', ';'];
+        // Secret, secret in another case, and two that merely resemble one.
+        const NAMES: &[(&str, bool)] = &[
+            ("key", true),
+            ("KeY", true),
+            ("password", true),
+            ("pubkey", false),
+            ("keyring", false),
+            ("port2", false),
+        ];
+
+        let mut checked = 0;
+        for before in GAPS {
+            for after in GAPS {
+                for separator in SEPARATORS {
+                    for (name, secret) in NAMES {
+                        let input = format!(
+                            "net:port=1{separator}{before}{name}={after}{FAKE_KEY}{separator}target=host"
+                        );
+                        assert_eq!(
+                            Parsed::of(&input).render(Secrets::Keep),
+                            input,
+                            "not accounted for: {input:?}"
+                        );
+                        let redacted = redact(&input);
+                        assert_eq!(
+                            !redacted.contains(FAKE_KEY),
+                            *secret,
+                            "`{name}` with gaps {before:?}/{after:?} redacted as {redacted:?}"
+                        );
+                        // Whatever happened to the secret, the readable parts survive — that is
+                        // what a redacted label is *for*.
+                        assert!(
+                            redacted.starts_with("net:port=1") && redacted.ends_with("target=host"),
+                            "{redacted:?}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            checked, 300,
+            "the corpus shrank; the coverage claim moved with it"
+        );
     }
 
     #[test]

@@ -5,6 +5,43 @@ status. Keep entries short; link to code with `file:line` where it helps a futur
 
 ---
 
+## Connection strings are parsed, not scanned (2026-08-09, follows #81)
+
+**Context.** Redaction started as a scanner: walk the raw string, and at each `=` work out where
+the parameter name began and where its value ended. Review found four holes in it, in four rounds.
+A `,\r\n` before a name made the name `"\r\nkey"`, which matched no secret. Whitespace after the
+`=` made the value measure zero-length, so nothing was masked and the remainder — key included —
+was then emitted whole. Each fix was correct and each was narrow, because the scanner had no
+invariant to violate: it was a list of delimiters someone had thought of, and every input was a
+chance to think of one fewer.
+
+**Decision.** Parse the string once into the structure DbgEng's syntax already has — a transport
+prefix, then separator-delimited items, each a `name`, or a `name` and everything after its first
+`=` — and render from that (`src/kdconn.rs`, `Parsed`/`Param`).
+
+**What the parse buys is one property: it is total.** Every byte of the input lands in exactly one
+field, so rendering with secrets kept reproduces the input character for character. That is a
+claim a test can make over a generated corpus, and it is the claim the safety rests on: a value is
+emitted only from a `value` field, and a secret parameter's `value` field is never emitted. Any
+decoration — whitespace, line breaks, doubled separators — changes which *field* text lands in and
+cannot change which parameter owns it, because the only boundaries are the two structural ones
+DbgEng itself uses. The class of bug is gone rather than four instances of it.
+
+**Why not keep hardening the scanner.** It was working, in the sense that each fix was right. But
+"is this correct?" was being answered by re-deriving the delimiter rules per input, by whoever
+happened to look, and four rounds of that is the evidence: nobody could hold the whole rule set at
+once, so the review found what review happens to find. The parse replaces that question with one
+anybody can check mechanically.
+
+**The unredacted render is `cfg(test)`.** `Secrets::Keep` does not exist in a release build — a
+build that could produce an unredacted render would be a build with a second way to print a key.
+The totality check needs it; nothing else may have it.
+
+**Status.** Implemented, no behaviour change intended: every redaction test from #81 passes
+unchanged, including the four regression cases, alongside the new totality tests.
+
+---
+
 ## The KDNET key is resolved server-side, and connection strings are a type (2026-08-09, issue #81)
 
 **Context.** `attach_kernel` took a raw DbgEng connection string, and a KDNET one carries the

@@ -361,6 +361,13 @@ exactly one call site, handing it to DbgEng inside the session's own worker proc
 covers `key=` and `password=` values in any connection string, and masks nothing else — debugger
 output is never rewritten.
 
+It works off a **parse**, not a text scan: the string is split once into the structure DbgEng's
+syntax has, and a secret parameter's value is simply never rendered. The parse is total — every
+byte lands in exactly one field, so an unredacted render reproduces the input exactly — which is
+what makes "the key cannot get out" checkable rather than a matter of having anticipated every
+delimiter. Whitespace, line breaks and repeated separators around a parameter change which field
+text lands in; they cannot change which parameter owns it.
+
 ### Typed operands are operands, not commands
 
 The typed tools build debugger commands by interpolation (`u {address}`, `bp {expression}`,
