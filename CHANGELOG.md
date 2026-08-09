@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`attach_kernel` can name its target by `profile`**, so a KDNET debug key never has to travel in
+  an MCP request ([#81](https://github.com/glslang/windbg-mcp/issues/81)).
+
+  A connection string carries the target's key, and a key passed as a tool argument does not stay in
+  the tool call: an MCP client keeps a transcript, and the one key handed over during the
+  MessageManager CTF session ended up replicated across 524 records of it — through messages, tool
+  calls, context snapshots and compaction summaries. That is what a transcript *is*, not a client
+  misbehaving, so the server had to offer a way for the secret never to enter the request at all.
+
+  `attach_kernel` now takes **exactly one** of `connection` (unchanged, still supported for a target
+  nothing is configured for) or `profile`, a non-secret name this process resolves from
+  `WINDBG_MCP_PROFILE_<NAME>` in its environment or from `%USERPROFILE%\.windbg-mcp\profiles.json`
+  (`WINDBG_MCP_PROFILES` overrides the path). Sources are re-read per attach, so adding a profile
+  does not mean restarting the client. Passing both, or neither, is a tool error naming the
+  alternative, and the "neither" case lists the profiles this host has — which is what lets an agent
+  find one instead of asking the user for a string it would then have to keep.
+
+  The exclusivity is enforced at runtime rather than in the schema: an untagged `oneOf` renders as a
+  schema composition clients handle unevenly, the same reason `session_id` is repeated per tool
+  struct rather than flattened. Both fields are therefore optional on the wire (`tools/list` golden
+  updated).
+
+### Changed
+
+- **Connection strings are redacted everywhere but the one call that dials them.** `key=` and
+  `password=` values are masked in session reports, errors and logs, whichever selector opened the
+  session: `session_status` now shows
+  `kernel target: profile "ctf-vm" (net:port=50000,key=<redacted>)`.
+
+  The guarantee is structural rather than a discipline. The value lives in a `kdconn::Connection`
+  whose `Debug` and `Display` are the redacted form, so a log line, a `{:?}` on `EngineOp`, or a
+  session label cannot carry the raw string; it is unwrapped at exactly one call site, handing it to
+  DbgEng inside the session's own worker process. Redaction masks *values inside connection strings*
+  only — debugger output is never rewritten, which on a CTF target would be its own kind of damage.
+
+  Errors on the profile path never echo a value either. A connection string typed into `profile` —
+  the one mistake that would defeat the whole feature — is refused by naming the shape a profile
+  name has, not by quoting back what it was handed.
+
 ## [0.5.0] - 2026-08-08
 
 ### Added

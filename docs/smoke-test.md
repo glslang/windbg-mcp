@@ -73,6 +73,18 @@ $env:UPDATE_GOLDEN = "1"; cargo test --test mcp_smoke tools_list_matches
 inside the same document. External or dangling refs break strict client-side validators, and a
 codegen dependency can introduce them with no change here.
 
+**Kernel connection secrecy.** `attach_kernel` takes exactly one of `connection` and `profile`, and
+the schema cannot say so — both are optional there, deliberately (an untagged `oneOf` renders as a
+schema composition clients handle unevenly). So the exclusivity is this server's own check, and
+these tests are what hold it: both selectors and neither are each refused as a **tool** error naming
+the alternative, and neither refusal spawns a worker. A profile that does not exist is answered with
+the names that do, and a connection string typed into `profile` — the mistake that would defeat the
+whole feature — is refused *without being echoed back*. Every one of these runs a fake profile
+(`WINDBG_MCP_PROFILE_SMOKE_KDNET`, pointed at a documentation-range address) and asserts that key
+appears on neither the JSON-RPC transport nor the log, checked against every line the server ever
+wrote rather than against one result. `WINDBG_MCP_PROFILES` is pointed at a path that does not
+exist, so a developer's real profiles can never be read into a failure message.
+
 **Debugger tier.** Opens the checked-in kernel crash dump, confirms it mints a `session_id` that
 `session_status` reports, reads it through `modules` / `registers` / `backtrace`, then checks the
 session-handle contract on the wire (a stale handle is refused; the handle stops working once
@@ -92,6 +104,11 @@ processes, so they need real ones:
   reclaims the parked session with `end_session`, checking by pid that the worker process is gone.
   It skips itself if the attach fails outright instead of parking (a busy UDP port), because there
   is nothing to assert about a park that did not happen.
+- *A profile-named attach opens a session and discloses no key.* The same dead-port park, opened by
+  `profile` instead of `connection`: `session_status` names the profile and reports the connection
+  as `key=<redacted>`, and the key is absent from the transport and the log for the whole life of
+  the session. The unit tests prove the resolution and the redaction; only this proves they hold
+  over the wire, which is where [#81](https://github.com/glslang/windbg-mcp/issues/81) was.
 - *No worker outlives the connection.* Reads the engine pid out of `session_status`, disconnects,
   and checks the process is gone — otherwise every disconnect leaks a debugger process, and for a
   launch or an attach, a debuggee with it.

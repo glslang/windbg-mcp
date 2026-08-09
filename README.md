@@ -47,6 +47,9 @@ process. Two things follow, and they are why it is built this way:
   extension DLL that prints to the console writes to the worker's stdout, which is drained into the
   log and carries nothing else.
 - **`server.rs`** — the MCP tools (see below), built with `rmcp`'s `#[tool_router]`/`#[tool_handler]`.
+- **`kdconn.rs`** — kernel connection strings, the one tool argument that is a secret: profile
+  resolution, and the `Connection` type whose `Debug`/`Display` are redacted so a key can only be
+  unwrapped deliberately (see [Kernel connection profiles](#kernel-connection-profiles-keeping-the-kdnet-key-out-of-the-transcript)).
 - **`ttd.rs`** — locates `TTD.exe` and launches trace recording.
 - **`main.rs`** — role selection (supervisor or worker), tokio + stdio transport. **Logs go to
   stderr** (stdout is the JSON-RPC channel); workers inherit the supervisor's stderr, so everything
@@ -301,6 +304,52 @@ reach the target than a name list can enumerate, and the data model is extensibl
 guarantee, and it is enforced at the front of that session's queue, after everything queued ahead of
 it: checking on the caller's side would leave a window in which an `execute { ".opendump …" }`
 already queued ahead retires the handle between a caller's check and its call.
+
+### Kernel connection profiles (keeping the KDNET key out of the transcript)
+
+A KDNET connection string carries the target's debug key — `net:port=50000,key=<w.x.y.z>` — and that
+key is all anyone on the same network needs to take the debug link. Passing it as a tool argument
+puts it somewhere this server does not control: an MCP client keeps a transcript, and a key handed
+over once is then copied into messages, tool calls, context snapshots and compaction summaries. That
+is what a transcript *is*, not a client misbehaving, so the fix is that the secret never enters the
+request.
+
+`attach_kernel` therefore takes **exactly one** of two selectors:
+
+```jsonc
+{ "profile": "ctf-vm" }                          // resolved on this host; no key in the request
+{ "connection": "net:port=50000,key=1.2.3.4" }   // the raw string, still supported
+```
+
+Configure a profile either way — the environment is checked first, then the file:
+
+```pwsh
+# Per profile, in the environment the MCP server is launched with. The variable's own suffix is
+# the profile name, lowercased: this defines `ctf_vm`, and `ctf-vm` finds it too.
+$env:WINDBG_MCP_PROFILE_CTF_VM = "net:port=50000,key=1.2.3.4"
+```
+
+```jsonc
+// %USERPROFILE%\.windbg-mcp\profiles.json  (override the path with WINDBG_MCP_PROFILES)
+{
+  "ctf-vm": "net:port=50000,key=1.2.3.4",
+  "lab":    "net:port=50001,key=5.6.7.8"
+}
+```
+
+Keep that file out of any repository — it holds keys, and it is deliberately machine-local. Names
+are matched case-insensitively with `-`, `_` and `.` equivalent, and they are re-read on every
+attach, so adding one does not mean restarting the client. `attach_kernel` with **neither** selector
+answers with the names this host has, which is how an agent discovers them without ever asking the
+user for a string.
+
+Connection strings are redacted everywhere else on principle, whichever selector opened the session:
+`session_status` reports `kernel target: profile "ctf-vm" (net:port=50000,key=<redacted>)`, and the
+value is held in a type whose `Debug`/`Display` are the redacted form, so a log line or an error can
+only ever carry the masked one ([`src/kdconn.rs`](./src/kdconn.rs)). The raw string is unwrapped at
+exactly one call site, handing it to DbgEng inside the session's own worker process. Redaction
+covers `key=` and `password=` values in any connection string, and masks nothing else — debugger
+output is never rewritten.
 
 ### Typed operands are operands, not commands
 

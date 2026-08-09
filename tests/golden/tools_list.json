@@ -14,11 +14,10 @@
       },
       "name": "attach_kernel",
       "params": [
-        "connection: string"
+        "connection: string|null",
+        "profile: string|null"
       ],
-      "required": [
-        "connection"
-      ],
+      "required": [],
       "title": "Attach to kernel target"
     },
     {

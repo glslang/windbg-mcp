@@ -14,7 +14,8 @@ ourselves** — do not add third-party DbgEng crates).
 Re-executed with `--engine-worker` it owns exactly one debug session, because dbgeng.dll holds one
 debuggee session per process. Key source: `src/engine.rs` (the supervisor — session registry,
 worker supervision, routing), `src/worker.rs` (the child process and the engine thread inside it),
-`src/proto.rs` (the wire protocol between them), `src/server.rs` (the MCP tools), `src/ttd.rs`,
+`src/proto.rs` (the wire protocol between them), `src/server.rs` (the MCP tools),
+`src/kdconn.rs` (KDNET connection profiles and the redacting `Connection` type), `src/ttd.rs`,
 `src/main.rs` (role selection).
 
 Practical consequences when debugging this server: a stack trace or log line can come from either
@@ -118,6 +119,14 @@ cargo test --test mcp_smoke -- --ignored --nocapture --test-threads=1 live_kerne
 single-owner, so in parallel the second attach fails and can leave the target halted.
 
 ## Live kernel + driver IOCTL gotchas (learned driving HEVD over KDNET)
+
+**Attach by `profile`, not by connection string.** `attach_kernel { "profile": "<name>" }` resolves
+the connection inside the server (`src/kdconn.rs`), so the target's debug key never lands in a tool
+argument — and therefore never in the session transcript, where one key previously ended up
+replicated across hundreds of records. `attach_kernel {}` lists the profiles this host has.
+Configure one with `WINDBG_MCP_PROFILE_<NAME>` or `%USERPROFILE%\.windbg-mcp\profiles.json`; raw
+`connection` still works for a target nothing is configured for. The live smoke tier below keeps
+using `WINDBG_MCP_SMOKE_KERNEL` because that variable *is* the local configuration.
 
 **KDNET attach is a blocking wait, by design.** A live kernel needs `WaitForEvent(INFINITE)` (a finite
 timeout returns `E_NOTIMPL` and never drives the link). So if the target isn't reachable, the

@@ -881,6 +881,133 @@ fn bad_calls_are_rejected_without_killing_the_session() {
     );
 }
 
+/// A fake KDNET connection for the profile tests, and the key inside it.
+///
+/// The whole point of asserting on this value is that it must appear **nowhere** a client can see,
+/// so it has to be one no real host would produce by coincidence — hence a documentation-range
+/// address, and not anyone's key.
+const FAKE_PROFILE: (&str, &str) = ("net:port=50008,key=203.0.113.9", "203.0.113.9");
+
+/// Environment defining exactly one profile and no others.
+///
+/// An environment variable cannot carry a hyphen, so this defines `smoke_kdnet` — which
+/// `smoke-kdnet` also resolves to, and the attach below relies on that. `WINDBG_MCP_PROFILES` is
+/// pointed at a path that does not exist on purpose: the developer running this may have real
+/// profiles configured, and reading them would make these tests vary by host — and put real
+/// profile names in a failure message.
+fn profile_env() -> [(&'static str, &'static str); 2] {
+    [
+        ("WINDBG_MCP_PROFILE_SMOKE_KDNET", FAKE_PROFILE.0),
+        (
+            "WINDBG_MCP_PROFILES",
+            r"C:\nonexistent\windbg-mcp-smoke.json",
+        ),
+    ]
+}
+
+/// `attach_kernel`'s two selectors are exclusive, and the check is this server's own — the schema
+/// leaves both optional, so nothing upstream enforces it.
+///
+/// Both failures have to arrive as *tool* errors with the alternative named, not as protocol
+/// errors: a model that gets "invalid params" back cannot tell which of the two to drop. Neither
+/// costs a worker, which is the other half — a mistyped selector must not leave a session to end.
+///
+/// Needs no debugger, so it runs in the protocol tier: both refusals happen in the supervisor,
+/// before anything is spawned.
+#[test]
+fn attach_kernel_refuses_both_selectors_and_neither() {
+    let mut server = Server::started_with(&profile_env());
+
+    let both = server.call_tool(
+        "attach_kernel",
+        json!({ "connection": "net:port=50009,key=1.1.1.1", "profile": "smoke" }),
+        STEP,
+    );
+    assert_no_error(&both, "attach_kernel with both selectors");
+    let text = text_of(&both["result"]);
+    assert!(
+        is_tool_error(&both),
+        "naming a target twice must be refused, got:\n{text}"
+    );
+    assert!(
+        text.contains("exactly one") && text.contains("`profile`"),
+        "the refusal must name the choice, got:\n{text}"
+    );
+
+    let neither = server.call_tool("attach_kernel", json!({}), STEP);
+    assert_no_error(&neither, "attach_kernel with no selector");
+    let text = text_of(&neither["result"]);
+    assert!(
+        is_tool_error(&neither),
+        "naming no target must be refused, got:\n{text}"
+    );
+    assert!(
+        text.contains("`profile`") && text.contains("`connection`"),
+        "the refusal must name both ways to say what to attach to, got:\n{text}"
+    );
+
+    // Neither refusal reached the engine, so there is nothing to clean up — which is the claim.
+    let sessions = server.tool_text("session_status", json!({}), STEP);
+    assert!(
+        sessions.contains("No debug session"),
+        "a refused selector must not leave a session behind:\n{sessions}"
+    );
+}
+
+/// A profile that is not configured has to be answered with the ones that are — and without the
+/// value of any of them. Guessing a name should cost a call; it must never cost a key.
+///
+/// The second half is the mistake that would defeat the whole feature: a caller who puts a
+/// connection string into `profile`. Quoting it back would write the key into exactly the
+/// transcript profiles exist to keep it out of, so the refusal names the *shape* of a profile
+/// name instead.
+///
+/// Protocol tier: every one of these is refused in the supervisor, before a worker exists.
+#[test]
+fn an_unknown_profile_is_refused_with_the_names_that_exist_but_no_values() {
+    let (connection, key) = FAKE_PROFILE;
+    let mut server = Server::started_with(&profile_env());
+
+    let unknown = server.call_tool("attach_kernel", json!({ "profile": "no-such-vm" }), STEP);
+    assert_no_error(&unknown, "attach_kernel with an unknown profile");
+    let text = text_of(&unknown["result"]);
+    assert!(is_tool_error(&unknown), "got:\n{text}");
+    // Listed under the variable's own spelling — an environment variable cannot carry a hyphen —
+    // while `smoke-kdnet` still resolves to it, which the tier-2 attach below relies on.
+    assert!(
+        text.contains("smoke_kdnet"),
+        "the refusal must name the profiles that do exist, got:\n{text}"
+    );
+    assert!(
+        !text.contains(key),
+        "the refusal disclosed a profile's key:\n{text}"
+    );
+
+    let mistyped = server.call_tool("attach_kernel", json!({ "profile": connection }), STEP);
+    assert_no_error(
+        &mistyped,
+        "attach_kernel with a connection string as the profile",
+    );
+    let text = text_of(&mistyped["result"]);
+    assert!(is_tool_error(&mistyped), "got:\n{text}");
+    assert!(
+        text.contains("`connection`"),
+        "the refusal must point at the field that takes a connection string, got:\n{text}"
+    );
+    assert!(
+        !text.contains(key),
+        "the refusal echoed the key it was handed:\n{text}"
+    );
+
+    // The whole point, restated over the transport itself: nothing carrying that key was ever
+    // written to the client, and nothing to the log either.
+    assert!(
+        !server.stdout_lines().iter().any(|l| l.contains(key)),
+        "a key reached the JSON-RPC transport"
+    );
+    assert!(!server.stderr().contains(key), "a key reached the log");
+}
+
 /// The harness's own guard, pinned because losing it is silent and expensive.
 ///
 /// `tool_text` used to hand back a tool error's text like any other result. Nothing failed when
@@ -1224,6 +1351,88 @@ fn a_kernel_attach_that_never_connects_costs_one_session_and_can_be_ended() {
         "end_session",
         json!({ "session_id": dump_session }),
         TARGET_STEP,
+    );
+}
+
+/// A profile-named attach opens the session it names, and the key never leaves this process.
+///
+/// The unit tests prove the resolution and the redaction; only this proves the two hold **over the
+/// wire**, which is where the issue actually was. The target is deliberately unreachable, so the
+/// attach parks — everything asserted here (the session exists, describes itself, and can be
+/// ended) is true of a parked attach, and a park costs no VM.
+///
+/// Two claims, and the second is the one that matters:
+///
+/// - `session_status` names the *profile*, so a caller can still tell two kernel sessions apart
+///   without either of them printing a key.
+/// - The key appears on neither the transport nor the log, at any point in the session's life.
+///   That is asserted against every line the server ever wrote, not against one result, because
+///   the failure this guards is a key surfacing somewhere nobody looked.
+#[test]
+fn a_profile_attach_names_its_target_without_disclosing_the_key() {
+    if target_tier().is_none() {
+        return;
+    }
+    let (_, key) = FAKE_PROFILE;
+    let mut server = Server::started_with(&profile_env());
+
+    let attaching = server.send_request(
+        "tools/call",
+        json!({
+            "name": "attach_kernel",
+            "arguments": { "profile": "smoke-kdnet" },
+        }),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let parked = loop {
+        let status = server.tool_text("session_status", json!({}), STEP);
+        if status.contains("waiting") && status.contains("kernel target") {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let Some(status) = parked else {
+        skip("the profile attach did not reach the parked state (port 50008 busy?)");
+        return;
+    };
+
+    // Named for the profile *as configured* (`smoke_kdnet`), not as the caller spelled it
+    // (`smoke-kdnet`) — the point is that the session is identifiable, and the configured name is
+    // the one an operator can look up.
+    assert!(
+        status.contains("smoke_kdnet"),
+        "the session should describe itself by the profile it was opened from:\n{status}"
+    );
+    assert!(
+        status.contains("key=<redacted>"),
+        "the connection should be reported with its key masked, not omitted:\n{status}"
+    );
+
+    let kernel_session = status
+        .lines()
+        .find(|l| l.contains("kernel target"))
+        .map(|l| l.split_whitespace().next().unwrap_or_default().to_string())
+        .expect("the kernel session should be listed");
+    server.tool_text(
+        "end_session",
+        json!({ "session_id": kernel_session }),
+        Duration::from_secs(120),
+    );
+    // The abandoned attach is still outstanding; its session is gone, so it has to be answered.
+    server.await_id(attaching, "attach_kernel", Duration::from_secs(60));
+
+    assert!(
+        !server.stdout_lines().iter().any(|l| l.contains(key)),
+        "the profile's key reached the JSON-RPC transport"
+    );
+    assert!(
+        !server.stderr().contains(key),
+        "the profile's key reached the log:\n{}",
+        server.stderr()
     );
 }
 

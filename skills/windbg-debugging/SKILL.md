@@ -68,6 +68,13 @@ a bare `execute`, which only sets the run state and doesn't move the target.
   carrying the debugger's own text — read it and adjust (wrong symbol, unmapped address, target
   still running). So do a refused handle and a session whose engine died; all of them are things
   you can act on. Only "no engine could be started at all" is a transport-level protocol error.
+- **Attach a KDNET kernel target by `profile`, not by connection string.** A connection string
+  carries the target's debug key, and once it arrives as a tool argument it is in the transcript
+  for good. `attach_kernel { "profile": "<name>" }` has the server resolve it locally instead;
+  `attach_kernel {}` with no arguments lists the profiles this host has, so you never have to
+  guess a name or ask the user for a secret you don't need. Fall back to
+  `attach_kernel { "connection": "…" }` only when no profile covers the target — and never invent
+  a key. [setup.md](setup.md) covers configuring one.
 - **Symbol *names* (`module!func`) need three things together:** (a) `msdia140.dll` and
   `symsrv.dll` bundled next to the binary, (b) a symbol path — set it with the
   **`set_symbol_path`** tool (`srv*C:\ProgramData\Dbg\sym*https://msdl.microsoft.com/download/symbols`,

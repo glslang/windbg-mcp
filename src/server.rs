@@ -18,6 +18,7 @@ use crate::engine::{
     Call, EngineError, MAX_SESSIONS, OpenError, OpenReport, SessionKind, SessionSnapshot,
     SessionState, Sessions,
 };
+use crate::kdconn;
 use crate::proto::{EngineOp, PoolOp, ReachabilityOp};
 use crate::ttd;
 
@@ -1026,10 +1027,22 @@ pub struct PathArgs {
     pub path: String,
 }
 
+/// `attach_kernel`'s target, named one of two ways. Exactly one is required, and that is checked
+/// at runtime rather than in the schema — see [`crate::kdconn::select`] for why.
 #[derive(Deserialize, JsonSchema)]
 pub struct ConnectionArgs {
-    /// Kernel debugging connection string, e.g. "net:port=50000,key=...".
-    pub connection: String,
+    /// Raw kernel debugging connection string, e.g. "net:port=50000,key=<w.x.y.z>". Pass exactly
+    /// one of `connection` or `profile`. This puts the target's KDNET key in this request — and
+    /// so into whatever transcript the client keeps — so prefer `profile` when the host has one
+    /// configured. Never invent a key: ask the user for the string, or for a profile name.
+    #[serde(default)]
+    pub connection: Option<String>,
+    /// Name of a kernel connection configured on this host, e.g. "ctf-vm", which this server
+    /// resolves locally so the key never appears in this request. Pass exactly one of
+    /// `connection` or `profile`. A wrong or absent name is answered with the names that do
+    /// exist, so guessing costs one call rather than a leaked key.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -1739,6 +1752,10 @@ impl WindbgServer {
     }
 
     /// Attach to a kernel target over a connection string (e.g. KDNET).
+    /// Takes exactly one of `profile` (a connection configured on this host, which the server
+    /// resolves locally — the target's debug key never enters this request) or `connection` (the
+    /// raw string, key and all). Prefer `profile`; call it with neither to be told which profiles
+    /// this host has.
     /// Opens a new session in its own engine process — sessions already open are left alone —
     /// and returns a `session_id` that routes later calls to it.
     /// A live kernel attach waits for the target to dial in, and that wait has no timeout and
@@ -1759,11 +1776,19 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<ConnectionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        // Resolved here, in the supervisor, and *before* a worker exists: a selector the caller
+        // has to fix should cost them a message, not a spawned process and a session to end. The
+        // label that comes back is already redacted, so the session can describe itself in
+        // `session_status` without holding the key anywhere but in the op below.
+        let selected = match kdconn::select(args.connection, args.profile) {
+            Ok(selected) => selected,
+            Err(why) => return tool_error(why),
+        };
         self.opened(
             SessionKind::Kernel,
-            args.connection.clone(),
+            selected.label,
             EngineOp::AttachKernel {
-                connection: args.connection,
+                connection: selected.connection,
             },
         )
         .await
