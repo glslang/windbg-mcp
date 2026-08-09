@@ -47,6 +47,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DbgEng inside the session's own worker process. Redaction masks *values inside connection strings*
   only — debugger output is never rewritten, which on a CTF target would be its own kind of damage.
 
+  Redaction works off a **parse** rather than a scan: the string is split once into the structure
+  DbgEng's syntax has (transport prefix, separator-delimited `name=value` items) and rendered from
+  that, with a secret parameter's value never emitted. The parse is total — every byte lands in
+  exactly one field, so an unredacted render reproduces the input exactly — which is what makes
+  the guarantee checkable rather than a matter of having anticipated every delimiter. Whitespace,
+  line breaks and repeated separators around a parameter change which field text lands in and
+  cannot change which parameter owns it.
+
   Errors on the profile path never echo a value either. A connection string typed into `profile` —
   the one mistake that would defeat the whole feature — is refused by naming the shape a profile
   name has, not by quoting back what it was handed. The same applies to a *configured* name: an
