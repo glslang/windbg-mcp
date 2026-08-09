@@ -219,7 +219,12 @@ $env:WINDBG_MCP_PROFILE_CTF_VM = "net:port=50000,key=1.2.3.4"
 
 This file holds keys: keep it out of every repository, and out of any directory that gets synced
 or shared. Names are matched case-insensitively with `-`, `_` and `.` equivalent, and the sources
-are re-read on every attach — adding a profile does not mean restarting the MCP client.
+are re-read on every attach — adding a profile does not mean restarting the MCP client. Two
+consequences of that matching worth knowing, both reported when a lookup fails: `ctf-vm` and
+`ctf.vm` in the *same* source are one name, so the second is ignored rather than silently reaching
+a different machine; and an entry whose name is not a name (letters, digits, `-`, `_`, `.`) is
+skipped without being quoted back, because the usual cause is an entry written the wrong way round
+— which would make the name the connection string.
 
 Raw connection strings stay supported (`attach_kernel { "connection": "net:port=…,key=…" }`) for a
 target no profile covers. Either way the session reports itself with the key masked —

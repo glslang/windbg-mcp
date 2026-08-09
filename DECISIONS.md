@@ -46,6 +46,21 @@ with a tool error naming the alternative. The "neither" error lists the profiles
 is the load-bearing part: an agent that cannot discover a profile name asks the user, the user
 answers with a connection string, and the key is in the transcript after all.
 
+**Where the resolved value is allowed to go.** Only into the op sent down one worker's private
+pipe. The worker is spawned *without* `WINDBG_MCP_PROFILE_*` in its environment
+(`engine::spawn_worker`), which matters for the process after it: `launch` runs an arbitrary binary
+under the debugger, that binary inherits its worker's environment, and a debuggee is the least
+trustworthy process this server ever creates. Resolution happens in the supervisor for a second
+reason too — a selector the caller must fix is refused before any worker is spawned, so a typo
+costs a message rather than a session to end.
+
+**Configured names are validated on the way in, not on the way out.** A name is *rendered* — in
+the profile list, in a session label, in a collision report — so a name that is not one never
+enters the map. The failure that motivates this is not exotic: an entry written the wrong way round
+makes the JSON key the connection string, and an unvalidated name would then print a key out of the
+error saying the entry is wrong. Rejections are located and counted, never quoted, for the same
+reason a mistyped `profile` argument is not echoed.
+
 **Status.** Implemented. Unit tests in `src/kdconn.rs` (fake values throughout); protocol-tier and
 debugger-tier smoke tests assert the fake key reaches neither the transport nor the log.
 

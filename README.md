@@ -343,6 +343,11 @@ attach, so adding one does not mean restarting the client. `attach_kernel` with 
 answers with the names this host has, which is how an agent discovers them without ever asking the
 user for a string.
 
+Configured profiles stay in the supervisor: an engine worker is spawned **without** the
+`WINDBG_MCP_PROFILE_*` variables, and is told only the one connection it is opening, over its
+private pipe. A `launch`ed debuggee inherits its worker's environment, and a debuggee is exactly the
+untrusted program that must not be handed every kernel key on the host.
+
 Connection strings are redacted everywhere else on principle, whichever selector opened the session:
 `session_status` reports `kernel target: profile "ctf-vm" (net:port=50000,key=<redacted>)`, and the
 value is held in a type whose `Debug`/`Display` are the redacted form, so a log line or an error can

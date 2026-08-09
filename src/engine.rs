@@ -37,6 +37,7 @@ use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot};
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
+use crate::kdconn;
 use crate::proto::{EngineOp, WorkerMessage, WorkerRequest};
 use crate::worker::{MESSAGES_FLAG, REQUESTS_FLAG, WORKER_FLAG};
 
@@ -1620,7 +1621,15 @@ fn spawn_worker(exe: &Path) -> std::io::Result<(Child, Channel)> {
     let _one_spawn_at_a_time = spawn_guard();
     inheritable(&their_requests)?;
     inheritable(&their_messages)?;
-    let child = Command::new(exe)
+    let mut command = Command::new(exe);
+    // Configured KDNET connections stay in the supervisor. A worker is told the *one* connection
+    // it is opening, down its private pipe, and has no use for the rest — while a `launch`ed
+    // debuggee inherits this environment in turn, and a debuggee is exactly the untrusted program
+    // that must not be handed every kernel key on the host.
+    for name in kdconn::env_names() {
+        command.env_remove(name);
+    }
+    let child = command
         .arg(WORKER_FLAG)
         .arg(format!(
             "{REQUESTS_FLAG}{}",
