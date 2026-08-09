@@ -169,13 +169,19 @@ try {
 
         Push-Location $repoRoot
         $testExit = 1
+        $oldErrorActionPreference = $ErrorActionPreference
         try {
+            # Windows PowerShell 5.1 wraps native stderr records as non-terminating errors.
+            # Cargo writes ordinary progress there, so `Stop` would abort before its exit code
+            # can be inspected even though `2>&1` intentionally captures the stream.
+            $ErrorActionPreference = 'Continue'
             & cargo test --test mcp_smoke -- --ignored --nocapture --test-threads=1 `
                 a_messagemanager_ctf_fixture_is_visible_through_mcp 2>&1 | ForEach-Object {
                     Write-TranscriptLine $_.ToString()
                 }
             $testExit = $LASTEXITCODE
         } finally {
+            $ErrorActionPreference = $oldErrorActionPreference
             Pop-Location
         }
         if ($testExit -ne 0) { throw "CTF regression test failed: cargo exit $testExit" }
@@ -214,7 +220,10 @@ try {
                 Write-Warning 'Fixture did not stop cleanly and was terminated.'
             }
             foreach ($line in @($cleanup.Stdout -split "`r?`n")) {
-                if (-not [string]::IsNullOrWhiteSpace($line)) { Write-TranscriptLine $line }
+                if (-not [string]::IsNullOrWhiteSpace($line) -and
+                    $line -notmatch '\[fixture\] ready:') {
+                    Write-TranscriptLine $line
+                }
             }
             if (-not [string]::IsNullOrWhiteSpace($cleanup.Stderr)) {
                 Write-TranscriptLine "fixture stderr: $($cleanup.Stderr)"

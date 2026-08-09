@@ -2789,17 +2789,21 @@ fn a_messagemanager_ctf_fixture_is_visible_through_mcp() {
             "the CTF attach reported a tool failure:\n{report}"
         );
 
-        let modules = server.tool_text("modules", json!({ "session_id": session }), TARGET_STEP);
-        assert!(
-            modules.to_ascii_lowercase().contains("messagemanager"),
-            "the fixture reported ready, but KD does not list MessageManager.sys:\n{modules}"
-        );
-
         let symbols = load_kernel_symbols(&mut server, &session);
         assert!(
             symbols.loaded.contains("pdb symbols") && !symbols.probe.is_empty(),
             "the CTF pool check needs full `nt` symbols and the pool-root global. If a known-good \
              path exists, set {SYMBOLS_ENV}. Engine setup said: {engine}\n{}",
+            symbols.transcript
+        );
+
+        // A fresh kernel attach may initially expose only `nt`; the unqualified reload above
+        // populates DbgEng's full module inventory as well as loading the pool types.
+        let modules = server.tool_text("modules", json!({ "session_id": session }), TARGET_STEP);
+        assert!(
+            modules.to_ascii_lowercase().contains("messagemanager"),
+            "the fixture reported ready, but KD does not list MessageManager.sys after the full \
+             module reload:\n{modules}\n\nsymbol setup said:{}",
             symbols.transcript
         );
 
