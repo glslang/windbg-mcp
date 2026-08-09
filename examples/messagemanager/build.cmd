@@ -10,4 +10,5 @@ if not exist "%VCVARS%" (
 call "%VCVARS%" >nul
 if "%~2"=="" ( set OUT=%~dpn1.exe ) else ( set OUT=%~2 )
 cl /nologo /W3 /O2 /GS- /Fe:"%OUT%" "%~1" /link /SUBSYSTEM:CONSOLE ntdll.lib advapi32.lib
-endlocal
+set BUILD_RC=%ERRORLEVEL%
+endlocal & exit /b %BUILD_RC%

@@ -42,3 +42,7 @@ so build the server first: `cargo build --release`. For symbol resolution, set
   during the `go` window (once as a normal user, once elevated). It opens the device and
   fires each `-Codes` IOCTL via `DeviceIoControl`; comparing which codes reach the host log
   under each token is the per-token reachability answer.
+- **`messagemanager/ctf_regression.ps1`** — builds and deploys a benign MessageManager pool
+  fixture over WinRM, then runs the doubly gated live-KD smoke test through the real MCP stdio
+  transport. It requires the challenge driver, a `PSCredential`, KDNET, and full `nt` symbols;
+  see the [CTF regression runbook](../docs/smoke-test.md#messagemanager-ctf-regression).

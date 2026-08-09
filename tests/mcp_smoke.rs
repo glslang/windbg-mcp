@@ -10,7 +10,7 @@
 //! * **The MCP spec revved.** New revision, new required field, a capability the SDK now
 //!   advertises on our behalf that this server does not actually implement.
 //!
-//! Three tiers, so the cheap one can ride `cargo test` everywhere:
+//! Five tiers, so the cheap one can ride `cargo test` everywhere:
 //!
 //! * **Protocol** (default) — spawns the server, speaks JSON-RPC. No debugger target, no
 //!   symbols, no network.
@@ -27,6 +27,10 @@
 //!   prove a kernel attach still *lands* and lets go cleanly rather than merely parks, or that a
 //!   pool walk stays inside its budget when every page it reads crosses a wire. Run it last, on
 //!   its own.
+//! * **MessageManager CTF** (`#[ignore]`d, `WINDBG_MCP_SMOKE_CTF=1`, and the live-kernel gate)
+//!   — deploys a benign allocation fixture over WinRM, then verifies that the real driver and its
+//!   pool objects are visible through the structured MCP tools. The PowerShell orchestrator owns
+//!   the second gate so an ordinary live-kernel run never assumes this challenge is installed.
 //!
 //! See `docs/smoke-test.md` for the runbook.
 
@@ -1624,6 +1628,21 @@ fn kernel_tier() -> Option<String> {
     }
 }
 
+/// An explicit second gate for the MessageManager CTF fixture.
+///
+/// A live KDNET connection alone must not make a broad `live_kernel` test filter expect a
+/// challenge driver and retained `Tgsm` allocations on every target. The PowerShell orchestrator
+/// sets this only after deploying the fixture and observing its ready line.
+fn messagemanager_ctf_tier() -> bool {
+    match std::env::var("WINDBG_MCP_SMOKE_CTF") {
+        Ok(value) if value.trim() == "1" => true,
+        _ => {
+            skip("set WINDBG_MCP_SMOKE_CTF=1 only after the MessageManager fixture reports ready");
+            false
+        }
+    }
+}
+
 /// The `port=` field of a KDNET connection string such as `net:port=50000,key=w.x.y.z`.
 ///
 /// The transport prefix sits on the *first* field (`net:port=50000`), not in front of the whole
@@ -2724,6 +2743,115 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
         }
         (Ok(()), Some(why)) => panic!("{why}"),
         (Ok(()), None) => {}
+    }
+}
+
+/// End-to-end CTF regression: a real MessageManager image and its retained `Tgsm` objects must be
+/// visible through the shipped MCP transport, DbgEng worker, symbol setup, and structured pool
+/// tools. The target-side fixture is deployed by `examples/messagemanager/ctf_regression.ps1`.
+///
+/// This has its own environment gate in addition to `#[ignore]` and the KDNET connection string,
+/// because the generic live-kernel tier is useful on machines that do not have this driver.
+#[test]
+#[ignore = "needs the live MessageManager CTF fixture; use ctf_regression.ps1"]
+fn a_messagemanager_ctf_fixture_is_visible_through_mcp() {
+    if !messagemanager_ctf_tier() {
+        return;
+    }
+    let Some(connection) = kernel_tier() else {
+        return;
+    };
+    let engine = ensure_engine_beside_test_binary();
+    println!("engine: {engine}");
+    let mut server = Server::started_with(&[(
+        "WINDBG_MCP_CALL_TIMEOUT_SECS",
+        &SERVER_CALL_TIMEOUT.as_secs().to_string(),
+    )]);
+
+    let attached = server.call_tool(
+        "attach_kernel",
+        json!({ "connection": connection }),
+        TARGET_STEP,
+    );
+    let report = text_of(&attached["result"]);
+    let Some(session) = maybe_session_id(&report) else {
+        assert_no_error(&attached, "attach_kernel for MessageManager CTF");
+        panic!(
+            "the CTF attach did not land and left no session to release. Confirm the guest is \
+             booted with debugging enabled and dialling this host:\n{report}"
+        );
+    };
+
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        assert_no_error(&attached, "attach_kernel for MessageManager CTF");
+        assert!(
+            !is_tool_error(&attached),
+            "the CTF attach reported a tool failure:\n{report}"
+        );
+
+        let modules = server.tool_text("modules", json!({ "session_id": session }), TARGET_STEP);
+        assert!(
+            modules.to_ascii_lowercase().contains("messagemanager"),
+            "the fixture reported ready, but KD does not list MessageManager.sys:\n{modules}"
+        );
+
+        let symbols = load_kernel_symbols(&mut server, &session);
+        assert!(
+            symbols.loaded.contains("pdb symbols") && !symbols.probe.is_empty(),
+            "the CTF pool check needs full `nt` symbols and the pool-root global. If a known-good \
+             path exists, set {SYMBOLS_ENV}. Engine setup said: {engine}\n{}",
+            symbols.transcript
+        );
+
+        let started = Instant::now();
+        let call = server.call_tool(
+            "pool_find_tag",
+            json!({
+                "tag": "Tgsm",
+                "paged": false,
+                "refresh": true,
+                "limit": 32,
+                "session_id": session,
+            }),
+            POOL_CALL_BUDGET,
+        );
+        let found = text_of(&call["result"]);
+        assert_no_error(&call, "pool_find_tag Tgsm on MessageManager CTF");
+        assert!(
+            !is_tool_error(&call),
+            "the structured pool query failed:\n{found}\n\nsymbol setup said:{}",
+            symbols.transcript
+        );
+        assert!(
+            found.contains("tag `Tgsm`") && found.contains("allocation(s)"),
+            "the target fixture retained `Tgsm` messages, but the MCP pool snapshot did not find \
+             them. Read the attached coverage report before treating an incomplete walk as an \
+             allocator result:\n{found}"
+        );
+        println!(
+            "MessageManager `Tgsm` allocations found through MCP in {:?}:\n{found}",
+            started.elapsed()
+        );
+
+        let registers =
+            server.tool_text("registers", json!({ "session_id": session }), TARGET_STEP);
+        assert!(
+            registers.contains("rip="),
+            "the kernel session did not remain usable after the CTF pool walk:\n{registers}"
+        );
+    }));
+
+    // Whatever the assertion outcome, release the broken-in kernel before propagating it.
+    let ended = server.call_tool("end_session", json!({ "session_id": session }), TARGET_STEP);
+    let ended_text = text_of(&ended["result"]);
+    match (outcome, ungraceful_detach(&ended, &ended_text)) {
+        (Err(_), Some(why)) => panic!(
+            "THE TARGET MAY STILL BE HALTED — {why}\n\nThe CTF check had already failed; check \
+             the VM before investigating the earlier assertion."
+        ),
+        (Err(panic), None) => resume_unwind(panic),
+        (Ok(()), Some(why)) => panic!("{why}"),
+        (Ok(()), None) => println!("MessageManager CTF session detached cleanly"),
     }
 }
 
