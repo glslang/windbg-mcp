@@ -51,9 +51,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DbgEng's syntax has (transport prefix, separator-delimited `name=value` items) and rendered from
   that, with a secret parameter's value never emitted. The parse is total — every byte lands in
   exactly one field, so an unredacted render reproduces the input exactly — which is what makes
-  the guarantee checkable rather than a matter of having anticipated every delimiter. Whitespace,
-  line breaks and repeated separators around a parameter change which field text lands in and
-  cannot change which parameter owns it.
+  the guarantee checkable rather than a matter of having anticipated every delimiter. A repeated
+  separator, an empty item or an `=` inside a value changes which field text lands in and cannot
+  change which parameter owns it.
+
+  **Whitespace between parameters is refused** rather than interpreted, on both the explicit and
+  the configured path: it reads as either a separator (a missing comma) or as filler (a stray
+  space), each of those leaks the key under the other reading, and nothing in the string says which
+  was meant. A connection carrying any is reported as `<connection redacted>` in full. Whitespace
+  *around* the whole string is still trimmed, so a pasted value is fine.
 
   Errors on the profile path never echo a value either. A connection string typed into `profile` —
   the one mistake that would defeat the whole feature — is refused by naming the shape a profile

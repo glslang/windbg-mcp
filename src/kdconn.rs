@@ -49,6 +49,9 @@ const SECRET_PARAMS: &[&str] = &["key", "password"];
 /// a mask that preserved length would leak the key's shape.
 const MASK: &str = "<redacted>";
 
+/// What a connection whose structure cannot be trusted is reported as, in full. See [`redact`].
+const OPAQUE: &str = "<connection redacted>";
+
 /// How long a profile name may be. Generous for a name, short enough that nothing anyone would
 /// mistake for a connection string or a pasted secret gets in under it.
 const NAME_LIMIT: usize = 64;
@@ -124,10 +127,15 @@ enum Secrets {
 /// [`Secrets::Keep`] reproduces the input exactly, which the tests assert over a generated corpus
 /// as well as the awkward cases. Given that, redaction is no longer a hunt: a value is emitted
 /// only from a `value` field, and a `value` field belonging to a secret parameter is never emitted
-/// at all. Decoration around it — whitespace, line breaks, repeated separators — changes which
-/// *field* text lands in, and cannot change which parameter owns it, because the boundaries are
-/// the two structural ones DbgEng itself uses: the separators between items, and the first `=`
-/// within one.
+/// at all. Decoration around a parameter — a repeated separator, an empty item, an `=` inside a
+/// value — changes which *field* text lands in, and cannot change which parameter owns it, because
+/// the only boundaries are the two structural ones DbgEng itself uses: the separators between
+/// items, and the first `=` within one.
+///
+/// **Whitespace is the exception, and it is handled before the parse rather than by it.** It has
+/// two readings — separator and filler — that this has now been wrong about in both directions, so
+/// a connection carrying any is refused by [`is_dialable`] and reported by [`redact`] as [`OPAQUE`]
+/// rather than parsed under a guess.
 struct Parsed<'a> {
     /// The transport, `net:` included, or empty. Never a parameter, so never a secret.
     prefix: &'a str,
@@ -136,10 +144,12 @@ struct Parsed<'a> {
 
 /// One item of a connection string.
 struct Param<'a> {
-    /// The name as written, whitespace and all. Compared trimmed, rendered verbatim.
+    /// The name as written. Compared trimmed — a no-op given that a dialable connection carries no
+    /// whitespace, and kept so that a future caller reaching [`redact`] by another route does not
+    /// silently lose the comparison.
     name: &'a str,
-    /// Everything after the first `=`, including any gap before the value proper. `None` for a
-    /// bare flag (`com:port=com1,pipe`), which has no value to hide.
+    /// Everything after the first `=`. `None` for a bare flag (`com:port=com1,pipe`), which has no
+    /// value to hide.
     value: Option<&'a str>,
     /// The separator that ended this item, or `None` for the last one. Kept so the render is a
     /// faithful reproduction rather than a re-formatting.
@@ -228,7 +238,24 @@ fn split_transport(connection: &str) -> (&str, &str) {
 /// `net:port=50000,key=1.2.3.4` → `net:port=50000,key=<redacted>`. The transport and the port are
 /// what let a person tell two sessions apart, and neither is a secret, so this masks *values* and
 /// never the whole string. See [`Parsed`] for why it goes through a parse rather than a scan.
-pub fn redact(connection: &str) -> String {
+///
+/// **Interior whitespace makes the whole string opaque**, because it has two readings that cannot
+/// both be honoured and each one leaks under the other:
+///
+/// - `net:port=50000 key=1.2.3.4` — a missing comma, where the space *separates* two parameters.
+///   Read as filler, the `key=` is swallowed into `port`'s value and never masked.
+/// - `net:port=1,key= 1.2.3.4` — a stray space, where it is *filler* before a value. Read as a
+///   separator, `key` has an empty value and `1.2.3.4` becomes a bare flag, rendered verbatim.
+///
+/// Nothing in the string says which was meant. So rather than pick — the choice this has now been
+/// wrong about in both directions — an ambiguous connection is reported as [`OPAQUE`] and keeps
+/// none of its detail. It costs a readable label for a string that [`is_dialable`] refuses anyway,
+/// which is the trade worth making: the label exists to tell two targets apart, and there is no
+/// version of that worth disclosing a key for.
+fn redact(connection: &str) -> String {
+    if connection.chars().any(char::is_whitespace) {
+        return OPAQUE.to_string();
+    }
     Parsed::of(connection).render(Secrets::Mask)
 }
 
@@ -321,8 +348,9 @@ impl Profiles {
             // Named, because the name passed its own check and so is safe to print — and the
             // operator needs to know *which* entry to go and fix. The value stays unquoted.
             self.notes.push(format!(
-                "profile `{name}` in {} was skipped: its connection string contains a control \
-                 character, which no connection string does.",
+                "profile `{name}` in {} was skipped: its connection string contains a space or a \
+                 control character between its parameters, which no connection string does — \
+                 parameters are separated by commas. A missing comma is the usual cause.",
                 source.label()
             ));
             return;
@@ -590,9 +618,10 @@ pub fn select(connection: Option<String>, profile: Option<String>) -> Result<Sel
             let connection = connection.trim();
             if !is_dialable(connection) {
                 return Err(
-                    "`connection` contains a control character, which no connection string does. \
-                     It is not repeated here, in case it carries a key. Pass it on one line, e.g. \
-                     \"net:port=50000,key=<w.x.y.z>\"."
+                    "`connection` contains a space or a control character between its parameters, \
+                     which no connection string does — parameters are separated by commas. It is \
+                     not repeated here, in case it carries a key. Pass it as one unbroken string, \
+                     e.g. \"net:port=50000,key=<w.x.y.z>\"."
                         .to_string(),
                 );
             }
@@ -672,14 +701,21 @@ fn once_each(profile: &Profile) -> String {
 /// Whether this is a connection string this server will dial.
 ///
 /// Deliberately a low bar — DbgEng owns the syntax, and reimplementing it here would reject
-/// transports nobody here has heard of — but a **control character** is never part of one, and
-/// letting one through costs more than the check. The label built from a connection goes into
-/// `session_status`'s multi-line report, so an embedded line break can forge a session line in a
-/// report a model then reasons about. ([`Parsed`] handles line breaks structurally, so this is no
-/// longer also the difference between a masked key and a disclosed one — but it was, and the
-/// cheapest way to keep it from becoming that again is to refuse the input.)
+/// transports nobody here has heard of — but two kinds of character are never part of one, and
+/// each costs more to allow than to refuse. Checked after the outer trim, so a pasted string with
+/// a trailing newline is still fine; this is about what sits *between* the parameters.
+///
+/// - A **control character** would let the label forge a line in `session_status`'s multi-line
+///   report, which a model then reasons about.
+/// - **Whitespace** makes the parameter boundaries ambiguous, and [`redact`] documents why that
+///   ambiguity cannot be resolved safely in either direction. A connection carrying it is
+///   reported opaquely rather than in detail, so refusing it up front is also the only way the
+///   caller learns *why* their label went blank.
 fn is_dialable(connection: &str) -> bool {
-    !connection.is_empty() && !connection.chars().any(char::is_control)
+    !connection.is_empty()
+        && !connection
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace())
 }
 
 /// Whether this is a profile name rather than something else that got put where one belongs.
@@ -763,19 +799,22 @@ mod tests {
         }
     }
 
-    /// The same invariant over a generated corpus, with both halves of the actual claim checked:
-    /// a secret parameter never survives redaction, and a non-secret one always does.
+    /// The same invariant over a generated corpus of **well-formed** connections, with both halves
+    /// of the actual claim checked: a secret parameter never survives redaction, and a non-secret
+    /// one always does.
     ///
     /// Both directions matter. Leaking is the failure this module exists to prevent; over-masking
     /// is the failure that would make a redacted label useless for telling two targets apart, and
     /// the tempting over-broad fixes (mask anything that looks like a value) fail exactly here.
-    /// The decorations are the ones that defeated the previous scanner, permuted around the two
-    /// positions they can occupy.
+    ///
+    /// Whitespace is deliberately **not** among the decorations: it has no unambiguous reading, so
+    /// it is refused by `is_dialable` and rendered opaque by `redact` — asserted separately, in
+    /// `an_ambiguous_connection_keeps_none_of_its_detail`. What is varied here is everything a
+    /// real connection string can legitimately contain.
     #[test]
     fn no_decoration_around_a_parameter_changes_which_parameter_it_is() {
-        const GAPS: &[&str] = &["", " ", "\t", "\r\n", "   "];
         const SEPARATORS: &[char] = &[',', ';'];
-        // Secret, secret in another case, and two that merely resemble one.
+        // Secret, secret in another case, and three that merely resemble one.
         const NAMES: &[(&str, bool)] = &[
             ("key", true),
             ("KeY", true),
@@ -784,14 +823,17 @@ mod tests {
             ("keyring", false),
             ("port2", false),
         ];
+        // Values that have themselves been mistaken for structure.
+        const VALUES: &[&str] = &[FAKE_KEY, "a=b=c", "a:b", "1.2.3.4"];
+        const PREFIXES: &[&str] = &["net:", "", "npipe:"];
 
         let mut checked = 0;
-        for before in GAPS {
-            for after in GAPS {
-                for separator in SEPARATORS {
-                    for (name, secret) in NAMES {
+        for separator in SEPARATORS {
+            for (name, secret) in NAMES {
+                for value in VALUES {
+                    for prefix in PREFIXES {
                         let input = format!(
-                            "net:port=1{separator}{before}{name}={after}{FAKE_KEY}{separator}target=host"
+                            "{prefix}port=1{separator}{name}={value}{separator}target=host"
                         );
                         assert_eq!(
                             Parsed::of(&input).render(Secrets::Keep),
@@ -800,14 +842,15 @@ mod tests {
                         );
                         let redacted = redact(&input);
                         assert_eq!(
-                            !redacted.contains(FAKE_KEY),
+                            !redacted.contains(value),
                             *secret,
-                            "`{name}` with gaps {before:?}/{after:?} redacted as {redacted:?}"
+                            "`{name}={value}` redacted as {redacted:?}"
                         );
                         // Whatever happened to the secret, the readable parts survive — that is
                         // what a redacted label is *for*.
                         assert!(
-                            redacted.starts_with("net:port=1") && redacted.ends_with("target=host"),
+                            redacted.starts_with(&format!("{prefix}port=1"))
+                                && redacted.ends_with("target=host"),
                             "{redacted:?}"
                         );
                         checked += 1;
@@ -816,7 +859,7 @@ mod tests {
             }
         }
         assert_eq!(
-            checked, 300,
+            checked, 144,
             "the corpus shrank; the coverage claim moved with it"
         );
     }
@@ -869,24 +912,18 @@ mod tests {
     /// the same way — the key back in the session label, the one output redaction exists to keep
     /// clean.
     #[test]
-    fn redaction_treats_every_ascii_whitespace_as_a_parameter_boundary() {
+    fn no_whitespace_anywhere_in_a_connection_leaves_a_key_readable() {
         for gap in ["\r\n", "\n", "\r", "\t", " ", "\x0c", "  "] {
-            let before = redact(&format!("net:port=1,{gap}key={FAKE_KEY}"));
-            assert!(
-                !before.contains(FAKE_KEY),
-                "gap {gap:?} before the name defeated redaction: {before}"
-            );
-            assert!(before.contains("key=<redacted>"), "gap {gap:?}: {before}");
-
-            let after = redact(&format!("net:port=1,key={gap}{FAKE_KEY},target=host"));
-            assert!(
-                !after.contains(FAKE_KEY),
-                "gap {gap:?} after the `=` defeated redaction: {after}"
-            );
-            assert!(
-                after.contains(MASK) && after.ends_with(",target=host"),
-                "the gap and the rest of the string survive: {after}"
-            );
+            for shape in [
+                format!("net:port=1,{gap}key={FAKE_KEY}"),
+                format!("net:port=1,key={gap}{FAKE_KEY},target=host"),
+                format!("net:port=1{gap}key={FAKE_KEY}"),
+                format!("net:port=1,key{gap}={FAKE_KEY}"),
+            ] {
+                let out = redact(&shape);
+                assert!(!out.contains(FAKE_KEY), "gap {gap:?} leaked: {out}");
+                assert_eq!(out, OPAQUE, "gap {gap:?} in {shape:?}");
+            }
         }
     }
 
@@ -1011,27 +1048,69 @@ mod tests {
         );
     }
 
-    /// A control character is in no connection string, and the label built from one lands in
-    /// `session_status`'s multi-line report — where a line break can forge a session line.
+    /// Neither a control character nor interior whitespace belongs in a connection string, and
+    /// both are refused before a label is ever built. The control character would forge a line in
+    /// `session_status`'s multi-line report; the whitespace would make the parameter boundaries
+    /// ambiguous, which is what `redact` cannot resolve safely in either direction.
+    ///
+    /// The outer trim runs first, so a pasted string with a trailing newline is still fine — this
+    /// is about what sits *between* parameters.
     #[test]
-    fn a_connection_carrying_a_control_character_is_refused_without_being_echoed() {
-        let err = select(Some(format!("net:port=1,\nkey={FAKE_KEY}")), None).unwrap_err();
-        assert!(err.contains("control character"), "{err}");
-        assert!(!err.contains(FAKE_KEY), "{err}");
+    fn a_connection_broken_across_parameters_is_refused_without_being_echoed() {
+        for broken in [
+            format!("net:port=1,\nkey={FAKE_KEY}"), // a control character
+            format!("net:port=50000 key={FAKE_KEY}"), // a missing comma
+            format!("net:port=1,key= {FAKE_KEY}"),  // a stray space before the value
+        ] {
+            let err = select(Some(broken.clone()), None).unwrap_err();
+            assert!(err.contains("space or a control character"), "{err}");
+            assert!(!err.contains(FAKE_KEY), "for {broken:?}: {err}");
+        }
+
+        // Trimmed, not refused: whitespace around the whole string is a paste artefact.
+        let padded = select(Some(format!("  {FAKE}\n")), None).expect("the outer trim runs first");
+        assert_eq!(padded.connection.expose(), FAKE);
 
         // Same gate on the configured path: the entry is named (its name passed its own check)
         // and the value is not.
         let profiles = Profiles::from_pairs(&[
             ("ctf-vm", FAKE),
-            ("broken", &format!("net:\nkey={FAKE_KEY}")),
+            ("broken", &format!("net:port=50000 key={FAKE_KEY}")),
         ]);
         assert_eq!(profiles.names(), ["ctf-vm"]);
         let err = resolve("broken", &profiles).unwrap_err();
         assert!(
-            err.contains("`broken`") && err.contains("control character"),
+            err.contains("`broken`") && err.contains("space or a control character"),
             "{err}"
         );
         assert!(!err.contains(FAKE_KEY), "{err}");
+    }
+
+    /// If a connection carrying whitespace reaches redaction anyway, it discloses **nothing**
+    /// rather than being read one of the two incompatible ways.
+    ///
+    /// This is the case that broke the parse and, before it, the scanner — in opposite directions.
+    /// Reading the space as filler swallows `key=` into `port`'s value and masks nothing; reading
+    /// it as a separator leaves `key` empty and turns the key into a bare flag. Both disclose it,
+    /// so neither reading is taken.
+    #[test]
+    fn an_ambiguous_connection_keeps_none_of_its_detail() {
+        for ambiguous in [
+            format!("net:port=50000 key={FAKE_KEY}"),
+            format!("net:port=1,key= {FAKE_KEY}"),
+            format!("net:port=1,key\t={FAKE_KEY}"),
+            format!("net:port=1,key={FAKE_KEY} target=host"),
+            format!("net:port=1,\r\nkey={FAKE_KEY}"),
+        ] {
+            let out = redact(&ambiguous);
+            assert!(!out.contains(FAKE_KEY), "{ambiguous:?} leaked: {out}");
+            assert_eq!(out, OPAQUE, "for {ambiguous:?}");
+        }
+        // And it stays opaque through the type, which is what a session label goes through.
+        assert_eq!(
+            Connection::new(format!("net:port=50000 key={FAKE_KEY}")).to_string(),
+            OPAQUE
+        );
     }
 
     /// The environment half of the same claim, on the real scan: a variable defines a profile
