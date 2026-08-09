@@ -26,6 +26,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::kdconn::Connection;
+
 /// One unit of debugger work, as it crosses the process boundary.
 ///
 /// The variants are deliberately **tool-shaped, not DbgEng-shaped**. Several tools are more than
@@ -44,8 +46,12 @@ pub enum EngineOp {
         path: String,
     },
     AttachKernelLocal,
+    /// The one op carrying a **secret**. [`Connection`] serializes as the bare string it always
+    /// was — this channel is a pair of anonymous pipes, and nothing outside these two processes
+    /// can read it — but renders redacted everywhere else, so the `Debug` this enum derives
+    /// cannot become the leak. See [`crate::kdconn`].
     AttachKernel {
-        connection: String,
+        connection: Connection,
     },
     AttachProcess {
         pid: u32,

@@ -5,6 +5,52 @@ status. Keep entries short; link to code with `file:line` where it helps a futur
 
 ---
 
+## The KDNET key is resolved server-side, and connection strings are a type (2026-08-09, issue #81)
+
+**Context.** `attach_kernel` took a raw DbgEng connection string, and a KDNET one carries the
+target's debug key. A tool argument is not a private channel: the client owns the transcript, and
+during the MessageManager CTF session the single key supplied was replicated into 524 records of it
+— messages, tool calls, context snapshots, compaction summaries. Nothing the client did was wrong;
+that is what keeping a conversation *means*. The server's fault was giving the client no way to
+avoid handling the secret in the first place.
+
+**Decision.** Two changes, and they answer different halves of the problem.
+
+- **Profiles.** `attach_kernel` takes exactly one of `connection` (unchanged) or `profile`, a name
+  resolved inside this process from `WINDBG_MCP_PROFILE_<NAME>` or a machine-local JSON file
+  (`src/kdconn.rs`). The name is not a secret, so it can be repeated through a transcript
+  indefinitely at no cost. This is the half that keeps the key out of the request.
+- **`Connection`, a string that cannot be printed.** Its `Debug` and `Display` render redacted, and
+  the raw value is reachable only through `expose()` — called once, in the worker, handing it to
+  DbgEng. This is the half that covers the string that *is* still supplied explicitly.
+
+**Why a type rather than "remember to redact".** The leak surfaces are not one place: a session
+label shown by `session_status` and by the "no room to open another" list, a tool error, a log line,
+and `EngineOp`'s derived `Debug` — which nothing prints today, and which the next person to debug
+the pipe protocol will reach for. A redaction helper called at each of those is correct until
+someone adds the fifth. Making the *value* unprintable moves the guarantee from a review checklist
+to the type system, at the cost of one `expose()` call whose name says what it does.
+
+**Why redaction is scoped to connection strings.** The obvious stronger move — filter every string
+leaving the server for `key=` — was rejected. This server's whole job is returning debugger output
+verbatim, and on a CTF target a flag can look like anything; a filter that rewrote `!reg` output or
+a memory dump would corrupt the answers people came for, silently and in the direction of "the tool
+is lying to me". So `redact` masks values in *connection strings*, at the points where a connection
+string is rendered, and nothing else.
+
+**Why exclusivity is a runtime check, not a schema `oneOf`.** An untagged enum renders as a schema
+composition, and clients handle those unevenly — the same reason each tool's arguments are a plain
+self-contained object with `session_id` repeated rather than flattened (`src/server.rs`, "Tool
+parameter types"). Both fields are optional on the wire and `kdconn::select` refuses both/neither
+with a tool error naming the alternative. The "neither" error lists the profiles the host has, which
+is the load-bearing part: an agent that cannot discover a profile name asks the user, the user
+answers with a connection string, and the key is in the transcript after all.
+
+**Status.** Implemented. Unit tests in `src/kdconn.rs` (fake values throughout); protocol-tier and
+debugger-tier smoke tests assert the fake key reaches neither the transport nor the log.
+
+---
+
 ## One process per debug session (2026-08-02, issue #61)
 
 **Context.** A live-kernel attach waits for its target with `WaitForEvent(INFINITE)` — a finite

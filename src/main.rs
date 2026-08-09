@@ -8,6 +8,7 @@
 //! session that cannot be unwound be killed without taking the server with it.
 
 mod engine;
+mod kdconn;
 mod proto;
 mod server;
 mod ttd;

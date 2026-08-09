@@ -12,11 +12,23 @@ Pick one entry point:
   `sxe ibp` initial-breakpoint filter, which a bare host leaves off).
 - **Attach to a running process.** `attach_process { "pid": 1234 }` — breaks in.
 - **Local kernel.** `attach_kernel_local {}` — breaks in and returns `vertarget`.
-- **Remote kernel (KDNET).** `attach_kernel { "connection": "net:port=<n>,key=<w.x.y.z>" }`
-  — connects, breaks in, and returns `vertarget`. **Ask the user for the actual
-  connection string**; the port and key are specific to the target's KDNET setup (from
-  `bcdedit /dbgsettings` on the target, or the `windbgx -k` / `kd -k` command they use)
-  and cannot be guessed — never invent a placeholder key.
+- **Remote kernel (KDNET).** `attach_kernel` — connects, breaks in, and returns `vertarget`.
+  Takes **exactly one** of two ways to name the target, in this order of preference:
+  1. `attach_kernel { "profile": "<name>" }` — a connection configured on the debugger host,
+     which the server resolves locally. **Prefer this.** A connection string carries the
+     target's debug key, and a key that arrives as a tool argument is in the transcript for
+     good. Don't know the names? Call `attach_kernel {}` with no arguments — the refusal lists
+     the profiles this host has, so you never have to guess one.
+  2. `attach_kernel { "connection": "net:port=<n>,key=<w.x.y.z>" }` — the raw string, for a
+     target no profile covers. **Ask the user for the actual connection string**; the port and
+     key come from the target's KDNET setup (`bcdedit /dbgsettings` on the target, or the
+     `windbgx -k` / `kd -k` command they use) and cannot be guessed — never invent a
+     placeholder key. Worth telling the user a profile would keep it out of the transcript next
+     time ([setup.md](setup.md)).
+
+  Passing both, or neither, is refused. So is a connection string put in `profile` by mistake —
+  and it is not echoed back. Sessions report their connection with the key masked
+  (`net:port=50000,key=<redacted>`), so `session_status` still tells two kernel targets apart.
 
 Each of these opens a session of its own and returns a `session_id` — opening one does not close
 another, so you can keep a kernel attach live while you look at a dump. Pass the id on later calls

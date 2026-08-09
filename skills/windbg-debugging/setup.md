@@ -191,6 +191,41 @@ is a symbol problem on this host, not a statement about the target's pool.
 Offline / no symbols? Navigation, memory reads, disassembly, and the data model still work
 — query by address instead of by name.
 
+## Kernel connection profiles — configure once, keep the key out of the transcript
+
+A KDNET connection string carries the target's debug key (`net:port=50000,key=<w.x.y.z>`), and a
+key passed as a tool argument is in the MCP client's transcript from then on — copied through
+messages, tool calls, context snapshots and compaction summaries. Configure the connection on
+**this host** instead and `attach_kernel { "profile": "<name>" }` names it without the key ever
+entering the request.
+
+Either source works; the environment is checked first, then the file.
+
+**Environment**, in whatever launches the MCP server (the variable's suffix is the profile name,
+lowercased — this defines `ctf_vm`, and `ctf-vm` resolves to it too):
+
+```pwsh
+$env:WINDBG_MCP_PROFILE_CTF_VM = "net:port=50000,key=1.2.3.4"
+```
+
+**File** — `%USERPROFILE%\.windbg-mcp\profiles.json`, or wherever `WINDBG_MCP_PROFILES` points:
+
+```json
+{
+  "ctf-vm": "net:port=50000,key=1.2.3.4",
+  "lab":    "net:port=50001,key=5.6.7.8"
+}
+```
+
+This file holds keys: keep it out of every repository, and out of any directory that gets synced
+or shared. Names are matched case-insensitively with `-`, `_` and `.` equivalent, and the sources
+are re-read on every attach — adding a profile does not mean restarting the MCP client.
+
+Raw connection strings stay supported (`attach_kernel { "connection": "net:port=…,key=…" }`) for a
+target no profile covers. Either way the session reports itself with the key masked —
+`kernel target: profile "ctf-vm" (net:port=50000,key=<redacted>)` — so `session_status` can still
+tell two kernel targets apart. `attach_kernel` with no arguments lists the profiles this host has.
+
 ## Elevation matrix
 
 | Operation | Administrator? |

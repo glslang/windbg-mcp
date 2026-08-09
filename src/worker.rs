@@ -492,7 +492,9 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<S
                 // This `wait` is the one that can never return: `SetInterrupt` cannot reach a
                 // wait still establishing the link, so a guest that never dials in parks here
                 // for good. It parks *this process*, which the supervisor can kill.
-                let pending = e.attach_kernel_begin(&connection).map_err(es)?;
+                // The one place the key is unwrapped, and the last: it goes straight into
+                // DbgEng. Everything else that touches this value renders it redacted.
+                let pending = e.attach_kernel_begin(connection.expose()).map_err(es)?;
                 commit();
                 pending.wait().map_err(es)
             },
