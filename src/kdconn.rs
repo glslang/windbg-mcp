@@ -106,9 +106,11 @@ impl fmt::Debug for Connection {
 /// `=` **inside** a masked value is consumed with it rather than restarting the scan — which is
 /// the case a naive split-on-`=` gets wrong, and it gets it wrong by emitting the tail of a key.
 ///
-/// **All** ASCII whitespace is a boundary, line breaks included. Anything narrower is a way to
-/// defeat this: `net:port=1,\r\nkey=…` would parse as a parameter called `"\r\nkey"`, match no
-/// secret, and hand the key straight back through the session label.
+/// **All** ASCII whitespace is a boundary, line breaks included, and whitespace between the `=`
+/// and the value is skipped rather than read as an empty value. Both are ways this has been
+/// defeated: `net:port=1,\r\nkey=…` parsed as a parameter called `"\r\nkey"` and matched no
+/// secret, and `key= …` measured a zero-length value and masked nothing. Each ended with the key
+/// back in the session label, which is the one place it must never be.
 pub fn redact(connection: &str) -> String {
     let name_delim = |c: char| matches!(c, ',' | ';' | ':' | '=') || c.is_ascii_whitespace();
     let value_delim = |c: char| matches!(c, ',' | ';') || c.is_ascii_whitespace();
@@ -127,9 +129,19 @@ pub fn redact(connection: &str) -> String {
         out.push('=');
         let value = &tail[1..];
         if SECRET_PARAMS.iter().any(|p| p.eq_ignore_ascii_case(name)) {
+            // Whitespace *after* the `=` is a gap before the value, not the value being empty —
+            // and whitespace is a value delimiter, so failing to skip it is how `key= 1.2.3.4`
+            // came out whole: the value measured zero length, nothing was masked, and the rest of
+            // the string (key included) was then emitted verbatim by the no-more-`=` exit.
+            let gap = value.len()
+                - value
+                    .trim_start_matches(|c: char| c.is_ascii_whitespace())
+                    .len();
+            let (spacing, value) = value.split_at(gap);
+            out.push_str(spacing);
             let end = value.find(value_delim).unwrap_or(value.len());
-            // An empty value has nothing to mask, and masking it would invent a secret that is
-            // not there — the honest rendering of `key=` is `key=`.
+            // A genuinely empty value has nothing to mask, and masking it would invent a secret
+            // that is not there — the honest rendering of `key=` is `key=`.
             if end > 0 {
                 out.push_str(MASK);
             }
@@ -164,6 +176,11 @@ struct Profile {
     name: String,
     connection: Connection,
     source: Source,
+    /// Other spellings from the same source that normalize to this name and point somewhere
+    /// **else**. Non-empty makes this profile unusable, deliberately: the server cannot tell which
+    /// target was meant, and the failure mode of guessing is attaching to the wrong kernel while
+    /// believing otherwise. A duplicate that agrees is not recorded here — nothing can go wrong.
+    conflicts: Vec<String>,
 }
 
 /// The kernel connection profiles configured on this host.
@@ -241,19 +258,21 @@ impl Profiles {
             return;
         }
         match self.entries.entry(normalize(&name)) {
-            std::collections::btree_map::Entry::Occupied(taken) => {
-                let kept = taken.get();
-                // Environment over file is the documented precedence, not a mistake. Two
-                // spellings within *one* source are: they are the same profile once `-`, `_` and
-                // `.` are treated alike, one of them silently wins, and the cost of not saying so
-                // is an operator dialling a name that reaches a different machine.
-                if kept.source == source {
+            std::collections::btree_map::Entry::Occupied(mut taken) => {
+                let kept = taken.get_mut();
+                // Environment over file is the documented precedence, not a mistake, and neither
+                // is a duplicate that agrees with itself. Two spellings within *one* source that
+                // name **different** targets are: they are one name once `-`, `_` and `.` are
+                // treated alike, and nothing here can know which was meant.
+                if kept.source == source && kept.connection.expose() != connection {
                     self.notes.push(format!(
-                        "`{name}` in {} is ignored: `{}` was read first and the two are one name \
-                         once `-`, `_` and `.` are treated alike.",
+                        "`{name}` and `{}` in {} are one name once `-`, `_` and `.` are treated \
+                         alike, but name different targets, so neither can be used until one is \
+                         renamed or removed.",
+                        kept.name,
                         source.label(),
-                        kept.name
                     ));
+                    kept.conflicts.push(name);
                 }
             }
             std::collections::btree_map::Entry::Vacant(slot) => {
@@ -261,6 +280,7 @@ impl Profiles {
                     name,
                     connection: Connection::new(connection),
                     source,
+                    conflicts: Vec::new(),
                 });
             }
         }
@@ -535,6 +555,19 @@ fn resolve(name: &str, profiles: &Profiles) -> Result<Selected, String> {
         ));
     }
     match profiles.get(name) {
+        // Configured twice, for two different targets. Refused rather than resolved to whichever
+        // was read first: this server cannot know which was meant, and the cost of guessing is a
+        // session on the wrong kernel that reports itself as the right one. The names are all
+        // valid ones (`admit` saw to that), so listing them is safe and is the whole fix.
+        Some(profile) if !profile.conflicts.is_empty() => Err(format!(
+            "the profile named `{name}` is configured more than once, for different targets: {}. \
+             Those are one name to this server, which treats `-`, `_` and `.` alike and ignores \
+             case, so it cannot tell which was meant — and dialling the wrong one would open a \
+             session on the wrong machine. Ask the user to rename or remove all but one; the \
+             others here are usable in the meantime. {}",
+            once_each(profile),
+            profiles.listed()
+        )),
         Some(profile) => Ok(Selected {
             label: format!("profile \"{}\" ({})", profile.name, profile.connection),
             connection: profile.connection.clone(),
@@ -545,6 +578,15 @@ fn resolve(name: &str, profiles: &Profiles) -> Result<Selected, String> {
             profiles.how_to_configure()
         )),
     }
+}
+
+/// The colliding spellings of one profile, as an error should list them.
+fn once_each(profile: &Profile) -> String {
+    std::iter::once(&profile.name)
+        .chain(&profile.conflicts)
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Whether this is a connection string this server will dial.
@@ -642,18 +684,30 @@ mod tests {
         assert!(!out.contains("cd"), "{out}");
     }
 
-    /// A line break before a secret parameter must not smuggle it past the scan. With only space
-    /// and tab as boundaries the name parsed as `"\r\nkey"`, matched nothing, and the key came
-    /// back through the session label — the one output redaction exists to keep clean.
+    /// Whitespace around a secret parameter must not smuggle it past the scan, on either side of
+    /// the `=`. Before the name, too narrow a delimiter set parsed `"\r\nkey"` and matched
+    /// nothing; after the `=`, the value measured zero length and nothing was masked. Both ended
+    /// the same way — the key back in the session label, the one output redaction exists to keep
+    /// clean.
     #[test]
     fn redaction_treats_every_ascii_whitespace_as_a_parameter_boundary() {
-        for gap in ["\r\n", "\n", "\r", "\t", " ", "\x0c"] {
-            let out = redact(&format!("net:port=1,{gap}key={FAKE_KEY}"));
+        for gap in ["\r\n", "\n", "\r", "\t", " ", "\x0c", "  "] {
+            let before = redact(&format!("net:port=1,{gap}key={FAKE_KEY}"));
             assert!(
-                !out.contains(FAKE_KEY),
-                "gap {gap:?} defeated redaction: {out}"
+                !before.contains(FAKE_KEY),
+                "gap {gap:?} before the name defeated redaction: {before}"
             );
-            assert!(out.contains("key=<redacted>"), "gap {gap:?}: {out}");
+            assert!(before.contains("key=<redacted>"), "gap {gap:?}: {before}");
+
+            let after = redact(&format!("net:port=1,key={gap}{FAKE_KEY},target=host"));
+            assert!(
+                !after.contains(FAKE_KEY),
+                "gap {gap:?} after the `=` defeated redaction: {after}"
+            );
+            assert!(
+                after.contains(MASK) && after.ends_with(",target=host"),
+                "the gap and the rest of the string survive: {after}"
+            );
         }
     }
 
@@ -849,21 +903,32 @@ mod tests {
         }
     }
 
-    /// Two spellings of one name inside a single source are a collision, not an override: one
-    /// silently wins, and the cost of not saying so is an operator dialling a name that reaches a
-    /// different machine. Environment-over-file *is* the documented precedence and stays quiet.
+    /// Two spellings of one name in one source, naming **different** targets, must not resolve to
+    /// whichever was read first. Nothing here can know which was meant, and the cost of guessing
+    /// is a session on the wrong kernel that reports itself as the right one — so both spellings
+    /// are refused until an operator picks. A note alone would not do it: notes surface when a
+    /// lookup *fails*, and this lookup used to succeed.
     #[test]
-    fn two_spellings_of_one_name_in_one_source_are_reported() {
+    fn one_name_configured_for_two_targets_is_refused_not_guessed() {
         let profiles =
             Profiles::from_pairs(&[("ctf-vm", FAKE), ("ctf.vm", "net:port=1,key=9.9.9.9")]);
-        assert_eq!(profiles.names(), ["ctf-vm"], "the first read wins");
-        let err = resolve("nope", &profiles).unwrap_err();
-        assert!(
-            err.contains("`ctf.vm`") && err.contains("is ignored"),
-            "the shadowed spelling has to be named, or it looks configured:\n{err}"
-        );
-        assert!(!err.contains("9.9.9.9"), "{err}");
+        for asked in ["ctf-vm", "ctf.vm", "CTF_VM"] {
+            let err = resolve(asked, &profiles)
+                .err()
+                .unwrap_or_else(|| panic!("`{asked}` must not resolve to a guess"));
+            assert!(
+                err.contains("`ctf-vm`") && err.contains("`ctf.vm`"),
+                "{err}"
+            );
+            assert!(err.contains("different targets"), "{err}");
+            assert!(!err.contains(FAKE_KEY) && !err.contains("9.9.9.9"), "{err}");
+        }
+    }
 
+    /// The two collisions that are *not* ambiguous, and so must stay usable: the documented
+    /// environment-over-file override, and a duplicate that simply agrees with itself.
+    #[test]
+    fn an_override_and_a_duplicate_that_agrees_are_not_conflicts() {
         let mut override_case = Profiles {
             entries: BTreeMap::new(),
             notes: Vec::new(),
@@ -876,6 +941,18 @@ mod tests {
             override_case.notes.is_empty(),
             "the environment overriding the file is documented behaviour, not a problem: {:?}",
             override_case.notes
+        );
+        let selected = resolve("ctf-vm", &override_case).expect("the override resolves");
+        assert_eq!(selected.connection.expose(), FAKE, "the environment wins");
+
+        let agreeing = Profiles::from_pairs(&[("lab-vm", FAKE), ("lab.vm", FAKE)]);
+        assert!(agreeing.notes.is_empty(), "{:?}", agreeing.notes);
+        assert_eq!(
+            resolve("lab.vm", &agreeing)
+                .expect("two spellings of one target are not ambiguous")
+                .connection
+                .expose(),
+            FAKE
         );
     }
 
