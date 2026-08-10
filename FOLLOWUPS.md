@@ -4,10 +4,10 @@ Deferred work, in five clusters: items 1–6 come from the reachability-confirma
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/win-kexp#71, 2026-08-01), items 13–14 from the bounded-command coverage review
-(#46, 2026-08-02), item 15 from the private worker channel (#65 / #72, 2026-08-04), and items 16–17
+(#46, 2026-08-02), item 15 from the private worker channel (#65 / #72, 2026-08-04), and items 16–18
 from transactional batches (#82, 2026-08-09/10 — item 17 is what validating the tool against the CTF
-session's own transcript turned up). Each item notes its repo, why it was deferred, and where it
-picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
+session's own transcript turned up, and item 18 what reviewing it did). Each item notes its repo,
+why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
 Items are roughly ordered by how soon they're worth doing, within each cluster. **Item 10 has
@@ -382,3 +382,30 @@ back on.
   `batch::Debuggee`, which would gain one method per capability so the executor stays engine-free.
   `@chunkt1`'s real shape is the test case: capture a register with `eval`, then ask `pool_chunk`
   about `{{that}}` — the capture half already works.
+
+## 18. [windbg-mcp] Let a running batch finish its rollback when the client disconnects
+
+`debug_batch` (#82) makes one guarantee totally and a weaker version of it partially. Against a call
+**timeout** the rollback is safe by construction: the batch budget is clamped to the caller's
+remaining patience, so `always` has run and the report has been written before the wait expires.
+Against a client **disconnect** it is not. `Sessions::shutdown` treats a disconnect as `end_session`
+on every session; the `EndSession` op queues behind the batch, `release` waits
+`SHUTDOWN_RELEASE_TIMEOUT` (5s), and then the worker is killed — mid-transaction, with the patch
+still applied.
+
+- **What it costs today:** a batch that patches a live kernel and is still running 5s after the
+  client goes away leaves the patch in place and, for a kernel session killed rather than released,
+  the target halted. The window is small, but it is exactly the case the tool exists for.
+- **Why deferred:** the two obvious fixes are both worse than the gap. Lengthening
+  `SHUTDOWN_RELEASE_TIMEOUT` slows *every* disconnect for a case that is rare, and the constant is
+  short on purpose (a session that cannot let go in a few seconds never will). Making the grace
+  conditional on what the worker is running means the supervisor tracking op identity through
+  teardown — a change to the path every session's shutdown depends on, landed alongside a new
+  feature, with the failure mode "the client hangs on disconnect".
+- **Where it picks up:** `Sessions::shutdown`/`release` in `src/engine.rs`. The shape worth trying
+  first is a *signal* rather than a longer wait — tell the worker to abandon its remaining steps and
+  jump to `always`, which `batch::run` is already structured for (every failure path falls through
+  to the same block), then wait the existing grace on that. It needs the side channel item 7
+  describes, for the same reason: a worker busy in DbgEng is not draining its request queue.
+- **Meanwhile:** documented as the boundary it is, in `README.md`, the skill playbook and the tool
+  description — a disconnect is not a way to abort a batch safely; `end_session` is.

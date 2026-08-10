@@ -395,10 +395,10 @@ cleanup is exactly the call that times out, and a disconnect sends nothing at al
 that costs the VM: an un-restored patch, or a target left halted.
 
 `debug_batch` submits the whole sequence as one op. It runs **inside the session's engine process**,
-which owns the deadline, so the `always` block runs on every path — success, a debugger error, an
-assertion that did not hold, the deadline expiring — before the tool call returns. Part of the budget
-is reserved for it up front, because "what is left" after a step that ran to its own deadline is
-nothing.
+which owns the deadline, so the `always` block is reached on every path — success, a debugger error,
+an assertion that did not hold, the deadline expiring — before the tool call returns. Part of the
+budget is reserved for it up front, because "what is left" after a step that ran to its own deadline
+is nothing.
 
 ```jsonc
 {
@@ -429,10 +429,21 @@ rollback completed — reported *beside* the original failure, never instead of 
 session is left stopped, running, detached, or uncertain. A batch that did not commit comes back as a
 tool error carrying that whole report.
 
-Two honest limits. A raw command that prints an error and returns success is a step that *succeeded*
-with that text (DbgEng reports most failures that way), so assert on it if it matters. And what a
-step "changed" is a best-effort classification of the command, biased toward reporting a change: it
-is a reporting aid, and the `always` block, not the classifier, is what makes a mutation recoverable.
+Four honest limits, none of them hidden in the report:
+
+- A raw command that prints an error and returns success is a step that *succeeded* with that text
+  (DbgEng reports most failures that way), so assert on it if it matters.
+- What a step "changed" is a best-effort classification of the command, biased toward reporting a
+  change: it is a reporting aid, and the `always` block, not the classifier, is what makes a
+  mutation recoverable.
+- The reserve buys the rollback *time*, not a guarantee. A step that overruns far enough to consume
+  the reserve as well leaves cleanup with no budget; the block is then skipped and the result says
+  `rollback: INCOMPLETE`, naming each step that did not run.
+- The strong guarantee is against a **call timeout**: the batch budget is clamped so the rollback
+  finishes and the report is written before the caller gives up. A **client disconnect** is weaker —
+  teardown treats it as `end_session` on every session, and a batch still running when that grace
+  expires is terminated with its worker, mid-transaction. Keep a batch that patches a live kernel
+  comfortably inside that grace, or end the session yourself rather than dropping the connection.
 
 ### Error reporting
 

@@ -18,9 +18,13 @@
 //!   the `always` block before it starts, so "the steps ran out of time" and "the rollback ran out
 //!   of time" are different events. The supervisor sizes that budget from the caller's remaining
 //!   patience (`worker::batch_budget`) so the report lands *before* the tool call gives up.
-//! * **`always` runs on every path.** Success, a debugger error, an assertion that did not hold, an
-//!   expired deadline — all of them fall through to the same block, and a failure inside it is
-//!   recorded beside the original rather than replacing it.
+//! * **`always` is reached on every path.** Success, a debugger error, an assertion that did not
+//!   hold, an expired deadline — all of them fall through to the same block, cleanup continues past
+//!   its own failures, and a failure inside it is recorded beside the original rather than
+//!   replacing it. What the reserve buys is *time to run*, not a guarantee: a step that overruns
+//!   far enough to consume the reserve as well leaves cleanup with no budget, and then the block is
+//!   skipped and the report says the rollback is incomplete. That is the honest edge, and it is
+//!   pinned by a test rather than left to be discovered.
 //! * **The executor never touches DbgEng.** It drives a [`Debuggee`], which the worker implements
 //!   over a real engine and the tests implement over a script. Assertion failure, a command failure
 //!   after a mutation, deadline expiry and a rollback that itself fails are therefore all testable
@@ -61,6 +65,36 @@ const ROLLBACK_RESERVE: Duration = Duration::from_secs(30);
 /// The smallest watchdog a step is armed with. Zero *disables* win-kexp's watchdog, so a step
 /// dequeued at or past the deadline must not round down to it.
 const MIN_STEP_BUDGET_MS: u32 = 1_000;
+
+/// Default deadline for a whole batch, when the caller names none (ms).
+///
+/// Comfortably more than a sequence of ordinary commands needs, and comfortably inside the default
+/// call budget so the rollback report lands before the caller gives up. A batch that wants longer
+/// asks for it; the worker still clamps it to the caller's remaining patience.
+pub const DEFAULT_BATCH_MS: u32 = 120_000;
+
+/// The shortest deadline a batch may ask for.
+///
+/// Below this there is no batch: the reserve is half the budget, a step is armed with at least
+/// [`MIN_STEP_BUDGET_MS`], and a budget under a second means every step *and* every cleanup step
+/// is skipped before it starts. A caller who writes `0` gets a batch that does nothing and reports
+/// nothing useful about why, which is worse than being told the number is unusable.
+pub const MIN_BATCH_MS: u32 = 1_000;
+
+/// The budget a batch is built with, from what the caller asked for.
+///
+/// Separate from [`validate`] because it answers a different question — that one is about the
+/// steps, this is about the clock — and because the answer is a value the caller's request is
+/// replaced by rather than a yes/no.
+pub fn budget_ms(requested: Option<u32>) -> Result<u32, String> {
+    match requested {
+        None => Ok(DEFAULT_BATCH_MS),
+        Some(ms) if ms < MIN_BATCH_MS => Err(format!(
+            "`timeout_ms` is {ms}; a batch needs at least {MIN_BATCH_MS} ms. Part of the budget is              reserved for the `always` block, so a deadline this short would skip every step and              every cleanup step before either started. Omit `timeout_ms` for the {DEFAULT_BATCH_MS}              ms default."
+        )),
+        Some(ms) => Ok(ms),
+    }
+}
 
 /// How much of a step's output the report carries, and how much it carries for the step that
 /// failed. The failing step is what the caller has to act on, so it gets the bigger share; the
@@ -106,6 +140,11 @@ pub enum StepAction {
     /// value. The only step a `capture` may be attached to.
     Eval { expr: String },
     /// Hex-dump `size` bytes at `address`.
+    ///
+    /// `address` is a **number** — decimal or `0x`-hex — not a debugger expression, matching the
+    /// `read_memory` tool. That is not a limitation in a batch: an `eval` step binds its value as
+    /// `0x`-hex, so `@rsp` or `poi(@rbx+8)` is one `eval` with a `capture` and then `{{name}}`
+    /// here.
     ReadMemory { address: String, size: u32 },
 }
 
@@ -425,7 +464,8 @@ pub fn retires_handle(steps: &[BatchStep], always: &[BatchStep]) -> bool {
 
 // ---- what a step changed --------------------------------------------------
 
-/// Session-control commands, taken from [`changes_debug_target`]'s list by asking it.
+/// Commands that write target memory. Session-control commands are deliberately absent:
+/// [`mutation`] asks [`changes_debug_target`] for those first, so `.detach` is not looked for here.
 const MEMORY_WRITES: &[&str] = &[
     "e", "ea", "eb", "ed", "ef", "ep", "eq", "eu", "ew", "ez", "eza", "ezu", "f", "fp", "m",
     ".readmem", ".fillmem",
@@ -805,7 +845,18 @@ fn run_step(
 
     let mut result = StepResult::Ok;
     for check in &checks {
-        if let Err(why) = evaluate(d, check, &output, budget_ms) {
+        // Re-read the clock between checks, not once for the step. An `eval` check is two engine
+        // queries, and a step may carry several — arming each of them with the budget computed
+        // before the *first* one would let a step's assertions run for a multiple of the time the
+        // step was given, and eat the reserve the rollback depends on.
+        if d.elapsed() >= deadline {
+            result = StepResult::Failed(
+                "the batch ran out of time before this step's assertions could be checked"
+                    .to_string(),
+            );
+            break;
+        }
+        if let Err(why) = evaluate(d, check, &output, deadline) {
             result = StepResult::Unmet(why);
             break;
         }
@@ -841,7 +892,12 @@ fn run_step(
 }
 
 /// One side of an [`Check::Eval`] comparison: what the debugger makes of a MASM expression.
-fn eval_value(d: &mut impl Debuggee, expr: &str, budget_ms: u32) -> Result<u64, String> {
+///
+/// Takes the *deadline* rather than a budget, and sizes its own watchdog from the clock at the
+/// moment it runs — a check is two of these, and the second must not be armed with the time the
+/// first one already spent.
+fn eval_value(d: &mut impl Debuggee, expr: &str, deadline: Duration) -> Result<u64, String> {
+    let budget_ms = step_budget_ms(d.elapsed(), deadline).max(MIN_STEP_BUDGET_MS);
     // Parenthesized, so a relational expression (`@rcx > 0x1000`) is evaluated as one value
     // rather than losing its precedence against whatever `?` does with the rest of the line.
     let text = d
@@ -860,7 +916,7 @@ fn evaluate(
     d: &mut impl Debuggee,
     check: &Check,
     output: &str,
-    budget_ms: u32,
+    deadline: Duration,
 ) -> Result<(), String> {
     match check {
         Check::Contains { text } => {
@@ -886,8 +942,8 @@ fn evaluate(
             }
         }
         Check::Eval { expr, equals } => {
-            let left = eval_value(d, expr, budget_ms)?;
-            let right = eval_value(d, equals, budget_ms)?;
+            let left = eval_value(d, expr, deadline)?;
+            let right = eval_value(d, equals, deadline)?;
             if left == right {
                 Ok(())
             } else {
@@ -1230,6 +1286,9 @@ mod tests {
 
     const BUDGET: Duration = Duration::from_secs(60);
 
+    /// What `? (…)` prints for a value of 1.
+    const EVAL_ONE: &str = "Evaluate expression: 1 = 00000000`00000001";
+
     // ---- the four paths the issue asks for --------------------------------
 
     /// An assertion that does not hold stops the batch *and* runs the rollback — the case a
@@ -1402,6 +1461,42 @@ mod tests {
         assert!(
             d.ran("dt nt!_EPROCESS 0x1000"),
             "the capture should have been substituted: {:?}",
+            d.calls
+        );
+    }
+
+    /// `read_memory` takes a number, not an expression — so the documented way to dump memory at
+    /// `@rsp` is an `eval` step in front of it. A capture binds as `0x`-hex, which is exactly what
+    /// that step accepts, so the two compose without the caller converting anything.
+    #[test]
+    fn a_capture_feeds_a_read_memory_step_that_takes_only_numbers() {
+        let mut d = stopped()
+            .on("? @rsp", Ok("Evaluate expression: 1 = ffff8001`0000f000"))
+            .on(
+                "read 64 at 0xffff80010000f000",
+                Ok("ffff80010000f000  90 90"),
+            );
+        let batch = op(
+            vec![
+                BatchStep {
+                    capture: Some("sp".to_string()),
+                    ..step(StepAction::Eval {
+                        expr: "@rsp".to_string(),
+                    })
+                },
+                step(StepAction::ReadMemory {
+                    address: "{{sp}}".to_string(),
+                    size: 64,
+                }),
+            ],
+            vec![],
+        );
+
+        let report = run(&mut d, &batch, BUDGET);
+        assert!(report.committed(), "{}", render(&report));
+        assert!(
+            d.ran("read 64 at 0xffff80010000f000"),
+            "the capture should have arrived as a number: {:?}",
             d.calls
         );
     }
@@ -1874,6 +1969,92 @@ mod tests {
             Duration::from_secs(10),
         );
         assert!(report.committed(), "{}", render(&report));
+    }
+
+    /// Assertions are engine work too, and a step may carry several — each an `eval` check worth
+    /// two queries. Arming them all from the clock as it stood before the *first* one would let a
+    /// step's checks run for a multiple of the time the step was given, and eat the reserve the
+    /// rollback depends on. The loop re-reads the clock between checks and stops at the deadline.
+    #[test]
+    fn assertions_cannot_run_past_the_step_deadline_and_eat_the_reserve() {
+        // 60s budget → 30s reserve → the steps get 30s. Each `?` query costs 20s.
+        let mut d = stopped()
+            .on("lm", Ok("start end module"))
+            .slow("? (first", Ok(EVAL_ONE), Duration::from_secs(20))
+            .slow("? (1)", Ok(EVAL_ONE), Duration::from_secs(20))
+            .on("? (second", Ok(EVAL_ONE))
+            .on("bc *", Ok(""));
+        let batch = op(
+            vec![BatchStep {
+                expect: vec![
+                    Check::Eval {
+                        expr: "first".to_string(),
+                        equals: "1".to_string(),
+                    },
+                    Check::Eval {
+                        expr: "second".to_string(),
+                        equals: "1".to_string(),
+                    },
+                ],
+                ..cmd("lm")
+            }],
+            vec![cmd("bc *")],
+        );
+
+        let report = run(&mut d, &batch, BUDGET);
+
+        // The first check's two queries put the clock at 40s, past the 30s step deadline, so the
+        // second check never starts.
+        assert!(
+            !d.ran("? (second"),
+            "assertions must stop at the step deadline: {:?}",
+            d.calls
+        );
+        assert_eq!(report.outcome, BatchOutcome::TimedOut { at: 1 });
+        // And the reserve did its job: the cleanup still ran.
+        assert!(d.ran("bc *"), "the rollback must survive: {:?}", d.calls);
+        assert!(report.rollback_complete());
+    }
+
+    /// The path where the rollback guarantee genuinely fails: a step overran so far that even the
+    /// reserve is gone. Nothing can be done about it — but the report must say so rather than
+    /// leave a caller believing the cleanup ran.
+    #[test]
+    fn a_cleanup_step_past_the_whole_budget_is_skipped_and_reported_as_incomplete() {
+        // One step costs 100s against a 60s budget, so the `always` block cannot start at all.
+        // The state probe still runs: past the deadline is exactly when a caller most needs to be
+        // told what the session is left holding.
+        let mut d = stopped().slow("lm", Ok(""), Duration::from_secs(100));
+        let report = run(
+            &mut d,
+            &op(vec![cmd("lm")], vec![cmd("bc *"), cmd("eb restore 41")]),
+            BUDGET,
+        );
+
+        assert!(
+            !d.ran("bc *") && !d.ran("eb restore"),
+            "there was no time left to run cleanup: {:?}",
+            d.calls
+        );
+        assert!(!report.rollback_complete());
+        let text = render(&report);
+        assert!(text.contains("rollback: INCOMPLETE — 2 of 2"), "{text}");
+        assert!(
+            text.contains("ran out of time before this cleanup step started"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_batch_deadline_too_short_to_run_anything_is_refused() {
+        // Zero is the one a caller writes by accident, and it yields a batch that skips every step
+        // *and* every cleanup step — silently, without the reserve ever mattering.
+        let why = budget_ms(Some(0)).unwrap_err();
+        assert!(why.contains("at least"), "{why}");
+        assert!(why.contains("reserved for the `always` block"), "{why}");
+        assert!(budget_ms(Some(MIN_BATCH_MS - 1)).is_err());
+        assert_eq!(budget_ms(Some(MIN_BATCH_MS)), Ok(MIN_BATCH_MS));
+        assert_eq!(budget_ms(None), Ok(DEFAULT_BATCH_MS));
     }
 
     #[test]

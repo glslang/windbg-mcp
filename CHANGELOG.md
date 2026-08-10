@@ -27,12 +27,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expressions and so covers registers, memory and any relation between them — and an `eval` step
   may `capture` its value under a name later steps interpolate as `{{name}}`.
 
-  **The `always` block runs on every path**: success, a debugger error, an assertion that did not
-  hold, the deadline expiring. Part of the budget is reserved for it before the first step runs,
-  because what is left after a step that ran to its own deadline is nothing. The worker owns that
-  deadline, sized from the caller's remaining patience the same way a bounded command's watchdog
-  is, so the rollback has finished and the report has been written before the tool call gives up —
-  which is the only reason the report is worth anything.
+  **The `always` block is reached on every path**: success, a debugger error, an assertion that did
+  not hold, the deadline expiring. Part of the budget is reserved for it before the first step runs,
+  because what is left after a step that ran to its own deadline is nothing, and cleanup continues
+  past its own failures. The worker owns that deadline, sized from the caller's remaining patience
+  the same way a bounded command's watchdog is, so the rollback has finished and the report has been
+  written before the tool call gives up — which is the only reason the report is worth anything.
+
+  Two edges are reported rather than papered over. The reserve buys the rollback *time*, not a
+  guarantee: a step that overruns far enough to consume the reserve as well leaves cleanup with no
+  budget, and the result then says `rollback: INCOMPLETE` and names each step that never started.
+  And the strong guarantee is against a call **timeout** — a client **disconnect** is treated as
+  `end_session` on every session, so a batch still running when that grace expires is terminated
+  with its worker, mid-transaction.
 
   The result names every step that ran, the exact failing one, what each step changed, whether the
   rollback completed (reported *beside* the original failure, never instead of it), and whether the
