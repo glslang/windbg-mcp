@@ -281,9 +281,11 @@ static TOKEN_CONTEXT inspect_token(void) {
     DWORD admin_sid_size = sizeof(admin_sid_buffer);
     PSID admin_sid = (PSID)admin_sid_buffer;
     TOKEN_GROUPS *groups = NULL;
+    TOKEN_GROUPS *restricted_sids = NULL;
     TOKEN_PRIVILEGES *privileges = NULL;
     TOKEN_MANDATORY_LABEL *label = NULL;
     TOKEN_ELEVATION elevation;
+    BOOL complete = TRUE;
     DWORD returned = 0;
     LUID debug_luid;
     DWORD index;
@@ -294,12 +296,17 @@ static TOKEN_CONTEXT inspect_token(void) {
         printf("[token] OpenProcessToken failed=%lu\n", GetLastError());
         return context;
     }
-    context.Valid = TRUE;
     print_token_user(token);
 
     groups = (TOKEN_GROUPS *)get_token_information_alloc(token, TokenGroups, NULL);
-    if (groups && CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, admin_sid,
-                                     &admin_sid_size)) {
+    if (!groups) {
+        printf("[token] TokenGroups query failed=%lu\n", GetLastError());
+        complete = FALSE;
+    } else if (!CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, admin_sid,
+                                   &admin_sid_size)) {
+        printf("[token] administrator SID creation failed=%lu\n", GetLastError());
+        complete = FALSE;
+    } else {
         for (index = 0; index < groups->GroupCount; ++index) {
             DWORD attributes;
             if (!EqualSid(groups->Groups[index].Sid, admin_sid)) continue;
@@ -313,23 +320,52 @@ static TOKEN_CONTEXT inspect_token(void) {
     }
 
     returned = sizeof(context.ElevationType);
-    GetTokenInformation(token, TokenElevationType, &context.ElevationType, returned, &returned);
+    if (!GetTokenInformation(token, TokenElevationType, &context.ElevationType, returned,
+                             &returned)) {
+        printf("[token] TokenElevationType query failed=%lu\n", GetLastError());
+        complete = FALSE;
+    }
     ZeroMemory(&elevation, sizeof(elevation));
     returned = sizeof(elevation);
     if (GetTokenInformation(token, TokenElevation, &elevation, returned, &returned)) {
         context.Elevated = elevation.TokenIsElevated != 0;
+    } else {
+        printf("[token] TokenElevation query failed=%lu\n", GetLastError());
+        complete = FALSE;
     }
-    context.Restricted = IsTokenRestricted(token);
+
+    restricted_sids =
+        (TOKEN_GROUPS *)get_token_information_alloc(token, TokenRestrictedSids, NULL);
+    if (restricted_sids) {
+        context.Restricted = restricted_sids->GroupCount != 0;
+    } else {
+        printf("[token] TokenRestrictedSids query failed=%lu\n", GetLastError());
+        complete = FALSE;
+    }
 
     label = (TOKEN_MANDATORY_LABEL *)get_token_information_alloc(token, TokenIntegrityLevel, NULL);
     if (label && IsValidSid(label->Label.Sid)) {
         UCHAR count = *GetSidSubAuthorityCount(label->Label.Sid);
-        if (count) context.IntegrityRid = *GetSidSubAuthority(label->Label.Sid, count - 1);
+        if (count) {
+            context.IntegrityRid = *GetSidSubAuthority(label->Label.Sid, count - 1);
+        } else {
+            printf("[token] TokenIntegrityLevel SID has no subauthorities\n");
+            complete = FALSE;
+        }
+    } else {
+        printf("[token] TokenIntegrityLevel query returned no valid SID\n");
+        complete = FALSE;
     }
 
     privileges =
         (TOKEN_PRIVILEGES *)get_token_information_alloc(token, TokenPrivileges, NULL);
-    if (privileges && LookupPrivilegeValueW(NULL, L"SeDebugPrivilege", &debug_luid)) {
+    if (!privileges) {
+        printf("[token] TokenPrivileges query failed=%lu\n", GetLastError());
+        complete = FALSE;
+    } else if (!LookupPrivilegeValueW(NULL, L"SeDebugPrivilege", &debug_luid)) {
+        printf("[token] SeDebugPrivilege lookup failed=%lu\n", GetLastError());
+        complete = FALSE;
+    } else {
         for (index = 0; index < privileges->PrivilegeCount; ++index) {
             LUID_AND_ATTRIBUTES entry = privileges->Privileges[index];
             if (entry.Luid.LowPart != debug_luid.LowPart ||
@@ -351,8 +387,11 @@ static TOKEN_CONTEXT inspect_token(void) {
            yes_no(context.AdminSidDenyOnly));
     printf("[token] SeDebugPrivilege_present=%s enabled=%s\n", yes_no(context.DebugPresent),
            yes_no(context.DebugEnabled));
+    context.Valid = complete;
+    printf("[token] classification_complete=%s\n", yes_no(context.Valid));
 
     if (groups) HeapFree(GetProcessHeap(), 0, groups);
+    if (restricted_sids) HeapFree(GetProcessHeap(), 0, restricted_sids);
     if (privileges) HeapFree(GetProcessHeap(), 0, privileges);
     if (label) HeapFree(GetProcessHeap(), 0, label);
     CloseHandle(token);
@@ -657,6 +696,8 @@ int main(int argc, char **argv) {
     PROBE_RESULT legacy_handles;
     PROBE_RESULT extended_handles;
     PROBE_RESULT big_pool;
+    BOOL probes_complete;
+    BOOL module_pointer_observed;
     int index;
 
     for (index = 1; index < argc; ++index) {
@@ -674,7 +715,10 @@ int main(int argc, char **argv) {
     printf("kernel_address_probe version=1\n");
     build = get_os_build();
     token = inspect_token();
-    if (!token.Valid) return 1;
+    if (!token.Valid) {
+        printf("[assessment] overall=INCONCLUSIVE_TOKEN_INSPECTION\n");
+        return 1;
+    }
     standard_caller = !token.AdminSidPresent && !token.DebugPresent && !token.Elevated &&
                       token.ElevationType == TokenElevationTypeDefault;
     printf("[assessment] caller_class=%s\n",
@@ -728,12 +772,27 @@ int main(int argc, char **argv) {
            (unsigned long)extended_handles.KernelPointerCount,
            (unsigned long)big_pool.KernelPointerCount);
 
+    probes_complete = documented_modules.QuerySucceeded && direct_modules.QuerySucceeded &&
+                      legacy_handles.QuerySucceeded && extended_handles.QuerySucceeded &&
+                      big_pool.QuerySucceeded;
+    if (!probes_complete) {
+        printf("[assessment] probe_status documented_modules=%s direct_modules=%s "
+               "legacy_handles=%s extended_handles=%s big_pool=%s\n",
+               yes_no(documented_modules.QuerySucceeded), yes_no(direct_modules.QuerySucceeded),
+               yes_no(legacy_handles.QuerySucceeded), yes_no(extended_handles.QuerySucceeded),
+               yes_no(big_pool.QuerySucceeded));
+        printf("[assessment] overall=INCONCLUSIVE_PROBE_FAILURE\n");
+        return 1;
+    }
+
+    module_pointer_observed = documented_modules.KernelPointerCount != 0 ||
+                              direct_modules.KernelPointerCount != 0;
     if (!standard_caller) {
         printf("[assessment] overall=INCONCLUSIVE_PRIVILEGED_CALLER\n");
-    } else if (direct_modules.KernelPointerCount || legacy_handles.KernelPointerCount ||
+    } else if (module_pointer_observed || legacy_handles.KernelPointerCount ||
                extended_handles.KernelPointerCount || big_pool.KernelPointerCount) {
         printf("[assessment] overall=POTENTIAL_KERNEL_ADDRESS_DISCLOSURE\n");
-        if (build >= 26100 && direct_modules.KernelPointerCount) {
+        if (build >= 26100 && module_pointer_observed) {
             printf("[assessment] candidate_24h2_module_base_disclosure=yes\n");
         }
         printf("[assessment] preserve this output and validate on a fully updated clean VM\n");
