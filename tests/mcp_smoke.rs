@@ -3374,15 +3374,24 @@ fn kernel_scratch(server: &mut Server, session: &str) -> Option<KernelScratch> {
 
     // Write it, read it back, put it back — the shortest thing that distinguishes "the debugger
     // can write here" from "the debugger accepted a write here and nothing happened".
-    server.tool_text(
-        "execute",
-        json!({
-            "command": format!("eb {} {:#x}", scratch.addr(), scratch.patched()),
-            "session_id": session,
-        }),
-        TARGET_STEP,
-    );
-    let wrote = eval_expr(server, session, &format!("by({})", scratch.addr()));
+    //
+    // Under `catch_unwind`, because between the write and the restore is the one window in this
+    // whole tier where a panic leaves the *guest* changed rather than merely halted: a call that
+    // times out in transit has still reached DbgEng, so the byte is patched and the reply that
+    // would have let this function continue never arrives. The restore below then has to run
+    // anyway — the outer handlers end the session, which puts a halted kernel back but not a
+    // patched one.
+    let wrote = catch_unwind(AssertUnwindSafe(|| {
+        server.tool_text(
+            "execute",
+            json!({
+                "command": format!("eb {} {:#x}", scratch.addr(), scratch.patched()),
+                "session_id": session,
+            }),
+            TARGET_STEP,
+        );
+        eval_expr(server, session, &format!("by({})", scratch.addr()))
+    }));
     // Restore before judging the result: the assertion is the caller's business, the byte is the
     // target's, and a failed probe must not be the reason a guest is left modified.
     server.tool_text(
@@ -3402,6 +3411,12 @@ fn kernel_scratch(server: &mut Server, session: &str) -> Option<KernelScratch> {
         scratch.addr(),
         scratch.original
     );
+    // Only now, with the byte confirmed back: whatever went wrong above is worth reporting, and
+    // it is worth reporting *after* the guest is whole rather than instead of making it whole.
+    let wrote = match wrote {
+        Ok(wrote) => wrote,
+        Err(panic) => resume_unwind(panic),
+    };
     if wrote != Some(scratch.patched()) {
         eprintln!(
             "NOTE: writing {} was accepted and did not take (read back {wrote:?}, wanted {:#x}), \
@@ -3990,6 +4005,11 @@ fn a_live_kernel_batch_step_can_ask_the_pool_about_a_captured_pointer() {
     };
     let engine = ensure_engine_beside_test_binary();
     println!("engine: {engine}");
+    // Pinned below `POOL_CALL_BUDGET`, exactly as the pool tier is, and that ordering is not
+    // adjustable: the server has to answer before the *harness* gives up, or the `end_session` in
+    // the cleanup queues behind a walk that is still running, misses its grace, and the worker is
+    // killed — which on a broken-in kernel leaves the guest halted. Raising this above the harness
+    // budget to buy the batch more room would buy it by inverting that.
     let mut server = Server::started_with(&[(
         "WINDBG_MCP_CALL_TIMEOUT_SECS",
         &SERVER_CALL_TIMEOUT.as_secs().to_string(),
@@ -4012,7 +4032,9 @@ fn a_live_kernel_batch_step_can_ask_the_pool_about_a_captured_pointer() {
                 "session_id": session,
                 // The walk is the expensive part and it is inside the batch, so give the batch
                 // room for it — the point is that the *step* bounds the walk, not that nothing
-                // ever has to wait.
+                // ever has to wait. Asking for the whole call budget is deliberate and the clamp
+                // to it (minus the reply's headroom) is the expected outcome: what the steps then
+                // have is ~255s, against a walk measured at ~52s over KDNET.
                 "timeout_ms": 300_000,
                 "steps": [
                     { "op": "eval", "expr": "@$proc", "capture": "proc",

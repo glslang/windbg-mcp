@@ -47,9 +47,10 @@ tools already learned not to make.
 
 **Validated against the workflow it was filed for.** The CTF session's own transcript
 (`~/.codex/sessions/2026/08/08`) records all 18 revisions of the throwaway client and all 188 of its
-invocations — 1,681 individual steps. Classified against the step language: 1,672 of them are
-`command`, `run_to`, `resume` or `eval` shapes, and **9 are pool-tool calls a batch cannot reach**
-(`@chunkt1`, `@census`, `@find`, `@findr`). Two of the client's revisions exist only to work around
+invocations — 1,681 individual steps. Classified against the step language *as adopted*: 1,672 of
+them are `command`, `run_to`, `resume` or `eval` shapes, and **9 were pool-tool calls a batch could
+not then reach** (`@chunkt1`, `@census`, `@find`, `@findr`) — the gap that became FOLLOWUPS item 17
+and is closed below. Two of the client's revisions exist only to work around
 gaps this design closes — its eighth replaced a compound `.if` assertion with three pseudo-register
 assignments and three regexes over printed output, and its sixteenth added a duplicate of `@run`
 whose only difference was restoring a patch "on both hit and timeout", which is `always` hand-rolled.
