@@ -222,7 +222,7 @@ impl BatchSignal {
     fn finish(&self) -> Option<(u64, u32)> {
         let mut state = self.state();
         state.finish_by = None;
-        state.told_by.take().map(|id| (id, RELEASE_STILL_NEEDS))
+        state.told_by.take().map(|id| (id, RETRACTED))
     }
 
     /// Claims the engine thread for a batch that will be done by `bound` — everything it may start
@@ -262,17 +262,15 @@ impl Drop for BatchGuard<'_> {
     }
 }
 
-/// What a retraction promises instead of the batch's remaining budget: the transaction is over, and
-/// what is left is the release, which has not started yet.
+/// What a retraction says: **nothing more**, because the transaction is over.
 ///
-/// **Not zero**, which is what "the batch is done" first became. The release was queued *behind*
-/// the batch, so at the moment the batch ends it has not run at all — and a teardown whose grace
-/// expires just then would terminate the worker in the middle of the resume-and-detach a live
-/// kernel needs, leaving the target halted. It would also be non-monotonic, since a batch finishing
-/// a moment later would keep its whole extension. A release gets what an idle engine takes to let
-/// go, which is the same figure this process waits when it has to do it unasked
-/// ([`ABRUPT_EXIT_RELEASE`]).
-const RELEASE_STILL_NEEDS: u32 = ABRUPT_EXIT_RELEASE.as_millis() as u32;
+/// A retraction names the moment the batch ended, and zero is how a deadline says "now". What the
+/// release still needs is not the worker's to name — the supervisor grants it from this moment,
+/// out of the same grace it would have given a session that never ran a batch at all. Naming a
+/// release interval here as well, which is what this first was, adds one: the supervisor waits the
+/// interval out and *then* starts the grace, so a disconnect took two of them after a batch ended
+/// rather than one.
+const RETRACTED: u32 = 0;
 
 /// This process's one batch signal. Global for the same reason [`MESSAGES`] is: the reader thread
 /// sets it, the engine thread reads it, and there is exactly one engine here to be talking about.
@@ -2170,15 +2168,18 @@ mod tests {
         assert_eq!(signal.finish(), None, "and owed it once");
         drop(guard);
 
-        // What it is told is not "stop waiting": the release was queued *behind* the batch, so at
-        // this moment it has not run at all. Retracting to nothing would let a teardown whose
-        // grace expires right here terminate the worker mid-detach — and would be non-monotonic,
-        // since a batch finishing a moment later keeps its whole extension.
-        assert!(
-            within_ms > 0,
-            "a finished transaction still leaves a release that has not started"
+        // What it is told is "now": the batch is done, and the moment it ended is the only thing
+        // the worker knows that the supervisor does not. How long the release then gets is the
+        // supervisor's to decide, out of the grace it would have given any session — naming an
+        // interval here as well would be added to that rather than replacing it.
+        // Against `0`, not against `RETRACTED`: comparing the constant with itself would hold
+        // whatever it was changed to, which is exactly how a retraction quietly became a second
+        // helping of grace once before.
+        assert_eq!(
+            within_ms, 0,
+            "a retraction names the moment the batch ended, not an interval — what the release \
+             then gets is the supervisor's own grace, measured from that moment"
         );
-        assert_eq!(u128::from(within_ms), ABRUPT_EXIT_RELEASE.as_millis());
     }
 
     /// Once the batch is over, a teardown gets the short grace again — the extra wait is for a

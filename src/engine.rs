@@ -103,13 +103,25 @@ fn unwind_slice(within: Duration, left: Duration) -> Duration {
 }
 
 /// The last wait a teardown owes once the transaction it was waiting on has ended: the ordinary
-/// grace, for the release that could not start until now.
+/// grace, measured from the moment the release could first have started.
+///
+/// `ended` is the last instant the worker named — the moment its batch finished, when it retracted,
+/// or the bound it promised and did not beat. Measuring from *there* rather than from now is what
+/// keeps the total honest: the grace this teardown already spent ran concurrently with a
+/// transaction the release was queued behind, so it bought the release nothing, but it should not
+/// buy it a second full helping either.
 ///
 /// `None` when there was no transaction — an ordinary teardown is not lengthened by a mechanism it
-/// never used — and none when the teardown's own patience is spent, so the total stays bounded by
-/// what [`Sessions::call_as`] started with.
-fn release_handoff(base: Duration, left: Duration, unwound: bool) -> Option<Duration> {
-    (unwound && !left.is_zero()).then(|| base.min(left))
+/// never used — and none when that grace is already spent or the teardown's own patience is, so the
+/// total stays bounded by what [`Sessions::call_as`] started with.
+fn release_handoff(
+    ended: Option<Instant>,
+    now: Instant,
+    base: Duration,
+    left: Duration,
+) -> Option<Duration> {
+    let owed = (ended? + base).saturating_duration_since(now).min(left);
+    (!owed.is_zero()).then_some(owed)
 }
 
 /// `CREATE_NEW_PROCESS_GROUP`, which every worker is spawned with.
@@ -444,6 +456,13 @@ impl Session {
     /// Read by the teardown that provoked it, after its own grace has run out — see
     /// [`Sessions::release`]. Nothing else consults it, and a session that never ran a batch never
     /// sets it, so an ordinary teardown neither reads nor pays for anything here.
+    /// The last moment this session's worker named for its transaction — when it ended, or the
+    /// bound it promised — or `None` if it never reported one. [`Self::unwinding_for`] is this read
+    /// as time remaining; the raw instant is what a release's own grace is measured from.
+    fn unwound_at(&self) -> Option<Instant> {
+        *self.unwinding.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn unwinding_for(&self) -> Option<Duration> {
         let by = (*self.unwinding.lock().unwrap_or_else(|e| e.into_inner()))?;
         let left = by.saturating_duration_since(Instant::now());
@@ -887,9 +906,7 @@ impl Sessions {
         // neither.
         if wait == Wait::UntilUnwound {
             let mut left = self.call_timeout;
-            let mut unwound = false;
             while let Some(within) = session.unwinding_for().filter(|_| !left.is_zero()) {
-                unwound = true;
                 let slice = unwind_slice(within, left);
                 if let Ok(reply) = tokio::time::timeout(slice, &mut rx).await {
                     return settled(reply);
@@ -905,7 +922,8 @@ impl Sessions {
             // is emitted as the batch ends, so a batch that runs to its bound emits it at the very
             // instant this loop stops looking. Resting on it arriving first would be resting on
             // pipe scheduling, and losing costs a worker killed as its release begins.
-            if let Some(handoff) = release_handoff(budget, left, unwound)
+            if let Some(handoff) =
+                release_handoff(session.unwound_at(), Instant::now(), budget, left)
                 && let Ok(reply) = tokio::time::timeout(handoff, &mut rx).await
             {
                 return settled(reply);
@@ -2850,16 +2868,29 @@ mod tests {
     fn a_release_that_waited_for_a_transaction_still_gets_its_own_grace() {
         let base = SHUTDOWN_RELEASE_TIMEOUT;
         let plenty = Duration::from_secs(300);
-        assert_eq!(release_handoff(base, plenty, true), Some(base));
+        let now = Instant::now();
+
+        // The transaction has just ended, so the release has its whole grace ahead of it.
+        assert_eq!(release_handoff(Some(now), now, base, plenty), Some(base));
+
+        // It ended a while ago and the release has been running since: it gets the rest, not
+        // another helping. Measuring from *now* instead would hand a second grace to every
+        // teardown that ever waited on a batch — which is what the retraction window used to do.
+        let third = base / 3;
+        assert_eq!(
+            release_handoff(Some(now - third), now, base, plenty),
+            Some(base - third)
+        );
+        assert_eq!(release_handoff(Some(now - base), now, base, plenty), None);
 
         // A teardown that never waited on a transaction is not lengthened by a mechanism it never
         // used: this is what keeps an ordinary disconnect costing what it always did.
-        assert_eq!(release_handoff(base, plenty, false), None);
+        assert_eq!(release_handoff(None, now, base, plenty), None);
 
         // And the teardown's own patience still bounds the total.
         let sliver = base / 4;
-        assert_eq!(release_handoff(base, sliver, true), Some(sliver));
-        assert_eq!(release_handoff(base, Duration::ZERO, true), None);
+        assert_eq!(release_handoff(Some(now), now, base, sliver), Some(sliver));
+        assert_eq!(release_handoff(Some(now), now, base, Duration::ZERO), None);
     }
 
     /// A session that has said nothing about a transaction is never waited on for one — which is
@@ -2944,12 +2975,12 @@ mod tests {
             "recorded as a deadline 90s out, not {left:?}"
         );
 
-        // A later, smaller figure *retracts* it: a worker whose transaction has finished says so
-        // by naming only what the release still needs, however long it said it might need when it
-        // was told to stop. The last word wins, in both directions.
+        // A retraction *replaces* it with the moment the batch ended, however long it said it
+        // might need when it was told to stop. The last word wins, in both directions — and what
+        // the release then gets is measured from that moment by `release_handoff`, not named here.
         let done = serde_json::to_string(&WorkerMessage::RollingBack {
             id: 7,
-            within_ms: 5_000,
+            within_ms: 0,
         })
         .expect("encode the retraction");
         writeln!(worker, "{done}").expect("write it as a worker would");
@@ -2957,15 +2988,9 @@ mod tests {
             .await
             .expect("the retraction reached the dispatcher within 10s");
         let by = unwinding.lock().unwrap().expect("still recorded");
-        let left = by.saturating_duration_since(Instant::now());
         assert!(
-            left <= Duration::from_secs(5),
-            "a finished transaction must not go on being waited out for the rest of its budget, \
-             and {left:?} is still most of it"
-        );
-        assert!(
-            !left.is_zero(),
-            "but the release it was holding up has not run yet, so it keeps its own moment"
+            by <= Instant::now(),
+            "a finished transaction must not go on being waited out for the rest of its budget"
         );
     }
 
