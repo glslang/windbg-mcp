@@ -46,3 +46,7 @@ so build the server first: `cargo build --release`. For symbol resolution, set
   fixture over WinRM, then runs the doubly gated live-KD smoke test through the real MCP stdio
   transport. It requires the challenge driver, a `PSCredential`, KDNET, and full `nt` symbols;
   see the [CTF regression runbook](../docs/smoke-test.md#messagemanager-ctf-regression).
+- **`messagemanager/kernel_address_probe.c`** - standalone, read-only probe for module bases,
+  handle object pointers, and big-pool addresses. It records token/elevation context and can refuse
+  privileged callers, so results can be reproduced without the challenge driver or KD. See the
+  [probe runbook](messagemanager/kernel-address-probe.md).
