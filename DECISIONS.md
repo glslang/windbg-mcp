@@ -65,11 +65,19 @@ terminated mid-patch. Neither obvious fix was worth taking: a longer grace is pa
 disconnect, including the parked kernel attach it was tuned against, and a supervisor that tracks
 what each worker is running is a change to the path every session's teardown depends on.
 
-So the teardown asks instead. `EngineOp::AbandonBatch` is answered by the worker's **request
-reader** rather than its engine thread — the one op that must be, since the thread it concerns is
-inside the batch — which sets a flag `batch::run` reads between steps and reports back, ahead of its
-own reply, **how long that batch may still need** (`WorkerMessage::RollingBack`). The grace is then
-widened for that session alone, by exactly that figure.
+So the teardown carries the signal itself. The worker's **request reader** acts on
+`EngineOp::EndSession` where it reads it — before queueing it for the engine thread, which is by
+definition busy inside the batch — setting a flag `batch::run` checks between steps and answering
+with **how long that batch may still need** (`WorkerMessage::RollingBack`). The teardown, already
+waiting on that op's reply, extends its wait by exactly that figure.
+
+A separate abandon op was the first shape, and review found what is wrong with it: telling a batch
+to stop is a sticky, one-way change to worker state, and two independently gated requests can come
+apart. A target-changing call landing between them retires the session, the release is then refused
+as stale, and the abandon has already aborted somebody's transaction and left a flag no later batch
+could get past — on a session that survives. Carried on the release, the property is structural
+rather than narrow: a gate refusal stops the request before it reaches the worker, and every request
+that reaches it is followed by the supervisor terminating that worker.
 
 Sizing it from the rollback's reserve instead was the first cut, and it was wrong in a way worth
 recording: the signal stops a batch at its *next* step, so what a teardown waits out is the step in
@@ -80,9 +88,10 @@ caller's patience already, and only the worker can measure it. The reserve then 
 what it always was — how much of the budget is held back for `always` — with nothing shortened to
 fit a teardown.
 
-The signal is skipped entirely when a worker owes no reply, which is every ordinary disconnect. What
-it cannot do is *shorten* a step already inside DbgEng — that is `SetInterrupt` bound to job
-identity, FOLLOWUPS item 7 — so a batch stops at its next step boundary, not where it stands.
+A session with nothing to unwind says nothing and costs exactly what it always did, so an ordinary
+disconnect is untouched. What none of this can do is *shorten* a step already inside DbgEng — that
+is `SetInterrupt` bound to job identity, FOLLOWUPS item 7 — so a batch stops at its next step
+boundary, not where it stands.
 
 **Status.** Adopted. Two things are still owed: pool steps (FOLLOWUPS item 17, the one gap the
 transcript found) and a live-kernel exercise of a *mutating* batch (item 16) — the dump tier proves
