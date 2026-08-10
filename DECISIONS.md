@@ -37,6 +37,27 @@ failed one **without being the thread that asked**. Without it an interrupt on r
 search is worth. The watchdog's explanatory note stays the watchdog's: it exists because nobody saw
 that deadline pass, whereas this caller is the one who asked.
 
+**This is the approved exception to engine-thread confinement** (`AGENTS.md`), and worth being
+explicit about, because the rule is otherwise absolute and the code visibly departs from it.
+`SetInterrupt` is the one DbgEng entry point Microsoft documents as safe from any thread; it is the
+only call this server makes off the engine thread, from exactly one place (`worker::interrupt_running`
+on the request reader). The engine is still created on the engine thread, never sent anywhere, and
+every other call is made there. The exception is unavoidable rather than convenient: an interrupt
+exists to stop an operation that is *running*, so the engine thread is busy by definition, and a
+request routed through it would be read only once there was nothing left to interrupt — the
+alternative is not a safer interrupt but no interrupt. It is also not new. win-kexp's two watchdogs
+have Ctrl+Broken the engine from threads of their own on every bounded command and every go/step
+since the bounded path existed; what changed is that a caller can now ask for the same thing.
+
+Validated where it can be: `execute_command_bounded`'s watchdog is the same call from the same
+kind of thread and is exercised by the bounded tier; win-kexp's
+`test_command_interrupted_on_request_keeps_its_output` drives the new caller against a live engine;
+and the dump tier's `a_running_command_is_interrupted_on_request_and_frees_its_session` drives it
+through the shipped binary, with the session used again afterwards — which is what would fail if
+the cross-thread call had corrupted engine state rather than merely raising a flag. The only other
+cross-thread touch is the handle's own refcount, and the handle windbg-mcp holds lives in a
+`OnceLock` for the life of the process, so it is never released at all.
+
 **Status.** Adopted. What it deliberately does **not** do: drop a *queued* job (nothing can name one
 — a tool call names a session, so that variant belongs with `tasks/cancel`), and reach a live-kernel
 wait whose target has not connected (`SetInterrupt` cannot, so the tool says so instead of reporting
