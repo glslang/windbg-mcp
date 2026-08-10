@@ -57,7 +57,8 @@ on this server's behalf, this test is where you find out, and the choice is impl
 suppress it — not ship an advertisement clients will call into a dead end.
 
 **Tool surface golden.** `tests/golden/tools_list.json` records the *structural* `tools/list`
-surface as it appears on the wire: JSON Schema dialect, `$defs` usage, tool count, and per tool its
+surface as it appears on the wire: JSON Schema dialect, `$defs` usage (`true` since `debug_batch`
+introduced the first nested schema), tool count, and per tool its
 name, title, four behaviour hints, required arguments, and each parameter's type/format/enum. It
 deliberately excludes descriptions, so prose edits do not churn it while a `schemars` dialect
 switch, an `rmcp` annotation-casing change, or an accidental tool rename all land as a readable
@@ -112,6 +113,12 @@ processes, so they need real ones:
 - *No worker outlives the connection.* Reads the engine pid out of `session_status`, disconnects,
   and checks the process is gone — otherwise every disconnect leaks a debugger process, and for a
   launch or an attach, a debuggee with it.
+- *A batch commits or fails, and its rollback runs either way.* `src/batch.rs` proves the executor
+  over a scripted debuggee; this proves the wiring — argument schema, the op crossing the pipe, the
+  engine seam, the report coming back — by running one batch to `COMMITTED` (with a capture bound
+  from one step and interpolated into the next) and one to `FAILED at step 2 of 3`, with the same
+  `always` block on both. The claim only a real engine can settle is the second one: the rollback
+  ran **inside the worker process**, on the failing path, before the tool call returned.
 
 This tier is also the only end-to-end check of the **protocol channel** — the inherited pipe pair a
 worker speaks on ([`proto.rs`](../src/proto.rs)). Handles are passed on the worker's command line

@@ -14,6 +14,7 @@ use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use crate::batch;
 use crate::engine::{
     Call, EngineError, MAX_SESSIONS, OpenError, OpenReport, SessionKind, SessionSnapshot,
     SessionState, Sessions,
@@ -24,7 +25,14 @@ use crate::ttd;
 
 /// How long to wait for an execution-control command (go/step/reverse) to reach its
 /// next stop (ms).
-const EXEC_WAIT_MS: u32 = 60_000;
+pub(crate) const EXEC_WAIT_MS: u32 = 60_000;
+
+/// Default deadline for a whole `debug_batch` (ms).
+///
+/// Comfortably more than a sequence of ordinary commands needs, and comfortably inside the default
+/// call budget so the rollback report lands before the caller gives up. A batch that wants longer
+/// asks for it; the worker still clamps it to the caller's remaining patience.
+const DEFAULT_BATCH_MS: u32 = 120_000;
 
 /// How long an open may sit un-landed before `session_status` stops calling it normal.
 ///
@@ -1367,6 +1375,36 @@ pub struct RunToAddressArgs {
     pub session_id: Option<String>,
 }
 
+/// A whole debugger transaction, for `debug_batch`.
+#[derive(Deserialize, JsonSchema)]
+pub struct DebugBatchArgs {
+    /// The steps to run, in order. Each is one flat object with an `op` field:
+    /// `{"op": "command", "command": "bp nt!NtCreateFile"}` runs a raw command;
+    /// `{"op": "resume", "command": "g"}` moves the target and waits for the next stop;
+    /// `{"op": "run_to", "address": "hevd!Trigger"}` reports a HIT/STOPPED ELSEWHERE/TIMEOUT
+    /// verdict; `{"op": "eval", "expr": "@rcx"}` reads a value; `{"op": "read_memory",
+    /// "address": "@rsp", "size": 64}` hex-dumps memory. Add `"expect"` to assert on the result
+    /// and `"capture"` (on an `eval` step) to bind its value for later steps as `{{name}}`.
+    /// The batch stops at the first step that fails or whose assertions do not hold.
+    pub steps: Vec<batch::BatchStep>,
+    /// Cleanup/rollback steps, same shape as `steps`. They run **on every path** — success, a
+    /// debugger error, an assertion that did not hold, or the deadline expiring — inside the
+    /// engine process, before this call returns. This is where an unpatch, a `bc *`, or a
+    /// re-`go` belongs: a client cannot be relied on to send it after a call that timed out.
+    /// Their failures are reported separately and never replace the batch's own outcome.
+    #[serde(default)]
+    pub always: Vec<batch::BatchStep>,
+    /// Deadline for the whole batch in milliseconds (default 120000). Part of it is reserved for
+    /// `always`, so a rollback still runs when the steps use the clock up. Clamped down to what
+    /// is left of this call's budget — it can only make the batch shorter, never longer.
+    #[serde(default)]
+    pub timeout_ms: Option<u32>,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 // ---- Session handles -----------------------------------------------------
 //
 // An MCP connection is explicitly *not* a session: clients may interleave unrelated requests
@@ -1391,7 +1429,7 @@ pub struct RunToAddressArgs {
 
 /// Whether an operand may legitimately contain a double quote.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Quotes {
+pub(crate) enum Quotes {
     /// Only `dx`, whose data-model expressions use quoted string literals as a matter of
     /// course (`@$cursession.TTD.Calls("ntdll!Nt*")`).
     Allowed,
@@ -1420,7 +1458,11 @@ enum Quotes {
 ///
 /// Quotes are refused everywhere except `dx` — see [`Quotes`] for why a quote is never a
 /// legitimate part of an address, symbol, device name or breakpoint location.
-fn reject_command_breakers(field: &str, value: &str, quotes: Quotes) -> Result<(), String> {
+pub(crate) fn reject_command_breakers(
+    field: &str,
+    value: &str,
+    quotes: Quotes,
+) -> Result<(), String> {
     let bad = value
         .chars()
         .find(|c| matches!(c, ';' | '\n' | '\r') || (quotes == Quotes::Rejected && *c == '"'));
@@ -1573,7 +1615,7 @@ fn dx_executes_commands(expression: &str) -> bool {
 /// failure this mechanism exists to prevent. It cannot be exhaustive — DbgEng has more ways
 /// to reach the target than a name list can enumerate — so `execute` remains the one place
 /// where a handle is a strong hint rather than a guarantee.
-fn changes_debug_target(command: &str) -> bool {
+pub(crate) fn changes_debug_target(command: &str) -> bool {
     /// Session-control commands: open, attach to, release, or terminate a target.
     const RETIRES_SESSION: &[&str] = &[
         ".opendump",
@@ -2108,6 +2150,50 @@ impl WindbgServer {
             // may still have detached, and a handle that outlives its target is the failure
             // mode this whole mechanism exists to prevent.
             call = call.retiring("a raw `execute` command replaced or released the target");
+        }
+        engine_result(self.run_call(args.session_id.as_deref(), call).await)
+    }
+
+    /// Run an ordered sequence of debugger steps as one transaction, with assertions and a
+    /// rollback block the engine process owns. Use this whenever a sequence *mutates* the
+    /// target — a patched byte, an armed breakpoint, a resumed thread — and something has to be
+    /// put back afterwards: the `always` block runs inside the worker on every path, including
+    /// an assertion that does not hold and the deadline expiring, so cleanup cannot be lost to a
+    /// call that times out or a client that disconnects. The result names every step that ran,
+    /// the exact one that failed, what each changed, whether the rollback completed, and whether
+    /// the target is left stopped, running, or gone.
+    #[rmcp::tool(annotations(
+        title = "Run a transactional debugger batch",
+        read_only_hint = false,
+        destructive_hint = true,
+        idempotent_hint = false,
+        open_world_hint = true
+    ))]
+    async fn debug_batch(
+        &self,
+        Parameters(args): Parameters<DebugBatchArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // Everything decidable without a debugger is decided here, before a single step runs.
+        // The alternative is a batch that applies three mutations and then trips over a typo in
+        // the fourth — survivable, because that is what `always` is for, but not something a
+        // caller should have to survive.
+        if let Err(why) = batch::validate(&args.steps, &args.always) {
+            return tool_error(why);
+        }
+        // Read before the steps move into the op, and before any of them runs: a `.detach` that
+        // reports an error may still have detached, so the handle has to be retired ahead of the
+        // batch rather than in light of what it reported.
+        let retires = batch::retires_handle(&args.steps, &args.always);
+        let mut call = Call::new(EngineOp::Batch(batch::BatchOp {
+            budget_ms: args.timeout_ms.unwrap_or(DEFAULT_BATCH_MS),
+            // Filled in by the supervisor's pump when this job reaches the front of its session's
+            // queue; see `EngineOp::Batch`.
+            patience_ms: 0,
+            steps: args.steps,
+            always: args.always,
+        }));
+        if retires {
+            call = call.retiring("a `debug_batch` step replaced or released the target");
         }
         engine_result(self.run_call(args.session_id.as_deref(), call).await)
     }
@@ -2906,6 +2992,11 @@ uf-based call-graph walk, whether a code block — by address or module+RVA — 
 dispatch routine; REACHABLE is sound, NOT REACHABLE is best-effort, and a REACHABLE verdict includes a \
 directional path recipe of the on-path branch conditions). Confirm a static verdict live with \
 run_to_address (run to a block on a KDNET/VM kernel target and report HIT/STOPPED ELSEWHERE/TIMEOUT). \
+When a sequence *mutates* the target — a patched byte, an armed breakpoint, a resumed thread — run it as \
+one `debug_batch` rather than as separate calls: its `always` block runs inside the engine process on \
+every path, including a failed assertion and an expired deadline, so cleanup cannot be lost to a call \
+that times out or a client that disconnects, and the result names the exact failing step, what each step \
+changed, whether the rollback completed, and whether the target is left stopped, running or gone. \
 Use `execute` for any raw command not covered by a dedicated tool."
 )]
 impl rmcp::ServerHandler for WindbgServer {}
@@ -2969,7 +3060,14 @@ mod tests {
                 .unwrap()
         };
 
-        for name in ["execute", "launch", "record_trace", "end_session", "go"] {
+        for name in [
+            "execute",
+            "launch",
+            "record_trace",
+            "end_session",
+            "go",
+            "debug_batch",
+        ] {
             assert_eq!(
                 ann(name).read_only_hint,
                 Some(false),
@@ -3025,6 +3123,7 @@ mod tests {
             "go",
             "end_session",
             "modules",
+            "debug_batch",
             // Takes one to ask *about*, not to be checked against.
             "session_status",
         ] {
@@ -3486,6 +3585,40 @@ mod tests {
                 "the explanation must survive: {rendered}"
             );
         }
+    }
+
+    /// A malformed batch must be refused *before* it reaches a session, and as a tool error the
+    /// model can read. The check that proves it: this server has no session at all, so a batch
+    /// that got past validation would come back complaining about that instead.
+    #[tokio::test]
+    async fn a_malformed_batch_is_refused_before_it_reaches_a_session() {
+        let server = WindbgServer::new(Sessions::new(Duration::from_secs(1)));
+        let result = server
+            .debug_batch(Parameters(DebugBatchArgs {
+                steps: vec![
+                    serde_json::from_value(serde_json::json!({
+                        "op": "command",
+                        "command": "eb fffff800`00001000 {{never_bound}}"
+                    }))
+                    .unwrap(),
+                ],
+                always: Vec::new(),
+                timeout_ms: None,
+                session_id: None,
+            }))
+            .await
+            .expect("a bad batch is a tool error, not a protocol error");
+        assert_eq!(result.is_error, Some(true));
+        let text = result
+            .content
+            .iter()
+            .filter_map(|b| b.as_text().map(|t| t.text.clone()))
+            .collect::<String>();
+        assert!(text.contains("`{{never_bound}}` is not bound"), "{text}");
+        assert!(
+            !text.contains("session"),
+            "validation must not have reached a session: {text}"
+        );
     }
 
     #[test]

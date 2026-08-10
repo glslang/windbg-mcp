@@ -16,7 +16,8 @@
 //!   symbols, no network.
 //! * **Target** (`WINDBG_MCP_SMOKE_DUMP=1`) — opens the sample crash dump through DbgEng, so
 //!   it needs `dbgeng.dll` and may reach a symbol server. Off by default; this is the tier
-//!   that catches a `win-kexp` regression.
+//!   that catches a `win-kexp` regression. It also runs a `debug_batch` to both outcomes,
+//!   because "the rollback ran inside the worker" is a claim only a real engine can settle.
 //! * **Bounded command** (`#[ignore]`d, run by hand) — deliberately runs away and waits out a
 //!   watchdog, so it is measured in minutes rather than seconds. It lives here rather than
 //!   beside the budget arithmetic in `src/engine.rs` because the two halves it proves are now
@@ -1149,6 +1150,109 @@ fn a_dump_session_opens_reads_and_closes() {
     assert!(
         is_tool_error(&after) || !after["error"].is_null(),
         "a handle from an ended session must be refused, got {after}"
+    );
+}
+
+/// `debug_batch` end to end against a real engine: a batch that commits, and one that fails an
+/// assertion — with the same `always` block on both.
+///
+/// The claim being tested is the one the tool exists for and the one no in-process test can make:
+/// the rollback runs **inside the worker process**, on the failing path, before the tool call
+/// returns. `src/batch.rs` proves the executor's logic over a scripted debuggee; this proves the
+/// wiring — argument schema, the op crossing the pipe, the engine seam, the report coming back.
+///
+/// Read-only against the checked-in kernel dump: the mutation the rollback would undo is left to
+/// the live-kernel tier, because a dump has nothing worth restoring.
+#[test]
+fn a_batch_commits_or_fails_and_its_rollback_runs_either_way() {
+    let Some(dump) = target_tier() else { return };
+    let mut server = Server::started();
+
+    let response = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
+    assert_no_error(&response, "open_dump");
+    let session_id = session_id_of(&text_of(&response["result"]));
+
+    // A batch that should commit: a capture bound from one step and interpolated into the next,
+    // which is the whole of the "named values" contract in three steps.
+    let committed = server.tool_text(
+        "debug_batch",
+        json!({
+            "session_id": session_id,
+            "steps": [
+                { "op": "command", "command": "lm m nt",
+                  "expect": [{ "check": "contains", "text": "nt" }] },
+                { "op": "eval", "expr": "@$ip", "capture": "ip" },
+                { "op": "command", "command": "u {{ip}} L1", "name": "disassemble where we are" }
+            ],
+            "always": [{ "op": "command", "command": "lm m hal" }]
+        }),
+        TARGET_STEP,
+    );
+    assert!(
+        committed.contains("BATCH: COMMITTED"),
+        "the batch should have committed:
+{committed}"
+    );
+    assert!(
+        committed.contains("rollback: COMPLETE"),
+        "the `always` block should have run:
+{committed}"
+    );
+    assert!(
+        committed.contains("session after: STOPPED"),
+        "a dump is always stopped; the state probe should say so:
+{committed}"
+    );
+    // The interpolated step is rendered with the *substituted* address, so a `{{ip}}` surviving
+    // into the report would mean nothing was bound.
+    assert!(
+        !committed.contains("u {{ip}}"),
+        "the capture was not interpolated:
+{committed}"
+    );
+
+    // The same shape with an assertion that cannot hold. The batch must stop at that step, name
+    // it, skip what follows — and still run the cleanup.
+    let failing = server.call_tool(
+        "debug_batch",
+        json!({
+            "session_id": session_id,
+            "steps": [
+                { "op": "command", "command": "lm m nt" },
+                { "op": "command", "command": "lm m nt",
+                  "expect": [{ "check": "contains", "text": "no module is called this" }] },
+                { "op": "command", "command": "lm m hal", "name": "must not run" }
+            ],
+            "always": [{ "op": "command", "command": "version", "name": "cleanup" }]
+        }),
+        TARGET_STEP,
+    );
+    assert_no_error(&failing, "debug_batch");
+    assert!(
+        is_tool_error(&failing),
+        "a batch that did not commit must come back as a tool error: {failing}"
+    );
+    let text = text_of(&failing["result"]);
+    assert!(
+        text.contains("BATCH: FAILED at step 2 of 3"),
+        "the report must name the exact failing step:
+{text}"
+    );
+    assert!(
+        text.contains("SKIPPED"),
+        "the step after the failure must be reported as skipped:
+{text}"
+    );
+    assert!(
+        text.contains("rollback: COMPLETE"),
+        "the `always` block must run on the failing path — that is the whole point:
+{text}"
+    );
+
+    server.tool_text(
+        "end_session",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
     );
 }
 

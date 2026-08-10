@@ -9,6 +9,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`debug_batch`: an ordered sequence of debugger steps as one transaction, with assertions and a
+  rollback the engine process owns** ([#82](https://github.com/glslang/windbg-mcp/issues/82)).
+
+  A tool call is a request/response, so a client driving a multi-step debugger transaction decides
+  what to do next *after* each answer — and the case that matters is the one where no answer
+  arrives. A call that times out, or a client that disconnects, leaves whatever the earlier calls
+  changed in place: a patched instruction, an armed breakpoint, a target left running. On a kernel
+  target that is not an inconvenience. The MessageManager CTF session grew a private JSON-RPC
+  client for exactly this (`target/mcp_batch.ps1`, referenced 204 times and revised 18); the shape
+  it converged on is what this tool is.
+
+  A batch is submitted as one op and executed inside the session's worker process. Steps are
+  `command` (raw), `resume` (a command that moves the target, plus the wait), `run_to` (a
+  HIT/STOPPED ELSEWHERE/TIMEOUT verdict), `eval` (a MASM expression's value) and `read_memory`.
+  Each may carry assertions — `contains`, `not_contains`, or `eval`, which compares two MASM
+  expressions and so covers registers, memory and any relation between them — and an `eval` step
+  may `capture` its value under a name later steps interpolate as `{{name}}`.
+
+  **The `always` block runs on every path**: success, a debugger error, an assertion that did not
+  hold, the deadline expiring. Part of the budget is reserved for it before the first step runs,
+  because what is left after a step that ran to its own deadline is nothing. The worker owns that
+  deadline, sized from the caller's remaining patience the same way a bounded command's watchdog
+  is, so the rollback has finished and the report has been written before the tool call gives up —
+  which is the only reason the report is worth anything.
+
+  The result names every step that ran, the exact failing one, what each step changed, whether the
+  rollback completed (reported *beside* the original failure, never instead of it), and whether the
+  session is left stopped, running, detached or uncertain. A batch that did not commit comes back as
+  a tool error carrying that whole report.
+
+  Validation is up front and engine-free: a forward capture reference, a capture on a step that has
+  no value, a duplicate name, a `;` in a typed operand, an empty or oversized batch are all refused
+  before a single step runs. A batch containing a target-changing command retires the session handle
+  ahead of running, as `execute` does. The executor drives a `Debuggee` trait rather than DbgEng, so
+  assertion failure, a command failure after a mutation, deadline expiry and a rollback that itself
+  fails are unit-tested without a debugger; the dump tier drives a real engine to both outcomes.
+
+  Two limits are documented rather than papered over. DbgEng reports most command failures by
+  printing them and returning success, so a raw step that prints an error is a step that
+  *succeeded* — assert on its output if that matters. And what a step "changed" is a best-effort
+  classification of the command text, biased toward reporting a change: a reporting aid, not what
+  makes a mutation recoverable. The `always` block is.
+
+  Validated against the workflow it was filed for, not against a guess at it: the CTF session's own
+  transcript records all 18 revisions of the throwaway client and all 188 of its invocations — 1,681
+  steps, of which 1,672 are shapes the step language covers. The 9 that are not are pool-tool calls
+  (`pool_chunk`, `pool_census`, `pool_find_tag`), which are win-kexp walks rather than debugger
+  commands and so have no `execute` to fall back on; that gap is [`FOLLOWUPS.md`](./FOLLOWUPS.md)
+  item 17. Two of the client's revisions exist only to work around gaps this closes — a compound
+  assertion rewritten as three pseudo-register assignments and three regexes, and a duplicate of its
+  run-to verb whose only difference was restoring a patch "on both hit and timeout". The longest
+  single invocation, 32 steps, is transcribed as a regression test.
+
+  `tools/list` gains one tool and its first nested schema, so the recorded wire surface now has
+  `$defs` (`usesDefs` flips to `true`); the refs stay internal and single-dialect.
+
 - **`attach_kernel` can name its target by `profile`**, so a KDNET debug key never has to travel in
   an MCP request ([#81](https://github.com/glslang/windbg-mcp/issues/81)).
 

@@ -246,7 +246,8 @@ gh attestation verify <zip> --repo glslang/windbg-mcp `
 |-------|-------|
 | Session | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `end_session`, `session_status` |
 | State   | `registers`, `read_memory`, `backtrace`, `modules`, `threads`, `disassemble`, `dx` |
-| Control | `go`, `step_over`, `step_into`, `set_breakpoint` |
+| Control | `go`, `step_over`, `step_into`, `set_breakpoint`, `run_to_address` |
+| Transaction | `debug_batch` — an ordered sequence with assertions and a rollback the engine process runs on every path |
 | TTD nav | `step_back` (`t-`), `step_over_back` (`p-`), `reverse_go` (`g-`), `goto_position` (`!tt`) |
 | TTD analysis | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
 | Driver IOCTL | `decode_ioctl`, `driver_object`, `device_object`, `irp_stack`, `ioctl_trace`, `reachable_from_dispatch` |
@@ -385,6 +386,53 @@ that could retire the session handle.
 
 Nothing legitimate is lost: these parameters were always single operands. Use `execute` to run a
 command list — it is annotated destructive and retires the handle when a command changes the target.
+
+### Transactional batches (`debug_batch`)
+
+A sequence that *mutates* a target — patch a byte, arm a breakpoint, resume a thread — has to put
+things back afterwards, and a client cannot be relied on to do it. The call that would have sent the
+cleanup is exactly the call that times out, and a disconnect sends nothing at all. On a kernel target
+that costs the VM: an un-restored patch, or a target left halted.
+
+`debug_batch` submits the whole sequence as one op. It runs **inside the session's engine process**,
+which owns the deadline, so the `always` block runs on every path — success, a debugger error, an
+assertion that did not hold, the deadline expiring — before the tool call returns. Part of the budget
+is reserved for it up front, because "what is left" after a step that ran to its own deadline is
+nothing.
+
+```jsonc
+{
+  "steps": [
+    { "op": "eval", "expr": "poi(hevd!Guard)", "capture": "orig" },   // save
+    { "op": "command", "command": "eq hevd!Guard 0" },                // patch
+    { "op": "run_to", "address": "hevd!TriggerUaf",                   // confirm, with a verdict
+      "expect": [{ "check": "contains", "text": "VERDICT: HIT" }] },
+    { "op": "eval", "expr": "@rcx",
+      "expect": [{ "check": "eval", "expr": "(@rcx > 0x1000)", "equals": "1" }] }
+  ],
+  "always": [
+    { "op": "command", "command": "eq hevd!Guard {{orig}}" },         // restore, whatever happened
+    { "op": "command", "command": "bc *" }
+  ]
+}
+```
+
+Five step kinds: `command` (raw), `resume` (a command that moves the target, plus the wait),
+`run_to` (a HIT/STOPPED ELSEWHERE/TIMEOUT verdict), `eval` (a MASM expression's value), and
+`read_memory`. Assertions are `contains`, `not_contains`, and `eval` — the last compares two MASM
+expressions, so registers, memory and relations between them are all one check. An `eval` step may
+`capture` its value under a name that later steps interpolate as `{{name}}`; a reference that names
+no earlier capture is refused before anything runs.
+
+The report names every step that ran, the exact one that failed, what each step changed, whether the
+rollback completed — reported *beside* the original failure, never instead of it — and whether the
+session is left stopped, running, detached, or uncertain. A batch that did not commit comes back as a
+tool error carrying that whole report.
+
+Two honest limits. A raw command that prints an error and returns success is a step that *succeeded*
+with that text (DbgEng reports most failures that way), so assert on it if it matters. And what a
+step "changed" is a best-effort classification of the command, biased toward reporting a change: it
+is a reporting aid, and the `always` block, not the classifier, is what makes a mutation recoverable.
 
 ### Error reporting
 

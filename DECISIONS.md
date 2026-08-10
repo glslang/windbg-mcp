@@ -5,6 +5,58 @@ status. Keep entries short; link to code with `file:line` where it helps a futur
 
 ---
 
+## The rollback belongs to the worker, not the client (2026-08-09, #82)
+
+**Context.** Multi-step debugger work that mutates a target — patch a byte, arm a breakpoint,
+resume a thread — has to undo itself. Driven as separate tool calls, the undo is a *later request*,
+and the failure mode is structural rather than accidental: the call that would carry the cleanup is
+exactly the call that times out, and a client that disconnects sends nothing at all. The
+MessageManager session grew a private PowerShell JSON-RPC client to work around this and revised it
+eighteen times; every revision added something the server could not express (a verdict check, a
+target-object assertion, ordered cleanup, rollback after a wrong object or a failed reclaim).
+
+**Decision.** `debug_batch` submits the whole sequence as one `EngineOp`, and the **worker process**
+executes it: steps, assertions, and an `always` block that runs on every path, before the reply is
+written (`src/batch.rs`). The client's timeout can no longer land between a mutation and its undo,
+because there is nothing left for it to land between.
+
+**Three properties follow, and they are the design.** The *deadline is the worker's* — a share of
+the budget is reserved for `always` before the first step runs, since what is left after a step that
+consumed its own deadline is nothing, and the budget itself is clamped to the caller's remaining
+patience (`worker::batch_budget`) so the report lands ahead of the tool call's timeout. The
+*rollback is unconditional* — a failure inside it is recorded beside the original, never in place of
+it, and cleanup continues past its own failures because a patch that cannot be restored must not
+stop a breakpoint from being cleared. And the *executor never touches DbgEng*: it drives a
+`Debuggee` trait with a virtual clock, so assertion failure, a command failure after a mutation,
+deadline expiry and a failed rollback are all unit tests rather than things a live target has to be
+persuaded to reproduce.
+
+**What is deliberately best-effort, and labelled as such.** Which steps "changed" something is a
+first-token classification of the command (`batch::mutation`), biased toward over-reporting for the
+same reason `changes_debug_target` is: an over-report costs a line of text, a missed one leaves a
+mutation nobody knows to undo. It decides nothing about what runs. Likewise the session-state probe
+answers `Stopped` only from a reading it actually got, and never reads a refused probe as
+"detached" — that verdict comes from what the batch ran, because a probe cannot tell a released
+target from a running one, and turning "could not read" into a verdict is the mistake the pool
+tools already learned not to make.
+
+**Validated against the workflow it was filed for.** The CTF session's own transcript
+(`~/.codex/sessions/2026/08/08`) records all 18 revisions of the throwaway client and all 188 of its
+invocations — 1,681 individual steps. Classified against the step language: 1,672 of them are
+`command`, `run_to`, `resume` or `eval` shapes, and **9 are pool-tool calls a batch cannot reach**
+(`@chunkt1`, `@census`, `@find`, `@findr`). Two of the client's revisions exist only to work around
+gaps this design closes — its eighth replaced a compound `.if` assertion with three pseudo-register
+assignments and three regexes over printed output, and its sixteenth added a duplicate of `@run`
+whose only difference was restoring a patch "on both hit and timeout", which is `always` hand-rolled.
+`batch::tests::the_messagemanager_sequence_is_a_valid_batch` is the longest single invocation
+transcribed, and its sibling drives the wrong-target failure the client wrote that rollback for.
+
+**Status.** Adopted. Two things are still owed: pool steps (FOLLOWUPS item 17, the one gap the
+transcript found) and a live-kernel exercise of a *mutating* batch (item 16) — the dump tier proves
+the wiring and both outcomes, but a dump has nothing worth restoring.
+
+---
+
 ## Connection strings are parsed, not scanned (2026-08-09, follows #81)
 
 **Context.** Redaction started as a scanner: walk the raw string, and at each `=` work out where
