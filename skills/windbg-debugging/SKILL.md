@@ -32,7 +32,8 @@ already does the job.
 |-------|-------|
 | Session | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `end_session`, `session_status` |
 | State | `registers`, `read_memory`, `backtrace`, `modules`, `threads`, `disassemble`, `dx` |
-| Control | `go`, `step_over`, `step_into`, `set_breakpoint` |
+| Control | `go`, `step_over`, `step_into`, `set_breakpoint`, `run_to_address` |
+| Transaction | `debug_batch` — an ordered sequence with assertions and a rollback the engine runs on every path |
 | TTD nav | `step_back` (`t-`), `step_over_back` (`p-`), `reverse_go` (`g-`), `goto_position` (`!tt`) |
 | TTD analysis | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
 | Raw | `execute` — run any debugger command, returns full text output |
@@ -41,6 +42,15 @@ The forward control tools (`go`/`step_over`/`step_into`) and the reverse ones
 (`reverse_go`/`step_over_back`/`step_back`) mirror a debugger UI's F9/F8/F7 and their
 Shift variants. They issue the command **and pump the engine to the next stop** — unlike
 a bare `execute`, which only sets the run state and doesn't move the target.
+
+**When a sequence mutates the target, run it as one `debug_batch`, not as separate calls.** A
+patched byte, an armed breakpoint or a resumed thread has to be put back, and the call that would
+have sent the cleanup is exactly the one that times out — a disconnect sends nothing at all. A
+batch's `always` block runs inside the engine process on every path, including a failed assertion
+and an expired deadline, so cleanup cannot be lost; the report names the exact failing step, what
+each step changed, whether the rollback completed, and whether the target is left stopped, running
+or gone. Save what you are about to overwrite with an `eval` step's `capture`, and restore it in
+`always` as `{{name}}`.
 
 ## Cross-cutting gotchas (apply to every workflow)
 

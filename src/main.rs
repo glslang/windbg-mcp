@@ -7,6 +7,7 @@
 //! is what dbgeng.dll's one-session-per-process rule makes the natural unit, and what lets a
 //! session that cannot be unwound be killed without taking the server with it.
 
+mod batch;
 mod engine;
 mod kdconn;
 mod proto;

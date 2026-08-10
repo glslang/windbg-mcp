@@ -4,8 +4,10 @@ Deferred work, in five clusters: items 1–6 come from the reachability-confirma
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/win-kexp#71, 2026-08-01), items 13–14 from the bounded-command coverage review
-(#46, 2026-08-02), and item 15 from the private worker channel (#65 / #72, 2026-08-04). Each item
-notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
+(#46, 2026-08-02), item 15 from the private worker channel (#65 / #72, 2026-08-04), and items 16–17
+from transactional batches (#82, 2026-08-09/10 — item 17 is what validating the tool against the CTF
+session's own transcript turned up). Each item notes its repo, why it was deferred, and where it
+picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
 Items are roughly ordered by how soon they're worth doing, within each cluster. **Item 10 has
@@ -338,3 +340,45 @@ and no other spawn site needs to know the rule exists.
   the crate's own source and fails if a `.spawn()` appears without `spawn_guard` held in the same
   function. The convention is pinned rather than merely documented, which is what makes this an
   improvement to *how* the property is held rather than a fix to a live hole.
+
+## 16. [windbg-mcp] Exercise a *mutating* `debug_batch` against a live kernel target
+
+`debug_batch` (#82) is proved at two altitudes: `src/batch.rs` drives the executor over a scripted
+debuggee with a virtual clock (assertion failure, a command failure after a mutation, deadline
+expiry, a rollback that itself fails), and the debugger tier drives a real engine to both outcomes
+over the wire. Neither covers the case the tool was built for — a **write that is then restored**
+on a target that would notice.
+
+- **Why deferred:** a crash dump has nothing worth restoring, and the live-kernel tier is
+  `#[ignore]`d and gated on a connection string precisely so an ordinary `cargo test` can never
+  reach a VM. So this belongs beside the existing `live_kernel` tests, run by hand.
+- **What it should assert:** save a byte with an `eval`+`capture`, patch it, fail an assertion
+  deliberately, and confirm from a *later, separate* call that the `always` block put the original
+  back — the point being that nothing after the batch had to be sent for that to happen. Then the
+  same batch with the call budget shortened (`WINDBG_MCP_CALL_TIMEOUT_SECS`) below the batch's own
+  deadline, to check the clamp in `worker::batch_budget` really keeps the report ahead of the
+  caller's timeout on a target where steps take real time.
+- **Where it picks up:** `tests/mcp_smoke.rs`, the `live_kernel` filter; the harness for setting and
+  reading back a byte already exists in the MessageManager tier.
+
+## 17. [windbg-mcp] Let a `debug_batch` step call a typed tool, starting with the pool queries
+
+The one gap the MessageManager transcript found in `debug_batch` (#82). Its step vocabulary reaches
+anything that is a *debugger command*, which is almost every typed tool in this server — but not the
+ones that are not commands at all. The pool tools are win-kexp walks over the allocator's own
+structures, so `pool_find_tag`, `pool_chunk` and `pool_census` have no `execute` equivalent to fall
+back on.
+
+- **How much it cost the workflow it is measured against:** 9 of 1,681 steps (`@chunkt1`, `@census`,
+  `@find`, `@findr`). Small, but not incidental — `@chunkt1` sat *inside* the 32-step transaction,
+  between a code patch and its restore, so a batch expressing that sequence today has to drop it.
+- **Why deferred:** the shape is a design question, not a missing wire. `PoolOp` already crosses to
+  the worker and `worker::pool` already renders it, so the plumbing is short; what needs deciding is
+  whether a step names a *tool* generically (open-ended, and every tool's arguments then have to
+  exist in the batch schema twice) or whether the batch grows one variant per typed tool worth
+  having in a transaction. The second is smaller and matches how `StepAction` is already justified —
+  variants exist for what a raw command cannot express — but it is a list that will keep growing.
+- **Where it picks up:** `StepAction` in `src/batch.rs`, `PoolOp` in `src/proto.rs`, and
+  `batch::Debuggee`, which would gain one method per capability so the executor stays engine-free.
+  `@chunkt1`'s real shape is the test case: capture a register with `eval`, then ask `pool_chunk`
+  about `{{that}}` — the capture half already works.

@@ -3,7 +3,7 @@
     "(none)",
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 41,
+  "toolCount": 42,
   "tools": [
     {
       "hints": {
@@ -61,6 +61,25 @@
       ],
       "required": [],
       "title": "Show call stack"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "debug_batch",
+      "params": [
+        "always: array<ref(#/$defs/BatchStep)>",
+        "session_id: string|null",
+        "steps: array<ref(#/$defs/BatchStep)>",
+        "timeout_ms: integer|null/uint32"
+      ],
+      "required": [
+        "steps"
+      ],
+      "title": "Run a transactional debugger batch"
     },
     {
       "hints": {
@@ -665,5 +684,5 @@
       "title": "TTD: find accesses to a memory range"
     }
   ],
-  "usesDefs": false
+  "usesDefs": true
 }

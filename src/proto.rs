@@ -26,6 +26,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::batch::BatchOp;
 use crate::kdconn::Connection;
 
 /// One unit of debugger work, as it crosses the process boundary.
@@ -106,6 +107,15 @@ pub enum EngineOp {
     /// to walk every pool page, and letting another call for the same session interleave would
     /// let the walk describe a target that moved underneath it.
     Pool(PoolOp),
+    /// A whole transaction: ordered steps, their assertions, and the rollback block that runs
+    /// whatever happens to them ([`crate::batch`]).
+    ///
+    /// The most emphatic case for one op being one indivisible job. The point of a batch is that
+    /// the caller's timeout cannot land between a mutation and its undo — which is only true
+    /// because the sequence crosses the boundary once, as a value, and the worker owns the
+    /// deadline. Splitting it into per-step round trips would put the client back in the middle
+    /// of it, which is the design this replaces.
+    Batch(BatchOp),
     /// Release the target. The supervisor tears the worker down afterwards — under
     /// process-per-session a worker outlives its target for no reason.
     EndSession,

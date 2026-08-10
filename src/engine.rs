@@ -37,6 +37,7 @@ use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot};
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
+use crate::batch::BatchOp;
 use crate::kdconn;
 use crate::proto::{EngineOp, WorkerMessage, WorkerRequest};
 use crate::worker::{MESSAGES_FLAG, REQUESTS_FLAG, WORKER_FLAG};
@@ -1851,8 +1852,15 @@ fn pump(
         }
 
         let mut op = job.op;
-        if let EngineOp::BoundedCommand { patience_ms, .. } = &mut op {
-            *patience_ms = remaining_patience_ms(call_timeout, job.submitted);
+        // The two ops whose own deadline is derived from the caller's: what is written here is how
+        // much patience the caller had left when this job reached the front of the queue, and the
+        // worker sizes its watchdog (or its batch budget) from it. See `EngineOp::BoundedCommand`.
+        match &mut op {
+            EngineOp::BoundedCommand { patience_ms, .. }
+            | EngineOp::Batch(BatchOp { patience_ms, .. }) => {
+                *patience_ms = remaining_patience_ms(call_timeout, job.submitted);
+            }
+            _ => {}
         }
         let request = WorkerRequest { id: job.id, op };
         let Ok(mut line) = serde_json::to_string(&request) else {

@@ -29,6 +29,7 @@ use win_kexp::pool::query::{self, PoolPageFilter};
 use win_kexp::pool::{DiagnosticShape, PoolDiagnostics, PoolSpan, PoolState};
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
+use crate::batch::{self, BatchOp, Debuggee};
 use crate::proto::{EngineOp, PoolOp, ReachabilityOp, WorkerMessage, WorkerRequest};
 use crate::server::{
     fmt_addr, format_recipe, format_report, hexdump, parse_eval, parse_lm_base, parse_u64,
@@ -550,22 +551,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<S
             timeout_ms,
         } => e.execute_and_wait(&command, timeout_ms).map_err(es),
         EngineOp::Registers => e.registers().map_err(es),
-        EngineOp::ReadMemory { address, size } => {
-            let addr = parse_u64(&address)?;
-            // Bounded before the allocation, not after. `size` arrives from the caller as a bare
-            // `u32`, and a large one costs that many bytes here plus a hexdump several times
-            // larger — enough to take the worker down with an OOM, which costs the caller their
-            // whole session for a number a model can produce by accident.
-            if size as usize > MAX_READ_BYTES {
-                return Err(format!(
-                    "`size` is {size} bytes; this tool reads at most {MAX_READ_BYTES}. Read the \
-                     range you need in pieces, or use `execute` with a `db`/`dd` command if you \
-                     want the debugger's own paging."
-                ));
-            }
-            let bytes = e.read_memory(addr, size as usize).map_err(es)?;
-            Ok(hexdump(addr, &bytes))
-        }
+        EngineOp::ReadMemory { address, size } => read_memory(e, &address, size),
         EngineOp::SymbolPath {
             path,
             append,
@@ -587,6 +573,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<S
         } => run_to_address(e, &address, timeout_ms),
         EngineOp::Reachability(args) => reachable(e, args),
         EngineOp::Pool(args) => pool(e, args),
+        EngineOp::Batch(op) => run_batch(e, op, queued),
         EngineOp::EndSession => e
             .end_session()
             .map(|_| "session ended".to_string())
@@ -597,6 +584,102 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<S
 /// Maps any error to a `String` for the wire.
 fn es<E: ToString>(e: E) -> String {
     e.to_string()
+}
+
+/// Reads target memory and renders it as a hex dump.
+///
+/// Free function rather than an inline arm because a batch step reads memory the same way, and a
+/// second copy of the bound below would be a second chance to get it wrong.
+fn read_memory(e: &DebugEngine, address: &str, size: u32) -> Result<String, String> {
+    let addr = parse_u64(address)?;
+    // Bounded before the allocation, not after. `size` arrives from the caller as a bare `u32`,
+    // and a large one costs that many bytes here plus a hexdump several times larger — enough to
+    // take the worker down with an OOM, which costs the caller their whole session for a number a
+    // model can produce by accident.
+    if size as usize > MAX_READ_BYTES {
+        return Err(format!(
+            "`size` is {size} bytes; this tool reads at most {MAX_READ_BYTES}. Read the range you \
+             need in pieces, or use `execute` with a `db`/`dd` command if you want the debugger's \
+             own paging."
+        ));
+    }
+    let bytes = e.read_memory(addr, size as usize).map_err(es)?;
+    Ok(hexdump(addr, &bytes))
+}
+
+/// How long a batch may run, given what it asked for and what its caller has left.
+///
+/// The batch's whole value is that its rollback runs *before* the tool call reports anything, so
+/// the budget has to end before the caller's patience does — [`WATCHDOG_HEADROOM`] again, for the
+/// same reason and with the same arithmetic as [`watchdog_budget_ms`]: patience as sent, minus the
+/// wait in this worker's queue, minus the headroom the reply needs.
+///
+/// The caller's `timeout_ms` can only make it *shorter*. A batch that asks for ten minutes inside
+/// a five-minute call budget would otherwise be a batch whose rollback report is guaranteed to
+/// arrive after nobody is listening — which is the failure this tool exists to remove, arriving
+/// by way of the argument that was supposed to prevent it.
+fn batch_budget(requested_ms: u32, patience: Duration, queued: Duration) -> Duration {
+    let allowed = patience
+        .saturating_sub(queued)
+        .saturating_sub(WATCHDOG_HEADROOM)
+        .max(WATCHDOG_HEADROOM);
+    allowed.min(Duration::from_millis(u64::from(requested_ms)))
+}
+
+/// A [`Debuggee`] over this worker's engine: the seam that keeps [`crate::batch`] free of DbgEng.
+struct BatchEngine<'a> {
+    e: &'a DebugEngine,
+    started: Instant,
+}
+
+impl Debuggee for BatchEngine<'_> {
+    fn command(&mut self, command: &str, budget_ms: u32) -> Result<String, String> {
+        // Bounded, always. A batch is the one place a runaway command would also strand a
+        // rollback, so the step self-aborts rather than eating the reserve.
+        self.e
+            .execute_command_bounded(command, budget_ms)
+            .map_err(es)
+    }
+
+    fn resume(&mut self, command: &str, timeout_ms: u32) -> Result<String, String> {
+        self.e.execute_and_wait(command, timeout_ms).map_err(es)
+    }
+
+    fn run_to(&mut self, address: &str, timeout_ms: u32) -> Result<String, String> {
+        run_to_address(self.e, address, timeout_ms)
+    }
+
+    fn read_memory(&mut self, address: &str, size: u32) -> Result<String, String> {
+        read_memory(self.e, address, size)
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+}
+
+/// Runs a batch and renders its report.
+///
+/// The report is the result either way — a failed transaction that did not say which step failed
+/// and whether the rollback ran would be worse than no report at all. `Err` only chooses how
+/// [`crate::server`] renders it: a tool-execution error the model can read and act on.
+fn run_batch(e: &DebugEngine, op: BatchOp, queued: Duration) -> Result<String, String> {
+    let budget = batch_budget(
+        op.budget_ms,
+        Duration::from_millis(u64::from(op.patience_ms)),
+        queued,
+    );
+    let mut engine = BatchEngine {
+        e,
+        started: Instant::now(),
+    };
+    let report = batch::run(&mut engine, &op, budget);
+    let rendered = batch::render(&report);
+    if report.committed() && report.rollback_complete() {
+        Ok(rendered)
+    } else {
+        Err(rendered)
+    }
 }
 
 /// Column header for the chunk tables below. Kept next to [`pool_row`] so the two cannot
@@ -1669,6 +1752,54 @@ mod tests {
         assert_eq!(
             watchdog_budget_ms(Duration::from_secs(u32::MAX as u64), Duration::ZERO),
             u32::MAX
+        );
+    }
+
+    // ---- the batch budget -------------------------------------------------
+
+    /// A batch gets what it asked for when the caller can afford it.
+    #[test]
+    fn a_batch_that_fits_gets_the_deadline_it_asked_for() {
+        assert_eq!(
+            batch_budget(60_000, Duration::from_secs(300), Duration::ZERO),
+            Duration::from_secs(60)
+        );
+    }
+
+    /// The property that makes the rollback report worth anything: **queue wait + batch budget
+    /// must leave the caller a headroom**, so the `always` block has finished and the report has
+    /// been written before the tool call gives up. A batch that asks for more than the call
+    /// budget is the case that would otherwise break it.
+    #[test]
+    fn a_batch_never_outlives_the_call_that_started_it() {
+        let patience = Duration::from_secs(300);
+        // Waits short enough that the floor below is not in play; past it the budget deliberately
+        // overruns, exactly as `watchdog_budget_ms`'s does.
+        for asked in [60_000, 300_000, 900_000, u32::MAX] {
+            for waited in [0, 30, 200, 270] {
+                let waited = Duration::from_secs(waited);
+                let budget = batch_budget(asked, patience, waited);
+                assert!(
+                    waited + budget <= patience,
+                    "asking for {asked}ms after a {waited:?} queue wait yielded {budget:?}, which \
+                     runs past the caller's {patience:?}"
+                );
+            }
+        }
+    }
+
+    /// Past the point where there is nothing left, the budget floors rather than reaching zero —
+    /// a zero-length batch would skip every step *and* its rollback, which is the one outcome
+    /// this tool must never produce.
+    #[test]
+    fn a_batch_dequeued_past_the_deadline_still_gets_enough_to_roll_back() {
+        assert_eq!(
+            batch_budget(120_000, Duration::from_secs(300), Duration::from_secs(400)),
+            WATCHDOG_HEADROOM
+        );
+        assert_eq!(
+            batch_budget(120_000, Duration::ZERO, Duration::ZERO),
+            WATCHDOG_HEADROOM
         );
     }
 }
