@@ -143,20 +143,41 @@ struct BatchSignal {
     /// started must not start, or the session's last act would be a fresh set of mutations run for
     /// a caller who is already gone.
     abandon: AtomicBool,
-    /// When the batch on the engine thread must be finished by, or `None` when none is running.
+    /// The mutable half, under one lock so the deadline and the teardown that is waiting on it
+    /// cannot be read out of step with each other.
     ///
-    /// A `Mutex` rather than an atomic because it carries an `Instant`, and because the lock is
-    /// what orders it against [`Self::abandon`] — see there. Uncontended in practice: it is taken
-    /// twice per batch and once per teardown.
-    finish_by: Mutex<Option<Instant>>,
+    /// A `Mutex` rather than atomics because it carries an `Instant`, and because the lock is what
+    /// orders it against [`Self::abandon`] — see there. Uncontended in practice: taken twice per
+    /// batch and once per teardown.
+    state: Mutex<SignalState>,
+}
+
+/// What [`BatchSignal`] knows about the batch on the engine thread and about who is waiting for it.
+#[derive(Default)]
+struct SignalState {
+    /// When the running batch must be finished by, or `None` when none is running. This *is* the
+    /// "is one running" answer rather than a second flag beside it, so the two can never disagree
+    /// about a batch that started or finished in between.
+    finish_by: Option<Instant>,
+    /// The request id of the teardown that told the batch to stop, once one has. Kept so the
+    /// promise made to that teardown can be *retracted* when the batch finishes — see
+    /// [`BatchGuard::drop`].
+    told_by: Option<u64>,
 }
 
 impl BatchSignal {
     const fn new() -> Self {
         Self {
             abandon: AtomicBool::new(false),
-            finish_by: Mutex::new(None),
+            state: Mutex::new(SignalState {
+                finish_by: None,
+                told_by: None,
+            }),
         }
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, SignalState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Tells any batch to stop at its next step boundary, and reports **how long it may still
@@ -174,20 +195,40 @@ impl BatchSignal {
     /// loads. If this sees `None` because it got the lock first, its store is already visible to
     /// the load `enter` makes after taking the lock — so that batch refuses to start. Both sides
     /// seeing each other is fine, and costs a teardown a grace it did not need.
-    fn abandon(&self) -> Option<Duration> {
+    fn abandon(&self, told_by: u64) -> Option<Duration> {
         self.abandon.store(true, Ordering::SeqCst);
-        let finish_by = *self.finish_by.lock().unwrap_or_else(|e| e.into_inner());
-        finish_by.map(|by| by.saturating_duration_since(Instant::now()))
+        let mut state = self.state();
+        state.told_by = Some(told_by);
+        state
+            .finish_by
+            .map(|by| by.saturating_duration_since(Instant::now()))
     }
 
     fn abandoned(&self) -> bool {
         self.abandon.load(Ordering::SeqCst)
     }
 
+    /// Ends the claim, and reports the teardown that is owed a **retraction** — the one told, back
+    /// when it arrived, that this batch might need up to N.
+    ///
+    /// The retraction is not tidiness. That promise was measured when the teardown arrived, and a
+    /// rollback usually finishes in a fraction of it. Left standing, a teardown whose *release*
+    /// then hangs — a live kernel that will not detach, the case the short grace exists for —
+    /// would wait out the rest of a batch budget that was spent long ago: minutes, for a
+    /// transaction already safely unwound. A fresh promise of zero says the only thing still worth
+    /// waiting for is the release itself.
+    ///
+    /// Owed once: whoever takes it here sends it.
+    fn finish(&self) -> Option<u64> {
+        let mut state = self.state();
+        state.finish_by = None;
+        state.told_by.take()
+    }
+
     /// Claims the engine thread for a batch that must be done within `budget`, for as long as the
     /// guard lives, and answers whether it may start at all.
     fn enter(&self, budget: Duration) -> (BatchGuard<'_>, bool) {
-        *self.finish_by.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now() + budget);
+        self.state().finish_by = Some(Instant::now() + budget);
         let guard = BatchGuard { signal: self };
         // After the lock above is released, so a teardown that observes this batch at all observes
         // its deadline too. See [`Self::abandon`].
@@ -196,20 +237,19 @@ impl BatchSignal {
     }
 }
 
-/// Clears the deadline however the batch ends — including by unwinding, which `engine_thread`'s
-/// guard catches one frame further out. A teardown after this point has nothing to wait for, and
-/// gets the ordinary grace.
+/// Ends the batch's claim however it ends — including by unwinding, which `engine_thread`'s guard
+/// catches one frame further out.
 struct BatchGuard<'a> {
     signal: &'a BatchSignal,
 }
 
 impl Drop for BatchGuard<'_> {
     fn drop(&mut self) {
-        *self
-            .signal
-            .finish_by
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+        // Outside the lock `finish` takes: `emit` takes one of its own, and nothing here should
+        // hold two at once.
+        if let Some(id) = self.signal.finish() {
+            emit(&WorkerMessage::RollingBack { id, within_ms: 0 });
+        }
     }
 }
 
@@ -341,7 +381,9 @@ pub fn run(args: &[String]) -> ! {
     // behind every step it has left, on the one path where nobody is left to have asked for
     // anything — and this process is leaving either way, so the choice is between a rollback and
     // no rollback, not between finishing the batch and not.
-    let grace = match BATCH.abandon() {
+    // No teardown request to answer here — the supervisor is gone — so the id is immaterial; what
+    // matters is that the batch is told, and that this process waits for it.
+    let grace = match BATCH.abandon(0) {
         Some(within) => {
             tracing::info!(
                 "worker: a batch is running; giving it up to {within:?} to stop and roll back \
@@ -513,7 +555,7 @@ fn emit(message: &WorkerMessage) -> Emit {
 /// the supervisor is waiting on that release, and this is what tells it how long the wait is worth.
 /// Sent only when there is a batch to stop, so an ordinary teardown says nothing and costs nothing.
 fn announce_teardown(id: u64) {
-    let Some(within) = BATCH.abandon() else {
+    let Some(within) = BATCH.abandon(id) else {
         return;
     };
     tracing::info!("worker: session ending with a batch in flight; it has {within:?} to unwind");
@@ -2028,6 +2070,9 @@ mod tests {
     /// this machine runs a test.
     const A_LONG_BATCH: Duration = Duration::from_secs(120);
 
+    /// Stands in for the request id of the teardown doing the telling.
+    const TEARDOWN: u64 = 42;
+
     /// The property the signal exists to hold: a batch never runs with a teardown believing there
     /// is nothing to wait for.
     ///
@@ -2038,7 +2083,7 @@ mod tests {
     fn a_batch_and_the_signal_that_stops_it_cannot_both_miss() {
         // The signal arrives first: the batch must not start.
         let waiting = BatchSignal::new();
-        assert_eq!(waiting.abandon(), None, "nothing is running yet");
+        assert_eq!(waiting.abandon(TEARDOWN), None, "nothing is running yet");
         let (_running, may_start) = waiting.enter(A_LONG_BATCH);
         assert!(
             !may_start,
@@ -2049,7 +2094,7 @@ mod tests {
         let started = BatchSignal::new();
         let (_running, may_start) = started.enter(A_LONG_BATCH);
         assert!(may_start, "an ordinary batch runs");
-        let within = started.abandon().expect(
+        let within = started.abandon(TEARDOWN).expect(
             "a signal that found a batch running has to say so, or the teardown waits five \
              seconds and kills it mid-transaction",
         );
@@ -2070,10 +2115,40 @@ mod tests {
         let (_running, may_start) = signal.enter(Duration::ZERO);
         assert!(may_start);
         assert_eq!(
-            signal.abandon(),
+            signal.abandon(TEARDOWN),
             Some(Duration::ZERO),
             "its budget is spent, so the teardown owes it only the ordinary grace"
         );
+    }
+
+    /// A batch that finishes retracts what it was promised for, so a teardown stops waiting on a
+    /// transaction that is already unwound.
+    ///
+    /// Without this the promise stands at the figure it had when the teardown arrived — and if the
+    /// *release* behind it then hangs, which is exactly what the short grace exists to bound, the
+    /// teardown waits out the rest of a batch budget that was spent long ago. Minutes, for a
+    /// rollback that finished in seconds.
+    #[test]
+    fn a_finished_batch_retracts_the_promise_it_was_given() {
+        // Nobody was told, so nobody is owed an answer.
+        let untold = BatchSignal::new();
+        let (guard, _) = untold.enter(A_LONG_BATCH);
+        drop(guard);
+        assert_eq!(untold.finish(), None);
+
+        let signal = BatchSignal::new();
+        let (guard, _) = signal.enter(A_LONG_BATCH);
+        assert!(
+            signal.abandon(TEARDOWN).is_some(),
+            "the teardown is told this batch may need time"
+        );
+        assert_eq!(
+            signal.finish(),
+            Some(TEARDOWN),
+            "so it is owed the news when that stops being true"
+        );
+        assert_eq!(signal.finish(), None, "and owed it once");
+        drop(guard);
     }
 
     /// Once the batch is over, a teardown gets the short grace again — the extra wait is for a
@@ -2086,7 +2161,7 @@ mod tests {
             assert!(may_start);
         }
         assert_eq!(
-            signal.abandon(),
+            signal.abandon(TEARDOWN),
             None,
             "the batch is done; there is nothing to unwind"
         );

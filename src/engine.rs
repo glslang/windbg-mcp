@@ -337,7 +337,12 @@ pub struct Session {
     /// the runtime had not yet got round to dispatching the message would be the exact outcome the
     /// message exists to prevent. Recorded on arrival, "the worker said so in time" means what it
     /// says — it cannot turn on how busy this process was.
-    unwinding: Arc<Mutex<Option<Duration>>>,
+    ///
+    /// Held as the **instant the batch must be done by**, not as the interval the worker named. The
+    /// interval was measured when the milestone was sent and only ever shrinks after it, so reading
+    /// it later as though it were still owed would hand a teardown the whole of a batch budget that
+    /// had already been spent. A worker that finishes early retracts it by naming zero.
+    unwinding: Arc<Mutex<Option<Instant>>>,
     child: Mutex<Option<Child>>,
 }
 
@@ -423,13 +428,16 @@ impl Session {
             )
     }
 
-    /// How long the worker says the transaction it is unwinding still needs, if it has said.
+    /// How much longer the worker's transaction may still need, from *now* — `None` when it has
+    /// said nothing, and `None` again once the time it named has run out or it has said it is done.
     ///
     /// Read by the teardown that provoked it, after its own grace has run out — see
     /// [`Sessions::release`]. Nothing else consults it, and a session that never ran a batch never
     /// sets it, so an ordinary teardown neither reads nor pays for anything here.
     fn unwinding_for(&self) -> Option<Duration> {
-        *self.unwinding.lock().unwrap_or_else(|e| e.into_inner())
+        let by = (*self.unwinding.lock().unwrap_or_else(|e| e.into_inner()))?;
+        let left = by.saturating_duration_since(Instant::now());
+        (!left.is_zero()).then_some(left)
     }
 
     /// Answers every outstanding call with `why`. Used when the worker dies or is killed: those
@@ -1381,7 +1389,7 @@ impl Sessions {
         tokio::spawn(log_stray_output(id.to_string(), stdout));
         // Created before the thread that records into it, and handed to the session below: see
         // [`Session::unwinding`] for why it is written there rather than in `reader`.
-        let unwinding: Arc<Mutex<Option<Duration>>> = Arc::new(Mutex::new(None));
+        let unwinding: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         let mut messages =
             match read_messages(id.to_string(), channel.messages, Arc::clone(&unwinding)) {
                 Ok(messages) => messages,
@@ -1798,7 +1806,7 @@ fn spawn_worker(exe: &Path) -> std::io::Result<(Child, Channel)> {
 fn read_messages(
     id: String,
     pipe: PipeReader,
-    unwinding: Arc<Mutex<Option<Duration>>>,
+    unwinding: Arc<Mutex<Option<Instant>>>,
 ) -> std::io::Result<mpsc::UnboundedReceiver<WorkerMessage>> {
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::Builder::new()
@@ -1814,9 +1822,12 @@ fn read_messages(
                         // Recorded here, before the message is handed on, because a teardown reads
                         // it against a deadline — see [`Session::unwinding`]. Everything this
                         // message is *reported* as still happens in `reader`.
+                        // Turned into a deadline here, at the one moment the interval the worker
+                        // named is current. A later zero retracts it — that is a worker saying its
+                        // transaction is done and only the release is left.
                         if let WorkerMessage::RollingBack { within_ms, .. } = &message {
                             *unwinding.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some(Duration::from_millis(u64::from(*within_ms)));
+                                Some(Instant::now() + Duration::from_millis(u64::from(*within_ms)));
                         }
                         if tx.send(message).is_err() {
                             break; // nobody is left to route it to
@@ -2801,6 +2812,40 @@ mod tests {
         assert_eq!(idle.unwinding_for(), None);
     }
 
+    /// What the worker promised is owed *until the moment it named*, and not a second longer.
+    ///
+    /// The interval it sends is measured when the teardown reaches it, and only ever shrinks after
+    /// that. Read later as though it were still owed in full — which is what storing the interval
+    /// rather than the deadline would do — a teardown whose release then hangs would wait out the
+    /// remains of a batch budget that was spent long ago: minutes, with the defaults, for a
+    /// transaction already unwound. The same reading is what makes a worker's retraction work: it
+    /// names zero, and zero is instantly in the past.
+    #[test]
+    fn a_promise_that_has_run_out_buys_no_more_time() {
+        let session = dormant("sess-1", SessionState::Open);
+        let set = |deadline| *session.unwinding.lock().unwrap() = Some(deadline);
+
+        set(Instant::now() + Duration::from_secs(30));
+        let left = session
+            .unwinding_for()
+            .expect("a live promise is still owed");
+        assert!(
+            left > Duration::from_secs(25) && left <= Duration::from_secs(30),
+            "owed the time remaining, not {left:?}"
+        );
+
+        // Spent, and so worth nothing — the batch's own deadline has passed.
+        set(Instant::now()
+            .checked_sub(Duration::from_secs(1))
+            .unwrap_or_else(Instant::now));
+        assert_eq!(session.unwinding_for(), None);
+
+        // The retraction a worker sends when its batch finishes early: `within_ms: 0`, recorded as
+        // a deadline of now, and read as nothing left to wait for.
+        set(Instant::now());
+        assert_eq!(session.unwinding_for(), None);
+    }
+
     /// A rollback milestone is recorded by the thread that **reads** it, before it is handed on to
     /// be dispatched at all.
     ///
@@ -2813,7 +2858,7 @@ mod tests {
     #[tokio::test]
     async fn a_rollback_milestone_is_recorded_where_it_arrives() {
         let (arriving, mut worker) = std::io::pipe().expect("a pipe to stand in for a worker's");
-        let unwinding: Arc<Mutex<Option<Duration>>> = Arc::new(Mutex::new(None));
+        let unwinding: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
         let mut messages = read_messages("sess-x".to_string(), arriving, Arc::clone(&unwinding))
             .expect("start a reader");
 
@@ -2831,11 +2876,31 @@ mod tests {
             dispatched,
             Some(WorkerMessage::RollingBack { id: 7, .. })
         ));
-        assert_eq!(
-            *unwinding.lock().unwrap(),
-            Some(Duration::from_millis(90_000)),
-            "the milestone was dispatched without having been recorded, so a teardown reading it \
-             on a deadline could miss one that had already arrived"
+        let by = unwinding.lock().unwrap().expect(
+            "the milestone was dispatched without having been recorded, so a teardown \
+                     reading it on a deadline could miss one that had already arrived",
+        );
+        let left = by.saturating_duration_since(Instant::now());
+        assert!(
+            left > Duration::from_secs(85) && left <= Duration::from_secs(90),
+            "recorded as a deadline 90s out, not {left:?}"
+        );
+
+        // And a zero retracts it: a worker whose transaction finished has nothing left to be
+        // waited for, however long it said it might need when it was told to stop.
+        let done = serde_json::to_string(&WorkerMessage::RollingBack {
+            id: 7,
+            within_ms: 0,
+        })
+        .expect("encode the retraction");
+        writeln!(worker, "{done}").expect("write it as a worker would");
+        tokio::time::timeout(Duration::from_secs(10), messages.recv())
+            .await
+            .expect("the retraction reached the dispatcher within 10s");
+        let by = unwinding.lock().unwrap().expect("still recorded");
+        assert!(
+            by <= Instant::now(),
+            "a finished transaction must not go on being waited for"
         );
     }
 
