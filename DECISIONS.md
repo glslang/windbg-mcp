@@ -97,6 +97,12 @@ so it decays instead of being owed in full whenever it happens to be read. And t
 retracts its bound to what the release still needs — a promise revised downwards is invisible to a
 wait that already committed to the whole of the old one.
 
+And the release keeps a grace of its own after all that, because it could not start until the
+transaction ended. The retraction usually delivers it, but a batch that runs to the bound it
+advertised emits that retraction at the instant the wait stops looking for one; resting on it
+winning that race would be resting on pipe scheduling, and losing means a worker killed as its
+release begins.
+
 A session with nothing to unwind says nothing and costs exactly what it always did, so an ordinary
 disconnect is untouched. What none of this can do is *shorten* a step already inside DbgEng — that
 is `SetInterrupt` bound to job identity, FOLLOWUPS item 7 — so a batch stops at its next step
