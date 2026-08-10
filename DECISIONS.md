@@ -16,7 +16,7 @@ eighteen times; every revision added something the server could not express (a v
 target-object assertion, ordered cleanup, rollback after a wrong object or a failed reclaim).
 
 **Decision.** `debug_batch` submits the whole sequence as one `EngineOp`, and the **worker process**
-executes it: steps, assertions, and an `always` block that runs on every path, before the reply is
+executes it: steps, assertions, and an `always` block reached on every path, before the reply is
 written (`src/batch.rs`). The client's timeout can no longer land between a mutation and its undo,
 because there is nothing left for it to land between.
 
@@ -24,9 +24,11 @@ because there is nothing left for it to land between.
 the budget is reserved for `always` before the first step runs, since what is left after a step that
 consumed its own deadline is nothing, and the budget itself is clamped to the caller's remaining
 patience (`worker::batch_budget`) so the report lands ahead of the tool call's timeout. The
-*rollback is unconditional* — a failure inside it is recorded beside the original, never in place of
-it, and cleanup continues past its own failures because a patch that cannot be restored must not
-stop a breakpoint from being cleared. And the *executor never touches DbgEng*: it drives a
+*rollback is reached unconditionally* — a failure inside it is recorded beside the original, never
+in place of it, and cleanup continues past its own failures because a patch that cannot be restored
+must not stop a breakpoint from being cleared. What the reserve buys is time to run, not a promise:
+a step that overruns it too leaves cleanup with no budget, and the report then says the rollback is
+incomplete rather than implying it happened. And the *executor never touches DbgEng*: it drives a
 `Debuggee` trait with a virtual clock, so assertion failure, a command failure after a mutation,
 deadline expiry and a failed rollback are all unit tests rather than things a live target has to be
 persuaded to reproduce.
@@ -51,9 +53,18 @@ whose only difference was restoring a patch "on both hit and timeout", which is 
 `batch::tests::the_messagemanager_sequence_is_a_valid_batch` is the longest single invocation
 transcribed, and its sibling drives the wrong-target failure the client wrote that rollback for.
 
-**Status.** Adopted. Two things are still owed: pool steps (FOLLOWUPS item 17, the one gap the
-transcript found) and a live-kernel exercise of a *mutating* batch (item 16) — the dump tier proves
-the wiring and both outcomes, but a dump has nothing worth restoring.
+**The guarantee is against a timeout, not against a disconnect.** The budget clamp makes the first
+one total: the rollback runs and the report is written before the caller's wait expires. A client
+disconnect is different in kind — `Sessions::shutdown` treats it as `end_session` on everything and
+gives each session `SHUTDOWN_RELEASE_TIMEOUT` before terminating its worker, so a batch still
+running then is killed mid-transaction. Deliberately not widened here: lengthening that grace slows
+every disconnect, and making it conditional on what a worker is running is a change to the teardown
+path every session depends on. Documented as the boundary it is, and filed as FOLLOWUPS item 18.
+
+**Status.** Adopted. Three things are still owed: pool steps (FOLLOWUPS item 17, the one gap the
+transcript found), a live-kernel exercise of a *mutating* batch (item 16) — the dump tier proves the
+wiring and both outcomes, but a dump has nothing worth restoring — and the disconnect grace above
+(item 18).
 
 ---
 

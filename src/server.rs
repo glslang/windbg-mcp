@@ -27,13 +27,6 @@ use crate::ttd;
 /// next stop (ms).
 pub(crate) const EXEC_WAIT_MS: u32 = 60_000;
 
-/// Default deadline for a whole `debug_batch` (ms).
-///
-/// Comfortably more than a sequence of ordinary commands needs, and comfortably inside the default
-/// call budget so the rollback report lands before the caller gives up. A batch that wants longer
-/// asks for it; the worker still clamps it to the caller's remaining patience.
-const DEFAULT_BATCH_MS: u32 = 120_000;
-
 /// How long an open may sit un-landed before `session_status` stops calling it normal.
 ///
 /// A KDNET link that is coming up resyncs in ~25s; a guest that is not booted in debug mode
@@ -1383,8 +1376,10 @@ pub struct DebugBatchArgs {
     /// `{"op": "resume", "command": "g"}` moves the target and waits for the next stop;
     /// `{"op": "run_to", "address": "hevd!Trigger"}` reports a HIT/STOPPED ELSEWHERE/TIMEOUT
     /// verdict; `{"op": "eval", "expr": "@rcx"}` reads a value; `{"op": "read_memory",
-    /// "address": "@rsp", "size": 64}` hex-dumps memory. Add `"expect"` to assert on the result
-    /// and `"capture"` (on an `eval` step) to bind its value for later steps as `{{name}}`.
+    /// "address": "0xfffff8000012c000", "size": 64}` hex-dumps memory — this one takes a *number*
+    /// (decimal or `0x`-hex), not an expression, so for `@rsp` or `poi(...)` put an `eval` step in
+    /// front of it and read the capture. Add `"expect"` to assert on the result and `"capture"`
+    /// (on an `eval` step) to bind its value for later steps as `{{name}}`.
     /// The batch stops at the first step that fails or whose assertions do not hold.
     pub steps: Vec<batch::BatchStep>,
     /// Cleanup/rollback steps, same shape as `steps`. They run **on every path** — success, a
@@ -2159,9 +2154,12 @@ impl WindbgServer {
     /// target — a patched byte, an armed breakpoint, a resumed thread — and something has to be
     /// put back afterwards: the `always` block runs inside the worker on every path, including
     /// an assertion that does not hold and the deadline expiring, so cleanup cannot be lost to a
-    /// call that times out or a client that disconnects. The result names every step that ran,
-    /// the exact one that failed, what each changed, whether the rollback completed, and whether
-    /// the target is left stopped, running, or gone.
+    /// call that times out. The result names every step that ran, the exact one that failed, what
+    /// each changed, whether the rollback completed, and whether the target is left stopped,
+    /// running, or gone. Two edges: a step that overruns far enough to consume the reserved
+    /// cleanup budget too leaves the rollback unrun, and the result says `rollback: INCOMPLETE`;
+    /// and a client *disconnect* is not a safe way to abort a batch — it is treated as
+    /// `end_session` everywhere and gives only a few seconds' grace, so end the session instead.
     #[rmcp::tool(annotations(
         title = "Run a transactional debugger batch",
         read_only_hint = false,
@@ -2180,12 +2178,16 @@ impl WindbgServer {
         if let Err(why) = batch::validate(&args.steps, &args.always) {
             return tool_error(why);
         }
+        let budget_ms = match batch::budget_ms(args.timeout_ms) {
+            Ok(budget_ms) => budget_ms,
+            Err(why) => return tool_error(why),
+        };
         // Read before the steps move into the op, and before any of them runs: a `.detach` that
         // reports an error may still have detached, so the handle has to be retired ahead of the
         // batch rather than in light of what it reported.
         let retires = batch::retires_handle(&args.steps, &args.always);
         let mut call = Call::new(EngineOp::Batch(batch::BatchOp {
-            budget_ms: args.timeout_ms.unwrap_or(DEFAULT_BATCH_MS),
+            budget_ms,
             // Filled in by the supervisor's pump when this job reaches the front of its session's
             // queue; see `EngineOp::Batch`.
             patience_ms: 0,

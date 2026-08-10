@@ -33,7 +33,7 @@ already does the job.
 | Session | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `end_session`, `session_status` |
 | State | `registers`, `read_memory`, `backtrace`, `modules`, `threads`, `disassemble`, `dx` |
 | Control | `go`, `step_over`, `step_into`, `set_breakpoint`, `run_to_address` |
-| Transaction | `debug_batch` — an ordered sequence with assertions and a rollback the engine runs on every path |
+| Transaction | `debug_batch` — an ordered sequence with assertions and a rollback the engine runs, not the client |
 | TTD nav | `step_back` (`t-`), `step_over_back` (`p-`), `reverse_go` (`g-`), `goto_position` (`!tt`) |
 | TTD analysis | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
 | Raw | `execute` — run any debugger command, returns full text output |
@@ -45,12 +45,19 @@ a bare `execute`, which only sets the run state and doesn't move the target.
 
 **When a sequence mutates the target, run it as one `debug_batch`, not as separate calls.** A
 patched byte, an armed breakpoint or a resumed thread has to be put back, and the call that would
-have sent the cleanup is exactly the one that times out — a disconnect sends nothing at all. A
-batch's `always` block runs inside the engine process on every path, including a failed assertion
-and an expired deadline, so cleanup cannot be lost; the report names the exact failing step, what
-each step changed, whether the rollback completed, and whether the target is left stopped, running
-or gone. Save what you are about to overwrite with an `eval` step's `capture`, and restore it in
+have sent the cleanup is exactly the one that times out. A batch's `always` block is reached inside
+the engine process on every path, including a failed assertion and an expired deadline, and part of
+the budget is reserved so it has time to run; the report names the exact failing step, what each
+step changed, whether the rollback completed, and whether the target is left stopped, running or
+gone. Save what you are about to overwrite with an `eval` step's `capture`, and restore it in
 `always` as `{{name}}`.
+
+Two edges to keep in mind. If a step overruns far enough to consume the reserve too, cleanup is
+skipped and the result says `rollback: INCOMPLETE` — believe it rather than the intent. And the
+guarantee is against a call *timeout*, not against a client *disconnect*: a disconnect is treated as
+`end_session` on every session and gives a batch only a few seconds' grace before its worker is
+terminated, so end a session holding a patched kernel yourself instead of just dropping the
+connection.
 
 ## Cross-cutting gotchas (apply to every workflow)
 
