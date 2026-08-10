@@ -618,12 +618,27 @@ fn read_memory(e: &DebugEngine, address: &str, size: u32) -> Result<String, Stri
 /// a five-minute call budget would otherwise be a batch whose rollback report is guaranteed to
 /// arrive after nobody is listening — which is the failure this tool exists to remove, arriving
 /// by way of the argument that was supposed to prevent it.
-fn batch_budget(requested_ms: u32, patience: Duration, queued: Duration) -> Duration {
-    let allowed = patience
+///
+/// `None` when there is not enough left to be worth starting, and **this is where a batch parts
+/// company with [`watchdog_budget_ms`]**. That one floors at [`WATCHDOG_HEADROOM`] rather than
+/// reaching zero, because its command is already running and the job left is to free the worker:
+/// bounding it 15s late beats never. A batch has not started. Handing it the same floor would run
+/// *mutations* for a caller who has already been told the call timed out — a job sits in the queue
+/// after its waiter has given up, so this is reachable by a long queue wait alone, and by any
+/// `WINDBG_MCP_CALL_TIMEOUT_SECS` under the headroom — and would then roll them back with nobody
+/// left to read whether that worked. Not starting is the only outcome that leaves the target as
+/// the caller last saw it.
+fn batch_budget(requested_ms: u32, patience: Duration, queued: Duration) -> Option<Duration> {
+    // What is left after reserving the headroom the reply needs to land inside the caller's wait.
+    let usable = patience
         .saturating_sub(queued)
-        .saturating_sub(WATCHDOG_HEADROOM)
-        .max(WATCHDOG_HEADROOM);
-    allowed.min(Duration::from_millis(u64::from(requested_ms)))
+        .saturating_sub(WATCHDOG_HEADROOM);
+    // The same floor the caller's own `timeout_ms` has to clear: below it the reserve cannot seat
+    // a step and a rollback, so there is no batch to run, only mutations to regret.
+    if usable < Duration::from_millis(u64::from(batch::MIN_BATCH_MS)) {
+        return None;
+    }
+    Some(usable.min(Duration::from_millis(u64::from(requested_ms))))
 }
 
 /// A [`Debuggee`] over this worker's engine: the seam that keeps [`crate::batch`] free of DbgEng.
@@ -664,11 +679,28 @@ impl Debuggee for BatchEngine<'_> {
 /// and whether the rollback ran would be worse than no report at all. `Err` only chooses how
 /// [`crate::server`] renders it: a tool-execution error the model can read and act on.
 fn run_batch(e: &DebugEngine, op: BatchOp, queued: Duration) -> Result<String, String> {
-    let budget = batch_budget(
+    let Some(budget) = batch_budget(
         op.budget_ms,
         Duration::from_millis(u64::from(op.patience_ms)),
         queued,
-    );
+    ) else {
+        // Answered rather than silently dropped: a `Done` is what releases the supervisor's waiter
+        // and frees this session, so the reply is worth sending even though its caller has stopped
+        // waiting for it. "Nothing ran" is the part that matters — it is what makes resubmitting
+        // safe, which is not true of a batch abandoned partway.
+        return Err(format!(
+            "This batch was not started: it reached the engine with {}s of its caller's timeout \
+             left, which is not enough to run it and report back before that timeout expires. \
+             Nothing was run and nothing was changed — no step, no assertion, no rollback — so \
+             the target is exactly as it was and resubmitting is safe. It waited {}s behind other \
+             work on this session; issue it when the session is idle, or raise the server's call \
+             timeout (WINDBG_MCP_CALL_TIMEOUT_SECS).",
+            Duration::from_millis(u64::from(op.patience_ms))
+                .saturating_sub(queued)
+                .as_secs(),
+            queued.as_secs(),
+        ));
+    };
     let mut engine = BatchEngine {
         e,
         started: Instant::now(),
@@ -1762,7 +1794,7 @@ mod tests {
     fn a_batch_that_fits_gets_the_deadline_it_asked_for() {
         assert_eq!(
             batch_budget(60_000, Duration::from_secs(300), Duration::ZERO),
-            Duration::from_secs(60)
+            Some(Duration::from_secs(60))
         );
     }
 
@@ -1778,7 +1810,7 @@ mod tests {
         for asked in [60_000, 300_000, 900_000, u32::MAX] {
             for waited in [0, 30, 200, 270] {
                 let waited = Duration::from_secs(waited);
-                let budget = batch_budget(asked, patience, waited);
+                let budget = batch_budget(asked, patience, waited).expect("still worth running");
                 assert!(
                     waited + budget <= patience,
                     "asking for {asked}ms after a {waited:?} queue wait yielded {budget:?}, which \
@@ -1788,18 +1820,36 @@ mod tests {
         }
     }
 
-    /// Past the point where there is nothing left, the budget floors rather than reaching zero —
-    /// a zero-length batch would skip every step *and* its rollback, which is the one outcome
-    /// this tool must never produce.
+    /// The one place a batch parts company with a bounded command: past the point where its
+    /// caller can still be answered, it does **not** start.
+    ///
+    /// `watchdog_budget_ms` floors instead, and is right to — its command is already running and
+    /// the job left is to free the worker. A batch has not started, so the same floor would apply
+    /// mutations for a caller already told the call timed out, then roll them back with nobody
+    /// left to read whether that worked.
     #[test]
-    fn a_batch_dequeued_past_the_deadline_still_gets_enough_to_roll_back() {
+    fn a_batch_whose_caller_has_given_up_is_not_started_at_all() {
+        // Dequeued long after the caller's timeout.
         assert_eq!(
             batch_budget(120_000, Duration::from_secs(300), Duration::from_secs(400)),
-            WATCHDOG_HEADROOM
+            None
+        );
+        // And the case a short `WINDBG_MCP_CALL_TIMEOUT_SECS` produces, with no queue wait at all.
+        assert_eq!(batch_budget(120_000, Duration::ZERO, Duration::ZERO), None);
+        assert_eq!(
+            batch_budget(120_000, WATCHDOG_HEADROOM, Duration::ZERO),
+            None
+        );
+
+        // The boundary: enough left for the headroom plus the smallest batch there can be.
+        let least = WATCHDOG_HEADROOM + Duration::from_millis(u64::from(batch::MIN_BATCH_MS));
+        assert_eq!(
+            batch_budget(120_000, least, Duration::ZERO),
+            Some(Duration::from_millis(u64::from(batch::MIN_BATCH_MS)))
         );
         assert_eq!(
-            batch_budget(120_000, Duration::ZERO, Duration::ZERO),
-            WATCHDOG_HEADROOM
+            batch_budget(120_000, least - Duration::from_millis(1), Duration::ZERO),
+            None
         );
     }
 }

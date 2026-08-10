@@ -36,6 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same way a bounded command's watchdog is, so the rollback has finished and the report has been
   written before the tool call gives up — which is the only reason the report is worth anything.
 
+A batch whose caller has already given up is **not started at all**: a job stays queued after
+  its waiter times out, so the worker checks what patience is left before the first step and
+  refuses outright rather than applying mutations nobody is waiting to hear about. That is where a
+  batch parts company with a bounded command, which floors its watchdog instead — that one is
+  already running and the job left is to free the worker; this one has not started, and not
+  starting is what leaves the target as the caller last saw it.
+
   Two edges are reported rather than papered over. The reserve buys the rollback *time*, not a
   guarantee: a step that overruns far enough to consume the reserve as well leaves cleanup with no
   budget, and the result then says `rollback: INCOMPLETE` and names each step that never started.

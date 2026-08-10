@@ -976,13 +976,35 @@ fn run_step(
         }
     }
 
+    // Clipped **here**, not at render time, and the difference is memory rather than presentation.
+    // The full text has done its work by now — the assertions read it and the capture parsed it —
+    // and a step that keeps it holds it until the whole batch ends. A `read_memory` step may
+    // return a megabyte of target memory as some five megabytes of hexdump, and a batch may carry
+    // sixty-four steps, so keeping every one whole would let a valid batch exhaust the worker and
+    // cost its session — walking straight past the read-size guard that exists to prevent exactly
+    // that.
+    //
+    // Clipping once, against the cap this step will actually be shown at, also keeps the dropped
+    // count honest: a second clip in the renderer would count from the first one's remainder and
+    // report a fraction of what was really left out.
+    let cap = report_cap(&result);
     StepOutcome {
         position,
         label: step.label(),
         rendered,
         changes,
         result,
-        output,
+        output: clip(&output, cap),
+    }
+}
+
+/// How much of a step's output survives into the report. The step that did not succeed is the one
+/// the caller has to act on, so it gets the larger share; the rest are context.
+fn report_cap(result: &StepResult) -> usize {
+    if matches!(result, StepResult::Ok) {
+        STEP_OUTPUT_CHARS
+    } else {
+        FAILED_OUTPUT_CHARS
     }
 }
 
@@ -1151,8 +1173,7 @@ fn indent(text: &str, prefix: &str) -> String {
         .collect()
 }
 
-/// Renders one block of steps. The step that did not succeed gets the larger output budget: it is
-/// the one the caller has to act on, and the rest are context for it.
+/// Renders one block of steps.
 fn render_block(out: &mut String, title: &str, block: &[StepOutcome]) {
     if block.is_empty() {
         return;
@@ -1185,13 +1206,10 @@ fn render_block(out: &mut String, title: &str, block: &[StepOutcome]) {
         if let Some(detail) = step.result.detail() {
             out.push_str(&indent(detail, "     ! "));
         }
+        // Already clipped to this step's cap when the outcome was built, so that the text was not
+        // carried whole for the life of the batch — see `run_step`.
         if !step.output.trim().is_empty() {
-            let limit = if step.ok() {
-                STEP_OUTPUT_CHARS
-            } else {
-                FAILED_OUTPUT_CHARS
-            };
-            out.push_str(&indent(&clip(&step.output, limit), "     | "));
+            out.push_str(&indent(&step.output, "     | "));
         }
     }
 }
@@ -1949,6 +1967,37 @@ mod tests {
         }
         // And what came back is still a batch this server would accept.
         validate(&back.steps, &back.always).expect("a round-tripped batch stays valid");
+    }
+
+    /// A step's output is clipped when the outcome is built, not when it is rendered, so a batch
+    /// cannot accumulate every step's full text and take the worker — and its session — down with
+    /// an allocation the read-size guard was supposed to bound.
+    #[test]
+    fn a_steps_output_is_bounded_when_it_is_recorded_not_when_it_is_printed() {
+        let huge = "A".repeat(FAILED_OUTPUT_CHARS * 4);
+        let mut d = stopped().on("db ", Ok(&huge));
+        let report = run(
+            &mut d,
+            &op(vec![cmd("db fffff800`00001000 L20000")], vec![]),
+            BUDGET,
+        );
+
+        let kept = report.steps[0].output.chars().count();
+        assert!(
+            kept <= STEP_OUTPUT_CHARS + 64,
+            "a successful step kept {kept} characters of a {}-character output",
+            huge.len()
+        );
+        // And the note says how much went missing, counted against the real output rather than
+        // against an already-truncated copy of it.
+        assert!(
+            report.steps[0].output.contains(&format!(
+                "{} more characters",
+                huge.len() - STEP_OUTPUT_CHARS
+            )),
+            "the dropped count must be measured against the whole output: {}",
+            &report.steps[0].output[report.steps[0].output.len().saturating_sub(80)..]
+        );
     }
 
     /// The typo that fails *open*: a misspelt `expect` is a step that asserts nothing and commits.
