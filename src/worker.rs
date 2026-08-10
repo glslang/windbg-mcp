@@ -26,7 +26,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use win_kexp::dbgeng::{DebugEngine, RunToOutcome};
-use win_kexp::pool::query::{self, PoolPageFilter};
+use win_kexp::pool::query::{self, PoolPageFilter, PoolWalk};
 use win_kexp::pool::{DiagnosticShape, PoolDiagnostics, PoolSpan, PoolState};
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
@@ -757,7 +757,10 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<S
             timeout_ms,
         } => run_to_address(e, &address, timeout_ms),
         EngineOp::Reachability(args) => reachable(e, args),
-        EngineOp::Pool(args) => pool(e, args),
+        // No deadline of our own: a pool *tool* call takes win-kexp's `DEFAULT_WALK_BUDGET`, which
+        // is sized to fit inside a typical per-call budget (this server's own is #75). A pool
+        // *step* is different — it has a batch's clock to keep — so that path passes one.
+        EngineOp::Pool(args) => pool(e, args, None),
         EngineOp::Batch(op) => run_batch(e, op, queued),
         // Reaching here means any batch has already been told to stop and has finished unwinding —
         // the reader saw this request go past and said so, and this thread runs one job at a time.
@@ -854,6 +857,18 @@ impl Debuggee for BatchEngine<'_> {
 
     fn read_memory(&mut self, address: &str, size: u32) -> Result<String, String> {
         read_memory(self.e, address, size)
+    }
+
+    fn pool(&mut self, query: &PoolOp, budget_ms: u32) -> Result<String, String> {
+        // The step's own budget, handed to the walker. Bounded, always, for the same reason a
+        // command step is: this is the one step that can spend minutes without a runaway anywhere
+        // — a full pool walk is every committed page over the KD wire — and the reserve the
+        // rollback lives on is what it would spend.
+        pool(
+            self.e,
+            query.clone(),
+            Some(Duration::from_millis(u64::from(budget_ms))),
+        )
     }
 
     fn elapsed(&self) -> Duration {
@@ -1091,7 +1106,22 @@ fn render_walk_report(report: &query::PoolSnapshotReport) -> String {
     out
 }
 
-fn pool(e: &DebugEngine, args: PoolOp) -> Result<String, String> {
+/// Answers one pool question, walking the pool if the cached snapshot will not do.
+///
+/// `within` is the caller's own deadline for a walk that actually happens, or `None` to take
+/// win-kexp's default. It is `Some` for a [`crate::batch`] step, whose budget is both shorter than
+/// that default and load-bearing: the batch reserves part of it for the rollback and advertises the
+/// whole of it to a teardown, so a walk that ran to the *walker's* default could overrun both. A
+/// walk stopped by a budget still answers — every rendering below carries how much of the pool the
+/// walk reached — so the cost of a short deadline is coverage, not an error.
+fn pool(e: &DebugEngine, args: PoolOp, within: Option<Duration>) -> Result<String, String> {
+    let walk = |refresh: bool| {
+        let walk = PoolWalk::from(refresh);
+        match within {
+            Some(budget) => walk.within(budget),
+            None => walk,
+        }
+    };
     match args {
         PoolOp::FindTag {
             tag,
@@ -1106,8 +1136,10 @@ fn pool(e: &DebugEngine, args: PoolOp) -> Result<String, String> {
                     PoolPageFilter::NonPaged
                 }
             });
-            let spans = query::find_tag(e, &tag, filter, refresh).map_err(es)?;
+            let spans = query::find_tag(e, &tag, filter, walk(refresh)).map_err(es)?;
             let mut out = render_find_tag(&tag, filter, &spans, limit);
+            // Both branches read the snapshot `find_tag` has just taken or reused — hence the bare
+            // `false` below, which cannot start a walk of its own whatever budget this query had.
             if spans.is_empty() {
                 append_walk_report(&mut out, e);
             } else if let Ok(report) = query::snapshot_report(e, false)
@@ -1119,7 +1151,7 @@ fn pool(e: &DebugEngine, args: PoolOp) -> Result<String, String> {
         }
         PoolOp::Chunk { address, refresh } => {
             let address = parse_pool_addr(&address)?;
-            match query::chunk_at(e, address, refresh).map_err(es)? {
+            match query::chunk_at(e, address, walk(refresh)).map_err(es)? {
                 Some(found) => Ok(render_chunk(address, &found)),
                 // "Not in the snapshot" and "free" are different answers, and reporting this one
                 // as free would manufacture a dangling pointer out of a gap in the walk.
@@ -1143,12 +1175,12 @@ fn pool(e: &DebugEngine, args: PoolOp) -> Result<String, String> {
             refresh,
             limit,
         } => {
-            let report = query::snapshot_report(e, refresh).map_err(es)?;
+            let report = query::snapshot_report(e, walk(refresh)).map_err(es)?;
             Ok(render_diagnostics(&report, filter.as_deref(), limit))
         }
         // The census *is* the state of the walk, so it always carries the report.
         PoolOp::Census { refresh, limit } => {
-            let census = query::tag_census(e, refresh).map_err(es)?;
+            let census = query::tag_census(e, walk(refresh)).map_err(es)?;
             let mut out = render_census(&census, limit);
             append_walk_report(&mut out, e);
             Ok(out)

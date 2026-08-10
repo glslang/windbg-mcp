@@ -180,6 +180,11 @@ pub struct ReachabilityOp {
 /// snapshot is cached per session and invalidated when the debugger reports the session
 /// changed. Pass it after resuming the target, when the cached view is a photograph of a
 /// target that has since moved.
+///
+/// **Built through the constructors below, never by hand.** Two callers now ask these questions —
+/// the pool tools and a [`crate::batch`] step — and the defaults are part of the *answer's* shape
+/// rather than of one tool's argument parsing. Spelling them out at each call site is how the two
+/// come to disagree about what `limit` means.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PoolOp {
     /// Every *allocated* chunk carrying `tag`.
@@ -205,6 +210,65 @@ pub enum PoolOp {
         refresh: bool,
         limit: usize,
     },
+}
+
+impl PoolOp {
+    /// Most rows or lines a pool answer will render in one response.
+    ///
+    /// The worker builds the whole reply as a single `String` before it crosses the pipe, so an
+    /// unbounded `limit` is a request to allocate a snapshot-sized buffer — hundreds of thousands
+    /// of chunks, or ~19k diagnostic lines on an idle machine. Clamping costs a caller nothing
+    /// they can act on; a worker killed mid-session costs them the session.
+    pub const MAX_ROWS: u32 = 2000;
+
+    /// Rows each question prints when the caller names no `limit`.
+    const FIND_TAG_ROWS: u32 = 64;
+    const CENSUS_ROWS: u32 = 40;
+    const DIAGNOSTIC_LINES: u32 = 60;
+
+    fn rows(limit: Option<u32>, default: u32) -> usize {
+        limit.unwrap_or(default).min(Self::MAX_ROWS) as usize
+    }
+
+    /// Every allocated chunk carrying `tag`.
+    pub fn find_tag(
+        tag: String,
+        paged: Option<bool>,
+        refresh: Option<bool>,
+        limit: Option<u32>,
+    ) -> Self {
+        Self::FindTag {
+            tag,
+            paged,
+            refresh: refresh.unwrap_or(false),
+            limit: Self::rows(limit, Self::FIND_TAG_ROWS),
+        }
+    }
+
+    /// The chunk containing `address`, with its immediate neighbours.
+    pub fn chunk(address: String, refresh: Option<bool>) -> Self {
+        Self::Chunk {
+            address,
+            refresh: refresh.unwrap_or(false),
+        }
+    }
+
+    /// Per-tag totals across the whole snapshot.
+    pub fn census(refresh: Option<bool>, limit: Option<u32>) -> Self {
+        Self::Census {
+            refresh: refresh.unwrap_or(false),
+            limit: Self::rows(limit, Self::CENSUS_ROWS),
+        }
+    }
+
+    /// The walk's own diagnostics, optionally narrowed.
+    pub fn diagnostics(filter: Option<String>, refresh: Option<bool>, limit: Option<u32>) -> Self {
+        Self::Diagnostics {
+            filter,
+            refresh: refresh.unwrap_or(false),
+            limit: Self::rows(limit, Self::DIAGNOSTIC_LINES),
+        }
+    }
 }
 
 /// A request down the worker's stdin. `id` is echoed on every message the op produces.
