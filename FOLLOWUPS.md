@@ -13,8 +13,10 @@ and the 2026-08-02 entries that items 13–14 and item 10 extend.
 Items are roughly ordered by how soon they're worth doing, within each cluster. **Item 10 has
 landed** (process-per-session, 2026-08-02); it is kept here rather than deleted because items 7, 8
 and 9 were all written against the single-engine design it replaced, and each now says what moved.
-**Item 18 has landed** (2026-08-10) and is kept for the opposite reason: it turned out to need much
-less of item 7 than it claimed to, and item 7 should be read knowing which half of it is still owed.
+**Items 16, 17 and 18 have landed** (2026-08-10) and are kept for the opposite reason: each turned
+out to need something its entry did not anticipate — item 18 needed much less of item 7 than it
+claimed to (item 7 should be read knowing which half of it is still owed), item 17 needed a walk
+deadline nothing had asked for, and item 16 needed a probe before it could measure anything at all.
 
 ## 1. [win-kexp] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -350,51 +352,60 @@ and no other spawn site needs to know the rule exists.
   function. The convention is pinned rather than merely documented, which is what makes this an
   improvement to *how* the property is held rather than a fix to a live hole.
 
-## 16. [windbg-mcp] Exercise a *mutating* `debug_batch` against a live kernel target
+## 16. [windbg-mcp] Exercise a *mutating* `debug_batch` against a live kernel target — **done**
 
-`debug_batch` (#82) is proved at two altitudes: `src/batch.rs` drives the executor over a scripted
+`debug_batch` (#82) was proved at two altitudes: `src/batch.rs` drives the executor over a scripted
 debuggee with a virtual clock (assertion failure, a command failure after a mutation, deadline
 expiry, a rollback that itself fails), and the debugger tier drives a real engine to both outcomes
-over the wire. Neither covers the case the tool was built for — a **write that is then restored**
+over the wire. Neither covered the case the tool was built for — a **write that is then restored**
 on a target that would notice.
 
-- **Why deferred:** a crash dump has nothing worth restoring, and the live-kernel tier is
-  `#[ignore]`d and gated on a connection string precisely so an ordinary `cargo test` can never
-  reach a VM. So this belongs beside the existing `live_kernel` tests, run by hand.
-- **What it should assert:** save a byte with an `eval`+`capture`, patch it, fail an assertion
-  deliberately, and confirm from a *later, separate* call that the `always` block put the original
-  back — the point being that nothing after the batch had to be sent for that to happen. Then the
-  same batch with the call budget shortened (`WINDBG_MCP_CALL_TIMEOUT_SECS`) below the batch's own
-  deadline, to check the clamp in `worker::batch_budget` really keeps the report ahead of the
-  caller's timeout on a target where steps take real time.
-- **And now the teardown paths too** (item 18, landed): patch a byte, disconnect mid-batch, and
-  read the byte back over a *fresh* attach — the dump tier proves the rollback ran by the file it
-  wrote, which is the shape of the claim but not the substance of it. Same again for `end_session`
-  arriving mid-batch, where the batch's own `BATCH: ABANDONED` report comes back to the client.
-- **Where it picks up:** `tests/mcp_smoke.rs`, the `live_kernel` filter; the harness for setting and
-  reading back a byte already exists in the MessageManager tier.
+Landed (2026-08-10) as five tests in the `live_kernel` filter of `tests/mcp_smoke.rs`: a failing
+batch whose `always` block restores a patched byte (confirmed by a *later, separate* call, so
+nothing after the batch had to be sent for it to happen); the same under a
+`WINDBG_MCP_CALL_TIMEOUT_SECS` shorter than the batch's own deadline, where the clamp in
+`worker::batch_budget` is what keeps the report ahead of the caller; a disconnect mid-batch, read
+back by a **new server process** over a fresh attach; an `end_session` mid-batch, where the client is
+still there to receive `BATCH: ABANDONED` *and* a second attach agrees about the byte; and a pool
+step inside a batch (item 17).
 
-## 17. [windbg-mcp] Let a `debug_batch` step call a typed tool, starting with the pool queries
+Two things the writing of it settled, both worth keeping:
+
+- **What to patch.** `nt`'s DOS-header `e_res2` field (`nt+0x28`) — reserved by the format, read by
+  nothing at runtime, and stable across a detach and re-attach, which the teardown tests need and a
+  stack address could not give. Anything with a *purpose* satisfies the first two conditions and
+  bugchecks the guest on the third.
+- **The probe is not optional.** A guest with memory integrity (HVCI) enabled accepts a debugger
+  write to an image page and silently drops it, so every one of these tests reads, writes, reads
+  back and restores the byte *before* it opens a transaction. Without that, a rollback that did
+  nothing and a patch that never landed are the same green tick.
+
+## 17. [windbg-mcp] Let a `debug_batch` step call a typed tool, starting with the pool queries — **done**
 
 The one gap the MessageManager transcript found in `debug_batch` (#82). Its step vocabulary reaches
 anything that is a *debugger command*, which is almost every typed tool in this server — but not the
 ones that are not commands at all. The pool tools are win-kexp walks over the allocator's own
-structures, so `pool_find_tag`, `pool_chunk` and `pool_census` have no `execute` equivalent to fall
-back on.
+structures, so `pool_find_tag`, `pool_chunk` and `pool_census` had no `execute` equivalent to fall
+back on. It cost the workflow this is measured against 9 of 1,681 steps (`@chunkt1`, `@census`,
+`@find`, `@findr`) — small, but not incidental: `@chunkt1` sat *inside* the 32-step transaction,
+between a code patch and its restore.
 
-- **How much it cost the workflow it is measured against:** 9 of 1,681 steps (`@chunkt1`, `@census`,
-  `@find`, `@findr`). Small, but not incidental — `@chunkt1` sat *inside* the 32-step transaction,
-  between a code patch and its restore, so a batch expressing that sequence today has to drop it.
-- **Why deferred:** the shape is a design question, not a missing wire. `PoolOp` already crosses to
-  the worker and `worker::pool` already renders it, so the plumbing is short; what needs deciding is
-  whether a step names a *tool* generically (open-ended, and every tool's arguments then have to
-  exist in the batch schema twice) or whether the batch grows one variant per typed tool worth
-  having in a transaction. The second is smaller and matches how `StepAction` is already justified —
-  variants exist for what a raw command cannot express — but it is a list that will keep growing.
-- **Where it picks up:** `StepAction` in `src/batch.rs`, `PoolOp` in `src/proto.rs`, and
-  `batch::Debuggee`, which would gain one method per capability so the executor stays engine-free.
-  `@chunkt1`'s real shape is the test case: capture a register with `eval`, then ask `pool_chunk`
-  about `{{that}}` — the capture half already works.
+Landed (2026-08-10) as **one `StepAction` variant per question** — `pool_chunk`, `pool_find_tag`,
+`pool_census` — rather than a generic "call a tool" step, for the reason this item guessed at: the
+generic form would have every tool's arguments living in the batch schema twice. `pool_diagnostics`
+is deliberately not among them; it explains a *walk* rather than the target, and belongs to the
+interactive look that follows a batch. `batch::Debuggee` gained one method, `pool`, so the executor
+stays engine-free, and the defaults and caps moved onto `PoolOp` constructors in `src/proto.rs` so a
+step and a tool cannot drift apart on what `limit` means.
+
+The design question the item did *not* anticipate, and the part worth remembering: **a walk needs a
+deadline from the batch.** win-kexp bounds a walk at `DEFAULT_WALK_BUDGET` (120s), which is longer
+than an ordinary batch's whole budget — so a `refresh` step taking that default could spend the
+reserve the rollback lives on and overrun the bound the worker advertises to a teardown (item 18),
+which is a worker terminated mid-transaction. `PoolWalk::within` already existed for exactly this
+("a host that knows its own deadline should pass that instead of taking this"), so a pool step now
+passes its own step budget and a walk cut short reports its coverage as it always did. The pool
+*tools* still take the default; giving them the call's patience is [#75](https://github.com/glslang/windbg-mcp/issues/75).
 
 ## 18. [windbg-mcp] Let a running batch finish its rollback when the client disconnects — **done**
 

@@ -111,9 +111,16 @@ disconnect is untouched. What none of this can do is *shorten* a step already in
 is `SetInterrupt` bound to job identity, FOLLOWUPS item 7 — so a batch stops at its next step
 boundary, not where it stands.
 
-**Status.** Adopted. Two things are still owed: pool steps (FOLLOWUPS item 17, the one gap the
-transcript found) and a live-kernel exercise of a *mutating* batch (item 16) — the dump tier proves
-the wiring and both outcomes, but a dump has nothing worth restoring.
+**Status.** Adopted, and the two things it owed are now paid (2026-08-10). **Pool steps** (FOLLOWUPS
+item 17) landed as one `StepAction` variant per question rather than a generic "call a tool" step,
+which would have put every tool's arguments in the batch schema twice; the part nobody had
+anticipated is that a walk needs a deadline *from the batch*, because win-kexp bounds one at 120s and
+an ordinary batch's whole budget is shorter — a refreshed pool step taking that default would spend
+the rollback's reserve and overrun the bound advertised to a teardown, which is the failure above
+arriving through the one step that is not a command. And the **mutating batch** (item 16) is now
+exercised on a live kernel, which is the only place the claim can be false: a byte patched in a dump
+is patched in a file nobody reads again, so a rollback that silently did nothing satisfies every
+assertion the dump tier can make.
 
 ---
 
