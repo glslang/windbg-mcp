@@ -65,6 +65,20 @@ fn engine_result(r: Result<String, EngineError>) -> Result<CallToolResult, Error
     }
 }
 
+/// Wraps a pool question as an engine op.
+///
+/// `patience_ms` is filled in by the supervisor's pump when the job reaches the front of its
+/// session's queue, so the zero here is never what the worker reads — see [`EngineOp::Pool`]. It
+/// lives in one place rather than at each of the four call sites for the reason the `PoolOp`
+/// constructors do: a tool that spelled it out and got it wrong would silently take a walk budget
+/// of nothing.
+fn pool_op(query: PoolOp) -> EngineOp {
+    EngineOp::Pool {
+        query,
+        patience_ms: 0,
+    }
+}
+
 /// Parses a decimal or `0x`-prefixed hex integer.
 pub(crate) fn parse_u64(s: &str) -> Result<u64, String> {
     let t = s.trim();
@@ -1885,7 +1899,7 @@ impl WindbgServer {
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::Pool(PoolOp::find_tag(
+                pool_op(PoolOp::find_tag(
                     args.tag,
                     args.paged,
                     args.refresh,
@@ -1922,7 +1936,7 @@ impl WindbgServer {
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::Pool(PoolOp::chunk(args.address, args.refresh)),
+                pool_op(PoolOp::chunk(args.address, args.refresh)),
             )
             .await;
         engine_result(out)
@@ -1949,7 +1963,7 @@ impl WindbgServer {
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::Pool(PoolOp::diagnostics(args.filter, args.refresh, args.limit)),
+                pool_op(PoolOp::diagnostics(args.filter, args.refresh, args.limit)),
             )
             .await;
         engine_result(out)
@@ -1974,7 +1988,7 @@ impl WindbgServer {
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::Pool(PoolOp::census(args.refresh, args.limit)),
+                pool_op(PoolOp::census(args.refresh, args.limit)),
             )
             .await;
         engine_result(out)
@@ -2085,6 +2099,49 @@ impl WindbgServer {
             ));
         };
         text_result(describe_session(session))
+    }
+
+    /// Stop the operation a session is currently running, **keeping the session and its target**.
+    /// The graceful way out of a call that is taking too long — a broad `s` search, a `go` that
+    /// has not hit anything, a pool walk over a slow KD link.
+    ///
+    /// This is a Ctrl+Break, exactly as at a WinDbg prompt. The interrupted operation ends at the
+    /// debugger's next poll and returns whatever it had reached *to the call that started it*, not
+    /// to this one — so partial output is preserved, marked as cut short, and the session takes the
+    /// next call immediately. This call answers as soon as the break is raised.
+    ///
+    /// Issue it while the other call is still outstanding; it does not queue behind it. With
+    /// nothing running it reports exactly that and does nothing.
+    ///
+    /// Two things it cannot reach, both properties of the debugger rather than of this server: an
+    /// operation that never polls for the break, and a live-kernel `attach_kernel` whose target has
+    /// not connected yet (the documented case — see `session_status`). `end_session` is what ends
+    /// those, at the cost of the target.
+    ///
+    /// A `debug_batch` interrupted this way fails the step that was running, which stops the
+    /// transaction and runs its `always` block — the rollback still happens, and the batch's own
+    /// result reports it.
+    #[rmcp::tool(annotations(
+        title = "Interrupt the running operation",
+        read_only_hint = false,
+        destructive_hint = false,
+        idempotent_hint = true,
+        open_world_hint = true
+    ))]
+    async fn interrupt(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let session_id = args.session_id.as_deref();
+        let session = match self.sessions.resolve(session_id) {
+            Ok(session) => session,
+            Err(e) => return engine_result(Err(e)),
+        };
+        engine_result(
+            self.sessions
+                .interrupt(&session, session_id.is_some())
+                .await,
+        )
     }
 
     /// End a debug session: release its target and shut down its engine process. Pass
@@ -2982,9 +3039,12 @@ Open a dump or .run trace, attach to a process or the kernel, inspect registers/
 Each open target is a separate session in its own engine process, so several can be open at once (up to 4) without \
 disturbing each other; pass the `session_id` an opener returns on later calls to route them to that target, and \
 `end_session` when done. `session_status` lists what is open and what state each session is in — ask it when an open \
-reports a timeout rather than re-running the open, which would attach or launch a second time. A live kernel attach \
-waits for its target indefinitely and cannot be interrupted; if it has been waiting far longer than a healthy link \
-takes, `end_session` reclaims that session (and only that session) by terminating its engine process. \
+reports a timeout rather than re-running the open, which would attach or launch a second time. To stop a call that is \
+taking too long without losing the target, call `interrupt` on its session while it is still outstanding: it Ctrl+Breaks \
+the engine, the running call returns whatever it had reached, and the session is free for the next one. A live kernel \
+attach is the exception — it waits for its target indefinitely and cannot be interrupted; if it has been waiting far \
+longer than a healthy link takes, `end_session` reclaims that session (and only that session) by terminating its engine \
+process. \
 Navigate a TTD trace in both directions: go/step_over/step_into forward, and reverse_go/step_over_back/step_back backward, \
 or jump with goto_position. Analyze a trace with the data-model tools ttd_calls (calls to a function), ttd_memory (accesses \
 to an address range), and ttd_events (module/thread/exception events), or run any data-model query with dx. Record new traces \

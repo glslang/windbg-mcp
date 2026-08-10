@@ -106,7 +106,18 @@ pub enum EngineOp {
     /// A pool query. Like [`Self::Reachability`] this is one indivisible job: a query may have
     /// to walk every pool page, and letting another call for the same session interleave would
     /// let the walk describe a target that moved underneath it.
-    Pool(PoolOp),
+    ///
+    /// `patience_ms` is the caller's remaining patience, filled in and derived exactly as
+    /// [`Self::BoundedCommand`]'s is, and for the same reason: a walk that outlives its caller is a
+    /// walk nobody is waiting for holding a session nobody can use. Without it the walk takes
+    /// win-kexp's `DEFAULT_WALK_BUDGET`, which knows nothing about this server's deadline and is
+    /// wrong in both directions — too long for a host configured with a short
+    /// `WINDBG_MCP_CALL_TIMEOUT_SECS`, and needlessly short for the default one, where it stops
+    /// with minutes still to spend and hands back a partial snapshot.
+    Pool {
+        query: PoolOp,
+        patience_ms: u32,
+    },
     /// A whole transaction: ordered steps, their assertions, and the rollback block that runs
     /// whatever happens to them ([`crate::batch`]).
     ///
@@ -116,6 +127,26 @@ pub enum EngineOp {
     /// deadline. Splitting it into per-step round trips would put the client back in the middle
     /// of it, which is the design this replaces.
     Batch(BatchOp),
+    /// Ctrl+Break whatever this worker's engine is running, and answer without going near the
+    /// engine thread.
+    ///
+    /// **The second op the reader acts on where it reads it**, and here it is the entire point
+    /// rather than an ordering detail: an interrupt queued behind the operation it is meant to stop
+    /// would be read after that operation ended, which is a request that can never do anything.
+    /// So this one is answered by the reader outright and never queued at all.
+    ///
+    /// It carries no job id, because the id that matters is not the caller's to know. A tool call
+    /// names a *session*, and which job that session is running is decided inside the worker
+    /// between the request being written and it being read — so the binding is made where the
+    /// answer is: the reader reads the running job and raises the interrupt under one lock, and the
+    /// engine thread clears that job under the same lock and drains anything still pending before
+    /// it starts the next one. An interrupt therefore reaches the job that was running when it
+    /// arrived, or nothing at all; it can never land on the one after it.
+    ///
+    /// What it cannot do is bounded by `SetInterrupt` itself: a live-kernel wait whose target has
+    /// never connected does not poll, so an `attach_kernel` parked on a dead link is unreachable
+    /// this way and only [`Self::EndSession`] ends it.
+    Interrupt,
     /// Release the target. The supervisor tears the worker down afterwards — under
     /// process-per-session a worker outlives its target for no reason.
     ///
@@ -142,6 +173,23 @@ pub enum EngineOp {
 }
 
 impl EngineOp {
+    /// The `patience_ms` this op carries, for the supervisor's pump to fill in as it writes the
+    /// request — or `None` for an op that derives no deadline from its caller's.
+    ///
+    /// Named here, next to the variants, rather than as a `match` inside [`crate::engine::pump`],
+    /// because the failure it prevents is silent: a variant that grows a `patience_ms` and is not
+    /// added to that `match` compiles, ships, and takes whatever the field's default happens to
+    /// be. That is exactly what [`Self::Pool`] did — it carried none at all and quietly took
+    /// win-kexp's default walk budget instead of this server's deadline.
+    pub fn patience_slot(&mut self) -> Option<&mut u32> {
+        match self {
+            Self::BoundedCommand { patience_ms, .. }
+            | Self::Pool { patience_ms, .. }
+            | Self::Batch(BatchOp { patience_ms, .. }) => Some(patience_ms),
+            _ => None,
+        }
+    }
+
     /// Whether this op creates the worker's target, and so reports the `Committed`/`Opened`
     /// milestones below.
     pub fn is_opener(&self) -> bool {
@@ -268,6 +316,70 @@ impl PoolOp {
             refresh: refresh.unwrap_or(false),
             limit: Self::rows(limit, Self::DIAGNOSTIC_LINES),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every op that *carries* a caller's patience must hand it out, and no other op may claim to.
+    ///
+    /// Checked against the serialized form rather than against a second list, because that is the
+    /// one thing a hand-written `match` cannot get out of step with: the field is either in the
+    /// JSON this op crosses the pipe as, or it is not. `Pool` is the reason — it reached the worker
+    /// with no patience at all, and the walk took win-kexp's 120s default however long its caller
+    /// was actually willing to wait ([#75](https://github.com/glslang/windbg-mcp/issues/75)).
+    #[test]
+    fn an_op_that_carries_a_deadline_hands_it_to_the_pump() {
+        let mut ops = vec![
+            EngineOp::Command {
+                command: "lm".into(),
+            },
+            EngineOp::BoundedCommand {
+                command: "s -b 0 L?0x1000 41".into(),
+                patience_ms: 0,
+            },
+            EngineOp::Registers,
+            EngineOp::Pool {
+                query: PoolOp::census(None, None),
+                patience_ms: 0,
+            },
+            EngineOp::Batch(BatchOp {
+                budget_ms: 1_000,
+                patience_ms: 0,
+                steps: Vec::new(),
+                always: Vec::new(),
+            }),
+            EngineOp::Interrupt,
+            EngineOp::EndSession,
+        ];
+        for op in &mut ops {
+            let carries = serde_json::to_string(&op)
+                .expect("every op is plain data")
+                .contains("patience_ms");
+            let handed = op.patience_slot().is_some();
+            assert_eq!(
+                carries, handed,
+                "{op:?} carries patience_ms={carries} but hands it out={handed}; the supervisor \
+                 fills in exactly what this returns, so the two disagreeing is a deadline that is \
+                 never set"
+            );
+        }
+    }
+
+    /// And what it hands out is the field the worker then reads, not a copy of it.
+    #[test]
+    fn the_slot_the_pump_writes_is_the_one_that_crosses_the_pipe() {
+        let mut op = EngineOp::Pool {
+            query: PoolOp::find_tag("Tgsm".into(), None, None, None),
+            patience_ms: 0,
+        };
+        *op.patience_slot().expect("a pool query carries one") = 42_000;
+        let EngineOp::Pool { patience_ms, .. } = op else {
+            unreachable!("still a pool query")
+        };
+        assert_eq!(patience_ms, 42_000);
     }
 }
 

@@ -3,7 +3,7 @@
     "(none)",
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 42,
+  "toolCount": 43,
   "tools": [
     {
       "hints": {
@@ -238,6 +238,20 @@
       ],
       "required": [],
       "title": "Build TTD trace index"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": true,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "interrupt",
+      "params": [
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Interrupt the running operation"
     },
     {
       "hints": {

@@ -7,6 +7,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`interrupt`: stop the operation a session is running, keeping the session and its target**
+  (FOLLOWUPS item 7).
+
+  A runaway call used to have exactly one way out: `end_session`, which ends it by throwing away
+  the target it was running against. On a live kernel that is a machine to re-attach, and often a
+  guest to reboot. `interrupt` is the graceful one — a Ctrl+Break, exactly as at a WinDbg prompt.
+  The interrupted operation ends at the debugger's next poll and returns **whatever it had reached
+  to the call that started it**, marked as cut short, and the session takes the next call
+  immediately. Partial output is preserved rather than discarded: `SetInterrupt` makes `Execute`
+  fail, so an aborted search used to be indistinguishable from a failed one and lost every line it
+  had already produced.
+
+  The primitive existed but was only ever *timeout-driven* — win-kexp's watchdog threads
+  Ctrl+Break when a deadline passes, and no caller could ask for the same. `SetInterrupt` is now a
+  public win-kexp method on a `Send` handle taken from a `&DebugEngine`, which needs no new
+  threading model: it is the one DbgEng call documented as safe from another thread, so the engine
+  stays confined to its own.
+
+  **Bound to a job, not to a moment.** `SetInterrupt` addresses an *engine*, so raised a moment
+  late it stops whatever started next — a caller's `go` aborted by a cancel meant for the search
+  before it. The worker tracks which job its engine thread is running, and the request reader reads
+  that job and raises the interrupt under one lock, while the engine thread claims and releases the
+  job under the same one. So an interrupt reaches the job that was running when it arrived or
+  nothing at all, and the job it reached spends it: a pending break left over is drained before the
+  next job starts, and only the interrupted caller is told their result was cut short.
+
+  Like the abandon-a-batch signal, the request is **answered by the worker's request reader** rather
+  than queued for its engine thread — queued, it could only be read once the operation it means to
+  stop had ended. So it does not wait behind the busy session: issue it while the slow call is still
+  outstanding. With nothing running it says so and does nothing. Two limits carry over from DbgEng:
+  an operation that never polls for the break is not reached, and neither is an `attach_kernel`
+  whose target has not connected — `end_session` remains the only end to that one.
+
+  A `debug_batch` interrupted this way fails the step that was running, which stops the transaction
+  and runs its `always` block, so the rollback still happens and the batch's own result reports it.
+
+### Changed
+
+- **The pool tools take the caller's own deadline instead of win-kexp's default walk budget**
+  ([#75](https://github.com/glslang/windbg-mcp/issues/75)).
+
+  A pool walk enforces a wall-clock ceiling of its own, so `pool_find_tag` and friends can no
+  longer run for minutes after their caller has given up and leave every later call to that session
+  queued behind them. But they took the walker's **default** — 120s — which knows nothing about
+  this server's deadline, and was wrong in both directions. A host configured with
+  `WINDBG_MCP_CALL_TIMEOUT_SECS=60` got a 120s walk against a 60s budget: the call timed out and
+  the engine kept walking, which is precisely the wedge the walk budget was added to fix, arriving
+  from this side. And with the 300s default the walk stopped at 120s and handed back a partial
+  snapshot with three minutes still to spend.
+
+  `EngineOp::Pool` now carries the caller's remaining patience exactly as a bounded command and a
+  batch do — filled in by the supervisor's pump as the request is written, with the worker deriving
+  the deadline, because only the worker knows how long the request then sat in *its* queue. The
+  arithmetic is the bounded command's, so the invariant is the same: queue wait plus walk budget
+  never exceeds the caller's patience. A walk cut short still answers, and every pool result already
+  reports how much of the pool it reached.
+
+  Which slot the pump fills is now named on `EngineOp` itself rather than matched inside the pump,
+  because the failure it prevents is silent — that is exactly how `Pool` came to carry no patience
+  at all — and is checked against the serialized form, so an op with a `patience_ms` that does not
+  hand it out fails a test rather than shipping with an unset deadline.
+
 ## [0.6.0] - 2026-08-10
 
 ### Added

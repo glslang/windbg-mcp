@@ -119,6 +119,30 @@ processes, so they need real ones:
   from one step and interpolated into the next) and one to `FAILED at step 2 of 3`, with the same
   `always` block on both. The claim only a real engine can settle is the second one: the rollback
   ran **inside the worker process**, on the failing path, before the tool call returned.
+- *A pool walk takes this server's deadline, not the walker's default.* Asserted against the
+  worker's log (`RUST_LOG=windbg_mcp=debug`) rather than against the answer, because on a dump the
+  number has no visible consequence — the pool is local memory, so every budget from 15s to 120s
+  produces the identical result. That is exactly why it shipped wrong
+  ([#75](https://github.com/glslang/windbg-mcp/issues/75)): the query carried no deadline at all and
+  quietly took win-kexp's 120s however long its caller was willing to wait, and nothing that looked
+  at results could see it. The test shrinks the call budget to 60s and checks the worker derived
+  ~45s — a range, since the milliseconds already spent come off the patience, and one that contains
+  neither the 15s floor nor the 120s default. The query itself is allowed to fail: the sample dump
+  has no pool-layout symbols on a bare machine (that is the live tier's business), and the budget is
+  derived before the first page is read.
+- *A running command is interrupted on request.* A `.for` sized to run for hours is stopped by
+  `interrupt` while its `execute` call is still outstanding, comes back **as a result** carrying
+  what it reached, and the session serves the next call. It belongs in this tier rather than the
+  bounded one below because nothing waits out a deadline: the break lands in milliseconds
+  (measured: 203ms), and the test bounds the session's call budget to 30s so a *failure* fails fast
+  — anything at the watchdog's 15s floor means the deadline did the work and the run proves nothing
+  about the request path, which the assertions say. The claim only the shipped binary can settle is
+  that the interrupt is answered by the worker's **request reader** rather than queued for its
+  engine thread: queued, it would be read only once the command had ended, and every other
+  assertion here would still pass. The test retries the interrupt until it reports it reached
+  something, because the worker claims the job a moment after the request is written and an
+  interrupt landing in that gap correctly binds to nothing — racing it is the test's problem, not
+  the server's. Proof it was cut short is the loop counter in `$t0`, as in the bounded tier.
 - *A teardown mid-batch rolls it back first.* Two tests, one per teardown, both with a batch parked
   in twenty seconds of `.sleep` steps. `end_session` gets the version with a client still attached:
   it returns in seconds rather than waiting the batch out, and the batch's own call comes back
@@ -279,8 +303,11 @@ about. This is the other half — an attach that lands:
   expected one on a busy kernel — so the test never asserts the walk was complete, only that it said
   which it was, and it prints the walk's own diagnostic categories when it fell short, which is the
   part worth reading. **Measured against Server 26100 over KDNET: a forced walk returned in ~52s,
-  indexed 530,680 chunks (306,227 allocated), and reported INCOMPLETE.** That is still inside the
-  120s budget, so on that target the coverage gap is not the deadline — which is why scoping the
+  indexed 530,680 chunks (306,227 allocated), and reported INCOMPLETE.** That was inside the 120s
+  the walker used to default to, and is inside the caller-derived budget it takes now
+  ([#75](https://github.com/glslang/windbg-mcp/issues/75) — 285s under the default call timeout, and
+  the figure to re-read if you shrink `WINDBG_MCP_CALL_TIMEOUT_SECS`), so on that target the
+  coverage gap is not the deadline — which is why scoping the
   walk to one side of the pool was closed unbuilt (glslang/win-kexp#89): it would have bought a
   faster query at the cost of a cache that keys on scope, against better than two-fold headroom
   that already exists. That margin is worth re-reading rather than assuming: the same walk cost
