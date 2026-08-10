@@ -419,12 +419,23 @@ step that ran to its own deadline is nothing.
 }
 ```
 
-Five step kinds: `command` (raw), `resume` (a command that moves the target, plus the wait),
-`run_to` (a HIT/STOPPED ELSEWHERE/TIMEOUT verdict), `eval` (a MASM expression's value), and
-`read_memory`. Assertions are `contains`, `not_contains`, and `eval` — the last compares two MASM
-expressions, so registers, memory and relations between them are all one check. An `eval` step may
-`capture` its value under a name that later steps interpolate as `{{name}}`; a reference that names
-no earlier capture is refused before anything runs.
+Eight step kinds. Five are the debugger itself: `command` (raw), `resume` (a command that moves the
+target, plus the wait), `run_to` (a HIT/STOPPED ELSEWHERE/TIMEOUT verdict), `eval` (a MASM
+expression's value), and `read_memory`. Three ask the kernel pool the questions the `pool_*` tools
+ask — `pool_chunk`, `pool_find_tag`, `pool_census` — because those are walks over the allocator's own
+descriptors rather than debugger commands, so no `command` step can stand in for them:
+
+```jsonc
+{ "op": "eval", "expr": "@$t1", "capture": "obj" },                    // what the target handed us
+{ "op": "pool_chunk", "address": "{{obj}}", "refresh": true }          // what the allocator says it is
+```
+
+Inside a batch a walk is bounded by the *step's* share of the budget rather than by the walker's own
+120s default, so a `refresh` cannot spend the reserve the rollback lives on; a walk cut short still
+reports how much of the pool it covered. Assertions are `contains`, `not_contains`, and `eval` — the
+last compares two MASM expressions, so registers, memory and relations between them are all one
+check. An `eval` step may `capture` its value under a name that later steps interpolate as
+`{{name}}`; a reference that names no earlier capture is refused before anything runs.
 
 **A field this tool does not know is an error, not something to ignore** — the one place in this
 server where that is true. Serde drops unknown fields silently, so `"aways"` for `always` would be a

@@ -1193,14 +1193,6 @@ pub struct SymbolPathArgs {
     pub session_id: Option<String>,
 }
 
-/// Most rows or lines a pool tool will render in one response.
-///
-/// The worker builds the whole reply as a single `String` before it crosses the pipe, so an
-/// unbounded `limit` is a request to allocate a snapshot-sized buffer — hundreds of thousands
-/// of chunks, or ~19k diagnostic lines on an idle machine. Clamping costs a caller nothing
-/// they can act on; a worker killed mid-session costs them the session.
-const MAX_POOL_ROWS: u32 = 2000;
-
 #[derive(Deserialize, JsonSchema)]
 pub struct PoolFindTagArgs {
     /// Pool tag to find: 1..4 ASCII bytes, e.g. "Tgsm". This is the tag as the debugger
@@ -1384,7 +1376,12 @@ pub struct DebugBatchArgs {
     /// verdict; `{"op": "eval", "expr": "@rcx"}` reads a value; `{"op": "read_memory",
     /// "address": "0xfffff8000012c000", "size": 64}` hex-dumps memory — this one takes a *number*
     /// (decimal or `0x`-hex), not an expression, so for `@rsp` or `poi(...)` put an `eval` step in
-    /// front of it and read the capture. Add `"expect"` to assert on the result and `"capture"`
+    /// front of it and read the capture. Three more ask the kernel pool the same questions the
+    /// `pool_*` tools do, because those are allocator walks rather than debugger commands and no
+    /// `command` step can stand in for them: `{"op": "pool_chunk", "address": "{{obj}}"}`,
+    /// `{"op": "pool_find_tag", "tag": "Tgsm", "paged": false}` and `{"op": "pool_census"}`, each
+    /// taking `refresh` (re-walk rather than reuse this session's snapshot) and the last two a
+    /// `limit`. Add `"expect"` to assert on the result and `"capture"`
     /// (on an `eval` step) to bind its value for later steps as `{{name}}`.
     /// The batch stops at the first step that fails or whose assertions do not hold.
     pub steps: Vec<batch::BatchStep>,
@@ -1888,12 +1885,12 @@ impl WindbgServer {
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::Pool(PoolOp::FindTag {
-                    tag: args.tag,
-                    paged: args.paged,
-                    refresh: args.refresh.unwrap_or(false),
-                    limit: args.limit.unwrap_or(64).min(MAX_POOL_ROWS) as usize,
-                }),
+                EngineOp::Pool(PoolOp::find_tag(
+                    args.tag,
+                    args.paged,
+                    args.refresh,
+                    args.limit,
+                )),
             )
             .await;
         engine_result(out)
@@ -1925,10 +1922,7 @@ impl WindbgServer {
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::Pool(PoolOp::Chunk {
-                    address: args.address,
-                    refresh: args.refresh.unwrap_or(false),
-                }),
+                EngineOp::Pool(PoolOp::chunk(args.address, args.refresh)),
             )
             .await;
         engine_result(out)
@@ -1955,11 +1949,7 @@ impl WindbgServer {
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::Pool(PoolOp::Diagnostics {
-                    filter: args.filter,
-                    refresh: args.refresh.unwrap_or(false),
-                    limit: args.limit.unwrap_or(60).min(MAX_POOL_ROWS) as usize,
-                }),
+                EngineOp::Pool(PoolOp::diagnostics(args.filter, args.refresh, args.limit)),
             )
             .await;
         engine_result(out)
@@ -1984,10 +1974,7 @@ impl WindbgServer {
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::Pool(PoolOp::Census {
-                    refresh: args.refresh.unwrap_or(false),
-                    limit: args.limit.unwrap_or(40).min(MAX_POOL_ROWS) as usize,
-                }),
+                EngineOp::Pool(PoolOp::census(args.refresh, args.limit)),
             )
             .await;
         engine_result(out)

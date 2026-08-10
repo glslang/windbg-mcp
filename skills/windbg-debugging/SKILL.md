@@ -50,7 +50,11 @@ the engine process on every path, including a failed assertion and an expired de
 the budget is reserved so it has time to run; the report names the exact failing step, what each
 step changed, whether the rollback completed, and whether the target is left stopped, running or
 gone. Save what you are about to overwrite with an `eval` step's `capture`, and restore it in
-`always` as `{{name}}`.
+`always` as `{{name}}`. A step can also ask the kernel pool what the `pool_*` tools ask —
+`pool_chunk`, `pool_find_tag`, `pool_census` — so "capture the pointer, ask the allocator what it
+is" stays *inside* the transaction instead of splitting it in two; a `refresh` there is bounded by
+the step's share of the batch budget rather than by the walker's own, and says how much of the pool
+it reached.
 
 Two edges to keep in mind. If a step overruns far enough to consume the reserve too, cleanup is
 skipped and the result says `rollback: INCOMPLETE` — believe it rather than the intent. And a

@@ -39,6 +39,7 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::proto::PoolOp;
 use crate::server::{
     EXEC_WAIT_MS, Quotes, changes_debug_target, fmt_addr, parse_eval, reject_command_breakers,
 };
@@ -135,6 +136,20 @@ const FAILED_OUTPUT_CHARS: usize = 8_000;
 /// `execute_command`, so [`Self::Command`] already covers them, and the variants that exist beside
 /// it are the ones a raw command genuinely cannot express as a single unit — a wait for the target
 /// to stop, a run-to verdict, a value this batch can bind a name to.
+///
+/// The pool variants are the same rule reaching its other end. `pool_find_tag`, `pool_chunk` and
+/// `pool_census` are not commands at all — they are win-kexp walks over the allocator's own
+/// descriptors, with no `!pool` text a `command` step could stand in for — so a batch without them
+/// simply cannot ask what a chunk is, which is what the MessageManager workflow found: its
+/// `@chunkt1` sat *inside* the transaction, between a code patch and its restore, so the sequence
+/// could not be expressed with it left out. `pool_diagnostics` is deliberately absent: it explains
+/// a *walk*, not the target, and belongs to the interactive look that follows a batch rather than
+/// to the transaction.
+///
+/// `refresh` is what makes a pool step expensive — it re-walks every committed page — and inside a
+/// batch that walk is bounded by the *step's* share of the budget rather than by win-kexp's own
+/// default, which is longer than most batches. A walk cut short says how much of the pool it
+/// covered, so the answer stays honest; see [`Debuggee::pool`].
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum StepAction {
@@ -169,6 +184,34 @@ pub enum StepAction {
     /// `0x`-hex, so `@rsp` or `poi(@rbx+8)` is one `eval` with a `capture` and then `{{name}}`
     /// here.
     ReadMemory { address: String, size: u32 },
+    /// Identify the pool chunk containing `address` and its neighbours — the `pool_chunk` tool.
+    ///
+    /// The step the transaction shape needs: an `eval` captures a pointer the target just handed
+    /// over, and this asks the allocator what it is. `address` takes the same forms the tool does,
+    /// and a `{{capture}}` is one of them.
+    PoolChunk {
+        address: String,
+        #[serde(default)]
+        refresh: Option<bool>,
+    },
+    /// Every allocated chunk carrying `tag` — the `pool_find_tag` tool.
+    PoolFindTag {
+        tag: String,
+        /// true = paged only, false = nonpaged only, omitted = both.
+        #[serde(default)]
+        paged: Option<bool>,
+        #[serde(default)]
+        refresh: Option<bool>,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
+    /// Per-tag totals across the pool, heaviest first — the `pool_census` tool.
+    PoolCensus {
+        #[serde(default)]
+        refresh: Option<bool>,
+        #[serde(default)]
+        limit: Option<u32>,
+    },
 }
 
 impl StepAction {
@@ -185,6 +228,9 @@ impl StepAction {
             Self::RunTo { .. } => &["address", "timeout_ms"],
             Self::Eval { .. } => &["expr"],
             Self::ReadMemory { .. } => &["address", "size"],
+            Self::PoolChunk { .. } => &["address", "refresh"],
+            Self::PoolFindTag { .. } => &["tag", "paged", "refresh", "limit"],
+            Self::PoolCensus { .. } => &["refresh", "limit"],
         };
         key == "op" || fields.contains(&key)
     }
@@ -197,6 +243,27 @@ impl StepAction {
             Self::RunTo { address, .. } => format!("run to {address}"),
             Self::Eval { expr } => format!("? {expr}"),
             Self::ReadMemory { address, size } => format!("read {size} bytes at {address}"),
+            // A refreshed walk is the expensive half of a pool step and the one that can dominate
+            // a batch's clock, so the report says which kind ran rather than leaving a reader to
+            // wonder where the time went.
+            Self::PoolChunk { address, refresh } => {
+                format!("pool chunk containing {address}{}", walk_kind(*refresh))
+            }
+            Self::PoolFindTag {
+                tag,
+                paged,
+                refresh,
+                ..
+            } => format!(
+                "pool chunks tagged {tag}{}{}",
+                match paged {
+                    Some(true) => " in paged pool",
+                    Some(false) => " in nonpaged pool",
+                    None => "",
+                },
+                walk_kind(*refresh)
+            ),
+            Self::PoolCensus { refresh, .. } => format!("pool census{}", walk_kind(*refresh)),
         }
     }
 
@@ -230,7 +297,40 @@ impl StepAction {
                 address: substitute(address, resolve)?,
                 size: *size,
             },
+            Self::PoolChunk { address, refresh } => Self::PoolChunk {
+                address: substitute(address, resolve)?,
+                refresh: *refresh,
+            },
+            // The tag is substituted too, though no capture can produce a plausible one: a
+            // `{{name}}` left to pass through would be sent to the allocator index as four
+            // literal bytes and answer "no such tag", which is a wrong answer where an
+            // unresolvable reference is meant to be an error.
+            Self::PoolFindTag {
+                tag,
+                paged,
+                refresh,
+                limit,
+            } => Self::PoolFindTag {
+                tag: substitute(tag, resolve)?,
+                paged: *paged,
+                refresh: *refresh,
+                limit: *limit,
+            },
+            Self::PoolCensus { refresh, limit } => Self::PoolCensus {
+                refresh: *refresh,
+                limit: *limit,
+            },
         })
+    }
+}
+
+/// How a pool step's walk is rendered in the report: a fresh walk is worth naming, a cached
+/// lookup is not.
+fn walk_kind(refresh: Option<bool>) -> &'static str {
+    if refresh.unwrap_or(false) {
+        " (fresh walk)"
+    } else {
+        ""
     }
 }
 
@@ -513,11 +613,19 @@ fn validate_operands(step: &BatchStep, where_: &str) -> Result<(), String> {
             .map_err(|e| format!("{where_}: {e}"))
     };
     match &step.action {
-        StepAction::RunTo { address, .. } | StepAction::ReadMemory { address, .. } => {
+        StepAction::RunTo { address, .. }
+        | StepAction::ReadMemory { address, .. }
+        | StepAction::PoolChunk { address, .. } => {
             operand("address", address)?;
         }
         StepAction::Eval { expr } => operand("expr", expr)?,
-        StepAction::Command { .. } | StepAction::Resume { .. } => {}
+        // A pool `tag` is exempt, and deliberately: it is 1..4 arbitrary ASCII bytes handed to an
+        // index lookup, never interpolated into a command, so there is no command to break — and
+        // refusing a quote here would refuse a tag the `pool_find_tag` tool itself accepts.
+        StepAction::Command { .. }
+        | StepAction::Resume { .. }
+        | StepAction::PoolFindTag { .. }
+        | StepAction::PoolCensus { .. } => {}
     }
     for check in &step.expect {
         if let Check::Eval { expr, equals } = check {
@@ -618,7 +726,13 @@ fn action_mutation(action: &StepAction) -> Option<String> {
             _ => "execution".to_string(),
         }),
         StepAction::RunTo { .. } => Some("execution".to_string()),
-        StepAction::Eval { .. } | StepAction::ReadMemory { .. } => None,
+        // A pool query reads the allocator's own descriptors and writes nothing, however long it
+        // takes to do it.
+        StepAction::Eval { .. }
+        | StepAction::ReadMemory { .. }
+        | StepAction::PoolChunk { .. }
+        | StepAction::PoolFindTag { .. }
+        | StepAction::PoolCensus { .. } => None,
     }
 }
 
@@ -635,6 +749,16 @@ pub trait Debuggee {
     fn run_to(&mut self, address: &str, timeout_ms: u32) -> Result<String, String>;
     /// Hex-dump `size` bytes at `address`.
     fn read_memory(&mut self, address: &str, size: u32) -> Result<String, String>;
+    /// Answer a pool question — the one capability here that is not a debugger command at all,
+    /// but a walk over the allocator's own descriptors.
+    ///
+    /// `budget_ms` bounds *the walk*, not a command, and that is why it is passed rather than left
+    /// to win-kexp's own default: that default (120s) is longer than a whole ordinary batch, so a
+    /// refreshed pool step taking it could overrun the deadline the rollback depends on — and with
+    /// it the bound the worker advertises to a teardown, which is what stops a worker being
+    /// terminated mid-transaction. A walk stopped by the budget reports how much of the pool it
+    /// reached, so a short step degrades to a partial answer that says so rather than to a failure.
+    fn pool(&mut self, query: &PoolOp, budget_ms: u32) -> Result<String, String>;
     /// How long this batch has been running.
     fn elapsed(&self) -> Duration;
     /// Whether something outside the batch has asked it to stop early and roll back — a client
@@ -973,6 +1097,23 @@ fn run_step(
         } => d.run_to(address, wait_ms(*timeout_ms)),
         StepAction::Eval { expr } => d.command(&format!("? {expr}"), budget_ms),
         StepAction::ReadMemory { address, size } => d.read_memory(address, *size),
+        // Through the same constructors the pool *tools* use, so a step and a tool cannot drift
+        // apart on what a default or a cap means — see [`PoolOp`].
+        StepAction::PoolChunk { address, refresh } => {
+            d.pool(&PoolOp::chunk(address.clone(), *refresh), budget_ms)
+        }
+        StepAction::PoolFindTag {
+            tag,
+            paged,
+            refresh,
+            limit,
+        } => d.pool(
+            &PoolOp::find_tag(tag.clone(), *paged, *refresh, *limit),
+            budget_ms,
+        ),
+        StepAction::PoolCensus { refresh, limit } => {
+            d.pool(&PoolOp::census(*refresh, *limit), budget_ms)
+        }
     });
 
     let output = match ran {
@@ -1477,6 +1618,12 @@ mod tests {
         }
         fn read_memory(&mut self, address: &str, size: u32) -> Result<String, String> {
             self.answer(&format!("read {size} at {address}"))
+        }
+        fn pool(&mut self, query: &PoolOp, budget_ms: u32) -> Result<String, String> {
+            // The budget is part of the call text, not swallowed: a pool step's whole hazard is
+            // taking longer than the batch can afford, so a test that could not see what the walk
+            // was armed with could not tell the fix from the bug.
+            self.answer(&format!("pool {query:?} within {budget_ms}ms"))
         }
         fn elapsed(&self) -> Duration {
             self.clock
@@ -2162,6 +2309,124 @@ mod tests {
         );
     }
 
+    // ---- pool steps ---------------------------------------------------------
+
+    /// `@chunkt1`, the workflow verb these variants were added for: capture the pointer the target
+    /// is holding, then ask the allocator what it is — inside the transaction, between a patch and
+    /// its restore, which is where the CTF client had to do it and where a batch previously could
+    /// not follow.
+    #[test]
+    fn a_captured_pointer_becomes_a_pool_question() {
+        let mut d = stopped()
+            .on("? @$t1", Ok("Evaluate expression: 1 = ffffc00f`6ec02f90"))
+            .on(
+                "pool Chunk",
+                Ok("ffffc00f`6ec02f90 is 0x0 byte(s) into a 0x70-byte chunk tagged `Tgsm`"),
+            );
+        let batch = op(
+            vec![
+                BatchStep {
+                    capture: Some("reclaimed".to_string()),
+                    ..step(StepAction::Eval {
+                        expr: "@$t1".to_string(),
+                    })
+                },
+                step(StepAction::PoolChunk {
+                    address: "{{reclaimed}}".to_string(),
+                    refresh: Some(true),
+                }),
+            ],
+            vec![],
+        );
+
+        let report = run(&mut d, &batch, BUDGET);
+
+        assert!(report.committed(), "{}", render(&report));
+        // The capture reached the *query*, not a command line: this step never becomes text the
+        // debugger parses, which is the whole reason it exists.
+        assert!(
+            d.ran("address: \"0xffffc00f6ec02f90\""),
+            "the captured pointer must arrive as the query's address: {:?}",
+            d.calls
+        );
+        assert!(
+            d.ran("refresh: true"),
+            "the step asked for a fresh walk: {:?}",
+            d.calls
+        );
+        let text = render(&report);
+        assert!(
+            text.contains("pool chunk containing 0xffffc00f6ec02f90 (fresh walk)"),
+            "{text}"
+        );
+        assert!(text.contains("tagged `Tgsm`"), "{text}");
+        // A walk reads the allocator's descriptors and writes nothing, so a batch of pool queries
+        // must not be reported as having changed the target.
+        assert!(text.contains("mutations: none recognised"), "{text}");
+    }
+
+    /// A pool step is armed with what the *batch* has left, not with the walker's own default.
+    ///
+    /// The one hazard these variants introduce: a refreshed walk is every committed page over the
+    /// KD wire and win-kexp bounds it at 120s, which is longer than an ordinary batch's whole
+    /// budget. A step that took that default could spend the reserve the rollback lives on, and
+    /// overrun the bound the worker advertises to a teardown — which is a worker terminated
+    /// mid-transaction, the failure the `always` block exists to prevent, arriving through the one
+    /// step that is not a command.
+    #[test]
+    fn a_pool_step_is_armed_with_what_the_batch_has_left() {
+        let mut d = stopped()
+            .slow("first", Ok(""), Duration::from_secs(25))
+            .on("pool Census", Ok("3 distinct tag(s) allocated"));
+        let batch = op(
+            vec![
+                cmd("first step"),
+                step(StepAction::PoolCensus {
+                    refresh: Some(true),
+                    limit: None,
+                }),
+            ],
+            vec![],
+        );
+
+        // 60s budget, 30s reserved → the steps have 30s, and the first one spends 25 of them.
+        let report = run(&mut d, &batch, BUDGET);
+
+        assert!(report.committed(), "{}", render(&report));
+        assert!(
+            d.ran("within 5000ms"),
+            "the walk must be bounded by what the batch has left, not by the walker's default: \
+             {:?}",
+            d.calls
+        );
+        // And the defaults are the pool *tools'* defaults, because both come from the same
+        // constructor: a census prints 40 rows unless asked otherwise.
+        assert!(d.ran("limit: 40"), "{:?}", d.calls);
+    }
+
+    /// A `{{name}}` is resolved in a pool tag as well as in an address — no field of a step is a
+    /// place where an unresolvable reference quietly becomes literal text. Here that would be four
+    /// bytes the allocator index has never seen, answered as "no such tag": a wrong answer, where
+    /// every other unbound reference is an error.
+    #[test]
+    fn an_unbound_reference_in_a_pool_step_is_refused_in_either_field() {
+        for action in [
+            StepAction::PoolFindTag {
+                tag: "{{nope}}".to_string(),
+                paged: None,
+                refresh: None,
+                limit: None,
+            },
+            StepAction::PoolChunk {
+                address: "{{nope}}".to_string(),
+                refresh: None,
+            },
+        ] {
+            let why = validate(&[step(action)], &[]).unwrap_err();
+            assert!(why.contains("`{{nope}}` is not bound"), "{why}");
+        }
+    }
+
     // ---- validation --------------------------------------------------------
 
     /// The catch-all must take *only* what the schema does not name. If serde routed a variant's
@@ -2178,6 +2443,12 @@ mod tests {
             serde_json::json!({"op": "eval", "expr": "@rcx", "capture": "x"}),
             serde_json::json!({"op": "read_memory", "address": "0x1000", "size": 64}),
             serde_json::json!({"op": "resume", "command": "g"}),
+            serde_json::json!({"op": "pool_chunk", "address": "0xffffc00f6ec02f90"}),
+            serde_json::json!({"op": "pool_chunk", "address": "{{obj}}", "refresh": true}),
+            serde_json::json!({
+                "op": "pool_find_tag", "tag": "Tgsm", "paged": false, "refresh": true, "limit": 32
+            }),
+            serde_json::json!({"op": "pool_census", "refresh": true, "limit": 200}),
         ] {
             let step: BatchStep = serde_json::from_value(json.clone()).expect("valid step");
             assert!(
@@ -2382,10 +2653,12 @@ mod tests {
     /// (`@asserttarget`), a structure assertion over three memory words (`@assertfake`), code
     /// patches and their restores, and `bc *`.
     ///
-    /// Two of the script's verbs are **not** here and cannot be: `@chunkt1` and `@census` call the
-    /// `pool_chunk`/`pool_census` tools, and a batch step cannot reach a typed tool that is not a
-    /// debugger command. Nine of the workflow's 1,681 steps were pool queries; the other 1,672 are
-    /// the shapes below.
+    /// The script's two pool verbs are here as well, and they are why the pool steps exist:
+    /// `@chunkt1` read the pseudo-register `@$t1` with `execute`, regex-scraped the value out of
+    /// the debugger's answer, and passed it to `pool_chunk` — a round trip through the client
+    /// that a `capture` plus a `pool_chunk` step now says in two lines. It sat *inside* the
+    /// transaction, between a code patch and its restore, so a batch that could not express it
+    /// would have had to drop it or split the transaction in half.
     fn messagemanager_sequence() -> (Vec<BatchStep>, Vec<BatchStep>) {
         // The verdict check the script open-coded as `if ($verdict -notmatch 'VERDICT: HIT')`.
         let run_to = |address: &str, ms: u32| BatchStep {
@@ -2429,6 +2702,24 @@ mod tests {
             cmd("bc *"),
             cmd("eb @$t7+1f00 f3 90 eb fc e9 27 f3 ff ff; eb @$t7+1230 e9 cb 0c 00 00"),
             run_to("fffff80615951210", 90_000),
+            // `@chunkt1`, in the two steps it always was: the value the target is holding, and
+            // the allocator's account of it. `refresh`, because the target has run since the
+            // last walk — which is the case the flag exists for.
+            BatchStep {
+                capture: Some("reclaimed".to_string()),
+                ..step(StepAction::Eval {
+                    expr: "@$t1".to_string(),
+                })
+            },
+            step(StepAction::PoolChunk {
+                address: "{{reclaimed}}".to_string(),
+                refresh: Some(true),
+            }),
+            // `@census`, with the limit the script settled on.
+            step(StepAction::PoolCensus {
+                refresh: Some(true),
+                limit: Some(200),
+            }),
             cmd("bc *"),
             cmd("eb @$t7+1230 48 89 5c 24 08"),
             run_to("fffff80615951560", 30_000),
@@ -2473,7 +2764,7 @@ mod tests {
     #[test]
     fn the_messagemanager_sequence_is_a_valid_batch() {
         let (steps, always) = messagemanager_sequence();
-        assert_eq!(steps.len(), 25);
+        assert_eq!(steps.len(), 28);
         validate(&steps, &always).expect("the sequence the tool was filed for must validate");
         // It patches code and clears breakpoints, so it must not be mistaken for inspection.
         assert!(
@@ -2483,6 +2774,15 @@ mod tests {
                 .any(|m| m.contains("memory")),
             "the code patches must be recognised as mutations"
         );
+        // And the pool queries in the middle of it change nothing, however long they take.
+        for step in &steps {
+            if matches!(
+                step.action,
+                StepAction::PoolChunk { .. } | StepAction::PoolCensus { .. }
+            ) {
+                assert_eq!(action_mutation(&step.action), None, "{:?}", step.action);
+            }
+        }
     }
 
     /// The failure the client hand-rolled a rollback for: the race breakpoint fires for a
@@ -2520,7 +2820,7 @@ mod tests {
             d.calls
         );
         let text = render(&report);
-        assert!(text.contains("BATCH: FAILED at step 3 of 25"), "{text}");
+        assert!(text.contains("BATCH: FAILED at step 3 of 28"), "{text}");
         assert!(text.contains("ffffb08e`e358c080"), "{text}");
         assert!(text.contains("ffffb08e`e358d100"), "{text}");
     }
