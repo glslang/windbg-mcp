@@ -330,7 +330,14 @@ pub struct Session {
     /// How long this session's worker said a transaction it was told to unwind still needs, or
     /// `None` while it has said nothing. Set from [`WorkerMessage::RollingBack`] and read by the
     /// teardown whose own request provoked it; see [`Sessions::release`].
-    unwinding: Mutex<Option<Duration>>,
+    ///
+    /// **Written by [`read_messages`]'s thread**, where the bytes arrive, rather than by [`reader`]
+    /// where every other message is handled. That is what the teardown's decision rests on: it
+    /// reads this once, when its grace expires, and killing a worker that is mid-rollback because
+    /// the runtime had not yet got round to dispatching the message would be the exact outcome the
+    /// message exists to prevent. Recorded on arrival, "the worker said so in time" means what it
+    /// says — it cannot turn on how busy this process was.
+    unwinding: Arc<Mutex<Option<Duration>>>,
     child: Mutex<Option<Child>>,
 }
 
@@ -1372,17 +1379,21 @@ impl Sessions {
         // Drained from the start, before the handshake: a worker that prints during startup must
         // not be able to block on a full pipe on its way to `Ready`.
         tokio::spawn(log_stray_output(id.to_string(), stdout));
-        let mut messages = match read_messages(id.to_string(), channel.messages) {
-            Ok(messages) => messages,
-            Err(e) => {
-                // Nothing has been asked of this worker yet, so it holds no target: killing it is
-                // the whole teardown.
-                let _ = child.start_kill();
-                return Err(format!(
-                    "could not start a reader for an engine worker's messages: {e}"
-                ));
-            }
-        };
+        // Created before the thread that records into it, and handed to the session below: see
+        // [`Session::unwinding`] for why it is written there rather than in `reader`.
+        let unwinding: Arc<Mutex<Option<Duration>>> = Arc::new(Mutex::new(None));
+        let mut messages =
+            match read_messages(id.to_string(), channel.messages, Arc::clone(&unwinding)) {
+                Ok(messages) => messages,
+                Err(e) => {
+                    // Nothing has been asked of this worker yet, so it holds no target: killing it is
+                    // the whole teardown.
+                    let _ = child.start_kill();
+                    return Err(format!(
+                        "could not start a reader for an engine worker's messages: {e}"
+                    ));
+                }
+            };
 
         // Nothing is registered until the worker says its engine exists. A session that cannot
         // debug is worse than no session: it would accept calls and fail every one.
@@ -1425,7 +1436,7 @@ impl Sessions {
             delivered: AtomicBool::new(false),
             phase: AtomicU8::new(OpenPhase::Started as u8),
             released: AtomicBool::new(false),
-            unwinding: Mutex::new(None),
+            unwinding,
             child: Mutex::new(Some(child)),
         });
 
@@ -1787,6 +1798,7 @@ fn spawn_worker(exe: &Path) -> std::io::Result<(Child, Channel)> {
 fn read_messages(
     id: String,
     pipe: PipeReader,
+    unwinding: Arc<Mutex<Option<Duration>>>,
 ) -> std::io::Result<mpsc::UnboundedReceiver<WorkerMessage>> {
     let (tx, rx) = mpsc::unbounded_channel();
     std::thread::Builder::new()
@@ -1799,6 +1811,13 @@ fn read_messages(
                 }
                 match serde_json::from_str::<WorkerMessage>(&line) {
                     Ok(message) => {
+                        // Recorded here, before the message is handed on, because a teardown reads
+                        // it against a deadline — see [`Session::unwinding`]. Everything this
+                        // message is *reported* as still happens in `reader`.
+                        if let WorkerMessage::RollingBack { within_ms, .. } = &message {
+                            *unwinding.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(Duration::from_millis(u64::from(*within_ms)));
+                        }
                         if tx.send(message).is_err() {
                             break; // nobody is left to route it to
                         }
@@ -2008,12 +2027,11 @@ async fn reader(
                 session.reach(OpenPhase::Opened);
                 promote_opened(&session);
             }
-            // Recorded while the teardown that provoked it is still waiting on that job's `Done`,
-            // which is the whole point of it being a milestone: the wait consults this only after
-            // its own grace runs out, by which time this store is long since visible.
+            // Already recorded by the thread that read it — see [`Session::unwinding`] — so this
+            // arm only reports it. Nothing here is on the teardown's critical path, which is the
+            // whole reason the store is not here.
             WorkerMessage::RollingBack { id, within_ms } => {
                 let within = Duration::from_millis(u64::from(within_ms));
-                *session.unwinding.lock().unwrap_or_else(|e| e.into_inner()) = Some(within);
                 tracing::info!(
                     "session {}: job {id} found a transaction in flight and told it to roll back; \
                      it needs up to {within:?}",
@@ -2104,8 +2122,12 @@ mod tests {
              channel did with it"
         );
 
-        let mut messages =
-            read_messages("sess-stand-in".to_string(), channel.messages).expect("read messages");
+        let mut messages = read_messages(
+            "sess-stand-in".to_string(),
+            channel.messages,
+            Arc::new(Mutex::new(None)),
+        )
+        .expect("read messages");
         let heard = tokio::time::timeout(Duration::from_secs(10), messages.recv()).await;
         assert!(
             matches!(heard, Ok(None)),
@@ -2387,7 +2409,7 @@ mod tests {
             delivered: AtomicBool::new(true),
             phase: AtomicU8::new(phase as u8),
             released: AtomicBool::new(false),
-            unwinding: Mutex::new(None),
+            unwinding: Arc::new(Mutex::new(None)),
             child: Mutex::new(None),
         })
     }
@@ -2777,6 +2799,44 @@ mod tests {
     fn a_session_with_nothing_to_unwind_asks_for_no_extension() {
         let idle = dormant("sess-idle", SessionState::Open);
         assert_eq!(idle.unwinding_for(), None);
+    }
+
+    /// A rollback milestone is recorded by the thread that **reads** it, before it is handed on to
+    /// be dispatched at all.
+    ///
+    /// That ordering is the whole guarantee. A teardown reads this once, when its grace expires,
+    /// and then kills the worker; if the store happened where the message is *handled* instead, the
+    /// read could miss a milestone that arrived seconds earlier but had not been dispatched — and
+    /// the worker would be terminated mid-rollback for being unlucky with the runtime's scheduling.
+    /// Receiving the message here is the synchronisation point: the value has to be visible to
+    /// anyone who could observe the message at all.
+    #[tokio::test]
+    async fn a_rollback_milestone_is_recorded_where_it_arrives() {
+        let (arriving, mut worker) = std::io::pipe().expect("a pipe to stand in for a worker's");
+        let unwinding: Arc<Mutex<Option<Duration>>> = Arc::new(Mutex::new(None));
+        let mut messages = read_messages("sess-x".to_string(), arriving, Arc::clone(&unwinding))
+            .expect("start a reader");
+
+        let line = serde_json::to_string(&WorkerMessage::RollingBack {
+            id: 7,
+            within_ms: 90_000,
+        })
+        .expect("encode a milestone");
+        writeln!(worker, "{line}").expect("write it as a worker would");
+
+        let dispatched = tokio::time::timeout(Duration::from_secs(10), messages.recv())
+            .await
+            .expect("the milestone reached the dispatcher within 10s");
+        assert!(matches!(
+            dispatched,
+            Some(WorkerMessage::RollingBack { id: 7, .. })
+        ));
+        assert_eq!(
+            *unwinding.lock().unwrap(),
+            Some(Duration::from_millis(90_000)),
+            "the milestone was dispatched without having been recorded, so a teardown reading it \
+             on a deadline could miss one that had already arrived"
+        );
     }
 
     /// The gap `admit` exists to close: a worker that finishes its handshake after the client has
