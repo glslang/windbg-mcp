@@ -102,6 +102,16 @@ fn unwind_slice(within: Duration, left: Duration) -> Duration {
     within.min(left).min(UNWIND_RECHECK)
 }
 
+/// The last wait a teardown owes once the transaction it was waiting on has ended: the ordinary
+/// grace, for the release that could not start until now.
+///
+/// `None` when there was no transaction — an ordinary teardown is not lengthened by a mechanism it
+/// never used — and none when the teardown's own patience is spent, so the total stays bounded by
+/// what [`Sessions::call_as`] started with.
+fn release_handoff(base: Duration, left: Duration, unwound: bool) -> Option<Duration> {
+    (unwound && !left.is_zero()).then(|| base.min(left))
+}
+
 /// `CREATE_NEW_PROCESS_GROUP`, which every worker is spawned with.
 ///
 /// An interactive Ctrl+C is delivered to *every* process attached to the console, and a child
@@ -877,12 +887,28 @@ impl Sessions {
         // neither.
         if wait == Wait::UntilUnwound {
             let mut left = self.call_timeout;
+            let mut unwound = false;
             while let Some(within) = session.unwinding_for().filter(|_| !left.is_zero()) {
+                unwound = true;
                 let slice = unwind_slice(within, left);
                 if let Ok(reply) = tokio::time::timeout(slice, &mut rx).await {
                     return settled(reply);
                 }
                 left -= slice;
+            }
+            // The transaction is over — it either said so or ran out the bound it promised — and
+            // the release has not started until this moment, because it was queued behind it. So
+            // it gets the grace it would have had if there had been no transaction at all, rather
+            // than whatever the batch happened to leave over.
+            //
+            // A guarantee, where the worker's own retraction is only an optimisation: that message
+            // is emitted as the batch ends, so a batch that runs to its bound emits it at the very
+            // instant this loop stops looking. Resting on it arriving first would be resting on
+            // pipe scheduling, and losing costs a worker killed as its release begins.
+            if let Some(handoff) = release_handoff(budget, left, unwound)
+                && let Ok(reply) = tokio::time::timeout(handoff, &mut rx).await
+            {
+                return settled(reply);
             }
         }
         // A timeout is an operational outcome, not broken plumbing: the target may simply still be
@@ -2810,6 +2836,30 @@ mod tests {
         assert_eq!(unwind_slice(sliver, cap), sliver);
         // And the teardown's own patience bounds it, whatever the worker says.
         assert_eq!(unwind_slice(Duration::from_secs(110), sliver), sliver);
+    }
+
+    /// A release that could not start until the transaction ended gets the ordinary grace from
+    /// *that* moment, rather than whatever the batch happened to leave over.
+    ///
+    /// The worker retracts its promise as the batch ends, which usually arrives first and makes
+    /// this moot — but a batch that runs to the bound it advertised emits that retraction at the
+    /// very instant the wait above stops looking for one. Resting on it winning that race would be
+    /// resting on pipe scheduling, and losing means a worker killed as its release begins, which
+    /// for a live kernel is the halted target this whole path exists to avoid.
+    #[test]
+    fn a_release_that_waited_for_a_transaction_still_gets_its_own_grace() {
+        let base = SHUTDOWN_RELEASE_TIMEOUT;
+        let plenty = Duration::from_secs(300);
+        assert_eq!(release_handoff(base, plenty, true), Some(base));
+
+        // A teardown that never waited on a transaction is not lengthened by a mechanism it never
+        // used: this is what keeps an ordinary disconnect costing what it always did.
+        assert_eq!(release_handoff(base, plenty, false), None);
+
+        // And the teardown's own patience still bounds the total.
+        let sliver = base / 4;
+        assert_eq!(release_handoff(base, sliver, true), Some(sliver));
+        assert_eq!(release_handoff(base, Duration::ZERO, true), None);
     }
 
     /// A session that has said nothing about a transaction is never waited on for one — which is
