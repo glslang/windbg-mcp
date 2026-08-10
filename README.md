@@ -56,8 +56,9 @@ process. Two things follow, and they are why it is built this way:
   lands in the same place. Workers never outlive the connection: a disconnect asks every session
   to release its target — all of them concurrently — waits **five seconds**, and terminates only
   the workers that have not finished by then; a worker also exits on its own once its request
-  channel closes. A session running a `debug_batch` is first told to abandon it, and then gets the
-  rollback's own reserve on top of that grace — the only case where a disconnect waits longer.
+  channel closes. A session running a `debug_batch` is first told to abandon it, and then gets as
+  long as that batch says it still needs on top of that grace — the only case where a disconnect
+  waits longer, and never longer than the batch's own budget allowed.
   Which of those two endings a session gets matters for a live kernel. DbgEng leaves a
   detached-but-halted kernel *frozen*, so a worker that releases its target leaves the machine
   running, while a worker that is terminated leaves it stopped. Five seconds is enough for an
@@ -449,11 +450,13 @@ Four honest limits, none of them hidden in the report:
 - Against a **call timeout** the guarantee is arithmetic: the batch budget is clamped so the
   rollback finishes and the report is written before the caller gives up. Against a **teardown** —
   `end_session`, or a client disconnect, both of which release the target — it is a signal instead.
-  The batch is told to stop, does so at its next step, runs `always`, and the teardown holds its
-  grace open for exactly the reserve that rollback is allowed to spend. What the signal cannot do is
-  reach a step already inside the debugger: a batch of long steps still waits for the current one,
-  and one long enough to outlast the grace is still terminated mid-transaction. Neither can it undo
-  what a batch has not recorded — the `always` block is still the only thing that puts anything back.
+  The batch is told to stop, does so at its next step, runs `always`, and the teardown waits: the
+  worker answers the signal with how long that batch may still need, so the wait covers the step in
+  flight as well as the rollback. That figure is the batch's own remaining budget, which was already
+  clamped to the caller's patience, so a teardown can never wait longer than the batch could have
+  run anyway. What the signal cannot do is *shorten* a step already inside the debugger, so a batch
+  of long steps stops at the end of the current one rather than where it stands — and it cannot undo
+  what the batch never recorded, since `always` is still the only thing that puts anything back.
 
 ### Error reporting
 

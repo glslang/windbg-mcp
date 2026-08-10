@@ -55,8 +55,9 @@ gone. Save what you are about to overwrite with an `eval` step's `capture`, and 
 Two edges to keep in mind. If a step overruns far enough to consume the reserve too, cleanup is
 skipped and the result says `rollback: INCOMPLETE` — believe it rather than the intent. And a
 teardown while the batch runs — `end_session`, or a client disconnect — stops it at its **next**
-step and rolls it back first, reported as `BATCH: ABANDONED`; it cannot cut a step already inside
-the debugger short, so a batch built from long steps still waits out the one it is in.
+step and rolls it back first, reported as `BATCH: ABANDONED`; it cannot cut short a step already
+inside the debugger, so a batch built from long steps waits out the one it is in before it unwinds
+(the teardown waits with it).
 
 ## Cross-cutting gotchas (apply to every workflow)
 

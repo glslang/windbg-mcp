@@ -47,8 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   timeout: `end_session` and a client disconnect both release the target, and the op that does so
   queues *behind* the batch, so the grace used to expire with the transaction still open and the
   worker was terminated mid-patch. The teardown now signals first — the batch stops at its next step,
-  runs `always`, and reports `BATCH: ABANDONED` — and holds its grace open for that session by the
-  rollback's own reserve. The signal is answered by the worker's *request reader*, not its engine
+  runs `always`, and reports `BATCH: ABANDONED` — and then waits for it: the worker answers the
+  signal with **how long that batch may still need**, so the grace covers the step already inside
+  DbgEng as well as the rollback behind it. That figure is the batch's own remaining budget, which
+  was already clamped to the caller's patience, so a teardown never waits longer than the batch
+  could have run anyway. The signal is answered by the worker's *request reader*, not its engine
   thread, because the engine thread is the one inside the batch; it is skipped entirely when a worker
   owes no reply, so an ordinary disconnect costs exactly what it always did. A batch that reaches the
   engine *after* the signal does not start at all, which is the same "nothing ran, resubmitting is
@@ -57,8 +60,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Two edges are reported rather than papered over. The reserve buys the rollback *time*, not a
   guarantee: a step that overruns far enough to consume the reserve as well leaves cleanup with no
   budget, and the result then says `rollback: INCOMPLETE` and names each step that never started.
-  And no signal reaches a step already inside DbgEng, so a batch built from long steps still waits
-  out the one it is in — a step longer than the grace is still terminated mid-transaction.
+  And no signal *shortens* a step already inside DbgEng, so a batch built from long steps unwinds
+  only once the current step ends — the teardown waits that out rather than cutting it off, but a
+  step that ignores its own watchdog is still terminated mid-transaction.
 
   The result names every step that ran, the exact failing one, what each step changed, whether the
   rollback completed (reported *beside* the original failure, never instead of it), and whether the

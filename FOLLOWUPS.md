@@ -413,21 +413,25 @@ answered where it is read. It sets a flag `batch::run` checks between steps; the
 runs `always`, and reports `BATCH: ABANDONED`.
 
 What made the grace conditional without the supervisor tracking op identity: the worker answers the
-signal with `WorkerMessage::RollingBack` — a milestone, so it rides *ahead* of the reply on the same
-ordered channel and the flag is set by the time the call returns — and `engine::release_grace` adds
-`batch::ROLLBACK_RESERVE` for that session only. An ordinary disconnect is untouched, and not merely
-by arithmetic: the signal is skipped entirely when the worker owes no reply. A batch reaching the
-engine *after* the signal does not start, which is the same "nothing ran, resubmitting is safe"
+signal with `WorkerMessage::RollingBack { within_ms }` — a milestone, so it rides *ahead* of the
+reply on the same ordered channel and the figure is stored by the time the call returns — and
+`engine::release_grace` adds it for that session only. `within_ms` is the batch's own remaining
+budget, so the grace covers the step in flight as well as the rollback; sizing it from the reserve
+instead (the first cut, caught in review) expires inside a long step and terminates the worker
+mid-patch, which is the same failure one step later. An ordinary disconnect is untouched, and not
+merely by arithmetic: the signal is skipped entirely when the worker owes no reply. A batch reaching
+the engine *after* the signal does not start, which is the same "nothing ran, resubmitting is safe"
 answer as an unaffordable budget, and the worker's own EOF path sets the flag too, so a supervisor
 killed outright still gets the rollback rather than a truncated transaction.
 
-- **What is still true, and now documented as the whole of the boundary:** no signal reaches a step
-  already inside DbgEng, so a batch stops at its *next* step. One step longer than the grace is
-  still terminated mid-transaction. That is item 7 (`SetInterrupt` bound to job identity), and it is
-  the only part of this that needs it.
-- **Proof:** `src/batch.rs` unit-tests the executor's two new behaviours (stop and roll back; the
-  rollback held to the reserve rather than to a budget nobody is waiting out), `src/worker.rs` pins
-  the flag pairing that makes "a batch runs while the teardown thinks nothing is running"
-  unreachable, and the dump tier drives both teardowns end to end — the disconnect one asserting
-  against a file the rollback wrote, because by then there is no client, supervisor or worker left
-  to ask.
+- **What is still true, and now documented as the whole of the boundary:** no signal *shortens* a
+  step already inside DbgEng, so a batch stops at its *next* step. The teardown waits that step out
+  rather than cutting it off, so the cost is latency rather than a lost rollback — but a step that
+  outlives its own watchdog is still terminated mid-transaction. Shortening it is item 7
+  (`SetInterrupt` bound to job identity), and that is the only part of this that needs it.
+- **Proof:** `src/batch.rs` unit-tests the executor's two new behaviours (stop and roll back; and
+  the rollback keeping the same budget every other path gets, whichever step the signal landed in),
+  `src/worker.rs` pins the pairing that makes "a batch runs while the teardown thinks nothing is
+  running" unreachable and the remaining-budget figure the grace is sized from, and the dump tier
+  drives both teardowns end to end — the disconnect one asserting against a file the rollback wrote,
+  because by then there is no client, supervisor or worker left to ask.
