@@ -88,6 +88,15 @@ caller's patience already, and only the worker can measure it. The reserve then 
 what it always was — how much of the budget is held back for `always` — with nothing shortened to
 fit a teardown.
 
+Three properties keep that promise honest, and each of them was a defect first. The figure is
+**advertised with the overrun the executor is allowed** (`batch::OVERRUN_ALLOWANCE`): a budget
+bounds what a batch may *start*, and anything started just inside it still gets a watchdog floor, so
+the bare budget is not a bound the worker can keep. It is stored as an **instant, not an interval**,
+so it decays instead of being owed in full whenever it happens to be read. And the teardown
+**re-reads it** rather than committing to one extension, because a batch that finishes early
+retracts its bound to what the release still needs — a promise revised downwards is invisible to a
+wait that already committed to the whole of the old one.
+
 A session with nothing to unwind says nothing and costs exactly what it always did, so an ordinary
 disconnect is untouched. What none of this can do is *shorten* a step already inside DbgEng — that
 is `SetInterrupt` bound to job identity, FOLLOWUPS item 7 — so a batch stops at its next step

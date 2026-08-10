@@ -225,14 +225,15 @@ impl BatchSignal {
         state.told_by.take().map(|id| (id, RELEASE_STILL_NEEDS))
     }
 
-    /// Claims the engine thread for a batch that must be done within `budget`, for as long as the
-    /// guard lives — or refuses, when a teardown has already been through.
+    /// Claims the engine thread for a batch that will be done by `bound` — everything it may start
+    /// plus everything that may still be finishing — for as long as the guard lives, or refuses
+    /// when a teardown has already been through.
     ///
     /// Checking and publishing under the **one** lock acquisition is what keeps a refused batch
     /// from ever being visible: published first and withdrawn after, there is a window in which a
     /// second teardown reads a whole batch budget for a batch that will not run, and waits it out
     /// before killing a worker that is doing nothing.
-    fn enter(&self, budget: Duration) -> Option<BatchGuard<'_>> {
+    fn enter(&self, bound: Duration) -> Option<BatchGuard<'_>> {
         let mut state = self.state();
         // Under the lock, which is what pairs it with [`Self::abandon`]: that one stores before it
         // takes this lock, so a teardown that got here first is visible to this load, and a batch
@@ -240,7 +241,7 @@ impl BatchSignal {
         if self.abandon.load(Ordering::SeqCst) {
             return None;
         }
-        state.finish_by = Some(Instant::now() + budget);
+        state.finish_by = Some(Instant::now() + bound);
         Some(BatchGuard { signal: self })
     }
 }
@@ -898,7 +899,12 @@ fn run_batch(e: &DebugEngine, op: BatchOp, queued: Duration) -> Result<String, S
     // has to be told how long it may still run, and that is not known until the budget is. From
     // here an abandon signal either finds this batch or is found by it — never neither. See
     // [`BatchSignal::abandon`].
-    let Some(_running) = BATCH.enter(budget) else {
+    //
+    // What is advertised is the budget **plus what the executor is allowed to overrun it by**: the
+    // budget bounds what a batch may start, and an operation started a moment before it still gets
+    // a watchdog floor. Advertising the bare budget would have a teardown terminate this worker
+    // while the last restore was still running — see [`batch::OVERRUN_ALLOWANCE`].
+    let Some(_running) = BATCH.enter(budget + batch::OVERRUN_ALLOWANCE) else {
         // The same answer as an unaffordable budget above, and for the same reason: nothing ran, so
         // there is nothing to undo and resubmitting is safe. This is the queue-wait case — the
         // teardown that set the flag arrived while this batch was still behind other work.

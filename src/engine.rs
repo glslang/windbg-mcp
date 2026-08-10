@@ -81,25 +81,25 @@ const END_SESSION_TIMEOUT: Duration = Duration::from_secs(20);
 /// rather than the cost per session.
 const SHUTDOWN_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How much longer a teardown waits after its grace expires, when the worker has said it is
-/// unwinding a transaction and how long that still needs.
+/// How long a teardown commits to before looking at the worker's promise again.
 ///
-/// **Not a number chosen to look generous.** `within` is the batch's own remaining budget, measured
-/// by the process running it, and it covers the step in flight as well as the rollback — a batch is
-/// told to stop at its *next* step, so an extension sized for the rollback alone expires mid-step
-/// and terminates the worker with the patch still applied, which is the failure this whole path
-/// exists to remove.
+/// A promise can be **revised downwards**: a batch that finishes early retracts its bound to what
+/// the release still needs. A wait that committed to the whole of it in one `timeout` could not see
+/// that — the retraction would update a value nobody reads again, and a disconnect would sit out the
+/// rest of a batch budget with no transaction left to protect. So no single wait is longer than
+/// this, and the promise is re-read between them.
 ///
-/// That it is an *extension*, taken only after the ordinary grace has run out and only for a
-/// session that asked, is what keeps it affordable: a disconnect stays quick for the case the grace
-/// was tuned for — a parked kernel attach that will never unwind, where every extra second is spent
-/// for nothing.
-///
-/// `cap` bounds what the claim can cost. A batch's budget is already clamped to the caller's
-/// patience, so an honest worker never reaches it; it is here because a teardown must not be able
-/// to wait indefinitely on a number that arrives over a pipe.
-fn unwind_extension(within: Duration, cap: Duration) -> Duration {
-    within.min(cap)
+/// A second is chosen against what it competes with: the shortest grace it can follow is five
+/// seconds, and the thing being waited for takes seconds at least, so a re-read this often is
+/// invisible — while the wakeups it costs, on a path that runs once per session teardown, are not
+/// worth avoiding with machinery that would have to be woken from a thread with no runtime of its
+/// own.
+const UNWIND_RECHECK: Duration = Duration::from_secs(1);
+
+/// How long to wait before looking again, given what the worker last promised and how much of the
+/// teardown's total patience is left.
+fn unwind_slice(within: Duration, left: Duration) -> Duration {
+    within.min(left).min(UNWIND_RECHECK)
 }
 
 /// `CREATE_NEW_PROCESS_GROUP`, which every worker is spawned with.
@@ -870,15 +870,20 @@ impl Sessions {
         if let Ok(reply) = tokio::time::timeout(budget, &mut rx).await {
             return settled(reply);
         }
-        // The budget is spent. A teardown gets one extension, and only because the worker asked
-        // for it: `RollingBack` says a transaction is unwinding and how long it still needs, and
-        // it arrived while this very wait was running. See [`unwind_extension`].
-        if wait == Wait::UntilUnwound
-            && let Some(within) = session.unwinding_for()
-            && let Ok(reply) =
-                tokio::time::timeout(unwind_extension(within, self.call_timeout), &mut rx).await
-        {
-            return settled(reply);
+        // The budget is spent. A teardown keeps waiting only while the worker keeps saying it is
+        // unwinding a transaction — and it asks again every time it looks, because the answer
+        // moves in both directions: the batch may finish early and hand the rest back, or run on
+        // to the bound it promised. Committing to one extension read at this instant would honour
+        // neither.
+        if wait == Wait::UntilUnwound {
+            let mut left = self.call_timeout;
+            while let Some(within) = session.unwinding_for().filter(|_| !left.is_zero()) {
+                let slice = unwind_slice(within, left);
+                if let Ok(reply) = tokio::time::timeout(slice, &mut rx).await {
+                    return settled(reply);
+                }
+                left -= slice;
+            }
         }
         // A timeout is an operational outcome, not broken plumbing: the target may simply still be
         // running. Note the job itself is *not* cancelled — only this wait for it.
@@ -2784,23 +2789,27 @@ mod tests {
         );
     }
 
-    /// A teardown's extension is what its worker asked for, and no more.
+    /// A teardown never commits to more than one recheck at a time, however long the worker says
+    /// it needs — because the answer can be revised *downwards*.
     ///
-    /// The cap is the half worth pinning: a batch's budget is clamped to the caller's patience, so
-    /// an honest worker never reaches it, and it is here only so a teardown cannot be made to wait
-    /// for ever by a number that arrived over a pipe.
+    /// A batch that finishes early retracts its bound to what the release still needs, and a wait
+    /// that had already committed to the original figure could not see it: a disconnect would sit
+    /// out the rest of a batch budget with no transaction left to protect. The cap is the other
+    /// half — a teardown cannot be made to wait for ever by a number arriving over a pipe.
     #[test]
-    fn a_teardown_waits_for_what_its_worker_asks_and_never_past_the_cap() {
+    fn a_teardown_never_commits_to_more_than_one_recheck() {
         let cap = Duration::from_secs(300);
-        // A step that may still run for a minute is a minute this teardown waits. An extension
-        // sized for the rollback alone would expire inside that step, which is the failure the
-        // whole signal exists to remove.
-        let step_plus_rollback = Duration::from_secs(60);
+        // Minutes promised, but only ever a recheck at a time.
+        assert_eq!(unwind_slice(Duration::from_secs(110), cap), UNWIND_RECHECK);
         assert_eq!(
-            unwind_extension(step_plus_rollback, cap),
-            step_plus_rollback
+            unwind_slice(Duration::from_secs(86_400), cap),
+            UNWIND_RECHECK
         );
-        assert_eq!(unwind_extension(Duration::from_secs(86_400), cap), cap);
+        // Less than a recheck left to promise: wait exactly that, then look again.
+        let sliver = UNWIND_RECHECK / 4;
+        assert_eq!(unwind_slice(sliver, cap), sliver);
+        // And the teardown's own patience bounds it, whatever the worker says.
+        assert_eq!(unwind_slice(Duration::from_secs(110), sliver), sliver);
     }
 
     /// A session that has said nothing about a transaction is never waited on for one — which is
