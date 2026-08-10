@@ -416,9 +416,11 @@ definition busy. It sets a flag `batch::run` checks between steps; the batch sto
 What made the wait conditional without the supervisor tracking op identity: the worker answers with
 `WorkerMessage::RollingBack { within_ms }` — a milestone, so it arrives while the teardown is still
 waiting on that same op's reply — and the wait extends itself by that figure once its ordinary grace
-runs out. `within_ms` is the batch's own remaining budget, so it covers the step in flight as well
-as the rollback; sizing it from the reserve instead (the first cut, caught in review) expires inside
-a long step and terminates the worker mid-patch, which is the same failure one step later.
+runs out. `within_ms` is the batch's own remaining budget plus the overrun its executor is allowed,
+so it covers the step in flight as well as the rollback; sizing it from the reserve instead (the
+first cut, caught in review) expires inside a long step and terminates the worker mid-patch, which
+is the same failure one step later. The wait re-reads it rather than committing once, because a
+batch that finishes early hands the rest back and keeps only what the release still needs.
 
 Carrying the signal on the release rather than on an op of its own was also review's doing, and for
 a sharper reason: telling a batch to stop is sticky and one-way, so it must not be possible for a

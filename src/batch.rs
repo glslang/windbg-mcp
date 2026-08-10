@@ -67,6 +67,21 @@ const ROLLBACK_RESERVE: Duration = Duration::from_secs(30);
 /// dequeued at or past the deadline must not round down to it.
 const MIN_STEP_BUDGET_MS: u32 = 1_000;
 
+/// How far past its budget a batch can still legitimately be running.
+///
+/// The budget bounds what may be **started**, not what may be finishing: an operation that begins a
+/// moment before the deadline is still armed with [`MIN_STEP_BUDGET_MS`], because a watchdog of
+/// zero is no watchdog at all. Three of those can stack at the end of a batch — the last cleanup
+/// step's action, an assertion inside it, and the state probe, which runs unconditionally — and
+/// win-kexp's watchdog needs a moment beyond that to interrupt and unwind.
+///
+/// Public because it is the difference between the budget and a bound the worker can actually
+/// *keep*, and something outside is relying on that bound: a teardown is told when the batch will
+/// be done and terminates the worker if it is not. Advertising the bare budget would have it kill
+/// a worker in the middle of the restore it was waiting for — which is the whole failure being
+/// avoided, arriving three seconds later.
+pub const OVERRUN_ALLOWANCE: Duration = Duration::from_millis(4 * MIN_STEP_BUDGET_MS as u64);
+
 /// Default deadline for a whole batch, when the caller names none (ms).
 ///
 /// Comfortably more than a sequence of ordinary commands needs, and comfortably inside the default
@@ -1667,6 +1682,57 @@ mod tests {
         let text = render(&report);
         assert!(text.contains("BATCH: ABANDONED at step 2 of 3"), "{text}");
         assert!(text.contains("rollback: COMPLETE"), "{text}");
+    }
+
+    /// **The bound the worker advertises to a teardown has to be one this executor keeps.**
+    ///
+    /// A teardown is told when the batch will be done and terminates the worker if it is not, so an
+    /// under-stated bound kills a worker in the middle of the restore the teardown was waiting for.
+    /// The budget alone is under-stated: it bounds what may be *started*, and everything started
+    /// just inside it is still armed with the watchdog floor — the last cleanup step's action, an
+    /// assertion within it, and the state probe, which runs whatever else happened.
+    ///
+    /// So this drives the worst case rather than asserting the arithmetic: a cleanup step that
+    /// starts a hair inside the budget and overruns, with an assertion behind it, and the probe
+    /// after that. What it must not exceed is `budget + OVERRUN_ALLOWANCE`.
+    #[test]
+    fn a_batch_finishes_inside_the_bound_its_worker_advertises() {
+        let step = Duration::from_millis(u64::from(MIN_STEP_BUDGET_MS));
+        // 60s budget, 30s reserve: the steps block ends at 30s, so the first step lands the clock a
+        // hair inside the *cleanup* deadline, and everything after it is a floor-armed overrun.
+        let mut d = stopped()
+            .slow("burn", Ok(""), Duration::from_millis(59_900))
+            .slow("restore", Ok(""), step)
+            .slow("? (1", Ok(EVAL_ONE), step)
+            .slow(
+                "? @$ip",
+                Ok("Evaluate expression: 1 = fffff803`1a2b3c4d"),
+                step,
+            );
+        let batch = op(
+            vec![cmd("burn the budget")],
+            vec![BatchStep {
+                expect: vec![Check::Eval {
+                    expr: "1".to_string(),
+                    equals: "1".to_string(),
+                }],
+                ..cmd("restore it")
+            }],
+        );
+
+        let report = run(&mut d, &batch, BUDGET);
+
+        assert!(
+            report.elapsed <= BUDGET + OVERRUN_ALLOWANCE,
+            "the batch ran {:?}, past the {:?} bound its worker advertises to a teardown — which \
+             would have the worker terminated mid-restore",
+            report.elapsed,
+            BUDGET + OVERRUN_ALLOWANCE
+        );
+        assert!(
+            report.elapsed > BUDGET,
+            "this test is only worth anything if it actually reaches past the budget"
+        );
     }
 
     /// **An abandoned batch's rollback keeps the whole budget**, exactly like every other path. It

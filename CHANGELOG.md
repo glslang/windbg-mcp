@@ -50,9 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reads it, rather than only when the engine thread reaches it: the batch stops at its next step,
   runs `always`, and reports `BATCH: ABANDONED`, while the reader answers with **how long that batch
   may still need** — so the teardown's wait covers the step already inside DbgEng as well as the
-  rollback behind it. That figure is the batch's own remaining budget, already clamped to the
-  caller's patience, so a teardown never waits longer than the batch could have run anyway. A
-  session with nothing to unwind says nothing and costs exactly what it always did. A batch that
+  rollback behind it. That figure is the batch's own remaining budget plus the overrun its executor
+  is allowed, already clamped to the caller's patience, so a teardown never waits longer than the
+  batch could have run anyway; it is re-read as the wait goes on, so a batch that finishes early can
+  hand the rest back and leave only what the release itself still needs. A session with nothing to
+  unwind says nothing and costs exactly what it always did. A batch that
   reaches the engine *after* the release does not start at all, which is the same "nothing ran,
   resubmitting is safe" answer as an unaffordable budget.
 
