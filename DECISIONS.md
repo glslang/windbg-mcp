@@ -56,18 +56,29 @@ whose only difference was restoring a patch "on both hit and timeout", which is 
 `batch::tests::the_messagemanager_sequence_is_a_valid_batch` is the longest single invocation
 transcribed, and its sibling drives the wrong-target failure the client wrote that rollback for.
 
-**The guarantee is against a timeout, not against a disconnect.** The budget clamp makes the first
-one total: the rollback runs and the report is written before the caller's wait expires. A client
-disconnect is different in kind — `Sessions::shutdown` treats it as `end_session` on everything and
-gives each session `SHUTDOWN_RELEASE_TIMEOUT` before terminating its worker, so a batch still
-running then is killed mid-transaction. Deliberately not widened here: lengthening that grace slows
-every disconnect, and making it conditional on what a worker is running is a change to the teardown
-path every session depends on. Documented as the boundary it is, and filed as FOLLOWUPS item 18.
+**A timeout is answered by arithmetic; a teardown is answered by a signal** (2026-08-10, item 18).
+The budget clamp makes the first guarantee total: the rollback runs and the report is written before
+the caller's wait expires. A teardown — `Sessions::shutdown` on a disconnect, or `end_session` — is
+different in kind, because it does not wait on the batch's clock at all: the `EndSession` op queues
+*behind* the batch and the grace expires while the transaction is still open, so the worker was
+terminated mid-patch. Neither obvious fix was worth taking: a longer grace is paid on every
+disconnect, including the parked kernel attach it was tuned against, and a supervisor that tracks
+what each worker is running is a change to the path every session's teardown depends on.
 
-**Status.** Adopted. Three things are still owed: pool steps (FOLLOWUPS item 17, the one gap the
-transcript found), a live-kernel exercise of a *mutating* batch (item 16) — the dump tier proves the
-wiring and both outcomes, but a dump has nothing worth restoring — and the disconnect grace above
-(item 18).
+So the teardown asks instead. `EngineOp::AbandonBatch` is answered by the worker's **request
+reader** rather than its engine thread — the one op that must be, since the thread it concerns is
+inside the batch — which sets a flag `batch::run` reads between steps and reports back, ahead of its
+own reply, whether it found a batch to stop (`WorkerMessage::RollingBack`). The grace is then
+widened for that session alone, by `batch::ROLLBACK_RESERVE`, which is the most an `always` block
+can ever spend; an abandoned batch holds its rollback to exactly that, so the two agree by
+derivation rather than by a number chosen to look sufficient. The signal is skipped entirely when a
+worker owes no reply, which is every ordinary disconnect. What it cannot do is reach a step already
+inside DbgEng — that is `SetInterrupt` bound to job identity, FOLLOWUPS item 7 — so a batch stops at
+its next step boundary, not where it stands.
+
+**Status.** Adopted. Two things are still owed: pool steps (FOLLOWUPS item 17, the one gap the
+transcript found) and a live-kernel exercise of a *mutating* batch (item 16) — the dump tier proves
+the wiring and both outcomes, but a dump has nothing worth restoring.
 
 ---
 

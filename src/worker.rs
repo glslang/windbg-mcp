@@ -20,6 +20,7 @@
 use std::io::{BufRead, BufReader, PipeReader, PipeWriter, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -132,6 +133,83 @@ fn watchdog_budget_ms(patience: Duration, queued: Duration) -> u32 {
 /// the case that matters: exiting without it leaves the target machine halted.
 const ABRUPT_EXIT_RELEASE: Duration = Duration::from_secs(5);
 
+/// The same, for a process whose engine is in the middle of a [`crate::batch`] transaction.
+///
+/// The release queues *behind* the batch, so waiting the bare grace above would exit with the
+/// rollback half-run — and on this path there is no supervisor left to have asked for anything
+/// better. The abandon flag is set alongside, so what is being waited on is one step finishing plus
+/// the `always` block, which is exactly [`batch::ROLLBACK_RESERVE`] at the outside.
+const ABRUPT_EXIT_ROLLBACK: Duration =
+    Duration::from_secs(ABRUPT_EXIT_RELEASE.as_secs() + batch::ROLLBACK_RESERVE.as_secs());
+
+/// Whether the batch on this worker's engine thread has been told to stop, and whether there is
+/// one to tell.
+///
+/// Two flags rather than one because the two questions have different owners: the *reader* sets
+/// `abandon` and needs an answer for the supervisor, the *engine thread* sets `running` and needs
+/// to know whether to stop. What matters is that they cannot both say "no" at once — see
+/// [`Self::abandon`].
+struct BatchSignal {
+    /// Set by a teardown, and never cleared. Sticky on purpose: after it a batch that has not
+    /// started must not start, or the session's last act would be a fresh set of mutations run for
+    /// a caller who is already gone.
+    abandon: AtomicBool,
+    /// Set while [`batch::run`] owns the engine thread.
+    running: AtomicBool,
+}
+
+impl BatchSignal {
+    const fn new() -> Self {
+        Self {
+            abandon: AtomicBool::new(false),
+            running: AtomicBool::new(false),
+        }
+    }
+
+    /// Tells any batch to stop at its next step boundary, and reports whether one is running — the
+    /// answer a teardown sizes its grace from.
+    ///
+    /// The store precedes the load, and [`Self::enter`] does the opposite, so at least one of the
+    /// two sees the other: either the batch has already started and this reports it, or it has not
+    /// and refuses to start. Both may happen, which costs a teardown a grace it did not need;
+    /// *neither* would be a batch running with the short grace behind it, which is the one outcome
+    /// this pairing exists to exclude. `SeqCst` because that guarantee is exactly what the weaker
+    /// orderings do not give across two locations.
+    fn abandon(&self) -> bool {
+        self.abandon.store(true, Ordering::SeqCst);
+        self.running.load(Ordering::SeqCst)
+    }
+
+    fn abandoned(&self) -> bool {
+        self.abandon.load(Ordering::SeqCst)
+    }
+
+    /// Marks a batch as running for as long as the guard lives, and answers whether it may start
+    /// at all. See [`Self::abandon`] for why the store comes first.
+    fn enter(&self) -> (BatchGuard<'_>, bool) {
+        self.running.store(true, Ordering::SeqCst);
+        let guard = BatchGuard { signal: self };
+        let may_start = !self.abandon.load(Ordering::SeqCst);
+        (guard, may_start)
+    }
+}
+
+/// Clears [`BatchSignal::running`] however the batch ends — including by unwinding, which
+/// `engine_thread`'s guard catches one frame further out.
+struct BatchGuard<'a> {
+    signal: &'a BatchSignal,
+}
+
+impl Drop for BatchGuard<'_> {
+    fn drop(&mut self) {
+        self.signal.running.store(false, Ordering::SeqCst);
+    }
+}
+
+/// This process's one batch signal. Global for the same reason [`MESSAGES`] is: the reader thread
+/// sets it, the engine thread reads it, and there is exactly one engine here to be talking about.
+static BATCH: BatchSignal = BatchSignal::new();
+
 /// What the request reader hands to the engine thread.
 enum Job {
     /// A request from the supervisor, stamped when it was read.
@@ -202,6 +280,14 @@ pub fn run(args: &[String]) -> ! {
             continue;
         }
         match serde_json::from_str::<WorkerRequest>(&line) {
+            // Answered here rather than queued, because the thread that would run it is the one
+            // this is about: it is inside the batch being abandoned. This loop is never blocked by
+            // the engine — it reads a line and hands it on — which is the whole reason the signal
+            // can arrive at all. See [`EngineOp::AbandonBatch`].
+            Ok(WorkerRequest {
+                id,
+                op: EngineOp::AbandonBatch,
+            }) => abandon_batch(id),
             Ok(request) => {
                 if tx.send(Job::Run(Instant::now(), request)).is_err() {
                     break; // the engine thread is gone; nothing can run any more
@@ -231,7 +317,8 @@ pub fn run(args: &[String]) -> ! {
     // supervisor without it running its own shutdown — nobody has, and exiting here would leave a
     // live kernel *halted*, because DbgEng needs an explicit resume-and-detach. So ask for one,
     // bounded: an idle engine obliges in milliseconds, a parked one never will, and either way
-    // this process is gone within `ABRUPT_EXIT_RELEASE`.
+    // this process is gone within `ABRUPT_EXIT_RELEASE` — or within `ABRUPT_EXIT_ROLLBACK`, when a
+    // batch is being unwound first.
     //
     // Ctrl+C only reaches this path because a worker is spawned into its own process group
     // (`engine::CREATE_NEW_PROCESS_GROUP`). Without that it would be delivered here too, and the
@@ -243,6 +330,17 @@ pub fn run(args: &[String]) -> ! {
     // Logged because it is otherwise invisible: this is the teardown nobody asked for, and an
     // operator looking at a target that came back fine wants to see which path did it.
     tracing::info!("worker: supervisor is gone; releasing the target before exit");
+    // Same signal, sent to ourselves. A batch still running would otherwise hold the release
+    // behind every step it has left, on the one path where nobody is left to have asked for
+    // anything — and this process is leaving either way, so the choice is between a rollback and
+    // no rollback, not between finishing the batch and not.
+    let rolling_back = BATCH.abandon();
+    let grace = if rolling_back {
+        tracing::info!("worker: a batch was running; letting it roll back before exit");
+        ABRUPT_EXIT_ROLLBACK
+    } else {
+        ABRUPT_EXIT_RELEASE
+    };
     let (ack, released) = mpsc::channel();
     if tx.send(Job::Release(ack)).is_err() {
         // The engine thread died before this could be asked, so nothing was even attempted --
@@ -255,12 +353,11 @@ pub fn run(args: &[String]) -> ! {
         // Whichever way this ends the process does, but *which* way is the difference between a
         // target let go and a target still attached to a debugger that no longer exists. Silence
         // here would leave that to be inferred from a guest that never came back.
-        match released.recv_timeout(ABRUPT_EXIT_RELEASE) {
+        match released.recv_timeout(grace) {
             Ok(()) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => tracing::warn!(
-                "worker: the engine did not finish releasing within {ABRUPT_EXIT_RELEASE:?} \
-                 (parked in DbgEng, most likely); exiting anyway, so a live kernel target may be \
-                 left halted"
+                "worker: the engine did not finish releasing within {grace:?} (parked in DbgEng, \
+                 most likely); exiting anyway, so a live kernel target may be left halted"
             ),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 tracing::error!("worker: the engine thread is gone, so nothing released the target")
@@ -397,6 +494,28 @@ fn emit(message: &WorkerMessage) -> Emit {
             Emit::Unwritable
         }
     }
+}
+
+/// Answers an [`EngineOp::AbandonBatch`] from the request reader.
+///
+/// The order of the two messages is the contract: [`WorkerMessage::RollingBack`] says the grace has
+/// to be held open, and it must be on the wire before the `Done` that releases the supervisor's
+/// waiter, or the teardown would read the flag before it was set and size its grace as though
+/// nothing were running.
+fn abandon_batch(id: u64) {
+    let rolling_back = BATCH.abandon();
+    if rolling_back {
+        emit(&WorkerMessage::RollingBack { id });
+    }
+    let what = if rolling_back {
+        "a batch was running; it will stop at its next step and run its `always` block"
+    } else {
+        "no batch was running; none can start on this session now"
+    };
+    emit(&WorkerMessage::Done {
+        id,
+        result: Ok(what.to_string()),
+    });
 }
 
 /// Runs one op against this worker's engine. `queued` is how long it waited its turn here, which
@@ -574,6 +693,14 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<S
         EngineOp::Reachability(args) => reachable(e, args),
         EngineOp::Pool(args) => pool(e, args),
         EngineOp::Batch(op) => run_batch(e, op, queued),
+        // Handled by the request reader, which is the only place it can be handled: reaching this
+        // thread means it queued behind the very batch it was meant to cut short. Answered rather
+        // than ignored, because a request without a reply costs the caller its session.
+        EngineOp::AbandonBatch => Err(
+            "the abandon signal reached the engine thread, which means it was queued rather than \
+             delivered — nothing was abandoned. This is a bug in the worker's request reader."
+                .to_string(),
+        ),
         EngineOp::EndSession => e
             .end_session()
             .map(|_| "session ended".to_string())
@@ -645,6 +772,7 @@ fn batch_budget(requested_ms: u32, patience: Duration, queued: Duration) -> Opti
 struct BatchEngine<'a> {
     e: &'a DebugEngine,
     started: Instant,
+    signal: &'a BatchSignal,
 }
 
 impl Debuggee for BatchEngine<'_> {
@@ -671,6 +799,10 @@ impl Debuggee for BatchEngine<'_> {
     fn elapsed(&self) -> Duration {
         self.started.elapsed()
     }
+
+    fn abandoned(&self) -> bool {
+        self.signal.abandoned()
+    }
 }
 
 /// Runs a batch and renders its report.
@@ -679,6 +811,22 @@ impl Debuggee for BatchEngine<'_> {
 /// and whether the rollback ran would be worse than no report at all. `Err` only chooses how
 /// [`crate::server`] renders it: a tool-execution error the model can read and act on.
 fn run_batch(e: &DebugEngine, op: BatchOp, queued: Duration) -> Result<String, String> {
+    // Claimed before the budget is worked out, so that from here on an abandon signal either finds
+    // this batch running or is found by it — never neither. See [`BatchSignal::abandon`].
+    let (_running, may_start) = BATCH.enter();
+    if !may_start {
+        // The same answer as an unaffordable budget below, and for the same reason: nothing ran, so
+        // there is nothing to undo and resubmitting is safe. This is the queue-wait case — the
+        // teardown that set the flag arrived while this batch was still behind other work.
+        return Err(
+            "This batch was not started: the session it names is being torn down (the client \
+             disconnected, or the session was ended) and was already doing so when this batch \
+             reached the engine. Nothing was run and nothing was changed — no step, no assertion, \
+             no rollback — so the target is exactly as it was. Open a session again and resubmit \
+             the whole batch."
+                .to_string(),
+        );
+    }
     let Some(budget) = batch_budget(
         op.budget_ms,
         Duration::from_millis(u64::from(op.patience_ms)),
@@ -704,9 +852,24 @@ fn run_batch(e: &DebugEngine, op: BatchOp, queued: Duration) -> Result<String, S
     let mut engine = BatchEngine {
         e,
         started: Instant::now(),
+        signal: &BATCH,
     };
     let report = batch::run(&mut engine, &op, budget);
     let rendered = batch::render(&report);
+    // The one outcome whose report is written for nobody: a batch is abandoned by a teardown, so
+    // the caller is already gone and the `Done` this becomes answers a waiter that is being failed
+    // out anyway. The log is where it can still be read, and an operator looking at a target that
+    // was patched wants to know the patch came off.
+    if matches!(report.outcome, batch::BatchOutcome::Abandoned { .. }) {
+        tracing::info!(
+            "worker: batch abandoned mid-flight; rollback {}",
+            if report.rollback_complete() {
+                "complete"
+            } else {
+                "INCOMPLETE — the target may still be patched"
+            }
+        );
+    }
     if report.committed() && report.rollback_complete() {
         Ok(rendered)
     } else {
@@ -1851,5 +2014,66 @@ mod tests {
             batch_budget(120_000, least - Duration::from_millis(1), Duration::ZERO),
             None
         );
+    }
+
+    // ---- the abandon signal -----------------------------------------------
+    //
+    // Against a local `BatchSignal` rather than the process-wide `BATCH`, so these say nothing
+    // about the order the test binary happens to run them in — and so that both sides of the race
+    // below can be staged, which against the real one would mean disconnecting a client at an
+    // exact instant.
+
+    /// The property the two flags exist to hold: a batch never runs with a teardown believing
+    /// there is nothing to wait for.
+    ///
+    /// Whichever way the race falls, at least one side sees the other — the batch refuses to start,
+    /// or the signal reports it running. The forbidden outcome is *both* saying no, which is a
+    /// worker terminated mid-transaction on the five-second grace.
+    #[test]
+    fn a_batch_and_the_signal_that_stops_it_cannot_both_miss() {
+        // The signal arrives first: the batch must not start.
+        let waiting = BatchSignal::new();
+        assert!(!waiting.abandon(), "nothing is running yet");
+        let (_running, may_start) = waiting.enter();
+        assert!(
+            !may_start,
+            "a batch that reached the engine after the teardown must not run its mutations"
+        );
+
+        // The batch got there first: the signal must report it, so the grace is held open.
+        let started = BatchSignal::new();
+        let (_running, may_start) = started.enter();
+        assert!(may_start, "an ordinary batch runs");
+        assert!(
+            started.abandon(),
+            "a signal that found a batch running has to say so, or the teardown waits five \
+             seconds and kills it mid-transaction"
+        );
+        assert!(started.abandoned(), "and the batch has to see it");
+    }
+
+    /// Once the batch is over, a teardown gets the short grace again — the extra wait is for a
+    /// rollback in flight, not for a session that has ever run one.
+    #[test]
+    fn a_finished_batch_leaves_nothing_for_a_teardown_to_wait_on() {
+        let signal = BatchSignal::new();
+        {
+            let (_running, may_start) = signal.enter();
+            assert!(may_start);
+        }
+        assert!(
+            !signal.abandon(),
+            "the batch is done; there is nothing to unwind"
+        );
+        // Still sticky, though: this session is on its way out and must not start another.
+        let (_running, may_start) = signal.enter();
+        assert!(!may_start);
+    }
+
+    /// The exit grace has to cover the rollback the abandon signal sets in motion, not just the
+    /// release queued behind it.
+    #[test]
+    fn the_abrupt_exit_grace_covers_a_rollback() {
+        assert!(ABRUPT_EXIT_ROLLBACK >= ABRUPT_EXIT_RELEASE + batch::ROLLBACK_RESERVE);
     }
 }
