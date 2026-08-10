@@ -28,9 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   may `capture` its value under a name later steps interpolate as `{{name}}`.
 
   **The `always` block is reached on every path**: success, a debugger error, an assertion that did
-  not hold, the deadline expiring. Part of the budget is reserved for it before the first step runs,
-  because what is left after a step that ran to its own deadline is nothing, and cleanup continues
-  past its own failures. The worker owns that deadline, sized from the caller's remaining patience
+  not hold, the deadline expiring, a panic out of the debugger (win-kexp methods do panic — several
+  use `.expect` — and the worker's own `catch_unwind` is around the whole op, so each engine call a
+  step makes is guarded individually). Part of the budget is reserved for it before the first step
+  runs, because what is left after a step that ran to its own deadline is nothing, and cleanup
+  continues past its own failures. The worker owns that deadline, sized from the caller's remaining patience
   the same way a bounded command's watchdog is, so the rollback has finished and the report has been
   written before the tool call gives up — which is the only reason the report is worth anything.
 

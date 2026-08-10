@@ -26,7 +26,10 @@ consumed its own deadline is nothing, and the budget itself is clamped to the ca
 patience (`worker::batch_budget`) so the report lands ahead of the tool call's timeout. The
 *rollback is reached unconditionally* — a failure inside it is recorded beside the original, never
 in place of it, and cleanup continues past its own failures because a patch that cannot be restored
-must not stop a breakpoint from being cleared. What the reserve buys is time to run, not a promise:
+must not stop a breakpoint from being cleared. Three paths lead to it and all three are handled in
+`batch::run`: a debugger error, an expired deadline, and an unwind — every engine call goes through
+`batch::guarded`, because `worker::engine_thread` catches panics at *op* granularity and one from a
+step would otherwise leave `run` without ever reaching `always`. What the reserve buys is time to run, not a promise:
 a step that overruns it too leaves cleanup with no budget, and the report then says the rollback is
 incomplete rather than implying it happened. And the *executor never touches DbgEng*: it drives a
 `Debuggee` trait with a virtual clock, so assertion failure, a command failure after a mutation,

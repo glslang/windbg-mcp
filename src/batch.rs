@@ -19,9 +19,9 @@
 //!   of time" are different events. The supervisor sizes that budget from the caller's remaining
 //!   patience (`worker::batch_budget`) so the report lands *before* the tool call gives up.
 //! * **`always` is reached on every path.** Success, a debugger error, an assertion that did not
-//!   hold, an expired deadline — all of them fall through to the same block, cleanup continues past
-//!   its own failures, and a failure inside it is recorded beside the original rather than
-//!   replacing it. What the reserve buys is *time to run*, not a guarantee: a step that overruns
+//!   hold, an expired deadline, a panic out of the debugger — all of them fall through to the same
+//!   block, cleanup continues past its own failures, and a failure inside it is recorded beside the
+//!   original rather than replacing it. What the reserve buys is *time to run*, not a guarantee: a step that overruns
 //!   far enough to consume the reserve as well leaves cleanup with no budget, and then the block is
 //!   skipped and the report says the rollback is incomplete. That is the honest edge, and it is
 //!   pinned by a test rather than left to be discovered.
@@ -33,6 +33,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Duration;
 
 use schemars::JsonSchema;
@@ -559,6 +560,36 @@ pub trait Debuggee {
     fn elapsed(&self) -> Duration;
 }
 
+/// Runs one engine call, turning a panic into a step failure.
+///
+/// The unwind is the third path that would otherwise skip the rollback, after a debugger error and
+/// an expired deadline — and the least obvious, because nothing in this module can raise it.
+/// `worker::engine_thread` already catches panics, but at *op* granularity: it wraps the whole
+/// `execute`, so an unwind from a step leaves [`run`] without ever reaching `always`, with the
+/// patch still applied. And this is not hypothetical — that same `catch_unwind` exists because
+/// several win-kexp methods use `.expect`, which is exactly what a batch step calls.
+///
+/// So the guard belongs here, where the promise is made, rather than being left to the layer
+/// above. `AssertUnwindSafe` is sound for the same reason it is there: the only state a
+/// [`Debuggee`] implementation holds across a call is the engine handle and the clock, neither of
+/// which a panic can leave half-written, and the engine itself survives — the worker's own comment
+/// makes the same argument for the same reason.
+fn guarded(call: impl FnOnce() -> Result<String, String>) -> Result<String, String> {
+    catch_unwind(AssertUnwindSafe(call)).unwrap_or_else(|payload| {
+        // The message, when the payload carries one. A bare "panicked" would tell a caller that
+        // their transaction stopped without telling them what stopped it, and this is a report
+        // whose whole job is to say which step and why.
+        let why = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned());
+        match why {
+            Some(why) => Err(format!("the debugger operation panicked: {why}")),
+            None => Err("the debugger operation panicked".to_string()),
+        }
+    })
+}
+
 // ---- results --------------------------------------------------------------
 
 /// How one step ended.
@@ -815,7 +846,7 @@ fn run_step(
             .min(budget_ms)
             .max(MIN_STEP_BUDGET_MS)
     };
-    let ran = match &action {
+    let ran = guarded(|| match &action {
         StepAction::Command { command } => d.command(command, budget_ms),
         StepAction::Resume {
             command,
@@ -827,7 +858,7 @@ fn run_step(
         } => d.run_to(address, wait_ms(*timeout_ms)),
         StepAction::Eval { expr } => d.command(&format!("? {expr}"), budget_ms),
         StepAction::ReadMemory { address, size } => d.read_memory(address, *size),
-    };
+    });
 
     let output = match ran {
         Ok(output) => output,
@@ -900,8 +931,7 @@ fn eval_value(d: &mut impl Debuggee, expr: &str, deadline: Duration) -> Result<u
     let budget_ms = step_budget_ms(d.elapsed(), deadline).max(MIN_STEP_BUDGET_MS);
     // Parenthesized, so a relational expression (`@rcx > 0x1000`) is evaluated as one value
     // rather than losing its precedence against whatever `?` does with the rest of the line.
-    let text = d
-        .command(&format!("? ({expr})"), budget_ms)
+    let text = guarded(|| d.command(&format!("? ({expr})"), budget_ms))
         .map_err(|why| format!("`? ({expr})` failed: {why}"))?;
     parse_eval(&text).ok_or_else(|| {
         format!(
@@ -995,7 +1025,7 @@ fn probe_state(
     });
 
     let budget_ms = step_budget_ms(d.elapsed(), budget).max(MIN_STEP_BUDGET_MS);
-    match d.command("? @$ip", budget_ms) {
+    match guarded(|| d.command("? @$ip", budget_ms)) {
         Ok(text) => match parse_eval(&text) {
             Some(ip) => SessionAfter::Stopped { ip: fmt_addr(ip) },
             None => SessionAfter::Uncertain {
@@ -1181,7 +1211,12 @@ mod tests {
         answers: Vec<(String, Answer)>,
         calls: Vec<String>,
         clock: Duration,
+        /// Call fragments this script panics on rather than answers; see [`Script::panics`].
+        panic_on: Vec<String>,
     }
+
+    /// The message a scripted panic carries, so the report can be asserted to have kept it.
+    const PANIC: &str = "called `Option::unwrap()` on a `None` value";
 
     impl Script {
         fn new() -> Self {
@@ -1200,6 +1235,15 @@ mod tests {
             self
         }
 
+        /// Answers any call containing `matching` by panicking, the way several win-kexp methods
+        /// do (`.expect`).
+        fn panics(mut self, matching: &str) -> Self {
+            // Not an `answers` entry: the panic fires before the lookup, so one would only be
+            // there to look like an answer that is never given.
+            self.panic_on.push(matching.to_string());
+            self
+        }
+
         /// As [`Self::on`], and the call advances the clock by `costs`.
         fn slow(mut self, matching: &str, result: Result<&str, &str>, costs: Duration) -> Self {
             self.answers.push((
@@ -1214,6 +1258,9 @@ mod tests {
 
         fn answer(&mut self, call: &str) -> Result<String, String> {
             self.calls.push(call.to_string());
+            if self.panic_on.iter().any(|m| call.contains(m.as_str())) {
+                panic!("{PANIC}");
+            }
             let found = self
                 .answers
                 .iter()
@@ -1430,6 +1477,72 @@ mod tests {
         assert!(text.contains("BATCH: FAILED at step 2 of 2"), "{text}");
         assert!(text.contains("rollback: INCOMPLETE — 1 of 2"), "{text}");
         assert!(text.contains("Couldn't resolve error"), "{text}");
+    }
+
+    /// A panic out of the debugger is the third path that would skip the rollback, and the least
+    /// visible: nothing in this module raises it, and the worker's own `catch_unwind` is around
+    /// the whole op, so an unwind from a step would leave `run` without ever reaching `always`.
+    /// win-kexp methods do panic — that worker guard exists because several use `.expect`.
+    #[test]
+    fn a_panicking_step_fails_that_step_and_still_rolls_back() {
+        let mut d = stopped()
+            .on("eb fffff800", Ok(""))
+            .panics("!analyze")
+            .on("never", Ok(""))
+            .on("eb restore", Ok(""));
+        let batch = op(
+            vec![
+                cmd("eb fffff800`00001000 90"),
+                cmd("!analyze -v"),
+                cmd("never runs"),
+            ],
+            vec![cmd("eb restore 41")],
+        );
+
+        let report = run(&mut d, &batch, BUDGET);
+
+        assert_eq!(report.outcome, BatchOutcome::Failed { at: 2 });
+        assert!(d.ran("eb restore"), "the rollback must run: {:?}", d.calls);
+        assert!(report.rollback_complete());
+        assert!(!d.ran("never"), "the batch must stop at the panic");
+
+        // The panic's own message has to survive into the report: "your transaction stopped" is
+        // not an answer to "why".
+        let text = render(&report);
+        assert!(text.contains("panicked"), "{text}");
+        assert!(text.contains(PANIC), "{text}");
+    }
+
+    /// A panicking *cleanup* step must not take the rest of the cleanup with it.
+    #[test]
+    fn a_panicking_rollback_step_does_not_stop_the_rest_of_the_cleanup() {
+        let mut d = stopped()
+            .on(
+                "bp nowhere",
+                Err("Couldn't resolve error at 'nowhere!Nope'"),
+            )
+            .panics("eb restore")
+            .on("bc *", Ok(""));
+        let report = run(
+            &mut d,
+            &op(
+                vec![cmd("bp nowhere!Nope")],
+                vec![cmd("eb restore 41"), cmd("bc *")],
+            ),
+            BUDGET,
+        );
+
+        assert_eq!(report.outcome, BatchOutcome::Failed { at: 1 });
+        assert!(!report.rollback_complete());
+        assert!(
+            d.ran("bc *"),
+            "cleanup continues past a panic: {:?}",
+            d.calls
+        );
+        let text = render(&report);
+        // Both survive: the original failure and the panic in the cleanup.
+        assert!(text.contains("Couldn't resolve error"), "{text}");
+        assert!(text.contains("panicked"), "{text}");
     }
 
     // ---- captures ----------------------------------------------------------
