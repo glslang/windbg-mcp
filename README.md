@@ -424,6 +424,12 @@ expressions, so registers, memory and relations between them are all one check. 
 `capture` its value under a name that later steps interpolate as `{{name}}`; a reference that names
 no earlier capture is refused before anything runs.
 
+**A field this tool does not know is an error, not something to ignore** — the one place in this
+server where that is true. Serde drops unknown fields silently, so `"aways"` for `always` would be a
+batch with no rollback block at all: mutations applied, nothing restored, `COMMITTED` reported. The
+same goes for a misspelt `expect`, which is a step that asserts nothing and lets the batch commit.
+Both fail *open*, so both are refused by name.
+
 The report names every step that ran, the exact one that failed, what each step changed, whether the
 rollback completed — reported *beside* the original failure, never instead of it — and whether the
 session is left stopped, running, detached, or uncertain. A batch that did not commit comes back as a

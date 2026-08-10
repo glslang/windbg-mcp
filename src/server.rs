@@ -1369,7 +1369,13 @@ pub struct RunToAddressArgs {
 }
 
 /// A whole debugger transaction, for `debug_batch`.
+///
+/// The one argument struct in this server that refuses unknown fields, and it is not fussiness:
+/// serde drops them silently, so `"aways"` for `always` would be accepted as a batch with **no
+/// rollback block** — mutations applied, nothing restored, and a `COMMITTED` verdict saying so.
+/// Every other tool's typo costs a wrong answer; this one's costs the target.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DebugBatchArgs {
     /// The steps to run, in order. Each is one flat object with an `op` field:
     /// `{"op": "command", "command": "bp nt!NtCreateFile"}` runs a raw command;
@@ -2156,8 +2162,10 @@ impl WindbgServer {
     /// an assertion that does not hold and the deadline expiring, so cleanup cannot be lost to a
     /// call that times out. The result names every step that ran, the exact one that failed, what
     /// each changed, whether the rollback completed, and whether the target is left stopped,
-    /// running, or gone. Two edges: a step that overruns far enough to consume the reserved
-    /// cleanup budget too leaves the rollback unrun, and the result says `rollback: INCOMPLETE`;
+    /// running, detached, or uncertain (the last when the debugger could not be asked — which is
+    /// reported as not knowing, never guessed at). Two edges: a step that overruns far enough to
+    /// consume the reserved cleanup budget too leaves the rollback unrun, and the result says
+    /// `rollback: INCOMPLETE`;
     /// and a client *disconnect* is not a safe way to abort a batch — it is treated as
     /// `end_session` everywhere and gives only a few seconds' grace, so end the session instead.
     #[rmcp::tool(annotations(
@@ -3621,6 +3629,32 @@ mod tests {
             !text.contains("session"),
             "validation must not have reached a session: {text}"
         );
+    }
+
+    /// The typo that would be worst to ignore: `always` misspelt is a batch with **no rollback
+    /// block**, which then applies its mutations and reports `COMMITTED` with nothing restored.
+    /// Serde drops unknown fields by default, so this only fails because the struct says otherwise.
+    #[test]
+    fn a_misspelt_rollback_block_is_refused_rather_than_silently_dropped() {
+        let args = serde_json::json!({
+            "steps": [{ "op": "command", "command": "eb fffff800`00001000 90" }],
+            "aways": [{ "op": "command", "command": "eb fffff800`00001000 41" }]
+        });
+        let refused = serde_json::from_value::<DebugBatchArgs>(args.clone())
+            .err()
+            .expect("an unknown field must be refused");
+        assert!(
+            refused.to_string().contains("aways"),
+            "the refusal should name the field: {refused}"
+        );
+
+        // Spelt correctly it deserializes, and the rollback is there.
+        let mut fixed = args.as_object().unwrap().clone();
+        let always = fixed.remove("aways").unwrap();
+        fixed.insert("always".to_string(), always);
+        let parsed: DebugBatchArgs =
+            serde_json::from_value(serde_json::Value::Object(fixed)).expect("valid");
+        assert_eq!(parsed.always.len(), 1);
     }
 
     #[test]

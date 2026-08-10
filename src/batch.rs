@@ -21,8 +21,8 @@
 //! * **`always` is reached on every path.** Success, a debugger error, an assertion that did not
 //!   hold, an expired deadline, a panic out of the debugger — all of them fall through to the same
 //!   block, cleanup continues past its own failures, and a failure inside it is recorded beside the
-//!   original rather than replacing it. What the reserve buys is *time to run*, not a guarantee: a step that overruns
-//!   far enough to consume the reserve as well leaves cleanup with no budget, and then the block is
+//!   original rather than replacing it. What the reserve buys is *time to run*, not a guarantee: a
+//!   step that overruns far enough to consume the reserve too leaves cleanup with no budget, and
 //!   skipped and the report says the rollback is incomplete. That is the honest edge, and it is
 //!   pinned by a test rather than left to be discovered.
 //! * **The executor never touches DbgEng.** It drives a [`Debuggee`], which the worker implements
@@ -76,11 +76,15 @@ pub const DEFAULT_BATCH_MS: u32 = 120_000;
 
 /// The shortest deadline a batch may ask for.
 ///
-/// Below this there is no batch: the reserve is half the budget, a step is armed with at least
-/// [`MIN_STEP_BUDGET_MS`], and a budget under a second means every step *and* every cleanup step
-/// is skipped before it starts. A caller who writes `0` gets a batch that does nothing and reports
-/// nothing useful about why, which is worse than being told the number is unusable.
-pub const MIN_BATCH_MS: u32 = 1_000;
+/// **Derived, not chosen.** For a short batch the reserve is half the budget, so the steps get the
+/// other half — and the floor below means the very first step is armed for [`MIN_STEP_BUDGET_MS`]
+/// however little of that half is left. Any budget under twice that floor therefore lets step one
+/// run past the steps deadline and spend the reserve the rollback needs, which is the failure this
+/// whole module is built to prevent, arriving through the argument meant to bound it.
+///
+/// At exactly this value the two are equal: the steps get one floor's worth, the reserve keeps
+/// one, and a step that overruns can eat into the reserve but cannot exhaust it.
+pub const MIN_BATCH_MS: u32 = 2 * MIN_STEP_BUDGET_MS;
 
 /// The budget a batch is built with, from what the caller asked for.
 ///
@@ -91,7 +95,10 @@ pub fn budget_ms(requested: Option<u32>) -> Result<u32, String> {
     match requested {
         None => Ok(DEFAULT_BATCH_MS),
         Some(ms) if ms < MIN_BATCH_MS => Err(format!(
-            "`timeout_ms` is {ms}; a batch needs at least {MIN_BATCH_MS} ms. Part of the budget is              reserved for the `always` block, so a deadline this short would skip every step and              every cleanup step before either started. Omit `timeout_ms` for the {DEFAULT_BATCH_MS}              ms default."
+            "`timeout_ms` is {ms}; a batch needs at least {MIN_BATCH_MS} ms. Part of the budget is \
+             reserved for the `always` block, and a step is armed with at least \
+             {MIN_STEP_BUDGET_MS} ms, so a deadline this short would spend the rollback's reserve \
+             on the first step. Omit `timeout_ms` for the {DEFAULT_BATCH_MS} ms default."
         )),
         Some(ms) => Ok(ms),
     }
@@ -150,6 +157,23 @@ pub enum StepAction {
 }
 
 impl StepAction {
+    /// Whether `key` is one this variant legitimately occupies in a flattened step.
+    ///
+    /// Spelled out rather than derived because serde will not tell us: a flattened internally
+    /// tagged enum leaves the keys it matched in the shared buffer, so this is the only way to
+    /// tell a variant's own field from a caller's typo. `a_well_formed_step_leaves_nothing_in_the
+    /// _catch_all` is what stops this list drifting from the variants above.
+    fn owns(&self, key: &str) -> bool {
+        let fields: &[&str] = match self {
+            Self::Command { .. } => &["command"],
+            Self::Resume { .. } => &["command", "timeout_ms"],
+            Self::RunTo { .. } => &["address", "timeout_ms"],
+            Self::Eval { .. } => &["expr"],
+            Self::ReadMemory { .. } => &["address", "size"],
+        };
+        key == "op" || fields.contains(&key)
+    }
+
     /// The command line this action runs, for the report. Not what is sent to the engine for the
     /// non-command variants — it is what a reader needs to see to know what the step did.
     fn rendered(&self) -> String {
@@ -250,9 +274,38 @@ pub struct BatchStep {
     /// step has a value to bind.
     #[serde(default)]
     pub capture: Option<String>,
+    /// Every key the step carried alongside the named fields above — the action's own included.
+    ///
+    /// Here so [`Self::unknown_fields`] can find the ones that belong to nothing. Serde ignores
+    /// unknown fields by default, which is the wrong default for a step: a misspelt `expect` is a
+    /// step that asserts nothing while reading as though it asserts, and it fails *open* — the
+    /// batch commits. `deny_unknown_fields` cannot say so here, because serde makes that attribute
+    /// and `flatten` mutually exclusive and `action` is flattened to keep a step one flat object.
+    ///
+    /// It collects the action's keys too, rather than only the leftovers: serde hands the same
+    /// buffered content to every flattened field, so an internally tagged enum does not consume
+    /// what it matched. Subtracting them is [`StepAction::owns`]'s job.
+    ///
+    /// **Never serialized.** This exists for one check at the supervisor's edge and has no business
+    /// on the wire — and writing it there is not merely redundant, it is corrupting: flattening a
+    /// map that already holds `op` and the action's fields emits each of them *twice*, and the
+    /// worker rejects the duplicate key, discards the request, and answers nobody. That costs the
+    /// caller the session, not the call (see [`crate::proto`]).
+    #[serde(flatten, skip_serializing)]
+    #[schemars(skip)]
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl BatchStep {
+    /// The keys this step carried that nothing in the schema claims — a typo, in practice.
+    fn unknown_fields(&self) -> Vec<&str> {
+        self.extra
+            .keys()
+            .map(String::as_str)
+            .filter(|key| !self.action.owns(key))
+            .collect()
+    }
+
     fn label(&self) -> String {
         match &self.name {
             Some(name) if !name.trim().is_empty() => name.clone(),
@@ -360,6 +413,17 @@ pub fn validate(steps: &[BatchStep], always: &[BatchStep]) -> Result<(), String>
     for (block, block_name) in [(steps, "steps"), (always, "always")] {
         for (index, step) in block.iter().enumerate() {
             let where_ = format!("`{block_name}` step {}", index + 1);
+            // First, because it is the check that catches a batch which *looks* right. Refused
+            // rather than ignored: the dangerous typo here is silent and fails open — a misspelt
+            // `expect` is a step that asserts nothing and lets the batch commit.
+            let unknown = step.unknown_fields();
+            if !unknown.is_empty() {
+                return Err(format!(
+                    "{where_} has field(s) this tool does not know: {}. A step takes `op` and that \
+                     op's own fields, plus `name`, `expect` and `capture` — check the spelling.",
+                    unknown.join(", ")
+                ));
+            }
             validate_operands(step, &where_)?;
             if step.expect.len() > MAX_CHECKS {
                 return Err(format!(
@@ -560,20 +624,11 @@ pub trait Debuggee {
     fn elapsed(&self) -> Duration;
 }
 
-/// Runs one engine call, turning a panic into a step failure.
+/// Runs one engine call, turning a panic into a step failure so [`run`] still reaches `always`.
 ///
-/// The unwind is the third path that would otherwise skip the rollback, after a debugger error and
-/// an expired deadline — and the least obvious, because nothing in this module can raise it.
-/// `worker::engine_thread` already catches panics, but at *op* granularity: it wraps the whole
-/// `execute`, so an unwind from a step leaves [`run`] without ever reaching `always`, with the
-/// patch still applied. And this is not hypothetical — that same `catch_unwind` exists because
-/// several win-kexp methods use `.expect`, which is exactly what a batch step calls.
-///
-/// So the guard belongs here, where the promise is made, rather than being left to the layer
-/// above. `AssertUnwindSafe` is sound for the same reason it is there: the only state a
-/// [`Debuggee`] implementation holds across a call is the engine handle and the clock, neither of
-/// which a panic can leave half-written, and the engine itself survives — the worker's own comment
-/// makes the same argument for the same reason.
+/// Needed because the only other guard is `worker::engine_thread`'s, which wraps a whole op — an
+/// unwind from a step would pass straight through the rollback. Not hypothetical: several win-kexp
+/// methods use `.expect`, and a step calls into them.
 fn guarded(call: impl FnOnce() -> Result<String, String>) -> Result<String, String> {
     catch_unwind(AssertUnwindSafe(call)).unwrap_or_else(|payload| {
         // The message, when the payload carries one. A bare "panicked" would tell a caller that
@@ -887,9 +942,18 @@ fn run_step(
             );
             break;
         }
-        if let Err(why) = evaluate(d, check, &output, deadline) {
-            result = StepResult::Unmet(why);
-            break;
+        match evaluate(d, check, &output, deadline) {
+            Ok(()) => {}
+            Err(CheckFailed::Unmet(why)) => {
+                result = StepResult::Unmet(why);
+                break;
+            }
+            // Not `Unmet`: nothing was learned about the target, so calling it a failed
+            // assertion would report a verdict the batch never reached.
+            Err(CheckFailed::Expired(why)) => {
+                result = StepResult::Failed(why);
+                break;
+            }
         }
     }
 
@@ -922,22 +986,40 @@ fn run_step(
     }
 }
 
+/// Why an assertion did not hold, which is not one thing.
+///
+/// An assertion that was *checked and failed* is a verdict about the target; one that never got
+/// checked because the clock ran out is a verdict about the batch. They read the same in a report
+/// unless they are kept apart here, and they call for opposite next moves — fix the target, or
+/// give the batch more room.
+enum CheckFailed {
+    Unmet(String),
+    Expired(String),
+}
+
 /// One side of an [`Check::Eval`] comparison: what the debugger makes of a MASM expression.
 ///
-/// Takes the *deadline* rather than a budget, and sizes its own watchdog from the clock at the
-/// moment it runs — a check is two of these, and the second must not be armed with the time the
-/// first one already spent.
-fn eval_value(d: &mut impl Debuggee, expr: &str, deadline: Duration) -> Result<u64, String> {
+/// Takes the *deadline* rather than a budget and re-reads the clock itself, because a check is two
+/// of these and the second must be told what the first one left. It refuses outright rather than
+/// falling back on [`MIN_STEP_BUDGET_MS`] when nothing is left: that floor exists so a query which
+/// *has* to run is never armed with a disabled watchdog, and using it to start a query that did
+/// not have to run would spend the rollback's reserve on an assertion.
+fn eval_value(d: &mut impl Debuggee, expr: &str, deadline: Duration) -> Result<u64, CheckFailed> {
+    if d.elapsed() >= deadline {
+        return Err(CheckFailed::Expired(format!(
+            "the batch ran out of time before `? ({expr})` could be evaluated"
+        )));
+    }
     let budget_ms = step_budget_ms(d.elapsed(), deadline).max(MIN_STEP_BUDGET_MS);
     // Parenthesized, so a relational expression (`@rcx > 0x1000`) is evaluated as one value
     // rather than losing its precedence against whatever `?` does with the rest of the line.
     let text = guarded(|| d.command(&format!("? ({expr})"), budget_ms))
-        .map_err(|why| format!("`? ({expr})` failed: {why}"))?;
+        .map_err(|why| CheckFailed::Unmet(format!("`? ({expr})` failed: {why}")))?;
     parse_eval(&text).ok_or_else(|| {
-        format!(
+        CheckFailed::Unmet(format!(
             "`? ({expr})` printed no value; the debugger answered: {}",
             text.trim()
-        )
+        ))
     })
 }
 
@@ -947,7 +1029,7 @@ fn evaluate(
     check: &Check,
     output: &str,
     deadline: Duration,
-) -> Result<(), String> {
+) -> Result<(), CheckFailed> {
     match check {
         Check::Contains { text } => {
             // Case-insensitive: debugger output mixes symbol casing freely, and a check that
@@ -958,7 +1040,9 @@ fn evaluate(
             {
                 Ok(())
             } else {
-                Err(format!("the output does not contain \"{text}\""))
+                Err(CheckFailed::Unmet(format!(
+                    "the output does not contain \"{text}\""
+                )))
             }
         }
         Check::NotContains { text } => {
@@ -966,7 +1050,9 @@ fn evaluate(
                 .to_ascii_lowercase()
                 .contains(&text.to_ascii_lowercase())
             {
-                Err(format!("the output contains \"{text}\", which it must not"))
+                Err(CheckFailed::Unmet(format!(
+                    "the output contains \"{text}\", which it must not"
+                )))
             } else {
                 Ok(())
             }
@@ -977,11 +1063,11 @@ fn evaluate(
             if left == right {
                 Ok(())
             } else {
-                Err(format!(
+                Err(CheckFailed::Unmet(format!(
                     "`{expr}` is {} ({left:#x}), `{equals}` is {} ({right:#x})",
                     fmt_addr(left),
                     fmt_addr(right)
-                ))
+                )))
             }
         }
     }
@@ -1313,6 +1399,7 @@ mod tests {
             action,
             expect: Vec::new(),
             capture: None,
+            extra: BTreeMap::new(),
         }
     }
 
@@ -1810,6 +1897,76 @@ mod tests {
 
     // ---- validation --------------------------------------------------------
 
+    /// The catch-all must take *only* what the schema does not name. If serde routed a variant's
+    /// own fields into it too, every well-formed step would be refused — so this pins the shape
+    /// the typo check depends on.
+    #[test]
+    fn a_well_formed_step_leaves_nothing_in_the_catch_all() {
+        for json in [
+            serde_json::json!({"op": "command", "command": "lm"}),
+            serde_json::json!({
+                "op": "run_to", "address": "nt!Foo", "timeout_ms": 5000,
+                "name": "go", "expect": [{"check": "contains", "text": "HIT"}]
+            }),
+            serde_json::json!({"op": "eval", "expr": "@rcx", "capture": "x"}),
+            serde_json::json!({"op": "read_memory", "address": "0x1000", "size": 64}),
+            serde_json::json!({"op": "resume", "command": "g"}),
+        ] {
+            let step: BatchStep = serde_json::from_value(json.clone()).expect("valid step");
+            assert!(
+                step.unknown_fields().is_empty(),
+                "{json} left {:?} unaccounted for",
+                step.unknown_fields()
+            );
+        }
+    }
+
+    /// A batch is a value that crosses a process boundary, so it has to survive its own encoding.
+    ///
+    /// Pinned because it did not, once: the typo-catching map is flattened, so serializing it wrote
+    /// `op` and the action's fields a second time, and the worker rejected the duplicate key and
+    /// discarded the request — which costs a caller their session rather than their call, because
+    /// only a reply removes the supervisor's waiter. Unit tests over `run` never touch the wire, so
+    /// nothing but the smoke tier saw it.
+    #[test]
+    fn a_batch_survives_being_encoded_for_the_worker() {
+        let (steps, always) = messagemanager_sequence();
+        let sent = BatchOp {
+            steps,
+            always,
+            budget_ms: 60_000,
+            patience_ms: 60_000,
+        };
+        let line = serde_json::to_string(&sent).expect("a batch must encode");
+        let back: BatchOp = serde_json::from_str(&line).expect("and decode");
+
+        assert_eq!(back.steps.len(), sent.steps.len());
+        assert_eq!(back.always.len(), sent.always.len());
+        for (before, after) in sent.steps.iter().zip(&back.steps) {
+            assert_eq!(before.action.rendered(), after.action.rendered());
+            assert_eq!(before.expect.len(), after.expect.len());
+            assert_eq!(before.capture, after.capture);
+        }
+        // And what came back is still a batch this server would accept.
+        validate(&back.steps, &back.always).expect("a round-tripped batch stays valid");
+    }
+
+    /// The typo that fails *open*: a misspelt `expect` is a step that asserts nothing and commits.
+    #[test]
+    fn a_misspelt_step_field_is_refused_rather_than_ignored() {
+        let step: BatchStep = serde_json::from_value(serde_json::json!({
+            "op": "command",
+            "command": "eb fffff800`00001000 90",
+            "expects": [{"check": "contains", "text": "never seen"}]
+        }))
+        .expect("serde accepts it — which is the problem");
+        assert_eq!(step.expect.len(), 0, "the assertions were silently dropped");
+
+        let why = validate(&[step], &[]).unwrap_err();
+        assert!(why.contains("expects"), "{why}");
+        assert!(why.contains("check the spelling"), "{why}");
+    }
+
     #[test]
     fn a_forward_capture_reference_is_refused_before_anything_runs() {
         let batch = vec![
@@ -2132,6 +2289,45 @@ mod tests {
     /// The path where the rollback guarantee genuinely fails: a step overran so far that even the
     /// reserve is gone. Nothing can be done about it — but the report must say so rather than
     /// leave a caller believing the cleanup ran.
+    /// Within one `eval` check the two queries are sequential, so the second must be told what the
+    /// first left. Falling back on the minimum watchdog would start debugger work the step no
+    /// longer had time for — and spend the rollback's reserve on an assertion.
+    #[test]
+    fn the_second_half_of_an_eval_check_does_not_start_past_the_deadline() {
+        // 60s budget → 30s steps deadline. The left query alone costs 35s.
+        let mut d = stopped()
+            .on("lm", Ok("start end module"))
+            .slow("? (left", Ok(EVAL_ONE), Duration::from_secs(35))
+            .on("? (right", Ok(EVAL_ONE))
+            .on("bc *", Ok(""));
+        let batch = op(
+            vec![BatchStep {
+                expect: vec![Check::Eval {
+                    expr: "left".to_string(),
+                    equals: "right".to_string(),
+                }],
+                ..cmd("lm")
+            }],
+            vec![cmd("bc *")],
+        );
+
+        let report = run(&mut d, &batch, BUDGET);
+
+        assert!(
+            !d.ran("? (right"),
+            "the right-hand query must not start past the deadline: {:?}",
+            d.calls
+        );
+        // A timeout, not an unmet assertion: nothing was learned about the target.
+        assert_eq!(report.outcome, BatchOutcome::TimedOut { at: 1 });
+        assert!(
+            render(&report).contains("ran out of time"),
+            "{}",
+            render(&report)
+        );
+        assert!(d.ran("bc *"), "the reserve survived: {:?}", d.calls);
+    }
+
     #[test]
     fn a_cleanup_step_past_the_whole_budget_is_skipped_and_reported_as_incomplete() {
         // One step costs 100s against a 60s budget, so the `always` block cannot start at all.
