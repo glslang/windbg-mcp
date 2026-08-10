@@ -49,8 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a tool error carrying that whole report.
 
   Validation is up front and engine-free: a forward capture reference, a capture on a step that has
-  no value, a duplicate name, a `;` in a typed operand, an empty or oversized batch are all refused
-  before a single step runs. A batch containing a target-changing command retires the session handle
+  no value, a duplicate name, a `;` in a typed operand, an empty or oversized batch, a deadline too
+  short to seat a step and its reserve, and — uniquely among this server's tools — any field the
+  schema does not name are all refused before a single step runs. The last is there because those
+  typos fail *open*: `"aways"` for `always` is a batch with no rollback that then reports
+  `COMMITTED`, and a misspelt `expect` is a step that asserts nothing and commits anyway. A batch containing a target-changing command retires the session handle
   ahead of running, as `execute` does. The executor drives a `Debuggee` trait rather than DbgEng, so
   assertion failure, a command failure after a mutation, deadline expiry and a rollback that itself
   fails are unit-tested without a debugger; the dump tier drives a real engine to both outcomes.
