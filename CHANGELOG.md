@@ -66,6 +66,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never exceeds the caller's patience. A walk cut short still answers, and every pool result already
   reports how much of the pool it reached.
 
+  Where it parts company with a bounded command is at the bottom of the range: that one *floors* its
+  budget, because zero disables its watchdog and an unbounded command is the worse outcome. A walk
+  has no such cliff — zero simply stops it at the first check — so there is no floor here, and a
+  query that reaches the engine with nothing left to spend is refused rather than run. Flooring it
+  would reintroduce the bug at the small end (a 10s call budget yielding a 15s walk) and buy nothing
+  for it, since win-kexp caches complete snapshots only: a budget-truncated walk is discarded, so the
+  work would be spent for a caller who has gone and the next query would walk from scratch anyway.
+  Only a query that *must* walk is refused; one that can be served from the session's cached snapshot
+  is still answered, because a cache read costs nothing that even an exhausted caller cannot afford.
+
   Which slot the pump fills is now named on `EngineOp` itself rather than matched inside the pump,
   because the failure it prevents is silent — that is exactly how `Pool` came to carry no patience
   at all — and is checked against the serialized form, so an op with a `patience_ms` that does not

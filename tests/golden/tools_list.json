@@ -242,7 +242,7 @@
     {
       "hints": {
         "destructive": false,
-        "idempotent": true,
+        "idempotent": false,
         "openWorld": true,
         "readOnly": false
       },

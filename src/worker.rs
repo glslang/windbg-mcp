@@ -125,22 +125,27 @@ fn watchdog_budget_ms(patience: Duration, queued: Duration) -> u32 {
         .min(u32::MAX as u128) as u32
 }
 
-/// How long a pool walk may run, on the same terms.
+/// How long a pool walk may run: the same arithmetic as [`watchdog_budget_ms`] and the same
+/// headroom, but **no floor** — `None` when the caller's clock has nothing left to give it.
 ///
-/// The same question as [`watchdog_budget_ms`] — how much of the caller's clock is this operation
-/// entitled to spend — so the same answer, rather than a second constant that would drift from it.
-/// What differs is only what runs out of time: win-kexp's walker checks the deadline between reads
-/// and returns the snapshot it has, so a short budget costs *coverage*, and every rendering here
-/// already says how much of the pool the walk reached.
+/// The same question as the watchdog's, so deliberately the same answer rather than a second
+/// constant that would drift from it. What differs is what running out of time *does*. There, zero
+/// disables the bound outright, so a command dequeued past the deadline would be the one command
+/// that runs unbounded, and a floor that overruns the caller by a headroom is the lesser evil. Here
+/// zero merely stops the walk at its first check — so the floor buys nothing and costs the one thing
+/// this budget exists to prevent, a walk still running after its caller gave up. That is #75 in
+/// miniature: with `WINDBG_MCP_CALL_TIMEOUT_SECS=10`, a floored 15s walk outlives *every* call.
 ///
-/// The floor matters for a different reason than the watchdog's, and matters less. There, zero
-/// would disable the bound outright; here it would simply stop the walk on its first check. Keeping
-/// the floor is still the better of the two, because the snapshot a walk builds is cached for the
-/// session: a walk dequeued past its caller's deadline that runs for one headroom leaves the *next*
-/// query something to answer from, where one that gives up immediately leaves it the same walk to
-/// do again.
-fn walk_budget(patience: Duration, queued: Duration) -> Duration {
-    Duration::from_millis(u64::from(watchdog_budget_ms(patience, queued)))
+/// **And it really does buy nothing**, which is the part worth writing down, because the first cut
+/// of this reasoned the other way: a walk cut short by its budget clears `complete`, and
+/// win-kexp caches only complete snapshots — an incomplete one invalidates the entry instead. So a
+/// floored walk for a caller who has gone does 15s of work that is then *discarded*, and the next
+/// query walks from scratch anyway. There is no cache to warm.
+fn walk_budget(patience: Duration, queued: Duration) -> Option<Duration> {
+    let left = patience
+        .saturating_sub(queued)
+        .saturating_sub(WATCHDOG_HEADROOM);
+    (!left.is_zero()).then_some(left)
 }
 
 /// How long the worker gives its engine to let go of the target when the supervisor disappears
@@ -949,14 +954,47 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<S
         // outlives its caller holds this session against nobody. Taking win-kexp's default instead
         // was wrong in both directions — see [`EngineOp::Pool`].
         EngineOp::Pool { query, patience_ms } => {
-            let budget = walk_budget(Duration::from_millis(u64::from(patience_ms)), queued);
-            // Logged because a truncated walk otherwise says only *that* it was truncated, and the
-            // two explanations — this deadline, or a target the walk could not read — want
-            // opposite responses. It is also the only place the number is observable, which is
-            // what `tests/mcp_smoke.rs` asserts against: the previous bug was that no number
-            // crossed the pipe at all.
-            tracing::debug!("worker: pool walk budget {budget:?} (queued {queued:?})");
-            pool(e, query, budget)
+            let patience = Duration::from_millis(u64::from(patience_ms));
+            match walk_budget(patience, queued) {
+                Some(budget) => {
+                    // Logged because a truncated walk otherwise says only *that* it was truncated,
+                    // and the two explanations — this deadline, or a target the walk could not
+                    // read — want opposite responses. It is also the only place the figure is
+                    // observable, which is what `tests/mcp_smoke.rs` asserts against: the bug this
+                    // fixed was that no figure crossed the pipe at all.
+                    tracing::debug!("worker: pool walk budget {budget:?} (queued {queued:?})");
+                    pool(e, query, budget)
+                }
+                // Nothing left to walk in. A query that *must* walk is refused rather than
+                // attempted, because attempting it cannot produce an answer: the walk would be cut
+                // short at its first check, and a truncated snapshot is discarded rather than
+                // cached, so the work would be spent for nobody and the next query would walk from
+                // scratch regardless.
+                None if query.refreshes() => {
+                    tracing::debug!(
+                        "worker: no pool walk budget left (queued {queued:?}); refusing a query \
+                         that must walk"
+                    );
+                    Err(format!(
+                        "This pool query was not run: it reached the engine with {}s of its \
+                         caller's timeout left, which is not enough to walk the pool and report \
+                         back before that timeout expires. It asked for `refresh`, so it cannot \
+                         be answered from the snapshot cached for this session either. Nothing \
+                         was read and nothing changed. It waited {}s behind other work on this \
+                         session; issue it when the session is idle, or raise the server's call \
+                         timeout (WINDBG_MCP_CALL_TIMEOUT_SECS — a pool walk needs more than the \
+                         {}s of headroom the reply itself reserves).",
+                        patience.saturating_sub(queued).as_secs(),
+                        queued.as_secs(),
+                        WATCHDOG_HEADROOM.as_secs(),
+                    ))
+                }
+                // Without `refresh` the session's cached snapshot may well answer this outright, and
+                // a caller with no time left can certainly afford a cache read. Passed zero rather
+                // than refused: if a walk *is* needed it stops at once and the answer says its
+                // coverage was nil, which every rendering below already does.
+                None => pool(e, query, Duration::ZERO),
+            }
         }
         EngineOp::Batch(op) => run_batch(e, op, queued),
         // Answered by the request reader, which is the only way it could reach a busy engine at
@@ -2536,7 +2574,7 @@ mod tests {
         const WIN_KEXP_DEFAULT: Duration = Duration::from_secs(120);
 
         let short = Duration::from_secs(60);
-        let budget = walk_budget(short, Duration::ZERO);
+        let budget = walk_budget(short, Duration::ZERO).expect("60s leaves time to walk in");
         assert!(
             budget < short,
             "a walk under a {short:?} call budget got {budget:?}; it would still be walking when \
@@ -2549,7 +2587,7 @@ mod tests {
 
         let generous = Duration::from_secs(300);
         assert!(
-            walk_budget(generous, Duration::ZERO) > WIN_KEXP_DEFAULT,
+            walk_budget(generous, Duration::ZERO).expect("300s does too") > WIN_KEXP_DEFAULT,
             "a caller who can wait five minutes should not be handed a partial snapshot at two"
         );
     }
@@ -2557,17 +2595,79 @@ mod tests {
     /// The same invariant the bounded command holds, for the same reason: **queue wait + walk
     /// budget must not exceed the caller's patience**. A pool query can sit behind another job on
     /// its session, and a budget derived from the patience as sent would spend it all again.
+    ///
+    /// Checked down to patiences *below* the headroom, which is where the first cut of this failed:
+    /// it borrowed the watchdog's floor, so every patience under 15s got a 15s walk. A 10s call
+    /// budget yielded a walk allowed to run half again as long as the call — #75's own complaint,
+    /// arriving at the small end.
     #[test]
     fn a_queued_pool_walk_still_stops_before_its_caller_gives_up() {
-        let patience = Duration::from_secs(300);
-        for waited in [0, 1, 30, 100, 240, 269] {
-            let waited = Duration::from_secs(waited);
-            let budget = walk_budget(patience, waited);
-            assert!(
-                waited + budget <= patience,
-                "a walk dequeued after {waited:?} got {budget:?} — it would still be walking at \
-                 the {patience:?} mark"
-            );
+        for patience in [10, 15, 20, 60, 300] {
+            let patience = Duration::from_secs(patience);
+            for waited in [0, 1, 5, 30, 100, 240, 269, 400] {
+                let waited = Duration::from_secs(waited);
+                // No budget means no walk, which trivially cannot outlive anybody.
+                let Some(budget) = walk_budget(patience, waited) else {
+                    continue;
+                };
+                assert!(
+                    waited + budget <= patience,
+                    "a walk dequeued after {waited:?} of a {patience:?} budget got {budget:?} — it \
+                     would still be walking after its caller gave up"
+                );
+            }
         }
+    }
+
+    /// A caller who cannot be answered gets **no walk at all**, rather than one floored to a
+    /// headroom.
+    ///
+    /// Two ways in, and both are real: a server configured with a call timeout at or under the
+    /// headroom, and a query dequeued after its caller has given up. Neither can be answered, and
+    /// the work would not even leave a cache behind — win-kexp caches complete snapshots only, so a
+    /// budget-truncated walk is discarded and the next query walks again regardless.
+    #[test]
+    fn a_pool_walk_with_no_time_left_is_not_run_at_all() {
+        assert_eq!(
+            walk_budget(Duration::from_secs(10), Duration::ZERO),
+            None,
+            "a 10s call budget is entirely reply headroom; there is no walk to be had"
+        );
+        assert_eq!(
+            walk_budget(WATCHDOG_HEADROOM, Duration::ZERO),
+            None,
+            "and the headroom itself is the boundary, not the first affordable value"
+        );
+        assert_eq!(
+            walk_budget(WATCHDOG_HEADROOM + Duration::from_millis(1), Duration::ZERO),
+            Some(Duration::from_millis(1)),
+            "one millisecond past it is a walk, however short"
+        );
+        // The queue-wait route to the same place: patience that was ample when the request was
+        // written and is spent by the time the engine reaches it.
+        assert_eq!(
+            walk_budget(Duration::from_secs(300), Duration::from_secs(290)),
+            None
+        );
+        assert_eq!(
+            walk_budget(Duration::from_secs(300), Duration::from_secs(400)),
+            None,
+            "and a wait past the whole budget saturates rather than wrapping to a huge one"
+        );
+    }
+
+    /// The refusal applies to a query that **must** walk. One that may be served from the cached
+    /// snapshot is still worth trying, because a cache read costs nothing that a caller with no time
+    /// left cannot afford.
+    #[test]
+    fn only_a_query_that_must_walk_is_refused_for_want_of_time() {
+        assert!(PoolOp::census(Some(true), None).refreshes());
+        assert!(PoolOp::find_tag("Tgsm".into(), None, Some(true), None).refreshes());
+        assert!(PoolOp::chunk("0x1000".into(), Some(true)).refreshes());
+        assert!(PoolOp::diagnostics(None, Some(true), None).refreshes());
+
+        // The default, and the reason the distinction is worth making at all.
+        assert!(!PoolOp::census(None, None).refreshes());
+        assert!(!PoolOp::chunk("0x1000".into(), Some(false)).refreshes());
     }
 }

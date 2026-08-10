@@ -1932,6 +1932,61 @@ fn a_pool_walk_takes_this_servers_deadline_not_the_walkers_default() {
     server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
 }
 
+/// A pool query with no time left to walk in is **refused**, not floored to a headroom and run for
+/// a caller who has already gone.
+///
+/// The budget borrowed the bounded command's floor at first, which is right *there* — zero disables
+/// that watchdog, so an unbounded command is the worse outcome — and wrong here, where zero merely
+/// stops the walk at its first check. Floored, a 10s call budget bought a 15s walk: #75's own
+/// complaint at the small end. And it bought nothing for it, since win-kexp caches complete
+/// snapshots only, so the truncated result is discarded and the next query walks from scratch
+/// regardless.
+///
+/// A 10s call budget is entirely reply headroom, so this needs no queue wait to stage — which is
+/// what keeps it in the tier that runs on a push. The open has to land inside that budget too; if
+/// it does not, the test skips rather than reporting a failure about the wrong thing.
+#[test]
+fn a_pool_query_with_no_time_to_walk_is_refused_rather_than_run() {
+    let Some(dump) = target_tier() else { return };
+    let mut server = Server::started_with(&[("WINDBG_MCP_CALL_TIMEOUT_SECS", "10")]);
+
+    let opened = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
+    assert_no_error(&opened, "open_dump");
+    if is_tool_error(&opened) {
+        skip("the sample dump did not open inside a 10s call budget on this machine");
+        return;
+    }
+    let session = session_id_of(&text_of(&opened["result"]));
+
+    // `refresh`, so the cached snapshot cannot answer it and a walk is unavoidable.
+    let response = server.call_tool(
+        "pool_census",
+        json!({ "session_id": session, "refresh": true }),
+        TARGET_STEP,
+    );
+    assert_no_error(&response, "pool_census with no walk budget");
+    let text = text_of(&response["result"]);
+    assert!(
+        is_tool_error(&response) && text.contains("was not run"),
+        "a pool query that must walk, reaching the engine with no time to walk in, should be \
+         refused with an explanation naming the call timeout — not floored to a headroom and run \
+         for nobody:\n{text}"
+    );
+    assert!(
+        text.contains("WINDBG_MCP_CALL_TIMEOUT_SECS"),
+        "and the refusal has to name the knob that fixes it:\n{text}"
+    );
+
+    // The session is untouched by the refusal — nothing was read, so nothing is in a odd state.
+    let after = server.call_tool("modules", json!({ "session_id": session }), TARGET_STEP);
+    assert!(
+        !is_tool_error(&after),
+        "the session should be unaffected by a refused query:\n{}",
+        text_of(&after["result"])
+    );
+    server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
+}
+
 /// The interrupt, end to end: a command that would run for hours is stopped **on request**, the
 /// call that started it gets its partial output back as a result, and the session takes the next
 /// call at once.
