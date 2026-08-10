@@ -5,6 +5,45 @@ status. Keep entries short; link to code with `file:line` where it helps a futur
 
 ---
 
+## An interrupt is bound to a job, not to a moment (2026-08-10, FOLLOWUPS item 7)
+
+**Context.** A runaway call had one way out: `end_session`, which ends it by discarding the target.
+The primitive for a gentler one existed but was only ever *timeout-driven* — win-kexp's watchdog
+threads Ctrl+Break when a deadline passes, and no caller could ask for the same. What stopped it
+being a five-line change is that `SetInterrupt` addresses an **engine**, not an operation.
+
+**Decision.** `interrupt` is a per-session tool, and the binding to a job is made **in the worker,
+under one lock**. The request reader reads which job the engine thread is claiming and raises the
+interrupt while holding `RUNNING`; the engine thread claims and releases that job under the same
+lock (`src/worker.rs`). So an interrupt reaches the job that was running when it arrived, or nothing
+at all — it can never land on the one after it — and the job it reached *spends* it: any break the
+engine did not consume is drained before the next job starts, and only that caller's reply is marked
+cut short.
+
+**Why the lock rather than a check.** Read-then-raise without it is a race against an ordinary job
+boundary, and losing it means a caller's `go` aborted by a cancel meant for the search before it,
+with nothing in the record to say why. That is a rare accident today and the *normal* case under
+tasks (FOLLOWUPS item 8), where several calls in flight is the point — which is why this was built
+now rather than deferred with it.
+
+**Answered by the reader, never queued**, exactly like the abandon-a-batch signal (2026-08-09
+above), and here it is the whole mechanism rather than an ordering detail: queued, the request would
+be read only once the operation it means to stop had ended.
+
+**One thing had to change in win-kexp**, and it is not the `SetInterrupt` call. The handle and the
+engine share a "raised" flag, so `execute_command_bounded` can tell an aborted `Execute` from a
+failed one **without being the thread that asked**. Without it an interrupt on request is a
+`CommandFailed` and the output captured up to the break goes with it — most of what an interrupted
+search is worth. The watchdog's explanatory note stays the watchdog's: it exists because nobody saw
+that deadline pass, whereas this caller is the one who asked.
+
+**Status.** Adopted. What it deliberately does **not** do: drop a *queued* job (nothing can name one
+— a tool call names a session, so that variant belongs with `tasks/cancel`), and reach a live-kernel
+wait whose target has not connected (`SetInterrupt` cannot, so the tool says so instead of reporting
+a success that does nothing). `end_session` remains the answer to that one.
+
+---
+
 ## The rollback belongs to the worker, not the client (2026-08-09, #82)
 
 **Context.** Multi-step debugger work that mutates a target — patch a byte, arm a breakpoint,
@@ -108,9 +147,11 @@ never ran a batch. When the worker named a release interval too, the supervisor 
 its advertised bound raced the wait's last look and could be killed as the release began.
 
 A session with nothing to unwind says nothing and costs exactly what it always did, so an ordinary
-disconnect is untouched. What none of this can do is *shorten* a step already inside DbgEng — that
-is `SetInterrupt` bound to job identity, FOLLOWUPS item 7 — so a batch stops at its next step
-boundary, not where it stands.
+disconnect is untouched. What none of this can do is *shorten* a step already inside DbgEng, so a
+batch stops at its next step boundary, not where it stands. The primitive for that now exists —
+FOLLOWUPS item 7 landed as `interrupt` (see the entry above) — and a teardown still does not raise
+it, because what it would buy is latency rather than safety: the grace already covers the step in
+flight, and Ctrl+Breaking it would turn a step that was about to succeed into a failed one.
 
 **Status.** Adopted, and the two things it owed are now paid (2026-08-10). **Pool steps** (FOLLOWUPS
 item 17) landed as one `StepAction` variant per question rather than a generic "call a tool" step,
@@ -118,7 +159,9 @@ which would have put every tool's arguments in the batch schema twice; the part 
 anticipated is that a walk needs a deadline *from the batch*, because win-kexp bounds one at 120s and
 an ordinary batch's whole budget is shorter — a refreshed pool step taking that default would spend
 the rollback's reserve and overrun the bound advertised to a teardown, which is the failure above
-arriving through the one step that is not a command. And the **mutating batch** (item 16) is now
+arriving through the one step that is not a command. The pool *tools* went on taking that default
+until [#75](https://github.com/glslang/windbg-mcp/issues/75) gave them the call's own patience, on
+the same arithmetic as a bounded command. And the **mutating batch** (item 16) is now
 exercised on a live kernel, which is the only place the claim can be false: a byte patched in a dump
 is patched in a file nobody reads again, so a rollback that silently did nothing satisfies every
 assertion the dump tier can make.

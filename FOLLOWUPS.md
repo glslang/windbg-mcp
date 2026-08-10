@@ -11,12 +11,14 @@ why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md)
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
 Items are roughly ordered by how soon they're worth doing, within each cluster. **Item 10 has
-landed** (process-per-session, 2026-08-02); it is kept here rather than deleted because items 7, 8
-and 9 were all written against the single-engine design it replaced, and each now says what moved.
+landed** (process-per-session, 2026-08-02); it is kept here rather than deleted because items 8 and
+9 were both written against the single-engine design it replaced, and each now says what moved.
 **Items 16, 17 and 18 have landed** (2026-08-10) and are kept for the opposite reason: each turned
 out to need something its entry did not anticipate — item 18 needed much less of item 7 than it
-claimed to (item 7 should be read knowing which half of it is still owed), item 17 needed a walk
-deadline nothing had asked for, and item 16 needed a probe before it could measure anything at all.
+claimed to, item 17 needed a walk deadline nothing had asked for, and item 16 needed a probe before
+it could measure anything at all. **Item 7 has landed** too (2026-08-10, the `interrupt` tool), and
+is kept because item 8 rests on it: what it built is the job binding, and what it deliberately did
+not build is the queued-job half that only `tasks/cancel` can ask for.
 
 ## 1. [win-kexp] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -78,52 +80,68 @@ than the human/LLM-readable recipe emitted today.
   debugger memory snapshot rather than building an in-house solver — kernel state modeling, loops,
   hashing, and stateful protocols make it brittle and a separate project.
 
-## 7. [win-kexp + windbg-mcp] On-demand engine interrupt
+## 7. [win-kexp + windbg-mcp] On-demand engine interrupt — **done** (2026-08-10)
 
 Expose `SetInterrupt` as a public win-kexp method (and a `Send` handle obtainable from a
-`&DebugEngine`), then plumb it through to a per-session `interrupt()`. Today the primitive exists
-but is only ever *timeout-driven*: `execute_command_bounded` (win-kexp `src/dbgeng.rs:607`) and
-`wait_for_event_bounded` (`:716`) each spawn a watchdog thread holding an `InterruptHandle` and
-Ctrl+Break the engine when a deadline passes. There is no way for a caller to ask for that now.
+`&DebugEngine`), then plumb it through to a per-session `interrupt()`. The primitive existed but was
+only ever *timeout-driven*: `execute_command_bounded` and `wait_for_event_bounded` each spawn a
+watchdog thread holding an `InterruptHandle` and Ctrl+Break the engine when a deadline passes, and
+no caller could ask for the same.
 
-`InterruptHandle` (`src/dbgeng.rs:115-119`) already carries the reasoning: `SetInterrupt` is the one
-DbgEng call documented as safe from another thread, so this needs no new threading model — the
-engine stays confined to its one thread (`src/worker.rs`) and the interrupt arrives from outside it,
-exactly as it does today.
+`InterruptHandle` already carried the reasoning: `SetInterrupt` is the one DbgEng call documented as
+safe from another thread, so this needed no new threading model — the engine stays confined to its
+one thread (`src/worker.rs`) and the interrupt arrives from outside it, exactly as it always did.
 
-**Reshaped by item 10.** The interrupt is now a *per-session* concern: it has to reach one worker's
-engine, and it cannot travel as an ordinary op, because a worker whose engine is wedged is exactly
-the one not draining its *engine* queue — it needs a request the worker's reader thread acts on
-where it reads it.
+**Reshaped by item 10, half-built by item 18.** The interrupt is a *per-session* concern: it has to
+reach one worker's engine, and it cannot travel as an ordinary op, because it would be read only
+once the operation it means to stop had ended. Item 18 built that half — `worker::run`'s reader acts
+on a request where it reads it — and settled the channel question: no side channel was needed,
+because the reader was never blocked.
 
-**Item 18 built that half.** `worker::run`'s reader loop acts on `EngineOp::EndSession` where it
-reads it, before queueing it, so the signal lands while the engine is busy. What is left for this
-item is the part that touches DbgEng — `SetInterrupt` as a public win-kexp method, bound to job
-identity so a cancel cannot Ctrl+Break an unrelated job. The channel question is settled; no side
-channel was needed, because the reader was never blocked.
-The urgency dropped with the same change: `end_session` already ends any call by terminating the
-session, so an interrupt is no longer the only way out of a runaway command, just the graceful one
-that keeps the target.
+Landed as the `interrupt` tool. What each half turned out to be:
 
-- **Why it comes first:** it is what would give item 8's `tasks/cancel` anything to do — the spec's
+- **win-kexp:** `InterruptHandle` is public, `Send + Sync`, and holds an owned `IDebugControl4`
+  rather than a borrowed pointer — a handle a host can keep would otherwise dangle past the engine
+  it came from. Both watchdogs now go through it, which is what makes the second part work: the
+  handle and the engine share a `raised` flag, so `execute_command_bounded` can tell an aborted
+  `Execute` from a failed one **without being the thread that asked**. Without that, an interrupt on
+  request came back as `CommandFailed` and threw away every line the command had produced — most of
+  what an interrupted search is worth. No note is appended for a requested interrupt, unlike the
+  watchdog's: that one explains a deadline nobody saw pass, whereas this caller is the one who
+  asked.
+- **windbg-mcp:** the reader answers `EngineOp::Interrupt` outright and never queues it. Job
+  identity is a `Running { job, interrupted }` under one lock: the reader reads the running job and
+  raises under it, the engine thread claims and releases under it, so an interrupt reaches the job
+  that was running when it arrived or nothing at all. The job it reached **spends** it — a pending
+  break is drained before the next job starts, and only that caller's reply is marked cut short.
+
+- **Why it came first:** it is what would give item 8's `tasks/cancel` anything to do — the spec's
   cancellation is cooperative, so acknowledging one conforms, but a session blocked inside DbgEng
-  cannot act on it at all *without being thrown away*. It stands alone too: it gives an operator a
-  way to abort a runaway `execute` before `ENGINE_CALL_TIMEOUT` (`src/main.rs`, 300s) elapses,
-  keeping the target that `end_session` would discard.
-- **A bare `interrupt()` would hit the wrong job.** `SetInterrupt` addresses one engine, meaning
-  whichever operation that session is *currently running* — but each session's queue is FIFO with
-  one consumer, and item 8 makes several calls in flight at once the normal case rather than the
-  exception. Cancelling a task whose job is still queued would then Ctrl+Break an unrelated
-  task's running operation, and the cancelled job would go on to execute anyway when its turn came:
-  `Sessions::call` already documents that a timeout abandons the wait and that the job itself is
-  *not* cancelled. So the interrupt has to be bound to job identity — the engine tracks which job
-  is active, a cancel for a queued job drops it from the queue, and `SetInterrupt` fires only when
-  the cancelled job is the running one. That is the substance of this item, not an add-on to it.
-- **Known limit, carried from win-kexp `src/dbgeng.rs:726`:** `SetInterrupt` cannot unblock a
-  live-kernel wait until the target is *connected*. So the `attach_kernel` KDNET park documented in
-  `CLAUDE.md` — the case that most wants cancelling — is not cancellable this way; only tearing down
-  the process ends it. That limit is what motivated item 10, which has since landed and made that
-  teardown a supported, in-band operation (`end_session`).
+  cannot act on it at all *without being thrown away*. It stands alone too, which is how it shipped:
+  an operator can abort a runaway `execute` before `ENGINE_CALL_TIMEOUT` (`src/main.rs`, 300s)
+  elapses, keeping the target that `end_session` would discard.
+- **A bare `interrupt()` would hit the wrong job**, and this is the part that needed designing
+  rather than plumbing. `SetInterrupt` addresses one engine, meaning whichever operation that
+  session is *currently running* — so raised a moment late it Ctrl+Breaks whatever started next.
+  Today that is a race against a job boundary; under item 8, with several calls in flight as the
+  normal case, it is the ordinary outcome of cancelling a task whose job is still queued. The lock
+  above closes the race and is the foundation the queued case needs: `tasks/cancel` for a job that
+  has not started should drop it from the queue rather than raise anything, and that is a *second*
+  variant of this request (one naming a job id) rather than a change to what landed. It is not
+  built, because nothing can name a job id yet — a tool call names a session.
+- **Known limit, unchanged:** `SetInterrupt` cannot unblock a live-kernel wait until the target is
+  *connected*. So the `attach_kernel` KDNET park documented in `CLAUDE.md` — the case that most
+  wants cancelling — is not cancellable this way; only tearing down the process ends it, which
+  item 10 made an in-band operation (`end_session`). The tool says so rather than reporting a
+  success that does nothing.
+- **Proof:** win-kexp's `test_command_interrupted_on_request_keeps_its_output` (live, `#[ignore]`d)
+  holds the partial-output-as-`Ok` claim the shared flag exists for; `src/worker.rs` unit-tests the
+  binding against a local `Running` (both orderings of the race, staged — which against the real
+  one would mean interrupting an engine at an exact instant); and `tests/mcp_smoke.rs`'s
+  `a_running_command_is_interrupted_on_request_and_frees_its_session` drives the whole thing through
+  the shipped binary, which is the only place both halves exist. That last one is in the ordinary
+  dump tier rather than the ignored one: the interrupt lands in milliseconds, so nothing waits out a
+  deadline — measured at 203ms against a `.for` sized to run for hours.
 
 ## 8. [windbg-mcp] Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663)
 
@@ -152,11 +170,15 @@ Suggested order, chosen so the protocol work is proved before it touches DbgEng:
    pure protocol work with no debugger risk.
 2. `open_dump` / `open_trace` / `index_trace` / `attach_kernel` — where the pain actually is, and
    where `session_status` can shrink to a thin adapter over `tasks/get`.
-3. `go` / `run_to_address` / `execute` — best held until item 7 lands. `tasks/cancel` is
-   *cooperative* by spec: acknowledging it while the work runs on to some terminal state is
-   conformant, so these are implementable without an interrupt. But for exactly these three the
-   session's engine is blocked inside DbgEng, so until item 7 the only effort the server can make
-   is ending the session outright — a heavier answer than a cancel should be.
+3. `go` / `run_to_address` / `execute` — these were held for item 7, which has landed. `tasks/cancel`
+   is *cooperative* by spec, so they were implementable without an interrupt; what they lacked was
+   any way to make an effort short of ending the session outright, since for exactly these three the
+   engine is blocked inside DbgEng. Now a cancel for the *running* job can raise the interrupt item 7
+   built, and the job returns what it reached. A cancel for a job still **queued** is the half item 7
+   did not build, and this is what would ask for it: drop it from the queue and answer its waiter,
+   rather than raise anything — a bare interrupt would Ctrl+Break the unrelated job that is actually
+   running. It needs a second request variant naming a job id, and the lock item 7 put in is what
+   makes both safe together.
 
 Fast, pure tools (`decode_ioctl`, `registers`, `read_memory`, `modules`, `threads`, `disassemble`,
 `backtrace`, `session_status`) should stay synchronous.
@@ -166,8 +188,9 @@ Fast, pure tools (`decode_ioctl`, `registers`, `read_memory`, `modules`, `thread
     `failed`; a kernel attach waits indefinitely by design. Attaches need `ttl_ms: None`, or the task
     reports a failure while the attach is still genuinely pending — the exact false report the
     conversion was meant to remove.
-  - **An `attach_kernel` task must not report `cancelled`.** Item 7's interrupt cannot unblock a
-    KDNET wait before the target connects, so a cancel cannot end that job — and the job is not
+  - **An `attach_kernel` task must not report `cancelled`.** Item 7's interrupt does not unblock a
+    KDNET wait before the target connects — `SetInterrupt` cannot reach it — so a cancel cannot end
+    that job — and the job is not
     inert while it runs: the attach self-heals and *lands* the moment the target dials in, replacing
     the current target. A task that went `cancelled` on request would therefore have the session
     swapped underneath a client that believes the operation is over. Cooperative cancellation is the
@@ -405,7 +428,10 @@ reserve the rollback lives on and overrun the bound the worker advertises to a t
 which is a worker terminated mid-transaction. `PoolWalk::within` already existed for exactly this
 ("a host that knows its own deadline should pass that instead of taking this"), so a pool step now
 passes its own step budget and a walk cut short reports its coverage as it always did. The pool
-*tools* still take the default; giving them the call's patience is [#75](https://github.com/glslang/windbg-mcp/issues/75).
+*tools* took the default until [#75](https://github.com/glslang/windbg-mcp/issues/75) gave them the
+call's patience on the same arithmetic (2026-08-10); `None` — the walker's own default — is now
+reachable from neither caller, which is right, because neither is a human at a prompt who could
+Ctrl+C a walk that ran long.
 
 ## 18. [windbg-mcp] Let a running batch finish its rollback when the client disconnects — **done**
 

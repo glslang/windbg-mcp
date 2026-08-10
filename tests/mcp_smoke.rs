@@ -1867,6 +1867,203 @@ fn a_failed_debugger_operation_is_a_tool_error_not_a_protocol_error() {
     );
 }
 
+/// A pool query's walk is bounded by **this server's** deadline, not by the walker's own default
+/// ([#75](https://github.com/glslang/windbg-mcp/issues/75)).
+///
+/// Asserted against the worker's log rather than against the answer, because on a dump the number
+/// has no visible consequence: the pool is local memory and any walk finishes in well under a
+/// second, so every budget from 15s to 120s produces the identical result. Only a live kernel makes
+/// the difference observable in an answer — which is exactly why this shipped wrong. `Pool` carried
+/// no patience at all and quietly took 120s however long its caller was willing to wait, and no
+/// test that looked at results could have seen it.
+///
+/// So this checks the one thing that *is* observable here: the figure the worker derived, which is
+/// the whole chain — the supervisor filling the slot in as it writes the request, and the worker
+/// turning it into a walk deadline. The query itself is allowed to fail (the sample dump has no
+/// symbols for the pool layout on a CI machine, and resolving them is the live tier's job); the
+/// budget is computed and logged before any of that is attempted.
+#[test]
+fn a_pool_walk_takes_this_servers_deadline_not_the_walkers_default() {
+    let Some(dump) = target_tier() else { return };
+    // 60s of call budget: enough that the 15s headroom leaves a distinctive 45s, and short enough
+    // that taking the walker's 120s default would be the bug this pins — a walk outliving its
+    // caller.
+    let mut server = Server::started_with(&[
+        ("WINDBG_MCP_CALL_TIMEOUT_SECS", "60"),
+        ("RUST_LOG", "windbg_mcp=debug"),
+    ]);
+    let session =
+        session_id_of(&server.tool_text("open_dump", json!({ "path": dump }), TARGET_STEP));
+
+    // Not `tool_text`: whether the walk itself succeeds depends on symbols this tier does not
+    // require, and the budget is derived before the first pool page is read either way.
+    let _ = server.call_tool(
+        "pool_census",
+        json!({ "session_id": session, "refresh": true }),
+        TARGET_STEP,
+    );
+
+    assert!(
+        server.wait_for_stderr("pool walk budget", Duration::from_secs(20)),
+        "the worker logged no walk budget at all, so the query reached the walker without one \
+         and took its 120s default:\n--- stderr ---\n{}",
+        server.stderr()
+    );
+    let log = server.stderr();
+    let budget = log
+        .lines()
+        .find_map(|line| line.split("pool walk budget ").nth(1))
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no budget on the line that carries it:\n{log}"));
+    // A range, not the exact figure: the patience the supervisor sends is what is left of the 60s
+    // when the request is *written*, so the milliseconds already spent come off it. Wide enough to
+    // ignore those, narrow enough that neither the 15s floor nor the walker's 120s default is
+    // inside it. Parsed from `Duration`'s own rendering, so a budget in milliseconds or
+    // microseconds fails to parse rather than passing as a small number of seconds.
+    let seconds: f64 = budget
+        .strip_suffix('s')
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("`{budget}` is not a whole-seconds walk budget"));
+    assert!(
+        (40.0..=46.0).contains(&seconds),
+        "the worker derived a {seconds}s walk budget; the 60s call timeout less the 15s headroom \
+         the reply needs is ~45s. 120s means the walker's default, 15s means no patience arrived."
+    );
+    server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
+}
+
+/// The interrupt, end to end: a command that would run for hours is stopped **on request**, the
+/// call that started it gets its partial output back as a result, and the session takes the next
+/// call at once.
+///
+/// This is the only place the whole mechanism exists. win-kexp proves `SetInterrupt` reaches a
+/// running command; what is unproven there is everything that makes it usable from a client — that
+/// the interrupt travels on the session's queue and is *answered by the worker's request reader*
+/// rather than queued behind the very operation it means to stop, and that the binding to the
+/// running job survives the round trip. Queue it like an ordinary op and every assertion below
+/// still passes except the one that matters: the interrupt would be read after the command ended.
+///
+/// Fast by construction — the interrupt lands in milliseconds, so this stays in the tier that runs
+/// on a `WINDBG_MCP_SMOKE_DUMP=1` push rather than in the ignored one that waits out deadlines. It
+/// borrows that tier's runaway helpers (below) because the probe is the same: a `.for` that polls
+/// for the break and leaves its progress in `$t0`.
+#[test]
+fn a_running_command_is_interrupted_on_request_and_frees_its_session() {
+    let Some(dump) = target_tier() else { return };
+    // A short call budget so a failure fails *fast*: if the interrupt never lands, the watchdog
+    // ends the runaway at the 15s floor and the assertions below say so, instead of this test
+    // sitting out five minutes of the default timeout.
+    let mut server = Server::started_with(&[("WINDBG_MCP_CALL_TIMEOUT_SECS", "30")]);
+    let session =
+        session_id_of(&server.tool_text("open_dump", json!({ "path": dump }), TARGET_STEP));
+
+    // An idle session says so and does nothing. Deterministic: the open above has been answered
+    // and nothing else is outstanding.
+    let idle = server.tool_text(
+        "interrupt",
+        json!({ "session_id": session }),
+        Duration::from_secs(20),
+    );
+    assert!(
+        idle.contains("Nothing was running"),
+        "an idle session has nothing to interrupt, and should say so rather than raise a break \
+         the next call would wear:\n{idle}"
+    );
+
+    // Now the real thing. Sent without waiting, because the interrupt has to reach a session that
+    // is *busy* — which is the arrangement the whole design is about.
+    let started = Instant::now();
+    let runaway = server.send_request(
+        "tools/call",
+        json!({
+            "name": "execute",
+            "arguments": { "command": runaway_command("$t0"), "session_id": session },
+        }),
+    );
+
+    // Retried until it reports it reached something, rather than sent once after a sleep: the
+    // command is queued the instant the request is written, but the worker claims it a moment
+    // later, and an interrupt that arrives in that gap correctly binds to nothing. Racing it is
+    // the test's problem, not the server's.
+    let interrupt_deadline = Instant::now() + Duration::from_secs(10);
+    let raised = loop {
+        std::thread::sleep(Duration::from_millis(100));
+        let reply = server.tool_text(
+            "interrupt",
+            json!({ "session_id": session }),
+            Duration::from_secs(20),
+        );
+        if reply.contains("Interrupted") {
+            break reply;
+        }
+        assert!(
+            Instant::now() < interrupt_deadline,
+            "10s of interrupts all found the session idle while a command that runs for hours was \
+             outstanding — the interrupt is being queued behind it instead of answered by the \
+             reader:\n{reply}"
+        );
+    };
+    // The interrupt answers while the command it stopped is still outstanding. That is the part
+    // that cannot be true if the request is queued.
+    assert!(
+        raised.contains("Ctrl+Break"),
+        "the interrupt should say what it did:\n{raised}"
+    );
+
+    let response = server.await_id(runaway, "the interrupted command", Duration::from_secs(60));
+    let elapsed = started.elapsed();
+    assert_no_error(&response, "an interrupted command");
+    let out = text_of(&response["result"]);
+    assert!(
+        !is_tool_error(&response),
+        "an interrupted command must come back as a result carrying what it reached, not as a \
+         failure — the interrupt is not an error condition ({elapsed:?}):\n{out}"
+    );
+    assert!(
+        out.contains("interrupted on request"),
+        "the caller of the interrupted command is the one who cannot otherwise know why their \
+         result is short, so it has to say:\n{out}"
+    );
+    // The watchdog's floor is 15s (30s call budget less the headroom), so anything under that
+    // could only have been the request. Without this the test would pass on a run where the
+    // interrupt did nothing and the deadline did all the work.
+    assert!(
+        elapsed < Duration::from_secs(14),
+        "the command took {elapsed:?}, which is the watchdog's floor rather than the interrupt — \
+         this run proves nothing about the request path"
+    );
+    assert!(
+        !out.contains("interrupted after"),
+        "and it carries the watchdog's note, so it was the deadline that ended it:\n{out}"
+    );
+
+    // Proof it was cut short rather than having finished: the loop counter, as in the bounded
+    // tier. A note alone would be produced by an interrupt the engine ignored.
+    let counter = server.tool_text(
+        "execute",
+        json!({ "command": "r $t0", "session_id": session }),
+        TARGET_STEP,
+    );
+    let t0 = pseudo_register(&counter, "$t0")
+        .unwrap_or_else(|| panic!("could not read $t0 back from:\n{counter}"));
+    println!("interrupted after {elapsed:?}, $t0 = {t0:#x} of {RUNAWAY_ITERATIONS:#x}");
+    assert!(t0 > 0, "the loop never started ($t0 = {t0:#x})");
+    assert!(
+        t0 < RUNAWAY_ITERATIONS,
+        "the loop ran to completion ($t0 = {t0:#x}) — nothing cut it short"
+    );
+
+    // And the session is genuinely free, not merely answering: `r $t0` above already ran on it,
+    // and this is the call that would have been aborted had the break been left pending.
+    let after = server.call_tool("modules", json!({ "session_id": session }), TARGET_STEP);
+    assert!(
+        !is_tool_error(&after),
+        "the session was not usable after the interrupt:\n{}",
+        text_of(&after["result"])
+    );
+    server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
+}
+
 // ---- tier 3: the bounded-command path -----------------------------------------
 //
 // These deliberately run a command that would take hours and wait for a watchdog to cut it short,

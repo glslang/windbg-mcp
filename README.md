@@ -38,7 +38,9 @@ process. Two things follow, and they are why it is built this way:
 - **`worker.rs`** — the child process. The `DebugEngine` is created on, and confined to, one OS
   thread inside it (DbgEng requires serialized, single-thread access, and `WaitForEvent` must run on
   the session-owning thread). A `catch_unwind` guard turns a panic in one operation into a failed
-  call rather than a dead session.
+  call rather than a dead session. The *request reader* is a second thread that only ever reads and
+  hands on, so it is never blocked by the engine — which is what makes `interrupt` and the
+  abandon-a-batch signal deliverable to a worker that is busy.
 - **`proto.rs`** — the line-delimited JSON protocol between the two. A closure cannot cross a
   process boundary, so what used to be closures marshalled onto the engine thread are now
   serializable operations — deliberately *tool*-shaped rather than DbgEng-shaped, so a tool that is
@@ -246,7 +248,7 @@ gh attestation verify <zip> --repo glslang/windbg-mcp `
 
 | Group | Tools |
 |-------|-------|
-| Session | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `end_session`, `session_status` |
+| Session | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `interrupt`, `end_session`, `session_status` |
 | State   | `registers`, `read_memory`, `backtrace`, `modules`, `threads`, `disassemble`, `dx` |
 | Control | `go`, `step_over`, `step_into`, `set_breakpoint`, `run_to_address` |
 | Transaction | `debug_batch` — an ordered sequence with assertions and a rollback the engine process runs on every path |
@@ -280,6 +282,16 @@ is that the call can never land on a target you did not open — it fails loudly
 `session_status` lists every session — what it is, what state it is in, how long it has been there,
 and which one is current — or reports on one you name. It never queues on any worker, so it answers
 even while a session is parked.
+
+**Stopping a call that is taking too long.** `interrupt` Ctrl+Breaks a session's engine, exactly as
+Ctrl+Break does at a WinDbg prompt, and leaves the session and its target alone. Call it while the
+slow call is still outstanding — it travels on the session's queue but is answered by the worker's
+*request reader*, so it does not queue behind the operation it is meant to stop. That operation ends
+at the debugger's next poll and returns whatever it had reached **to the call that started it**,
+marked as cut short, and the session takes the next call immediately. It is bound to the job that
+was running when it arrived, so it can never land on the one after it; with nothing running it says
+so and does nothing. Two things it cannot reach, both properties of the debugger: an operation that
+never polls for the break, and the parked kernel attach below.
 
 **Recovering a session that is stuck.** A per-call timeout abandons the *wait*, not the job, so a
 call that reports a timeout may still be running. The case that matters is `attach_kernel`: it waits
@@ -430,9 +442,9 @@ descriptors rather than debugger commands, so no `command` step can stand in for
 { "op": "pool_chunk", "address": "{{obj}}", "refresh": true }          // what the allocator says it is
 ```
 
-Inside a batch a walk is bounded by the *step's* share of the budget rather than by the walker's own
-120s default, so a `refresh` cannot spend the reserve the rollback lives on; a walk cut short still
-reports how much of the pool it covered. Assertions are `contains`, `not_contains`, and `eval` — the
+Inside a batch a walk is bounded by the *step's* share of the budget rather than by the whole call's,
+so a `refresh` cannot spend the reserve the rollback lives on; a walk cut short still reports how
+much of the pool it covered. Assertions are `contains`, `not_contains`, and `eval` — the
 last compares two MASM expressions, so registers, memory and relations between them are all one
 check. An `eval` step may `capture` its value under a name that later steps interpolate as
 `{{name}}`; a reference that names no earlier capture is refused before anything runs.
@@ -511,7 +523,11 @@ timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressio
   one snapshot and cannot disagree with each other. They need a **broken-in x64 kernel** target.
   Walking every pool page is expensive, so the snapshot is **cached per session** and reused; pass
   `refresh: true` after letting the target run, or you are reading a photograph of a target that has
-  since moved. Two semantics worth knowing: only *allocated* chunks are indexed by tag (a freed
+  since moved. A walk that does happen is bounded by **what is left of the caller's own timeout**
+  (`WINDBG_MCP_CALL_TIMEOUT_SECS`, less what the query waited its turn on the session), so it can
+  neither outlive the call that asked for it nor stop early while that call is still waiting; a walk
+  cut short still answers, and every result says how much of the pool it reached. `interrupt` ends
+  one sooner. Two semantics worth knowing: only *allocated* chunks are indexed by tag (a freed
   chunk's tag is not reliably preserved, so `pool_find_tag` never reports freed memory — ask about a
   specific address with `pool_chunk` instead), and `pool_chunk` reports three outcomes that are
   easy to conflate. A chunk in an explicitly free state (`ReusableFree` or `CachedFree`) is the

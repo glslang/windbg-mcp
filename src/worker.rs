@@ -25,7 +25,7 @@ use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use win_kexp::dbgeng::{DebugEngine, RunToOutcome};
+use win_kexp::dbgeng::{DebugEngine, InterruptHandle, RunToOutcome};
 use win_kexp::pool::query::{self, PoolPageFilter, PoolWalk};
 use win_kexp::pool::{DiagnosticShape, PoolDiagnostics, PoolSpan, PoolState};
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
@@ -123,6 +123,24 @@ fn watchdog_budget_ms(patience: Duration, queued: Duration) -> u32 {
         .max(WATCHDOG_HEADROOM)
         .as_millis()
         .min(u32::MAX as u128) as u32
+}
+
+/// How long a pool walk may run, on the same terms.
+///
+/// The same question as [`watchdog_budget_ms`] — how much of the caller's clock is this operation
+/// entitled to spend — so the same answer, rather than a second constant that would drift from it.
+/// What differs is only what runs out of time: win-kexp's walker checks the deadline between reads
+/// and returns the snapshot it has, so a short budget costs *coverage*, and every rendering here
+/// already says how much of the pool the walk reached.
+///
+/// The floor matters for a different reason than the watchdog's, and matters less. There, zero
+/// would disable the bound outright; here it would simply stop the walk on its first check. Keeping
+/// the floor is still the better of the two, because the snapshot a walk builds is cached for the
+/// session: a walk dequeued past its caller's deadline that runs for one headroom leaves the *next*
+/// query something to answer from, where one that gives up immediately leaves it the same walk to
+/// do again.
+fn walk_budget(patience: Duration, queued: Duration) -> Duration {
+    Duration::from_millis(u64::from(watchdog_budget_ms(patience, queued)))
 }
 
 /// How long the worker gives its engine to let go of the target when the supervisor disappears
@@ -276,6 +294,83 @@ const RETRACTED: u32 = 0;
 /// sets it, the engine thread reads it, and there is exactly one engine here to be talking about.
 static BATCH: BatchSignal = BatchSignal::new();
 
+/// Which job the engine thread is running, and whether an interrupt has been raised for it.
+///
+/// The two live under one lock because the property that matters is a relation between them: an
+/// interrupt must reach *the job that was running when it arrived*, or nothing. `SetInterrupt`
+/// addresses an engine rather than an operation, so raised a moment late it Ctrl+Breaks whatever
+/// started next — a caller's `go` aborted by a cancel meant for the search before it, with nothing
+/// in the record to say why.
+///
+/// Holding the lock across the raise is what closes that: the engine thread takes the same lock to
+/// clear `job`, so an interrupt either finds the job still claimed (and the engine thread then
+/// waits behind it) or finds `None` and does nothing. It is never held *across* a job — only around
+/// its two ends — so the reader is not blocked by the work it may be about to interrupt.
+struct Running {
+    /// The request id the engine thread is executing, or `None` between jobs.
+    job: Option<u64>,
+    /// The job an interrupt was raised for, kept until that job ends so the engine thread knows to
+    /// drain whatever the engine did not consume. An interrupt lodged just as a command finishes
+    /// leaves a Ctrl+Break pending with nothing running, and the next job would wear it.
+    interrupted: Option<u64>,
+}
+
+static RUNNING: Mutex<Running> = Mutex::new(Running {
+    job: None,
+    interrupted: None,
+});
+
+impl Running {
+    /// Claims the engine thread for `id`.
+    fn claim(&mut self, id: u64) {
+        self.job = Some(id);
+    }
+
+    /// Records that an interrupt has been raised for the job running *now* — which is the binding
+    /// itself, and why it takes no id: the only job an interrupt can ever reach is the one claimed
+    /// at the moment it is raised, and this is called under the lock that makes that true.
+    fn interrupt_raised(&mut self) {
+        self.interrupted = self.job;
+    }
+
+    /// Ends `id`'s claim, reporting whether an interrupt was bound to it.
+    ///
+    /// Taken rather than read, so an interrupt is spent by the job it reached: the next job starts
+    /// with nothing outstanding and cannot inherit a cut-short label — or a drain — that belongs
+    /// to the one before it.
+    fn release(&mut self, id: u64) -> bool {
+        self.job = None;
+        self.interrupted.take() == Some(id)
+    }
+}
+
+fn running() -> std::sync::MutexGuard<'static, Running> {
+    RUNNING.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The engine's interrupt handle, published by the engine thread once the engine exists.
+///
+/// A `OnceLock` rather than a field somewhere, because the two threads that need it are the only
+/// two this process has: the engine thread creates the engine, and the request reader is the one
+/// that ever asks for a break. Set before [`WorkerMessage::Ready`], so a supervisor that has been
+/// told this worker is usable is never then told there is no handle.
+static INTERRUPT: OnceLock<InterruptHandle> = OnceLock::new();
+
+/// [`Running::claim`] on this process's one tracker.
+fn claim(id: u64) {
+    running().claim(id);
+}
+
+/// [`Running::release`] on this process's one tracker.
+///
+/// `true` is the engine thread's cue to do two things before the next job: drain whatever
+/// Ctrl+Break the engine did not consume, and tell the caller their result was cut short. Paired
+/// with [`claim`] around the `catch_unwind` rather than inside it, so an op that panics still gives
+/// the claim back.
+fn release(id: u64) -> bool {
+    running().release(id)
+}
+
 /// What the request reader hands to the engine thread.
 enum Job {
     /// A request from the supervisor, stamped when it was read.
@@ -354,6 +449,16 @@ pub fn run(args: &[String]) -> ! {
                 // reason the signal can arrive at all. See [`EngineOp::EndSession`].
                 if matches!(request.op, EngineOp::EndSession) {
                     announce_teardown(request.id);
+                }
+                // The one request that is *answered* here rather than queued. Queueing it would
+                // put it behind the operation it exists to stop, so it could only ever run once
+                // there was nothing left to interrupt. See [`EngineOp::Interrupt`].
+                if matches!(request.op, EngineOp::Interrupt) {
+                    emit(&WorkerMessage::Done {
+                        id: request.id,
+                        result: interrupt_running(),
+                    });
+                    continue;
                 }
                 if tx.send(Job::Run(Instant::now(), request)).is_err() {
                     break; // the engine thread is gone; nothing can run any more
@@ -455,6 +560,8 @@ fn engine_thread(rx: mpsc::Receiver<Job>) {
             std::process::exit(1);
         }
     };
+    // Published before `Ready`, so the request reader can never be handed work it cannot interrupt.
+    let _ = INTERRUPT.set(engine.interrupt_handle());
     emit(&WorkerMessage::Ready);
 
     while let Ok(job) = rx.recv() {
@@ -488,14 +595,28 @@ fn engine_thread(rx: mpsc::Receiver<Job>) {
         // Measured here, at the front of the queue: this is the wait only this process can see,
         // and the bounded path needs it to size the watchdog.
         let queued = arrived.elapsed();
+        let id = request.id;
+        // Claimed around the whole op, so an interrupt arriving while it runs names *this* job.
+        // Outside the `catch_unwind` below, so a panicking op gives the claim back too.
+        claim(id);
         // A panic inside a win-kexp method (several use `.expect`) must not kill the session —
         // surface it as an error for this one op. The engine survives, so this stays a
         // debugger-level failure the model can work around by trying something else.
         let result = catch_unwind(AssertUnwindSafe(|| {
-            execute(&engine, request.id, request.op, queued)
+            execute(&engine, id, request.op, queued)
         }))
         .unwrap_or_else(|_| Err("debugger operation panicked".to_string()));
-        let id = request.id;
+        let result = if release(id) {
+            // The engine may have consumed the Ctrl+Break, or the request may have been lodged as
+            // the operation was already returning — in which case it is still pending with nothing
+            // running, and the next job would be the one to stop. Draining is cheap and this is
+            // the only moment it is unambiguous: this job's claim is gone and the next has not
+            // been made, so nothing else can be raising one.
+            let _ = engine.interrupted();
+            cut_short(result)
+        } else {
+            result
+        };
         // A `Done` is what removes the supervisor's waiter, so one that never arrives costs the
         // caller its session rather than its result: the call times out, the waiter stays, and
         // the session counts as busy — and so stays unreclaimable — for the life of the server.
@@ -582,6 +703,73 @@ fn announce_teardown(id: u64) {
         id,
         within_ms: within.as_millis().min(u128::from(u32::MAX)) as u32,
     });
+}
+
+/// Marks a result as one that was cut short by an interrupt somebody asked for.
+///
+/// Said on *this* reply because this is the caller who cannot otherwise find out. The one who asked
+/// for the interrupt was answered when they asked; this one gets back a search that found nothing,
+/// or a `go` that stopped somewhere unremarkable, and would read either as a fact about the target
+/// rather than about a request made behind their back.
+///
+/// Appended rather than substituted, both ways round: the partial output is the point of
+/// interrupting rather than ending the session, and a failure keeps its debugger text because
+/// "this is why it stopped" is not the same claim as "this is what it would have said".
+fn cut_short(result: Result<String, String>) -> Result<String, String> {
+    const NOTE: &str = "[windbg-mcp] This operation was interrupted on request (Ctrl+Break) \
+                        before it finished, so this is what it had reached, not a complete \
+                        result. Nothing about the target failed. Re-run it — scoped more \
+                        narrowly, if it was interrupted for taking too long.";
+    match result {
+        Ok(text) if text.is_empty() => Ok(NOTE.to_string()),
+        Ok(text) if text.ends_with('\n') => Ok(format!("{text}\n{NOTE}")),
+        Ok(text) => Ok(format!("{text}\n\n{NOTE}")),
+        Err(text) => Err(format!("{text}\n\n{NOTE}")),
+    }
+}
+
+/// Ctrl+Breaks the job the engine thread is running, from the request reader — see
+/// [`EngineOp::Interrupt`] for why this happens here rather than on the engine thread.
+///
+/// The whole decision is made under [`RUNNING`]'s lock: which job is running, and the raise itself.
+/// That is what binds the interrupt to a job rather than to a moment — the engine thread cannot
+/// finish that job and start another in between, because clearing the claim needs the same lock.
+///
+/// Says which job it reached, in a reply the *interrupting* caller reads. That caller is not the
+/// one running the operation, so "an operation was interrupted" and "there was nothing to
+/// interrupt" are the two answers it needs, and they are indistinguishable from the outside.
+fn interrupt_running() -> Result<String, String> {
+    let mut running = running();
+    let Some(job) = running.job else {
+        return Ok(
+            "Nothing was running on this session's engine, so nothing was interrupted. \
+                   Whatever you meant to stop had already finished — its own reply says how it \
+                   ended."
+                .to_string(),
+        );
+    };
+    let Some(handle) = INTERRUPT.get() else {
+        // Only reachable before the engine exists, and the supervisor is told `Ready` after that,
+        // so no session can be routed here. Reported rather than unwrapped all the same.
+        return Err(
+            "this engine worker has no interrupt handle yet — its engine is still \
+                    starting up"
+                .to_string(),
+        );
+    };
+    handle.interrupt().map_err(es)?;
+    // Recorded only once the raise succeeded: a failed one has left nothing pending, and claiming
+    // otherwise would have the engine thread drain an interrupt that was never lodged and label a
+    // complete result as cut short.
+    running.interrupt_raised();
+    tracing::info!("worker: interrupt raised for job {job}");
+    Ok(
+        "Interrupted. Ctrl+Break was raised on this session's engine, so the operation it was \
+         running stops at its next poll and returns whatever it had reached — to the call that \
+         started it, not to this one. A command that never polls, and a live-kernel attach whose \
+         target has not connected, cannot be reached this way; `end_session` is what ends those."
+            .to_string(),
+    )
 }
 
 /// Runs one op against this worker's engine. `queued` is how long it waited its turn here, which
@@ -757,11 +945,27 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<S
             timeout_ms,
         } => run_to_address(e, &address, timeout_ms),
         EngineOp::Reachability(args) => reachable(e, args),
-        // No deadline of our own: a pool *tool* call takes win-kexp's `DEFAULT_WALK_BUDGET`, which
-        // is sized to fit inside a typical per-call budget (this server's own is #75). A pool
-        // *step* is different — it has a batch's clock to keep — so that path passes one.
-        EngineOp::Pool(args) => pool(e, args, None),
+        // The caller's own deadline, on the same arithmetic as a bounded command's: a walk that
+        // outlives its caller holds this session against nobody. Taking win-kexp's default instead
+        // was wrong in both directions — see [`EngineOp::Pool`].
+        EngineOp::Pool { query, patience_ms } => {
+            let budget = walk_budget(Duration::from_millis(u64::from(patience_ms)), queued);
+            // Logged because a truncated walk otherwise says only *that* it was truncated, and the
+            // two explanations — this deadline, or a target the walk could not read — want
+            // opposite responses. It is also the only place the number is observable, which is
+            // what `tests/mcp_smoke.rs` asserts against: the previous bug was that no number
+            // crossed the pipe at all.
+            tracing::debug!("worker: pool walk budget {budget:?} (queued {queued:?})");
+            pool(e, query, budget)
+        }
         EngineOp::Batch(op) => run_batch(e, op, queued),
+        // Answered by the request reader, which is the only way it could reach a busy engine at
+        // all, so it is never queued and never arrives here. See [`EngineOp::Interrupt`].
+        EngineOp::Interrupt => Err(
+            "an interrupt reached the engine thread, which cannot act on \
+                                    one; this is a bug in the worker's request reader"
+                .to_string(),
+        ),
         // Reaching here means any batch has already been told to stop and has finished unwinding —
         // the reader saw this request go past and said so, and this thread runs one job at a time.
         EngineOp::EndSession => e
@@ -867,7 +1071,7 @@ impl Debuggee for BatchEngine<'_> {
         pool(
             self.e,
             query.clone(),
-            Some(Duration::from_millis(u64::from(budget_ms))),
+            Duration::from_millis(u64::from(budget_ms)),
         )
     }
 
@@ -1108,20 +1312,17 @@ fn render_walk_report(report: &query::PoolSnapshotReport) -> String {
 
 /// Answers one pool question, walking the pool if the cached snapshot will not do.
 ///
-/// `within` is the caller's own deadline for a walk that actually happens, or `None` to take
-/// win-kexp's default. It is `Some` for a [`crate::batch`] step, whose budget is both shorter than
-/// that default and load-bearing: the batch reserves part of it for the rollback and advertises the
-/// whole of it to a teardown, so a walk that ran to the *walker's* default could overrun both. A
-/// walk stopped by a budget still answers — every rendering below carries how much of the pool the
-/// walk reached — so the cost of a short deadline is coverage, not an error.
-fn pool(e: &DebugEngine, args: PoolOp, within: Option<Duration>) -> Result<String, String> {
-    let walk = |refresh: bool| {
-        let walk = PoolWalk::from(refresh);
-        match within {
-            Some(budget) => walk.within(budget),
-            None => walk,
-        }
-    };
+/// `within` is the caller's own deadline for a walk that actually happens, and is **required** —
+/// win-kexp's `DEFAULT_WALK_BUDGET` is reachable from neither caller here, which is right, because
+/// neither is a human at a prompt who could Ctrl+C a walk that ran long. A [`crate::batch`] step
+/// passes its step budget; a pool *tool* call passes what is left of its caller's patience
+/// ([`walk_budget`]). For a batch the deadline is load-bearing beyond the caller: it reserves part
+/// of its budget for the rollback and advertises the whole of it to a teardown, so a walk running to
+/// the *walker's* default could overrun both. A walk stopped by a budget still answers — every
+/// rendering below carries how much of the pool the walk reached — so the cost of a short deadline
+/// is coverage, not an error.
+fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<String, String> {
+    let walk = |refresh: bool| PoolWalk::from(refresh).within(within);
     match args {
         PoolOp::FindTag {
             tag,
@@ -2227,5 +2428,146 @@ mod tests {
         );
         // Still sticky, though: this session is on its way out and must not start another.
         assert!(signal.enter(A_LONG_BATCH).is_none());
+    }
+
+    // ---- binding an interrupt to a job -------------------------------------
+    //
+    // Against a local `Running` rather than the process-wide `RUNNING`, for the reason above: these
+    // stage both orderings of a race that against the real one would mean interrupting a real
+    // engine at an exact instant. What is *wired* to it — that the reader raises under this lock
+    // and the engine thread claims and releases under it — is `src/worker.rs`'s own code above and
+    // the smoke tier's business; what is checked here is that the bookkeeping cannot misattribute.
+
+    fn idle() -> Running {
+        Running {
+            job: None,
+            interrupted: None,
+        }
+    }
+
+    /// The everyday case: an interrupt raised while a job runs is reported to *that* job, so its
+    /// caller is told their result was cut short and the engine's pending break is drained.
+    #[test]
+    fn an_interrupt_reaches_the_job_that_was_running() {
+        let mut running = idle();
+        running.claim(7);
+        running.interrupt_raised();
+        assert!(running.release(7));
+    }
+
+    /// The failure the binding exists to prevent, stated as the property: an interrupt is spent by
+    /// the job it reached and can never be charged to the next one.
+    ///
+    /// `SetInterrupt` addresses an engine, not an operation. Without the pairing, a cancel landing
+    /// as a search ends would leave a Ctrl+Break pending for whatever ran next — and the caller of
+    /// *that* would be told their `go` had been interrupted on request, which nobody asked for.
+    #[test]
+    fn an_interrupt_is_spent_by_the_job_it_reached() {
+        let mut running = idle();
+        running.claim(7);
+        running.interrupt_raised();
+        assert!(running.release(7));
+
+        running.claim(8);
+        assert!(
+            !running.release(8),
+            "the next job inherited an interrupt meant for the one before it"
+        );
+    }
+
+    /// The other side of the same race: an interrupt that arrives between jobs binds to nothing, so
+    /// the job that starts next is not the one it stops.
+    ///
+    /// This is what the reader's early return reports as "nothing was running". The engine may
+    /// still hold a pending break from it — that is what the drain after each job is for — but no
+    /// caller is told their complete result was cut short.
+    #[test]
+    fn an_interrupt_between_jobs_binds_to_nothing() {
+        let mut running = idle();
+        running.interrupt_raised();
+        assert_eq!(running.interrupted, None, "there was no job to bind it to");
+
+        running.claim(9);
+        assert!(
+            !running.release(9),
+            "a job that started after the interrupt must not answer for it"
+        );
+    }
+
+    // ---- what an interrupted caller is told --------------------------------
+
+    /// A cut-short result keeps what it reached and gains the reason — which is the whole point of
+    /// interrupting rather than ending the session.
+    #[test]
+    fn a_cut_short_result_keeps_its_output_and_says_why() {
+        let out = cut_short(Ok("0x1000  41 42 43\n".to_string())).expect("still a result");
+        assert!(out.starts_with("0x1000  41 42 43"), "{out}");
+        assert!(out.contains("interrupted on request"), "{out}");
+
+        // And a failure keeps its debugger text: "this is why it stopped" is not a claim about
+        // what it would otherwise have said.
+        let err = cut_short(Err("Memory access error".to_string())).expect_err("still a failure");
+        assert!(err.starts_with("Memory access error"), "{err}");
+        assert!(err.contains("interrupted on request"), "{err}");
+    }
+
+    /// An operation interrupted before it printed anything still explains itself, rather than
+    /// coming back as an empty success the caller would read as "found nothing".
+    #[test]
+    fn a_cut_short_result_with_no_output_is_still_an_explanation() {
+        let out = cut_short(Ok(String::new())).expect("still a result");
+        assert!(out.contains("interrupted on request"), "{out}");
+        assert!(
+            !out.starts_with('\n'),
+            "no blank lead-in when there is nothing above it: {out:?}"
+        );
+    }
+
+    // ---- the pool walk budget (#75) ----------------------------------------
+
+    /// A pool walk is bounded by the *caller's* deadline, not by win-kexp's default.
+    ///
+    /// Both directions matter, which is why this checks a short call budget and the default one.
+    /// Taking `DEFAULT_WALK_BUDGET` (120s) meant a host configured with a 60s call timeout got a
+    /// walk that outlived its caller — the wedge, reintroduced from this side — while the 300s
+    /// default stopped at 120s and handed back a partial snapshot with minutes left to spend.
+    #[test]
+    fn a_pool_walk_is_bounded_by_the_call_that_asked_for_it() {
+        const WIN_KEXP_DEFAULT: Duration = Duration::from_secs(120);
+
+        let short = Duration::from_secs(60);
+        let budget = walk_budget(short, Duration::ZERO);
+        assert!(
+            budget < short,
+            "a walk under a {short:?} call budget got {budget:?}; it would still be walking when \
+             its caller gave up"
+        );
+        assert!(
+            budget < WIN_KEXP_DEFAULT,
+            "which is what taking the walker's own default did"
+        );
+
+        let generous = Duration::from_secs(300);
+        assert!(
+            walk_budget(generous, Duration::ZERO) > WIN_KEXP_DEFAULT,
+            "a caller who can wait five minutes should not be handed a partial snapshot at two"
+        );
+    }
+
+    /// The same invariant the bounded command holds, for the same reason: **queue wait + walk
+    /// budget must not exceed the caller's patience**. A pool query can sit behind another job on
+    /// its session, and a budget derived from the patience as sent would spend it all again.
+    #[test]
+    fn a_queued_pool_walk_still_stops_before_its_caller_gives_up() {
+        let patience = Duration::from_secs(300);
+        for waited in [0, 1, 30, 100, 240, 269] {
+            let waited = Duration::from_secs(waited);
+            let budget = walk_budget(patience, waited);
+            assert!(
+                waited + budget <= patience,
+                "a walk dequeued after {waited:?} got {budget:?} — it would still be walking at \
+                 the {patience:?} mark"
+            );
+        }
     }
 }

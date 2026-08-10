@@ -37,7 +37,6 @@ use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot};
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
-use crate::batch::BatchOp;
 use crate::kdconn;
 use crate::proto::{EngineOp, WorkerMessage, WorkerRequest};
 use crate::worker::{MESSAGES_FLAG, REQUESTS_FLAG, WORKER_FLAG};
@@ -66,6 +65,14 @@ const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// that a live target with real teardown work (a detach that has to resume threads) finishes
 /// gracefully, short enough that recovering a parked attach is not a wait.
 const END_SESSION_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long to wait for a worker to acknowledge an interrupt.
+///
+/// Not a bound on the operation being interrupted: that one ends when the engine next polls, and it
+/// reports to its own caller on its own clock. This bounds only the round trip to the worker's
+/// *request reader*, which does no debugging and is by construction never blocked behind the engine
+/// — so it is short, and a wait that reaches it means the worker has stopped reading altogether.
+const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The same grace, but at shutdown, where it competes with the client's expectation that closing
 /// stdin ends the process promptly.
@@ -1053,6 +1060,27 @@ impl Sessions {
         outcome
     }
 
+    /// Ctrl+Breaks whatever a session's engine is running, leaving the session and its target
+    /// alone.
+    ///
+    /// The graceful counterpart to [`Self::end`], and the reason both exist: `end_session` also
+    /// ends a runaway command, but by throwing away the target it was running against. Here the
+    /// operation returns to *its own* caller — with whatever it had reached — and the session is
+    /// ready for the next call.
+    ///
+    /// Its own short budget rather than the call timeout, because this waits on nothing that can
+    /// run long. The worker answers from its request reader, which is never blocked by the engine
+    /// (that is what makes an interrupt deliverable at all), so anything slower than this is a
+    /// worker that has stopped reading rather than one that is thinking.
+    pub async fn interrupt(
+        &self,
+        session: &Arc<Session>,
+        named: bool,
+    ) -> Result<String, EngineError> {
+        let call = Call::new(EngineOp::Interrupt).named(named);
+        self.call_within(session, call, INTERRUPT_TIMEOUT).await
+    }
+
     /// Ends a session: asks the worker to release its target, then terminates it.
     ///
     /// The kill is not a fallback for tidiness — it is the recovery path. A worker parked in a
@@ -2035,15 +2063,12 @@ fn pump(
         }
 
         let mut op = job.op;
-        // The two ops whose own deadline is derived from the caller's: what is written here is how
+        // For the ops whose own deadline is derived from the caller's: what is written here is how
         // much patience the caller had left when this job reached the front of the queue, and the
-        // worker sizes its watchdog (or its batch budget) from it. See `EngineOp::BoundedCommand`.
-        match &mut op {
-            EngineOp::BoundedCommand { patience_ms, .. }
-            | EngineOp::Batch(BatchOp { patience_ms, .. }) => {
-                *patience_ms = remaining_patience_ms(call_timeout, job.submitted);
-            }
-            _ => {}
+        // worker sizes its watchdog (or its walk, or its batch budget) from it. See
+        // `EngineOp::BoundedCommand` for why the derivation itself belongs to the worker.
+        if let Some(patience_ms) = op.patience_slot() {
+            *patience_ms = remaining_patience_ms(call_timeout, job.submitted);
         }
         let request = WorkerRequest { id: job.id, op };
         let Ok(mut line) = serde_json::to_string(&request) else {
