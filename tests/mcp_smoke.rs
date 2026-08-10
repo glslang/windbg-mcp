@@ -26,9 +26,11 @@
 //!   worker — so the only place the wiring exists as a whole is the shipped binary.
 //! * **Live kernel** (`#[ignore]`d **and** `WINDBG_MCP_SMOKE_KERNEL=<connection string>`) — a
 //!   real KDNET target. The only tier that touches another machine, and the only one that can
-//!   prove a kernel attach still *lands* and lets go cleanly rather than merely parks, or that a
-//!   pool walk stays inside its budget when every page it reads crosses a wire. Run it last, on
-//!   its own.
+//!   prove a kernel attach still *lands* and lets go cleanly rather than merely parks, that a
+//!   pool walk stays inside its budget when every page it reads crosses a wire, or that a
+//!   `debug_batch` which patches a byte of the running kernel puts it back — a dump has nothing
+//!   worth restoring, so a rollback that did nothing would pass every check the tier above can
+//!   make. Run it last, on its own.
 //! * **MessageManager CTF** (`#[ignore]`d, `WINDBG_MCP_SMOKE_CTF=1`, and the live-kernel gate)
 //!   — deploys a benign allocation fixture over WinRM, then verifies that the real driver and its
 //!   pool objects are visible through the structured MCP tools. The PowerShell orchestrator owns
@@ -3261,6 +3263,799 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
         (Ok(()), Some(why)) => panic!("{why}"),
         (Ok(()), None) => {}
     }
+}
+
+// ---- tier 4b: a batch that actually mutates a live kernel ---------------------
+//
+// `debug_batch` is proved at two altitudes elsewhere: `src/batch.rs` drives the executor over a
+// scripted debuggee with a virtual clock, and the dump tier drives a real engine to both outcomes
+// and through both teardowns. Neither covers the case the tool exists for — **a write that is then
+// restored, on a target that would notice**. A crash dump has nothing worth restoring: a byte
+// "patched" in it is patched in a file nobody reads again, so a rollback that silently did nothing
+// would pass every assertion the dump tier can make. The disconnect test there proves the rollback
+// ran by the *file it wrote*, which is the shape of the claim rather than its substance.
+//
+// Here the claim is settled by reading the byte back — from a later call, from a re-attached
+// session, or from a whole new server process — and the value either is the original or it is not.
+
+/// The byte this tier patches, and what it was.
+///
+/// `nt`'s DOS header `e_res2` field: reserved by the PE format, zero in every image MSVC has ever
+/// linked, read by the loader never and by Windows never. It is real kernel memory, it is stable
+/// across a detach and re-attach (the image does not move without a reboot), and nothing in the
+/// running system can observe it changing — which is exactly the combination this tier needs, since
+/// the whole point is to leave the target patched for a while and then prove something put it back.
+/// Anything with a *purpose* would satisfy the first two and bugcheck the machine on the third.
+struct KernelScratch {
+    address: u64,
+    original: u64,
+}
+
+impl KernelScratch {
+    /// The address as the debugger and the tools both take it.
+    fn addr(&self) -> String {
+        format!("{:#x}", self.address)
+    }
+
+    /// A byte value that is definitely not the original, so "the patch landed" is a real check
+    /// rather than a comparison that would hold either way.
+    fn patched(&self) -> u64 {
+        self.original ^ 0xa5
+    }
+
+    /// A third value, distinct from both of the others, for the step that must **not** run: with
+    /// two values a "it never wrote this" check could pass by coinciding with the original.
+    fn never(&self) -> u64 {
+        self.original ^ 0x5a
+    }
+}
+
+/// `nt`'s load base, from the module list.
+fn nt_base(server: &mut Server, session: &str) -> u64 {
+    let modules = server.tool_text("modules", json!({ "session_id": session }), TARGET_STEP);
+    let start = modules
+        .lines()
+        .find(|line| line.split_whitespace().nth(2) == Some("nt"))
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no `nt` in the module list:\n{modules}"))
+        .replace('`', "");
+    u64::from_str_radix(&start, 16)
+        .unwrap_or_else(|e| panic!("`{start}` is not a module base ({e}):\n{modules}"))
+}
+
+/// What the debugger makes of a MASM expression, or `None` if it would not say.
+///
+/// Deliberately *not* `tool_text`: several callers below use this on paths where a failure is
+/// possible and must not panic, because a panic there would skip a detach and leave a kernel
+/// halted.
+fn eval_expr(server: &mut Server, session: &str, expr: &str) -> Option<u64> {
+    let call = server.call_tool(
+        "execute",
+        json!({ "command": format!("? {expr}"), "session_id": session }),
+        TARGET_STEP,
+    );
+    if !call["error"].is_null() || is_tool_error(&call) {
+        eprintln!(
+            "NOTE: `? {expr}` failed: {}",
+            text_of(&call["result"]).trim()
+        );
+        return None;
+    }
+    // `Evaluate expression: 84 = 00000000`00000054` — the value is what follows the last `=`.
+    let text = text_of(&call["result"]);
+    let (_, value) = text.rsplit_once('=')?;
+    u64::from_str_radix(&value.replace('`', "").trim().replace(' ', ""), 16).ok()
+}
+
+/// Reads the scratch byte and proves this target lets a debugger write it, leaving it as found.
+///
+/// A probe rather than an assumption, and it runs *before* any batch does, because the two ways
+/// this can be unavailable are both about the host being debugged rather than about this code:
+/// a header page that is not resident cannot be read, and a guest with memory integrity enabled
+/// refuses debugger writes to image pages outright. Finding that out from a batch would mean
+/// finding it out with a transaction already open.
+///
+/// `None` means the check could not be made here — reported loudly, and the caller stops. What it
+/// must never do is carry on: a batch whose patch never landed would "restore" a byte that was
+/// never changed and pass every assertion below while proving nothing at all.
+fn kernel_scratch(server: &mut Server, session: &str) -> Option<KernelScratch> {
+    // +0x28 is `e_res2[0]`; `e_lfanew` (the one header field anything reads at runtime) is at
+    // +0x3c, well clear of it.
+    let address = nt_base(server, session) + 0x28;
+    let Some(original) = eval_expr(server, session, &format!("by({address:#x})")) else {
+        eprintln!(
+            "NOTE: {address:#x} (nt's DOS header) could not be read, so this run cannot patch and \
+             restore a byte. Skipped rather than failed: an unreadable header page is a fact \
+             about the guest, not about the server."
+        );
+        return None;
+    };
+    let scratch = KernelScratch { address, original };
+
+    // Write it, read it back, put it back — the shortest thing that distinguishes "the debugger
+    // can write here" from "the debugger accepted a write here and nothing happened".
+    server.tool_text(
+        "execute",
+        json!({
+            "command": format!("eb {} {:#x}", scratch.addr(), scratch.patched()),
+            "session_id": session,
+        }),
+        TARGET_STEP,
+    );
+    let wrote = eval_expr(server, session, &format!("by({})", scratch.addr()));
+    // Restore before judging the result: the assertion is the caller's business, the byte is the
+    // target's, and a failed probe must not be the reason a guest is left modified.
+    server.tool_text(
+        "execute",
+        json!({
+            "command": format!("eb {} {:#x}", scratch.addr(), scratch.original),
+            "session_id": session,
+        }),
+        TARGET_STEP,
+    );
+    let back = eval_expr(server, session, &format!("by({})", scratch.addr()));
+    assert_eq!(
+        back,
+        Some(scratch.original),
+        "the probe could not put {} back the way it found it ({:#x}) — stop and look at the \
+         guest before running anything else here",
+        scratch.addr(),
+        scratch.original
+    );
+    if wrote != Some(scratch.patched()) {
+        eprintln!(
+            "NOTE: writing {} was accepted and did not take (read back {wrote:?}, wanted {:#x}), \
+             so this guest does not let a debugger patch image pages — memory integrity (HVCI) \
+             does exactly this. Skipped: nothing below could tell a rollback that worked from a \
+             patch that never landed.",
+            scratch.addr(),
+            scratch.patched()
+        );
+        return None;
+    }
+    Some(scratch)
+}
+
+/// Attaches, runs `body` against the session, and **releases the target whatever `body` did**.
+///
+/// The ceremony every test in this tier needs and none of them may skip: from the attach onward
+/// the guest is broken in, so a panic that escaped before the detach would leave someone's machine
+/// frozen because an assertion failed. The ordering at the end is deliberate — a failed detach is
+/// reported *first*, even when the body already failed, because it is the only outcome that needs
+/// action now and the earlier failure keeps.
+fn with_live_kernel_session<R>(
+    server: &mut Server,
+    connection: &str,
+    body: impl FnOnce(&mut Server, &str) -> R,
+) -> R {
+    let attached = server.call_tool(
+        "attach_kernel",
+        json!({ "connection": connection }),
+        TARGET_STEP,
+    );
+    let report = text_of(&attached["result"]);
+    // The handle decides whether there is anything to clean up, not `isError`: an attach that
+    // claimed its target and then failed the wait comes back as a tool error carrying a live,
+    // halted session.
+    let Some(session) = maybe_session_id(&report) else {
+        assert_no_error(&attached, "attach_kernel");
+        panic!(
+            "the attach did not land, and left no session behind. The target must be booted with \
+             debugging enabled and dialling this host, and the KD transport is single-owner:\n\
+             {report}"
+        );
+    };
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        assert_no_error(&attached, "attach_kernel");
+        assert!(
+            !is_tool_error(&attached),
+            "the attach claimed its target and then failed:\n{report}"
+        );
+        body(server, &session)
+    }));
+    let ended = server.call_tool("end_session", json!({ "session_id": session }), TARGET_STEP);
+    let ended_text = text_of(&ended["result"]);
+    match (outcome, ungraceful_detach(&ended, &ended_text)) {
+        (Err(_), Some(why)) => panic!(
+            "THE TARGET MAY STILL BE HALTED — {why}\n\nThis run had already failed, for the \
+             reason printed above; that is what to investigate, but check the machine first."
+        ),
+        (Err(panic), None) => resume_unwind(panic),
+        (Ok(_), Some(why)) => panic!("{why}"),
+        (Ok(value), None) => value,
+    }
+}
+
+/// The steps that save a byte, patch it, and prove the patch landed — the opening of every
+/// mutating batch below, and the part that has to be true before a rollback means anything.
+fn patch_steps(scratch: &KernelScratch) -> Vec<Value> {
+    vec![
+        json!({
+            "op": "eval", "expr": format!("by({})", scratch.addr()), "capture": "orig",
+            "name": "save the byte we are about to overwrite",
+        }),
+        json!({
+            "op": "command", "command": format!("eb {} {:#x}", scratch.addr(), scratch.patched()),
+            "name": "patch it",
+        }),
+        // An assertion, because DbgEng reports most write failures by printing them and returning
+        // success — so "the `eb` step succeeded" is not the same claim as "the byte changed", and
+        // only the second one makes the restore below worth measuring.
+        json!({
+            "op": "eval", "expr": format!("by({})", scratch.addr()),
+            "name": "the patch is really in the target",
+            "expect": [{
+                "check": "eval",
+                "expr": format!("by({})", scratch.addr()),
+                "equals": format!("{:#x}", scratch.patched()),
+            }],
+        }),
+    ]
+}
+
+/// The `always` block: put the captured byte back, whatever happened.
+fn restore_steps(scratch: &KernelScratch) -> Vec<Value> {
+    vec![json!({
+        "op": "command", "command": format!("eb {} {{{{orig}}}}", scratch.addr()),
+        "name": "restore the byte",
+    })]
+}
+
+/// A batch that patches a live kernel and then fails: the `always` block has to put the byte back,
+/// and a **later, separate call** has to see it back.
+///
+/// This is the claim `debug_batch` was built for, made where it can actually be false. Everything
+/// the dump tier can say about a rollback is about control flow — the block ran, its steps reported
+/// OK. Here the target holds a byte that either changed back or did not, and nothing in the batch's
+/// own report is trusted to settle it: the verification is a separate tool call, made after the
+/// batch has returned, exactly as a caller would make it.
+#[test]
+#[ignore = "needs a live KDNET target and its connection string; run manually, last"]
+fn a_mutating_batch_on_a_live_kernel_restores_its_patch_when_a_step_fails() {
+    let Some(connection) = kernel_tier() else {
+        return;
+    };
+    let mut server = Server::started_with(&[(
+        "WINDBG_MCP_CALL_TIMEOUT_SECS",
+        &SERVER_CALL_TIMEOUT.as_secs().to_string(),
+    )]);
+
+    with_live_kernel_session(&mut server, &connection, |server, session| {
+        let Some(scratch) = kernel_scratch(server, session) else {
+            return;
+        };
+        println!(
+            "scratch byte {} reads {:#x}",
+            scratch.addr(),
+            scratch.original
+        );
+
+        let mut steps = patch_steps(&scratch);
+        steps.push(json!({
+            "op": "command", "command": "version",
+            "name": "an assertion that cannot hold",
+            "expect": [{ "check": "contains", "text": "no version banner says this" }],
+        }));
+        steps.push(json!({
+            "op": "command", "command": format!("eb {} {:#x}", scratch.addr(), scratch.never()),
+            "name": "must not run",
+        }));
+        let call = server.call_tool(
+            "debug_batch",
+            json!({
+                "session_id": session,
+                "steps": steps,
+                "always": restore_steps(&scratch),
+            }),
+            TARGET_STEP,
+        );
+        let report = text_of(&call["result"]);
+        assert_no_error(&call, "debug_batch on a live kernel");
+        assert!(
+            is_tool_error(&call),
+            "a batch that did not commit must come back as a tool error:\n{report}"
+        );
+        assert!(
+            report.contains("BATCH: FAILED at step 4 of 5"),
+            "the batch had to stop at the assertion that cannot hold:\n{report}"
+        );
+        assert!(
+            report.contains("rollback: COMPLETE"),
+            "the `always` block must run on the failing path — that is the whole point:\n{report}"
+        );
+
+        // The claim, from outside the batch: the byte is what it was before any of this ran.
+        let now = eval_expr(server, session, &format!("by({})", scratch.addr()));
+        assert_eq!(
+            now,
+            Some(scratch.original),
+            "the rollback reported COMPLETE and {} still reads {now:?} rather than {:#x} — the \
+             restore ran and did not take, which is worse than not running:\n{report}",
+            scratch.addr(),
+            scratch.original
+        );
+        // And the step after the failure never wrote its own value, so "SKIPPED" is a fact about
+        // the target and not only about the report.
+        assert_ne!(
+            now,
+            Some(scratch.never()),
+            "the step after the failure ran anyway"
+        );
+        println!("the patch was applied inside the batch and restored by its rollback");
+    });
+}
+
+/// The same batch under a **call budget shorter than the batch asks for**: the clamp in
+/// `worker::batch_budget` has to keep the whole report — steps, rollback and all — inside the
+/// caller's own timeout.
+///
+/// Only a live target can test this honestly. Against a dump every step returns in microseconds, so
+/// a batch never reaches its deadline and the clamp is arithmetic nobody exercises; here the steps
+/// take real time and the batch is deliberately given more of it than the call has. What must come
+/// back is a *report* — not a timeout from the server, and not silence — with the byte restored.
+#[test]
+#[ignore = "needs a live KDNET target and its connection string; run manually, last"]
+fn a_live_kernel_batch_reports_and_rolls_back_before_its_callers_timeout() {
+    let Some(connection) = kernel_tier() else {
+        return;
+    };
+    /// Short enough that a batch of real steps runs out of time inside it, long enough that the
+    /// attach and the probe are unaffected.
+    const CALL_BUDGET: Duration = Duration::from_secs(60);
+    let mut server = Server::started_with(&[(
+        "WINDBG_MCP_CALL_TIMEOUT_SECS",
+        &CALL_BUDGET.as_secs().to_string(),
+    )]);
+
+    with_live_kernel_session(&mut server, &connection, |server, session| {
+        let Some(scratch) = kernel_scratch(server, session) else {
+            return;
+        };
+
+        let mut steps = patch_steps(&scratch);
+        // Nearly a minute of work in a budget that will be clamped to well under it, so the
+        // deadline is certain to expire. Many short steps rather than a few long ones on purpose:
+        // the clock is then crossed *between* steps, where the executor stops cleanly, instead of
+        // inside one, where the outcome depends on whether the engine honours an interrupt during
+        // a `.sleep` — a property of DbgEng that this test has no business asserting.
+        steps.extend(std::iter::repeat_n(
+            json!({ "op": "command", "command": ".sleep 1000" }),
+            55,
+        ));
+        let started = Instant::now();
+        let call = server.call_tool(
+            "debug_batch",
+            json!({
+                "session_id": session,
+                "steps": steps,
+                // Ten minutes, which this call does not have. The clamp is what stops that being
+                // a rollback report nobody is left to read.
+                "timeout_ms": 600_000,
+                "always": restore_steps(&scratch),
+            }),
+            TARGET_STEP,
+        );
+        let took = started.elapsed();
+        let report = text_of(&call["result"]);
+        assert_no_error(&call, "debug_batch under a short call budget");
+        assert!(
+            report.contains("BATCH: TIMED OUT"),
+            "the batch should have run out of its (clamped) time and said so:\n{report}"
+        );
+        assert!(
+            report.contains("rollback: COMPLETE"),
+            "the reserve exists so the rollback still runs when the steps use the clock up:\n\
+             {report}"
+        );
+        assert!(
+            took < CALL_BUDGET,
+            "the report took {took:?}, past the {CALL_BUDGET:?} its caller was waiting — the \
+             batch outlived the call it belongs to, which is what the clamp exists to prevent"
+        );
+        println!("a 10-minute batch reported in {took:?}, inside a {CALL_BUDGET:?} call budget");
+
+        let now = eval_expr(server, session, &format!("by({})", scratch.addr()));
+        assert_eq!(
+            now,
+            Some(scratch.original),
+            "the byte was not restored when the batch ran out of time:\n{report}"
+        );
+    });
+}
+
+/// A client **disconnect** while a live kernel batch holds a patch: the rollback has to run before
+/// the worker goes, and the byte has to be back when somebody else looks.
+///
+/// The dump tier proves this by the log file the `always` block writes, because by then there is no
+/// client, no supervisor and no worker left to ask. That proves the block *ran*; it cannot prove
+/// what it did to a target, because a dump has nothing to do anything to. Here the evidence is the
+/// guest's own memory, read by a **new server process** over a fresh attach — the byte outlives
+/// every process that was involved in patching it.
+#[test]
+#[ignore = "needs a live KDNET target and its connection string; run manually, last"]
+fn a_disconnect_lets_a_live_kernel_batch_restore_its_patch_first() {
+    let Some(connection) = kernel_tier() else {
+        return;
+    };
+    let running = marker_path("live-kernel-batch-running");
+    let _ = std::fs::remove_file(&running);
+
+    let mut server = Server::started_with(&[(
+        "WINDBG_MCP_CALL_TIMEOUT_SECS",
+        &SERVER_CALL_TIMEOUT.as_secs().to_string(),
+    )]);
+    let attached = server.call_tool(
+        "attach_kernel",
+        json!({ "connection": connection }),
+        TARGET_STEP,
+    );
+    let report = text_of(&attached["result"]);
+    assert_no_error(&attached, "attach_kernel");
+    let session = maybe_session_id(&report)
+        .unwrap_or_else(|| panic!("the attach left no session behind:\n{report}"));
+    assert!(
+        !is_tool_error(&attached),
+        "the attach claimed its target and then failed; this test needs one that landed:\n{report}"
+    );
+    // Everything up to the disconnect runs under `catch_unwind`: from the attach onward the guest
+    // is broken in, and the release is the disconnect itself, so a panic before it would leave the
+    // machine frozen for the sake of a failed assertion. That includes the two lines below, which
+    // look harmless and would still cost a VM.
+    let ready = catch_unwind(AssertUnwindSafe(|| {
+        // Read now, because the re-attach below has to wait for this process to be gone: the KD
+        // transport is single-owner, so a second attach that races the first worker's exit fails
+        // on the port rather than on anything this test is about.
+        let status = server.tool_text("session_status", json!({}), STEP);
+        let worker = engine_pid_of(&status, &session);
+        let scratch = kernel_scratch(&mut server, &session)?;
+
+        // Patch, announce, then spend twenty seconds so the disconnect lands squarely inside the
+        // batch with the byte already changed. The marker is written *after* the patch for exactly
+        // that reason: waiting on it means waiting for a target that is genuinely modified.
+        let mut steps = patch_steps(&scratch);
+        steps.push(
+            json!({ "op": "command", "command": format!(".logopen \"{}\"", running.display()) }),
+        );
+        steps.push(json!({ "op": "command", "command": ".echo BATCH-RUNNING" }));
+        steps.push(json!({ "op": "command", "command": ".logclose" }));
+        steps.extend(std::iter::repeat_n(
+            json!({ "op": "command", "command": ".sleep 1000" }),
+            20,
+        ));
+        // Sent without waiting: nobody will be here to read the answer, which is the whole
+        // scenario.
+        server.send_request(
+            "tools/call",
+            json!({
+                "name": "debug_batch",
+                "arguments": {
+                    "session_id": session,
+                    "steps": steps,
+                    "always": restore_steps(&scratch),
+                }
+            }),
+        );
+
+        // Disconnect only once the patch is demonstrably in the target. Timing it with a sleep
+        // would make a slow machine into a test that proves nothing: the batch would not have
+        // started, and refusing to start is a *different* correct behaviour with the same green
+        // tick.
+        let deadline = Instant::now() + TARGET_STEP;
+        while !running.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the batch never got past its patch steps, so the disconnect below would prove \
+                 nothing\n--- stderr ---\n{}",
+                server.stderr()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Some((scratch, worker))
+    }));
+    let (scratch, worker) = match ready {
+        Ok(Some(ready)) => ready,
+        // Either nothing to prove (no writable scratch byte) or an assertion failed. Both leave a
+        // halted kernel that has to be released the ordinary way, since the disconnect below is
+        // now not going to happen.
+        other => {
+            let ended =
+                server.call_tool("end_session", json!({ "session_id": session }), TARGET_STEP);
+            let text = text_of(&ended["result"]);
+            if let Some(why) = ungraceful_detach(&ended, &text) {
+                panic!("THE TARGET MAY STILL BE HALTED — {why}");
+            }
+            match other {
+                Err(panic) => resume_unwind(panic),
+                _ => return,
+            }
+        }
+    };
+    let (base, expected) = (scratch.address, scratch.original);
+
+    let disconnected = Instant::now();
+    let exit = catch_unwind(AssertUnwindSafe(|| server.shutdown()));
+    let took = disconnected.elapsed();
+
+    // The worker outlives the supervisor by however long its rollback and release take, and it
+    // owns the KD endpoint until it exits.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while process_alive(worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let worker_gone = !process_alive(worker);
+
+    // Re-attach from a *new server process* and ask the guest what the byte says now. Everything
+    // is collected rather than asserted until the target has been released again.
+    let mut again = Server::started_with(&[(
+        "WINDBG_MCP_CALL_TIMEOUT_SECS",
+        &SERVER_CALL_TIMEOUT.as_secs().to_string(),
+    )]);
+    let (base_now, byte_now) =
+        with_live_kernel_session(&mut again, &connection, |server, session| {
+            (
+                nt_base(server, session),
+                eval_expr(server, session, &format!("by({:#x})", base)),
+            )
+        });
+
+    match exit {
+        Ok(code) => assert_eq!(code, Some(0), "a disconnect should still be a clean exit"),
+        Err(panic) => resume_unwind(panic),
+    }
+    assert!(
+        worker_gone,
+        "engine worker pid {worker} outlived the connection"
+    );
+    assert_eq!(
+        base_now + 0x28,
+        base,
+        "the guest rebooted between the two attaches, so the byte read back is not the byte that \
+         was patched and this run can say nothing about the rollback"
+    );
+    assert_eq!(
+        byte_now,
+        Some(expected),
+        "{:#x} still reads {byte_now:?} rather than {expected:#x} after a disconnect — the batch \
+         was terminated with its patch in place, which on a real target is the loss this tool \
+         exists to prevent",
+        base
+    );
+    // The steps had twenty seconds left. Waiting them out would be a rollback that happened for
+    // the wrong reason — the batch finishing normally — and would say nothing about abandoning one.
+    assert!(
+        took < Duration::from_secs(15),
+        "the disconnect took {took:?}: the batch ran on instead of stopping at its next step"
+    );
+    println!(
+        "a disconnect mid-patch left {:#x} restored to {expected:#x}",
+        base
+    );
+    let _ = std::fs::remove_file(&running);
+}
+
+/// `end_session` while a live kernel batch holds a patch — the same guarantee with a client still
+/// present to be told about it.
+///
+/// Two things have to be true at once here, and only the first is testable against a dump: the
+/// batch's own call comes back saying `BATCH: ABANDONED` with the rollback complete, *and* the
+/// guest's memory agrees. The session is gone by then, so the byte is read over a second attach.
+#[test]
+#[ignore = "needs a live KDNET target and its connection string; run manually, last"]
+fn ending_a_live_kernel_session_mid_batch_restores_its_patch() {
+    let Some(connection) = kernel_tier() else {
+        return;
+    };
+    let running = marker_path("live-kernel-end-session-batch");
+    let _ = std::fs::remove_file(&running);
+
+    let mut server = Server::started_with(&[(
+        "WINDBG_MCP_CALL_TIMEOUT_SECS",
+        &SERVER_CALL_TIMEOUT.as_secs().to_string(),
+    )]);
+
+    // The first session is ended *by the test itself*, mid-batch, so it cannot use the helper —
+    // but everything it does before that still has to be unwound if it fails.
+    let attached = server.call_tool(
+        "attach_kernel",
+        json!({ "connection": connection }),
+        TARGET_STEP,
+    );
+    let report = text_of(&attached["result"]);
+    assert_no_error(&attached, "attach_kernel");
+    let session = maybe_session_id(&report)
+        .unwrap_or_else(|| panic!("the attach left no session behind:\n{report}"));
+    assert!(
+        !is_tool_error(&attached),
+        "the attach claimed its target and then failed:\n{report}"
+    );
+    // Under `catch_unwind` from here: the guest is broken in, and the `end_session` below is what
+    // releases it — so nothing in between may propagate a panic past it, including the two
+    // bookkeeping calls that open this block.
+    let outcome = catch_unwind(AssertUnwindSafe(|| {
+        // The second attach has to wait for this worker to exit before it can claim the KD
+        // transport, which is single-owner.
+        let status = server.tool_text("session_status", json!({}), STEP);
+        let worker = engine_pid_of(&status, &session);
+        let scratch = kernel_scratch(&mut server, &session)?;
+        let mut steps = patch_steps(&scratch);
+        steps.push(
+            json!({ "op": "command", "command": format!(".logopen \"{}\"", running.display()) }),
+        );
+        steps.push(json!({ "op": "command", "command": ".echo BATCH-RUNNING" }));
+        steps.push(json!({ "op": "command", "command": ".logclose" }));
+        steps.extend(std::iter::repeat_n(
+            json!({ "op": "command", "command": ".sleep 1000" }),
+            20,
+        ));
+        let batch = server.send_request(
+            "tools/call",
+            json!({
+                "name": "debug_batch",
+                "arguments": {
+                    "session_id": session,
+                    "steps": steps,
+                    "always": restore_steps(&scratch),
+                }
+            }),
+        );
+
+        let deadline = Instant::now() + TARGET_STEP;
+        while !running.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "the batch never got past its patch steps\n--- stderr ---\n{}",
+                server.stderr()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Some((scratch, batch, worker))
+    }));
+
+    // Whatever happened above, this session is ending now — it is either the act under test or the
+    // cleanup, and on a broken-in kernel it is not optional.
+    let asked = Instant::now();
+    let ended = server.call_tool("end_session", json!({ "session_id": session }), TARGET_STEP);
+    let ended_text = text_of(&ended["result"]);
+    let took = asked.elapsed();
+    if let Some(why) = ungraceful_detach(&ended, &ended_text) {
+        panic!("THE TARGET MAY STILL BE HALTED — {why}");
+    }
+    let started = match outcome {
+        Ok(started) => started,
+        Err(panic) => resume_unwind(panic),
+    };
+    let Some((scratch, batch, worker)) = started else {
+        return;
+    };
+
+    // The batch's own reply, which the client is still here to receive.
+    let report = text_of(&server.await_id(batch, "debug_batch", TARGET_STEP)["result"]);
+    assert!(
+        report.contains("BATCH: ABANDONED"),
+        "the batch should say it was cut short, not that it failed or timed out:\n{report}"
+    );
+    assert!(
+        report.contains("rollback: COMPLETE"),
+        "the rollback is the reason for stopping early:\n{report}"
+    );
+    assert!(
+        took < Duration::from_secs(15),
+        "end_session took {took:?}: it waited out the batch instead of stopping it at its next step"
+    );
+
+    // The KD transport is single-owner, so the second attach has to wait for the first worker to
+    // be gone rather than race it.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while process_alive(worker) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !process_alive(worker),
+        "engine worker pid {worker} outlived the session that was ended"
+    );
+
+    let byte_now = with_live_kernel_session(&mut server, &connection, |server, session| {
+        assert_eq!(
+            nt_base(server, session) + 0x28,
+            scratch.address,
+            "the guest rebooted between the two attaches, so nothing below is about the byte that \
+             was patched"
+        );
+        eval_expr(server, session, &format!("by({})", scratch.addr()))
+    });
+    assert_eq!(
+        byte_now,
+        Some(scratch.original),
+        "the batch reported its rollback complete, but {} reads {byte_now:?} rather than {:#x} on \
+         a fresh attach:\n{report}",
+        scratch.addr(),
+        scratch.original
+    );
+    println!("`end_session` mid-batch left the guest with its byte restored");
+    let _ = std::fs::remove_file(&running);
+}
+
+/// A batch step that asks the **pool** about a pointer it just captured — the one shape the CTF
+/// workflow needed and `debug_batch` could not express (`FOLLOWUPS.md` item 17).
+///
+/// Live-only, and not incidentally: the pool tools walk the allocator's own descriptors, which
+/// needs a broken-in x64 kernel with `nt` private symbols. What it proves beyond the unit tests is
+/// the part that only exists over a wire — that a step's walk is armed with the *batch's* budget
+/// rather than the walker's own default, and still answers.
+#[test]
+#[ignore = "needs a live KDNET target and its connection string; run manually, last"]
+fn a_live_kernel_batch_step_can_ask_the_pool_about_a_captured_pointer() {
+    let Some(connection) = kernel_tier() else {
+        return;
+    };
+    let engine = ensure_engine_beside_test_binary();
+    println!("engine: {engine}");
+    let mut server = Server::started_with(&[(
+        "WINDBG_MCP_CALL_TIMEOUT_SECS",
+        &SERVER_CALL_TIMEOUT.as_secs().to_string(),
+    )]);
+
+    with_live_kernel_session(&mut server, &connection, |server, session| {
+        let symbols = load_kernel_symbols(server, session);
+        assert!(
+            symbols.loaded.contains("pdb symbols") && !symbols.probe.is_empty(),
+            "a pool step needs full `nt` symbols and the pool-root global, same as the pool tools. \
+             If a known-good path exists, set {SYMBOLS_ENV}. Engine setup said: {engine}\n{}",
+            symbols.transcript
+        );
+
+        // `@$proc` is the current process's EPROCESS — a real pool allocation, and a pointer the
+        // debugger will hand over without any of this having to know an address in advance.
+        let call = server.call_tool(
+            "debug_batch",
+            json!({
+                "session_id": session,
+                // The walk is the expensive part and it is inside the batch, so give the batch
+                // room for it — the point is that the *step* bounds the walk, not that nothing
+                // ever has to wait.
+                "timeout_ms": 300_000,
+                "steps": [
+                    { "op": "eval", "expr": "@$proc", "capture": "proc",
+                      "name": "the EPROCESS the target is running on" },
+                    { "op": "pool_chunk", "address": "{{proc}}", "refresh": true,
+                      "name": "what the allocator says that pointer is" },
+                    { "op": "pool_census", "limit": 8, "name": "and what the pool holds overall",
+                      "expect": [{ "check": "contains", "text": "chunks walked:" }] }
+                ]
+            }),
+            POOL_CALL_BUDGET,
+        );
+        let report = text_of(&call["result"]);
+        assert_no_error(&call, "debug_batch with pool steps");
+        assert!(
+            !is_tool_error(&call),
+            "the pool steps failed inside the batch:\n{report}\n\nsymbol setup said:{}",
+            symbols.transcript
+        );
+        assert!(
+            report.contains("BATCH: COMMITTED"),
+            "a read-only batch of pool queries should commit:\n{report}"
+        );
+        // Nothing was written, and the report must not claim otherwise: a pool walk reads
+        // descriptors, however long it takes to do it.
+        assert!(
+            report.contains("mutations: none recognised"),
+            "pool queries change nothing:\n{report}"
+        );
+        // The captured pointer reached the query — a `{{proc}}` surviving into the report would
+        // mean nothing was bound.
+        assert!(
+            !report.contains("{{proc}}"),
+            "the capture was not interpolated into the pool step:\n{report}"
+        );
+        // Either answer is correct and they are different facts, so accept both by name rather
+        // than asserting the walk covered this particular chunk.
+        assert!(
+            report.contains("chunk tagged") || report.contains("not covered by the pool snapshot"),
+            "the pool_chunk step answered neither of the two things it can say:\n{report}"
+        );
+        println!("a pool query inside a live-kernel batch:\n{report}");
+    });
 }
 
 /// End-to-end CTF regression: a real MessageManager image and its retained `Tgsm` objects must be

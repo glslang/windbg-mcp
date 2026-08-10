@@ -22,7 +22,7 @@ connected MCP client holds a lock on (see [`CLAUDE.md`](../CLAUDE.md)). Whole su
 | **Protocol** | always | nothing — no debugger, no target, no network | transport, revision negotiation, tool-surface drift |
 | **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump | `win-kexp` / DbgEng regressions |
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
-| **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a KDNET target you can freeze | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect |
+| **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a KDNET target you can freeze | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
 | **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
 | **Live (other)** | manual | TTD engine, elevation, a test driver | see [Manual checklist](#manual-checklist) |
 
@@ -220,7 +220,7 @@ $env:WINDBG_MCP_SMOKE_KERNEL = "net:port=50000,key=<w.x.y.z>"
 cargo test --test mcp_smoke -- --ignored --nocapture --test-threads=1 live_kernel
 ```
 
-`--test-threads=1` is required, not tidiness: the filter matches **three** tests, and the KD
+`--test-threads=1` is required, not tidiness: the filter matches **eight** tests, and the KD
 transport is single-owner. Run them in parallel and the later attaches fail, which can leave the
 target halted.
 
@@ -313,6 +313,47 @@ a *dump* costs nothing. Both tests therefore collect their evidence and assert o
 target has been released: an earlier draft asserted as it went, failed at the release check, and
 left the target halted. A test for a bug that freezes a machine must not freeze the machine when
 it fails.
+
+### A `debug_batch` that really mutates the target
+
+Five of the eight tests are about a batch that **patches a byte of the running kernel and puts it
+back**, which is the thing the tool exists for and the thing no dump can test: a byte "patched" in a
+crash dump is patched in a file nobody reads again, so a rollback that silently did nothing would
+satisfy every assertion the debugger tier can make. Here the byte either reads back as it was or it
+does not.
+
+The byte is `nt`'s DOS-header `e_res2` field (`nt+0x28`) — reserved by the PE format, zero in every
+image MSVC has linked, read by nothing at runtime, and stable across a detach and re-attach because
+the image does not move without a reboot. Each test **probes it first**: read, write a different
+value, read it back, restore. That probe decides whether the run can prove anything at all, and it
+is the one place a guest with memory integrity (HVCI) enabled announces itself — such a guest
+accepts a debugger write to an image page and drops it, which would leave every assertion below
+passing for the wrong reason. When the probe cannot write, the test says so loudly and stops rather
+than measuring a patch that never landed.
+
+- **A failing batch restores its patch** — the assertion that cannot hold is step 4 of 5, the batch
+  stops there, and a **separate later call** finds the original byte. The step after the failure
+  writes a third distinct value, so "SKIPPED" is checked against the target and not only against the
+  report.
+- **A batch reports and rolls back inside its caller's timeout.** The server's per-call budget is
+  pinned to 60s, the batch asks for ten minutes and is given nearly a minute of work; the clamp in
+  `worker::batch_budget` is what makes the report arrive before the call gives up. The steps are
+  many short `.sleep`s rather than a few long ones deliberately: the deadline is then crossed
+  *between* steps, so the outcome does not depend on whether DbgEng honours an interrupt inside a
+  `.sleep`.
+- **A disconnect lets the rollback finish first**, verified from a **new server process** over a
+  fresh attach — the byte outlives every process that was involved in patching it. This is the
+  substance the debugger tier's version can only approximate with a log file.
+- **`end_session` mid-batch does the same with a client still listening**: the batch's own call
+  comes back `BATCH: ABANDONED` with the rollback complete, *and* a second attach agrees about the
+  byte. Both attaches check `nt`'s base, so a guest that rebooted in between fails loudly instead of
+  comparing a byte to a different byte.
+- **A batch step queries the pool.** `pool_chunk`, `pool_find_tag` and `pool_census` are the only
+  typed tools that are not debugger commands, so a batch that could not call them could not express
+  the CTF workflow's `@chunkt1` — which sat inside the transaction, between a patch and its restore.
+  The test captures `@$proc` with an `eval` step and asks `pool_chunk` about `{{proc}}`; it needs the
+  same full `nt` symbols the pool tier does. Either pool answer is correct (a chunk, or an address
+  the walk did not cover) and they are different facts, so both are accepted by name.
 
 ## MessageManager CTF regression
 

@@ -22,8 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   A batch is submitted as one op and executed inside the session's worker process. Steps are
   `command` (raw), `resume` (a command that moves the target, plus the wait), `run_to` (a
-  HIT/STOPPED ELSEWHERE/TIMEOUT verdict), `eval` (a MASM expression's value) and `read_memory`.
-  Each may carry assertions — `contains`, `not_contains`, or `eval`, which compares two MASM
+  HIT/STOPPED ELSEWHERE/TIMEOUT verdict), `eval` (a MASM expression's value) and `read_memory`,
+  plus `pool_chunk`, `pool_find_tag` and `pool_census`, which ask the kernel pool exactly what the
+  tools of those names ask. Those three are here because they are the only typed tools that are
+  *not* debugger commands — they are win-kexp walks over the allocator's descriptors, so no
+  `command` step can stand in for them, and a transaction that needed one had to be split around
+  it. Inside a batch their walk is bounded by the step's share of the budget rather than by the
+  walker's own 120s default, so a `refresh` cannot spend the reserve the rollback lives on; a walk
+  cut short still reports the coverage it reached.
+  Each step may carry assertions — `contains`, `not_contains`, or `eval`, which compares two MASM
   expressions and so covers registers, memory and any relation between them — and an `eval` step
   may `capture` its value under a name later steps interpolate as `{{name}}`.
 
@@ -82,6 +89,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to both teardowns — a real disconnect mid-batch, whose rollback has to leave a mark on the machine
   because there is no client left to report to, and an `end_session` mid-batch, where there is.
 
+  The claim itself — *a write that is then restored* — is settled where it can be false, on a live
+  KDNET kernel: a byte of the running kernel is patched inside a batch and read back afterwards,
+  through a failing assertion, through a call budget shorter than the batch asked for, through a
+  disconnect (read back by a **new server process** over a fresh attach) and through an
+  `end_session`. A crash dump cannot make that claim at all — a byte patched in a dump is patched in
+  a file nobody reads again, so a rollback that silently did nothing passes every assertion the dump
+  tier can make. Each of those tests probes the byte before it starts, because a guest with memory
+  integrity enabled accepts a debugger write to an image page and drops it, which would otherwise
+  leave the whole tier passing for the wrong reason.
+
   Two limits are documented rather than papered over. DbgEng reports most command failures by
   printing them and returning success, so a raw step that prints an error is a step that
   *succeeded* — assert on its output if that matters. And what a step "changed" is a best-effort
@@ -90,10 +107,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Validated against the workflow it was filed for, not against a guess at it: the CTF session's own
   transcript records all 18 revisions of the throwaway client and all 188 of its invocations — 1,681
-  steps, of which 1,672 are shapes the step language covers. The 9 that are not are pool-tool calls
-  (`pool_chunk`, `pool_census`, `pool_find_tag`), which are win-kexp walks rather than debugger
-  commands and so have no `execute` to fall back on; that gap is [`FOLLOWUPS.md`](./FOLLOWUPS.md)
-  item 17. Two of the client's revisions exist only to work around gaps this closes — a compound
+  steps, every one of them a shape the step language covers. The 9 that motivated the pool steps are
+  the reason those exist: the client's `@chunkt1` read a pseudo-register with `execute`,
+  regex-scraped the value out of the debugger's prose and handed it to `pool_chunk`, and it sat
+  *inside* the 32-step transaction, between a code patch and its restore — so a batch without it
+  would have had to drop the query or split the transaction. It is now a `capture` and a step.
+  Two of the client's revisions exist only to work around gaps this closes — a compound
   assertion rewritten as three pseudo-register assignments and three regexes, and a duplicate of its
   run-to verb whose only difference was restoring a patch "on both hit and timeout". The longest
   single invocation, 32 steps, is transcribed as a regression test.
