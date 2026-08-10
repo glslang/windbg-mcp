@@ -98,10 +98,13 @@ retracts its bound to what the release still needs — a promise revised downwar
 wait that already committed to the whole of the old one.
 
 And the release keeps a grace of its own after all that, because it could not start until the
-transaction ended. The retraction usually delivers it, but a batch that runs to the bound it
-advertised emits that retraction at the instant the wait stops looking for one; resting on it
-winning that race would be resting on pipe scheduling, and losing means a worker killed as its
-release begins.
+transaction ended — granted by the supervisor, measured from the moment the worker named, and owed
+only to a teardown that actually waited on a transaction. The division of labour is the point, and
+it took two rounds to find: the **worker** knows when its batch ended and says so; **how long a
+release then gets** is the supervisor's own grace, the same one it would have given a session that
+never ran a batch. When the worker named a release interval too, the supervisor waited that out and
+*then* started its grace, so a teardown spent two of them; when it named nothing, a batch running to
+its advertised bound raced the wait's last look and could be killed as the release began.
 
 A session with nothing to unwind says nothing and costs exactly what it always did, so an ordinary
 disconnect is untouched. What none of this can do is *shorten* a step already inside DbgEng — that
