@@ -218,22 +218,30 @@ impl BatchSignal {
     /// transaction already safely unwound. A fresh promise of zero says the only thing still worth
     /// waiting for is the release itself.
     ///
-    /// Owed once: whoever takes it here sends it.
-    fn finish(&self) -> Option<u64> {
+    /// Owed once: whoever takes it here sends it, to the id and with the figure this returns.
+    fn finish(&self) -> Option<(u64, u32)> {
         let mut state = self.state();
         state.finish_by = None;
-        state.told_by.take()
+        state.told_by.take().map(|id| (id, RELEASE_STILL_NEEDS))
     }
 
     /// Claims the engine thread for a batch that must be done within `budget`, for as long as the
-    /// guard lives, and answers whether it may start at all.
-    fn enter(&self, budget: Duration) -> (BatchGuard<'_>, bool) {
-        self.state().finish_by = Some(Instant::now() + budget);
-        let guard = BatchGuard { signal: self };
-        // After the lock above is released, so a teardown that observes this batch at all observes
-        // its deadline too. See [`Self::abandon`].
-        let may_start = !self.abandon.load(Ordering::SeqCst);
-        (guard, may_start)
+    /// guard lives — or refuses, when a teardown has already been through.
+    ///
+    /// Checking and publishing under the **one** lock acquisition is what keeps a refused batch
+    /// from ever being visible: published first and withdrawn after, there is a window in which a
+    /// second teardown reads a whole batch budget for a batch that will not run, and waits it out
+    /// before killing a worker that is doing nothing.
+    fn enter(&self, budget: Duration) -> Option<BatchGuard<'_>> {
+        let mut state = self.state();
+        // Under the lock, which is what pairs it with [`Self::abandon`]: that one stores before it
+        // takes this lock, so a teardown that got here first is visible to this load, and a batch
+        // that got here first is visible to that read. Never neither.
+        if self.abandon.load(Ordering::SeqCst) {
+            return None;
+        }
+        state.finish_by = Some(Instant::now() + budget);
+        Some(BatchGuard { signal: self })
     }
 }
 
@@ -247,11 +255,23 @@ impl Drop for BatchGuard<'_> {
     fn drop(&mut self) {
         // Outside the lock `finish` takes: `emit` takes one of its own, and nothing here should
         // hold two at once.
-        if let Some(id) = self.signal.finish() {
-            emit(&WorkerMessage::RollingBack { id, within_ms: 0 });
+        if let Some((id, within_ms)) = self.signal.finish() {
+            emit(&WorkerMessage::RollingBack { id, within_ms });
         }
     }
 }
+
+/// What a retraction promises instead of the batch's remaining budget: the transaction is over, and
+/// what is left is the release, which has not started yet.
+///
+/// **Not zero**, which is what "the batch is done" first became. The release was queued *behind*
+/// the batch, so at the moment the batch ends it has not run at all — and a teardown whose grace
+/// expires just then would terminate the worker in the middle of the resume-and-detach a live
+/// kernel needs, leaving the target halted. It would also be non-monotonic, since a batch finishing
+/// a moment later would keep its whole extension. A release gets what an idle engine takes to let
+/// go, which is the same figure this process waits when it has to do it unasked
+/// ([`ABRUPT_EXIT_RELEASE`]).
+const RELEASE_STILL_NEEDS: u32 = ABRUPT_EXIT_RELEASE.as_millis() as u32;
 
 /// This process's one batch signal. Global for the same reason [`MESSAGES`] is: the reader thread
 /// sets it, the engine thread reads it, and there is exactly one engine here to be talking about.
@@ -878,8 +898,7 @@ fn run_batch(e: &DebugEngine, op: BatchOp, queued: Duration) -> Result<String, S
     // has to be told how long it may still run, and that is not known until the budget is. From
     // here an abandon signal either finds this batch or is found by it — never neither. See
     // [`BatchSignal::abandon`].
-    let (_running, may_start) = BATCH.enter(budget);
-    if !may_start {
+    let Some(_running) = BATCH.enter(budget) else {
         // The same answer as an unaffordable budget above, and for the same reason: nothing ran, so
         // there is nothing to undo and resubmitting is safe. This is the queue-wait case — the
         // teardown that set the flag arrived while this batch was still behind other work.
@@ -891,7 +910,7 @@ fn run_batch(e: &DebugEngine, op: BatchOp, queued: Duration) -> Result<String, S
              the whole batch."
                 .to_string(),
         );
-    }
+    };
     let mut engine = BatchEngine {
         e,
         started: Instant::now(),
@@ -2084,16 +2103,14 @@ mod tests {
         // The signal arrives first: the batch must not start.
         let waiting = BatchSignal::new();
         assert_eq!(waiting.abandon(TEARDOWN), None, "nothing is running yet");
-        let (_running, may_start) = waiting.enter(A_LONG_BATCH);
         assert!(
-            !may_start,
+            waiting.enter(A_LONG_BATCH).is_none(),
             "a batch that reached the engine after the teardown must not run its mutations"
         );
 
         // The batch got there first: the signal must report it, so the grace is held open.
         let started = BatchSignal::new();
-        let (_running, may_start) = started.enter(A_LONG_BATCH);
-        assert!(may_start, "an ordinary batch runs");
+        let _running = started.enter(A_LONG_BATCH).expect("an ordinary batch runs");
         let within = started.abandon(TEARDOWN).expect(
             "a signal that found a batch running has to say so, or the teardown waits five \
              seconds and kills it mid-transaction",
@@ -2112,8 +2129,7 @@ mod tests {
     #[test]
     fn a_batch_that_is_out_of_time_asks_a_teardown_for_none() {
         let signal = BatchSignal::new();
-        let (_running, may_start) = signal.enter(Duration::ZERO);
-        assert!(may_start);
+        let _running = signal.enter(Duration::ZERO).expect("it may start");
         assert_eq!(
             signal.abandon(TEARDOWN),
             Some(Duration::ZERO),
@@ -2132,23 +2148,31 @@ mod tests {
     fn a_finished_batch_retracts_the_promise_it_was_given() {
         // Nobody was told, so nobody is owed an answer.
         let untold = BatchSignal::new();
-        let (guard, _) = untold.enter(A_LONG_BATCH);
-        drop(guard);
+        drop(untold.enter(A_LONG_BATCH).expect("it may start"));
         assert_eq!(untold.finish(), None);
 
         let signal = BatchSignal::new();
-        let (guard, _) = signal.enter(A_LONG_BATCH);
+        let guard = signal.enter(A_LONG_BATCH).expect("it may start");
         assert!(
             signal.abandon(TEARDOWN).is_some(),
             "the teardown is told this batch may need time"
         );
-        assert_eq!(
-            signal.finish(),
-            Some(TEARDOWN),
-            "so it is owed the news when that stops being true"
-        );
+        let (told, within_ms) = signal
+            .finish()
+            .expect("so it is owed the news when that stops being true");
+        assert_eq!(told, TEARDOWN);
         assert_eq!(signal.finish(), None, "and owed it once");
         drop(guard);
+
+        // What it is told is not "stop waiting": the release was queued *behind* the batch, so at
+        // this moment it has not run at all. Retracting to nothing would let a teardown whose
+        // grace expires right here terminate the worker mid-detach — and would be non-monotonic,
+        // since a batch finishing a moment later keeps its whole extension.
+        assert!(
+            within_ms > 0,
+            "a finished transaction still leaves a release that has not started"
+        );
+        assert_eq!(u128::from(within_ms), ABRUPT_EXIT_RELEASE.as_millis());
     }
 
     /// Once the batch is over, a teardown gets the short grace again — the extra wait is for a
@@ -2156,17 +2180,13 @@ mod tests {
     #[test]
     fn a_finished_batch_leaves_nothing_for_a_teardown_to_wait_on() {
         let signal = BatchSignal::new();
-        {
-            let (_running, may_start) = signal.enter(A_LONG_BATCH);
-            assert!(may_start);
-        }
+        drop(signal.enter(A_LONG_BATCH).expect("it may start"));
         assert_eq!(
             signal.abandon(TEARDOWN),
             None,
             "the batch is done; there is nothing to unwind"
         );
         // Still sticky, though: this session is on its way out and must not start another.
-        let (_running, may_start) = signal.enter(A_LONG_BATCH);
-        assert!(!may_start);
+        assert!(signal.enter(A_LONG_BATCH).is_none());
     }
 }

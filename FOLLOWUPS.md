@@ -437,7 +437,7 @@ killed outright still gets the rollback rather than a truncated transaction.
   rather than cutting it off, so the cost is latency rather than a lost rollback — but a step that
   outlives its own watchdog is still terminated mid-transaction. Shortening it is item 7
   (`SetInterrupt` bound to job identity), and that is the only part of this that needs it.
-- **Proof:** `src/batch.rs` unit-tests the executor's two new behaviours (stop and roll back; and
+- **Proof:** `src/batch.rs` unit-tests the executor's two new behaviours (stop and roll back, and
   the rollback keeping the same budget every other path gets, whichever step the signal landed in),
   `src/worker.rs` pins the pairing that makes "a batch runs while the teardown thinks nothing is
   running" unreachable and the remaining-budget figure the grace is sized from, and the dump tier

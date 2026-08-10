@@ -2840,8 +2840,7 @@ mod tests {
             .unwrap_or_else(Instant::now));
         assert_eq!(session.unwinding_for(), None);
 
-        // The retraction a worker sends when its batch finishes early: `within_ms: 0`, recorded as
-        // a deadline of now, and read as nothing left to wait for.
+        // The boundary itself: a deadline of exactly now is spent, not owed.
         set(Instant::now());
         assert_eq!(session.unwinding_for(), None);
     }
@@ -2886,11 +2885,12 @@ mod tests {
             "recorded as a deadline 90s out, not {left:?}"
         );
 
-        // And a zero retracts it: a worker whose transaction finished has nothing left to be
-        // waited for, however long it said it might need when it was told to stop.
+        // A later, smaller figure *retracts* it: a worker whose transaction has finished says so
+        // by naming only what the release still needs, however long it said it might need when it
+        // was told to stop. The last word wins, in both directions.
         let done = serde_json::to_string(&WorkerMessage::RollingBack {
             id: 7,
-            within_ms: 0,
+            within_ms: 5_000,
         })
         .expect("encode the retraction");
         writeln!(worker, "{done}").expect("write it as a worker would");
@@ -2898,9 +2898,15 @@ mod tests {
             .await
             .expect("the retraction reached the dispatcher within 10s");
         let by = unwinding.lock().unwrap().expect("still recorded");
+        let left = by.saturating_duration_since(Instant::now());
         assert!(
-            by <= Instant::now(),
-            "a finished transaction must not go on being waited for"
+            left <= Duration::from_secs(5),
+            "a finished transaction must not go on being waited out for the rest of its budget, \
+             and {left:?} is still most of it"
+        );
+        assert!(
+            !left.is_zero(),
+            "but the release it was holding up has not run yet, so it keeps its own moment"
         );
     }
 
