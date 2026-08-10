@@ -36,19 +36,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the same way a bounded command's watchdog is, so the rollback has finished and the report has been
   written before the tool call gives up — which is the only reason the report is worth anything.
 
-A batch whose caller has already given up is **not started at all**: a job stays queued after
+  A batch whose caller has already given up is **not started at all**: a job stays queued after
   its waiter times out, so the worker checks what patience is left before the first step and
   refuses outright rather than applying mutations nobody is waiting to hear about. That is where a
   batch parts company with a bounded command, which floors its watchdog instead — that one is
   already running and the job left is to free the worker; this one has not started, and not
   starting is what leaves the target as the caller last saw it.
 
+  **A teardown while the batch is running is answered too**, and it is a different problem from a
+  timeout: `end_session` and a client disconnect both release the target, and the op that does so
+  queues *behind* the batch, so the grace used to expire with the transaction still open and the
+  worker was terminated mid-patch. The teardown now signals first — the batch stops at its next step,
+  runs `always`, and reports `BATCH: ABANDONED` — and holds its grace open for that session by the
+  rollback's own reserve. The signal is answered by the worker's *request reader*, not its engine
+  thread, because the engine thread is the one inside the batch; it is skipped entirely when a worker
+  owes no reply, so an ordinary disconnect costs exactly what it always did. A batch that reaches the
+  engine *after* the signal does not start at all, which is the same "nothing ran, resubmitting is
+  safe" answer as an unaffordable budget.
+
   Two edges are reported rather than papered over. The reserve buys the rollback *time*, not a
   guarantee: a step that overruns far enough to consume the reserve as well leaves cleanup with no
   budget, and the result then says `rollback: INCOMPLETE` and names each step that never started.
-  And the strong guarantee is against a call **timeout** — a client **disconnect** is treated as
-  `end_session` on every session, so a batch still running when that grace expires is terminated
-  with its worker, mid-transaction.
+  And no signal reaches a step already inside DbgEng, so a batch built from long steps still waits
+  out the one it is in — a step longer than the grace is still terminated mid-transaction.
 
   The result names every step that ran, the exact failing one, what each step changed, whether the
   rollback completed (reported *beside* the original failure, never instead of it), and whether the
@@ -63,7 +73,9 @@ A batch whose caller has already given up is **not started at all**: a job stays
   `COMMITTED`, and a misspelt `expect` is a step that asserts nothing and commits anyway. A batch containing a target-changing command retires the session handle
   ahead of running, as `execute` does. The executor drives a `Debuggee` trait rather than DbgEng, so
   assertion failure, a command failure after a mutation, deadline expiry and a rollback that itself
-  fails are unit-tested without a debugger; the dump tier drives a real engine to both outcomes.
+  fails are unit-tested without a debugger; the dump tier drives a real engine to both outcomes, and
+  to both teardowns — a real disconnect mid-batch, whose rollback has to leave a mark on the machine
+  because there is no client left to report to, and an `end_session` mid-batch, where there is.
 
   Two limits are documented rather than papered over. DbgEng reports most command failures by
   printing them and returning success, so a raw step that prints an error is a step that

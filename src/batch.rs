@@ -61,7 +61,12 @@ pub const MAX_CHECKS: usize = 16;
 /// Reserved *up front* rather than taken from what is left, because "what is left" after a step
 /// that ran to its own deadline is nothing. Capped at half the budget so a short batch still
 /// spends most of its time on the work it was asked to do.
-const ROLLBACK_RESERVE: Duration = Duration::from_secs(30);
+///
+/// Public because it is also the longest a rollback can take, which is what a teardown has to wait
+/// out after telling a batch to abandon ([`Debuggee::abandoned`]). The supervisor derives its grace
+/// from this constant rather than picking one that happens to be long enough — see
+/// `engine::release_grace`.
+pub const ROLLBACK_RESERVE: Duration = Duration::from_secs(30);
 
 /// The smallest watchdog a step is armed with. Zero *disables* win-kexp's watchdog, so a step
 /// dequeued at or past the deadline must not round down to it.
@@ -622,6 +627,14 @@ pub trait Debuggee {
     fn read_memory(&mut self, address: &str, size: u32) -> Result<String, String>;
     /// How long this batch has been running.
     fn elapsed(&self) -> Duration;
+    /// Whether something outside the batch has asked it to stop early and roll back — a client
+    /// disconnect, or an `end_session` for the session it is running on.
+    ///
+    /// Read between steps, never mid-step: this cannot reach a call already inside DbgEng, and
+    /// pretending otherwise would be a promise the mechanism cannot keep. What it *is* is the
+    /// difference between a rollback that runs and a worker terminated with the patch still
+    /// applied, because the teardown that sets it then waits for the `always` block.
+    fn abandoned(&self) -> bool;
 }
 
 /// Runs one engine call, turning a panic into a step failure so [`run`] still reaches `always`.
@@ -718,6 +731,15 @@ pub enum BatchOutcome {
     Failed { at: usize },
     /// The deadline expired; `at` is the 1-based position of the first step not attempted.
     TimedOut { at: usize },
+    /// The session is being torn down — the client disconnected, or someone ended it — so the
+    /// batch stopped and went to its rollback. `at` is the 1-based position of the first step not
+    /// attempted.
+    ///
+    /// Its own outcome rather than a timeout, because nothing about the target or the budget was
+    /// wrong: the steps that did not run were not *refused*, they were cut short by something the
+    /// batch has no quarrel with. Resubmitting from the top is the right next move, which is not
+    /// what a caller should conclude from either of the other two.
+    Abandoned { at: usize },
 }
 
 /// What the session holds once the batch is done — the question a caller cannot answer from the
@@ -805,6 +827,29 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
                 ));
                 continue;
             }
+            BatchOutcome::Abandoned { at } => {
+                steps.push(StepOutcome::skipped(
+                    position,
+                    step,
+                    format!(
+                        "the session was torn down while the batch was running, so it stopped at \
+                         step {at} and went to its rollback"
+                    ),
+                ));
+                continue;
+            }
+        }
+        // Before the deadline check, because the two are not the same news and this one is the
+        // more urgent: something is tearing this session down and the rollback is what is left
+        // worth doing. Between steps only — a step already inside DbgEng runs to its own end.
+        if d.abandoned() {
+            outcome = BatchOutcome::Abandoned { at: position };
+            steps.push(StepOutcome::skipped(
+                position,
+                step,
+                "the session was torn down before this step started",
+            ));
+            continue;
         }
         if d.elapsed() >= steps_deadline {
             outcome = BatchOutcome::TimedOut { at: position };
@@ -831,11 +876,19 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
     }
 
     // The rollback block, on every path. Its own deadline is the *whole* budget, which is what the
-    // reserve above bought it.
+    // reserve above bought it — except when the batch was abandoned, where the budget is no longer
+    // the bound that matters. A teardown is waiting on this rollback and gives it the reserve, so
+    // running past that would only mean being terminated mid-cleanup with the report unwritten:
+    // the same failure, one step later. Held to the reserve, the block that fits is the block that
+    // runs, and what did not fit is *reported* as not having run.
+    let cleanup_deadline = match outcome {
+        BatchOutcome::Abandoned { .. } => (d.elapsed() + reserve).min(budget),
+        _ => budget,
+    };
     let mut always: Vec<StepOutcome> = Vec::with_capacity(op.always.len());
     for (index, step) in op.always.iter().enumerate() {
         let position = index + 1;
-        if d.elapsed() >= budget {
+        if d.elapsed() >= cleanup_deadline {
             always.push(StepOutcome::skipped(
                 position,
                 step,
@@ -845,7 +898,7 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
         }
         // Cleanup continues past its own failures, deliberately: the steps are ordered, but a
         // patch that cannot be restored must not stop a breakpoint from being cleared.
-        always.push(run_step(d, step, position, budget, &mut bound));
+        always.push(run_step(d, step, position, cleanup_deadline, &mut bound));
     }
 
     let after = probe_state(d, &steps, &always, budget);
@@ -1226,6 +1279,12 @@ pub fn render(report: &BatchReport) -> String {
             report.budget.as_secs_f64(),
             report.elapsed.as_secs_f64()
         ),
+        BatchOutcome::Abandoned { at } => format!(
+            "BATCH: ABANDONED at step {at} of {total} — the session was being torn down (the \
+             client disconnected, or the session was ended), so the batch stopped there and ran \
+             its rollback. Nothing was wrong with the steps or the budget; resubmit the whole \
+             batch on a fresh session.\n"
+        ),
     };
 
     let mutations = report.mutations();
@@ -1317,6 +1376,9 @@ mod tests {
         clock: Duration,
         /// Call fragments this script panics on rather than answers; see [`Script::panics`].
         panic_on: Vec<String>,
+        /// How many calls this debuggee answers before it starts reporting itself abandoned; see
+        /// [`Script::abandoned_after`].
+        abandon_after: Option<usize>,
     }
 
     /// The message a scripted panic carries, so the report can be asserted to have kept it.
@@ -1345,6 +1407,14 @@ mod tests {
             // Not an `answers` entry: the panic fires before the lookup, so one would only be
             // there to look like an answer that is never given.
             self.panic_on.push(matching.to_string());
+            self
+        }
+
+        /// Reports the batch abandoned once `calls` calls have been answered — the scripted stand-in
+        /// for a teardown arriving mid-transaction, which is otherwise only reproducible by
+        /// disconnecting a client from a real worker.
+        fn abandoned_after(mut self, calls: usize) -> Self {
+            self.abandon_after = Some(calls);
             self
         }
 
@@ -1403,6 +1473,10 @@ mod tests {
         }
         fn elapsed(&self) -> Duration {
             self.clock
+        }
+        fn abandoned(&self) -> bool {
+            self.abandon_after
+                .is_some_and(|after| self.calls.len() >= after)
         }
     }
 
@@ -1550,6 +1624,94 @@ mod tests {
         assert!(report.rollback_complete());
         let text = render(&report);
         assert!(text.contains("BATCH: TIMED OUT at step 2 of 2"), "{text}");
+    }
+
+    /// A teardown arriving mid-transaction: the batch stops where it is and unwinds, rather than
+    /// running on to be killed with the patch still applied.
+    ///
+    /// This is the disconnect path. Nothing is wrong with the target or the budget — the session
+    /// is simply going away — so the outcome is neither a failure nor a timeout, and the steps that
+    /// did not run say which of the three it was, because the next move differs for each.
+    #[test]
+    fn an_abandoned_batch_stops_where_it_is_and_still_rolls_back() {
+        let mut d = stopped()
+            .on("eb fffff800", Ok(""))
+            .on("second", Ok(""))
+            .on("third", Ok(""))
+            .on("eb restore", Ok(""))
+            // The signal lands after the first step's command; `? @$ip` at the end is the only
+            // other call, and by then the rollback has run.
+            .abandoned_after(1);
+        let batch = op(
+            vec![
+                cmd("eb fffff800`00001000 90"),
+                cmd("second step"),
+                cmd("third step"),
+            ],
+            vec![cmd("eb restore 41")],
+        );
+
+        let report = run(&mut d, &batch, BUDGET);
+
+        assert_eq!(report.outcome, BatchOutcome::Abandoned { at: 2 });
+        assert!(!d.ran("second"), "a step after the signal must not run");
+        assert!(!d.ran("third"), "nor any step after that one");
+        assert!(
+            d.ran("eb restore"),
+            "the rollback is the whole reason for stopping early"
+        );
+        assert!(report.rollback_complete());
+        // Every skipped step says the session went away — not that something failed, and not that
+        // the clock ran out, which would send a caller looking for a bug or a bigger budget.
+        for step in &report.steps[1..] {
+            let StepResult::Skipped(why) = &step.result else {
+                panic!(
+                    "step {} should have been skipped: {:?}",
+                    step.position, step
+                );
+            };
+            assert!(why.contains("torn down"), "{why}");
+        }
+        let text = render(&report);
+        assert!(text.contains("BATCH: ABANDONED at step 2 of 3"), "{text}");
+        assert!(text.contains("rollback: COMPLETE"), "{text}");
+    }
+
+    /// An abandoned batch's rollback is held to the reserve, not to whatever is left of a budget
+    /// nobody is waiting out any more.
+    ///
+    /// The teardown that sent the signal gives the rollback exactly `ROLLBACK_RESERVE` before it
+    /// terminates the worker, so cleanup that ran past that would be killed mid-step with the
+    /// report unwritten — the same loss one step later. Held to the reserve, what fits runs and
+    /// what does not is *reported* as not having run, which is the difference between an incomplete
+    /// rollback and an unknown one.
+    #[test]
+    fn an_abandoned_rollback_is_held_to_the_reserve_it_is_given() {
+        let mut d = stopped()
+            .on("first", Ok(""))
+            // A first cleanup step that overruns the reserve on its own: the second is then past
+            // the deadline, even though the batch's own budget still has minutes left in it.
+            .slow("slow restore", Ok(""), Duration::from_secs(40))
+            .on("late restore", Ok(""))
+            .abandoned_after(1);
+        let batch = op(
+            vec![cmd("first step"), cmd("never runs")],
+            vec![cmd("slow restore"), cmd("late restore")],
+        );
+
+        // Ten minutes: far more than the reserve, so anything the cleanup is bounded by here is
+        // the reserve rather than the budget.
+        let report = run(&mut d, &batch, Duration::from_secs(600));
+
+        assert_eq!(report.outcome, BatchOutcome::Abandoned { at: 2 });
+        assert!(d.ran("slow restore"), "the first cleanup step fits");
+        assert!(
+            !d.ran("late restore"),
+            "the second is past the reserve, so it must not be started with a teardown waiting"
+        );
+        assert!(!report.rollback_complete());
+        let text = render(&report);
+        assert!(text.contains("rollback: INCOMPLETE"), "{text}");
     }
 
     /// A rollback step that itself fails is reported beside the original failure, never instead

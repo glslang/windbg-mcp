@@ -119,6 +119,15 @@ processes, so they need real ones:
   from one step and interpolated into the next) and one to `FAILED at step 2 of 3`, with the same
   `always` block on both. The claim only a real engine can settle is the second one: the rollback
   ran **inside the worker process**, on the failing path, before the tool call returned.
+- *A teardown mid-batch rolls it back first.* Two tests, one per teardown, both with a batch parked
+  in twenty seconds of `.sleep` steps. `end_session` gets the version with a client still attached:
+  it returns in seconds rather than waiting the batch out, and the batch's own call comes back
+  `BATCH: ABANDONED` with the rollback complete. The **disconnect** version has nobody left to
+  report to — client, supervisor and worker are all gone by the time it is checked — so the rollback
+  writes a file (`.logopen`/`.echo`/`.logclose`) and the assertion is made against the filesystem
+  afterwards, which is as close as a dump gets to the byte a live target would have restored. Both
+  wait for a marker the batch's *first* step writes before tearing anything down: timed with a sleep
+  instead, a slow machine would test the refuse-to-start path and pass just as green.
 
 This tier is also the only end-to-end check of the **protocol channel** — the inherited pipe pair a
 worker speaks on ([`proto.rs`](../src/proto.rs)). Handles are passed on the worker's command line

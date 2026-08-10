@@ -116,6 +116,20 @@ pub enum EngineOp {
     /// deadline. Splitting it into per-step round trips would put the client back in the middle
     /// of it, which is the design this replaces.
     Batch(BatchOp),
+    /// Abandon a running [`Self::Batch`]: stop before the next step and go straight to its
+    /// `always` block. Sent by a teardown — a client disconnect, or `end_session` — so the
+    /// rollback runs before the worker is asked to let the target go.
+    ///
+    /// **The one op the worker does not run on its engine thread.** Every other variant here is a
+    /// job for that thread, and this one exists precisely because that thread is busy: it is
+    /// inside the batch being abandoned. So the worker's *request reader* handles it where it
+    /// reads it, which it can, because the reader is never blocked by the engine — it drains this
+    /// channel into an in-process queue and nothing more.
+    ///
+    /// It does not interrupt a step already inside DbgEng; the batch stops at the next step
+    /// boundary. Interrupting the engine itself is a different mechanism (`SetInterrupt`, bound to
+    /// job identity) and is not this.
+    AbandonBatch,
     /// Release the target. The supervisor tears the worker down afterwards — under
     /// process-per-session a worker outlives its target for no reason.
     EndSession,
@@ -213,6 +227,16 @@ pub enum WorkerMessage {
     /// that report. This is also what moves a kernel attach out of the state it can park in
     /// forever.
     Opened { id: u64 },
+    /// An [`EngineOp::AbandonBatch`] found a batch in flight, and its rollback is running now.
+    /// `id` is the abandon request's, like every other message here.
+    ///
+    /// A milestone rather than part of the reply, for the same reason [`Self::Committed`] is: it
+    /// says something the supervisor has to act on *before* the `Done` it precedes. The two travel
+    /// the same ordered channel and are processed in order, so by the time the abandon call
+    /// returns, the session already knows a rollback is under way — which is what lets the
+    /// teardown hold its grace open for that one session and no other. Absent, the ordinary short
+    /// grace stands.
+    RollingBack { id: u64 },
     /// The op finished. `Err` is a debugger-level failure with the engine's own text.
     Done {
         id: u64,

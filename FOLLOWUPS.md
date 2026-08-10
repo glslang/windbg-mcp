@@ -13,6 +13,8 @@ and the 2026-08-02 entries that items 13–14 and item 10 extend.
 Items are roughly ordered by how soon they're worth doing, within each cluster. **Item 10 has
 landed** (process-per-session, 2026-08-02); it is kept here rather than deleted because items 7, 8
 and 9 were all written against the single-engine design it replaced, and each now says what moved.
+**Item 18 has landed** (2026-08-10) and is kept for the opposite reason: it turned out to need much
+less of item 7 than it claimed to, and item 7 should be read knowing which half of it is still owed.
 
 ## 1. [win-kexp] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -89,7 +91,14 @@ exactly as it does today.
 
 **Reshaped by item 10.** The interrupt is now a *per-session* concern: it has to reach one worker's
 engine, and it cannot travel as an ordinary op, because a worker whose engine is wedged is exactly
-the one not draining its request queue — it needs a side channel the worker's reader thread acts on.
+the one not draining its *engine* queue — it needs a request the worker's reader thread acts on
+where it reads it.
+
+**Item 18 built that half.** `EngineOp::AbandonBatch` is exactly such a request: answered by
+`worker::run`'s reader loop, never queued to the engine thread, so it lands while the engine is
+busy. What is left for this item is the part that touches DbgEng — `SetInterrupt` as a public
+win-kexp method, bound to job identity so a cancel cannot Ctrl+Break an unrelated job. The channel
+question is settled; no side channel was needed, because the reader was never blocked.
 The urgency dropped with the same change: `end_session` already ends any call by terminating the
 session, so an interrupt is no longer the only way out of a runaway command, just the graceful one
 that keeps the target.
@@ -358,6 +367,10 @@ on a target that would notice.
   same batch with the call budget shortened (`WINDBG_MCP_CALL_TIMEOUT_SECS`) below the batch's own
   deadline, to check the clamp in `worker::batch_budget` really keeps the report ahead of the
   caller's timeout on a target where steps take real time.
+- **And now the teardown paths too** (item 18, landed): patch a byte, disconnect mid-batch, and
+  read the byte back over a *fresh* attach — the dump tier proves the rollback ran by the file it
+  wrote, which is the shape of the claim but not the substance of it. Same again for `end_session`
+  arriving mid-batch, where the batch's own `BATCH: ABANDONED` report comes back to the client.
 - **Where it picks up:** `tests/mcp_smoke.rs`, the `live_kernel` filter; the harness for setting and
   reading back a byte already exists in the MessageManager tier.
 
@@ -383,29 +396,38 @@ back on.
   `@chunkt1`'s real shape is the test case: capture a register with `eval`, then ask `pool_chunk`
   about `{{that}}` — the capture half already works.
 
-## 18. [windbg-mcp] Let a running batch finish its rollback when the client disconnects
+## 18. [windbg-mcp] Let a running batch finish its rollback when the client disconnects — **done**
 
-`debug_batch` (#82) makes one guarantee totally and a weaker version of it partially. Against a call
+`debug_batch` (#82) made one guarantee totally and a weaker version of it partially. Against a call
 **timeout** the rollback is safe by construction: the batch budget is clamped to the caller's
 remaining patience, so `always` has run and the report has been written before the wait expires.
-Against a client **disconnect** it is not. `Sessions::shutdown` treats a disconnect as `end_session`
-on every session; the `EndSession` op queues behind the batch, `release` waits
-`SHUTDOWN_RELEASE_TIMEOUT` (5s), and then the worker is killed — mid-transaction, with the patch
-still applied.
+Against a **teardown** it was not. `Sessions::shutdown` treats a disconnect as `end_session` on every
+session; the `EndSession` op queues behind the batch, `release` waits `SHUTDOWN_RELEASE_TIMEOUT`
+(5s), and then the worker was killed — mid-transaction, with the patch still applied. `end_session`
+itself was the same shape with a longer number on it.
 
-- **What it costs today:** a batch that patches a live kernel and is still running 5s after the
-  client goes away leaves the patch in place and, for a kernel session killed rather than released,
-  the target halted. The window is small, but it is exactly the case the tool exists for.
-- **Why deferred:** the two obvious fixes are both worse than the gap. Lengthening
-  `SHUTDOWN_RELEASE_TIMEOUT` slows *every* disconnect for a case that is rare, and the constant is
-  short on purpose (a session that cannot let go in a few seconds never will). Making the grace
-  conditional on what the worker is running means the supervisor tracking op identity through
-  teardown — a change to the path every session's shutdown depends on, landed alongside a new
-  feature, with the failure mode "the client hangs on disconnect".
-- **Where it picks up:** `Sessions::shutdown`/`release` in `src/engine.rs`. The shape worth trying
-  first is a *signal* rather than a longer wait — tell the worker to abandon its remaining steps and
-  jump to `always`, which `batch::run` is already structured for (every failure path falls through
-  to the same block), then wait the existing grace on that. It needs the side channel item 7
-  describes, for the same reason: a worker busy in DbgEng is not draining its request queue.
-- **Meanwhile:** documented as the boundary it is, in `README.md`, the skill playbook and the tool
-  description — a disconnect is not a way to abort a batch safely; `end_session` is.
+Landed (2026-08-10) as the *signal* this item proposed rather than a longer wait, and it needed less
+than item 7 to build: a worker busy in DbgEng **is** draining its request queue, because the reader
+lives on the main thread and only hands work to the engine thread. So `EngineOp::AbandonBatch` is
+answered where it is read. It sets a flag `batch::run` checks between steps; the batch stops there,
+runs `always`, and reports `BATCH: ABANDONED`.
+
+What made the grace conditional without the supervisor tracking op identity: the worker answers the
+signal with `WorkerMessage::RollingBack` — a milestone, so it rides *ahead* of the reply on the same
+ordered channel and the flag is set by the time the call returns — and `engine::release_grace` adds
+`batch::ROLLBACK_RESERVE` for that session only. An ordinary disconnect is untouched, and not merely
+by arithmetic: the signal is skipped entirely when the worker owes no reply. A batch reaching the
+engine *after* the signal does not start, which is the same "nothing ran, resubmitting is safe"
+answer as an unaffordable budget, and the worker's own EOF path sets the flag too, so a supervisor
+killed outright still gets the rollback rather than a truncated transaction.
+
+- **What is still true, and now documented as the whole of the boundary:** no signal reaches a step
+  already inside DbgEng, so a batch stops at its *next* step. One step longer than the grace is
+  still terminated mid-transaction. That is item 7 (`SetInterrupt` bound to job identity), and it is
+  the only part of this that needs it.
+- **Proof:** `src/batch.rs` unit-tests the executor's two new behaviours (stop and roll back; the
+  rollback held to the reserve rather than to a budget nobody is waiting out), `src/worker.rs` pins
+  the flag pairing that makes "a batch runs while the teardown thinks nothing is running"
+  unreachable, and the dump tier drives both teardowns end to end — the disconnect one asserting
+  against a file the rollback wrote, because by then there is no client, supervisor or worker left
+  to ask.

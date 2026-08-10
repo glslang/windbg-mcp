@@ -16,7 +16,8 @@
 //!   symbols, no network.
 //! * **Target** (`WINDBG_MCP_SMOKE_DUMP=1`) — opens the sample crash dump through DbgEng, so
 //!   it needs `dbgeng.dll` and may reach a symbol server. Off by default; this is the tier
-//!   that catches a `win-kexp` regression. It also runs a `debug_batch` to both outcomes,
+//!   that catches a `win-kexp` regression. It also runs a `debug_batch` to both outcomes, and
+//!   through both teardowns — an `end_session` and a client disconnect landing mid-transaction —
 //!   because "the rollback ran inside the worker" is a claim only a real engine can settle.
 //! * **Bounded command** (`#[ignore]`d, run by hand) — deliberately runs away and waits out a
 //!   watchdog, so it is measured in minutes rather than seconds. It lives here rather than
@@ -41,7 +42,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Value, json};
 
@@ -1254,6 +1255,200 @@ fn a_batch_commits_or_fails_and_its_rollback_runs_either_way() {
         json!({ "session_id": session_id }),
         TARGET_STEP,
     );
+}
+
+/// `end_session` on a session that is running a batch: the batch stops at its next step, rolls
+/// back, and *reports* — which is what makes ending the session the documented way to abort one.
+///
+/// The client is still here for this one, so unlike the disconnect below it can be asked what
+/// happened, and the answer is the point: an `ABANDONED` report with the rollback complete, rather
+/// than a session that goes quiet for as long as the batch had left. Both calls are outstanding at
+/// once, deliberately — a teardown that had to queue behind the work it is tearing down would be no
+/// use for the case it exists for.
+#[test]
+fn ending_a_session_stops_a_running_batch_and_rolls_it_back() {
+    let Some(dump) = target_tier() else { return };
+    let running = marker_path("end-session-batch-running");
+    let _ = std::fs::remove_file(&running);
+
+    let mut server = Server::started();
+    let response = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
+    assert_no_error(&response, "open_dump");
+    let session_id = session_id_of(&text_of(&response["result"]));
+
+    let mut steps = vec![
+        json!({ "op": "command", "command": format!(".logopen {}", running.display()) }),
+        json!({ "op": "command", "command": ".echo BATCH-RUNNING" }),
+        json!({ "op": "command", "command": ".logclose" }),
+    ];
+    steps.extend(std::iter::repeat_n(
+        json!({ "op": "command", "command": ".sleep 1000" }),
+        20,
+    ));
+    let batch = server.send_request(
+        "tools/call",
+        json!({
+            "name": "debug_batch",
+            "arguments": {
+                "session_id": session_id,
+                "steps": steps,
+                "always": [{ "op": "command", "command": "version", "name": "cleanup" }],
+            }
+        }),
+    );
+
+    // As below: end the session only once the batch is demonstrably inside it, or this would be
+    // testing the refuse-to-start path instead and passing just as green.
+    let deadline = Instant::now() + TARGET_STEP;
+    while !running.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the batch never reached its first step\n--- stderr ---\n{}",
+            server.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let asked = Instant::now();
+    let ended = server.tool_text(
+        "end_session",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
+    let took = asked.elapsed();
+    assert!(!ended.trim().is_empty(), "end_session said nothing");
+    assert!(
+        took < Duration::from_secs(15),
+        "end_session took {took:?}: it waited out the batch instead of cutting it short"
+    );
+
+    // The batch's own reply, which the client is still here to receive.
+    let report = text_of(&server.await_id(batch, "debug_batch", TARGET_STEP)["result"]);
+    assert!(
+        report.contains("BATCH: ABANDONED"),
+        "the batch should say it was cut short, not that it failed or timed out:\n{report}"
+    );
+    assert!(
+        report.contains("rollback: COMPLETE"),
+        "the rollback is the reason for stopping early:\n{report}"
+    );
+
+    let _ = std::fs::remove_file(&running);
+}
+
+/// A batch still running when the client disconnects has to finish its rollback before its worker
+/// goes — the one guarantee `debug_batch` used to make only against a call *timeout*.
+///
+/// The teardown is the adversary here: a disconnect is `end_session` on every session, the
+/// `EndSession` op queues *behind* the batch, and the grace it waits is deliberately short. So the
+/// worker used to be terminated mid-transaction, with whatever the batch had patched still
+/// patched — on a live kernel, the exact loss the tool exists to prevent, arriving by the path
+/// where nobody is watching.
+///
+/// Both facts it asserts need a real engine and a real disconnect, which is why this is here rather
+/// than in `src/batch.rs`: the abandon signal has to cross the worker's channel and be answered by
+/// its *reader* while its engine thread is busy, and the rollback has to leave something behind
+/// after the client, the supervisor and the worker are all gone. That last part is what the log
+/// files are for — a side effect on this machine outlives every process involved, where a tool
+/// result has nobody left to be returned to. A dump has nothing worth restoring, so the mutation is
+/// stood in for by writing a file; the byte-level version belongs in the live-kernel tier.
+#[test]
+fn a_disconnect_lets_a_running_batch_roll_back_first() {
+    let Some(dump) = target_tier() else { return };
+    let running = marker_path("batch-running");
+    let rolled_back = marker_path("batch-rolled-back");
+    let _ = std::fs::remove_file(&running);
+    let _ = std::fs::remove_file(&rolled_back);
+
+    let mut server = Server::started();
+    let response = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
+    assert_no_error(&response, "open_dump");
+    let session_id = session_id_of(&text_of(&response["result"]));
+
+    // Steps: announce that the batch is running, then spend twenty seconds so the disconnect
+    // lands squarely inside it. `always` leaves the second marker, and is the thing under test.
+    let mut steps = vec![
+        json!({ "op": "command", "command": format!(".logopen {}", running.display()) }),
+        json!({ "op": "command", "command": ".echo BATCH-RUNNING" }),
+        json!({ "op": "command", "command": ".logclose" }),
+    ];
+    steps.extend(std::iter::repeat_n(
+        json!({ "op": "command", "command": ".sleep 1000" }),
+        20,
+    ));
+    // Sent without waiting: nobody is left to read the answer, which is the whole scenario.
+    server.send_request(
+        "tools/call",
+        json!({
+            "name": "debug_batch",
+            "arguments": {
+                "session_id": session_id,
+                "steps": steps,
+                "always": [
+                    { "op": "command", "command": format!(".logopen {}", rolled_back.display()) },
+                    { "op": "command", "command": ".echo ROLLBACK-RAN" },
+                    { "op": "command", "command": ".logclose" },
+                ],
+            }
+        }),
+    );
+
+    // Disconnect only once the batch is demonstrably inside its steps. Timing it with a sleep
+    // instead would make a slow machine into a test that proves nothing: the batch would not have
+    // started, and refusing to start is a *different* correct behaviour with the same green tick.
+    let deadline = Instant::now() + TARGET_STEP;
+    while !running.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the batch never reached its first step, so the disconnect below would prove \
+             nothing\n--- stderr ---\n{}",
+            server.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let disconnected = Instant::now();
+    assert_eq!(
+        server.shutdown(),
+        Some(0),
+        "clean disconnect should be a clean exit"
+    );
+    let took = disconnected.elapsed();
+
+    let rollback = std::fs::read_to_string(&rolled_back).unwrap_or_else(|e| {
+        panic!(
+            "the `always` block left nothing at {} ({e}) — the batch was terminated \
+             mid-transaction, which on a live kernel would leave the patch in place",
+            rolled_back.display()
+        )
+    });
+    assert!(
+        rollback.contains("ROLLBACK-RAN"),
+        "the rollback started but did not finish; it left:\n{rollback}"
+    );
+    // The steps had twenty seconds left to run. Waiting them out would be a rollback that happened
+    // for the wrong reason — the batch finishing normally — and would say nothing about abandoning
+    // one.
+    assert!(
+        took < Duration::from_secs(15),
+        "the disconnect took {took:?}: the batch ran on instead of stopping at its next step"
+    );
+
+    let _ = std::fs::remove_file(&running);
+    let _ = std::fs::remove_file(&rolled_back);
+}
+
+/// A path in the temp directory nothing else in this run will pick, for tests that need a side
+/// effect outliving the server process.
+fn marker_path(what: &str) -> std::path::PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    std::env::temp_dir().join(format!(
+        "windbg-mcp-smoke-{what}-{}-{unique:x}.log",
+        std::process::id()
+    ))
 }
 
 /// The `session_id` a tool result carries, if it carries one.
