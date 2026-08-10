@@ -2113,6 +2113,12 @@ impl WindbgServer {
     /// Issue it while the other call is still outstanding; it does not queue behind it. With
     /// nothing running it reports exactly that and does nothing.
     ///
+    /// **Not safe to retry blind.** Each call stops whatever is running *at the moment it arrives*,
+    /// and this one returns as soon as the break is raised, while the operation it stopped runs on
+    /// to its next poll. So a second call sent after the first has answered can land on the next
+    /// operation instead of the one you meant. Read the reply — it says whether it reached anything
+    /// — rather than repeating the call.
+    ///
     /// Two things it cannot reach, both properties of the debugger rather than of this server: an
     /// operation that never polls for the break, and a live-kernel `attach_kernel` whose target has
     /// not connected yet (the documented case — see `session_status`). `end_session` is what ends
@@ -2121,11 +2127,17 @@ impl WindbgServer {
     /// A `debug_batch` interrupted this way fails the step that was running, which stops the
     /// transaction and runs its `always` block — the rollback still happens, and the batch's own
     /// result reports it.
+    // `idempotent_hint = false`, which is not the intuitive reading: raising the same Ctrl+Break
+    // twice on the same operation plainly has no second effect. But the hint is about *repeating
+    // the call*, and what a repeat addresses is whichever job is running when it arrives — which
+    // after the first call has answered may well be the next one. So a client retrying this on a
+    // timeout can stop an operation nobody asked it to. See the note above, and the smoke test that
+    // has to loop until it reaches something, which is the same property from the other side.
     #[rmcp::tool(annotations(
         title = "Interrupt the running operation",
         read_only_hint = false,
         destructive_hint = false,
-        idempotent_hint = true,
+        idempotent_hint = false,
         open_world_hint = true
     ))]
     async fn interrupt(

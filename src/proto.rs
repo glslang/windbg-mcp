@@ -317,6 +317,22 @@ impl PoolOp {
             limit: Self::rows(limit, Self::DIAGNOSTIC_LINES),
         }
     }
+
+    /// Whether this query **must** walk, rather than possibly being served from the session's
+    /// cached snapshot.
+    ///
+    /// The distinction matters only when there is no time to walk in: a query that can be answered
+    /// from the cache costs nothing and should be, while one that has to walk and cannot finish
+    /// produces a truncated snapshot that win-kexp discards rather than caches — so it is work for
+    /// nobody, twice over. The worker refuses that one instead of doing it.
+    pub fn refreshes(&self) -> bool {
+        match self {
+            Self::FindTag { refresh, .. }
+            | Self::Chunk { refresh, .. }
+            | Self::Census { refresh, .. }
+            | Self::Diagnostics { refresh, .. } => *refresh,
+        }
+    }
 }
 
 #[cfg(test)]
