@@ -61,12 +61,7 @@ pub const MAX_CHECKS: usize = 16;
 /// Reserved *up front* rather than taken from what is left, because "what is left" after a step
 /// that ran to its own deadline is nothing. Capped at half the budget so a short batch still
 /// spends most of its time on the work it was asked to do.
-///
-/// Public because it is also the longest a rollback can take, which is what a teardown has to wait
-/// out after telling a batch to abandon ([`Debuggee::abandoned`]). The supervisor derives its grace
-/// from this constant rather than picking one that happens to be long enough — see
-/// `engine::release_grace`.
-pub const ROLLBACK_RESERVE: Duration = Duration::from_secs(30);
+const ROLLBACK_RESERVE: Duration = Duration::from_secs(30);
 
 /// The smallest watchdog a step is armed with. Zero *disables* win-kexp's watchdog, so a step
 /// dequeued at or past the deadline must not round down to it.
@@ -633,7 +628,9 @@ pub trait Debuggee {
     /// Read between steps, never mid-step: this cannot reach a call already inside DbgEng, and
     /// pretending otherwise would be a promise the mechanism cannot keep. What it *is* is the
     /// difference between a rollback that runs and a worker terminated with the patch still
-    /// applied, because the teardown that sets it then waits for the `always` block.
+    /// applied, because the teardown that sets it then waits out the step in flight and the
+    /// `always` block after it — the batch's whole remaining budget, which is why nothing here
+    /// has to be shortened to fit a teardown.
     fn abandoned(&self) -> bool;
 }
 
@@ -876,19 +873,14 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
     }
 
     // The rollback block, on every path. Its own deadline is the *whole* budget, which is what the
-    // reserve above bought it — except when the batch was abandoned, where the budget is no longer
-    // the bound that matters. A teardown is waiting on this rollback and gives it the reserve, so
-    // running past that would only mean being terminated mid-cleanup with the report unwritten:
-    // the same failure, one step later. Held to the reserve, the block that fits is the block that
-    // runs, and what did not fit is *reported* as not having run.
-    let cleanup_deadline = match outcome {
-        BatchOutcome::Abandoned { .. } => (d.elapsed() + reserve).min(budget),
-        _ => budget,
-    };
+    // reserve above bought it — and that holds when the batch is abandoned too, rather than the
+    // rollback being cut short to fit a teardown's grace. The grace is sized from this budget
+    // instead (`worker::BatchSignal::abandon`), so shortening the block here would only mean
+    // skipping cleanup the teardown was already waiting for.
     let mut always: Vec<StepOutcome> = Vec::with_capacity(op.always.len());
     for (index, step) in op.always.iter().enumerate() {
         let position = index + 1;
-        if d.elapsed() >= cleanup_deadline {
+        if d.elapsed() >= budget {
             always.push(StepOutcome::skipped(
                 position,
                 step,
@@ -898,7 +890,7 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
         }
         // Cleanup continues past its own failures, deliberately: the steps are ordered, but a
         // patch that cannot be restored must not stop a breakpoint from being cleared.
-        always.push(run_step(d, step, position, cleanup_deadline, &mut bound));
+        always.push(run_step(d, step, position, budget, &mut bound));
     }
 
     let after = probe_state(d, &steps, &always, budget);
@@ -1677,41 +1669,70 @@ mod tests {
         assert!(text.contains("rollback: COMPLETE"), "{text}");
     }
 
-    /// An abandoned batch's rollback is held to the reserve, not to whatever is left of a budget
-    /// nobody is waiting out any more.
+    /// **An abandoned batch's rollback keeps the whole budget**, exactly like every other path. It
+    /// is not shortened to fit the teardown's grace — the grace is sized from that budget instead
+    /// (`worker::BatchSignal::abandon`), so shortening it here would only skip cleanup somebody was
+    /// already waiting for.
     ///
-    /// The teardown that sent the signal gives the rollback exactly `ROLLBACK_RESERVE` before it
-    /// terminates the worker, so cleanup that ran past that would be killed mid-step with the
-    /// report unwritten — the same loss one step later. Held to the reserve, what fits runs and
-    /// what does not is *reported* as not having run, which is the difference between an incomplete
-    /// rollback and an unknown one.
+    /// Both halves of this were once wrong in the same way. Holding the rollback to the reserve
+    /// dropped the third step below, *and* it depended on the outcome — so a signal arriving during
+    /// the batch's **last** step, where no further loop iteration exists to notice it, left the
+    /// outcome `Committed` and the cleanup on a different bound from an identical signal one step
+    /// earlier. The second run here is that case, and it must be indistinguishable from the first.
     #[test]
-    fn an_abandoned_rollback_is_held_to_the_reserve_it_is_given() {
-        let mut d = stopped()
-            .on("first", Ok(""))
-            // A first cleanup step that overruns the reserve on its own: the second is then past
-            // the deadline, even though the batch's own budget still has minutes left in it.
-            .slow("slow restore", Ok(""), Duration::from_secs(40))
-            .on("late restore", Ok(""))
-            .abandoned_after(1);
-        let batch = op(
-            vec![cmd("first step"), cmd("never runs")],
-            vec![cmd("slow restore"), cmd("late restore")],
+    fn an_abandoned_rollback_keeps_the_budget_every_other_path_gets() {
+        // Cleanup steps costing 20s each against a 60s budget: three of them fit, where the
+        // reserve (30s) would have seated two.
+        let scripted = || {
+            stopped()
+                .on("first", Ok(""))
+                .slow("restore", Ok(""), Duration::from_secs(20))
+                .slow("clear", Ok(""), Duration::from_secs(20))
+                .slow("bc *", Ok(""), Duration::from_secs(20))
+        };
+        let cleanup = || vec![cmd("restore it"), cmd("clear it"), cmd("bc *")];
+
+        // Signalled mid-batch: the outcome is `Abandoned`, and the rollback still runs whole.
+        let mut midway = scripted().abandoned_after(1);
+        let stopped_early = run(
+            &mut midway,
+            &op(vec![cmd("first step"), cmd("never runs")], cleanup()),
+            BUDGET,
         );
-
-        // Ten minutes: far more than the reserve, so anything the cleanup is bounded by here is
-        // the reserve rather than the budget.
-        let report = run(&mut d, &batch, Duration::from_secs(600));
-
-        assert_eq!(report.outcome, BatchOutcome::Abandoned { at: 2 });
-        assert!(d.ran("slow restore"), "the first cleanup step fits");
+        assert_eq!(stopped_early.outcome, BatchOutcome::Abandoned { at: 2 });
         assert!(
-            !d.ran("late restore"),
-            "the second is past the reserve, so it must not be started with a teardown waiting"
+            stopped_early.rollback_complete(),
+            "cleanup was cut short to fit a grace that is sized from the budget anyway: {:?}",
+            stopped_early.always
         );
-        assert!(!report.rollback_complete());
-        let text = render(&report);
-        assert!(text.contains("rollback: INCOMPLETE"), "{text}");
+
+        // Signalled during the *last* step, so `run`'s loop never sees it: the batch commits, and
+        // the rollback must be bounded identically. A bound that read the outcome would differ
+        // here, silently, in the case hardest to notice.
+        let mut at_the_end = scripted().abandoned_after(1);
+        let committed = run(
+            &mut at_the_end,
+            &op(vec![cmd("first step")], cleanup()),
+            BUDGET,
+        );
+        assert_eq!(
+            committed.outcome,
+            BatchOutcome::Committed,
+            "every step ran and every assertion held, whatever became of the session"
+        );
+        assert_eq!(
+            committed
+                .always
+                .iter()
+                .map(|s| s.result.tag())
+                .collect::<Vec<_>>(),
+            stopped_early
+                .always
+                .iter()
+                .map(|s| s.result.tag())
+                .collect::<Vec<_>>(),
+            "the rollback's bound must not depend on which step the signal landed in"
+        );
     }
 
     /// A rollback step that itself fails is reported beside the original failure, never instead

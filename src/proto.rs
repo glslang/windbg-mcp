@@ -127,8 +127,9 @@ pub enum EngineOp {
     /// channel into an in-process queue and nothing more.
     ///
     /// It does not interrupt a step already inside DbgEng; the batch stops at the next step
-    /// boundary. Interrupting the engine itself is a different mechanism (`SetInterrupt`, bound to
-    /// job identity) and is not this.
+    /// boundary, and the worker says how long that leaves it ([`WorkerMessage::RollingBack`]) so
+    /// the teardown can wait for the step as well as the rollback. Interrupting the engine itself
+    /// is a different mechanism (`SetInterrupt`, bound to job identity) and is not this.
     AbandonBatch,
     /// Release the target. The supervisor tears the worker down afterwards — under
     /// process-per-session a worker outlives its target for no reason.
@@ -227,16 +228,23 @@ pub enum WorkerMessage {
     /// that report. This is also what moves a kernel attach out of the state it can park in
     /// forever.
     Opened { id: u64 },
-    /// An [`EngineOp::AbandonBatch`] found a batch in flight, and its rollback is running now.
-    /// `id` is the abandon request's, like every other message here.
+    /// An [`EngineOp::AbandonBatch`] found a batch in flight, and it will be done — stopped,
+    /// rolled back and reported — within `within_ms`. `id` is the abandon request's, like every
+    /// other message here.
     ///
     /// A milestone rather than part of the reply, for the same reason [`Self::Committed`] is: it
     /// says something the supervisor has to act on *before* the `Done` it precedes. The two travel
     /// the same ordered channel and are processed in order, so by the time the abandon call
-    /// returns, the session already knows a rollback is under way — which is what lets the
-    /// teardown hold its grace open for that one session and no other. Absent, the ordinary short
-    /// grace stands.
-    RollingBack { id: u64 },
+    /// returns, the session already knows how long to hold its grace open — for that one session
+    /// and no other. Absent, the ordinary short grace stands.
+    ///
+    /// The figure is a **field, not a sentence in the reply**, because the supervisor computes a
+    /// deadline from it, and it is the worker's to compute: only that process knows what budget the
+    /// batch is running under and how much of it is spent. It covers the step in flight as well as
+    /// the rollback, since the signal cannot reach a step already inside DbgEng — a grace sized for
+    /// the rollback alone would expire mid-step, which is the whole failure being fixed, arriving a
+    /// little later.
+    RollingBack { id: u64, within_ms: u32 },
     /// The op finished. `Err` is a debugger-level failure with the engine's own text.
     Done {
         id: u64,

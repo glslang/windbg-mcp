@@ -1277,7 +1277,7 @@ fn ending_a_session_stops_a_running_batch_and_rolls_it_back() {
     let session_id = session_id_of(&text_of(&response["result"]));
 
     let mut steps = vec![
-        json!({ "op": "command", "command": format!(".logopen {}", running.display()) }),
+        json!({ "op": "command", "command": format!(".logopen \"{}\"", running.display()) }),
         json!({ "op": "command", "command": ".echo BATCH-RUNNING" }),
         json!({ "op": "command", "command": ".logclose" }),
     ];
@@ -1368,7 +1368,7 @@ fn a_disconnect_lets_a_running_batch_roll_back_first() {
     // Steps: announce that the batch is running, then spend twenty seconds so the disconnect
     // lands squarely inside it. `always` leaves the second marker, and is the thing under test.
     let mut steps = vec![
-        json!({ "op": "command", "command": format!(".logopen {}", running.display()) }),
+        json!({ "op": "command", "command": format!(".logopen \"{}\"", running.display()) }),
         json!({ "op": "command", "command": ".echo BATCH-RUNNING" }),
         json!({ "op": "command", "command": ".logclose" }),
     ];
@@ -1385,7 +1385,7 @@ fn a_disconnect_lets_a_running_batch_roll_back_first() {
                 "session_id": session_id,
                 "steps": steps,
                 "always": [
-                    { "op": "command", "command": format!(".logopen {}", rolled_back.display()) },
+                    { "op": "command", "command": format!(".logopen \"{}\"", rolled_back.display()) },
                     { "op": "command", "command": ".echo ROLLBACK-RAN" },
                     { "op": "command", "command": ".logclose" },
                 ],

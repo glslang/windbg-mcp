@@ -90,22 +90,27 @@ const SHUTDOWN_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 /// manage that in two seconds is not going to roll anything back either.
 const ABANDON_ACK_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The grace a teardown gives a session, given whether its worker said a batch is rolling back.
+/// The grace a teardown gives a session: the ordinary `base`, plus however long the worker said a
+/// batch it is unwinding still needs.
 ///
-/// The extra is [`crate::batch::ROLLBACK_RESERVE`] and not a number chosen to look generous: that
-/// reserve is the most an `always` block can ever be given, and an abandoned batch holds its
-/// rollback to exactly it, so this is "as long as the rollback can possibly need" rather than a
-/// guess that will drift when the reserve changes.
+/// **Not a number chosen to look generous.** `unwinding` is the batch's own remaining budget,
+/// measured by the process running it, and it covers the step in flight as well as the rollback —
+/// the signal stops a batch at its *next* step, so a grace sized for the rollback alone expires
+/// mid-step and terminates the worker with the patch still applied, which is the failure this
+/// whole path exists to remove.
 ///
-/// The conditional is the point. A disconnect must stay quick for the case it was tuned for — a
-/// parked kernel attach that will never unwind, where every extra second is spent for nothing — so
-/// the longer wait is spent only where a worker has said, in the same round trip, that there is
-/// something to wait for.
-fn release_grace(base: Duration, rolling_back: bool) -> Duration {
-    if rolling_back {
-        base + crate::batch::ROLLBACK_RESERVE
-    } else {
-        base
+/// The conditional is what keeps that affordable. A disconnect must stay quick for the case it was
+/// tuned for — a parked kernel attach that will never unwind, where every extra second is spent for
+/// nothing — so the longer wait is spent only where a worker has said, in the same round trip, that
+/// there is something to wait for and how long it will take.
+///
+/// `cap` bounds what that claim can cost. A batch's budget is already clamped to the caller's
+/// patience, so an honest worker never reaches it; it is here because a teardown must not be able
+/// to wait indefinitely on a number that arrives over a pipe.
+fn release_grace(base: Duration, unwinding: Option<Duration>, cap: Duration) -> Duration {
+    match unwinding {
+        Some(within) => base + within.min(cap),
+        None => base,
     }
 }
 
@@ -334,10 +339,10 @@ pub struct Session {
     /// from the worker having crashed. This is what tells those two apart, and the difference is
     /// "the target was let go" versus "a live kernel may be sitting halted".
     released: AtomicBool,
-    /// Whether this session's worker reported a transactional batch rolling back in answer to
-    /// [`EngineOp::AbandonBatch`]. Read by the teardown that asked, to decide how long to hold the
-    /// door open; see [`release_grace`].
-    rolling_back: AtomicBool,
+    /// How long this session's worker said a transactional batch still needs, in answer to
+    /// [`EngineOp::AbandonBatch`] — `None` when it had none to abandon. Read by the teardown that
+    /// asked, to decide how long to hold the door open; see [`release_grace`].
+    rolling_back: Mutex<Option<Duration>>,
     child: Mutex<Option<Child>>,
 }
 
@@ -982,6 +987,7 @@ impl Sessions {
             END_SESSION_TIMEOUT,
             self.abandon_batch(session, Call::new(EngineOp::AbandonBatch).named(named))
                 .await,
+            self.call_timeout,
         );
         let call = Call::new(EngineOp::EndSession).named(named);
         let (reason, message) = match self.release(session, call, grace).await {
@@ -1053,16 +1059,19 @@ impl Sessions {
     /// is nothing running to abandon, so the round trip would buy nothing. Best-effort by
     /// construction: a signal that is refused, times out, or finds nothing simply leaves the
     /// ordinary grace in place, and the teardown proceeds exactly as it did before.
-    async fn abandon_batch(&self, session: &Arc<Session>, call: Call) -> bool {
+    async fn abandon_batch(&self, session: &Arc<Session>, call: Call) -> Option<Duration> {
         if !session.awaiting_reply() {
-            return false;
+            return None;
         }
         // The answer is not read from here: the worker reports it as a `RollingBack` milestone,
         // which travels ahead of this call's reply on the same ordered channel, so by the time this
         // returns the flag is set. Reading it off the reply text instead would be the same fact
         // arriving twice, in a form that has to be parsed back.
         let _ = self.call_within(session, call, ABANDON_ACK_TIMEOUT).await;
-        session.rolling_back.load(Ordering::SeqCst)
+        *session
+            .rolling_back
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     /// Asks a worker to release its target and then terminates it, without deciding *why* the
@@ -1139,6 +1148,7 @@ impl Sessions {
                     sessions
                         .abandon_batch(&session, Call::supervisor(EngineOp::AbandonBatch))
                         .await,
+                    sessions.call_timeout,
                 );
                 if grace != SHUTDOWN_RELEASE_TIMEOUT {
                     tracing::info!(
@@ -1426,7 +1436,7 @@ impl Sessions {
             delivered: AtomicBool::new(false),
             phase: AtomicU8::new(OpenPhase::Started as u8),
             released: AtomicBool::new(false),
-            rolling_back: AtomicBool::new(false),
+            rolling_back: Mutex::new(None),
             child: Mutex::new(Some(child)),
         });
 
@@ -2013,10 +2023,14 @@ async fn reader(
             // exists for, and it is the channel's ordering that provides it, not luck: messages
             // are read and handled in the order the worker wrote them, so the teardown waiting on
             // that `Done` cannot wake up before this store.
-            WorkerMessage::RollingBack { id } => {
-                session.rolling_back.store(true, Ordering::SeqCst);
+            WorkerMessage::RollingBack { id, within_ms } => {
+                let within = Duration::from_millis(u64::from(within_ms));
+                *session
+                    .rolling_back
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner()) = Some(within);
                 tracing::info!(
-                    "session {}: job {id} found a transaction in flight and told it to roll back",
+                    "session {}: job {id} found a transaction in flight and told it to roll back;                      it needs up to {within:?}",
                     session.id
                 );
             }
@@ -2387,7 +2401,7 @@ mod tests {
             delivered: AtomicBool::new(true),
             phase: AtomicU8::new(phase as u8),
             released: AtomicBool::new(false),
-            rolling_back: AtomicBool::new(false),
+            rolling_back: Mutex::new(None),
             child: Mutex::new(None),
         })
     }
@@ -2744,29 +2758,42 @@ mod tests {
     }
 
     /// The grace a teardown gives is the ordinary one unless a worker has said it is unwinding a
-    /// transaction — and then it is long enough for the whole rollback.
+    /// transaction — and then it covers everything that worker said it still needs.
     ///
     /// Both halves matter, and the first is the one that is easy to lose: lengthening the wait for
     /// every session would spend it on the case it was tuned against, a parked kernel attach that
-    /// will never let go however long anyone waits.
+    /// will never let go however long anyone waits. The second is why the figure comes from the
+    /// worker rather than from a constant here — what a teardown is waiting out is the step in
+    /// flight and then the rollback, and only the worker knows how long the step may still take.
     #[test]
-    fn only_a_session_that_is_rolling_back_gets_the_longer_grace() {
+    fn a_teardown_waits_only_for_what_its_worker_says_it_needs() {
+        let cap = Duration::from_secs(300);
+        for base in [SHUTDOWN_RELEASE_TIMEOUT, END_SESSION_TIMEOUT] {
+            assert_eq!(
+                release_grace(base, None, cap),
+                base,
+                "a session with nothing to unwind must cost exactly what it always did"
+            );
+            // A step that may still run for a minute is a minute this teardown waits, on top of
+            // the release behind it. A grace sized for the rollback alone would expire inside that
+            // step, which is the failure the whole signal exists to remove.
+            let step_plus_rollback = Duration::from_secs(60);
+            assert_eq!(
+                release_grace(base, Some(step_plus_rollback), cap),
+                base + step_plus_rollback
+            );
+        }
+        // The claim is bounded. A batch's budget is clamped to the caller's patience, so an honest
+        // worker never reaches this — it is here so a teardown cannot be made to wait for ever by
+        // a number arriving over a pipe.
         assert_eq!(
-            release_grace(SHUTDOWN_RELEASE_TIMEOUT, false),
-            SHUTDOWN_RELEASE_TIMEOUT,
-            "an ordinary disconnect must cost exactly what it always did"
+            release_grace(
+                SHUTDOWN_RELEASE_TIMEOUT,
+                Some(Duration::from_secs(86_400)),
+                cap
+            ),
+            SHUTDOWN_RELEASE_TIMEOUT + cap
         );
-        assert!(
-            release_grace(SHUTDOWN_RELEASE_TIMEOUT, true)
-                >= SHUTDOWN_RELEASE_TIMEOUT + crate::batch::ROLLBACK_RESERVE,
-            "a rollback gets the reserve it is allowed to spend, plus the release behind it"
-        );
-        // The same rule for the explicit end, where the base is longer to begin with.
-        assert_eq!(
-            release_grace(END_SESSION_TIMEOUT, false),
-            END_SESSION_TIMEOUT
-        );
-        assert!(release_grace(END_SESSION_TIMEOUT, true) > END_SESSION_TIMEOUT);
     }
 
     /// A teardown asks about a batch only when the worker owes a reply, which is what keeps the
@@ -2786,7 +2813,10 @@ mod tests {
         )
         .await
         .expect("asking an idle session must not wait on anything");
-        assert!(!asked, "nothing is running, so nothing is rolling back");
+        assert_eq!(
+            asked, None,
+            "nothing is running, so nothing is rolling back"
+        );
     }
 
     /// The gap `admit` exists to close: a worker that finishes its handshake after the client has

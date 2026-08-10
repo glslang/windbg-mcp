@@ -68,13 +68,21 @@ what each worker is running is a change to the path every session's teardown dep
 So the teardown asks instead. `EngineOp::AbandonBatch` is answered by the worker's **request
 reader** rather than its engine thread — the one op that must be, since the thread it concerns is
 inside the batch — which sets a flag `batch::run` reads between steps and reports back, ahead of its
-own reply, whether it found a batch to stop (`WorkerMessage::RollingBack`). The grace is then
-widened for that session alone, by `batch::ROLLBACK_RESERVE`, which is the most an `always` block
-can ever spend; an abandoned batch holds its rollback to exactly that, so the two agree by
-derivation rather than by a number chosen to look sufficient. The signal is skipped entirely when a
-worker owes no reply, which is every ordinary disconnect. What it cannot do is reach a step already
-inside DbgEng — that is `SetInterrupt` bound to job identity, FOLLOWUPS item 7 — so a batch stops at
-its next step boundary, not where it stands.
+own reply, **how long that batch may still need** (`WorkerMessage::RollingBack`). The grace is then
+widened for that session alone, by exactly that figure.
+
+Sizing it from the rollback's reserve instead was the first cut, and it was wrong in a way worth
+recording: the signal stops a batch at its *next* step, so what a teardown waits out is the step in
+flight and then the `always` block. A reserve-sized grace expires inside a long step and terminates
+the worker mid-patch — the same failure, arriving a little later, and only on the batches whose
+steps are slowest. The batch's own remaining budget is the honest figure, it is bounded by the
+caller's patience already, and only the worker can measure it. The reserve then goes back to being
+what it always was — how much of the budget is held back for `always` — with nothing shortened to
+fit a teardown.
+
+The signal is skipped entirely when a worker owes no reply, which is every ordinary disconnect. What
+it cannot do is *shorten* a step already inside DbgEng — that is `SetInterrupt` bound to job
+identity, FOLLOWUPS item 7 — so a batch stops at its next step boundary, not where it stands.
 
 **Status.** Adopted. Two things are still owed: pool steps (FOLLOWUPS item 17, the one gap the
 transcript found) and a live-kernel exercise of a *mutating* batch (item 16) — the dump tier proves

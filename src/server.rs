@@ -2110,7 +2110,7 @@ impl WindbgServer {
     ///
     /// A `debug_batch` running on the session is told to stop at its next step and run its
     /// rollback before the target is released, and the batch's own call reports that; the grace
-    /// covers the rollback.
+    /// covers the step in flight and the rollback after it.
     #[rmcp::tool(annotations(
         title = "End debug session",
         read_only_hint = false,
@@ -2169,10 +2169,11 @@ impl WindbgServer {
     /// running, detached, or uncertain (the last when the debugger could not be asked — which is
     /// reported as not knowing, never guessed at). Tearing the session down while a batch runs —
     /// `end_session`, or a client disconnect — stops it at its next step and runs the rollback
-    /// first, reported as `BATCH: ABANDONED`; what that cannot do is cut short a step already
-    /// inside the debugger, so a batch of long steps still waits for the current one. One edge
-    /// remains: a step that overruns far enough to consume the reserved cleanup budget too leaves
-    /// the rollback unrun, and the result says `rollback: INCOMPLETE`.
+    /// first, reported as `BATCH: ABANDONED`; the teardown waits for the step in flight as well as
+    /// the rollback, but it cannot cut that step short, so a batch of long steps unwinds only once
+    /// the current one ends. One edge remains: a step that overruns far enough to consume the
+    /// reserved cleanup budget too leaves the rollback unrun, and the result says
+    /// `rollback: INCOMPLETE`.
     #[rmcp::tool(annotations(
         title = "Run a transactional debugger batch",
         read_only_hint = false,
