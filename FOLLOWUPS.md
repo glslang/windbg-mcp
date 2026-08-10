@@ -94,11 +94,11 @@ engine, and it cannot travel as an ordinary op, because a worker whose engine is
 the one not draining its *engine* queue — it needs a request the worker's reader thread acts on
 where it reads it.
 
-**Item 18 built that half.** `EngineOp::AbandonBatch` is exactly such a request: answered by
-`worker::run`'s reader loop, never queued to the engine thread, so it lands while the engine is
-busy. What is left for this item is the part that touches DbgEng — `SetInterrupt` as a public
-win-kexp method, bound to job identity so a cancel cannot Ctrl+Break an unrelated job. The channel
-question is settled; no side channel was needed, because the reader was never blocked.
+**Item 18 built that half.** `worker::run`'s reader loop acts on `EngineOp::EndSession` where it
+reads it, before queueing it, so the signal lands while the engine is busy. What is left for this
+item is the part that touches DbgEng — `SetInterrupt` as a public win-kexp method, bound to job
+identity so a cancel cannot Ctrl+Break an unrelated job. The channel question is settled; no side
+channel was needed, because the reader was never blocked.
 The urgency dropped with the same change: `end_session` already ends any call by terminating the
 session, so an interrupt is no longer the only way out of a runaway command, just the graceful one
 that keeps the target.
@@ -408,17 +408,25 @@ itself was the same shape with a longer number on it.
 
 Landed (2026-08-10) as the *signal* this item proposed rather than a longer wait, and it needed less
 than item 7 to build: a worker busy in DbgEng **is** draining its request queue, because the reader
-lives on the main thread and only hands work to the engine thread. So `EngineOp::AbandonBatch` is
-answered where it is read. It sets a flag `batch::run` checks between steps; the batch stops there,
-runs `always`, and reports `BATCH: ABANDONED`.
+lives on the main thread and only hands work to the engine thread. So the reader acts on the
+teardown's own `EndSession` where it reads it, before queueing it for an engine thread that is by
+definition busy. It sets a flag `batch::run` checks between steps; the batch stops there, runs
+`always`, and reports `BATCH: ABANDONED`.
 
-What made the grace conditional without the supervisor tracking op identity: the worker answers the
-signal with `WorkerMessage::RollingBack { within_ms }` — a milestone, so it rides *ahead* of the
-reply on the same ordered channel and the figure is stored by the time the call returns — and
-`engine::release_grace` adds it for that session only. `within_ms` is the batch's own remaining
-budget, so the grace covers the step in flight as well as the rollback; sizing it from the reserve
-instead (the first cut, caught in review) expires inside a long step and terminates the worker
-mid-patch, which is the same failure one step later. An ordinary disconnect is untouched, and not
+What made the wait conditional without the supervisor tracking op identity: the worker answers with
+`WorkerMessage::RollingBack { within_ms }` — a milestone, so it arrives while the teardown is still
+waiting on that same op's reply — and the wait extends itself by that figure once its ordinary grace
+runs out. `within_ms` is the batch's own remaining budget, so it covers the step in flight as well
+as the rollback; sizing it from the reserve instead (the first cut, caught in review) expires inside
+a long step and terminates the worker mid-patch, which is the same failure one step later.
+
+Carrying the signal on the release rather than on an op of its own was also review's doing, and for
+a sharper reason: telling a batch to stop is sticky and one-way, so it must not be possible for a
+teardown that does not happen. Two separately gated requests can come apart — a target-changing call
+between them retires the session, the release is refused as stale, and the abandon has already
+aborted a transaction and left a flag no later batch could get past on a session that survives. On
+one request the property is structural: a gate refusal stops it before the worker sees it, and every
+request the worker does see is followed by that worker being terminated. An ordinary disconnect is untouched, and not
 merely by arithmetic: the signal is skipped entirely when the worker owes no reply. A batch reaching
 the engine *after* the signal does not start, which is the same "nothing ran, resubmitting is safe"
 answer as an unaffordable budget, and the worker's own EOF path sets the flag too, so a supervisor

@@ -287,15 +287,15 @@ pub fn run(args: &[String]) -> ! {
             continue;
         }
         match serde_json::from_str::<WorkerRequest>(&line) {
-            // Answered here rather than queued, because the thread that would run it is the one
-            // this is about: it is inside the batch being abandoned. This loop is never blocked by
-            // the engine — it reads a line and hands it on — which is the whole reason the signal
-            // can arrive at all. See [`EngineOp::AbandonBatch`].
-            Ok(WorkerRequest {
-                id,
-                op: EngineOp::AbandonBatch,
-            }) => abandon_batch(id),
             Ok(request) => {
+                // Acted on here, before it is queued, because the thread that will run it is the
+                // one it is about: a batch on that thread has to be told to stop *now* if the
+                // release behind it is not to wait out every step it has left. This loop is never
+                // blocked by the engine — it reads a line and hands it on — which is the whole
+                // reason the signal can arrive at all. See [`EngineOp::EndSession`].
+                if matches!(request.op, EngineOp::EndSession) {
+                    announce_teardown(request.id);
+                }
                 if tx.send(Job::Run(Instant::now(), request)).is_err() {
                     break; // the engine thread is gone; nothing can run any more
                 }
@@ -506,29 +506,20 @@ fn emit(message: &WorkerMessage) -> Emit {
     }
 }
 
-/// Answers an [`EngineOp::AbandonBatch`] from the request reader.
+/// Tells any running batch that its session is going away, from the request reader — see
+/// [`EngineOp::EndSession`] for why this happens here rather than on the engine thread.
 ///
-/// The order of the two messages is the contract: [`WorkerMessage::RollingBack`] says the grace has
-/// to be held open, and it must be on the wire before the `Done` that releases the supervisor's
-/// waiter, or the teardown would read the flag before it was set and size its grace as though
-/// nothing were running.
-fn abandon_batch(id: u64) {
-    let what = match BATCH.abandon() {
-        Some(within) => {
-            emit(&WorkerMessage::RollingBack {
-                id,
-                within_ms: within.as_millis().min(u128::from(u32::MAX)) as u32,
-            });
-            format!(
-                "a batch was running; it will stop at its next step and run its `always` block, \
-                 within {within:?}"
-            )
-        }
-        None => "no batch was running; none can start on this session now".to_string(),
+/// The message it may send is a promise about time, so it goes out *before* the release is queued:
+/// the supervisor is waiting on that release, and this is what tells it how long the wait is worth.
+/// Sent only when there is a batch to stop, so an ordinary teardown says nothing and costs nothing.
+fn announce_teardown(id: u64) {
+    let Some(within) = BATCH.abandon() else {
+        return;
     };
-    emit(&WorkerMessage::Done {
+    tracing::info!("worker: session ending with a batch in flight; it has {within:?} to unwind");
+    emit(&WorkerMessage::RollingBack {
         id,
-        result: Ok(what),
+        within_ms: within.as_millis().min(u128::from(u32::MAX)) as u32,
     });
 }
 
@@ -707,14 +698,8 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<S
         EngineOp::Reachability(args) => reachable(e, args),
         EngineOp::Pool(args) => pool(e, args),
         EngineOp::Batch(op) => run_batch(e, op, queued),
-        // Handled by the request reader, which is the only place it can be handled: reaching this
-        // thread means it queued behind the very batch it was meant to cut short. Answered rather
-        // than ignored, because a request without a reply costs the caller its session.
-        EngineOp::AbandonBatch => Err(
-            "the abandon signal reached the engine thread, which means it was queued rather than \
-             delivered — nothing was abandoned. This is a bug in the worker's request reader."
-                .to_string(),
-        ),
+        // Reaching here means any batch has already been told to stop and has finished unwinding —
+        // the reader saw this request go past and said so, and this thread runs one job at a time.
         EngineOp::EndSession => e
             .end_session()
             .map(|_| "session ended".to_string())

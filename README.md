@@ -56,9 +56,9 @@ process. Two things follow, and they are why it is built this way:
   lands in the same place. Workers never outlive the connection: a disconnect asks every session
   to release its target — all of them concurrently — waits **five seconds**, and terminates only
   the workers that have not finished by then; a worker also exits on its own once its request
-  channel closes. A session running a `debug_batch` is first told to abandon it, and then gets as
-  long as that batch says it still needs on top of that grace — the only case where a disconnect
-  waits longer, and never longer than the batch's own budget allowed.
+  channel closes. A session running a `debug_batch` is told to abandon it by that same request, and
+  then gets as long as the batch says it still needs on top of the grace — the only case where a
+  disconnect waits longer, and never longer than the batch's own budget allowed.
   Which of those two endings a session gets matters for a live kernel. DbgEng leaves a
   detached-but-halted kernel *frozen*, so a worker that releases its target leaves the machine
   running, while a worker that is terminated leaves it stopped. Five seconds is enough for an

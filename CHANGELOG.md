@@ -46,16 +46,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **A teardown while the batch is running is answered too**, and it is a different problem from a
   timeout: `end_session` and a client disconnect both release the target, and the op that does so
   queues *behind* the batch, so the grace used to expire with the transaction still open and the
-  worker was terminated mid-patch. The teardown now signals first — the batch stops at its next step,
-  runs `always`, and reports `BATCH: ABANDONED` — and then waits for it: the worker answers the
-  signal with **how long that batch may still need**, so the grace covers the step already inside
-  DbgEng as well as the rollback behind it. That figure is the batch's own remaining budget, which
-  was already clamped to the caller's patience, so a teardown never waits longer than the batch
-  could have run anyway. The signal is answered by the worker's *request reader*, not its engine
-  thread, because the engine thread is the one inside the batch; it is skipped entirely when a worker
-  owes no reply, so an ordinary disconnect costs exactly what it always did. A batch that reaches the
-  engine *after* the signal does not start at all, which is the same "nothing ran, resubmitting is
-  safe" answer as an unaffordable budget.
+  worker was terminated mid-patch. The worker's *request reader* now acts on that release as it
+  reads it, rather than only when the engine thread reaches it: the batch stops at its next step,
+  runs `always`, and reports `BATCH: ABANDONED`, while the reader answers with **how long that batch
+  may still need** — so the teardown's wait covers the step already inside DbgEng as well as the
+  rollback behind it. That figure is the batch's own remaining budget, already clamped to the
+  caller's patience, so a teardown never waits longer than the batch could have run anyway. A
+  session with nothing to unwind says nothing and costs exactly what it always did. A batch that
+  reaches the engine *after* the release does not start at all, which is the same "nothing ran,
+  resubmitting is safe" answer as an unaffordable budget.
 
   Two edges are reported rather than papered over. The reserve buys the rollback *time*, not a
   guarantee: a step that overruns far enough to consume the reserve as well leaves cleanup with no
