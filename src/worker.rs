@@ -16,6 +16,22 @@
 //! Which is why the request reader lives on the *main* thread and exits the process outright on
 //! EOF instead of joining the engine thread: at EOF the engine thread may be parked forever,
 //! and waiting for it would recreate the very wedge this design removes.
+//!
+//! **The one call that crosses that line, and why it is not a hole in it.** `SetInterrupt` is the
+//! single DbgEng entry point Microsoft documents as safe from any thread, and it is the only one
+//! this process ever makes off the engine thread — from exactly one place, [`interrupt_running`],
+//! on the request reader. Everything else about the engine stays where it always was: it is created
+//! on the engine thread, never sent anywhere, and every other call is made there.
+//!
+//! The exception is not optional and not an optimisation. An interrupt exists to stop an operation
+//! that is *running*, which means the engine thread is by definition busy; routed through that
+//! thread it would be read only once there was nothing left to interrupt. So the alternative to
+//! reaching the engine from outside is not a safer interrupt, it is no interrupt at all.
+//!
+//! It is also not new here — win-kexp's two watchdogs have always Ctrl+Broken the engine from a
+//! thread of their own, on every bounded command and every go/step. What this adds is a caller who
+//! can ask for the same thing, and the binding ([`Running`]) that decides *which job* the request
+//! reaches. See `AGENTS.md` and the `DECISIONS.md` entry for the invariant and its boundary.
 
 use std::io::{BufRead, BufReader, PipeReader, PipeWriter, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};

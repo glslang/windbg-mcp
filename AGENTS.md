@@ -15,7 +15,9 @@ For local iteration while an MCP client may have the release executable locked, 
 
 ## Coding Style & Naming Conventions
 
-Use Rust 2024 idioms and `rustfmt` defaults. Keep DbgEng access inside the worker process and on its engine thread; do not add ad hoc cross-thread or cross-process calls. The supervisor must never touch a `DebugEngine`. Prefer typed Rust APIs and structured JSON over parsing debugger text unless the command surface only exposes text. Use `snake_case` for functions, modules, fields, and tests; use `PascalCase` for types. Keep comments short and focused on non-obvious debugger behavior.
+Use Rust 2024 idioms and `rustfmt` defaults. Keep DbgEng access inside the worker process and on its engine thread; do not add ad hoc cross-thread or cross-process calls. The supervisor must never touch a `DebugEngine`.
+
+**There is exactly one approved exception, and it is not a precedent for a second.** `SetInterrupt` is the single DbgEng entry point Microsoft documents as safe to call from any thread, and it is the only call made off the engine thread: from `worker::interrupt_running` on the request reader, and from win-kexp's two watchdog threads, which have always done it. It is unavoidable rather than convenient — an interrupt exists to stop an operation that is running, so the engine thread is busy by definition, and a request routed through it would be read only once there was nothing left to interrupt. Adding any *other* cross-thread DbgEng call is a design change, not a local one: raise it before writing it. See the `DECISIONS.md` entry "An interrupt is bound to a job, not to a moment" and the `worker.rs` module docs. Prefer typed Rust APIs and structured JSON over parsing debugger text unless the command surface only exposes text. Use `snake_case` for functions, modules, fields, and tests; use `PascalCase` for types. Keep comments short and focused on non-obvious debugger behavior.
 
 ## Testing Guidelines
 
