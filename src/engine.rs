@@ -1874,9 +1874,20 @@ fn read_messages(
                         // Turned into a deadline here, at the one moment the interval the worker
                         // named is current. A later zero retracts it — that is a worker saying its
                         // transaction is done and only the release is left.
+                        //
+                        // Kept **only if it is earlier**, which is what makes the order these
+                        // arrive in stop mattering. A worker's promise never grows: the bound is
+                        // fixed when the batch is claimed, and the one other thing it can say is
+                        // the moment that batch ended. But the two are emitted from different
+                        // threads — the promise by the worker's request reader, the retraction by
+                        // its engine thread — so a teardown landing exactly as a batch exits can
+                        // put them on the wire in either order. Taking the earlier means a stale
+                        // promise cannot undo a retraction that beat it here.
                         if let WorkerMessage::RollingBack { within_ms, .. } = &message {
-                            *unwinding.lock().unwrap_or_else(|e| e.into_inner()) =
-                                Some(Instant::now() + Duration::from_millis(u64::from(*within_ms)));
+                            let named =
+                                Instant::now() + Duration::from_millis(u64::from(*within_ms));
+                            let mut slot = unwinding.lock().unwrap_or_else(|e| e.into_inner());
+                            *slot = Some(slot.map_or(named, |had| had.min(named)));
                         }
                         if tx.send(message).is_err() {
                             break; // nobody is left to route it to
@@ -2991,6 +3002,27 @@ mod tests {
         assert!(
             by <= Instant::now(),
             "a finished transaction must not go on being waited out for the rest of its budget"
+        );
+
+        // And a promise that arrives *after* its own retraction cannot undo it. The two are
+        // emitted from different threads inside the worker — the promise by its request reader,
+        // the retraction by its engine thread — so a teardown landing exactly as a batch exits can
+        // put them on the wire in either order. Only the earlier deadline counts, so the order
+        // stops mattering.
+        let stale = serde_json::to_string(&WorkerMessage::RollingBack {
+            id: 7,
+            within_ms: 90_000,
+        })
+        .expect("encode a stale promise");
+        writeln!(worker, "{stale}").expect("write it as a worker would");
+        tokio::time::timeout(Duration::from_secs(10), messages.recv())
+            .await
+            .expect("the stale promise reached the dispatcher within 10s");
+        assert_eq!(
+            *unwinding.lock().unwrap(),
+            Some(by),
+            "a promise overtaken by its own retraction would have a teardown wait out a batch \
+             budget that is already spent"
         );
     }
 
