@@ -67,12 +67,26 @@ holding, an `eval` that stops parsing — reported `FAILED`, sending the caller 
 was fine. Both are attributions this executor can actually make: the between-steps check runs before
 every step, so a break outstanding when one fails can only have been raised during that step.
 
-The general shape, worth keeping because it is what four rounds of review kept finding: **an
-interrupted operation is indistinguishable from a successful one to everything downstream**, so
-every place that reads a result has to be told separately. The places are enumerable — between
+**The root cause was the return type, and it is now fixed rather than worked around.** Four rounds
+of review each found a different place that had to be told an interrupt had happened — between
 steps, after the last step, when a step fails, and the plain-command path that discarded its output
-entirely — and each was wrong in the same direction, reporting the caller's own interrupt as a fact
-about their target.
+entirely — and every one was wrong in the same direction, reporting the caller's own interrupt as a
+fact about their target. They were all the same defect: `execute_command_bounded` returned
+`Result<String, _>`, an interrupt is not an error (the output is worth keeping), so it returned
+`Ok(text)` — and a `String` cannot say "this did not finish". The fact then had to travel by side
+channel, and a side channel is something each reader must remember to consult.
+
+It now returns `CommandRun { output, cut_short: Option<Interruption> }`, the shape `run_to_address`
+had all along — a structured verdict *and* the text, which is what should have been copied in the
+first place. Two of the four special cases disappeared rather than being fixed: the last-step case
+and the failed-assertion case are both just "the step says it was cut short", read where the step's
+result is already interpreted. `Debuggee::interrupted` survives for the one case a step genuinely
+cannot carry — a break landing between steps — and the batch outcome now names the step the break
+actually *reached* rather than the one that never started.
+
+The general lesson, since it cost four rounds: **a value that omits how it was produced makes every
+reader responsible for finding out**, and readers are added over time. `Ok` for "interrupted" bought
+partial output at the price of an invariant nobody could see from the type.
 
 **This is the approved exception to engine-thread confinement** (`AGENTS.md`), and worth being
 explicit about, because the rule is otherwise absolute and the code visibly departs from it.

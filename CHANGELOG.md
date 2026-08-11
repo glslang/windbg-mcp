@@ -42,13 +42,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an operation that never polls for the break is not reached, and neither is an `attach_kernel`
   whose target has not connected — `end_session` remains the only end to that one.
 
-  A `debug_batch` interrupted this way stops at its **next step** and runs its `always` block,
-  reporting `BATCH: INTERRUPTED` — a distinct outcome from `ABANDONED`, because the session is still
-  open and still holds its target, so the same batch can be resubmitted against it. The executor is
-  told separately rather than inferring it from the step, and that is not a detail: an interrupted
-  step *succeeds*. Preserving the output reached up to the break is the whole point, so the debugger
-  returns `Ok` and a step whose assertions still hold is indistinguishable from one that ran — the
-  batch would carry on applying later mutations for a caller who had just asked it to stop.
+  A `debug_batch` interrupted this way stops and runs its `always` block, reporting
+  `BATCH: INTERRUPTED` at the step the break reached — a distinct outcome from `ABANDONED`, because
+  the session is still open and still holds its target, so the same batch can be resubmitted against
+  it. It has to be told rather than left to infer it, and that is not a detail: **an interrupted
+  command succeeds**. Preserving the output reached up to the break is the whole point, so a step
+  whose assertions still hold is indistinguishable from one that ran, and the batch would carry on
+  applying later mutations for a caller who had just asked it to stop.
+
+  So the debugger reports *both* facts. `execute_command_bounded` returns the output **and** whether
+  the command finished (`CommandRun { output, cut_short }`), the shape `run_to_address` already had,
+  rather than a bare `String` that cannot say "this did not finish" — every place that reads a result
+  gets the fact with the value instead of having to remember to ask for it. That is the difference
+  between a step that reports itself cut short and a batch that has to guess: the last step of a
+  batch, and a step whose assertion stops holding *because* the output was truncated, are both just
+  "the step says so" rather than two more special cases.
 
   **A batch's rollback is not interruptible.** Cleanup runs as part of the same call and is reached
   on every path, so a break landing there hits a restore command — which returns `Ok` with partial
@@ -56,14 +64,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   COMPLETE` with the target still changed. The executor announces the block before running it, and
   the worker then refuses breaks for that call and drains any already pending, both under the lock a
   raise has to take. An `interrupt` aimed at a batch that is unwinding says so and sends nothing.
-  A break landing during the **last** step is caught too, on a re-check once the steps end: it
-  cannot be seen between steps, and the batch would otherwise report `COMMITTED` of a transaction
-  whose final step was cut short — directly above the note saying it had been. And a step that
-  *fails* because the break truncated its output — a `contains` that stops holding, an `eval` that
-  stops parsing, which is the likeliest shape of an interrupted step — reports `INTERRUPTED` rather
-  than `FAILED`, so the caller is not sent to debug a step that was fine. Attributable rather than
-  guessed: the between-steps check runs before every step, so a break outstanding when one fails can
-  only have been raised during it.
+  Two readings that were wrong in the same direction come right for free once the step carries the
+  fact. A break landing during the **last** step has no next step to be caught before, so the batch
+  reported `COMMITTED` of a transaction whose final step was cut short — directly above the note
+  saying it had been. And a step that *fails* because the break truncated its output — a `contains`
+  that stops holding, an `eval` that stops parsing, the likeliest shape of an interrupted step —
+  reported `FAILED`, sending the caller to debug a step that was fine. Both are now `INTERRUPTED`,
+  named at the step the break actually reached.
 
   Every op now keeps the output an interrupted command reached, not only the bounded ones. The plain
   path (`modules`, `index_trace` and the other typed commands) went through `execute_command`, where

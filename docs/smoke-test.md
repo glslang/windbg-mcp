@@ -223,8 +223,9 @@ case.
 - `a_bounded_runaway_command_aborts_and_leaves_its_session_usable` — a `.for` loop sized to run for
   hours is cut short by the watchdog, and the session executes the *next* command normally. This is
   the wedge that used to need a server restart. Proof of interruption is the loop counter left in
-  `$t0`, not the clock and not the "interrupted after" note (which is appended whenever the watchdog
-  *attempted* an interrupt, even one the engine ignored).
+  `$t0`, not the clock and not the "interrupted after" note (which the worker renders whenever the
+  watchdog *attempted* an interrupt, even one the engine ignored — win-kexp reports the reason as a
+  field, and prose for a human is this server's to add).
 - `a_bounded_command_queued_behind_another_job_still_beats_its_caller` — the same, from behind a
   `.sleep` that occupies the session for half the call budget. This is the half win-kexp cannot
   cover, because the queue belongs to this crate: budgeting from the patience as sent, instead of
