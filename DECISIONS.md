@@ -88,6 +88,14 @@ flag is collected across its assertions too: an `eval` check is two further engi
 break landing in one can leave a value that still parses and still matches, so nothing else in the
 step would ever say anything was wrong.
 
+And the seam has **no** "this finished" constructor, which is the part that stops the class coming
+back. There was one, used at the dispatch to wrap the three actions that are not commands — `run_to`,
+`read_memory` and the pool steps — and it made *finished* their silent default. Two of those are
+interruptible in fact (a pool walk polls the same flag win-kexp's walker does), and the engine
+cannot report it for any of them, since only the worker knows a break was raised. So every method on
+the trait returns the same type and every implementor has to say what it saw: there is now no way to
+claim a call finished without deciding that it did.
+
 The general lesson, since it cost four rounds: **a value that omits how it was produced makes every
 reader responsible for finding out**, and readers are added over time. `Ok` for "interrupted" bought
 partial output at the price of an invariant nobody could see from the type.

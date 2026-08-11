@@ -1145,16 +1145,6 @@ fn told(run: CommandRun) -> String {
     out
 }
 
-/// A [`CommandRun`] as the batch executor sees it: the output, and whether a break somebody asked
-/// for reached it. A deadline is not that — it is the step's own `timeout_ms` doing its job, which
-/// the step's output and assertions already speak to. See [`batch::Ran`].
-fn ran(run: CommandRun) -> Ran {
-    Ran {
-        interrupted: matches!(run.cut_short, Some(Interruption::OnRequest)),
-        output: told(run),
-    }
-}
-
 /// Reads target memory and renders it as a hex dump.
 ///
 /// Free function rather than an inline arm because a batch step reads memory the same way, and a
@@ -1220,41 +1210,79 @@ struct BatchEngine<'a> {
     job: u64,
 }
 
+impl BatchEngine<'_> {
+    /// Whether a break has been raised for this batch's job.
+    ///
+    /// Which, at the moment a call returns, means it was raised *during that call*: the executor
+    /// checks between steps, so a break outstanding from an earlier one would have stopped the
+    /// batch before this step began.
+    ///
+    /// This is the authority for the calls win-kexp cannot answer for. A command knows its own
+    /// interruption — the engine clears and reads a flag around `Execute` — but a `run_to` verdict,
+    /// a typed memory read and a pool walk have no such notion, and a walk in particular *is*
+    /// interruptible: win-kexp's walker polls the same Ctrl+C flag and stops. Left unasked, they
+    /// reported every result as whole.
+    fn broken(&self) -> bool {
+        interrupt_pending(self.job)
+    }
+
+    /// A command's result as the executor sees it: the text with any deadline note, and whether a
+    /// break reached it — from the engine, which knows, or from this worker, which raised it.
+    fn ran(&self, run: CommandRun) -> Ran {
+        Ran {
+            interrupted: matches!(run.cut_short, Some(Interruption::OnRequest)) || self.broken(),
+            output: told(run),
+        }
+    }
+}
+
 impl Debuggee for BatchEngine<'_> {
     fn command(&mut self, command: &str, budget_ms: u32) -> Result<Ran, String> {
         // Bounded, always. A batch is the one place a runaway command would also strand a
         // rollback, so the step self-aborts rather than eating the reserve.
         self.e
             .execute_command_bounded(command, budget_ms)
-            .map(ran)
+            .map(|run| self.ran(run))
             .map_err(es)
     }
 
     fn resume(&mut self, command: &str, timeout_ms: u32) -> Result<Ran, String> {
         self.e
             .execute_and_wait(command, timeout_ms)
-            .map(ran)
+            .map(|run| self.ran(run))
             .map_err(es)
     }
 
-    fn run_to(&mut self, address: &str, timeout_ms: u32) -> Result<String, String> {
-        run_to_address(self.e, address, timeout_ms)
+    fn run_to(&mut self, address: &str, timeout_ms: u32) -> Result<Ran, String> {
+        let output = run_to_address(self.e, address, timeout_ms)?;
+        Ok(Ran {
+            output,
+            interrupted: self.broken(),
+        })
     }
 
-    fn read_memory(&mut self, address: &str, size: u32) -> Result<String, String> {
-        read_memory(self.e, address, size)
+    fn read_memory(&mut self, address: &str, size: u32) -> Result<Ran, String> {
+        let output = read_memory(self.e, address, size)?;
+        Ok(Ran {
+            output,
+            interrupted: self.broken(),
+        })
     }
 
-    fn pool(&mut self, query: &PoolOp, budget_ms: u32) -> Result<String, String> {
+    fn pool(&mut self, query: &PoolOp, budget_ms: u32) -> Result<Ran, String> {
         // The step's own budget, handed to the walker. Bounded, always, for the same reason a
         // command step is: this is the one step that can spend minutes without a runaway anywhere
         // — a full pool walk is every committed page over the KD wire — and the reserve the
         // rollback lives on is what it would spend.
-        pool(
+        let output = pool(
             self.e,
             query.clone(),
             Duration::from_millis(u64::from(budget_ms)),
-        )
+        )?;
+        Ok(Ran {
+            output,
+            interrupted: self.broken(),
+        })
     }
 
     fn elapsed(&self) -> Duration {

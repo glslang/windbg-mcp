@@ -755,15 +755,11 @@ pub struct Ran {
     pub interrupted: bool,
 }
 
-impl Ran {
-    /// A call that finished.
-    pub fn whole(output: String) -> Self {
-        Self {
-            output,
-            interrupted: false,
-        }
-    }
-}
+// Deliberately no `Ran::whole` constructor. There was one, used at the dispatch to wrap the actions
+// whose calls returned a bare `String` — and it made "this finished" the silent default for three
+// of them, including a pool walk, which is genuinely interruptible (win-kexp's walker polls the same
+// flag). Every implementor now has to say what it saw, because there is no way to say it without
+// deciding.
 
 /// What [`run`] needs from a debugger. Implemented over a real engine by the worker, and over a
 /// script by the tests — see the module docs for why that seam is where it is.
@@ -773,9 +769,9 @@ pub trait Debuggee {
     /// Run a command that moves the target, waiting up to `timeout_ms` for the next stop.
     fn resume(&mut self, command: &str, timeout_ms: u32) -> Result<Ran, String>;
     /// Run to `address` and report a verdict.
-    fn run_to(&mut self, address: &str, timeout_ms: u32) -> Result<String, String>;
+    fn run_to(&mut self, address: &str, timeout_ms: u32) -> Result<Ran, String>;
     /// Hex-dump `size` bytes at `address`.
-    fn read_memory(&mut self, address: &str, size: u32) -> Result<String, String>;
+    fn read_memory(&mut self, address: &str, size: u32) -> Result<Ran, String>;
     /// Answer a pool question — the one capability here that is not a debugger command at all,
     /// but a walk over the allocator's own descriptors.
     ///
@@ -785,7 +781,7 @@ pub trait Debuggee {
     /// it the bound the worker advertises to a teardown, which is what stops a worker being
     /// terminated mid-transaction. A walk stopped by the budget reports how much of the pool it
     /// reached, so a short step degrades to a partial answer that says so rather than to a failure.
-    fn pool(&mut self, query: &PoolOp, budget_ms: u32) -> Result<String, String>;
+    fn pool(&mut self, query: &PoolOp, budget_ms: u32) -> Result<Ran, String>;
     /// How long this batch has been running.
     fn elapsed(&self) -> Duration;
     /// Whether something outside the batch has asked it to stop early and roll back — a client
@@ -1206,28 +1202,26 @@ fn run_step(
         StepAction::RunTo {
             address,
             timeout_ms,
-        } => d.run_to(address, wait_ms(*timeout_ms)).map(Ran::whole),
+        } => d.run_to(address, wait_ms(*timeout_ms)),
         StepAction::Eval { expr } => d.command(&format!("? {expr}"), budget_ms),
-        StepAction::ReadMemory { address, size } => d.read_memory(address, *size).map(Ran::whole),
+        StepAction::ReadMemory { address, size } => d.read_memory(address, *size),
         // Through the same constructors the pool *tools* use, so a step and a tool cannot drift
         // apart on what a default or a cap means — see [`PoolOp`].
-        StepAction::PoolChunk { address, refresh } => d
-            .pool(&PoolOp::chunk(address.clone(), *refresh), budget_ms)
-            .map(Ran::whole),
+        StepAction::PoolChunk { address, refresh } => {
+            d.pool(&PoolOp::chunk(address.clone(), *refresh), budget_ms)
+        }
         StepAction::PoolFindTag {
             tag,
             paged,
             refresh,
             limit,
-        } => d
-            .pool(
-                &PoolOp::find_tag(tag.clone(), *paged, *refresh, *limit),
-                budget_ms,
-            )
-            .map(Ran::whole),
-        StepAction::PoolCensus { refresh, limit } => d
-            .pool(&PoolOp::census(*refresh, *limit), budget_ms)
-            .map(Ran::whole),
+        } => d.pool(
+            &PoolOp::find_tag(tag.clone(), *paged, *refresh, *limit),
+            budget_ms,
+        ),
+        StepAction::PoolCensus { refresh, limit } => {
+            d.pool(&PoolOp::census(*refresh, *limit), budget_ms)
+        }
     });
 
     let (output, mut cut_short) = match ran {
@@ -1799,17 +1793,17 @@ mod tests {
         fn resume(&mut self, command: &str, _timeout_ms: u32) -> Result<Ran, String> {
             self.answer_run(command)
         }
-        fn run_to(&mut self, address: &str, _timeout_ms: u32) -> Result<String, String> {
-            self.answer(&format!("run to {address}"))
+        fn run_to(&mut self, address: &str, _timeout_ms: u32) -> Result<Ran, String> {
+            self.answer_run(&format!("run to {address}"))
         }
-        fn read_memory(&mut self, address: &str, size: u32) -> Result<String, String> {
-            self.answer(&format!("read {size} at {address}"))
+        fn read_memory(&mut self, address: &str, size: u32) -> Result<Ran, String> {
+            self.answer_run(&format!("read {size} at {address}"))
         }
-        fn pool(&mut self, query: &PoolOp, budget_ms: u32) -> Result<String, String> {
+        fn pool(&mut self, query: &PoolOp, budget_ms: u32) -> Result<Ran, String> {
             // The budget is part of the call text, not swallowed: a pool step's whole hazard is
             // taking longer than the batch can afford, so a test that could not see what the walk
             // was armed with could not tell the fix from the bug.
-            self.answer(&format!("pool {query:?} within {budget_ms}ms"))
+            self.answer_run(&format!("pool {query:?} within {budget_ms}ms"))
         }
         fn elapsed(&self) -> Duration {
             self.clock
@@ -2085,6 +2079,64 @@ mod tests {
         let text = render(&report);
         assert!(text.contains("BATCH: INTERRUPTED at step 1 of 3"), "{text}");
         assert!(text.contains("rollback: COMPLETE"), "{text}");
+    }
+
+    /// Every kind of step reports a break that reached it — not only the command-shaped ones.
+    ///
+    /// `run_to`, `read_memory` and the pool steps do not go through `execute_command_bounded`, so
+    /// the engine has no interruption to report for them and the worker's own record is the
+    /// authority. They were wrapped as "finished" at the dispatch, which made a `run_to` cut short
+    /// look like a target that had merely stopped somewhere else — and a pool walk is *genuinely*
+    /// interruptible, since win-kexp's walker polls the same flag.
+    #[test]
+    fn a_break_is_reported_by_every_shape_of_step() {
+        for (action, matching) in [
+            (
+                StepAction::RunTo {
+                    address: "nt!NtCreateFile".to_string(),
+                    timeout_ms: None,
+                },
+                "run to",
+            ),
+            (
+                StepAction::ReadMemory {
+                    address: "0x1000".to_string(),
+                    size: 16,
+                },
+                "read 16",
+            ),
+            (
+                StepAction::PoolCensus {
+                    refresh: None,
+                    limit: None,
+                },
+                "pool",
+            ),
+        ] {
+            let mut d = stopped()
+                .on(matching, Ok("whatever it had reached"))
+                .on("second", Ok(""))
+                .on("eb restore", Ok(""))
+                .interrupted_after(1);
+            let batch = op(
+                vec![step(action), cmd("second step")],
+                vec![cmd("eb restore 41")],
+            );
+
+            let report = run(&mut d, &batch, BUDGET);
+
+            assert_eq!(
+                report.outcome,
+                BatchOutcome::Interrupted { at: 1 },
+                "a `{matching}` step cut short reported {:?}",
+                report.outcome
+            );
+            assert!(!d.ran("second"), "`{matching}`: a later mutation still ran");
+            assert!(
+                d.ran("eb restore"),
+                "`{matching}`: the rollback did not run"
+            );
+        }
     }
 
     /// A break landing while an **assertion** is being evaluated belongs to the step too.
