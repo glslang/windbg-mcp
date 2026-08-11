@@ -200,7 +200,7 @@ Windows Server 26100.32995 were:
 | Candidate | Live measurement | Result |
 |---|---|---|
 | NPFS write-data (`NpFr`) | physical blocks were `0xa0`; payload followed an NPFS header | wrong bucket and offset |
-| Pending METHOD_BUFFERED requests (`IoSB`) | 784/1024 exact-`0x68` SystemBuffers stayed parked | target remained `ReusableFree` |
+| Pending pipe writes ("IoSB" attempt) | payload lands in an `NpFr` block (`0xb0`, data at `+0x40`), **not** a distinct `0x68` SystemBuffer | wrong bucket and offset; freed slots stayed `ReusableFree` |
 | Event objects | requested `0x68` and appeared in mixed `0x80` LFH blocks near `Tgsm` | useful density groom, unreliable reclaim |
 | Retained SetData buffers (`Tfub`) | 1024 exact-`0x68` driver copies | target remained free: SetData uses `POOL_FLAG_PAGED` (`0x100`) |
 | SetData with KD-patched tag and flags | `Tgsm` plus `POOL_FLAG_NON_PAGED` (`0x40`) | still missed; call-site/subsegment selection remained different |
@@ -208,6 +208,55 @@ Windows Server 26100.32995 were:
 `pool_census` established the population, `pool_find_tag` found the candidate classes, and
 `pool_chunk(refresh=true)` gave the final per-address verdict. The tools do not mutate or groom
 pool state; they prevent a plausible-looking spray count from being mistaken for a reclaim.
+
+**Retried in isolation (26100.32995) — and the reclaim can be made natural.** To separate the
+reclaim question from the race, the `reclaimprobe` mode (`examples/messagemanager/mm_exploit.c`)
+frees a *run* of bare `Tgsm` chunks cleanly — no UAF — captures each freed address from the handle
+list, then sprays a NonPaged candidate (everything pinned to CPU 0) and `db`s each slot. Two things
+came out of it — a mechanical detail about freeing, and a primitive that reclaims without KD:
+
+- A bare `Create`+`Delete` frees a `Tgsm` chunk cleanly (RefCount `1`→`0`; the `Buffer != NULL`
+  guard skips the paged `Tfub` free). A `SetData` first leaves RefCount at **2** — SetData's
+  `lock inc` is never released, the same bug that drives the UAF — so a single `Delete` then frees
+  *nothing*. A clean free needs the bare path.
+
+The reclaim's difficulty is **allocation context**, not size. The freed `Tgsm` `0x80` slots are
+reused live — by system `Even` (Event) objects. `CreateEvent` allocates its `0x68` NonPagedNx block
+through the *generic* `ExAllocatePool2` path, the same context the driver's `Create` uses, so Events
+land in exactly these subsegments. A reclaim spray therefore has to draw from that same generic
+context; a same-size NonPaged spray from a *different* context misses. Four candidates, measured:
+
+- **pending pipe write** (the harness's mislabeled "IoSB"): NPFS routes it to an `NpFr` block
+  (`0xb0`, payload at `+0x40`) — wrong bucket, wrong offset. Miss.
+- **`FSCTL_PIPE_TRANSCEIVE`** (`0x11C017`) is `METHOD_NEITHER` — no SystemBuffer copy at all.
+- **AFD socket context** (`IOCTL_AFD_SET_CONTEXT`): a genuine attacker-controlled NonPaged
+  verbatim spray from `+0x00` (500/500 held), but `AfdC` is a **separate context** — its marker
+  is absent from the whole `Tgsm` region and 0/16 slots were reclaimed. Same size, wrong context.
+- **pending `FSCTL_PIPE_WAIT`** (tag `IoSB`): **this reclaims.** Its input SystemBuffer is an
+  I/O-manager *buffered* allocation on the generic context, so it lands in the freed slots. Two
+  plumbing points make it work: the FSCTL must go through `NtFsControlFile`
+  (`IRP_MJ_FILE_SYSTEM_CONTROL`; `DeviceIoControl` sends device-control and NPFS answers
+  `ERROR_INVALID_FUNCTION`), and the NPFS root is opened async + as a directory so the wait parks
+  with `STATUS_PENDING` and keeps the buffer live.
+
+Against a run of 16 freshly-freed `Tgsm` slots, a 500-buffer `FSCTL_PIPE_WAIT` spray reclaimed
+**8 of them** — each formerly-`Tgsm` chunk becomes tag `IoSB` holding `MMWAIT!!` at `+0x00`, with
+**no debugger assist**:
+
+```text
+ffff...5e55f500  size: 80  (Free) *IoSB          // !pool misreads 26100 segment-heap LFH state
+ffff...5e55f510  4d 4d 57 41 49 54 21 21 58 00..  // "MMWAIT!!" then NameLength 0x58
+```
+
+That is the natural reclaim the KD-forced allocation was standing in for: the reclaim step of the
+chain no longer needs the debugger. The caveat is offset control. `FSCTL_PIPE_WAIT`'s buffer is a
+`FILE_PIPE_WAIT_FOR_BUFFER`: `+0x00` Timeout (free — the `RefCount`), `+0x08` `NameLength` (a
+validated length, not a pointer), `+0x10..` the pipe name. So it controls `+0x00` and `+0x10`
+onward — reaching **Buffer `+0x18`, the arbitrary-free primitive** — but **not** Flink `+0x08` as a
+kernel pointer, which the §8 *unlink* RIP specifically writes. Removing the assist from the unlink
+variant still needs an offset-`0` primitive that also frees `+0x08`; the data-only **arbitrary-free**
+route (`ExFreePoolWithTag(msg+0x18)`, §3/§6) is now reachable with a fully natural reclaim, and a
+double-free → type-confusion would sidestep `+0x08` entirely.
 
 The [SSTIC 2020 pool-overflow work](https://www.sstic.org/2020/presentation/pool_overflow_exploitation_since_windows_10_19h1/)
 is applicable to the allocator model: LFH subsegments, affinity slots, and free-bitmap randomisation
@@ -309,9 +358,17 @@ redirected the trigger to the original CREATE handler, and finally restored the 
 `48 89 41 08` bytes. A final read verified both the dispatch pointer and instruction bytes before a
 clean reboot discarded the intentionally corrupted free chunk.
 
-This establishes controlled kernel RIP on the challenge build. It remains a debugger-assisted CTF
-proof because the exact LFH reclaim is not natural; it makes no claim of privilege escalation or a
-debugger-free exploit.
+This establishes controlled kernel RIP on the challenge build. The RIP *mechanism* above is
+debugger-assisted, but the **reclaim it depended on is no longer**: §6 shows a pending
+`FSCTL_PIPE_WAIT` (`IoSB`) spray reclaiming freed `Tgsm` slots naturally (8/16), attacker-controlled
+from `+0x00`, with no debugger. So the KD-forced allocation return can be dropped from the reclaim
+step. What the *unlink* variant in this section still needs is `+0x08` as a kernel pointer, which the
+`IoSB` buffer pins to `NameLength`; that specific store is the only remaining debugger-assisted
+piece. The natural reclaim instead lands the controllable fields at `+0x00` and `+0x18`, which is
+exactly the **arbitrary-free** primitive (§3, §6) — a debugger-free `ExFreePoolWithTag(msg+0x18)`
+that a full exploit would pivot through (free-a-victim → type-confusion), rather than the KD-only
+dispatch overwrite shown here. This makes no claim of privilege escalation; it moves the boundary
+from "reclaim needs KD" to "only the `+0x08` unlink store needs KD."
 
 ## 9. Streamlining the next kernel CTF
 
