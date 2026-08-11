@@ -41,12 +41,12 @@ use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use win_kexp::dbgeng::{DebugEngine, InterruptHandle, RunToOutcome};
+use win_kexp::dbgeng::{CommandRun, DebugEngine, InterruptHandle, Interruption, RunToOutcome};
 use win_kexp::pool::query::{self, PoolPageFilter, PoolWalk};
 use win_kexp::pool::{DiagnosticShape, PoolDiagnostics, PoolSpan, PoolState};
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
-use crate::batch::{self, BatchOp, Debuggee};
+use crate::batch::{self, BatchOp, Debuggee, Ran};
 use crate::proto::{EngineOp, PoolOp, ReachabilityOp, WorkerMessage, WorkerRequest};
 use crate::server::{
     fmt_addr, format_recipe, format_report, hexdump, parse_eval, parse_lm_base, parse_u64,
@@ -1014,18 +1014,25 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<S
         // Zero costs nothing to say. It spawns no watchdog at all — which is the whole reason these
         // ops are off the bounded path (DECISIONS.md, 2026-08-02: arming one rounds a command up to
         // a multiple of 200ms) — so this stays unbounded, as `index_trace` in particular must.
-        EngineOp::Command { command } => e.execute_command_bounded(&command, 0).map_err(es),
+        EngineOp::Command { command } => {
+            e.execute_command_bounded(&command, 0).map(told).map_err(es)
+        }
         EngineOp::BoundedCommand {
             command,
             patience_ms,
         } => {
             let budget = watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), queued);
-            e.execute_command_bounded(&command, budget).map_err(es)
+            e.execute_command_bounded(&command, budget)
+                .map(told)
+                .map_err(es)
         }
         EngineOp::CommandAndWait {
             command,
             timeout_ms,
-        } => e.execute_and_wait(&command, timeout_ms).map_err(es),
+        } => e
+            .execute_and_wait(&command, timeout_ms)
+            .map(told)
+            .map_err(es),
         EngineOp::Registers => e.registers().map_err(es),
         EngineOp::ReadMemory { address, size } => read_memory(e, &address, size),
         EngineOp::SymbolPath {
@@ -1118,6 +1125,36 @@ fn es<E: ToString>(e: E) -> String {
     e.to_string()
 }
 
+/// A command's text, with the deadline's explanation appended when there is one.
+///
+/// The note lives here rather than in win-kexp because it is prose for whoever reads the tool's
+/// output, and a return value is the wrong place to put prose: the caller before this one had to
+/// string-match for it. Only the deadline earns one — an interrupt *on request* is explained to
+/// the caller by [`cut_short`], and to the one who asked by their own reply.
+fn told(run: CommandRun) -> String {
+    let mut out = run.output;
+    if let Some(Interruption::Deadline { after_ms }) = run.cut_short {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "[windbg-mcp] command interrupted after {after_ms} ms (Ctrl+Break) — it was taking \
+             too long. Scope it (e.g. a bounded memory range) and retry."
+        ));
+    }
+    out
+}
+
+/// A [`CommandRun`] as the batch executor sees it: the output, and whether a break somebody asked
+/// for reached it. A deadline is not that — it is the step's own `timeout_ms` doing its job, which
+/// the step's output and assertions already speak to. See [`batch::Ran`].
+fn ran(run: CommandRun) -> Ran {
+    Ran {
+        interrupted: matches!(run.cut_short, Some(Interruption::OnRequest)),
+        output: told(run),
+    }
+}
+
 /// Reads target memory and renders it as a hex dump.
 ///
 /// Free function rather than an inline arm because a batch step reads memory the same way, and a
@@ -1184,16 +1221,20 @@ struct BatchEngine<'a> {
 }
 
 impl Debuggee for BatchEngine<'_> {
-    fn command(&mut self, command: &str, budget_ms: u32) -> Result<String, String> {
+    fn command(&mut self, command: &str, budget_ms: u32) -> Result<Ran, String> {
         // Bounded, always. A batch is the one place a runaway command would also strand a
         // rollback, so the step self-aborts rather than eating the reserve.
         self.e
             .execute_command_bounded(command, budget_ms)
+            .map(ran)
             .map_err(es)
     }
 
-    fn resume(&mut self, command: &str, timeout_ms: u32) -> Result<String, String> {
-        self.e.execute_and_wait(command, timeout_ms).map_err(es)
+    fn resume(&mut self, command: &str, timeout_ms: u32) -> Result<Ran, String> {
+        self.e
+            .execute_and_wait(command, timeout_ms)
+            .map(ran)
+            .map_err(es)
     }
 
     fn run_to(&mut self, address: &str, timeout_ms: u32) -> Result<String, String> {

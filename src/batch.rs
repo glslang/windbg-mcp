@@ -740,11 +740,40 @@ fn action_mutation(action: &StepAction) -> Option<String> {
 
 /// What [`run`] needs from a debugger. Implemented over a real engine by the worker, and over a
 /// script by the tests — see the module docs for why that seam is where it is.
+/// What a step's engine call produced: its output, and whether it actually finished.
+///
+/// Both, because either alone is a lie in the case that matters. Output alone cannot say a command
+/// was cut short, and an interrupted command's output looks exactly like a complete one — a search
+/// prints the hits it reached and nothing to say there were more. An error alone throws that output
+/// away, which is the whole reason to interrupt a call rather than end its session.
+#[derive(Debug, Clone)]
+pub struct Ran {
+    pub output: String,
+    /// The operation was stopped by a break somebody asked for, before it finished.
+    ///
+    /// A *deadline*-driven abort is deliberately not this: that is the step's own `timeout_ms`
+    /// doing its job, the output says so, and the step's assertions are the right place to judge
+    /// it. This is the one a caller outside the batch caused.
+    pub interrupted: bool,
+}
+
+impl Ran {
+    /// A call that finished.
+    pub fn whole(output: String) -> Self {
+        Self {
+            output,
+            interrupted: false,
+        }
+    }
+}
+
+/// What [`run`] needs from a debugger. Implemented over a real engine by the worker, and over a
+/// script by the tests — see the module docs for why that seam is where it is.
 pub trait Debuggee {
     /// Run a command to completion, self-aborting after `budget_ms`.
-    fn command(&mut self, command: &str, budget_ms: u32) -> Result<String, String>;
+    fn command(&mut self, command: &str, budget_ms: u32) -> Result<Ran, String>;
     /// Run a command that moves the target, waiting up to `timeout_ms` for the next stop.
-    fn resume(&mut self, command: &str, timeout_ms: u32) -> Result<String, String>;
+    fn resume(&mut self, command: &str, timeout_ms: u32) -> Result<Ran, String>;
     /// Run to `address` and report a verdict.
     fn run_to(&mut self, address: &str, timeout_ms: u32) -> Result<String, String>;
     /// Hex-dump `size` bytes at `address`.
@@ -772,21 +801,21 @@ pub trait Debuggee {
     /// has to be shortened to fit a teardown.
     fn abandoned(&self) -> bool;
     /// Whether someone has asked this batch's *call* to stop — the `interrupt` tool, aimed at the
-    /// job this batch is running as. Read between steps, with the same limit as
-    /// [`Self::abandoned`]: it cannot reach a call already inside DbgEng.
+    /// job this batch is running as.
     ///
-    /// Separate from `abandoned` because the two say opposite things about the session: a teardown
-    /// means it is going away, this means it is staying.
+    /// Separate from [`Self::abandoned`] because the two say opposite things about the session: a
+    /// teardown means it is going away, this means it is staying.
     ///
-    /// **The executor has to be told, because an interrupted step succeeds.** The break makes the
-    /// debugger return early with whatever it had produced — preserving that is the point — so a
-    /// step whose assertions still hold is indistinguishable from one that ran. See `DECISIONS.md`.
+    /// Only for a break that landed while **no step was running**. One that lands during a step is
+    /// carried back by that step, in [`Ran::interrupted`], which is where it belongs: the step is
+    /// what the break actually reached, and a fact travelling with the value it is about cannot be
+    /// forgotten at one of the places that reads it.
     fn interrupted(&self) -> bool;
     /// Announces that the main steps are over and the `always` block is about to run.
     ///
     /// A safety boundary, not bookkeeping: cleanup must not be interruptible, because a restore cut
-    /// short returns `Ok` like any other interrupted command and would be reported as a rollback
-    /// that completed. Implementations refuse interrupts from here on.
+    /// short comes back as a step that ran and would be reported as a rollback that completed.
+    /// Implementations refuse interrupts from here on.
     fn rolling_back(&mut self);
 }
 
@@ -795,7 +824,7 @@ pub trait Debuggee {
 /// Needed because the only other guard is `worker::engine_thread`'s, which wraps a whole op — an
 /// unwind from a step would pass straight through the rollback. Not hypothetical: several win-kexp
 /// methods use `.expect`, and a step calls into them.
-fn guarded(call: impl FnOnce() -> Result<String, String>) -> Result<String, String> {
+fn guarded<T>(call: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     catch_unwind(AssertUnwindSafe(call)).unwrap_or_else(|payload| {
         // The message, when the payload carries one. A bare "panicked" would tell a caller that
         // their transaction stopped without telling them what stopped it, and this is a report
@@ -856,6 +885,14 @@ pub struct StepOutcome {
     pub changes: Option<String>,
     pub result: StepResult,
     pub output: String,
+    /// A break somebody asked for landed while this step was running, so its output is what the
+    /// step had reached rather than what it would have produced.
+    ///
+    /// Travels with the step rather than being asked for separately, which is the point: this is
+    /// the fact that made an interrupted step indistinguishable from a completed one, and carrying
+    /// it on the value means every reader of the step has it — the outcome classification, the
+    /// renderer, and whatever comes next — instead of each having to remember to ask.
+    pub cut_short: bool,
 }
 
 impl StepOutcome {
@@ -867,6 +904,7 @@ impl StepOutcome {
             changes: None,
             result: StepResult::Skipped(why.into()),
             output: String::new(),
+            cut_short: false,
         }
     }
 
@@ -1050,15 +1088,23 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
             continue;
         }
         let done = run_step(d, step, position, steps_deadline, &mut bound);
-        if !done.ok() {
+        // The step says whether a break reached it, so this needs no separate question and covers
+        // every shape at once: a step cut short that still succeeded (including the *last* one,
+        // which no between-steps check can ever see), and one whose assertions stopped holding
+        // *because* the output was truncated — which would otherwise read as `FAILED` and send the
+        // caller to debug a step that was fine.
+        if done.cut_short {
+            // A teardown outranks a break that reached the same step: the session is going away,
+            // so "resubmit on a fresh session" is the advice, and `Interrupted` would send the
+            // caller back to one that will not be there. Only asked here, where both can be true
+            // of the same step — an ordinary teardown is still caught before the *next* step.
+            outcome = if d.abandoned() {
+                BatchOutcome::Abandoned { at: position }
+            } else {
+                BatchOutcome::Interrupted { at: position }
+            };
+        } else if !done.ok() {
             outcome = match &done.result {
-                // A step that failed while a break was landing on it failed *because* of the
-                // break, and saying otherwise sends the caller to debug their own step: an
-                // interrupt truncates the output, so a `contains` assertion stops holding and an
-                // `eval` capture stops parsing. Attributable rather than guessed — the check
-                // above runs before every step, so a break outstanding *here* can only have been
-                // raised during this one.
-                _ if d.interrupted() => BatchOutcome::Interrupted { at: position },
                 // An assertion that did not hold is a verdict about the target, and stays one
                 // however long the step took to reach it.
                 StepResult::Unmet(_) => BatchOutcome::Failed { at: position },
@@ -1069,22 +1115,6 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
             };
         }
         steps.push(done);
-    }
-
-    // The between-steps check above cannot see a break that lands during the **last** step: there is
-    // no next step to stop before. Left there, every step has run and every assertion has held, so
-    // the batch reports `COMMITTED` — of a transaction whose final step was cut short, with only the
-    // generic cut-short note beneath to contradict it. Contradicting itself is worse than either
-    // reading alone, so the outcome is corrected here.
-    //
-    // Only from `Committed`. A step that failed or ran out of time has news the caller must act on
-    // first, and an interrupt does not change what it says.
-    if outcome == BatchOutcome::Committed && d.interrupted() {
-        // One past the end, which is what `at` means everywhere it appears — the first step not
-        // attempted — and here says there is no such step. `render` reads it back and says so.
-        outcome = BatchOutcome::Interrupted {
-            at: op.steps.len() + 1,
-        };
     }
 
     // The rollback block, on every path. Its own deadline is the *whole* budget, which is what the
@@ -1178,30 +1208,32 @@ fn run_step(
         StepAction::RunTo {
             address,
             timeout_ms,
-        } => d.run_to(address, wait_ms(*timeout_ms)),
+        } => d.run_to(address, wait_ms(*timeout_ms)).map(Ran::whole),
         StepAction::Eval { expr } => d.command(&format!("? {expr}"), budget_ms),
-        StepAction::ReadMemory { address, size } => d.read_memory(address, *size),
+        StepAction::ReadMemory { address, size } => d.read_memory(address, *size).map(Ran::whole),
         // Through the same constructors the pool *tools* use, so a step and a tool cannot drift
         // apart on what a default or a cap means — see [`PoolOp`].
-        StepAction::PoolChunk { address, refresh } => {
-            d.pool(&PoolOp::chunk(address.clone(), *refresh), budget_ms)
-        }
+        StepAction::PoolChunk { address, refresh } => d
+            .pool(&PoolOp::chunk(address.clone(), *refresh), budget_ms)
+            .map(Ran::whole),
         StepAction::PoolFindTag {
             tag,
             paged,
             refresh,
             limit,
-        } => d.pool(
-            &PoolOp::find_tag(tag.clone(), *paged, *refresh, *limit),
-            budget_ms,
-        ),
-        StepAction::PoolCensus { refresh, limit } => {
-            d.pool(&PoolOp::census(*refresh, *limit), budget_ms)
-        }
+        } => d
+            .pool(
+                &PoolOp::find_tag(tag.clone(), *paged, *refresh, *limit),
+                budget_ms,
+            )
+            .map(Ran::whole),
+        StepAction::PoolCensus { refresh, limit } => d
+            .pool(&PoolOp::census(*refresh, *limit), budget_ms)
+            .map(Ran::whole),
     });
 
-    let output = match ran {
-        Ok(output) => output,
+    let (output, cut_short) = match ran {
+        Ok(ran) => (ran.output, ran.interrupted),
         Err(why) => {
             return StepOutcome {
                 position,
@@ -1210,6 +1242,7 @@ fn run_step(
                 changes,
                 result: StepResult::Failed(why),
                 output: String::new(),
+                cut_short: false,
             };
         }
     };
@@ -1280,6 +1313,7 @@ fn run_step(
         changes,
         result,
         output: clip(&output, cap),
+        cut_short,
     }
 }
 
@@ -1320,8 +1354,11 @@ fn eval_value(d: &mut impl Debuggee, expr: &str, deadline: Duration) -> Result<u
     let budget_ms = step_budget_ms(d.elapsed(), deadline).max(MIN_STEP_BUDGET_MS);
     // Parenthesized, so a relational expression (`@rcx > 0x1000`) is evaluated as one value
     // rather than losing its precedence against whatever `?` does with the rest of the line.
-    let text = guarded(|| d.command(&format!("? ({expr})"), budget_ms))
-        .map_err(|why| CheckFailed::Unmet(format!("`? ({expr})` failed: {why}")))?;
+    let text = guarded(|| {
+        d.command(&format!("? ({expr})"), budget_ms)
+            .map(|ran| ran.output)
+    })
+    .map_err(|why| CheckFailed::Unmet(format!("`? ({expr})` failed: {why}")))?;
     parse_eval(&text).ok_or_else(|| {
         CheckFailed::Unmet(format!(
             "`? ({expr})` printed no value; the debugger answered: {}",
@@ -1418,7 +1455,7 @@ fn probe_state(
     });
 
     let budget_ms = step_budget_ms(d.elapsed(), budget).max(MIN_STEP_BUDGET_MS);
-    match guarded(|| d.command("? @$ip", budget_ms)) {
+    match guarded(|| d.command("? @$ip", budget_ms).map(|ran| ran.output)) {
         Ok(text) => match parse_eval(&text) {
             Some(ip) => SessionAfter::Stopped { ip: fmt_addr(ip) },
             None => SessionAfter::Uncertain {
@@ -1517,21 +1554,16 @@ pub fn render(report: &BatchReport) -> String {
              its rollback. Nothing was wrong with the steps or the budget; resubmit the whole \
              batch on a fresh session.\n"
         ),
-        // `at` past the end means no step was skipped: the break landed during the last one, so
-        // every step ran but the last one's result is whatever it had reached. Reported as its own
-        // sentence, because "stopped at step N" would claim a step did not run when they all did —
-        // and `COMMITTED`, which this replaces, claimed the opposite and worse.
-        BatchOutcome::Interrupted { at } if *at > total => format!(
-            "BATCH: INTERRUPTED during step {total} of {total} — every step ran, but `interrupt` \
-             was called on this session while the last one was still going, so what it reported is \
-             what it had reached rather than a completed step. The rollback ran. The session is \
-             still open and still holds its target.\n"
-        ),
+        // One form, because `at` now has one meaning: the step the break reached — which is the
+        // step it landed *during*, or the one it stopped from starting. The step list says which,
+        // and says it more precisely than a second sentence here could: that step is either a step
+        // with a result and output, or a skipped one.
         BatchOutcome::Interrupted { at } => format!(
             "BATCH: INTERRUPTED at step {at} of {total} — `interrupt` was called on this session, \
-             so the batch stopped there and ran its rollback. Nothing was wrong with the steps or \
-             the budget, and the session is still open and still holds its target; resubmit the \
-             whole batch on it once whatever prompted the interrupt is dealt with.\n"
+             so the batch stopped there and ran its rollback. The step list says whether step {at} \
+             was cut short mid-flight or never started. Nothing was wrong with the steps or the \
+             budget, and the session is still open and still holds its target; resubmit the whole \
+             batch on it once whatever prompted the interrupt is dealt with.\n"
         ),
     };
 
@@ -1630,6 +1662,10 @@ mod tests {
         /// The same, for an interrupt aimed at this batch's own call; see
         /// [`Script::interrupted_after`].
         interrupt_after: Option<usize>,
+        /// How many calls before an answered call reports *itself* cut short. Separate from
+        /// `interrupt_after` because the two are separately reachable on a real engine: a break
+        /// landing during a call comes back on the call, and one landing between calls does not.
+        cut_short_after: Option<usize>,
         /// Whether the executor announced its rollback — the notification a host turns into "no
         /// break may reach this job any more".
         sealed: bool,
@@ -1679,6 +1715,15 @@ mod tests {
         /// be testing the failure path that already worked.
         fn interrupted_after(mut self, calls: usize) -> Self {
             self.interrupt_after = Some(calls);
+            self.cut_short_after = Some(calls);
+            self
+        }
+
+        /// A break that lands in the gap *between* calls: the host knows, but no call carries it.
+        /// The narrow case `Debuggee::interrupted` still exists for, now that a break during a call
+        /// travels back on the call.
+        fn interrupted_between_calls(mut self, calls: usize) -> Self {
+            self.interrupt_after = Some(calls);
             self
         }
 
@@ -1717,17 +1762,30 @@ mod tests {
             }
         }
 
+        /// [`Self::answer`], as the call a *step* makes — carrying whether the break reached this
+        /// call, which is how a real engine reports it.
+        fn answer_run(&mut self, call: &str) -> Result<Ran, String> {
+            let output = self.answer(call)?;
+            let interrupted = self
+                .cut_short_after
+                .is_some_and(|after| self.calls.len() >= after);
+            Ok(Ran {
+                output,
+                interrupted,
+            })
+        }
+
         fn ran(&self, matching: &str) -> bool {
             self.calls.iter().any(|c| c.contains(matching))
         }
     }
 
     impl Debuggee for Script {
-        fn command(&mut self, command: &str, _budget_ms: u32) -> Result<String, String> {
-            self.answer(command)
+        fn command(&mut self, command: &str, _budget_ms: u32) -> Result<Ran, String> {
+            self.answer_run(command)
         }
-        fn resume(&mut self, command: &str, _timeout_ms: u32) -> Result<String, String> {
-            self.answer(command)
+        fn resume(&mut self, command: &str, _timeout_ms: u32) -> Result<Ran, String> {
+            self.answer_run(command)
         }
         fn run_to(&mut self, address: &str, _timeout_ms: u32) -> Result<String, String> {
             self.answer(&format!("run to {address}"))
@@ -1986,7 +2044,10 @@ mod tests {
 
         let report = run(&mut d, &batch, BUDGET);
 
-        assert_eq!(report.outcome, BatchOutcome::Interrupted { at: 2 });
+        // Step 1, not 2: the break reached that step, and the step is what reports it. Before the
+        // fact travelled with the value it could only be inferred *between* steps, so it was
+        // attributed to the step that never started.
+        assert_eq!(report.outcome, BatchOutcome::Interrupted { at: 1 });
         assert!(
             !d.ran("second"),
             "a mutation after the interrupt must not run — this is the whole finding"
@@ -2010,8 +2071,39 @@ mod tests {
             assert!(!why.contains("torn down"), "{why}");
         }
         let text = render(&report);
-        assert!(text.contains("BATCH: INTERRUPTED at step 2 of 3"), "{text}");
+        assert!(text.contains("BATCH: INTERRUPTED at step 1 of 3"), "{text}");
         assert!(text.contains("rollback: COMPLETE"), "{text}");
+    }
+
+    /// A break landing in the gap *between* steps still stops the batch.
+    ///
+    /// The narrow case [`Debuggee::interrupted`] still exists for, now that a break landing during
+    /// a step travels back on the step. It is reachable on a real engine: the break is raised after
+    /// a command has returned and accounted for its own interrupt state, but before the next step
+    /// starts — so no step carries it, and only the host's own record has it.
+    #[test]
+    fn a_break_between_steps_stops_the_batch_too() {
+        let mut d = stopped()
+            .on("first", Ok(""))
+            .on("second", Ok(""))
+            .on("eb restore", Ok(""))
+            .interrupted_between_calls(1);
+        let batch = op(
+            vec![cmd("first step"), cmd("second step")],
+            vec![cmd("eb restore 41")],
+        );
+
+        let report = run(&mut d, &batch, BUDGET);
+
+        // The step that never started, since no step was running when the break landed.
+        assert_eq!(report.outcome, BatchOutcome::Interrupted { at: 2 });
+        assert!(
+            report.steps[0].ok(),
+            "the first step ran and was not cut short"
+        );
+        assert!(!d.ran("second"));
+        assert!(d.ran("eb restore"));
+        assert!(report.rollback_complete());
     }
 
     /// A step whose assertion fails *because* the break truncated its output reports `INTERRUPTED`,
@@ -2078,20 +2170,16 @@ mod tests {
 
         assert_eq!(
             report.outcome,
-            BatchOutcome::Interrupted { at: 2 },
-            "one past the end: every step ran, so none was skipped"
+            BatchOutcome::Interrupted { at: 1 },
+            "the break reached step 1, and step 1 is what says so — no between-steps check could              have seen this one, because there is no step after it"
         );
         assert!(d.ran("eb restore"), "the rollback runs on this path too");
         assert!(report.rollback_complete());
         let text = render(&report);
-        assert!(
-            text.contains("BATCH: INTERRUPTED during step 1 of 1"),
-            "{text}"
-        );
-        assert!(
-            !text.contains("stopped there"),
-            "no step was skipped, so nothing should claim one was: {text}"
-        );
+        assert!(text.contains("BATCH: INTERRUPTED at step 1 of 1"), "{text}");
+        // The step is not skipped — it ran and was cut short — and the report says to read the
+        // step list for which of the two it was.
+        assert!(!matches!(report.steps[0].result, StepResult::Skipped(_)));
     }
 
     /// The rollback is announced before it runs, so a host can close the job to further breaks.
@@ -2131,7 +2219,7 @@ mod tests {
 
         let report = run(&mut d, &batch, BUDGET);
 
-        assert_eq!(report.outcome, BatchOutcome::Abandoned { at: 2 });
+        assert_eq!(report.outcome, BatchOutcome::Abandoned { at: 1 });
         assert!(report.rollback_complete());
     }
 
