@@ -771,6 +771,22 @@ pub trait Debuggee {
     /// `always` block after it — the batch's whole remaining budget, which is why nothing here
     /// has to be shortened to fit a teardown.
     fn abandoned(&self) -> bool;
+    /// Whether someone has asked this batch's *call* to stop — the `interrupt` tool, aimed at the
+    /// job this batch is running as.
+    ///
+    /// Separate from [`Self::abandoned`] because the two say opposite things about the session: a
+    /// teardown means it is going away, this means it is staying and the caller simply wants the
+    /// transaction to end. Folding them together would tell a caller to resubmit on a fresh session
+    /// when the one they have is fine.
+    ///
+    /// **Why the executor has to be told at all**, when an interrupt already stops the step: it
+    /// stops the step by making the debugger return early, and — since the whole point of an
+    /// on-request interrupt is that partial output is preserved rather than thrown away — that
+    /// return is a *success*. A step whose assertions still hold therefore reads as a step that
+    /// ran, and the batch would carry on applying later mutations for a caller who has asked it to
+    /// stop. Read between steps, with the same limit as `abandoned`: a call already inside DbgEng
+    /// runs to its own end.
+    fn interrupted(&self) -> bool;
 }
 
 /// Runs one engine call, turning a panic into a step failure so [`run`] still reaches `always`.
@@ -876,6 +892,14 @@ pub enum BatchOutcome {
     /// batch has no quarrel with. Resubmitting from the top is the right next move, which is not
     /// what a caller should conclude from either of the other two.
     Abandoned { at: usize },
+    /// Someone called `interrupt` on this batch's session, so it stopped and went to its rollback.
+    /// `at` is the 1-based position of the first step not attempted.
+    ///
+    /// Distinct from [`Self::Abandoned`] for the same reason that one is distinct from a timeout:
+    /// the next move differs. Nothing is wrong with the steps, the budget, or the *session* — which
+    /// is still open and still holds its target — so this batch can be resubmitted as it stands, on
+    /// the same session, once whatever prompted the interrupt has been dealt with.
+    Interrupted { at: usize },
 }
 
 /// What the session holds once the batch is done — the question a caller cannot answer from the
@@ -974,6 +998,17 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
                 ));
                 continue;
             }
+            BatchOutcome::Interrupted { at } => {
+                steps.push(StepOutcome::skipped(
+                    position,
+                    step,
+                    format!(
+                        "the batch was interrupted while it was running, so it stopped at step \
+                         {at} and went to its rollback"
+                    ),
+                ));
+                continue;
+            }
         }
         // Before the deadline check, because the two are not the same news and this one is the
         // more urgent: something is tearing this session down and the rollback is what is left
@@ -984,6 +1019,23 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
                 position,
                 step,
                 "the session was torn down before this step started",
+            ));
+            continue;
+        }
+        // After the teardown check and before the deadline, which is where it belongs on both
+        // sides: a session going away outranks a caller who merely wants this call to stop, and a
+        // caller who has asked it to stop outranks a clock that has not run out yet.
+        //
+        // Checked here rather than inferred from the step's result, because an interrupted step
+        // *succeeds*: preserving the output reached up to the break is the whole point of an
+        // on-request interrupt, so the debugger returns `Ok` and the batch would otherwise run on
+        // through every later mutation. See [`Debuggee::interrupted`].
+        if d.interrupted() {
+            outcome = BatchOutcome::Interrupted { at: position };
+            steps.push(StepOutcome::skipped(
+                position,
+                step,
+                "the batch was interrupted before this step started",
             ));
             continue;
         }
@@ -1433,6 +1485,12 @@ pub fn render(report: &BatchReport) -> String {
              its rollback. Nothing was wrong with the steps or the budget; resubmit the whole \
              batch on a fresh session.\n"
         ),
+        BatchOutcome::Interrupted { at } => format!(
+            "BATCH: INTERRUPTED at step {at} of {total} — `interrupt` was called on this session, \
+             so the batch stopped there and ran its rollback. Nothing was wrong with the steps or \
+             the budget, and the session is still open and still holds its target; resubmit the \
+             whole batch on it once whatever prompted the interrupt is dealt with.\n"
+        ),
     };
 
     let mutations = report.mutations();
@@ -1527,6 +1585,9 @@ mod tests {
         /// How many calls this debuggee answers before it starts reporting itself abandoned; see
         /// [`Script::abandoned_after`].
         abandon_after: Option<usize>,
+        /// The same, for an interrupt aimed at this batch's own call; see
+        /// [`Script::interrupted_after`].
+        interrupt_after: Option<usize>,
     }
 
     /// The message a scripted panic carries, so the report can be asserted to have kept it.
@@ -1563,6 +1624,16 @@ mod tests {
         /// disconnecting a client from a real worker.
         fn abandoned_after(mut self, calls: usize) -> Self {
             self.abandon_after = Some(calls);
+            self
+        }
+
+        /// Reports the batch interrupted once `calls` calls have been answered — the scripted
+        /// stand-in for someone calling `interrupt` mid-transaction. Deliberately *not* expressed
+        /// as a failing step, because the whole difficulty is that an interrupted step succeeds:
+        /// the debugger returns the output it reached, so a script that answered `Err` here would
+        /// be testing the failure path that already worked.
+        fn interrupted_after(mut self, calls: usize) -> Self {
+            self.interrupt_after = Some(calls);
             self
         }
 
@@ -1630,6 +1701,10 @@ mod tests {
         }
         fn abandoned(&self) -> bool {
             self.abandon_after
+                .is_some_and(|after| self.calls.len() >= after)
+        }
+        fn interrupted(&self) -> bool {
+            self.interrupt_after
                 .is_some_and(|after| self.calls.len() >= after)
         }
     }
@@ -1829,6 +1904,85 @@ mod tests {
         let text = render(&report);
         assert!(text.contains("BATCH: ABANDONED at step 2 of 3"), "{text}");
         assert!(text.contains("rollback: COMPLETE"), "{text}");
+    }
+
+    /// An `interrupt` arriving mid-transaction stops the batch and unwinds it, exactly as a teardown
+    /// does — and this is the case that does **not** announce itself through a failing step.
+    ///
+    /// An interrupted step *succeeds*. Preserving whatever output the debugger reached is the whole
+    /// point of an on-request interrupt, so `execute_command_bounded` returns `Ok` rather than the
+    /// error the break provoked, and a step whose assertions still hold is indistinguishable from
+    /// one that ran to completion. Without the executor being told separately, the batch would carry
+    /// on applying later mutations for a caller who has asked it to stop — which is why the script
+    /// here answers `Ok` to every step rather than failing the interrupted one.
+    #[test]
+    fn an_interrupted_batch_stops_where_it_is_and_still_rolls_back() {
+        let mut d = stopped()
+            .on("eb fffff800", Ok(""))
+            .on("second", Ok(""))
+            .on("third", Ok(""))
+            .on("eb restore", Ok(""))
+            // Lands after the first step's command — which still answers `Ok`, as a real
+            // interrupted command does.
+            .interrupted_after(1);
+        let batch = op(
+            vec![
+                cmd("eb fffff800`00001000 90"),
+                cmd("second step"),
+                cmd("third step"),
+            ],
+            vec![cmd("eb restore 41")],
+        );
+
+        let report = run(&mut d, &batch, BUDGET);
+
+        assert_eq!(report.outcome, BatchOutcome::Interrupted { at: 2 });
+        assert!(
+            !d.ran("second"),
+            "a mutation after the interrupt must not run — this is the whole finding"
+        );
+        assert!(!d.ran("third"), "nor any step after that one");
+        assert!(
+            d.ran("eb restore"),
+            "and the rollback still runs, as on every other path"
+        );
+        assert!(report.rollback_complete());
+        // The skipped steps must not say the session was torn down: it was not, and a caller told
+        // so would open a new session to resubmit against when the one they have is fine.
+        for step in &report.steps[1..] {
+            let StepResult::Skipped(why) = &step.result else {
+                panic!(
+                    "step {} should have been skipped: {:?}",
+                    step.position, step
+                );
+            };
+            assert!(why.contains("interrupted"), "{why}");
+            assert!(!why.contains("torn down"), "{why}");
+        }
+        let text = render(&report);
+        assert!(text.contains("BATCH: INTERRUPTED at step 2 of 3"), "{text}");
+        assert!(text.contains("rollback: COMPLETE"), "{text}");
+    }
+
+    /// A teardown outranks an interrupt when both are in play: the session is going away, and that
+    /// is the news the caller needs — resubmit on a *fresh* session, not on this one.
+    #[test]
+    fn a_teardown_outranks_an_interrupt_for_the_same_batch() {
+        let mut d = stopped()
+            .on("first", Ok(""))
+            .on("second", Ok(""))
+            .on("eb restore", Ok(""))
+            .abandoned_after(1)
+            .interrupted_after(1);
+        let batch = op(
+            vec![cmd("first step"), cmd("second step")],
+            vec![cmd("eb restore 41")],
+        );
+
+        let report = run(&mut d, &batch, BUDGET);
+
+        assert_eq!(report.outcome, BatchOutcome::Abandoned { at: 2 });
+        assert!(report.rollback_complete());
     }
 
     /// **The bound the worker advertises to a teardown has to be one this executor keeps.**

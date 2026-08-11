@@ -293,6 +293,12 @@ was running when it arrived, so it can never land on the one after it; with noth
 so and does nothing. Two things it cannot reach, both properties of the debugger: an operation that
 never polls for the break, and the parked kernel attach below.
 
+A `debug_batch` is the one call that stops *itself*: it checks between steps and, when interrupted,
+runs its `always` block and reports `BATCH: INTERRUPTED` — so no step after the interrupt is applied
+and the session keeps its target, unlike `end_session`, which also stops a batch but takes the
+session with it. Repeating `interrupt` while one is already stopping is a no-op that says so, since
+the rollback runs as part of the same call and a second break could land on a restore.
+
 **Recovering a session that is stuck.** A per-call timeout abandons the *wait*, not the job, so a
 call that reports a timeout may still be running. The case that matters is `attach_kernel`: it waits
 for the target to dial in with no timeout, and DbgEng cannot interrupt a wait that has not yet

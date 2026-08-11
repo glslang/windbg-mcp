@@ -37,6 +37,22 @@ failed one **without being the thread that asked**. Without it an interrupt on r
 search is worth. The watchdog's explanatory note stays the watchdog's: it exists because nobody saw
 that deadline pass, whereas this caller is the one who asked.
 
+**A batch has to be told, because an interrupted step succeeds.** Preserving the output a command
+reached up to the break is the point of an on-request interrupt, so the debugger returns `Ok` rather
+than the error the break provoked — and a `debug_batch` step whose assertions still hold is then
+indistinguishable from one that ran to completion. Left to infer it, the executor carried on
+applying later mutations for a caller who had just asked it to stop. So `batch::run` checks between
+steps, exactly where it checks for a teardown, and stops with its own outcome: `Interrupted` rather
+than `Abandoned`, because the session is *staying* — telling a caller to resubmit on a fresh session
+when the one they hold is fine is the same class of wrong answer that keeps `Abandoned` apart from a
+timeout. The signal it reads is the per-job record ([`Running`]), not the batch abandon flag: that
+one is sticky by design, and a sticky flag on a session that survives would refuse every later batch.
+
+One consequence worth naming: the rollback runs as part of the same job, so a *second* interrupt
+while a batch is already stopping could land on a restore command — a cut-short `Execute` that still
+reports `Ok`, which is a mutation left applied and reported as undone. So at most one break is
+raised per job; a repeat is answered with "already interrupted, it is stopping".
+
 **This is the approved exception to engine-thread confinement** (`AGENTS.md`), and worth being
 explicit about, because the rule is otherwise absolute and the code visibly departs from it.
 `SetInterrupt` is the one DbgEng entry point Microsoft documents as safe from any thread; it is the

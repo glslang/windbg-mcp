@@ -2124,9 +2124,11 @@ impl WindbgServer {
     /// not connected yet (the documented case — see `session_status`). `end_session` is what ends
     /// those, at the cost of the target.
     ///
-    /// A `debug_batch` interrupted this way fails the step that was running, which stops the
-    /// transaction and runs its `always` block — the rollback still happens, and the batch's own
-    /// result reports it.
+    /// A `debug_batch` interrupted this way stops at its next step and runs its `always` block, and
+    /// its own result reports `BATCH: INTERRUPTED` with the rollback state — so no step after the
+    /// interrupt is applied, and the session keeps its target (unlike `end_session`, which also
+    /// stops a batch but takes the session with it). A second `interrupt` while one is already
+    /// stopping is a no-op that says so, rather than a break that could land on the rollback.
     // `idempotent_hint = false`, which is not the intuitive reading: raising the same Ctrl+Break
     // twice on the same operation plainly has no second effect. But the hint is about *repeating
     // the call*, and what a repeat addresses is whichever job is running when it arrives — which
