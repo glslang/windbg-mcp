@@ -296,8 +296,10 @@ never polls for the break, and the parked kernel attach below.
 A `debug_batch` is the one call that stops *itself*: it checks between steps and, when interrupted,
 runs its `always` block and reports `BATCH: INTERRUPTED` — so no step after the interrupt is applied
 and the session keeps its target, unlike `end_session`, which also stops a batch but takes the
-session with it. Repeating `interrupt` while one is already stopping is a no-op that says so, since
-the rollback runs as part of the same call and a second break could land on a restore.
+session with it. Its **rollback is not interruptible**: cleanup runs as part of the same call, and a
+restore cut short would come back `Ok` with partial output and be reported as a rollback that
+completed while the target was still changed — so an `interrupt` aimed at a batch that is unwinding
+says so and sends nothing, as does one repeated while a batch is still stopping.
 
 **Recovering a session that is stuck.** A per-call timeout abandons the *wait*, not the job, so a
 call that reports a timeout may still be running. The case that matters is `attach_kernel`: it waits

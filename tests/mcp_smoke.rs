@@ -1450,6 +1450,102 @@ fn interrupting_a_running_batch_stops_it_and_rolls_it_back() {
     let _ = std::fs::remove_file(&reached_later);
 }
 
+/// An `interrupt` that arrives while a batch is running its **rollback** is refused, and the
+/// rollback finishes.
+///
+/// The severe half of the same problem. Cleanup is reached on every path, including paths no
+/// interrupt was involved in, so this needs no earlier interrupt to set it up — a *first* break
+/// landing here would hit a restore command, and an interrupted command returns `Ok` with whatever
+/// it had produced. The restore would then be recorded as a step that worked and the report would
+/// say `rollback: COMPLETE` with the target still changed, which is the one outcome the whole
+/// transaction machinery exists to prevent, arriving through the tool meant to be the gentle way
+/// out.
+///
+/// Staged with markers rather than timing, like the teardown tests: the first cleanup step
+/// announces that the rollback has begun, and the last one records that it finished. Interrupting
+/// on a sleep instead would sometimes land in the steps block and pass for the wrong reason.
+#[test]
+fn interrupting_a_batch_during_its_rollback_is_refused() {
+    let Some(dump) = target_tier() else { return };
+    let unwinding = marker_path("interrupt-batch-unwinding");
+    let unwound = marker_path("interrupt-batch-unwound");
+    let _ = std::fs::remove_file(&unwinding);
+    let _ = std::fs::remove_file(&unwound);
+
+    let mut server = Server::started();
+    let response = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
+    assert_no_error(&response, "open_dump");
+    let session_id = session_id_of(&text_of(&response["result"]));
+
+    let batch = server.send_request(
+        "tools/call",
+        json!({
+            "name": "debug_batch",
+            "arguments": {
+                "session_id": session_id,
+                "steps": [{ "op": "command", "command": "version" }],
+                "always": [
+                    { "op": "command", "command": format!(".logopen \"{}\"", unwinding.display()) },
+                    { "op": "command", "command": ".echo ROLLBACK-RUNNING" },
+                    { "op": "command", "command": ".logclose" },
+                    // The window the interrupt has to land in.
+                    { "op": "command", "command": ".sleep 0n5000" },
+                    { "op": "command", "command": format!(".logopen \"{}\"", unwound.display()) },
+                    { "op": "command", "command": ".echo ROLLBACK-FINISHED" },
+                    { "op": "command", "command": ".logclose" },
+                ],
+            }
+        }),
+    );
+
+    let deadline = Instant::now() + TARGET_STEP;
+    while !unwinding.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the batch never reached its rollback\n--- stderr ---\n{}",
+            server.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let refused = server.tool_text(
+        "interrupt",
+        json!({ "session_id": session_id }),
+        Duration::from_secs(20),
+    );
+    assert!(
+        refused.contains("Not interrupted"),
+        "a break must not be raised against a rollback — cleanup cut short reports success:\n{refused}"
+    );
+    assert!(
+        refused.contains("rollback"),
+        "and the refusal has to say why, or it reads as a bug:\n{refused}"
+    );
+
+    let report = text_of(&server.await_id(batch, "debug_batch", TARGET_STEP)["result"]);
+    assert!(
+        report.contains("rollback: COMPLETE"),
+        "the rollback had to finish, which is what refusing the break was for:\n{report}"
+    );
+    assert!(
+        unwound.exists(),
+        "the last cleanup step never ran, so the rollback was cut short after all:\n{report}"
+    );
+    // Nothing was interrupted, so nothing should claim it was.
+    assert!(
+        !report.contains("INTERRUPTED"),
+        "the break was refused, so the batch was not interrupted:\n{report}"
+    );
+
+    server.tool_text(
+        "end_session",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
+    let _ = std::fs::remove_file(&unwinding);
+    let _ = std::fs::remove_file(&unwound);
+}
+
 /// A batch still running when the client disconnects has to finish its rollback before its worker
 /// goes — the one guarantee `debug_batch` used to make only against a call *timeout*.
 ///

@@ -48,9 +48,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   told separately rather than inferring it from the step, and that is not a detail: an interrupted
   step *succeeds*. Preserving the output reached up to the break is the whole point, so the debugger
   returns `Ok` and a step whose assertions still hold is indistinguishable from one that ran — the
-  batch would carry on applying later mutations for a caller who had just asked it to stop. A second
-  `interrupt` while one is already stopping is a no-op that says so, because the rollback runs as
-  part of the same job and a second break could land on a restore.
+  batch would carry on applying later mutations for a caller who had just asked it to stop.
+
+  **A batch's rollback is not interruptible.** Cleanup runs as part of the same call and is reached
+  on every path, so a break landing there hits a restore command — which returns `Ok` with partial
+  output like any interrupted command, and would be recorded as a step that worked: `rollback:
+  COMPLETE` with the target still changed. The executor announces the block before running it, and
+  the worker then refuses breaks for that call and drains any already pending, both under the lock a
+  raise has to take. An `interrupt` aimed at a batch that is unwinding says so and sends nothing.
+  A break landing during the **last** step is caught too, on a re-check once the steps end: it
+  cannot be seen between steps, and the batch would otherwise report `COMMITTED` of a transaction
+  whose final step was cut short — directly above the note saying it had been.
 
 ### Changed
 

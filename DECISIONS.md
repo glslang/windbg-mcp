@@ -48,10 +48,21 @@ when the one they hold is fine is the same class of wrong answer that keeps `Aba
 timeout. The signal it reads is the per-job record ([`Running`]), not the batch abandon flag: that
 one is sticky by design, and a sticky flag on a session that survives would refuse every later batch.
 
-One consequence worth naming: the rollback runs as part of the same job, so a *second* interrupt
-while a batch is already stopping could land on a restore command — a cut-short `Execute` that still
-reports `Ok`, which is a mutation left applied and reported as undone. So at most one break is
-raised per job; a repeat is answered with "already interrupted, it is stopping".
+**The rollback is not interruptible, and that is the sharper end of the same fact.** Cleanup runs as
+part of the same job and is reached on *every* path, so a break landing there — the first one, not
+merely a repeat — hits a restore command, which returns `Ok` with partial output like any
+interrupted command and is recorded as a step that worked: `rollback: COMPLETE` with the target
+still changed. So the executor announces the block before it runs it (`Debuggee::rolling_back`), and
+the worker seals the job against further breaks *and* drains any already pending, both under the
+lock a raise has to take. Every break is therefore either lodged before the seal and consumed
+there, or refused after it. A repeat while a batch is merely *stopping* is refused for the same
+reason one step earlier.
+
+**And an interrupt during the last step is not a commit.** The between-steps check cannot see it —
+there is no next step to stop before — so every step has run and every assertion has held, and the
+report said `COMMITTED` of a transaction whose final step was cut short, directly above the note
+saying the operation was interrupted. The outcome is re-checked once the loop ends, and only from
+`Committed`: a step that failed or timed out has news the caller must act on first.
 
 **This is the approved exception to engine-thread confinement** (`AGENTS.md`), and worth being
 explicit about, because the rule is otherwise absolute and the code visibly departs from it.

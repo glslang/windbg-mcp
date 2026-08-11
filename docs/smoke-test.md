@@ -162,6 +162,12 @@ processes, so they need real ones:
   break provoked, so the interrupted step comes back `Ok` with its assertions intact and the executor
   saw a step that simply ran. `src/batch.rs` pins the executor's half against a scripted debuggee,
   which answers `Ok` to the interrupted step for exactly this reason.
+- *Interrupting a batch during its **rollback** is refused.* The severe half of the same problem,
+  and it needs no earlier interrupt to set up: cleanup is reached on every path, so a *first* break
+  landing there hits a restore command — recorded as a step that worked, reported as `rollback:
+  COMPLETE`, with the target still changed. The batch's `always` block writes a marker when it
+  starts and another when it finishes, so the interrupt is staged on the first and the second is the
+  proof the rollback ran whole; the refusal has to say it is a rollback, or it reads as a bug.
 
 This tier is also the only end-to-end check of the **protocol channel** — the inherited pipe pair a
 worker speaks on ([`proto.rs`](../src/proto.rs)). Handles are passed on the worker's command line
