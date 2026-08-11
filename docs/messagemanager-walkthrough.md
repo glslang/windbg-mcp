@@ -1,17 +1,18 @@
-# MessageManager: from a pool UAF to KD-assisted RIP control
+# MessageManager: from a pool UAF to a debugger-free arbitrary-free
 
 A tour of the **MessageManager** CTF driver on a **live KDNET kernel** (Windows Server 26100),
 driven end to end with windbg-mcp. Unlike the [HEVD](hevd-ioctl-walkthrough.md) and
 [mountmgr](driver-ioctl-walkthrough.md) tours — which are about *reaching* an IOCTL — this one is
-about a **use-after-free in the kernel pool**, measuring candidate reclaims, and proving controlled
-kernel RIP with a debugger-assisted handoff when natural grooming misses. There is **no PDB**, so
-everything is `module+RVA`.
+about a **use-after-free in the kernel pool**: measuring candidate reclaims, proving controlled
+kernel RIP with a debugger-assisted handoff, and then removing the debugger from the pieces that let
+it — first the reclaim, then the trigger itself. There is **no PDB**, so everything is `module+RVA`.
 
-> **The thesis.** The bug is a garden-variety locking mistake. The interesting parts are proving
-> what the allocator actually did on Windows 26100, extending the tiny refcount race without losing
-> the target object, and separating a natural reclaim from a debugger-assisted control-flow proof.
-> A pool walker that silently returns "empty" is worse than no walker at all, so this also records
-> the four fixes needed before the 26100 measurements could be trusted.
+> **The thesis.** The bug is a garden-variety locking mistake. The interesting parts are proving what
+> the allocator actually did on Windows 26100, understanding the tiny refcount race exactly enough to
+> win it from pure user mode (the free-with-node fires debugger-free and Verifier-free — §8), and
+> separating what genuinely needs a kernel debugger from what only looked like it did. A pool walker
+> that silently returns "empty" is worse than no walker at all, so this also records the four fixes
+> needed before the 26100 measurements could be trusted.
 
 The four kernel-pool tools this walkthrough leans on (`pool_find_tag`, `pool_chunk`, `pool_census`,
 `pool_diagnostics`) were built for exactly this target; see the
@@ -253,7 +254,7 @@ chain no longer needs the debugger. The caveat is offset control. `FSCTL_PIPE_WA
 `FILE_PIPE_WAIT_FOR_BUFFER`: `+0x00` Timeout (free — the `RefCount`), `+0x08` `NameLength` (a
 validated length, not a pointer), `+0x10..` the pipe name. So it controls `+0x00` and `+0x10`
 onward — reaching **Buffer `+0x18`, the arbitrary-free primitive** — but **not** Flink `+0x08` as a
-kernel pointer, which the §8 *unlink* RIP specifically writes. Removing the assist from the unlink
+kernel pointer, which the §9 *unlink* RIP specifically writes. Removing the assist from the unlink
 variant still needs an offset-`0` primitive that also frees `+0x08`; the data-only **arbitrary-free**
 route (`ExFreePoolWithTag(msg+0x18)`, §3/§6) is now reachable with a fully natural reclaim, and a
 double-free → type-confusion would sidestep `+0x08` entirely.
@@ -299,7 +300,67 @@ does not mark the target allocated in LFH metadata, so the VM must be rebooted a
 Keeping this boundary explicit is important: the handoff proves the object layout, stale lookup,
 unlink primitive, and final indirect call; it does not claim a production-quality pool spray.
 
-## 8. Direct RIP control without `PreviousMode`
+## 8. Firing the same UAF without a debugger
+
+§7's handoff proves the object layout and the primitives, but it drives the free with KD: it stops
+the SetData caller at the unlink, walks the refcount to 1 by hand, and steps Flush into the free.
+That leaves one honest gap — *does the race actually win from user mode?* On this build it does, and
+reliably.
+
+The blocker was never the reclaim (§6 made that natural) and never the arithmetic. Reversing SetData
+and Flush to the instruction shows the real bug and the real lever:
+
+- **Flush holds the list lock across its whole walk** (`+0x14cd` acquire → `+0x1531` release), so no
+  amount of Flush-vs-Flush hammering yields a double free. The only cross-decrement is Flush vs
+  SetData's cross-move.
+- SetData's cross-move does its **unlink from the source list holding only the per-message mutex, not
+  the list lock** (`+0x16e4`), and it decides inc-vs-no-inc from a **TOCTOU read of the `Linked`
+  flag** (`+0x16d5`). When a concurrent Flush clears `Linked` and decrements in that window, SetData
+  relinks to the target list **without** the compensating inc — the message ends on a list at
+  refcount one-too-low, and the next Flush frees it **with its handle node still alive**. That is the
+  exact free-with-node the arbitrary-free needs.
+- The window is a handful of instructions, so the win is **statistical**. Widening SetData's `memcpy`
+  is a dead end — the driver rejects `Length > 0x2FF4`, so a large buffer silently no-ops the call.
+  The lever is **volume**: every earlier harness raced one cross-move per message (tens to low
+  hundreds of attempts); the win needs millions.
+
+The `drift` mode (`examples/messagemanager/mm_exploit.c`) seeds a small set of messages and loops
+`SetData(→large)/SetData(→small)` cross-moves on them while `Flush(small)` and `Flush(large)`
+hammer both lists — a pure user-mode race, all four CPUs. **Live on 26100.32995 with Driver Verifier
+off and no debugger attached, it bugchecks the guest within about a second:**
+
+```text
+KERNEL_MODE_HEAP_CORRUPTION (13a)
+nt!RtlpHpVsContextFree → nt!ExFreePoolWithTag
+MessageManager+0x1654        ; SetData's ExFreePoolWithTag(msg+0x18,'Tfub')
+PROCESS_NAME: mm_exploit.exe
+```
+
+That is the driver's own arbitrary-free path executing on a use-after-free MESSAGE, driven entirely
+from user mode — three independent minidumps, same signature. The guest auto-reboots and writes the
+dump, so reading it *is* the debugger-free proof: nothing was attached when it fired. So the last KD
+dependency §7 carried — *the trigger* — is gone.
+
+**What is still debugger-assisted is only the *cleanliness* of the fire, and that turns out to be a
+genuine constraint, not a budget shortfall.** A weaponized arbitrary free wants the freed pointer to
+be an attacker-*chosen* value (plant `0x4242…` into the freed slot via the §6 `IoSB` reclaim, then
+Delete the stale node → `ExFreePoolWithTag(0x4242…)`). But the only source of the stale handle is
+Flush + the missing-inc, and the missing-inc is produced by the **lockless unlink that tears the
+list** — so Flush AVs walking the corrupted list, or a re-touch double-frees, and the heap is
+corrupted *faster* than any controlled reclaim-then-Delete can run. Across ~10 crash/reboot cycles
+the same race fired from four distinct debugger-free sites — SetData's free (`+0x1654`), SetData's
+`ExAllocatePool2` for a new `Tfub` on a corrupted `Tfub` LFH (`+0x1668`), and Flush's unlink write
+`[Blink]=Flink` (`+0x14e9`, a `0x3B` AV — the **write-what-where** primitive firing on garbage) —
+but never the clean `0x4242` ordering. That ordering is exactly what KD buys in §9: precise control
+over *when* the free happens relative to the reclaim. Harness modes `drift` (winnability proof),
+`driftfire` (safe single-pass toward a controlled Delete), and `driftarb` (continuous race + planted
+`0x4242` reclaim) are all in `mm_exploit.c`.
+
+The boundary has moved twice now: from "reclaim needs KD" (§6 removed it) to "the trigger needs KD"
+to **"the trigger and both primitives fire debugger-free; only the clean *chosen-target ordering*
+remains KD-assisted."**
+
+## 9. Direct RIP control without `PreviousMode`
 
 The first post-UAF attempt used the usual data-only bootstrap: set fake `Flink` to a writable kernel
 anchor ending in `0x0800`, set fake `Blink` to `KTHREAD.PreviousMode`, and let the unlink's second
@@ -359,18 +420,18 @@ redirected the trigger to the original CREATE handler, and finally restored the 
 clean reboot discarded the intentionally corrupted free chunk.
 
 This establishes controlled kernel RIP on the challenge build. The RIP *mechanism* above is
-debugger-assisted, but the **reclaim it depended on is no longer**: §6 shows a pending
-`FSCTL_PIPE_WAIT` (`IoSB`) spray reclaiming freed `Tgsm` slots naturally (8/16), attacker-controlled
-from `+0x00`, with no debugger. So the KD-forced allocation return can be dropped from the reclaim
-step. What the *unlink* variant in this section still needs is `+0x08` as a kernel pointer, which the
-`IoSB` buffer pins to `NameLength`; that specific store is the only remaining debugger-assisted
-piece. The natural reclaim instead lands the controllable fields at `+0x00` and `+0x18`, which is
-exactly the **arbitrary-free** primitive (§3, §6) — a debugger-free `ExFreePoolWithTag(msg+0x18)`
-that a full exploit would pivot through (free-a-victim → type-confusion), rather than the KD-only
-dispatch overwrite shown here. This makes no claim of privilege escalation; it moves the boundary
-from "reclaim needs KD" to "only the `+0x08` unlink store needs KD."
+debugger-assisted, but the pieces it depended on have fallen away one at a time: §6 makes the
+**reclaim** natural (a pending `FSCTL_PIPE_WAIT`/`IoSB` spray reclaims freed `Tgsm` slots 8/16,
+attacker-controlled from `+0x00`, no debugger), and §8 makes the **trigger** natural (the high-volume
+`drift` race fires `ExFreePoolWithTag` on a use-after-free MESSAGE from user mode, three dumps, no
+debugger and no Verifier). What the *unlink* variant in this section still specifically needs is
+`+0x08` as a kernel pointer, which the `IoSB` buffer pins to `NameLength`; that store, and the
+precise free-vs-reclaim *ordering* a clean chosen-target arbitrary free needs (§8), are what KD still
+buys. This makes no claim of privilege escalation; it moves the boundary from "reclaim needs KD"
+through "trigger needs KD" to **"the primitives fire debugger-free; only the `+0x08` unlink store and
+the clean chosen-target ordering remain KD-assisted."**
 
-## 9. Streamlining the next kernel CTF
+## 10. Streamlining the next kernel CTF
 
 This run exposed several improvements that would remove orchestration risk without hiding the
 debugger mechanics.
