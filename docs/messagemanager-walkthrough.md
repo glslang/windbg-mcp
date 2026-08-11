@@ -497,6 +497,29 @@ run the race or the debugger-assisted control-flow handoff; those remain disposa
    but keep KD keys and credentials in host credential storage rather than scripts, logs, snapshots,
    or the repository.
 
+### Debugger-free proof loop (what actually worked)
+
+Proving §8's user-mode fire needs no debugger *attached at the moment it fires* — which is the point —
+so the loop is deliberately KD-free and reads the crash afterwards:
+
+1. **Detach (`end_session`), race the guest free over WinRM, let it bugcheck.** With a kernel dump
+   configured, the guest auto-reboots and writes `C:\Windows\Minidump\*.dmp`. Reading that dump is the
+   proof: nothing was attached when the driver freed the UAF'd chunk. Re-attach KD only when you need
+   to *observe* an intermediate state (walk the handle list during a deliberate hold).
+2. **Launch the harness detached from the WinRM job.** A process started with `Start-Process` inside a
+   `PSSession` (or an `Invoke-Command` block) is killed when that session/host job tears down — it
+   dies mid-race, often after writing nothing. Use WMI `Win32_Process.Create`
+   (`cmd /c harness.exe … > out 2> err`); that child survives the session and keeps running.
+3. **Make stdout unbuffered** (`setvbuf(stdout, NULL, _IONBF, 0)`). Redirected stdout is fully
+   buffered, so a bugcheck loses every `printf`; unbuffered, the log on disk shows exactly how far the
+   run got (an 88-byte file of NULs is the tell that the OS never flushed the last line before halt).
+4. **Verify the deployed hash.** `Copy-Item -ToSession` silently produced a corrupted, unrunnable exe
+   once ("file corrupted/unreadable"); compare `Get-FileHash` against the host build after every copy.
+5. **Classify the crash from the minidump, not a live break-in.** The bugcheck code plus the top
+   `MessageManager+RVA` frame is enough to tell an intended fire (`SetData`'s `ExFreePoolWithTag`,
+   `+0x1654`) from an incidental one (Flush's unlink AV, `+0x14e9`; a `Tfub` LFH double-free at
+   `+0x1668`).
+
 ## Gotchas recap
 
 - **Attach blocks on an INFINITE wait** — diagnose a hung attach out-of-band, don't hammer tools.
@@ -520,6 +543,12 @@ run the race or the debugger-assisted control-flow handoff; those remain disposa
 - **`!analyze` can misname the faulting module** — trust the bugcheck banner and `IP_IN_PAGED_CODE`.
 - **Verifier special pool hides a driver from naive walkers** — it needs a page-granular decoder;
   `pool_find_tag` handles it, and shows the guard page as an `Unreadable` neighbour.
+- **The refcount race is won by volume, not a wider window** — SetData rejects `Length > 0x2FF4`, so
+  enlarging its `memcpy` to widen the mutex hold silently no-ops the call. The missing-inc window is a
+  few instructions; millions of cross-move attempts win it, one-per-message does not (§8).
+- **A single unmapped `poi` aborts a whole `execute` script with `0x80040205`** — walking a list where
+  some nodes point at freed/unmapped chunks fails opaquely with no partial result. Read defensively
+  (bisect the range, or print pointers without dereferencing first) rather than trusting one big walk.
 - **A full pool walk is expensive on a *live* KDNET target** — `pool_find_tag`/`pool_census`
   traverse every free tree node-by-node over the wire, and a live target mutates the lists under
   the walk (stale pointers get chased, diagnostics balloon), so the call can exceed the engine
