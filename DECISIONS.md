@@ -58,11 +58,21 @@ lock a raise has to take. Every break is therefore either lodged before the seal
 there, or refused after it. A repeat while a batch is merely *stopping* is refused for the same
 reason one step earlier.
 
-**And an interrupt during the last step is not a commit.** The between-steps check cannot see it —
-there is no next step to stop before — so every step has run and every assertion has held, and the
-report said `COMMITTED` of a transaction whose final step was cut short, directly above the note
-saying the operation was interrupted. The outcome is re-checked once the loop ends, and only from
-`Committed`: a step that failed or timed out has news the caller must act on first.
+**And the same fact distorts the report in two more places, both fixed by attributing rather than
+guessing.** An interrupt during the *last* step is invisible between steps — there is no next step
+to stop before — so every step had run and the report said `COMMITTED` of a transaction whose final
+step was cut short, directly above the note saying it had been; the outcome is re-checked once the
+loop ends. And a step that *fails* because the break truncated its output — a `contains` that stops
+holding, an `eval` that stops parsing — reported `FAILED`, sending the caller to debug a step that
+was fine. Both are attributions this executor can actually make: the between-steps check runs before
+every step, so a break outstanding when one fails can only have been raised during that step.
+
+The general shape, worth keeping because it is what four rounds of review kept finding: **an
+interrupted operation is indistinguishable from a successful one to everything downstream**, so
+every place that reads a result has to be told separately. The places are enumerable — between
+steps, after the last step, when a step fails, and the plain-command path that discarded its output
+entirely — and each was wrong in the same direction, reporting the caller's own interrupt as a fact
+about their target.
 
 **This is the approved exception to engine-thread confinement** (`AGENTS.md`), and worth being
 explicit about, because the rule is otherwise absolute and the code visibly departs from it.

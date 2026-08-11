@@ -1006,7 +1006,15 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<S
         ),
 
         // ---- ordinary work ----
-        EngineOp::Command { command } => e.execute_command(&command).map_err(es),
+        // Bounded with a zero deadline, which is `execute_command` plus one thing: the recovery
+        // that keeps the output an *interrupted* command had already produced. Without it a break
+        // makes `Execute` fail and the captured buffer goes with the error, so the caller of a long
+        // `index_trace` gets a bare failure and a note promising partial output that is not there.
+        //
+        // Zero costs nothing to say. It spawns no watchdog at all — which is the whole reason these
+        // ops are off the bounded path (DECISIONS.md, 2026-08-02: arming one rounds a command up to
+        // a multiple of 200ms) — so this stays unbounded, as `index_trace` in particular must.
+        EngineOp::Command { command } => e.execute_command_bounded(&command, 0).map_err(es),
         EngineOp::BoundedCommand {
             command,
             patience_ms,

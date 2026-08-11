@@ -58,7 +58,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   raise has to take. An `interrupt` aimed at a batch that is unwinding says so and sends nothing.
   A break landing during the **last** step is caught too, on a re-check once the steps end: it
   cannot be seen between steps, and the batch would otherwise report `COMMITTED` of a transaction
-  whose final step was cut short — directly above the note saying it had been.
+  whose final step was cut short — directly above the note saying it had been. And a step that
+  *fails* because the break truncated its output — a `contains` that stops holding, an `eval` that
+  stops parsing, which is the likeliest shape of an interrupted step — reports `INTERRUPTED` rather
+  than `FAILED`, so the caller is not sent to debug a step that was fine. Attributable rather than
+  guessed: the between-steps check runs before every step, so a break outstanding when one fails can
+  only have been raised during it.
+
+  Every op now keeps the output an interrupted command reached, not only the bounded ones. The plain
+  path (`modules`, `index_trace` and the other typed commands) went through `execute_command`, where
+  a break makes `Execute` fail and the captured buffer is discarded with the error — a bare failure
+  plus a note promising partial output that was not there. They take `execute_command_bounded` with
+  a zero deadline instead, which is the same call plus that recovery: zero spawns no watchdog, so
+  they stay unbounded, as `index_trace` in particular must.
 
 ### Changed
 

@@ -1052,6 +1052,13 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
         let done = run_step(d, step, position, steps_deadline, &mut bound);
         if !done.ok() {
             outcome = match &done.result {
+                // A step that failed while a break was landing on it failed *because* of the
+                // break, and saying otherwise sends the caller to debug their own step: an
+                // interrupt truncates the output, so a `contains` assertion stops holding and an
+                // `eval` capture stops parsing. Attributable rather than guessed — the check
+                // above runs before every step, so a break outstanding *here* can only have been
+                // raised during this one.
+                _ if d.interrupted() => BatchOutcome::Interrupted { at: position },
                 // An assertion that did not hold is a verdict about the target, and stays one
                 // however long the step took to reach it.
                 StepResult::Unmet(_) => BatchOutcome::Failed { at: position },
@@ -2005,6 +2012,50 @@ mod tests {
         let text = render(&report);
         assert!(text.contains("BATCH: INTERRUPTED at step 2 of 3"), "{text}");
         assert!(text.contains("rollback: COMPLETE"), "{text}");
+    }
+
+    /// A step whose assertion fails *because* the break truncated its output reports `INTERRUPTED`,
+    /// not `FAILED`.
+    ///
+    /// The most likely shape of an interrupted step, and the one that sends a caller furthest
+    /// wrong: an interrupt cuts the output short, so a `contains` stops holding — and the report
+    /// then tells them to go and debug a step that was fine. Attributable rather than guessed,
+    /// because the between-steps check runs before every step: a break outstanding when *this* one
+    /// fails can only have been raised during it.
+    #[test]
+    fn a_step_that_failed_because_it_was_cut_short_is_not_a_failure() {
+        let mut d = stopped()
+            .on("first", Ok("truncated"))
+            .on("eb restore", Ok(""))
+            .interrupted_after(1);
+        let batch = op(
+            vec![
+                BatchStep {
+                    expect: vec![Check::Contains {
+                        text: "the whole output".to_string(),
+                    }],
+                    ..cmd("first step")
+                },
+                cmd("second step"),
+            ],
+            vec![cmd("eb restore 41")],
+        );
+
+        let report = run(&mut d, &batch, BUDGET);
+
+        assert_eq!(
+            report.outcome,
+            BatchOutcome::Interrupted { at: 1 },
+            "the assertion did not hold because the break truncated the output, so the batch was \
+             interrupted rather than wrong"
+        );
+        assert!(!d.ran("second"), "and it still stops there");
+        assert!(d.ran("eb restore"));
+        // The step's own entry keeps the assertion detail — reclassifying the *batch* outcome does
+        // not hide which assertion did not hold.
+        assert!(matches!(report.steps[0].result, StepResult::Unmet(_)));
+        let text = render(&report);
+        assert!(text.contains("BATCH: INTERRUPTED at step 1 of 2"), "{text}");
     }
 
     /// A break landing during the **last** step must not leave the batch reporting `COMMITTED`.
