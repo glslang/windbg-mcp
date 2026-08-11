@@ -58,14 +58,15 @@ lock a raise has to take. Every break is therefore either lodged before the seal
 there, or refused after it. A repeat while a batch is merely *stopping* is refused for the same
 reason one step earlier.
 
-**And the same fact distorts the report in two more places, both fixed by attributing rather than
-guessing.** An interrupt during the *last* step is invisible between steps — there is no next step
-to stop before — so every step had run and the report said `COMMITTED` of a transaction whose final
-step was cut short, directly above the note saying it had been; the outcome is re-checked once the
-loop ends. And a step that *fails* because the break truncated its output — a `contains` that stops
-holding, an `eval` that stops parsing — reported `FAILED`, sending the caller to debug a step that
-was fine. Both are attributions this executor can actually make: the between-steps check runs before
-every step, so a break outstanding when one fails can only have been raised during that step.
+**And the same fact distorted the report in two more places.** An interrupt during the *last* step
+is invisible between steps — there is no next step to stop before — so every step had run and the
+report said `COMMITTED` of a transaction whose final step was cut short, directly above the note
+saying it had been. And a step that *failed* because the break truncated its output — a `contains`
+that stops holding, an `eval` that stops parsing — reported `FAILED`, sending the caller to debug a
+step that was fine. Both were first fixed as further special cases (a re-check after the loop, and a
+reclassification arm), and both then *deleted* by the return-type change below, which is the reason
+that change was worth making: they are the same fact arriving at two more readers, and the fix that
+scales is to stop asking readers to remember.
 
 **The root cause was the return type, and it is now fixed rather than worked around.** Four rounds
 of review each found a different place that had to be told an interrupt had happened — between
