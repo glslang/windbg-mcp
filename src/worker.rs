@@ -334,11 +334,21 @@ struct Running {
     /// drain whatever the engine did not consume. An interrupt lodged just as a command finishes
     /// leaves a Ctrl+Break pending with nothing running, and the next job would wear it.
     interrupted: Option<u64>,
+    /// The job that has entered a phase no break may reach — a [`crate::batch`] running its
+    /// `always` block.
+    ///
+    /// Cleanup is the one thing an interrupt must never touch. A restore cut short returns `Ok`
+    /// with partial output like any other interrupted command, so `run_step` records it as a step
+    /// that worked and the report says `rollback: COMPLETE` with the patch still applied — the
+    /// exact loss the whole transaction machinery exists to prevent, arriving through the tool
+    /// meant to be the gentle way out.
+    uninterruptible: Option<u64>,
 }
 
 static RUNNING: Mutex<Running> = Mutex::new(Running {
     job: None,
     interrupted: None,
+    uninterruptible: None,
 });
 
 impl Running {
@@ -363,6 +373,16 @@ impl Running {
         self.interrupted == Some(id)
     }
 
+    /// Closes `id` to interrupts for the rest of its life. See [`Self::uninterruptible`].
+    fn seal(&mut self, id: u64) {
+        self.uninterruptible = Some(id);
+    }
+
+    /// Whether a break may still be raised for `id`.
+    fn sealed(&self, id: u64) -> bool {
+        self.uninterruptible == Some(id)
+    }
+
     /// Ends `id`'s claim, reporting whether an interrupt was bound to it.
     ///
     /// Taken rather than read, so an interrupt is spent by the job it reached: the next job starts
@@ -370,6 +390,7 @@ impl Running {
     /// to the one before it.
     fn release(&mut self, id: u64) -> bool {
         self.job = None;
+        self.uninterruptible = None;
         self.interrupted.take() == Some(id)
     }
 }
@@ -394,6 +415,19 @@ fn claim(id: u64) {
 /// [`Running::interrupt_pending`] on this process's one tracker.
 fn interrupt_pending(id: u64) -> bool {
     running().interrupt_pending(id)
+}
+
+/// Closes `id` to further interrupts and consumes anything already pending on the engine.
+///
+/// Both under the one lock, which is what makes it a boundary rather than a hope: a raise takes the
+/// same lock, so every break is either lodged before this — and drained here, before the first
+/// cleanup command runs — or refused after it. Called by a batch as it enters its `always` block.
+fn seal_against_interrupts(e: &DebugEngine, id: u64) {
+    let mut running = running();
+    running.seal(id);
+    // Under the lock deliberately: a break raised between the seal and the drain would survive
+    // both and land on the first restore command.
+    let _ = e.interrupted();
 }
 
 /// [`Running::release`] on this process's one tracker.
@@ -783,10 +817,19 @@ fn interrupt_running() -> Result<String, String> {
                 .to_string(),
         );
     };
-    // At most one break per job, and the reason is a `debug_batch`: its rollback runs as part of
-    // the same job, so a second interrupt aimed at a batch that is already stopping would land on
-    // a restore command instead — a cut-short `Execute` that still reports `Ok`, which is a
-    // mutation left applied and reported as undone. The one thing this subsystem exists to prevent.
+    // A batch that has reached its `always` block is closed to breaks, whether or not one has been
+    // raised for it before. Cleanup is the one thing an interrupt must not reach: a restore cut
+    // short returns `Ok` with partial output like any other interrupted command, so it would be
+    // recorded as a step that worked and reported as `rollback: COMPLETE` with the patch still
+    // applied.
+    if running.sealed(job) {
+        return Ok(format!(
+            "Not interrupted. The operation on this session (job {job}) is a `debug_batch` that              has finished its steps and is running its rollback, which is deliberately not              interruptible — a restore stopped halfway would report success while leaving the              target changed. It is bounded by the batch's own budget and will return shortly. If              it does not, `end_session` ends the session outright, at the cost of the target."
+        ));
+    }
+    // At most one break per job otherwise, for the same reason one step later: a batch told to stop
+    // runs its rollback as part of this same job, so a second interrupt aimed at it would land on a
+    // restore command.
     //
     // Costs nothing anywhere else: a repeat only ever meant "that same operation, again", and it
     // is already stopping. A *later* job is a different id and is interrupted normally, which is
@@ -1175,6 +1218,10 @@ impl Debuggee for BatchEngine<'_> {
 
     fn interrupted(&self) -> bool {
         interrupt_pending(self.job)
+    }
+
+    fn rolling_back(&mut self) {
+        seal_against_interrupts(self.e, self.job);
     }
 }
 
@@ -2537,6 +2584,7 @@ mod tests {
         Running {
             job: None,
             interrupted: None,
+            uninterruptible: None,
         }
     }
 
@@ -2568,6 +2616,28 @@ mod tests {
             !running.release(8),
             "the next job inherited an interrupt meant for the one before it"
         );
+    }
+
+    /// A job that has sealed itself takes no break at all — not a second one, and **not a first**.
+    ///
+    /// The first is the case that matters and the one the seal exists for. A `debug_batch` reaches
+    /// its `always` block on every path, including paths no interrupt was ever involved in, so an
+    /// interrupt arriving for the first time while cleanup runs would land on a restore command.
+    /// That returns `Ok` with partial output like any interrupted command, so it is recorded as a
+    /// step that worked: `rollback: COMPLETE` with the target still changed.
+    #[test]
+    fn a_sealed_job_takes_no_interrupt_at_all() {
+        let mut running = idle();
+        running.claim(7);
+        assert!(!running.sealed(7), "an ordinary job is interruptible");
+
+        running.seal(7);
+        assert!(running.sealed(7));
+        // And the seal is the job's, not the process's: it goes when the job does, or the next
+        // batch on this session could never be interrupted.
+        assert!(!running.release(7), "no interrupt was ever raised for it");
+        running.claim(8);
+        assert!(!running.sealed(8), "the next job starts interruptible");
     }
 
     /// The other side of the same race: an interrupt that arrives between jobs binds to nothing, so

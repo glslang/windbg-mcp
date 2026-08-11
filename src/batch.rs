@@ -772,21 +772,22 @@ pub trait Debuggee {
     /// has to be shortened to fit a teardown.
     fn abandoned(&self) -> bool;
     /// Whether someone has asked this batch's *call* to stop — the `interrupt` tool, aimed at the
-    /// job this batch is running as.
+    /// job this batch is running as. Read between steps, with the same limit as
+    /// [`Self::abandoned`]: it cannot reach a call already inside DbgEng.
     ///
-    /// Separate from [`Self::abandoned`] because the two say opposite things about the session: a
-    /// teardown means it is going away, this means it is staying and the caller simply wants the
-    /// transaction to end. Folding them together would tell a caller to resubmit on a fresh session
-    /// when the one they have is fine.
+    /// Separate from `abandoned` because the two say opposite things about the session: a teardown
+    /// means it is going away, this means it is staying.
     ///
-    /// **Why the executor has to be told at all**, when an interrupt already stops the step: it
-    /// stops the step by making the debugger return early, and — since the whole point of an
-    /// on-request interrupt is that partial output is preserved rather than thrown away — that
-    /// return is a *success*. A step whose assertions still hold therefore reads as a step that
-    /// ran, and the batch would carry on applying later mutations for a caller who has asked it to
-    /// stop. Read between steps, with the same limit as `abandoned`: a call already inside DbgEng
-    /// runs to its own end.
+    /// **The executor has to be told, because an interrupted step succeeds.** The break makes the
+    /// debugger return early with whatever it had produced — preserving that is the point — so a
+    /// step whose assertions still hold is indistinguishable from one that ran. See `DECISIONS.md`.
     fn interrupted(&self) -> bool;
+    /// Announces that the main steps are over and the `always` block is about to run.
+    ///
+    /// A safety boundary, not bookkeeping: cleanup must not be interruptible, because a restore cut
+    /// short returns `Ok` like any other interrupted command and would be reported as a rollback
+    /// that completed. Implementations refuse interrupts from here on.
+    fn rolling_back(&mut self);
 }
 
 /// Runs one engine call, turning a panic into a step failure so [`run`] still reaches `always`.
@@ -1063,11 +1064,35 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
         steps.push(done);
     }
 
+    // The between-steps check above cannot see a break that lands during the **last** step: there is
+    // no next step to stop before. Left there, every step has run and every assertion has held, so
+    // the batch reports `COMMITTED` — of a transaction whose final step was cut short, with only the
+    // generic cut-short note beneath to contradict it. Contradicting itself is worse than either
+    // reading alone, so the outcome is corrected here.
+    //
+    // Only from `Committed`. A step that failed or ran out of time has news the caller must act on
+    // first, and an interrupt does not change what it says.
+    if outcome == BatchOutcome::Committed && d.interrupted() {
+        // One past the end, which is what `at` means everywhere it appears — the first step not
+        // attempted — and here says there is no such step. `render` reads it back and says so.
+        outcome = BatchOutcome::Interrupted {
+            at: op.steps.len() + 1,
+        };
+    }
+
     // The rollback block, on every path. Its own deadline is the *whole* budget, which is what the
     // reserve above bought it — and that holds when the batch is abandoned too, rather than the
     // rollback being cut short to fit a teardown's grace. The grace is sized from this budget
     // instead (`worker::BatchSignal::abandon`), so shortening the block here would only mean
     // skipping cleanup the teardown was already waiting for.
+    //
+    // Announced first, and this is a safety boundary rather than bookkeeping: from here the host
+    // must not let a Ctrl+Break reach the engine. An interrupted command returns `Ok` with whatever
+    // it had produced, so a *restore* that is cut short reports success — a patch left applied and
+    // reported as undone, which is the one outcome this whole tool exists to prevent. The host
+    // refuses interrupts from this point and clears any already pending
+    // (`worker::BatchEngine::rolling_back`).
+    d.rolling_back();
     let mut always: Vec<StepOutcome> = Vec::with_capacity(op.always.len());
     for (index, step) in op.always.iter().enumerate() {
         let position = index + 1;
@@ -1485,6 +1510,16 @@ pub fn render(report: &BatchReport) -> String {
              its rollback. Nothing was wrong with the steps or the budget; resubmit the whole \
              batch on a fresh session.\n"
         ),
+        // `at` past the end means no step was skipped: the break landed during the last one, so
+        // every step ran but the last one's result is whatever it had reached. Reported as its own
+        // sentence, because "stopped at step N" would claim a step did not run when they all did —
+        // and `COMMITTED`, which this replaces, claimed the opposite and worse.
+        BatchOutcome::Interrupted { at } if *at > total => format!(
+            "BATCH: INTERRUPTED during step {total} of {total} — every step ran, but `interrupt` \
+             was called on this session while the last one was still going, so what it reported is \
+             what it had reached rather than a completed step. The rollback ran. The session is \
+             still open and still holds its target.\n"
+        ),
         BatchOutcome::Interrupted { at } => format!(
             "BATCH: INTERRUPTED at step {at} of {total} — `interrupt` was called on this session, \
              so the batch stopped there and ran its rollback. Nothing was wrong with the steps or \
@@ -1588,6 +1623,9 @@ mod tests {
         /// The same, for an interrupt aimed at this batch's own call; see
         /// [`Script::interrupted_after`].
         interrupt_after: Option<usize>,
+        /// Whether the executor announced its rollback — the notification a host turns into "no
+        /// break may reach this job any more".
+        sealed: bool,
     }
 
     /// The message a scripted panic carries, so the report can be asserted to have kept it.
@@ -1706,6 +1744,11 @@ mod tests {
         fn interrupted(&self) -> bool {
             self.interrupt_after
                 .is_some_and(|after| self.calls.len() >= after)
+        }
+        fn rolling_back(&mut self) {
+            // A real host seals the job against further breaks here; the script only records that
+            // it was told, which is what the executor owes it.
+            self.sealed = true;
         }
     }
 
@@ -1962,6 +2005,62 @@ mod tests {
         let text = render(&report);
         assert!(text.contains("BATCH: INTERRUPTED at step 2 of 3"), "{text}");
         assert!(text.contains("rollback: COMPLETE"), "{text}");
+    }
+
+    /// A break landing during the **last** step must not leave the batch reporting `COMMITTED`.
+    ///
+    /// The between-steps check cannot see this one: there is no next step to stop before, so every
+    /// step has run and every assertion has held. The report would then say the transaction
+    /// committed while the note beneath it said the operation was cut short — and a report that
+    /// contradicts itself is worse than either reading alone. It says `INTERRUPTED` instead, in the
+    /// form that admits every step ran.
+    #[test]
+    fn an_interrupt_during_the_last_step_is_not_a_commit() {
+        let mut d = stopped()
+            .on("only", Ok(""))
+            .on("eb restore", Ok(""))
+            // After the one and only step's command — so the loop never looks again.
+            .interrupted_after(1);
+        let batch = op(vec![cmd("only step")], vec![cmd("eb restore 41")]);
+
+        let report = run(&mut d, &batch, BUDGET);
+
+        assert_eq!(
+            report.outcome,
+            BatchOutcome::Interrupted { at: 2 },
+            "one past the end: every step ran, so none was skipped"
+        );
+        assert!(d.ran("eb restore"), "the rollback runs on this path too");
+        assert!(report.rollback_complete());
+        let text = render(&report);
+        assert!(
+            text.contains("BATCH: INTERRUPTED during step 1 of 1"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("stopped there"),
+            "no step was skipped, so nothing should claim one was: {text}"
+        );
+    }
+
+    /// The rollback is announced before it runs, so a host can close the job to further breaks.
+    ///
+    /// Without it the *first* interrupt of a batch can land on a restore — cleanup is reached on
+    /// every path, including paths no interrupt was involved in — and an interrupted restore
+    /// returns `Ok` with partial output, so it is recorded as a step that worked and the report
+    /// says `rollback: COMPLETE` with the target still changed.
+    #[test]
+    fn the_rollback_is_announced_before_it_runs() {
+        let mut d = stopped().on("only", Ok("")).on("eb restore", Ok(""));
+        let batch = op(vec![cmd("only step")], vec![cmd("eb restore 41")]);
+
+        run(&mut d, &batch, BUDGET);
+
+        assert!(
+            d.sealed,
+            "the executor must tell its host that cleanup is starting, or the host cannot know \
+             when to stop letting breaks through"
+        );
     }
 
     /// A teardown outranks an interrupt when both are in play: the session is going away, and that
