@@ -738,8 +738,6 @@ fn action_mutation(action: &StepAction) -> Option<String> {
 
 // ---- the engine seam ------------------------------------------------------
 
-/// What [`run`] needs from a debugger. Implemented over a real engine by the worker, and over a
-/// script by the tests — see the module docs for why that seam is where it is.
 /// What a step's engine call produced: its output, and whether it actually finished.
 ///
 /// Both, because either alone is a lie in the case that matters. Output alone cannot say a command
@@ -1232,7 +1230,7 @@ fn run_step(
             .map(Ran::whole),
     });
 
-    let (output, cut_short) = match ran {
+    let (output, mut cut_short) = match ran {
         Ok(ran) => (ran.output, ran.interrupted),
         Err(why) => {
             return StepOutcome {
@@ -1260,7 +1258,7 @@ fn run_step(
             );
             break;
         }
-        match evaluate(d, check, &output, deadline) {
+        match evaluate(d, check, &output, deadline, &mut cut_short) {
             Ok(()) => {}
             Err(CheckFailed::Unmet(why)) => {
                 result = StepResult::Unmet(why);
@@ -1345,7 +1343,12 @@ enum CheckFailed {
 /// falling back on [`MIN_STEP_BUDGET_MS`] when nothing is left: that floor exists so a query which
 /// *has* to run is never armed with a disabled watchdog, and using it to start a query that did
 /// not have to run would spend the rollback's reserve on an assertion.
-fn eval_value(d: &mut impl Debuggee, expr: &str, deadline: Duration) -> Result<u64, CheckFailed> {
+fn eval_value(
+    d: &mut impl Debuggee,
+    expr: &str,
+    deadline: Duration,
+    cut_short: &mut bool,
+) -> Result<u64, CheckFailed> {
     if d.elapsed() >= deadline {
         return Err(CheckFailed::Expired(format!(
             "the batch ran out of time before `? ({expr})` could be evaluated"
@@ -1355,8 +1358,13 @@ fn eval_value(d: &mut impl Debuggee, expr: &str, deadline: Duration) -> Result<u
     // Parenthesized, so a relational expression (`@rcx > 0x1000`) is evaluated as one value
     // rather than losing its precedence against whatever `?` does with the rest of the line.
     let text = guarded(|| {
-        d.command(&format!("? ({expr})"), budget_ms)
-            .map(|ran| ran.output)
+        d.command(&format!("? ({expr})"), budget_ms).map(|ran| {
+            // An assertion is engine calls too, so a break can land in one — and it belongs to the
+            // step just as much as one landing in the step's action. Dropped here, an interrupted
+            // assertion that still parses reports the step, and the batch, as having succeeded.
+            *cut_short |= ran.interrupted;
+            ran.output
+        })
     })
     .map_err(|why| CheckFailed::Unmet(format!("`? ({expr})` failed: {why}")))?;
     parse_eval(&text).ok_or_else(|| {
@@ -1373,6 +1381,10 @@ fn evaluate(
     check: &Check,
     output: &str,
     deadline: Duration,
+    // `cut_short` is set when a break landed while this assertion was being evaluated. An
+    // out-parameter because an assertion can be *both* interrupted and conclusive — a truncated
+    // value that still parses and still matches — so it cannot ride on the `Result`.
+    cut_short: &mut bool,
 ) -> Result<(), CheckFailed> {
     match check {
         Check::Contains { text } => {
@@ -1402,8 +1414,8 @@ fn evaluate(
             }
         }
         Check::Eval { expr, equals } => {
-            let left = eval_value(d, expr, deadline)?;
-            let right = eval_value(d, equals, deadline)?;
+            let left = eval_value(d, expr, deadline, cut_short)?;
+            let right = eval_value(d, equals, deadline, cut_short)?;
             if left == right {
                 Ok(())
             } else {
@@ -2073,6 +2085,48 @@ mod tests {
         let text = render(&report);
         assert!(text.contains("BATCH: INTERRUPTED at step 1 of 3"), "{text}");
         assert!(text.contains("rollback: COMPLETE"), "{text}");
+    }
+
+    /// A break landing while an **assertion** is being evaluated belongs to the step too.
+    ///
+    /// The nastiest shape of it, which is why the assertion here *holds*: an `eval` check is two
+    /// more engine calls, and a break landing in one leaves a value that may still parse and still
+    /// match. Nothing fails, so nothing else in the step says anything is wrong — and on a last
+    /// step, with no next iteration to notice, the batch reported `COMMITTED`.
+    #[test]
+    fn a_break_during_an_assertion_is_the_steps_too() {
+        let mut d = stopped()
+            .on("only", Ok(""))
+            .on("? (1)", Ok("Evaluate expression: 1 = 00000000`00000001"))
+            .on("eb restore", Ok(""))
+            // Call 1 is the step's own command; the break lands on call 2, which is the first of
+            // the assertion's two evaluations.
+            .interrupted_after(2);
+        let batch = op(
+            vec![BatchStep {
+                expect: vec![Check::Eval {
+                    expr: "1".to_string(),
+                    equals: "1".to_string(),
+                }],
+                ..cmd("only step")
+            }],
+            vec![cmd("eb restore 41")],
+        );
+
+        let report = run(&mut d, &batch, BUDGET);
+
+        assert!(
+            report.steps[0].ok(),
+            "the assertion held — this is the case where nothing looks wrong: {:?}",
+            report.steps[0].result
+        );
+        assert_eq!(
+            report.outcome,
+            BatchOutcome::Interrupted { at: 1 },
+            "a break during the step's assertions is a break during the step"
+        );
+        assert!(d.ran("eb restore"));
+        assert!(report.rollback_complete());
     }
 
     /// A break landing in the gap *between* steps still stops the batch.

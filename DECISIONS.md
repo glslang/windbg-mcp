@@ -82,7 +82,10 @@ first place. Two of the four special cases disappeared rather than being fixed: 
 and the failed-assertion case are both just "the step says it was cut short", read where the step's
 result is already interpreted. `Debuggee::interrupted` survives for the one case a step genuinely
 cannot carry — a break landing between steps — and the batch outcome now names the step the break
-actually *reached* rather than the one that never started.
+actually *reached* rather than the one that never started. A step is more than its action, so the
+flag is collected across its assertions too: an `eval` check is two further engine calls, and a
+break landing in one can leave a value that still parses and still matches, so nothing else in the
+step would ever say anything was wrong.
 
 The general lesson, since it cost four rounds: **a value that omits how it was produced makes every
 reader responsible for finding out**, and readers are added over time. `Ok` for "interrupted" bought
