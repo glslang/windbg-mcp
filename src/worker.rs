@@ -354,6 +354,15 @@ impl Running {
         self.interrupted = self.job;
     }
 
+    /// Whether an interrupt has been raised for `id` and not yet spent.
+    ///
+    /// A peek, where [`Self::release`] takes: a long-running job that can stop *itself* — a
+    /// [`crate::batch`], between its steps — has to be able to see the request without consuming
+    /// the record that its reply is owed an explanation.
+    fn interrupt_pending(&self, id: u64) -> bool {
+        self.interrupted == Some(id)
+    }
+
     /// Ends `id`'s claim, reporting whether an interrupt was bound to it.
     ///
     /// Taken rather than read, so an interrupt is spent by the job it reached: the next job starts
@@ -380,6 +389,11 @@ static INTERRUPT: OnceLock<InterruptHandle> = OnceLock::new();
 /// [`Running::claim`] on this process's one tracker.
 fn claim(id: u64) {
     running().claim(id);
+}
+
+/// [`Running::interrupt_pending`] on this process's one tracker.
+fn interrupt_pending(id: u64) -> bool {
+    running().interrupt_pending(id)
 }
 
 /// [`Running::release`] on this process's one tracker.
@@ -769,6 +783,23 @@ fn interrupt_running() -> Result<String, String> {
                 .to_string(),
         );
     };
+    // At most one break per job, and the reason is a `debug_batch`: its rollback runs as part of
+    // the same job, so a second interrupt aimed at a batch that is already stopping would land on
+    // a restore command instead — a cut-short `Execute` that still reports `Ok`, which is a
+    // mutation left applied and reported as undone. The one thing this subsystem exists to prevent.
+    //
+    // Costs nothing anywhere else: a repeat only ever meant "that same operation, again", and it
+    // is already stopping. A *later* job is a different id and is interrupted normally, which is
+    // why this is not idempotence — see the tool's annotation.
+    if running.interrupt_pending(job) {
+        return Ok(format!(
+            "Already interrupted. Ctrl+Break was raised on this session's engine for the \
+             operation it is running (job {job}) and it is stopping; nothing further was sent. If \
+             it does not end, it is one of the cases an interrupt cannot reach — a command that \
+             never polls, or a live-kernel attach whose target has not connected — and \
+             `end_session` is what ends those, at the cost of the target."
+        ));
+    }
     let Some(handle) = INTERRUPT.get() else {
         // Only reachable before the engine exists, and the supervisor is told `Ready` after that,
         // so no session can be routed here. Reported rather than unwrapped all the same.
@@ -1012,7 +1043,9 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<S
                 None => pool(e, query, Duration::ZERO),
             }
         }
-        EngineOp::Batch(op) => run_batch(e, op, queued),
+        // `id` is passed because a batch is the one op that can stop *itself*: it checks between
+        // steps whether an interrupt has been raised for the job it is running as.
+        EngineOp::Batch(op) => run_batch(e, id, op, queued),
         // Answered by the request reader, which is the only way it could reach a busy engine at
         // all, so it is never queued and never arrives here. See [`EngineOp::Interrupt`].
         EngineOp::Interrupt => Err(
@@ -1094,6 +1127,9 @@ struct BatchEngine<'a> {
     e: &'a DebugEngine,
     started: Instant,
     signal: &'a BatchSignal,
+    /// The request id this batch is running as, so it can see an interrupt aimed at *it* — see
+    /// [`Debuggee::interrupted`].
+    job: u64,
 }
 
 impl Debuggee for BatchEngine<'_> {
@@ -1136,6 +1172,10 @@ impl Debuggee for BatchEngine<'_> {
     fn abandoned(&self) -> bool {
         self.signal.abandoned()
     }
+
+    fn interrupted(&self) -> bool {
+        interrupt_pending(self.job)
+    }
 }
 
 /// Runs a batch and renders its report.
@@ -1143,7 +1183,7 @@ impl Debuggee for BatchEngine<'_> {
 /// The report is the result either way — a failed transaction that did not say which step failed
 /// and whether the rollback ran would be worse than no report at all. `Err` only chooses how
 /// [`crate::server`] renders it: a tool-execution error the model can read and act on.
-fn run_batch(e: &DebugEngine, op: BatchOp, queued: Duration) -> Result<String, String> {
+fn run_batch(e: &DebugEngine, job: u64, op: BatchOp, queued: Duration) -> Result<String, String> {
     let Some(budget) = batch_budget(
         op.budget_ms,
         Duration::from_millis(u64::from(op.patience_ms)),
@@ -1192,6 +1232,7 @@ fn run_batch(e: &DebugEngine, op: BatchOp, queued: Duration) -> Result<String, S
         e,
         started: Instant::now(),
         signal: &BATCH,
+        job,
     };
     let report = batch::run(&mut engine, &op, budget);
     let rendered = batch::render(&report);

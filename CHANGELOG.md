@@ -42,8 +42,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an operation that never polls for the break is not reached, and neither is an `attach_kernel`
   whose target has not connected — `end_session` remains the only end to that one.
 
-  A `debug_batch` interrupted this way fails the step that was running, which stops the transaction
-  and runs its `always` block, so the rollback still happens and the batch's own result reports it.
+  A `debug_batch` interrupted this way stops at its **next step** and runs its `always` block,
+  reporting `BATCH: INTERRUPTED` — a distinct outcome from `ABANDONED`, because the session is still
+  open and still holds its target, so the same batch can be resubmitted against it. The executor is
+  told separately rather than inferring it from the step, and that is not a detail: an interrupted
+  step *succeeds*. Preserving the output reached up to the break is the whole point, so the debugger
+  returns `Ok` and a step whose assertions still hold is indistinguishable from one that ran — the
+  batch would carry on applying later mutations for a caller who had just asked it to stop. A second
+  `interrupt` while one is already stopping is a no-op that says so, because the rollback runs as
+  part of the same job and a second break could land on a restore.
 
 ### Changed
 

@@ -152,6 +152,16 @@ processes, so they need real ones:
   afterwards, which is as close as a dump gets to the byte a live target would have restored. Both
   wait for a marker the batch's *first* step writes before tearing anything down: timed with a sleep
   instead, a slow machine would test the refuse-to-start path and pass just as green.
+- *Interrupting a batch stops it and rolls it back, keeping the session.* The same twenty-second
+  batch, stopped with `interrupt` instead: `BATCH: INTERRUPTED`, rollback complete, and the session
+  still usable afterwards — which is the whole difference from the `end_session` version above.
+  The assertion that carries it is a **second marker file** written by a step *after* the sleeps: a
+  batch that ignored the interrupt reaches it, and the file says so independently of what the report
+  claims about itself. That is the bug the interrupt itself created, and it needs a real engine to
+  reproduce: an on-request interrupt returns the output the command reached rather than the error the
+  break provoked, so the interrupted step comes back `Ok` with its assertions intact and the executor
+  saw a step that simply ran. `src/batch.rs` pins the executor's half against a scripted debuggee,
+  which answers `Ok` to the interrupted step for exactly this reason.
 
 This tier is also the only end-to-end check of the **protocol channel** — the inherited pipe pair a
 worker speaks on ([`proto.rs`](../src/proto.rs)). Handles are passed on the worker's command line

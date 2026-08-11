@@ -1338,6 +1338,118 @@ fn ending_a_session_stops_a_running_batch_and_rolls_it_back() {
     let _ = std::fs::remove_file(&running);
 }
 
+/// `interrupt` on a session that is running a batch: the batch stops at its next step, rolls back,
+/// and reports `BATCH: INTERRUPTED` — while the **session stays open**, which is what separates it
+/// from the `end_session` case above.
+///
+/// The bug this pins is one an interrupt *created*. An on-request interrupt deliberately returns the
+/// output the command reached rather than the error the break provoked — that is what makes partial
+/// output survivable — so the interrupted step comes back `Ok`, its assertions still hold, and the
+/// batch executor sees a step that ran. Without being told separately it carried straight on into
+/// the next mutation, for a caller who had just asked it to stop. `src/batch.rs` pins the executor's
+/// half against a scripted debuggee; only here is the whole path real, because only a real engine
+/// turns a Ctrl+Break into that deceptively successful step.
+#[test]
+fn interrupting_a_running_batch_stops_it_and_rolls_it_back() {
+    let Some(dump) = target_tier() else { return };
+    let running = marker_path("interrupt-batch-running");
+    let reached_later = marker_path("interrupt-batch-later-step");
+    let _ = std::fs::remove_file(&running);
+    let _ = std::fs::remove_file(&reached_later);
+
+    let mut server = Server::started();
+    let response = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
+    assert_no_error(&response, "open_dump");
+    let session_id = session_id_of(&text_of(&response["result"]));
+
+    // Announce that the batch is inside its steps, spend long enough to be interrupted, and then —
+    // the assertion that matters — write a second marker. A batch that carries on past the
+    // interrupt reaches that step; one that stops does not, and the file is the evidence either
+    // way, independent of what the report says about itself.
+    let mut steps = vec![
+        json!({ "op": "command", "command": format!(".logopen \"{}\"", running.display()) }),
+        json!({ "op": "command", "command": ".echo BATCH-RUNNING" }),
+        json!({ "op": "command", "command": ".logclose" }),
+    ];
+    steps.extend(std::iter::repeat_n(
+        json!({ "op": "command", "command": ".sleep 1000" }),
+        20,
+    ));
+    steps.extend([
+        json!({ "op": "command", "command": format!(".logopen \"{}\"", reached_later.display()) }),
+        json!({ "op": "command", "command": ".echo REACHED-A-LATER-STEP" }),
+        json!({ "op": "command", "command": ".logclose" }),
+    ]);
+    let batch = server.send_request(
+        "tools/call",
+        json!({
+            "name": "debug_batch",
+            "arguments": {
+                "session_id": session_id,
+                "steps": steps,
+                "always": [{ "op": "command", "command": "version", "name": "cleanup" }],
+            }
+        }),
+    );
+
+    // Wait for the batch to be demonstrably inside its steps, as the teardown tests do: timed with
+    // a sleep instead, a slow machine would interrupt before the batch started and take the
+    // refuse-to-start path, passing just as green.
+    let deadline = Instant::now() + TARGET_STEP;
+    while !running.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the batch never reached its first step\n--- stderr ---\n{}",
+            server.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let raised = server.tool_text(
+        "interrupt",
+        json!({ "session_id": session_id }),
+        Duration::from_secs(20),
+    );
+    assert!(
+        raised.contains("Interrupted"),
+        "the batch was running, so the interrupt should have reached it:\n{raised}"
+    );
+
+    let report = text_of(&server.await_id(batch, "debug_batch", TARGET_STEP)["result"]);
+    assert!(
+        report.contains("BATCH: INTERRUPTED"),
+        "an interrupted batch should say so — not COMMITTED, which is what it reported while the \
+         interrupt was invisible to the executor, and not ABANDONED, which would send the caller \
+         to a new session:\n{report}"
+    );
+    assert!(
+        report.contains("rollback: COMPLETE"),
+        "the rollback runs on this path like every other:\n{report}"
+    );
+    assert!(
+        !reached_later.exists(),
+        "the batch ran a step *after* the interrupt — the executor was never told, so it treated \
+         the interrupted step as one that simply succeeded:\n{report}"
+    );
+
+    // And the session is still open, which is the whole difference from `end_session`: the same
+    // batch can be resubmitted against it.
+    let after = server.call_tool("modules", json!({ "session_id": session_id }), TARGET_STEP);
+    assert!(
+        !is_tool_error(&after),
+        "interrupting a batch must not cost the session:\n{}",
+        text_of(&after["result"])
+    );
+    server.tool_text(
+        "end_session",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
+
+    let _ = std::fs::remove_file(&running);
+    let _ = std::fs::remove_file(&reached_later);
+}
+
 /// A batch still running when the client disconnects has to finish its rollback before its worker
 /// goes — the one guarantee `debug_batch` used to make only against a call *timeout*.
 ///
