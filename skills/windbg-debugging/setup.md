@@ -75,16 +75,19 @@ dependency — no sibling checkout needed.
 
 Either way, run `/reload-plugins` afterwards so Claude Code connects the `windbg` MCP server.
 
-## WinDbg engine + extensions — for `.run` replay and crash-dump `!analyze`
+## WinDbg engine + extensions — for `.run` replay, crash-dump `!analyze`, and the kernel driver tools
 
 Drop the **WinDbg** store-package binaries next to `windbg-mcp.exe` (the `$dst` below — for a
 registry/MCPB install that's the client's extraction directory, **not** `target\release`) for
-two reasons:
+three reasons:
 
 - **TTD `.run` replay** — System32's `dbgeng.dll` **rejects** traces with `0x80070057`.
 - **Crash-dump `!analyze`** — it lives in the `winext\` extensions, which System32 doesn't ship
   (so a `.dmp`-only user still needs the `winext\` copy below, even though dump *loading* itself
   works on System32's engine).
+- **`driver_object`/`device_object`/`irp_stack`** — they run `!drvobj`/`!devobj`/`!irp` from
+  `winxp\kdexts.dll`, which System32 doesn't ship either (so a live-kernel-only user needs the
+  `winxp\` copy below, even though the attach itself works on the System32 engine).
 
 `DebugCreate` binds to whichever `dbgeng.dll` the loader finds first, and the app directory is
 searched before `System32`, so the copied engine wins. One-time, from the installed WinDbg store

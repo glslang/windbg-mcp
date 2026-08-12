@@ -87,6 +87,10 @@ and a client that validates against the spec schema then rejects the whole tool 
 - **For crash-dump `!analyze`** (and any other `!`-extension command), the engine needs the
   WinDbg `winext\` extensions bundled next to the binary — System32's engine ships none, so
   `!analyze` would return *"No export analyze found"*. See *Bundling the WinDbg engine* below.
+- **For the kernel driver tools** (`driver_object` / `device_object` / `irp_stack`), the engine
+  needs `winxp\kdexts.dll` bundled next to the binary — it exports `!drvobj`/`!devobj`/`!irp`, which
+  System32 doesn't ship, so without it those three return *"No export drvobj found"* even though the
+  kernel attach itself succeeded. See *Bundling the WinDbg engine* below.
 - **For Time Travel Debugging (`.run`) replay**, the System32 engine is *not* enough — it rejects
   `.run` traces (`0x80070057`). You need the **WinDbg engine** (which bundles the TTD replay
   components) loaded next to the binary — see *TTD engine* below.
@@ -117,9 +121,11 @@ stdio. Run it after a dependency bump or an MCP spec revision — see
 
 ### Bundling the WinDbg engine
 
-Needed for two things: TTD `.run` replay (System32's engine rejects traces with `0x80070057`) and
-crash-dump `!analyze` (which lives in the `winext\` extensions that System32 doesn't ship).
-`DebugCreate` binds to whichever `dbgeng.dll` the loader finds first, and the app directory is
+Needed for three things: TTD `.run` replay (System32's engine rejects traces with `0x80070057`),
+crash-dump `!analyze` (which lives in the `winext\` extensions that System32 doesn't ship), and the
+kernel driver tools `driver_object`/`device_object`/`irp_stack` (which need `winxp\kdexts.dll`).
+So a live-kernel-only user needs this section too, even though the attach itself works on the
+System32 engine. `DebugCreate` binds to whichever `dbgeng.dll` the loader finds first, and the app directory is
 searched before `System32`, so the copied **WinDbg** engine (which replays TTD traces and ships the
 extensions) wins. One-time, from the installed WinDbg store package:
 
@@ -142,8 +148,9 @@ Copy-Item "$wd\winxp\kdexts.dll" "$dst\winxp" -Force   # !drvobj/!devobj/!irp �
   `winext\`, `!analyze` returns *"No export analyze found"*.
 - `winxp\kdexts.dll` provides `!drvobj`/`!devobj`/`!irp`, behind the
   `driver_object`/`device_object`/`irp_stack` tools. `attach_kernel` / `attach_kernel_local`
-  `.load kdexts` for you, but without the file those tools return *"No export drvobj found"*. It
-  lives in `winxp\`, not `winext\` — the engine searches that subdir by name.
+  `.load kdexts` for you and nothing complains at attach time, so a missing file first surfaces as
+  *"No export drvobj found"* from those three tools. It lives in `winxp\`, not `winext\` — the
+  engine searches that subdir by name.
 - **`msdia140.dll` is required for PDB symbols.** Without it, `dbghelp` can't parse any PDB
   (`dia error 0x8007007e`) and silently falls back to *export* symbols — which makes `module!name`
   lookups (and so `ttd_calls("ucrtbase!__stdio_common_vfprintf")`) fail even with the right PDB in
