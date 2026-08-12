@@ -152,6 +152,7 @@ impl ErrorCategory {
             EngineError::Lost(_) => Self::WorkerLost,
             EngineError::Interrupted(_) => Self::Interrupted,
             EngineError::NotRun(_) => Self::NotRun,
+            EngineError::InvalidArgument(_) => Self::InvalidArgument,
         }
     }
 }
@@ -376,6 +377,7 @@ pub struct RegisterSet {
     pub all_registers: bool,
 }
 
+/// One register: its name, and its value tagged by what kind of value it is.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RegisterInfo {
     /// The engine's own name for it (`rax`, `xmm0`, `efl`).
@@ -425,6 +427,10 @@ pub struct ModuleList {
     pub loaded: usize,
 }
 
+/// One loaded module.
+///
+/// Carries its own description because a flattened enum's would otherwise be hoisted onto the
+/// struct: `symbols` is flattened in, and schemars merges its documentation with this object's.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ModuleInfo {
     /// The name symbols are qualified by — the `nt` in `nt!KeBugCheckEx`.
@@ -438,6 +444,7 @@ pub struct ModuleInfo {
     /// One past the last byte, matching the `start end` pair `lm` prints.
     pub end: String,
     pub size: u64,
+    #[serde(flatten)]
     pub symbols: SymbolState,
     pub user_mode: bool,
     pub timestamp: u32,
@@ -445,8 +452,14 @@ pub struct ModuleInfo {
 }
 
 /// How much symbol information the engine has for a module.
+///
+/// Internally tagged on `symbols` and flattened into [`ModuleInfo`], so the field is **always a
+/// string** — including for a symbol type this build does not name, which adds a sibling
+/// `symbol_type_code` rather than turning `symbols` into an object. A field whose JSON type
+/// depends on its value is one a consumer parses correctly right up until the first target that
+/// reports something new.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "symbols", rename_all = "snake_case")]
 pub enum SymbolState {
     None,
     /// Not loaded *yet* — the engine fetches them when something needs them. Emphatically not
@@ -459,9 +472,9 @@ pub enum SymbolState {
     Export,
     Sym,
     Dia,
-    /// A symbol type this build does not name; `code` is the engine's own.
+    /// A symbol type this build does not name. `symbol_type_code` is the engine's own value.
     Other {
-        code: u32,
+        symbol_type_code: u32,
     },
 }
 
@@ -477,7 +490,9 @@ impl From<win_kexp::dbgeng::SymbolKind> for SymbolState {
             Engine::Export => Self::Export,
             Engine::Sym => Self::Sym,
             Engine::Dia => Self::Dia,
-            Engine::Other(code) => Self::Other { code },
+            Engine::Other(code) => Self::Other {
+                symbol_type_code: code,
+            },
         }
     }
 }
@@ -510,10 +525,12 @@ pub struct BreakpointSet {
     pub breakpoints: Vec<BreakpointInfo>,
 }
 
+/// One breakpoint the session holds.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BreakpointInfo {
     /// The id the debugger prints, and that `bc`/`bd`/`be` take.
     pub id: u32,
+    #[serde(flatten)]
     pub kind: BreakpointKind,
     /// Where it will fire. Absent while it is deferred — its module is not loaded, so it has no
     /// address yet, which is not the same as an address of zero.
@@ -538,16 +555,20 @@ pub struct BreakpointInfo {
     pub passes_remaining: u32,
 }
 
+/// What a breakpoint watches for.
+///
+/// Tagged and flattened for the reason [`SymbolState`] is: `kind` is always a string, and the one
+/// case this build cannot name adds `kind_code` beside it instead of changing the field's type.
+/// Not hypothetical — DbgEng also has time and inline breakpoint types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum BreakpointKind {
     /// Execution reaching an address (`bp`).
     Code,
     /// Access to a range of memory (`ba`).
     Data,
-    Other {
-        code: u32,
-    },
+    /// A type this build does not name. `kind_code` is the engine's own value.
+    Other { kind_code: u32 },
 }
 
 impl From<&win_kexp::dbgeng::BreakpointInfo> for BreakpointInfo {
@@ -558,7 +579,7 @@ impl From<&win_kexp::dbgeng::BreakpointInfo> for BreakpointInfo {
             kind: match bp.kind {
                 Engine::Code => BreakpointKind::Code,
                 Engine::Data => BreakpointKind::Data,
-                Engine::Other(code) => BreakpointKind::Other { code },
+                Engine::Other(code) => BreakpointKind::Other { kind_code: code },
             },
             address: bp.address.map(addr),
             expression: bp.expression.clone(),
@@ -878,6 +899,21 @@ mod tests {
                 ErrorCategory::WorkerLost,
                 "worker_lost",
             ),
+            (
+                EngineError::Interrupted("no".into()),
+                ErrorCategory::Interrupted,
+                "interrupted",
+            ),
+            (
+                EngineError::NotRun("no".into()),
+                ErrorCategory::NotRun,
+                "not_run",
+            ),
+            (
+                EngineError::InvalidArgument("no".into()),
+                ErrorCategory::InvalidArgument,
+                "invalid_argument",
+            ),
         ];
         for (error, expected, wire) in cases {
             assert_eq!(ErrorCategory::of(&error), expected);
@@ -925,6 +961,60 @@ mod tests {
             assert_eq!(PoolCoverage::from(engine), expected);
             assert_eq!(serde_json::to_value(expected).unwrap(), wire);
         }
+    }
+
+    /// A field's JSON type must not depend on its value.
+    ///
+    /// `symbols` and `kind` each have a branch for a code this build does not name, and the
+    /// obvious spelling makes those branches objects while every other is a string. A consumer
+    /// then reads the field correctly until the first target that reports something new — which
+    /// is the worst possible moment to change shape. Both are tagged and flattened instead, so
+    /// the field stays a string and the unnamed code arrives beside it.
+    #[test]
+    fn a_named_state_is_a_string_whether_or_not_it_is_one_we_know() {
+        let module = |symbols| {
+            serde_json::to_value(ModuleInfo {
+                name: "nt".into(),
+                image_name: "ntkrnlmp.exe".into(),
+                loaded_image_name: None,
+                start: addr(0xfffff803_1ab10000),
+                end: addr(0xfffff803_1ab1b000),
+                size: 0xb000,
+                symbols,
+                user_mode: false,
+                timestamp: 0,
+                checksum: 0,
+            })
+            .expect("serializes")
+        };
+        assert_eq!(module(SymbolState::Pdb)["symbols"], "pdb");
+        assert_eq!(module(SymbolState::Deferred)["symbols"], "deferred");
+        let unknown = module(SymbolState::Other {
+            symbol_type_code: 9,
+        });
+        assert_eq!(unknown["symbols"], "other");
+        assert_eq!(unknown["symbol_type_code"], 9);
+
+        let breakpoint = |kind| {
+            serde_json::to_value(BreakpointInfo {
+                id: 0,
+                kind,
+                address: Some(addr(0x1000)),
+                expression: None,
+                command: None,
+                thread: None,
+                enabled: true,
+                deferred: false,
+                one_shot: false,
+                pass_count: 1,
+                passes_remaining: 1,
+            })
+            .expect("serializes")
+        };
+        assert_eq!(breakpoint(BreakpointKind::Code)["kind"], "code");
+        let inline = breakpoint(BreakpointKind::Other { kind_code: 3 });
+        assert_eq!(inline["kind"], "other");
+        assert_eq!(inline["kind_code"], 3);
     }
 
     /// A chunk's state is four named values, and the fourth is not a kind of free.

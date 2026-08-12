@@ -938,6 +938,12 @@ fn tool_schemas_declare_one_dialect_and_are_self_contained() {
 /// Driven with no session open, so every session-scoped tool takes its refusal path without a
 /// debugger anywhere near it — which is what keeps this in the default tier.
 ///
+/// The **openers** are the exception, and are handled rather than excluded: each fails on
+/// something that cannot exist (a path, a pid, an image), but reaching that failure spawns a
+/// worker, and a worker needs DbgEng. On a host without it there is no session at all — the one
+/// failure this server reports as a JSON-RPC error — so those rows are skipped by *error code*,
+/// visibly, rather than by matching the message or by dropping them from the table.
+///
 /// The table is checked *against* `tools/list` in both directions: a tool that grows a schema and
 /// is not listed here fails, so this cannot quietly stop covering the surface it is about.
 #[test]
@@ -1014,6 +1020,15 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
 
     for (name, args, expected) in cases {
         let response = server.call_tool(name, args.clone(), STEP);
+        // `-32603` is `ErrorData::internal_error`, which this server emits for exactly one thing:
+        // no engine worker could be started. Every other failure is a tool result by design, so
+        // this cannot swallow the case the test is for.
+        if response["error"]["code"] == -32603 {
+            skip(&format!(
+                "`{name}` needs an engine worker and none could be started (no DbgEng on this                  host?), so its structured-result contract was not checked"
+            ));
+            continue;
+        }
         assert_no_error(&response, &format!("tools/call {name}"));
         let result = &response["result"];
         let data = &result["structuredContent"];
@@ -2061,21 +2076,28 @@ fn two_sessions_coexist_and_do_not_disturb_each_other() {
         text_of(&response["result"])
     );
 
-    // Both are listed, and the newest is the one an omitted handle routes to.
-    let status = server.tool_text("session_status", json!({}), TARGET_STEP);
-    for id in [&first, &second] {
-        assert!(
-            status.contains(id.as_str()),
-            "`{id}` should be listed:\n{status}"
-        );
-    }
-    let current_line = status
-        .lines()
-        .find(|l| l.contains("(current)"))
-        .unwrap_or_else(|| panic!("some session must be current:\n{status}"));
-    assert!(
-        current_line.contains(&second),
-        "the newest session should be current, got:\n{current_line}"
+    // Both are listed, and the newest is the one an omitted handle routes to. Read as `current`
+    // rather than by finding a line containing `(current)`: that marker is a rendering, and which
+    // session it sits on is the routing rule this test is actually about.
+    let status = server.tool_data("session_status", json!({}), TARGET_STEP);
+    let listed = |id: &str| -> Value {
+        status["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|s| s["session_id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("`{id}` should be listed: {status}"))
+    };
+    assert_eq!(
+        listed(&first)["current"],
+        false,
+        "the older session is not the default target: {status}"
+    );
+    assert_eq!(
+        listed(&second)["current"],
+        true,
+        "the newest session should be the one an omitted handle routes to: {status}"
     );
 
     // Ending one leaves the other alone — the failure mode that made `end_session` unusable as a
@@ -3891,9 +3913,12 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
                 json!({ "session_id": session, "limit": 40 }),
                 POOL_CALL_BUDGET,
             );
+            // The categories, which is what the extra call was made for — the census text says
+            // only *that* the walk fell short, and this tier runs on a machine an operator had to
+            // set up, so losing the one output that explains it wastes the whole run.
             println!(
-                "why the walk fell short: {}",
-                text_of(&census_call["result"])
+                "why the walk fell short ({} diagnostic(s)): {}",
+                diagnostics["walk"]["diagnostics_emitted"], diagnostics["categories"]
             );
             assert_diagnostic_total_covers_its_categories(&diagnostics);
         }
