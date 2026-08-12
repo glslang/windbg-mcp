@@ -1026,6 +1026,7 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
         ),
         ("pool_census", json!({}), "error"),
         ("pool_diagnostics", json!({}), "error"),
+        ("crash_triage", json!({}), "error"),
     ];
 
     let mut server = Server::started();
@@ -1491,6 +1492,153 @@ fn a_dump_session_opens_reads_and_closes() {
     assert!(
         is_tool_error(&after) || !after["error"].is_null(),
         "a handle from an ended session must be refused, got {after}"
+    );
+}
+
+/// `crash_triage` against the checked-in bug check, which is a `0x9F DRIVER_POWER_STATE_FAILURE`.
+///
+/// The claim is the one the tool exists for and the one no unit test can make: the fields come
+/// off a real dump through a real engine. `src/triage.rs` proves the assembly over scripted
+/// values; this proves that `ReadBugCheckData`, the stack walk, the per-frame module attribution
+/// and the `!analyze` fallback all reach that assembly with something in them.
+///
+/// Deliberately asserts on the *engine-read* half plus the shape of the rest: the sample's
+/// parameters and its `nt`-topped stack are facts about the file, while what `!analyze` concludes
+/// depends on whether this host has `winext\ext.dll` beside the engine — so the analysis is
+/// checked for being coherent, not for having run.
+#[test]
+fn a_bug_check_is_triaged_into_its_fields() {
+    let Some(dump) = target_tier() else { return };
+    let mut server = Server::started();
+
+    let response = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
+    assert_no_error(&response, "open_dump");
+    let session_id = session_id_of(&response["result"]);
+
+    let triage = server.tool_data(
+        "crash_triage",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
+
+    // The bug check itself, read through `ReadBugCheckData` rather than off any text.
+    assert_eq!(triage["bug_check"]["code"], "0x9f", "{triage}");
+    assert_eq!(
+        triage["bug_check"]["name"], "DRIVER_POWER_STATE_FAILURE",
+        "the name comes from this build's table, so it does not need `!analyze`: {triage}"
+    );
+    let parameters = triage["bug_check"]["parameters"]
+        .as_array()
+        .expect("four parameters");
+    assert_eq!(parameters.len(), 4, "{triage}");
+    // Arg1 is the 0x9F subtype: 3, "a device object has been blocking an IRP for too long".
+    assert_eq!(parameters[0], "0x0000000000000003", "{triage}");
+    for parameter in parameters {
+        assert_eq!(
+            parameter.as_str().map(str::len),
+            Some(18),
+            "one address representation, zero-padded: {triage}"
+        );
+    }
+
+    // The stack walk, attributed to modules from their load bases.
+    let frames = triage["frames"].as_array().expect("some frames");
+    assert!(
+        !frames.is_empty(),
+        "a crash dump has a stack to walk: {triage}"
+    );
+    assert!(frames.len() <= 16, "the default frame cap is 16: {triage}");
+    let top = &frames[0];
+    assert_eq!(top["index"], 0, "{triage}");
+    assert_eq!(
+        top["module"], "nt",
+        "every bug check is topped by the kernel: {triage}"
+    );
+    // The RVA is an offset within the image, so it is unpadded and short — the distinction from
+    // `address`, which is a padded 16-digit target address.
+    let rva = top["rva"].as_str().expect("the top frame has an RVA");
+    assert!(rva.starts_with("0x") && rva.len() < 18, "{triage}");
+    assert_eq!(top["address"].as_str().map(str::len), Some(18), "{triage}");
+    // The frames are consecutive from the innermost outwards.
+    for (position, frame) in frames.iter().enumerate() {
+        assert_eq!(frame["index"], position as u64, "{triage}");
+    }
+
+    // The sample's crash is entirely inside the kernel's watchdog path, so there is no driver
+    // frame to name — and the tool says why rather than blaming `nt!KeBugCheckEx`.
+    if triage["faulting_frame"].is_null() {
+        let note = triage["faulting_frame_note"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no faulting frame has to come with a reason: {triage}"));
+        assert!(note.contains("kernel image"), "{triage}");
+    } else {
+        let faulting = &triage["faulting_frame"];
+        assert_ne!(
+            faulting["module"], "nt",
+            "the faulting frame is the first one *outside* the kernel: {triage}"
+        );
+    }
+
+    // `PROCESS_NAME`, read out of the current `_EPROCESS`. The sample's watchdog fires on an idle
+    // CPU, so the answer is `System` — and the check that matters is that it is *not* the kernel
+    // image, which is what the engine's own `GetCurrentProcessExecutableName` answers on a kernel
+    // target for every process there has ever been.
+    assert_eq!(
+        triage["process_name"], "System",
+        "the crashing process comes from the EPROCESS, not from the loaded kernel image: {triage}"
+    );
+
+    // `!analyze` needs `winext\ext.dll` beside the engine, which CI may not have. Either way the
+    // answer has to be coherent: it ran and says which spelling worked, or it did not and says
+    // why — never silently absent.
+    let analysis = &triage["analysis"];
+    if analysis["ran"] == true {
+        let command = analysis["command"]
+            .as_str()
+            .expect("the command that worked");
+        assert!(
+            command == "!analyze -v" || command == "!ext.analyze -v",
+            "{triage}"
+        );
+        assert_eq!(
+            analysis["parameter_notes"].as_array().map_or(0, Vec::len),
+            4,
+            "`!analyze` explains all four parameters of a 0x9F: {triage}"
+        );
+        assert_eq!(
+            analysis["failure_bucket_id"], "0x9F_3",
+            "the bucket is one of the fields only `!analyze` computes: {triage}"
+        );
+        // The two provenances agree about the process, which is the check that the extraction is
+        // reading the right block rather than something that happens to look like it.
+        assert_eq!(
+            analysis["process_name"], triage["process_name"],
+            "`!analyze`'s PROCESS_NAME and the EPROCESS read must be the same process: {triage}"
+        );
+    } else {
+        assert!(
+            analysis["note"].as_str().is_some_and(|n| !n.is_empty()),
+            "an analysis that did not run has to say why: {triage}"
+        );
+        assert!(analysis["pool_tag"].is_null(), "{triage}");
+    }
+
+    // The text is the other channel and carries the same headline.
+    let text = server.tool_text(
+        "crash_triage",
+        json!({ "session_id": session_id, "analyze": false }),
+        TARGET_STEP,
+    );
+    assert!(
+        text.contains("BUG CHECK: 0x9f DRIVER_POWER_STATE_FAILURE"),
+        "{text}"
+    );
+    assert!(text.contains("STACK ("), "{text}");
+
+    server.tool_data(
+        "end_session",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
     );
 }
 

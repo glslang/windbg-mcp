@@ -242,8 +242,9 @@ gh attestation verify <zip> --repo glslang/windbg-mcp `
 
 - [`docs/crash-dump-walkthrough.md`](docs/crash-dump-walkthrough.md) — triaging a real kernel
   minidump ([`docs/samples/052126-34312-01.dmp`](docs/samples/052126-34312-01.dmp)): a
-  `0x9F DRIVER_POWER_STATE_FAILURE` traced to `nvlddmkm.sys` via `!ext.analyze -v` and a manual
-  device-stack walk, with the real outputs and the partial-minidump (`0x80040205`) gotcha.
+  `0x9F DRIVER_POWER_STATE_FAILURE` traced to `nvlddmkm.sys` — `crash_triage` for the bug check as
+  fields, then `!ext.analyze -v` and a manual device-stack walk for the culprit it cannot name, with
+  the real outputs and the partial-minidump (`0x80040205`) gotcha.
 - [`docs/ttd-walkthrough.md`](docs/ttd-walkthrough.md) — a hands-on tour of the TTD tools against the
   [`xusheng6/TTD_lab`](https://github.com/xusheng6/TTD_lab) `helloworld` sample: opening a `.run`,
   surveying events/threads, forward/reverse navigation, memory analysis, and counting `printf` calls
@@ -269,6 +270,7 @@ gh attestation verify <zip> --repo glslang/windbg-mcp `
 |-------|-------|
 | Session | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `interrupt`, `end_session`, `session_status` |
 | State   | `registers`, `read_memory`, `backtrace`, `modules`, `threads`, `disassemble`, `dx` |
+| Crash   | `crash_triage` — a bug check as fields: code and parameters, crashing process, the stack as `module+RVA`, and the faulting driver frame |
 | Control | `go`, `step_over`, `step_into`, `set_breakpoint`, `run_to_address` |
 | Transaction | `debug_batch` — an ordered sequence with assertions and a rollback the engine process runs on every path |
 | TTD nav | `step_back` (`t-`), `step_over_back` (`p-`), `reverse_go` (`g-`), `goto_position` (`!tt`) |
@@ -525,6 +527,7 @@ matching `outputSchema` in `tools/list`, so a program can read a field instead o
 | `run_to_address` | `verdict` (`hit`/`stopped_elsewhere`/`timeout`), `target`, `stopped_at` |
 | `go`, `step_over`, `step_into`, `step_back`, `step_over_back`, `reverse_go` | `stopped_at` |
 | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics` | the chunks/totals/diagnostics as values, each carrying the `walk` behind them |
+| `crash_triage` | `bug_check` (`code`, `name`, four `parameters`), `process_name`, `frames[]` as `{module, rva, symbol}`, the `faulting_frame` picked out of them — and `!analyze`'s own conclusions kept apart under `analysis` |
 
 Two conventions hold across all of them:
 
@@ -606,8 +609,22 @@ timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressio
   `Unreadable` is the walk's own limit (a Verifier guard page reads that way) and says nothing
   about whether the allocator freed anything. `pool_chunk` also
   reports the **neighbouring** chunks, which is what tells you what a reclaim would land next to. `pool_diagnostics` returns the walk's own diagnostics filtered by substring: a real walk emits tens of thousands across a hundred-plus categories, so any per-call summary truncates and the one line explaining a specific heap is never in the truncated head — filter by a heap address or a phrase to reach it.
+- **`crash_triage` reads a bug check two ways, and keeps them apart.** The code and its parameters
+  (`ReadBugCheckData`), the stack, each frame's module, and the crashing process (out of the current
+  `_EPROCESS`, which is where `!analyze` reads `PROCESS_NAME`) are engine reads. The pool tag, the
+  failure bucket, the blamed module and the per-parameter explanations exist nowhere but `!analyze`'s
+  own output, so they are extracted from it and confined to the `analysis` object. **Prefer
+  `faulting_frame` to `analysis.module_name`**: the frame's `module+RVA` is computed from the load
+  base and is right for a driver with no PDB, which is exactly where `!analyze`'s attribution goes
+  wrong — the text points the disagreement out when there is one. `faulting_frame` is the topmost
+  frame outside `nt`/`hal`; `null` means the whole captured stack is in the kernel image, and
+  `faulting_frame_note` says whether that is the crash or the 16-frame default cap
+  (`frames` raises it, up to 128). `analyze: false` skips `!analyze` for a fast answer of everything
+  else. Needs a kernel target *stopped at a bug check*: a live kernel that has not crashed and a
+  dump that is not a crash dump both report bug check code 0, and say so.
 - **Crash-dump triage uses `!ext.analyze -v`**, not `!analyze` — the bundled engine only resolves
-  the module-qualified form (see *Bundling the WinDbg engine*). On a **partial minidump**, reads of
+  the module-qualified form (see *Bundling the WinDbg engine*). `crash_triage` tries both spellings
+  and reports which worked; a bare `execute` has to pick. On a **partial minidump**, reads of
   pages that weren't captured raise `An unexpected exception was raised (0x80040205)` rather than a
   clean "memory read error"; query the specific field you need (e.g.
   `dt nt!_DRIVER_OBJECT <addr> DriverName`) instead of dumping whole structures. See the

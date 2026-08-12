@@ -13,6 +13,7 @@ mod kdconn;
 mod proto;
 mod server;
 mod structured;
+mod triage;
 mod ttd;
 mod worker;
 

@@ -101,6 +101,15 @@ which DbgEng implements only in user mode, so on a kernel dump it must come back
 carrying the engine's message** — not a JSON-RPC error, and not a dead session. Read-only
 throughout, and it needs no symbols, so it runs offline.
 
+It also triages the dump's bug check (`crash_triage`), which is the one place the tier depends on
+the sample being a *crash* dump rather than any dump: the `0x9F` code and its four parameters read
+through `ReadBugCheckData`, the stack walked and attributed to `nt` by load base, and the crashing
+process read out of the current `_EPROCESS` — asserted as `System`, because the engine's own
+`GetCurrentProcessExecutableName` answers `ntkrnlmp.exe` there for every process that has ever run
+and that regression is invisible in any other check. `!analyze`'s half is checked for coherence
+rather than for having run: a host with no `winext\ext.dll` has to say *why* the analysis is
+missing, not silently omit it.
+
 Those checks are made against **typed fields** wherever a tool has them (issue #84): the handle is
 read from `structuredContent`, not from a `session_id:` line; `nt` and `hal` are matched as module
 records rather than as the third token of a rendered row, which is what used to break on a column

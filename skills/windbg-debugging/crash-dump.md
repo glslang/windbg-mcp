@@ -10,32 +10,49 @@ offending frame. No elevation needed; works on System32's engine.
    (`open_dump` also accepts a `.run` trace, but for TTD use `open_trace` — see
    [ttd.md](ttd.md).)
 
-2. **Auto-analyze.** `execute { "command": "!ext.analyze -v" }`
-   — WinDbg's built-in triage: the exception record, the probable faulting frame, the
-   bugcheck (for kernel dumps), and `FAILURE_BUCKET_ID`. Read this first; it usually names
-   the culprit module and call.
+2. **Triage the bug check.** `crash_triage {}`
+   — for a **kernel** dump (or a live kernel stopped at a bug check), this is the first call:
+   the code and its four parameters, the crashing process, the stack with every frame as
+   `module+RVA`, and the **faulting frame** — the topmost frame outside `nt`/`hal`, which is the
+   driver. It runs `!analyze -v` for you (either spelling — see below) and reports the fields
+   only `!analyze` computes (`pool_tag`, `failure_bucket_id`, the per-parameter explanations)
+   under `analysis`, so you get them without reading ~150 lines.
+   — **Prefer `faulting_frame` over `analysis.module_name`.** The frame is computed from the
+   module's load base and is right even for a driver with no PDB; `!analyze`'s own attribution
+   is a heuristic and is often wrong for exactly those drivers. When the two differ, the text
+   says so.
+   — `crash_triage { "analyze": false }` skips the `!analyze` and answers from engine reads
+   alone — fast, and it still names the bug check and the driver frame.
+   — `faulting_frame: null` means every captured frame is in the kernel image;
+   `faulting_frame_note` says whether that is the crash or the frame cap
+   (`crash_triage { "frames": 64 }` if it is the cap).
+
+3. **Auto-analyze in full**, for the parts the triage summary leaves out (the exception record
+   on a user-mode dump, the rendered stack, the hypervisor/blackbox detail):
+   `execute { "command": "!ext.analyze -v" }`
    — **Use the module-qualified `!ext.analyze`, not bare `!analyze`.** `open_dump` auto-runs
    `.load ext`, but this engine only resolves the qualified form; bare `!analyze` returns
    *"No export analyze found"*. If even `!ext.analyze` says that, the `winext\` extensions
-   aren't bundled — see [setup.md](setup.md).
+   aren't bundled — see [setup.md](setup.md). (`crash_triage` tries both spellings itself and
+   reports which one worked.)
    — When `!ext.analyze` leaves `MODULE_NAME: Unknown_Module` (common for power/IRP bugchecks
    like `0x9F`), name the driver yourself from the bugcheck args by walking the device stack —
-   see step 6.
+   see step 7.
 
-3. **Locate the faulting context.** `threads {}` (`~`) to see all threads; `!ext.analyze -v`
+4. **Locate the faulting context.** `threads {}` (`~`) to see all threads; `!ext.analyze -v`
    already switches to the faulting thread. Confirm with `registers {}`.
 
-4. **Read the stack.** `backtrace {}` (`k`). If frames show `module!name` you have symbols;
+5. **Read the stack.** `backtrace {}` (`k`). If frames show `module!name` you have symbols;
    if not, set up symbols (see [setup.md](setup.md)) and `execute { "command": ".reload /f" }`,
    then `backtrace {}` again.
 
-5. **Inspect the crash site.**
+6. **Inspect the crash site.**
    - `disassemble {}` at the current IP, or `disassemble { "address": "module!func" }`.
    - `read_memory { "address": "0x...", "size": 64 }` for a hex dump (numeric/hex address
      only — for a register expression use `execute { "command": "db @rsp" }`).
    - `execute { "command": "dt module!_STRUCT <addr>" }` to format a structure.
 
-6. **Name the driver by hand when `!ext.analyze` can't** (e.g. `0x9F`
+7. **Name the driver by hand when `!ext.analyze` can't** (e.g. `0x9F`
    `DRIVER_POWER_STATE_FAILURE`). The bugcheck args hand you the device object and the blocked
    IRP; walk to the owning driver by *field*, not by dumping whole structs (see the pitfall
    below):

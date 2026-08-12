@@ -56,6 +56,7 @@ use crate::server::{
     parse_windbg_addr, path_recipe, reachability,
 };
 use crate::structured;
+use crate::triage::{self, Analysis, AttributedFrame};
 
 /// The argument that turns this executable into a worker. Not a documented CLI: the supervisor
 /// re-executes itself with it, and nothing else should.
@@ -1078,6 +1079,17 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             timeout_ms,
         } => run_to_address(e, &address, timeout_ms),
         EngineOp::Reachability(args) => reachable(e, args).map(Output::text).map_err(Failed::from),
+        EngineOp::CrashTriage {
+            frames,
+            analyze,
+            patience_ms,
+        } => crash_triage(
+            e,
+            frames as usize,
+            analyze,
+            Duration::from_millis(u64::from(patience_ms)),
+            queued,
+        ),
         // The caller's own deadline, on the same arithmetic as a bounded command's: a walk that
         // outlives its caller holds this session against nobody. Taking win-kexp's default instead
         // was wrong in both directions — see [`EngineOp::Pool`].
@@ -1265,6 +1277,156 @@ fn modules(e: &DebugEngine) -> Result<Output, Failed> {
             modules: modules.iter().map(structured::ModuleInfo::from).collect(),
         },
     ))
+}
+
+/// Everything a bug check is, gathered as one indivisible job.
+///
+/// Six engine reads and (optionally) one command. They are one op because the frames and the
+/// module bases they are turned into RVAs against have to describe the *same* target: interleave
+/// another call for this session between the walk and the attribution and the offsets are
+/// computed against bases that have moved, which is the one number this tool exists to get right.
+///
+/// **Only the bug check itself can fail this call.** A crash with no readable stack, no nameable
+/// process or no `!analyze` is still a crash, and reporting "the process name could not be read"
+/// as a failed triage would throw away the code, the parameters and everything else the dump did
+/// give up. So each of those comes back as an absent field, and the report says so.
+fn crash_triage(
+    e: &DebugEngine,
+    frames: usize,
+    analyze: bool,
+    patience: Duration,
+    queued: Duration,
+) -> Result<Output, Failed> {
+    let bug_check = match e.bug_check() {
+        Ok(Some(bug_check)) => bug_check,
+        // A kernel target that did not bug check. Both cases are named because they want opposite
+        // responses: a live kernel simply has not crashed *yet*, and a dump that is not a crash
+        // dump never will.
+        Ok(None) => {
+            return Err(Failed::categorised(
+                structured::ErrorCategory::Debugger,
+                "this target is not stopped at a bug check: the engine reports bug check code 0. \
+                 A live kernel reads this way until it actually crashes — leave the session open, \
+                 `go`, and triage it once it does. A dump reads this way when it is not a crash \
+                 dump (a live-system or hand-written dump), and nothing will change that.",
+            ));
+        }
+        // The engine has no bug check data to read at all, which on a user-mode target is not a
+        // failure of this call so much as the wrong question — said plainly, because "reading the
+        // target's bug check data failed: 0x80004005" is not.
+        Err(why) => {
+            let user_mode = matches!(e.is_kernel_target(), Ok(false));
+            return Err(Failed::categorised(
+                structured::ErrorCategory::Debugger,
+                if user_mode {
+                    "this is a user-mode session, which has no bug check: `crash_triage` reads \
+                     the kernel bug check data a crash dump or a bug-checked live kernel carries. \
+                     For a user-mode crash use `backtrace` for the stack and \
+                     `execute {\"command\": \"!analyze -v\"}` for the exception."
+                        .to_string()
+                } else {
+                    format!("the target's bug check data could not be read: {why}")
+                },
+            ));
+        }
+    };
+
+    // Best-effort from here on. A stack walk that fails leaves no frames, which the report renders
+    // as "no faulting frame" with the reason — strictly more than a failed call would say.
+    let walked = e.stack_frames(frames).unwrap_or_else(|why| {
+        tracing::debug!("worker: crash triage could not walk the stack: {why}");
+        Vec::new()
+    });
+    // A walk that came back exactly full is the only evidence there is that the stack went on:
+    // `GetStackTrace` fills the buffer and says how much, not how much it left. Reported as "may
+    // be truncated" rather than resolved by walking again one frame deeper, because the answer
+    // only changes what a caller does when there is no driver frame — and then re-asking with a
+    // larger `frames` is the same work done once instead of on every triage.
+    let truncated = walked.len() == frames;
+    let attributed: Vec<AttributedFrame> = walked
+        .into_iter()
+        .map(|frame| AttributedFrame {
+            module: e.module_at(frame.instruction_offset).unwrap_or(None),
+            frame,
+        })
+        .collect();
+    let process_name = e
+        .current_process_name()
+        .ok()
+        .filter(|name| !name.trim().is_empty());
+
+    let analysis = if analyze {
+        run_analyze(e, patience, queued)
+    } else {
+        Analysis::NotRequested
+    };
+
+    let report = triage::report(bug_check, &attributed, truncated, process_name, analysis);
+    Ok(Output::typed(triage::render(&report), report))
+}
+
+/// Runs `!analyze -v`, whichever spelling this engine resolves.
+///
+/// The bundled minimal engine does not resolve the unqualified `!analyze` even after `.load ext`
+/// — only the module-qualified `!ext.analyze` does — while a full WinDbg install resolves both.
+/// So the plain form is tried first and the qualified one is the fallback, and which one worked
+/// is reported rather than assumed.
+///
+/// Both attempts share **one** deadline. Giving each the caller's full patience would let a slow
+/// first attempt plus a slow second one overrun the caller twice over, which is the arithmetic
+/// [`crate::batch`] does per step for the same reason.
+fn run_analyze(e: &DebugEngine, patience: Duration, queued: Duration) -> Analysis {
+    let started = Instant::now();
+    let mut last: Option<String> = None;
+    for command in ["!analyze -v", "!ext.analyze -v"] {
+        let budget = watchdog_budget_ms(patience, queued.saturating_add(started.elapsed()));
+        match e.execute_command_bounded(command, budget) {
+            // An engine without the extension answers with "No export analyze found" and an
+            // otherwise empty result, which is a *successful* command that analysed nothing — so
+            // emptiness, not the HRESULT, is what decides whether to try the other spelling.
+            Ok(run) if looks_analysed(&run.output) => {
+                return Analysis::Ran {
+                    command: command.to_string(),
+                    output: run.output,
+                };
+            }
+            Ok(run) => {
+                last = Some(format!(
+                    "`{command}` returned no analysis: {}",
+                    brief(&run.output)
+                ))
+            }
+            Err(why) => last = Some(format!("`{command}` failed: {why}")),
+        }
+    }
+    Analysis::Unavailable(format!(
+        "`!analyze -v` could not be run, so the pool tag and failure bucket are missing; \
+         everything else here is read from the engine and is unaffected. Neither spelling \
+         worked — the engine most likely has no `winext\\ext.dll` beside it (see the README's \
+         engine setup). Last attempt: {}",
+        last.unwrap_or_else(|| "no output".to_string())
+    ))
+}
+
+/// Whether output is an analysis rather than the engine declining to run one.
+///
+/// `!analyze` on an engine with no extension DLL prints a one-line "No export analyze found" and
+/// nothing else, so the test is for the summary block every real analysis has: the `Arguments:`
+/// list, or one of the `KEY:  value` lines the fields are taken from.
+fn looks_analysed(output: &str) -> bool {
+    output.contains("Arguments:")
+        || output.contains("BUGCHECK_CODE:")
+        || output.contains("Bugcheck Analysis")
+}
+
+/// A one-line rendering of output that was not what was wanted, for a note about it.
+fn brief(output: &str) -> String {
+    let line = output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("(no output)");
+    line.chars().take(160).collect()
 }
 
 /// Sets a breakpoint and reports what the session holds afterwards.
