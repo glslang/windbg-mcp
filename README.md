@@ -187,8 +187,8 @@ knows how to drive it (setup, crash-dump, live/kernel, and TTD playbooks).
 ```
 
 The plugin ships source, not a binary, so after installing you still put the server binary in
-place — download a prebuilt release or build from source — and (for `.run` replay and
-crash-dump `!analyze`) bundle the WinDbg engine — the skill's `setup.md`
+place — download a prebuilt release or build from source — and (for `.run` replay, crash-dump
+`!analyze`, and the kernel driver tools) bundle the WinDbg engine — the skill's `setup.md`
 walks through it, and it mirrors the [*Build or download*](#build-or-download) and
 [*Bundling the WinDbg engine*](#bundling-the-windbg-engine) sections above. Then `/reload-plugins`
 to connect the server. The plugin points at `${CLAUDE_PLUGIN_ROOT}/target/release/windbg-mcp.exe`.
@@ -202,9 +202,11 @@ downloads that release's `.mcpb` bundle, verifies its SHA-256, and wires up the 
 inside it as an stdio server, with no Rust build or manual binary placement.
 
 The bundle is **Windows x64 only** and ships just the server binary, so the one-time engine setup
-still applies — for TTD `.run` replay and crash-dump `!analyze`, drop the WinDbg engine DLLs next
-to the client-extracted `windbg-mcp.exe` (the skill's `setup.md` covers it). Basic live and
-crash-dump work runs on the in-box `System32` engine without them.
+still applies — for TTD `.run` replay, crash-dump `!analyze`, and the
+`driver_object`/`device_object`/`irp_stack` tools, drop the WinDbg engine DLLs next to the
+client-extracted `windbg-mcp.exe` (the skill's `setup.md` covers it). Basic live and crash-dump
+work runs on the in-box `System32` engine without them — a kernel attach included, but not those
+three tools, which need `winxp\kdexts.dll`.
 
 ### Releasing
 
