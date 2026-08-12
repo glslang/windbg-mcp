@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- README's engine-bundling section now copies **`winxp\kdexts.dll`**, which it had never listed
+  even though `attach_kernel` auto-`.load`s it: without that file `driver_object` /
+  `device_object` / `irp_stack` fail with *"No export drvobj found"*. The skill's `setup.md` and
+  the driver-IOCTL docs already had it, so the README was the odd one out.
+
 ## [0.7.0] - 2026-08-12
 
 ### Added
