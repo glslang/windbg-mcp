@@ -864,6 +864,130 @@ pub struct DiagnosticCategory {
     pub total: usize,
 }
 
+/// What `crash_triage` read off a bug check.
+///
+/// **Two provenances, kept apart on purpose.** Everything outside [`Self::analysis`] is read from
+/// the engine as values — `ReadBugCheckData`, a stack walk, the module table, the current
+/// process — and is as reliable as the dump. [`Self::analysis`] is `!analyze -v`'s own
+/// conclusions, which are a heuristic: useful, occasionally wrong, and the reason the frames here
+/// are attributed to modules independently rather than taken from it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CrashTriage {
+    pub bug_check: BugCheckInfo,
+    /// The process the crashing context was in — `PROCESS_NAME`, read through the engine rather
+    /// than off `!analyze`. Absent when the engine could not name it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+    /// The topmost frame outside the kernel image and the HAL — in a driver bug, the driver.
+    ///
+    /// `None` when every captured frame is in `nt`/`hal`, which is a real answer (the bug is in
+    /// the kernel's own path, or the stack did not reach the culprit) and not a failure;
+    /// [`Self::faulting_frame_note`] says which, and [`Self::frames`] is the whole walk either
+    /// way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub faulting_frame: Option<FrameInfo>,
+    /// Why there is no [`Self::faulting_frame`], when there is none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub faulting_frame_note: Option<String>,
+    /// The crashing thread's stack, innermost first, capped by the call's `frames` argument.
+    pub frames: Vec<FrameInfo>,
+    /// Whether the walk stopped at that cap rather than at the end of the stack — so there may be
+    /// more frames, and a `faulting_frame` of `null` may be an artefact of the cap rather than a
+    /// fact about the crash. Raise `frames` and ask again.
+    pub frames_truncated: bool,
+    pub analysis: AnalysisInfo,
+}
+
+/// The bug check itself, exactly as the engine reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BugCheckInfo {
+    /// The code, `0x`-prefixed and lowercase — `"0x9f"`, `"0x13a"`. Not zero-padded: this is a
+    /// small enumerated value, not an address, and `0x9f` is how every bug check reference,
+    /// the blue screen and `!analyze` all spell it.
+    pub code: String,
+    /// The bug check's name, where this build knows the code or `!analyze` printed it —
+    /// `"DRIVER_POWER_STATE_FAILURE"`. Absent for a code neither could name; [`Self::code`] is
+    /// still the answer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// `Arg1`..`Arg4`, always four, in the order the bug check screen prints them. Addresses by
+    /// convention (padded, lowercase) because that is what most of them are; what each *means*
+    /// is per-code, and `analysis.parameter_notes` carries `!analyze`'s explanation when it ran.
+    pub parameters: Vec<String>,
+}
+
+/// One stack frame, named two ways.
+///
+/// `symbol` is what the debugger resolves; `module` + `rva` is what it can always compute. The
+/// second is the point of this tool: a driver with no PDB has no `symbol` at all, and a bug check
+/// in one is identified by the offset into its image — which is stable across reboots, unlike the
+/// load address it was computed from.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct FrameInfo {
+    /// Position in the walk; 0 is where the target is stopped.
+    pub index: u32,
+    /// The instruction this frame is executing at.
+    pub address: String,
+    /// The module holding [`Self::address`], or absent if it is in none (unloaded driver, pool).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+    /// The offset of [`Self::address`] from that module's load base — the `1654` in
+    /// `MessageManager+0x1654`. `0x`-prefixed and lowercase, and *not* padded: an offset within
+    /// an image is not an address, and this is the form that can be pasted after `module+`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rva: Option<String>,
+    /// `module!Symbol` as the debugger resolves it, or absent when nothing resolves.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+    /// How far past [`Self::symbol`] the instruction is, when there is a symbol. Unpadded, like
+    /// [`Self::rva`], and for the same reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub displacement: Option<String>,
+}
+
+/// What `!analyze -v` concluded, kept separate from the values above because it is a heuristic.
+///
+/// Every field is `!analyze`'s own, extracted from its summary block. They are here because they
+/// are the ones no API answers — most of all the pool tag, which `!analyze` recovers from the
+/// header of the chunk a pool bug check is about.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AnalysisInfo {
+    /// Whether `!analyze -v` ran and produced output. `false` is ordinary rather than a failure:
+    /// the call may have asked for `analyze: false`, or the engine may have no extensions.
+    pub ran: bool,
+    /// Which spelling produced it — `!analyze -v`, or `!ext.analyze -v` on an engine where the
+    /// unqualified form does not resolve.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The bug check's name off `!analyze`'s own header line. Beside `bug_check.name` rather than
+    /// merged into it: that field prefers this build's table, and falls back to this one only for
+    /// a code the table does not know.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bug_check_name: Option<String>,
+    /// The pool tag `!analyze` blamed (`FREED_POOL_TAG`, or `POOL_TAG` where it names one).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pool_tag: Option<String>,
+    /// `FAILURE_BUCKET_ID` — the bucket this crash would be grouped under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_bucket_id: Option<String>,
+    /// `MODULE_NAME`, `!analyze`'s guess at the culprit. Compare it with `faulting_frame`: for a
+    /// driver without a PDB the two disagree often enough that the frame is the one to trust.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module_name: Option<String>,
+    /// `IMAGE_NAME`, the image behind [`Self::module_name`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_name: Option<String>,
+    /// `PROCESS_NAME` as `!analyze` printed it, beside the engine's own answer above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+    /// `!analyze`'s explanation of each bug check parameter, in `Arg1`..`Arg4` order. Empty when
+    /// it did not run or printed none.
+    pub parameter_notes: Vec<String>,
+    /// Why the analysis is missing or incomplete, when it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -137,6 +137,28 @@ pub enum EngineOp {
         query: PoolOp,
         patience_ms: u32,
     },
+    /// Everything a bug check is, in one job: the code and its four parameters, the crashing
+    /// stack with each frame attributed to a module, the process — and, when `analyze` is set,
+    /// `!analyze -v`'s own conclusions beside them ([`crate::triage`]).
+    ///
+    /// Indivisible for the usual reason and one more. The usual one: it is half a dozen engine
+    /// calls, and a stack walk whose module attribution came from a target that moved in between
+    /// would report frames against the wrong load bases — which is the single field this tool
+    /// exists to get right. The extra one: `analyze` is a *command*, so the caller's patience has
+    /// to be spent across the gathering and the analysis together, and only one side of the pipe
+    /// can do that arithmetic.
+    ///
+    /// `patience_ms` is the caller's remaining patience, filled in exactly as
+    /// [`Self::BoundedCommand`]'s is. It bounds the `!analyze` only — the typed reads are bounded
+    /// by the dump, not by a watchdog — so a triage that runs out of clock still answers with
+    /// everything the engine gave it and an analysis that says why it is missing.
+    CrashTriage {
+        /// How many stack frames to walk. Bounded by the supervisor before it gets here.
+        frames: u32,
+        /// Whether to run `!analyze -v` at all.
+        analyze: bool,
+        patience_ms: u32,
+    },
     /// A whole transaction: ordered steps, their assertions, and the rollback block that runs
     /// whatever happens to them ([`crate::batch`]).
     ///
@@ -204,6 +226,7 @@ impl EngineOp {
         match self {
             Self::BoundedCommand { patience_ms, .. }
             | Self::Pool { patience_ms, .. }
+            | Self::CrashTriage { patience_ms, .. }
             | Self::Batch(BatchOp { patience_ms, .. }) => Some(patience_ms),
             _ => None,
         }

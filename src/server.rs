@@ -1445,6 +1445,33 @@ pub struct PoolDiagnosticsArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct CrashTriageArgs {
+    /// How many stack frames to walk (default 16, maximum 128). The default reaches past the
+    /// kernel's own bug-check path to the driver frame on every crash seen so far; raise it for a
+    /// deep stack where it does not.
+    #[serde(default)]
+    pub frames: Option<u32>,
+    /// Run `!analyze -v` and report its conclusions beside the engine's values (default true).
+    /// It is what supplies the pool tag, the failure bucket and the per-parameter explanations,
+    /// and it is also the slow part — set false for a fast answer of code, parameters and frames.
+    #[serde(default)]
+    pub analyze: Option<bool>,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// The most frames `crash_triage` will walk, and its default.
+///
+/// The cap is not about cost — a stack walk is cheap — but about the answer staying readable: a
+/// triage is a summary, and a caller who wants the whole stack of a 200-frame recursion wants
+/// `backtrace`. The default is deep enough to clear the kernel's bug-check preamble (`KeBugCheckEx`
+/// over `KiBugCheckDispatch` over a fault handler over the allocator) and reach the driver.
+const MAX_TRIAGE_FRAMES: u32 = 128;
+const DEFAULT_TRIAGE_FRAMES: u32 = 16;
+
+#[derive(Deserialize, JsonSchema)]
 pub struct DriverObjectArgs {
     /// Driver object name, e.g. "mydriver" or "\\Driver\\mydriver".
     pub name: String,
@@ -2213,6 +2240,46 @@ impl WindbgServer {
             .run(
                 args.session_id.as_deref(),
                 pool_op(PoolOp::census(args.refresh, args.limit)),
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Summarise a bug check: the code and its four parameters, the crashing process, the stack
+    /// with every frame as `module+RVA`, and the faulting driver frame picked out of it — the
+    /// handful of fields `!analyze -v` buries in ~150 lines.
+    /// Works on a kernel crash dump and on a live kernel that has bug checked.
+    /// The frames are attributed to modules from the engine's own load bases, so a driver with no
+    /// PDB is still named `MessageManager+0x1654` — an offset that is comparable across reboots
+    /// and does not depend on `!analyze`'s attribution, which for such a driver is often wrong.
+    /// `!analyze`'s own conclusions (pool tag, failure bucket, blamed module) travel beside them
+    /// under `analysis`, so the two can be compared; pass `analyze: false` to skip it.
+    #[rmcp::tool(
+        annotations(
+            title = "Triage a bug check",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::CrashTriage>>()
+    )]
+    async fn crash_triage(
+        &self,
+        Parameters(args): Parameters<CrashTriageArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::CrashTriage {
+                    frames: args
+                        .frames
+                        .unwrap_or(DEFAULT_TRIAGE_FRAMES)
+                        .clamp(1, MAX_TRIAGE_FRAMES),
+                    analyze: args.analyze.unwrap_or(true),
+                    // Filled in by the supervisor's pump, like every other op that carries one.
+                    patience_ms: 0,
+                },
             )
             .await;
         engine_result_for(args.session_id.as_deref(), out)
