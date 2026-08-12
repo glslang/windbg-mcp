@@ -321,8 +321,9 @@ and Flush to the instruction shows the real bug and the real lever:
   exact free-with-node the arbitrary-free needs.
 - The window is a handful of instructions, so the win is **statistical**. Widening SetData's `memcpy`
   is a dead end — the driver rejects `Length > 0x2FF4`, so a large buffer silently no-ops the call.
-  The lever is **volume**: every earlier harness raced one cross-move per message (tens to low
-  hundreds of attempts); the win needs millions.
+  The lever is **sustained hammering**: every earlier harness performed one cross-move per message
+  and then moved on, so the race got tens to low hundreds of isolated attempts. What it needs is a
+  loop that keeps cross-moving the *same* messages against a Flush that keeps walking the list.
 
 The `drift` mode (`examples/messagemanager/mm_exploit.c`) seeds a small set of messages and loops
 `SetData(→large)/SetData(→small)` cross-moves on them while `Flush(small)` and `Flush(large)`
@@ -341,6 +342,17 @@ from user mode — three independent minidumps, same signature. The guest auto-r
 dump, so reading it *is* the debugger-free proof: nothing was attached when it fired. So the last KD
 dependency §7 carried — *the trigger* — is gone.
 
+**How often does it win? Measured rather than estimated: 28 consecutive runs, 28 bugchecks.** Two
+configurations, both saturated — the default (64 messages, 20-second window) at 16/16, and the
+smallest the harness accepts, `drift 1 1 1`, a **single** message raced for **one second**, at 12/12.
+Time from process launch to bugcheck was 0.61–0.63 s in nearly every run and *identical* for one
+message and sixty-four, which means it is measuring process startup, not the race; once the threads
+are running the win lands within milliseconds. Two things follow. First, "volume" is about sustained
+attempts, not a large target set: one message hammered for one second is enough. Second, a saturated
+rate can show that a change did not regress the race, but it can never show that two variants differ
+— for that the window would have to drop below a second or the loop be throttled, and the harness
+exposes neither.
+
 **What is still debugger-assisted is only the *cleanliness* of the fire, and that turns out to be a
 genuine constraint, not a budget shortfall.** A weaponized arbitrary free wants the freed pointer to
 be an attacker-*chosen* value (plant `0x4242…` into the freed slot via the §6 `IoSB` reclaim, then
@@ -355,6 +367,22 @@ but never the clean `0x4242` ordering. That ordering is exactly what KD buys in 
 over *when* the free happens relative to the reclaim. Harness modes `drift` (winnability proof),
 `driftfire` (safe single-pass toward a controlled Delete), and `driftarb` (continuous race + planted
 `0x4242` reclaim) are all in `mm_exploit.c`.
+
+A further presentation turned up during the 28-run batch, and it is the one worth knowing before you
+triage a dump from this race:
+
+```text
+KERNEL_MODE_HEAP_CORRUPTION (13a)   Arg1 = 0x11        ; not the usual 0x8
+nt!RtlpHpLfhSubsegmentDelayFreeListProcess
+nt!RtlpHpLfhOwnerCompact → nt!ExpHpCompactionRoutine → nt!ExpWorkerThread
+PROCESS_NAME: System                ; mm_exploit.exe had already exited
+```
+
+This is LFH *maintenance* tripping over the corrupt subsegment asynchronously, on a system worker
+thread, after the harness process is gone — same root cause, later detection point. The trap is that
+**`MessageManager` appears nowhere in the stack**, so the obvious reading is "unrelated crash, some
+other bug". It is not: a corrupted subsegment outlives the process that corrupted it, and the heap
+gets to it on its own schedule.
 
 The boundary has moved twice now: from "reclaim needs KD" (§6 removed it) to "the trigger needs KD"
 to **"the trigger and both primitives fire debugger-free; only the clean *chosen-target ordering*
@@ -518,7 +546,20 @@ so the loop is deliberately KD-free and reads the crash afterwards:
 5. **Classify the crash from the minidump, not a live break-in.** The bugcheck code plus the top
    `MessageManager+RVA` frame is enough to tell an intended fire (`SetData`'s `ExFreePoolWithTag`,
    `+0x1654`) from an incidental one (Flush's unlink AV, `+0x14e9`; a `Tfub` LFH double-free at
-   `+0x1668`).
+   `+0x1668`). **An absent driver frame does not mean an unrelated crash:** the `0x13A`/`Arg1=0x11`
+   variant is raised from `RtlpHpLfhSubsegmentDelayFreeListProcess` on a *system worker thread* with
+   `PROCESS_NAME: System`, because LFH compaction reached the corrupt subsegment after the harness
+   exited. Check the bugcheck arguments and the `RtlpHp*` frame before discarding a dump.
+6. **Take the crash instant from the dump, not from host-side polling.** The dump's own `.time`
+   ("Debug session time") is the moment of the bugcheck, rendered in the *debugger host's* timezone;
+   subtract the launch timestamp for a real time-to-crash. Polling a TCP port to notice the guest
+   going down is unreliable — a fast crash-and-reboot cycle can fit entirely between two probes and
+   read as a successful run. Diff `C:\Windows\Minidump` and compare `LastBootUpTime` instead; the
+   dump directory rotates (five files here), so copy each dump off before the next run, and match by
+   crash timestamp rather than filename, since names are reused.
+7. **Anything written to the guest seconds before the bugcheck is lost.** NTFS never flushes it, so a
+   helper script created just before the run is gone after the reboot and the *next* run silently
+   does nothing. Write helpers first, `Write-VolumeCache -DriveLetter C`, then verify they exist.
 
 ## Gotchas recap
 
