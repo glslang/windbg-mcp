@@ -65,8 +65,24 @@ fn typed_error(
     let structured: Outcome<()> = Outcome::failed_in(category, message.clone(), session_id);
     Ok(with_structured(
         CallToolResult::error(vec![ContentBlock::text(message)]),
-        serde_json::to_value(structured).ok(),
+        payload(structured),
     ))
+}
+
+/// Serializes a structured payload, saying so if it cannot.
+///
+/// A tool that declares an `outputSchema` and answers with text alone is a contract broken, and
+/// silently: the client sees a schema-bearing tool return nothing to validate and has nothing to
+/// go on. It cannot happen — these are plain data types — which is exactly why the one place it
+/// could must not swallow it. [`Output::typed`] logs the same failure on the worker's side.
+fn payload<T: serde::Serialize>(value: T) -> Option<serde_json::Value> {
+    match serde_json::to_value(value) {
+        Ok(value) => Some(value),
+        Err(error) => {
+            tracing::error!("structured payload did not serialize: {error}");
+            None
+        }
+    }
 }
 
 /// Attaches structured content to a result, if there is any.
@@ -94,7 +110,7 @@ fn outcome_result<T: serde::Serialize>(
 ) -> Result<CallToolResult, ErrorData> {
     Ok(with_structured(
         CallToolResult::success(vec![ContentBlock::text(text)]),
-        serde_json::to_value(outcome).ok(),
+        payload(outcome),
     ))
 }
 
@@ -163,7 +179,7 @@ fn open_failure(
     });
     Ok(with_structured(
         CallToolResult::error(vec![ContentBlock::text(message)]),
-        serde_json::to_value(structured).ok(),
+        payload(structured),
     ))
 }
 
@@ -180,13 +196,7 @@ fn open_failure(
 /// and the failure's category otherwise. A tool with no typed shape yet simply has none, and is
 /// unchanged.
 fn engine_result(r: Result<Output, EngineError>) -> Result<CallToolResult, ErrorData> {
-    match r {
-        Ok(out) => Ok(with_structured(
-            CallToolResult::success(vec![ContentBlock::text(out.text)]),
-            out.data,
-        )),
-        Err(e) => typed_error(ErrorCategory::of(&e), e.to_string(), None),
-    }
+    engine_result_for(None, r)
 }
 
 /// [`engine_result`] for a call that named a session, so a failure can say which one it was.
@@ -4045,6 +4055,44 @@ mod tests {
             r.content.first().and_then(|c| c.as_text()).map(|t| &t.text),
             Some(&"`sess-7` was retired".to_string())
         );
+    }
+
+    /// A failed open says whether a target exists, because that is what decides the next move.
+    ///
+    /// The most consequential field in this PR: `no` means opening again is the recovery, `yes`
+    /// means it would attach a second time or start a second process, and `pending` means the
+    /// open is still running. A future edit that returned the wrong one here would invert the
+    /// advice while every other assertion stayed green — the text carries the same distinction,
+    /// but only in prose, which is what this replaces.
+    #[test]
+    fn a_post_commit_open_failure_reports_that_a_target_exists() {
+        let r = open_failure(
+            ErrorCategory::Debugger,
+            "the target never broke in".to_string(),
+            Some("sess-3".to_string()),
+            TargetCreated::Yes,
+        )
+        .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        let structured = r
+            .structured_content
+            .expect("a failed open is structured too");
+        assert_eq!(structured["status"], "error");
+        assert_eq!(structured["target"], "yes");
+        assert_eq!(structured["error"]["session_id"], "sess-3");
+
+        // And the clean case says the opposite, which is the pair that matters: these two
+        // failures read alike and want opposite responses.
+        let clean = open_failure(
+            ErrorCategory::Debugger,
+            "the dump could not be opened".to_string(),
+            None,
+            TargetCreated::No,
+        )
+        .unwrap();
+        let clean = clean.structured_content.expect("structured");
+        assert_eq!(clean["target"], "no");
+        assert!(clean["error"].get("session_id").is_none());
     }
 
     /// The typed half of a success is the worker's, forwarded rather than re-derived.

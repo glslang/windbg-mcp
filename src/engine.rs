@@ -190,6 +190,11 @@ pub enum EngineError {
     /// report back. Distinct from [`Self::Timeout`] in the way that matters: nothing ran, so
     /// nothing changed, and a retry is unambiguous.
     NotRun(String),
+    /// The **worker** refused the call on its arguments, before the debugger saw them — an
+    /// address that will not parse, say. The same class of mistake this server rejects on its own
+    /// side, and it has to read the same way from both: a caller told "the debugger failed" for a
+    /// malformed argument goes looking at the target.
+    InvalidArgument(String),
 }
 
 // Note what is *not* here any more: an "engine is unusable" variant. Under process-per-session
@@ -207,7 +212,8 @@ impl fmt::Display for EngineError {
             | Self::Stale(m)
             | Self::Lost(m)
             | Self::Interrupted(m)
-            | Self::NotRun(m) => f.write_str(m),
+            | Self::NotRun(m)
+            | Self::InvalidArgument(m) => f.write_str(m),
         }
     }
 }
@@ -215,13 +221,19 @@ impl fmt::Display for EngineError {
 /// Lifts a worker's failure into this side's error type, keeping the kind the worker named.
 ///
 /// The default is [`EngineError::Debugger`], because for almost every op that is what a failure
-/// is. The two exceptions are the ones the worker can see and the supervisor cannot: an operation
-/// that was interrupted, and one that was never started for want of budget.
+/// is. The exceptions are the kinds the worker can tell apart and the supervisor cannot: an
+/// operation that was interrupted, one that was never started for want of budget, and one refused
+/// on its arguments before the debugger ever saw them.
+///
+/// Every named category gets a variant rather than being folded into the default. Folding is how
+/// a category becomes decorative: the worker went to the trouble of saying "this was the caller's
+/// mistake, not the target's", and a `_` arm here quietly restates it as the target's.
 fn engine_error(failed: crate::proto::Failed) -> EngineError {
     use crate::structured::ErrorCategory;
     match failed.category {
         Some(ErrorCategory::Interrupted) => EngineError::Interrupted(failed.message),
         Some(ErrorCategory::NotRun) => EngineError::NotRun(failed.message),
+        Some(ErrorCategory::InvalidArgument) => EngineError::InvalidArgument(failed.message),
         _ => EngineError::Debugger(failed.message),
     }
 }

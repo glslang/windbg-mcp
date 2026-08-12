@@ -17,7 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `allocation(s)`, on module-name substrings and on the exact spelling of the `session_id:` line —
   which means a rewording here broke automation there without any debugger behaviour changing at
   all. Twenty-two tools now return the same text **and** a typed result beside it, with a schema in
-  `tools/list` describing it. The text is unchanged: this adds a channel rather than replacing one.
+  `tools/list` describing it. The text is unchanged with one exception, which is an improvement
+  rather than a break: a successful `bp` prints nothing at all, so `set_breakpoint` used to answer
+  with an empty string and now renders the breakpoints the session holds beneath the command's own
+  (usually empty) output.
 
   What is typed, and why each one earns it: an opener's `session_id` (previously recoverable only
   by finding a line in the report) and, when an open fails, **whether a target was created** — the

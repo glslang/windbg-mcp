@@ -12,8 +12,10 @@ to parse it — `VERDICT: HIT`, `allocation(s)`, the `session_id:` line at the f
 report. A rewording here broke automation elsewhere with no debugger behaviour changing at all.
 
 **Decision.** The tools in #84 return the same text **and** MCP `structuredContent`, with an
-`outputSchema` in `tools/list`. The text is byte-for-byte what it was: adding a channel, not
-migrating one. A tool with no typed shape yet carries none, and is untouched.
+`outputSchema` in `tools/list`. The text is byte-for-byte what it was — adding a channel, not
+migrating one — with one deliberate exception: `set_breakpoint`, whose success case printed the
+empty string, now renders the breakpoints the session holds. A tool with no typed shape yet carries
+none, and is untouched.
 
 **One schema covers both outcomes.** Every result is internally tagged on `status` (`"ok"` /
 `"error"`), so a failure conforms to the same schema a success does. The alternative — structured

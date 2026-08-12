@@ -1696,6 +1696,13 @@ fn render_walk_report(report: &query::PoolSnapshotReport) -> String {
 /// rendering below carries how much of the pool the walk reached — so the cost of a short deadline
 /// is coverage, not an error.
 fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Failed> {
+    // `within` is a duration, and the walk report below is read *after* the query has spent most
+    // of it — so handing it `within` again would grant a second full-length walk (which is a real
+    // possibility, not a theoretical one: an incomplete snapshot is not cached, so the report can
+    // find nothing to read and start one). Anchored to a deadline here, and what is left of it is
+    // what the report gets.
+    let started = Instant::now();
+    let left = move || within.saturating_sub(started.elapsed());
     let walk = |refresh: bool| PoolWalk::from(refresh).within(within);
     match args {
         PoolOp::FindTag {
@@ -1715,7 +1722,7 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
             let mut out = render_find_tag(&tag, filter, &spans, limit);
             // Reads the snapshot `find_tag` has just taken or reused — hence `refresh: false`,
             // which cannot start a walk of its own whatever budget this query had.
-            let report = walk_report(e, within);
+            let report = walk_report(e, left());
             if spans.is_empty() {
                 // An empty answer has to explain itself, or "the pool holds no such chunk" and
                 // "the walk reached almost none of the pool" read identically.
@@ -1772,7 +1779,7 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
             // Read once and spent twice: the text below and the typed answer describe the same
             // walk, and asking again could start a second one — an incomplete snapshot is not
             // cached, so a re-read is a re-walk.
-            let report = walk_report(e, within);
+            let report = walk_report(e, left());
             if found.is_none() {
                 append_walk_report(&mut out, report.as_ref());
             }
@@ -1839,7 +1846,7 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
         PoolOp::Census { refresh, limit } => {
             let census = query::tag_census(e, walk(refresh)).map_err(pool_failure)?;
             let mut out = render_census(&census, limit);
-            let report = walk_report(e, within);
+            let report = walk_report(e, left());
             append_walk_report(&mut out, report.as_ref());
             Ok(Output::typed(
                 out,
@@ -1865,14 +1872,15 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
 
 /// The walk's own state, for an answer that has already been computed from it.
 ///
-/// `refresh: false`, so this reads the snapshot the query just took or reused. It is bounded by
-/// the caller's remaining `within` all the same: an *incomplete* walk is not cached, so this can
-/// find no snapshot and start one, and win-kexp's 120s default is not this call's to spend.
+/// `refresh: false`, so this reads the snapshot the query just took or reused. It is bounded all
+/// the same, and by what is **left** of the caller's patience rather than by the whole of it: an
+/// *incomplete* walk is not cached, so this can find no snapshot and start one — and neither
+/// win-kexp's 120s default nor a second helping of a budget already spent is this call's to give.
 fn walk_report(
     e: &DebugEngine,
-    within: Duration,
+    left: Duration,
 ) -> Result<query::PoolSnapshotReport, query::PoolQueryError> {
-    query::snapshot_report(e, PoolWalk::from(false).within(within))
+    query::snapshot_report(e, PoolWalk::from(false).within(left))
 }
 
 /// The walk state every pool answer carries.
