@@ -38,7 +38,7 @@ use tokio::sync::{mpsc, oneshot};
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
 use crate::kdconn;
-use crate::proto::{EngineOp, WorkerMessage, WorkerRequest};
+use crate::proto::{EngineOp, Output, WorkerMessage, WorkerRequest};
 use crate::worker::{MESSAGES_FLAG, REQUESTS_FLAG, WORKER_FLAG};
 
 /// How many sessions may be open at once.
@@ -183,6 +183,13 @@ pub enum EngineError {
     /// The worker holding this session is gone — it crashed, or it was terminated to reclaim it.
     /// The session is unrecoverable, but the server is not: opening again gets a fresh worker.
     Lost(String),
+    /// The work was stopped on request. Not a failure of the target, and reported as one for as
+    /// long as the worker could only send a message: somebody asked for this.
+    Interrupted(String),
+    /// The work was never started — too little of the caller's budget was left to do it and
+    /// report back. Distinct from [`Self::Timeout`] in the way that matters: nothing ran, so
+    /// nothing changed, and a retry is unambiguous.
+    NotRun(String),
 }
 
 // Note what is *not* here any more: an "engine is unusable" variant. Under process-per-session
@@ -195,8 +202,27 @@ pub enum EngineError {
 impl fmt::Display for EngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Debugger(m) | Self::Timeout(m) | Self::Stale(m) | Self::Lost(m) => f.write_str(m),
+            Self::Debugger(m)
+            | Self::Timeout(m)
+            | Self::Stale(m)
+            | Self::Lost(m)
+            | Self::Interrupted(m)
+            | Self::NotRun(m) => f.write_str(m),
         }
+    }
+}
+
+/// Lifts a worker's failure into this side's error type, keeping the kind the worker named.
+///
+/// The default is [`EngineError::Debugger`], because for almost every op that is what a failure
+/// is. The two exceptions are the ones the worker can see and the supervisor cannot: an operation
+/// that was interrupted, and one that was never started for want of budget.
+fn engine_error(failed: crate::proto::Failed) -> EngineError {
+    use crate::structured::ErrorCategory;
+    match failed.category {
+        Some(ErrorCategory::Interrupted) => EngineError::Interrupted(failed.message),
+        Some(ErrorCategory::NotRun) => EngineError::NotRun(failed.message),
+        _ => EngineError::Debugger(failed.message),
     }
 }
 
@@ -375,7 +401,7 @@ pub struct Session {
     child: Mutex<Option<Child>>,
 }
 
-type Waiters = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<String, EngineError>>>>>;
+type Waiters = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Output, EngineError>>>>>;
 
 impl Session {
     fn state(&self) -> SessionState {
@@ -840,7 +866,7 @@ impl Sessions {
     }
 
     /// Runs `call` against `session`, awaiting the result with the configured timeout.
-    pub async fn call(&self, session: &Arc<Session>, call: Call) -> Result<String, EngineError> {
+    pub async fn call(&self, session: &Arc<Session>, call: Call) -> Result<Output, EngineError> {
         self.call_within(session, call, self.call_timeout).await
     }
 
@@ -849,7 +875,7 @@ impl Sessions {
         session: &Arc<Session>,
         call: Call,
         budget: Duration,
-    ) -> Result<String, EngineError> {
+    ) -> Result<Output, EngineError> {
         let id = session.next_id.fetch_add(1, Ordering::Relaxed);
         self.call_as(session, call, budget, id, Wait::Fixed).await
     }
@@ -863,7 +889,7 @@ impl Sessions {
         budget: Duration,
         id: u64,
         wait: Wait,
-    ) -> Result<String, EngineError> {
+    ) -> Result<Output, EngineError> {
         let (tx, rx) = oneshot::channel();
         // Registered before the job is queued, so the session counts as busy from the moment the
         // call is submitted rather than from the moment it is written to the worker.
@@ -900,7 +926,7 @@ impl Sessions {
         let mut rx = rx;
         // The sender is dropped only when the worker's reader gives up on it, which it does by
         // answering first — so `Err` here is the residual case, not the normal one.
-        let settled = |reply: Result<Result<String, EngineError>, oneshot::error::RecvError>| {
+        let settled = |reply: Result<Result<Output, EngineError>, oneshot::error::RecvError>| {
             reply.unwrap_or_else(|_| Err(EngineError::Lost(worker_gone(&session.id))))
         };
         if let Ok(reply) = tokio::time::timeout(budget, &mut rx).await {
@@ -1006,7 +1032,10 @@ impl Sessions {
                 // the overage is more than one. The caller is owed the handle for a target that
                 // is already open.
                 self.reconcile_capacity(&session);
-                Ok(OpenReport { id, report })
+                Ok(OpenReport {
+                    id,
+                    report: report.text,
+                })
             }
             Err(EngineError::Timeout(message)) => Err(OpenError::Timeout { id, message }),
             Err(e) => {
@@ -1076,7 +1105,7 @@ impl Sessions {
         &self,
         session: &Arc<Session>,
         named: bool,
-    ) -> Result<String, EngineError> {
+    ) -> Result<Output, EngineError> {
         let call = Call::new(EngineOp::Interrupt).named(named);
         self.call_within(session, call, INTERRUPT_TIMEOUT).await
     }
@@ -1087,9 +1116,25 @@ impl Sessions {
     /// kernel attach that will never connect cannot answer, cannot be interrupted, and would
     /// otherwise hold its session forever; killing it is the only thing that ends that wait, and
     /// under process-per-session it costs nothing else.
-    pub async fn end(&self, session: &Arc<Session>, named: bool) -> Result<String, EngineError> {
+    pub async fn end(&self, session: &Arc<Session>, named: bool) -> Result<Output, EngineError> {
         let call = Call::new(EngineOp::EndSession).named(named);
-        let (reason, message) = match self.release(session, call, END_SESSION_TIMEOUT).await {
+        let outcome = self.release(session, call, END_SESSION_TIMEOUT).await;
+        // Read before the rendering, from the outcome rather than from the message it produces:
+        // "did the worker let go, or was it killed still holding the target?" is the question a
+        // caller has to act on, and it was previously only answerable by reading which paragraph
+        // came back.
+        let ended = crate::structured::SessionEnded {
+            session_id: session.id.clone(),
+            released: matches!(outcome, Release::Released(_)),
+            worker_terminated: !matches!(outcome, Release::AlreadyGone | Release::Stale(_)),
+            waited_ms: match &outcome {
+                Release::Parked { waited } => {
+                    Some(waited.as_millis().min(u128::from(u64::MAX)) as u64)
+                }
+                _ => None,
+            },
+        };
+        let (reason, message) = match outcome {
             // A refused handle is the mechanism working, not a session to tear down.
             Release::Stale(why) => return Err(EngineError::Stale(why)),
             Release::Released(text) => (
@@ -1140,7 +1185,7 @@ impl Sessions {
             ),
         };
         session.set_state(SessionState::Closed(reason));
-        Ok(message)
+        Ok(Output::typed(message, ended))
     }
 
     /// Asks a worker to release its target and then terminates it, without deciding *why* the
@@ -1184,7 +1229,7 @@ impl Sessions {
         session.fail_outstanding(&format!("session `{}` was ended", session.id));
         session.kill();
         match out {
-            Ok(text) => Release::Released(text),
+            Ok(out) => Release::Released(out.text),
             // Carries what it actually waited, because that is no longer one constant: a session
             // unwinding a transaction is given the extra time it asked for, and a report naming
             // the base grace would understate what was allowed before the worker was terminated.
@@ -1628,7 +1673,7 @@ fn settle_uncommitted(session: &Session, why: &str) -> bool {
 ///
 /// Returns whether the session was left **live**: its worker still holds a target, so it still
 /// owes its slot and capacity has to be reconciled against it.
-fn settle_open(session: &Session, result: &Result<String, EngineError>) -> bool {
+fn settle_open(session: &Session, result: &Result<Output, EngineError>) -> bool {
     // The same discriminator `open` uses, and for the same reason: the *phase* says whether a
     // target was created, while the state may since have been retired by a command queued behind
     // the open.
@@ -2042,7 +2087,7 @@ fn pump(
         let Some(session) = session.upgrade() else {
             return;
         };
-        let answer = |result: Result<String, EngineError>| {
+        let answer = |result: Result<Output, EngineError>| {
             let waiter = waiters
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -2154,7 +2199,7 @@ async fn reader(
                 // `Opening` or `Attaching` for the life of the process — `session_status` would
                 // keep reporting an open that finished long ago, and `busy()` would keep the
                 // worker from ever being reclaimed.
-                if let Err(unreceived) = waiter.send(result.map_err(EngineError::Debugger))
+                if let Err(unreceived) = waiter.send(result.map_err(engine_error))
                     && id == OPENER_JOB
                     && settle_open(&session, &unreceived)
                 {
@@ -2799,7 +2844,7 @@ mod tests {
         assert_eq!(committed.state(), SessionState::Open);
 
         let landed = dormant("sess-3", SessionState::Attaching);
-        settle_open(&landed, &Ok("vertarget".into()));
+        settle_open(&landed, &Ok(Output::text("vertarget")));
         assert_eq!(landed.state(), SessionState::Open);
     }
 
@@ -3216,7 +3261,7 @@ mod tests {
     #[test]
     fn settling_never_reopens_a_session_that_is_already_over() {
         let closed = dormant("sess-1", SessionState::Closed("ended".into()));
-        assert!(!settle_open(&closed, &Ok("vertarget".into())));
+        assert!(!settle_open(&closed, &Ok(Output::text("vertarget"))));
         assert_eq!(closed.state(), SessionState::Closed("ended".into()));
     }
 

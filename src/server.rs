@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use rmcp::ErrorData;
+use rmcp::handler::server::tool::schema_for_output;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
@@ -20,7 +21,8 @@ use crate::engine::{
     SessionState, Sessions,
 };
 use crate::kdconn;
-use crate::proto::{EngineOp, PoolOp, ReachabilityOp};
+use crate::proto::{EngineOp, Output, PoolOp, ReachabilityOp};
+use crate::structured::{self, ErrorCategory, Outcome, TargetCreated};
 use crate::ttd;
 
 /// How long to wait for an execution-control command (go/step/reverse) to reach its
@@ -50,6 +52,121 @@ fn tool_error(s: String) -> Result<CallToolResult, ErrorData> {
     Ok(CallToolResult::error(vec![ContentBlock::text(s)]))
 }
 
+/// A tool-execution error carrying a typed reason beside the text.
+///
+/// The text is what it always was. The structured half exists so a caller can branch on
+/// [`ErrorCategory`] instead of on wording, and it conforms to the same `outputSchema` the
+/// success branch does — see [`crate::structured`] for why both branches are one shape.
+fn typed_error(
+    category: ErrorCategory,
+    message: String,
+    session_id: Option<String>,
+) -> Result<CallToolResult, ErrorData> {
+    let structured: Outcome<()> = Outcome::failed_in(category, message.clone(), session_id);
+    Ok(with_structured(
+        CallToolResult::error(vec![ContentBlock::text(message)]),
+        serde_json::to_value(structured).ok(),
+    ))
+}
+
+/// Attaches structured content to a result, if there is any.
+fn with_structured(mut result: CallToolResult, data: Option<serde_json::Value>) -> CallToolResult {
+    result.structured_content = data;
+    result
+}
+
+/// A success carrying both halves: the text a person reads, and the payload a program does.
+///
+/// For the tools the supervisor answers by itself — `session_status`, the openers, `end_session`
+/// — where there is no worker to have built the typed half.
+fn structured_result<T: serde::Serialize>(
+    text: String,
+    payload: T,
+) -> Result<CallToolResult, ErrorData> {
+    outcome_result(text, Outcome::Ok(payload))
+}
+
+/// [`structured_result`] for a payload that is already an outcome of its own — the openers,
+/// whose success and failure branches carry different fields and so have their own enum.
+fn outcome_result<T: serde::Serialize>(
+    text: String,
+    outcome: T,
+) -> Result<CallToolResult, ErrorData> {
+    Ok(with_structured(
+        CallToolResult::success(vec![ContentBlock::text(text)]),
+        serde_json::to_value(outcome).ok(),
+    ))
+}
+
+/// The typed view of what `session_status` was asked and what it found.
+///
+/// `asked`/`unknown_handle` exist because an empty list is three different answers — nothing is
+/// open, the handle you named is gone, the handle you named was never issued — and prose was the
+/// only thing telling them apart.
+fn sessions_report(
+    sessions: &[&SessionSnapshot],
+    asked: Option<&str>,
+    unknown_handle: bool,
+) -> structured::SessionsReport {
+    structured::SessionsReport {
+        sessions: sessions
+            .iter()
+            .map(|s| structured::SessionInfo {
+                session_id: s.id.clone(),
+                kind: s.kind.into(),
+                target: s.what.clone(),
+                engine_pid: s.pid,
+                // The two derived facts a caller cannot compute: whether this wait can end on its
+                // own, and whether it has already gone on longer than a healthy one ever does.
+                // Both come from the same constants the text is written against.
+                state: structured::SessionStateInfo::of(
+                    &s.state,
+                    s.kind.waits_indefinitely(),
+                    s.in_state_for >= OPEN_TAKING_TOO_LONG,
+                ),
+                in_state_for_ms: ms(s.in_state_for),
+                age_ms: ms(s.age),
+                current: s.current,
+                live: s.state.is_live(),
+            })
+            .collect(),
+        max_sessions: MAX_SESSIONS as u32,
+        asked: asked.map(str::to_string),
+        unknown_handle,
+    }
+}
+
+/// A duration in whole milliseconds, saturating rather than wrapping.
+fn ms(d: Duration) -> u64 {
+    d.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+/// A failed open, with the two things a caller has to act on as fields.
+///
+/// `session_id` because an open that failed *after* creating its target hands back the only
+/// handle that reaches it — text that had to be scraped for a `session_id:` line before — and
+/// `target` because "was anything created?" is what decides whether opening again is a recovery
+/// or a second process.
+fn open_failure(
+    category: ErrorCategory,
+    message: String,
+    session_id: Option<String>,
+    target: TargetCreated,
+) -> Result<CallToolResult, ErrorData> {
+    let structured = structured::OpenOutcome::Error(structured::OpenFailure {
+        error: structured::FailureDetail {
+            category,
+            message: message.clone(),
+            session_id,
+        },
+        target,
+    });
+    Ok(with_structured(
+        CallToolResult::error(vec![ContentBlock::text(message)]),
+        serde_json::to_value(structured).ok(),
+    ))
+}
+
 /// Renders a session-scoped engine outcome using the MCP error model.
 ///
 /// Everything that can go wrong here is feedback the model can act on — a failed debugger
@@ -58,10 +175,35 @@ fn tool_error(s: String) -> Result<CallToolResult, ErrorData> {
 /// intact, never as a JSON-RPC error the model never really sees. The one failure that is the
 /// *server's* rather than a session's is "no engine worker could be started", and only an opener
 /// can hit it; [`WindbgServer::opened`] renders that one.
-fn engine_result(r: Result<String, EngineError>) -> Result<CallToolResult, ErrorData> {
+///
+/// Both branches carry whatever typed answer exists: the worker's, on success ([`Output::data`]),
+/// and the failure's category otherwise. A tool with no typed shape yet simply has none, and is
+/// unchanged.
+fn engine_result(r: Result<Output, EngineError>) -> Result<CallToolResult, ErrorData> {
     match r {
-        Ok(out) => text_result(out),
-        Err(e) => tool_error(e.to_string()),
+        Ok(out) => Ok(with_structured(
+            CallToolResult::success(vec![ContentBlock::text(out.text)]),
+            out.data,
+        )),
+        Err(e) => typed_error(ErrorCategory::of(&e), e.to_string(), None),
+    }
+}
+
+/// [`engine_result`] for a call that named a session, so a failure can say which one it was.
+fn engine_result_for(
+    session_id: Option<&str>,
+    r: Result<Output, EngineError>,
+) -> Result<CallToolResult, ErrorData> {
+    match r {
+        Ok(out) => Ok(with_structured(
+            CallToolResult::success(vec![ContentBlock::text(out.text)]),
+            out.data,
+        )),
+        Err(e) => typed_error(
+            ErrorCategory::of(&e),
+            e.to_string(),
+            session_id.map(str::to_string),
+        ),
     }
 }
 
@@ -1036,6 +1178,21 @@ pub struct SessionArgs {
     pub session_id: Option<String>,
 }
 
+/// Parameters for `registers`.
+#[derive(Deserialize, JsonSchema)]
+pub struct RegistersArgs {
+    /// Include every register the engine knows, not just the integer ones: x87 and vector
+    /// registers, and subregister views such as `eax` within `rax`. Off by default because on
+    /// x64 that is several hundred entries — the `r` text is unaffected either way.
+    #[serde(default)]
+    pub all: Option<bool>,
+    /// Session handle returned by open_dump/open_trace/attach_*/launch. Optional: omit it
+    /// to act on whatever session is current, or pass it to have the call refuse to run if
+    /// this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 #[derive(Deserialize, JsonSchema)]
 pub struct PathArgs {
     /// Filesystem path to the dump (.dmp) or TTD trace (.run) file.
@@ -1658,7 +1815,7 @@ impl WindbgServer {
     /// worker and cannot be ordered against this call at all. What still has to be re-checked
     /// at the front of the session's own queue is whether the handle survived work queued ahead
     /// of it, and that is `engine::Gate`'s job.
-    async fn run_call(&self, session_id: Option<&str>, call: Call) -> Result<String, EngineError> {
+    async fn run_call(&self, session_id: Option<&str>, call: Call) -> Result<Output, EngineError> {
         let session = self.sessions.resolve(session_id)?;
         self.sessions
             .call(&session, call.named(session_id.is_some()))
@@ -1666,7 +1823,7 @@ impl WindbgServer {
     }
 
     /// The common case: one op, no handle retirement.
-    async fn run(&self, session_id: Option<&str>, op: EngineOp) -> Result<String, EngineError> {
+    async fn run(&self, session_id: Option<&str>, op: EngineOp) -> Result<Output, EngineError> {
         self.run_call(session_id, Call::new(op)).await
     }
 
@@ -1682,42 +1839,71 @@ impl WindbgServer {
         what: String,
         op: EngineOp,
     ) -> Result<CallToolResult, ErrorData> {
+        // Kept for the typed answer, which describes what was asked for rather than re-deriving
+        // it from the report the debugger printed.
+        let target = what.clone();
         match self.sessions.open(kind, what, op).await {
-            Ok(OpenReport { id, report }) => text_result(format!(
-                "{report}\n\nsession_id: {id}\nPass this as `session_id` on later calls to route \
-                 them to this session and to fail loudly rather than act on a different target."
-            )),
+            Ok(OpenReport { id, report }) => outcome_result(
+                format!(
+                    "{report}\n\nsession_id: {id}\nPass this as `session_id` on later calls to \
+                     route them to this session and to fail loudly rather than act on a different \
+                     target."
+                ),
+                structured::OpenOutcome::Ok(structured::OpenedSession {
+                    session_id: id,
+                    kind: kind.into(),
+                    target,
+                    report,
+                }),
+            ),
             // No worker, so no session — and no argument the model can change fixes that.
             Err(OpenError::Unavailable(m)) => Err(ErrorData::internal_error(m, None)),
-            Err(OpenError::NoRoom(m)) => tool_error(m),
-            Err(OpenError::Clean(m)) => tool_error(m),
+            Err(OpenError::NoRoom(m)) => {
+                open_failure(ErrorCategory::Capacity, m, None, TargetCreated::No)
+            }
+            Err(OpenError::Clean(m)) => {
+                open_failure(ErrorCategory::Debugger, m, None, TargetCreated::No)
+            }
             Err(OpenError::PostCommit {
                 id,
                 message,
                 report_only,
-            }) => tool_error(if report_only {
-                format!(
-                    "{message}\n\nsession_id: {id}\nThe target opened; only this follow-up report \
-                     failed, so the handle above is valid and usable."
-                )
-            } else {
-                post_commit_failure(&message, &id)
-            }),
+            }) => open_failure(
+                ErrorCategory::Debugger,
+                if report_only {
+                    format!(
+                        "{message}\n\nsession_id: {id}\nThe target opened; only this follow-up \
+                         report failed, so the handle above is valid and usable."
+                    )
+                } else {
+                    post_commit_failure(&message, &id)
+                },
+                Some(id),
+                // Both halves of this branch created a target; that is what "post commit" means,
+                // and it is the fact that makes re-opening the wrong move.
+                TargetCreated::Yes,
+            ),
             // A timeout abandons the *wait*, not the job: this open may still be running and may
             // still land. The handle exists from the moment the session is registered, so it can
             // be named now — which is what makes recovery via `session_status` sound.
             // The `session_id:` line is the same one a successful open emits, deliberately: this
             // is the result a caller most needs to get a handle *out* of, and prose alone would
             // make it the one opener outcome they cannot parse the id from.
-            Err(OpenError::Timeout { id, message }) => tool_error(format!(
-                "{message}\n\nsession_id: {id}\nThe wait was abandoned, but this open was not: it \
-                 is still running in the session above, and may still land. Ask `session_status \
-                 {{ \"session_id\": \"{id}\" }}` — it reports whether the open is still going, \
-                 how long it has been going, and whether that is longer than a healthy one takes. \
-                 Do not re-run the open while it is still going, which would attach to, or start, \
-                 a second target; `end_session {{ \"session_id\": \"{id}\" }}` ends it outright, \
-                 terminating the worker process if it will not unwind."
-            )),
+            Err(OpenError::Timeout { id, message }) => open_failure(
+                ErrorCategory::Timeout,
+                format!(
+                    "{message}\n\nsession_id: {id}\nThe wait was abandoned, but this open was \
+                     not: it is still running in the session above, and may still land. Ask \
+                     `session_status {{ \"session_id\": \"{id}\" }}` — it reports whether the \
+                     open is still going, how long it has been going, and whether that is longer \
+                     than a healthy one takes. Do not re-run the open while it is still going, \
+                     which would attach to, or start, a second target; `end_session \
+                     {{ \"session_id\": \"{id}\" }}` ends it outright, terminating the worker \
+                     process if it will not unwind."
+                ),
+                Some(id),
+                TargetCreated::Pending,
+            ),
         }
     }
 }
@@ -1745,13 +1931,16 @@ impl WindbgServer {
     /// Open a crash dump (.dmp) or a Time Travel Debugging trace (.run) and wait for it to load.
     /// Opens a new session in its own engine process — sessions already open are left alone —
     /// and returns a `session_id` that routes later calls to it. End it with `end_session`.
-    #[rmcp::tool(annotations(
-        title = "Open crash dump or TTD trace",
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = false,
-        open_world_hint = true
-    ))]
+    #[rmcp::tool(
+        annotations(
+            title = "Open crash dump or TTD trace",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<structured::OpenOutcome>()
+    )]
     async fn open_dump(
         &self,
         Parameters(args): Parameters<PathArgs>,
@@ -1767,13 +1956,16 @@ impl WindbgServer {
     /// Open a TTD trace (.run); alias of open_dump. Enables time-travel navigation and TTD queries.
     /// Opens a new session in its own engine process — sessions already open are left alone —
     /// and returns a `session_id` that routes later calls to it. End it with `end_session`.
-    #[rmcp::tool(annotations(
-        title = "Open TTD trace",
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = false,
-        open_world_hint = true
-    ))]
+    #[rmcp::tool(
+        annotations(
+            title = "Open TTD trace",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<structured::OpenOutcome>()
+    )]
     async fn open_trace(
         &self,
         Parameters(args): Parameters<PathArgs>,
@@ -1789,13 +1981,16 @@ impl WindbgServer {
     /// Attach to the local kernel (live local kernel debugging).
     /// Opens a new session in its own engine process — sessions already open are left alone —
     /// and returns a `session_id` that routes later calls to it. End it with `end_session`.
-    #[rmcp::tool(annotations(
-        title = "Attach to local kernel",
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = false,
-        open_world_hint = true
-    ))]
+    #[rmcp::tool(
+        annotations(
+            title = "Attach to local kernel",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<structured::OpenOutcome>()
+    )]
     async fn attach_kernel_local(&self) -> Result<CallToolResult, ErrorData> {
         self.opened(
             SessionKind::KernelLocal,
@@ -1819,13 +2014,16 @@ impl WindbgServer {
     /// unaffected — and `session_status` says how long it has been waiting. Recover with
     /// `end_session`, which terminates the session's engine process; do NOT re-attach while it
     /// is still waiting.
-    #[rmcp::tool(annotations(
-        title = "Attach to kernel target",
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = false,
-        open_world_hint = true
-    ))]
+    #[rmcp::tool(
+        annotations(
+            title = "Attach to kernel target",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<structured::OpenOutcome>()
+    )]
     async fn attach_kernel(
         &self,
         Parameters(args): Parameters<ConnectionArgs>,
@@ -1836,7 +2034,11 @@ impl WindbgServer {
         // `session_status` without holding the key anywhere but in the op below.
         let selected = match kdconn::select(args.connection, args.profile) {
             Ok(selected) => selected,
-            Err(why) => return tool_error(why),
+            // Typed like every other refusal from a tool that declares an output schema: the
+            // result has to conform whichever way it went, and "fix the argument" is a category.
+            Err(why) => {
+                return open_failure(ErrorCategory::InvalidArgument, why, None, TargetCreated::No);
+            }
         };
         self.opened(
             SessionKind::Kernel,
@@ -1885,13 +2087,16 @@ impl WindbgServer {
     /// Only allocated chunks are indexed by tag — a freed chunk's tag is not reliably
     /// preserved by the allocator, so this never reports freed memory. To ask whether one
     /// specific address has been freed, use `pool_chunk`.
-    #[rmcp::tool(annotations(
-        title = "Find pool chunks by tag",
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true
-    ))]
+    #[rmcp::tool(
+        annotations(
+            title = "Find pool chunks by tag",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::PoolTagMatches>>()
+    )]
     async fn pool_find_tag(
         &self,
         Parameters(args): Parameters<PoolFindTagArgs>,
@@ -1907,7 +2112,7 @@ impl WindbgServer {
                 )),
             )
             .await;
-        engine_result(out)
+        engine_result_for(args.session_id.as_deref(), out)
     }
 
     /// Identify the pool chunk containing an address, **with its immediate neighbours**.
@@ -1922,13 +2127,16 @@ impl WindbgServer {
     /// prints before reading it as "never was pool". A third state, `Unreadable`, is neither:
     /// the walk could not read the span (a Verifier guard page reads exactly this way), so it
     /// says nothing about whether the chunk is live.
-    #[rmcp::tool(annotations(
-        title = "Locate a pool chunk by address",
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true
-    ))]
+    #[rmcp::tool(
+        annotations(
+            title = "Locate a pool chunk by address",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::PoolChunkAt>>()
+    )]
     async fn pool_chunk(
         &self,
         Parameters(args): Parameters<PoolChunkArgs>,
@@ -1939,7 +2147,7 @@ impl WindbgServer {
                 pool_op(PoolOp::chunk(args.address, args.refresh)),
             )
             .await;
-        engine_result(out)
+        engine_result_for(args.session_id.as_deref(), out)
     }
 
     /// The pool walk's own diagnostics, verbatim, optionally narrowed by substring.
@@ -1949,13 +2157,16 @@ impl WindbgServer {
     /// hundred-plus categories, so the summaries the other tools print are necessarily
     /// truncated — and the one line explaining a specific heap is reliably not in the
     /// truncated head. Filter by a heap address or a phrase to get at it.
-    #[rmcp::tool(annotations(
-        title = "Filter pool walk diagnostics",
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true
-    ))]
+    #[rmcp::tool(
+        annotations(
+            title = "Filter pool walk diagnostics",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::PoolDiagnosticsReport>>()
+    )]
     async fn pool_diagnostics(
         &self,
         Parameters(args): Parameters<PoolDiagnosticsArgs>,
@@ -1966,7 +2177,7 @@ impl WindbgServer {
                 pool_op(PoolOp::diagnostics(args.filter, args.refresh, args.limit)),
             )
             .await;
-        engine_result(out)
+        engine_result_for(args.session_id.as_deref(), out)
     }
 
     /// Per-tag census of the kernel pool: allocation counts and bytes, heaviest first.
@@ -1974,13 +2185,16 @@ impl WindbgServer {
     /// The structured answer to what `!poolused` renders as text, taken from the same walk
     /// as `pool_find_tag` and `pool_chunk` so the three cannot disagree. Useful for spotting
     /// which tag a driver's allocations are landing under before querying it by name.
-    #[rmcp::tool(annotations(
-        title = "Census pool usage by tag",
-        read_only_hint = true,
-        destructive_hint = false,
-        idempotent_hint = true,
-        open_world_hint = true
-    ))]
+    #[rmcp::tool(
+        annotations(
+            title = "Census pool usage by tag",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::PoolCensus>>()
+    )]
     async fn pool_census(
         &self,
         Parameters(args): Parameters<PoolCensusArgs>,
@@ -1991,19 +2205,22 @@ impl WindbgServer {
                 pool_op(PoolOp::census(args.refresh, args.limit)),
             )
             .await;
-        engine_result(out)
+        engine_result_for(args.session_id.as_deref(), out)
     }
 
     /// Attach to an existing user-mode process by PID and break in.
     /// Opens a new session in its own engine process — sessions already open are left alone —
     /// and returns a `session_id` that routes later calls to it. End it with `end_session`.
-    #[rmcp::tool(annotations(
-        title = "Attach to process",
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = false,
-        open_world_hint = true
-    ))]
+    #[rmcp::tool(
+        annotations(
+            title = "Attach to process",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<structured::OpenOutcome>()
+    )]
     async fn attach_process(
         &self,
         Parameters(args): Parameters<PidArgs>,
@@ -2019,13 +2236,16 @@ impl WindbgServer {
     /// Launch a new user-mode process under the debugger, stopping at the initial breakpoint.
     /// Opens a new session in its own engine process — sessions already open are left alone —
     /// and returns a `session_id` that routes later calls to it. End it with `end_session`.
-    #[rmcp::tool(annotations(
-        title = "Launch process under debugger",
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = false,
-        open_world_hint = true
-    ))]
+    #[rmcp::tool(
+        annotations(
+            title = "Launch process under debugger",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<structured::OpenOutcome>()
+    )]
     async fn launch(
         &self,
         Parameters(args): Parameters<CommandLineArgs>,
@@ -2055,11 +2275,14 @@ impl WindbgServer {
     ///
     /// Answers even while a session is parked: it reads this server's own bookkeeping and never
     /// queues on any session's engine.
-    #[rmcp::tool(annotations(
-        title = "List debug sessions",
-        read_only_hint = true,
-        open_world_hint = false
-    ))]
+    #[rmcp::tool(
+        annotations(
+            title = "List debug sessions",
+            read_only_hint = true,
+            open_world_hint = false
+        ),
+        output_schema = schema_for_output::<Outcome<structured::SessionsReport>>()
+    )]
     async fn session_status(
         &self,
         Parameters(args): Parameters<SessionArgs>,
@@ -2070,15 +2293,19 @@ impl WindbgServer {
         let sessions = self.sessions.snapshot();
 
         let Some(asked) = args.session_id.as_deref() else {
-            if sessions.iter().all(|s| !s.state.is_live()) {
-                return text_result(
+            let live: Vec<&SessionSnapshot> =
+                sessions.iter().filter(|s| s.state.is_live()).collect();
+            let report = sessions_report(&live, None, false);
+            if live.is_empty() {
+                return structured_result(
                     "No debug session is open. Start one with open_dump / open_trace / \
                      attach_process / attach_kernel / attach_kernel_local / launch."
                         .to_string(),
+                    report,
                 );
             }
             let mut out = String::new();
-            for s in sessions.iter().filter(|s| s.state.is_live()) {
+            for s in &live {
                 out.push_str(&describe_session(s));
                 out.push('\n');
             }
@@ -2088,17 +2315,26 @@ impl WindbgServer {
                  `session_id` on a call to route it to a specific session; omit it and the \
                  session marked (current) is used.",
             ));
-            return text_result(out);
+            return structured_result(out, report);
         };
 
         let Some(session) = sessions.iter().find(|s| s.id == asked) else {
-            return text_result(format!(
-                "`{asked}` is not a handle this server is holding. Either it was never issued \
-                 here, or it closed a while ago and has aged out of the session history. A \
-                 session that still exists is never forgotten, so opening again is safe."
-            ));
+            // Not an error: asking after a handle that has aged out is a fair question with a
+            // definite answer. `unknown_handle` is how a caller tells that answer from "the
+            // session exists, here it is", which an empty list on its own cannot.
+            return structured_result(
+                format!(
+                    "`{asked}` is not a handle this server is holding. Either it was never issued \
+                     here, or it closed a while ago and has aged out of the session history. A \
+                     session that still exists is never forgotten, so opening again is safe."
+                ),
+                sessions_report(&[], Some(asked), true),
+            );
         };
-        text_result(describe_session(session))
+        structured_result(
+            describe_session(session),
+            sessions_report(&[session], Some(asked), false),
+        )
     }
 
     /// Stop the operation a session is currently running, **keeping the session and its target**.
@@ -2172,13 +2408,16 @@ impl WindbgServer {
     /// A `debug_batch` running on the session is told to stop at its next step and run its
     /// rollback before the target is released, and the batch's own call reports that; the grace
     /// covers the step in flight and the rollback after it.
-    #[rmcp::tool(annotations(
-        title = "End debug session",
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = true,
-        open_world_hint = true
-    ))]
+    #[rmcp::tool(
+        annotations(
+            title = "End debug session",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::SessionEnded>>()
+    )]
     async fn end_session(
         &self,
         Parameters(args): Parameters<SessionArgs>,
@@ -2186,9 +2425,12 @@ impl WindbgServer {
         let session_id = args.session_id.as_deref();
         let session = match self.sessions.resolve(session_id) {
             Ok(session) => session,
-            Err(e) => return engine_result(Err(e)),
+            Err(e) => return engine_result_for(session_id, Err(e)),
         };
-        engine_result(self.sessions.end(&session, session_id.is_some()).await)
+        engine_result_for(
+            session_id,
+            self.sessions.end(&session, session_id.is_some()).await,
+        )
     }
 
     /// Run a raw debugger command and return its full output. The universal escape hatch.
@@ -2275,32 +2517,49 @@ impl WindbgServer {
         engine_result(self.run_call(args.session_id.as_deref(), call).await)
     }
 
-    /// Show the current register set.
-    #[rmcp::tool(annotations(
-        title = "Show registers",
-        read_only_hint = true,
-        open_world_hint = true
-    ))]
+    /// Show the current register set, as `r` prints it and as typed values beside it.
+    /// By default the structured half carries the **integer** registers (what `r` prints,
+    /// plus any control registers the target has); pass `all: true` for the whole bank,
+    /// including x87/vector registers and subregister views such as `eax` within `rax`.
+    #[rmcp::tool(
+        annotations(
+            title = "Show registers",
+            read_only_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::RegisterSet>>()
+    )]
     async fn registers(
         &self,
-        Parameters(args): Parameters<SessionArgs>,
+        Parameters(args): Parameters<RegistersArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let out = self
-            .run(args.session_id.as_deref(), EngineOp::Registers)
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::Registers {
+                    all: args.all.unwrap_or(false),
+                },
+            )
             .await;
         // DbgEng prints nothing for `r` when there is no live thread context (e.g. a
-        // module-load break, or a bare goto_position to the very start of a trace).
-        let out = out.map(|s| {
-            if s.trim().is_empty() {
-                "(no thread register context at this position — e.g. a module-load break or \
-                 the start of a trace. Travel to a settled position after a go/breakpoint, or \
-                 read a specific register with execute { \"command\": \"r rip\" }.)"
-                    .to_string()
+        // module-load break, or a bare goto_position to the very start of a trace). The
+        // structured half says the same thing by carrying no registers, so this replaces only
+        // the text — and only when the text is the empty one.
+        let out = out.map(|out| {
+            if out.text.trim().is_empty() {
+                Output {
+                    text: "(no thread register context at this position — e.g. a module-load \
+                           break or the start of a trace. Travel to a settled position after a \
+                           go/breakpoint, or read a specific register with execute \
+                           { \"command\": \"r rip\" }.)"
+                        .to_string(),
+                    data: out.data,
+                }
             } else {
-                s
+                out
             }
         });
-        engine_result(out)
+        engine_result_for(args.session_id.as_deref(), out)
     }
 
     /// Read process/kernel virtual memory and return a hex dump.
@@ -2346,25 +2605,26 @@ impl WindbgServer {
         engine_result(out)
     }
 
-    /// List loaded modules (`lm`).
-    #[rmcp::tool(annotations(
-        title = "List modules",
-        read_only_hint = true,
-        open_world_hint = true
-    ))]
+    /// List loaded modules, as `lm` prints them and as typed values beside it: each module's
+    /// name, image name, start/end addresses and **symbol state** — `deferred` (not fetched
+    /// yet) is not the same as `none` (this module has no symbols), which the `lm` text
+    /// renders as an easily-missed parenthesis.
+    #[rmcp::tool(
+        annotations(
+            title = "List modules",
+            read_only_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::ModuleList>>()
+    )]
     async fn modules(
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let out = self
-            .run(
-                args.session_id.as_deref(),
-                EngineOp::Command {
-                    command: "lm".to_string(),
-                },
-            )
+            .run(args.session_id.as_deref(), EngineOp::Modules)
             .await;
-        engine_result(out)
+        engine_result_for(args.session_id.as_deref(), out)
     }
 
     /// List threads (`~`).
@@ -2543,39 +2803,49 @@ impl WindbgServer {
         engine_result(out)
     }
 
-    /// Set a breakpoint at a symbol, address, or expression (`bp`).
-    #[rmcp::tool(annotations(
-        title = "Set breakpoint",
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true
-    ))]
+    /// Set a breakpoint at a symbol, address, or expression (`bp`), and report every
+    /// breakpoint the session then holds. A successful `bp` prints nothing at all, so the
+    /// structured result is where "it was set, and here is its id" actually lives — along with
+    /// whether it resolved to an address or is deferred until its module loads.
+    #[rmcp::tool(
+        annotations(
+            title = "Set breakpoint",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::BreakpointSet>>()
+    )]
     async fn set_breakpoint(
         &self,
         Parameters(args): Parameters<BreakpointArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         if let Err(e) = reject_command_breakers("expression", &args.expression, Quotes::Rejected) {
-            return tool_error(e);
+            return typed_error(ErrorCategory::InvalidArgument, e, args.session_id);
         }
-        let cmd = format!("bp {}", args.expression);
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::Command { command: cmd },
+                EngineOp::SetBreakpoint {
+                    expression: args.expression,
+                },
             )
             .await;
-        engine_result(out)
+        engine_result_for(args.session_id.as_deref(), out)
     }
 
     /// Continue execution (`g`). Runs to the next breakpoint, or the end of a TTD trace.
-    #[rmcp::tool(annotations(
-        title = "Continue execution",
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = false,
-        open_world_hint = true
-    ))]
+    #[rmcp::tool(
+        annotations(
+            title = "Continue execution",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::StopReport>>()
+    )]
     async fn go(
         &self,
         Parameters(args): Parameters<SessionArgs>,
@@ -2589,7 +2859,7 @@ impl WindbgServer {
                 },
             )
             .await;
-        engine_result(out)
+        engine_result_for(args.session_id.as_deref(), out)
     }
 
     /// Run the target until it reaches `address` (a one-shot `g <addr>` that doesn't
@@ -2598,19 +2868,22 @@ impl WindbgServer {
     /// reached in time). Confirms *live* that the current input/state drives execution to
     /// a block — e.g. one from `reachable_from_dispatch`. Needs a real KDNET/VM kernel
     /// target (a local kernel can't set code breakpoints).
-    #[rmcp::tool(annotations(
-        title = "Run to address",
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = false,
-        open_world_hint = true
-    ))]
+    #[rmcp::tool(
+        annotations(
+            title = "Run to address",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::RunToReport>>()
+    )]
     async fn run_to_address(
         &self,
         Parameters(args): Parameters<RunToAddressArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         if let Err(e) = reject_command_breakers("address", &args.address, Quotes::Rejected) {
-            return tool_error(e);
+            return typed_error(ErrorCategory::InvalidArgument, e, args.session_id);
         }
         let out = self
             .run(
@@ -2621,17 +2894,20 @@ impl WindbgServer {
                 },
             )
             .await;
-        engine_result(out)
+        engine_result_for(args.session_id.as_deref(), out)
     }
 
     /// Step over one source/instruction step (`p`).
-    #[rmcp::tool(annotations(
-        title = "Step over",
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = false,
-        open_world_hint = true
-    ))]
+    #[rmcp::tool(
+        annotations(
+            title = "Step over",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::StopReport>>()
+    )]
     async fn step_over(
         &self,
         Parameters(args): Parameters<SessionArgs>,
@@ -2645,17 +2921,20 @@ impl WindbgServer {
                 },
             )
             .await;
-        engine_result(out)
+        engine_result_for(args.session_id.as_deref(), out)
     }
 
     /// Step into one instruction (`t`).
-    #[rmcp::tool(annotations(
-        title = "Step into",
-        read_only_hint = false,
-        destructive_hint = true,
-        idempotent_hint = false,
-        open_world_hint = true
-    ))]
+    #[rmcp::tool(
+        annotations(
+            title = "Step into",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::StopReport>>()
+    )]
     async fn step_into(
         &self,
         Parameters(args): Parameters<SessionArgs>,
@@ -2669,19 +2948,22 @@ impl WindbgServer {
                 },
             )
             .await;
-        engine_result(out)
+        engine_result_for(args.session_id.as_deref(), out)
     }
 
     /// Step backward one instruction in a TTD trace (`t-`). Reverse of step_into.
     // The reverse-navigation tools only work on a TTD trace, which is a recorded replay:
     // moving through it cannot destroy state, unlike stepping a live target.
-    #[rmcp::tool(annotations(
-        title = "Step back (TTD)",
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true
-    ))]
+    #[rmcp::tool(
+        annotations(
+            title = "Step back (TTD)",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::StopReport>>()
+    )]
     async fn step_back(
         &self,
         Parameters(args): Parameters<SessionArgs>,
@@ -2695,17 +2977,20 @@ impl WindbgServer {
                 },
             )
             .await;
-        engine_result(out)
+        engine_result_for(args.session_id.as_deref(), out)
     }
 
     /// Step over one call backward in a TTD trace (`p-`). Reverse of step_over.
-    #[rmcp::tool(annotations(
-        title = "Step over back (TTD)",
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true
-    ))]
+    #[rmcp::tool(
+        annotations(
+            title = "Step over back (TTD)",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::StopReport>>()
+    )]
     async fn step_over_back(
         &self,
         Parameters(args): Parameters<SessionArgs>,
@@ -2719,17 +3004,20 @@ impl WindbgServer {
                 },
             )
             .await;
-        engine_result(out)
+        engine_result_for(args.session_id.as_deref(), out)
     }
 
     /// Reverse-continue: run the TTD trace backward until a breakpoint or its start (`g-`).
-    #[rmcp::tool(annotations(
-        title = "Reverse continue (TTD)",
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true
-    ))]
+    #[rmcp::tool(
+        annotations(
+            title = "Reverse continue (TTD)",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::StopReport>>()
+    )]
     async fn reverse_go(
         &self,
         Parameters(args): Parameters<SessionArgs>,
@@ -2743,7 +3031,7 @@ impl WindbgServer {
                 },
             )
             .await;
-        engine_result(out)
+        engine_result_for(args.session_id.as_deref(), out)
     }
 
     /// Travel to a specific position in a TTD trace (`!tt <position>`).
@@ -3729,8 +4017,54 @@ mod tests {
 
     #[test]
     fn successful_output_is_not_flagged_as_an_error() {
-        let r = engine_result(Ok("rax=0000000000000000".into())).unwrap();
+        let r = engine_result(Ok(Output::text("rax=0000000000000000"))).unwrap();
         assert_eq!(r.is_error, Some(false));
+    }
+
+    /// A failure carries its category as a value beside the same text it always had.
+    ///
+    /// The point of the pair: the text is what the model reads and may be reworded at any time,
+    /// while `category` is what a program branches on. A client that had to tell a stale handle
+    /// from a debugger error by matching prose was one rewording away from breaking.
+    #[test]
+    fn a_failure_carries_its_category_beside_the_text() {
+        let r = engine_result_for(
+            Some("sess-7"),
+            Err(EngineError::Stale("`sess-7` was retired".into())),
+        )
+        .unwrap();
+        assert_eq!(r.is_error, Some(true));
+        let structured = r.structured_content.expect("a failure is structured too");
+        assert_eq!(structured["status"], "error");
+        assert_eq!(structured["error"]["category"], "stale_session");
+        assert_eq!(structured["error"]["session_id"], "sess-7");
+        assert_eq!(structured["error"]["message"], "`sess-7` was retired");
+        // And the text content is unchanged — the whole point of adding a channel rather than
+        // replacing one.
+        assert_eq!(
+            r.content.first().and_then(|c| c.as_text()).map(|t| &t.text),
+            Some(&"`sess-7` was retired".to_string())
+        );
+    }
+
+    /// The typed half of a success is the worker's, forwarded rather than re-derived.
+    #[test]
+    fn a_success_forwards_the_workers_typed_answer() {
+        let r = engine_result(Ok(Output::typed(
+            "VERDICT: HIT",
+            structured::RunToReport {
+                verdict: structured::RunToVerdict::Hit,
+                target: structured::addr(0xfffff803_1ab10000),
+                stopped_at: Some(structured::addr(0xfffff803_1ab10000)),
+                timeout_ms: 60_000,
+                output: String::new(),
+            },
+        )))
+        .unwrap();
+        let structured = r.structured_content.expect("carried through");
+        assert_eq!(structured["status"], "ok");
+        assert_eq!(structured["verdict"], "hit");
+        assert_eq!(structured["target"], "0xfffff8031ab10000");
     }
 
     #[test]

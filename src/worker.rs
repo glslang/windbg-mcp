@@ -33,6 +33,7 @@
 //! can ask for the same thing, and the binding ([`Running`]) that decides *which job* the request
 //! reaches. See `AGENTS.md` and the `DECISIONS.md` entry for the invariant and its boundary.
 
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, PipeReader, PipeWriter, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -47,11 +48,14 @@ use win_kexp::pool::{DiagnosticShape, PoolDiagnostics, PoolSpan, PoolState};
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
 use crate::batch::{self, BatchOp, Debuggee, Ran};
-use crate::proto::{EngineOp, PoolOp, ReachabilityOp, WorkerMessage, WorkerRequest};
+use crate::proto::{
+    EngineOp, Failed, Output, PoolOp, ReachabilityOp, WorkerMessage, WorkerRequest,
+};
 use crate::server::{
     fmt_addr, format_recipe, format_report, hexdump, parse_eval, parse_lm_base, parse_u64,
     parse_windbg_addr, path_recipe, reachability,
 };
+use crate::structured;
 
 /// The argument that turns this executable into a worker. Not a documented CLI: the supervisor
 /// re-executes itself with it, and nothing else should.
@@ -525,7 +529,7 @@ pub fn run(args: &[String]) -> ! {
                 if matches!(request.op, EngineOp::Interrupt) {
                     emit(&WorkerMessage::Done {
                         id: request.id,
-                        result: interrupt_running(),
+                        result: interrupt_running().map(Output::text).map_err(Failed::from),
                     });
                     continue;
                 }
@@ -650,7 +654,7 @@ fn engine_thread(rx: mpsc::Receiver<Job>) {
                     Ok(Err(e)) => tracing::error!(
                         "worker: the debugger refused to release the target ({}); a live kernel \
                          target may be left halted",
-                        es(e)
+                        e
                     ),
                     Err(_) => tracing::error!(
                         "worker: releasing the target panicked; a live kernel target may be left \
@@ -674,7 +678,7 @@ fn engine_thread(rx: mpsc::Receiver<Job>) {
         let result = catch_unwind(AssertUnwindSafe(|| {
             execute(&engine, id, request.op, queued)
         }))
-        .unwrap_or_else(|_| Err("debugger operation panicked".to_string()));
+        .unwrap_or_else(|_| Err(Failed::from("debugger operation panicked")));
         let result = if release(id) {
             // The engine may have consumed the Ctrl+Break, or the request may have been lodged as
             // the operation was already returning — in which case it is still pending with nothing
@@ -695,9 +699,9 @@ fn engine_thread(rx: mpsc::Receiver<Job>) {
             // in the same shape. The caller loses the output, not the session.
             emit(&WorkerMessage::Done {
                 id,
-                result: Err(
-                    "the debugger's result could not be encoded for the supervisor".to_string(),
-                ),
+                result: Err(Failed::from(
+                    "the debugger's result could not be encoded for the supervisor",
+                )),
             });
         }
         // `Unwritable` gets no retry, and needs none: the supervisor holds the only read end, so
@@ -784,16 +788,31 @@ fn announce_teardown(id: u64) {
 /// Appended rather than substituted, both ways round: the partial output is the point of
 /// interrupting rather than ending the session, and a failure keeps its debugger text because
 /// "this is why it stopped" is not the same claim as "this is what it would have said".
-fn cut_short(result: Result<String, String>) -> Result<String, String> {
+fn cut_short(result: Result<Output, Failed>) -> Result<Output, Failed> {
     const NOTE: &str = "[windbg-mcp] This operation was interrupted on request (Ctrl+Break) \
                         before it finished, so this is what it had reached, not a complete \
                         result. Nothing about the target failed. Re-run it — scoped more \
                         narrowly, if it was interrupted for taking too long.";
     match result {
-        Ok(text) if text.is_empty() => Ok(NOTE.to_string()),
-        Ok(text) if text.ends_with('\n') => Ok(format!("{text}\n{NOTE}")),
-        Ok(text) => Ok(format!("{text}\n\n{NOTE}")),
-        Err(text) => Err(format!("{text}\n\n{NOTE}")),
+        // The note lands on the text and the typed payload is left as it was: the interruption is
+        // a fact about this *call*, and rewriting an answer the engine did produce — a stop
+        // position, a chunk listing — to say it did not would throw away the very thing that
+        // makes interrupting better than ending the session.
+        Ok(out) => Ok(Output {
+            text: match out.text {
+                text if text.is_empty() => NOTE.to_string(),
+                text if text.ends_with('\n') => format!("{text}\n{NOTE}"),
+                text => format!("{text}\n\n{NOTE}"),
+            },
+            data: out.data,
+        }),
+        // The category matters as much as the note: an interrupted operation reported as a
+        // debugger failure tells its caller the target misbehaved, when what happened is that
+        // somebody — quite possibly that same caller — asked for it to stop.
+        Err(failed) => Err(Failed::categorised(
+            structured::ErrorCategory::Interrupted,
+            format!("{}\n\n{NOTE}", failed.message),
+        )),
     }
 }
 
@@ -869,7 +888,7 @@ fn interrupt_running() -> Result<String, String> {
 
 /// Runs one op against this worker's engine. `queued` is how long it waited its turn here, which
 /// only the bounded-command path cares about.
-fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<String, String> {
+fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<Output, Failed> {
     match op {
         // ---- openers ----
         //
@@ -1014,27 +1033,29 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<S
         // Zero costs nothing to say. It spawns no watchdog at all — which is the whole reason these
         // ops are off the bounded path (DECISIONS.md, 2026-08-02: arming one rounds a command up to
         // a multiple of 200ms) — so this stays unbounded, as `index_trace` in particular must.
-        EngineOp::Command { command } => {
-            e.execute_command_bounded(&command, 0).map(told).map_err(es)
-        }
+        EngineOp::Command { command } => e
+            .execute_command_bounded(&command, 0)
+            .map(|run| Output::text(told(run)))
+            .map_err(failed),
         EngineOp::BoundedCommand {
             command,
             patience_ms,
         } => {
             let budget = watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), queued);
             e.execute_command_bounded(&command, budget)
-                .map(told)
-                .map_err(es)
+                .map(|run| Output::text(told(run)))
+                .map_err(failed)
         }
         EngineOp::CommandAndWait {
             command,
             timeout_ms,
-        } => e
-            .execute_and_wait(&command, timeout_ms)
-            .map(told)
-            .map_err(es),
-        EngineOp::Registers => e.registers().map_err(es),
-        EngineOp::ReadMemory { address, size } => read_memory(e, &address, size),
+        } => resumed(e, &command, timeout_ms),
+        EngineOp::Registers { all } => registers(e, all),
+        EngineOp::Modules => modules(e),
+        EngineOp::SetBreakpoint { expression } => set_breakpoint(e, &expression),
+        EngineOp::ReadMemory { address, size } => read_memory(e, &address, size)
+            .map(Output::text)
+            .map_err(Failed::from),
         EngineOp::SymbolPath {
             path,
             append,
@@ -1048,13 +1069,15 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<S
             // Reload so the new path takes effect (default: all deferred modules).
             e.reload_symbols(&reload).map_err(es)?;
             // Echo the effective path so the caller can confirm what resolved.
-            e.execute_command(".sympath").map_err(es)
+            e.execute_command(".sympath")
+                .map(Output::text)
+                .map_err(failed)
         }
         EngineOp::RunToAddress {
             address,
             timeout_ms,
         } => run_to_address(e, &address, timeout_ms),
-        EngineOp::Reachability(args) => reachable(e, args),
+        EngineOp::Reachability(args) => reachable(e, args).map(Output::text).map_err(Failed::from),
         // The caller's own deadline, on the same arithmetic as a bounded command's: a walk that
         // outlives its caller holds this session against nobody. Taking win-kexp's default instead
         // was wrong in both directions — see [`EngineOp::Pool`].
@@ -1080,18 +1103,25 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<S
                         "worker: no pool walk budget left (queued {queued:?}); refusing a query \
                          that must walk"
                     );
-                    Err(format!(
-                        "This pool query was not run: it reached the engine with {}s of its \
-                         caller's timeout left, which is not enough to walk the pool and report \
-                         back before that timeout expires. It asked for `refresh`, so it cannot \
-                         be answered from the snapshot cached for this session either. Nothing \
-                         was read and nothing changed. It waited {}s behind other work on this \
-                         session; issue it when the session is idle, or raise the server's call \
-                         timeout (WINDBG_MCP_CALL_TIMEOUT_SECS — a pool walk needs more than the \
-                         {}s of headroom the reply itself reserves).",
-                        patience.saturating_sub(queued).as_secs(),
-                        queued.as_secs(),
-                        WATCHDOG_HEADROOM.as_secs(),
+                    // Categorised, because "nothing ran" is the whole content of this answer and
+                    // a caller that reads it as an ordinary debugger failure learns the opposite
+                    // of what happened: nothing about the target is wrong, and nothing changed.
+                    Err(Failed::categorised(
+                        structured::ErrorCategory::NotRun,
+                        format!(
+                            "This pool query was not run: it reached the engine with {}s of its \
+                             caller's timeout left, which is not enough to walk the pool and \
+                             report back before that timeout expires. It asked for `refresh`, so \
+                             it cannot be answered from the snapshot cached for this session \
+                             either. Nothing was read and nothing changed. It waited {}s behind \
+                             other work on this session; issue it when the session is idle, or \
+                             raise the server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS — a \
+                             pool walk needs more than the {}s of headroom the reply itself \
+                             reserves).",
+                            patience.saturating_sub(queued).as_secs(),
+                            queued.as_secs(),
+                            WATCHDOG_HEADROOM.as_secs(),
+                        ),
                     ))
                 }
                 // Without `refresh` the session's cached snapshot may well answer this outright, and
@@ -1103,26 +1133,36 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<S
         }
         // `id` is passed because a batch is the one op that can stop *itself*: it checks between
         // steps whether an interrupt has been raised for the job it is running as.
-        EngineOp::Batch(op) => run_batch(e, id, op, queued),
+        EngineOp::Batch(op) => run_batch(e, id, op, queued)
+            .map(Output::text)
+            .map_err(Failed::from),
         // Answered by the request reader, which is the only way it could reach a busy engine at
         // all, so it is never queued and never arrives here. See [`EngineOp::Interrupt`].
-        EngineOp::Interrupt => Err(
-            "an interrupt reached the engine thread, which cannot act on \
-                                    one; this is a bug in the worker's request reader"
-                .to_string(),
-        ),
+        EngineOp::Interrupt => Err(Failed::from(
+            "an interrupt reached the engine thread, which cannot act on one; this is a bug in \
+             the worker's request reader",
+        )),
         // Reaching here means any batch has already been told to stop and has finished unwinding —
         // the reader saw this request go past and said so, and this thread runs one job at a time.
         EngineOp::EndSession => e
             .end_session()
-            .map(|_| "session ended".to_string())
-            .map_err(es),
+            .map(|_| Output::text("session ended"))
+            .map_err(failed),
     }
 }
 
 /// Maps any error to a `String` for the wire.
 fn es<E: ToString>(e: E) -> String {
     e.to_string()
+}
+
+/// Maps any error onto the wire as the ordinary case: the debugger ran it and it failed.
+///
+/// The two failures that are *not* that — interrupted, and never started — say so where they
+/// happen, through [`Failed::categorised`]. Everything else reaching a caller as a debugger
+/// failure is right: that is what it is.
+fn failed<E: ToString>(e: E) -> Failed {
+    Failed::from(e.to_string())
 }
 
 /// A command's text, with the deadline's explanation appended when there is one.
@@ -1143,6 +1183,115 @@ fn told(run: CommandRun) -> String {
         ));
     }
     out
+}
+
+/// Runs a command that moves the target, and reports where it ended up.
+///
+/// The text is exactly what it always was. What is added is the *position*, read typed from the
+/// engine rather than left for a caller to find in the stop banner — which is a different shape
+/// for a breakpoint, an exception and the end of a trace.
+///
+/// A position that cannot be read is reported as absent, never as zero: after a `g` that left the
+/// target running, or on a module-load break with no thread context, there is no instruction
+/// pointer to report and saying `0` would name the null page as the answer.
+fn resumed(e: &DebugEngine, command: &str, timeout_ms: u32) -> Result<Output, Failed> {
+    let run = e.execute_and_wait(command, timeout_ms).map_err(failed)?;
+    let stopped_at = e.instruction_pointer().ok().map(structured::addr);
+    let interrupted = run.cut_short.is_some();
+    let text = told(run.clone());
+    Ok(Output::typed(
+        text,
+        structured::StopReport {
+            command: command.to_string(),
+            stopped_at,
+            interrupted,
+            output: run.output,
+        },
+    ))
+}
+
+/// The register set, as `r` renders it and as values beside it.
+///
+/// Two reads of the same context rather than one parsed twice — and they cannot disagree, because
+/// this is one indivisible job on the engine thread, so nothing can move the target between them.
+///
+/// `all` decides how much of the bank travels. The integer registers are what `r` prints and what
+/// nearly every question is about; the x87/vector registers and the subregister views are several
+/// hundred more entries, and including them unasked would put ~20x the payload on every call for
+/// `rsp`.
+fn registers(e: &DebugEngine, all: bool) -> Result<Output, Failed> {
+    let text = e.registers().map_err(failed)?;
+    let registers = e.register_values().map_err(failed)?;
+    let selected: Vec<structured::RegisterInfo> = registers
+        .iter()
+        .filter(|register| {
+            all || (!register.subregister
+                && matches!(register.value, win_kexp::dbgeng::RegisterValue::Int(_)))
+        })
+        .map(|register| structured::RegisterInfo {
+            name: register.name.clone(),
+            value: (&register.value).into(),
+            subregister: register.subregister,
+        })
+        .collect();
+    Ok(Output::typed(
+        // DbgEng prints nothing for `r` when there is no live thread context (a module-load
+        // break, or a bare `goto_position` to the very start of a trace). The explanation is the
+        // supervisor's to add — it is advice about which tool to call next — so the text crosses
+        // as the engine gave it.
+        text,
+        structured::RegisterSet {
+            instruction_pointer: e.instruction_pointer().ok().map(structured::addr),
+            registers: selected,
+            all_registers: all,
+        },
+    ))
+}
+
+/// The loaded modules, as `lm` renders them and as values beside them.
+fn modules(e: &DebugEngine) -> Result<Output, Failed> {
+    let text = e.execute_command("lm").map_err(failed)?;
+    let modules = e.modules().map_err(failed)?;
+    Ok(Output::typed(
+        text,
+        structured::ModuleList {
+            loaded: modules.len(),
+            modules: modules.iter().map(structured::ModuleInfo::from).collect(),
+        },
+    ))
+}
+
+/// Sets a breakpoint and reports what the session holds afterwards.
+///
+/// The ids are diffed across the `bp` rather than assumed, because `bp` is not the only thing
+/// that can produce one: a command string on an existing breakpoint can add another, and DbgEng
+/// reuses ids freed by a `bc`. Diffing says what *this call* did; guessing "the highest id" would
+/// be right until the first time it was not.
+///
+/// A successful `bp` prints nothing at all, so the text alone cannot distinguish "set" from
+/// "silently did nothing" — which is the gap this fills.
+fn set_breakpoint(e: &DebugEngine, expression: &str) -> Result<Output, Failed> {
+    let before: HashSet<u32> = e
+        .breakpoints()
+        .map_err(failed)?
+        .iter()
+        .map(|breakpoint| breakpoint.id)
+        .collect();
+    let text = e
+        .execute_command(&format!("bp {expression}"))
+        .map_err(failed)?;
+    let after = e.breakpoints().map_err(failed)?;
+    Ok(Output::typed(
+        text,
+        structured::BreakpointSet {
+            added: after
+                .iter()
+                .map(|breakpoint| breakpoint.id)
+                .filter(|id| !before.contains(id))
+                .collect(),
+            breakpoints: after.iter().map(structured::BreakpointInfo::from).collect(),
+        },
+    ))
 }
 
 /// Reads target memory and renders it as a hex dump.
@@ -1254,9 +1403,11 @@ impl Debuggee for BatchEngine<'_> {
     }
 
     fn run_to(&mut self, address: &str, timeout_ms: u32) -> Result<Ran, String> {
-        let output = run_to_address(self.e, address, timeout_ms)?;
+        // The typed half is dropped here, deliberately: a batch's product is its own report,
+        // which renders every step into one narrative, and a step does not answer separately.
+        let output = run_to_address(self.e, address, timeout_ms).map_err(|error| error.message)?;
         Ok(Ran {
-            output,
+            output: output.text,
             interrupted: self.broken(),
         })
     }
@@ -1278,9 +1429,10 @@ impl Debuggee for BatchEngine<'_> {
             self.e,
             query.clone(),
             Duration::from_millis(u64::from(budget_ms)),
-        )?;
+        )
+        .map_err(|error| error.message)?;
         Ok(Ran {
-            output,
+            output: output.text,
             interrupted: self.broken(),
         })
     }
@@ -1445,7 +1597,7 @@ fn diagnostic_categories(diagnostics: &PoolDiagnostics) -> Vec<&DiagnosticShape>
 /// drawn from what the walk indexed, so under partial coverage a count is a floor. Saying so
 /// is the difference between "there are three of these" and "these are the three I could see".
 fn coverage_caveat(report: &query::PoolSnapshotReport) -> Option<String> {
-    if report.complete {
+    if report.coverage.complete() {
         return None;
     }
     Some(format!(
@@ -1466,9 +1618,12 @@ fn coverage_caveat(report: &query::PoolSnapshotReport) -> Option<String> {
 /// thousands, and the first forty of those are a sample of whichever heap happened to be
 /// walked first, not of the problem. Counts per category say which failures actually
 /// dominate; the verbatim tail keeps concrete addresses available.
-fn append_walk_report(out: &mut String, e: &DebugEngine) {
-    match query::snapshot_report(e, false) {
-        Ok(report) => out.push_str(&render_walk_report(&report)),
+fn append_walk_report(
+    out: &mut String,
+    report: Result<&query::PoolSnapshotReport, &query::PoolQueryError>,
+) {
+    match report {
+        Ok(report) => out.push_str(&render_walk_report(report)),
         Err(error) => out.push_str(&format!("\n(could not summarise the walk: {error})\n")),
     }
 }
@@ -1482,7 +1637,7 @@ fn render_walk_report(report: &query::PoolSnapshotReport) -> String {
         "\n--- pool walk ---\nchunks walked: {} ({} allocated), coverage: {}\n",
         report.total_chunks,
         report.allocated_chunks,
-        if report.complete {
+        if report.coverage.complete() {
             "complete"
         } else {
             "INCOMPLETE - the walk did not reach everything it set out to"
@@ -1540,7 +1695,7 @@ fn render_walk_report(report: &query::PoolSnapshotReport) -> String {
 /// the *walker's* default could overrun both. A walk stopped by a budget still answers — every
 /// rendering below carries how much of the pool the walk reached — so the cost of a short deadline
 /// is coverage, not an error.
-fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<String, String> {
+fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Failed> {
     let walk = |refresh: bool| PoolWalk::from(refresh).within(within);
     match args {
         PoolOp::FindTag {
@@ -1556,55 +1711,205 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<String, Strin
                     PoolPageFilter::NonPaged
                 }
             });
-            let spans = query::find_tag(e, &tag, filter, walk(refresh)).map_err(es)?;
+            let spans = query::find_tag(e, &tag, filter, walk(refresh)).map_err(pool_failure)?;
             let mut out = render_find_tag(&tag, filter, &spans, limit);
-            // Both branches read the snapshot `find_tag` has just taken or reused — hence the bare
-            // `false` below, which cannot start a walk of its own whatever budget this query had.
+            // Reads the snapshot `find_tag` has just taken or reused — hence `refresh: false`,
+            // which cannot start a walk of its own whatever budget this query had.
+            let report = walk_report(e, within);
             if spans.is_empty() {
-                append_walk_report(&mut out, e);
-            } else if let Ok(report) = query::snapshot_report(e, false)
-                && let Some(caveat) = coverage_caveat(&report)
+                // An empty answer has to explain itself, or "the pool holds no such chunk" and
+                // "the walk reached almost none of the pool" read identically.
+                append_walk_report(&mut out, report.as_ref());
+            } else if let Ok(report) = &report
+                && let Some(caveat) = coverage_caveat(report)
             {
                 out.push_str(&caveat);
             }
-            Ok(out)
+            Ok(Output::typed(
+                out,
+                structured::PoolTagMatches {
+                    tag,
+                    scope: match filter {
+                        None => structured::PoolScope::Both,
+                        Some(PoolPageFilter::Paged) => structured::PoolScope::Paged,
+                        Some(PoolPageFilter::NonPaged) => structured::PoolScope::NonPaged,
+                    },
+                    matches: spans.len(),
+                    // Summed over every match, not over the listed ones: `limit` bounds the
+                    // rows a reply carries and must never bound what it *says* is there.
+                    total_bytes: spans.iter().map(|span| span.size).sum(),
+                    chunks: spans
+                        .iter()
+                        .take(limit)
+                        .map(structured::PoolChunkInfo::from)
+                        .collect(),
+                    walk: walk_info(report.as_ref()),
+                },
+            ))
         }
         PoolOp::Chunk { address, refresh } => {
-            let address = parse_pool_addr(&address)?;
-            match query::chunk_at(e, address, walk(refresh)).map_err(es)? {
-                Some(found) => Ok(render_chunk(address, &found)),
+            // The caller's own mistake, and named as one: an unparseable address never reached
+            // the debugger, so reporting it as a debugger failure would send them looking at the
+            // target.
+            let address = parse_pool_addr(&address).map_err(|why| {
+                Failed::categorised(structured::ErrorCategory::InvalidArgument, why)
+            })?;
+            let found = query::chunk_at(e, address, walk(refresh)).map_err(pool_failure)?;
+            let mut out = match &found {
+                Some(found) => render_chunk(address, found),
                 // "Not in the snapshot" and "free" are different answers, and reporting this one
                 // as free would manufacture a dangling pointer out of a gap in the walk.
-                None => {
-                    let mut out = format!(
-                        "{} is not covered by the pool snapshot.\n\nThat is not the same as \
-                         \"free\": a free hole inside a walked region comes back as a chunk in \
-                         an explicitly free state (ReusableFree or CachedFree). An address \
-                         outside every region is either not pool at all, or sits in a region \
-                         this walk did not reach. If the target has run since the snapshot was \
-                         taken, retry with refresh=true.",
-                        fmt_addr(address)
-                    );
-                    append_walk_report(&mut out, e);
-                    Ok(out)
-                }
+                None => format!(
+                    "{} is not covered by the pool snapshot.\n\nThat is not the same as \
+                     \"free\": a free hole inside a walked region comes back as a chunk in \
+                     an explicitly free state (ReusableFree or CachedFree). An address \
+                     outside every region is either not pool at all, or sits in a region \
+                     this walk did not reach. If the target has run since the snapshot was \
+                     taken, retry with refresh=true.",
+                    fmt_addr(address)
+                ),
+            };
+            // Read once and spent twice: the text below and the typed answer describe the same
+            // walk, and asking again could start a second one — an incomplete snapshot is not
+            // cached, so a re-read is a re-walk.
+            let report = walk_report(e, within);
+            if found.is_none() {
+                append_walk_report(&mut out, report.as_ref());
             }
+            Ok(Output::typed(
+                out,
+                structured::PoolChunkAt {
+                    address: structured::addr(address),
+                    covered: found.is_some(),
+                    offset: found
+                        .as_ref()
+                        .map(|found| address.saturating_sub(found.chunk.usable_address)),
+                    chunk: found
+                        .as_ref()
+                        .map(|found| structured::PoolChunkInfo::from(&found.chunk)),
+                    previous: found
+                        .as_ref()
+                        .and_then(|found| found.previous.as_ref())
+                        .map(structured::PoolChunkInfo::from),
+                    next: found
+                        .as_ref()
+                        .and_then(|found| found.next.as_ref())
+                        .map(structured::PoolChunkInfo::from),
+                    walk: walk_info(report.as_ref()),
+                },
+            ))
         }
         PoolOp::Diagnostics {
             filter,
             refresh,
             limit,
         } => {
-            let report = query::snapshot_report(e, walk(refresh)).map_err(es)?;
-            Ok(render_diagnostics(&report, filter.as_deref(), limit))
+            let report = query::snapshot_report(e, walk(refresh)).map_err(pool_failure)?;
+            let out = render_diagnostics(&report, filter.as_deref(), limit);
+            let examples = select_examples(&report.diagnostics, filter.as_deref());
+            let categories = select_categories(&report.diagnostics, filter.as_deref());
+            let (example_rows, category_rows) =
+                split_row_budget(limit, examples.len(), categories.len());
+            Ok(Output::typed(
+                out,
+                structured::PoolDiagnosticsReport {
+                    filter,
+                    matched_categories: categories.len(),
+                    matched_examples: examples.len(),
+                    categories: categories
+                        .iter()
+                        .take(category_rows)
+                        .map(|category| structured::DiagnosticCategory {
+                            shape: category.shape.trim().to_string(),
+                            // The walk's own total for this shape, not the number of messages
+                            // that survived its sampling — see #77.
+                            total: category.total,
+                        })
+                        .collect(),
+                    examples: examples
+                        .iter()
+                        .take(example_rows)
+                        .map(|line| (*line).clone())
+                        .collect(),
+                    walk: walk_info(Ok(&report)),
+                },
+            ))
         }
         // The census *is* the state of the walk, so it always carries the report.
         PoolOp::Census { refresh, limit } => {
-            let census = query::tag_census(e, walk(refresh)).map_err(es)?;
+            let census = query::tag_census(e, walk(refresh)).map_err(pool_failure)?;
             let mut out = render_census(&census, limit);
-            append_walk_report(&mut out, e);
-            Ok(out)
+            let report = walk_report(e, within);
+            append_walk_report(&mut out, report.as_ref());
+            Ok(Output::typed(
+                out,
+                structured::PoolCensus {
+                    distinct_tags: census.len(),
+                    tags: census
+                        .iter()
+                        .take(limit)
+                        .map(|entry| structured::PoolTagTotals {
+                            tag: entry.display_tag.clone(),
+                            allocations: entry.allocations,
+                            total_bytes: entry.total_bytes,
+                            paged_allocations: entry.paged_allocations,
+                            nonpaged_allocations: entry.nonpaged_allocations,
+                        })
+                        .collect(),
+                    walk: walk_info(report.as_ref()),
+                },
+            ))
         }
+    }
+}
+
+/// The walk's own state, for an answer that has already been computed from it.
+///
+/// `refresh: false`, so this reads the snapshot the query just took or reused. It is bounded by
+/// the caller's remaining `within` all the same: an *incomplete* walk is not cached, so this can
+/// find no snapshot and start one, and win-kexp's 120s default is not this call's to spend.
+fn walk_report(
+    e: &DebugEngine,
+    within: Duration,
+) -> Result<query::PoolSnapshotReport, query::PoolQueryError> {
+    query::snapshot_report(e, PoolWalk::from(false).within(within))
+}
+
+/// The walk state every pool answer carries.
+///
+/// A walk whose own summary could not be read reports `Partial` with nothing counted, which is
+/// the honest reading: something is not being covered here, and it is certainly not complete.
+fn walk_info(
+    report: Result<&query::PoolSnapshotReport, &query::PoolQueryError>,
+) -> structured::WalkInfo {
+    match report {
+        Ok(report) => structured::WalkInfo {
+            coverage: report.coverage.into(),
+            chunks_walked: report.total_chunks,
+            allocated_chunks: report.allocated_chunks,
+            diagnostics_emitted: report.diagnostics.emitted(),
+            diagnostic_categories: report.diagnostics.shapes().len(),
+        },
+        Err(_) => structured::WalkInfo {
+            coverage: structured::PoolCoverage::Partial,
+            chunks_walked: 0,
+            allocated_chunks: 0,
+            diagnostics_emitted: 0,
+            diagnostic_categories: 0,
+        },
+    }
+}
+
+/// A pool query's failure, with the one kind of stop that is not a failure kept apart from it.
+///
+/// A walk that was interrupted did exactly what it was told; reporting it as a debugger failure
+/// sends a caller looking for a broken target.
+fn pool_failure(error: query::PoolQueryError) -> Failed {
+    match error {
+        query::PoolQueryError::Interrupted => {
+            Failed::categorised(structured::ErrorCategory::Interrupted, error.to_string())
+        }
+        other => Failed::from(other.to_string()),
     }
 }
 
@@ -1764,7 +2069,7 @@ fn render_diagnostics(
             "No diagnostics{scope}.\n\nThe walk was {}. It emitted {} diagnostic(s) in total over {} \
              chunk(s) ({} allocated). If you expected a match, check the spelling — the \
              filter is a plain case-insensitive substring, not a pattern.",
-            if report.complete {
+            if report.coverage.complete() {
                 "complete"
             } else {
                 "INCOMPLETE"
@@ -1887,7 +2192,7 @@ fn render_census(census: &[query::PoolTagSummary], limit: usize) -> String {
 /// win-kexp's openers expose the first seam as `x_begin()` returning a `PendingTarget` guard,
 /// which cannot exist unless the side effect succeeded — so `commit()` between the guard and its
 /// `wait()` is enforced by the type rather than by convention (glslang/win-kexp#71).
-fn open<T, R>(id: u64, transition: T, report: R) -> Result<String, String>
+fn open<T, R>(id: u64, transition: T, report: R) -> Result<Output, Failed>
 where
     T: FnOnce(&dyn Fn()) -> Result<(), String>,
     R: FnOnce() -> Result<String, String>,
@@ -1896,7 +2201,10 @@ where
         emit(&WorkerMessage::Committed { id });
     })?;
     emit(&WorkerMessage::Opened { id });
-    report()
+    // The opener's *typed* answer is assembled by the supervisor, which is the only side that
+    // knows the handle it minted and the state it settled the session into; this side owns the
+    // report text and nothing else.
+    report().map(Output::text).map_err(Failed::from)
 }
 
 /// The post-attach diagnostic shared by both kernel openers.
@@ -1922,10 +2230,10 @@ fn resolve(e: &DebugEngine, expr: &str) -> Option<u64> {
         .or_else(|| parse_u64(expr).ok())
 }
 
-fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<String, String> {
+fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, Failed> {
     let target =
         resolve(e, address).ok_or_else(|| format!("could not resolve address `{address}`"))?;
-    let res = e.run_to_address(target, wait).map_err(es)?;
+    let res = e.run_to_address(target, wait).map_err(failed)?;
     let mut msg = match res.outcome {
         RunToOutcome::Hit => format!("VERDICT: HIT — execution reached {}\n", fmt_addr(target)),
         RunToOutcome::StoppedElsewhere { stopped_at } => format!(
@@ -1944,7 +2252,25 @@ fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<String, S
         msg.push_str("---- debugger output ----\n");
         msg.push_str(&res.output);
     }
-    Ok(msg)
+    // The verdict was a value in win-kexp and became a `VERDICT:` line here, which is what every
+    // caller then matched on. It travels as a value again; the line stays for the reader.
+    let (verdict, stopped_at) = match res.outcome {
+        RunToOutcome::Hit => (structured::RunToVerdict::Hit, Some(target)),
+        RunToOutcome::StoppedElsewhere { stopped_at } => {
+            (structured::RunToVerdict::StoppedElsewhere, Some(stopped_at))
+        }
+        RunToOutcome::Timeout => (structured::RunToVerdict::Timeout, None),
+    };
+    Ok(Output::typed(
+        msg,
+        structured::RunToReport {
+            verdict,
+            target: structured::addr(target),
+            stopped_at: stopped_at.map(structured::addr),
+            timeout_ms: wait,
+            output: res.output,
+        },
+    ))
 }
 
 fn reachable(e: &DebugEngine, args: ReachabilityOp) -> Result<String, String> {
@@ -2021,8 +2347,19 @@ mod tests {
         query::PoolSnapshotReport {
             total_chunks: 4211,
             allocated_chunks: 3007,
-            complete,
+            coverage: coverage(complete),
             diagnostics: diagnostics.iter().map(|line| line.to_string()).collect(),
+        }
+    }
+
+    /// A walk that covered everything, or one that stopped short for a reason other than the
+    /// clock. The deadline case is a value of its own and is exercised where it becomes an
+    /// answer — in `structured`.
+    fn coverage(complete: bool) -> query::WalkCoverage {
+        if complete {
+            query::WalkCoverage::Complete
+        } else {
+            query::WalkCoverage::Partial
         }
     }
 
@@ -2036,7 +2373,7 @@ mod tests {
         query::PoolSnapshotReport {
             total_chunks: 4211,
             allocated_chunks: 3007,
-            complete: false,
+            coverage: coverage(false),
             diagnostics: lines.into_iter().collect(),
         }
     }
@@ -2144,7 +2481,7 @@ mod tests {
         query::PoolSnapshotReport {
             total_chunks: 4211,
             allocated_chunks: 3007,
-            complete: true,
+            coverage: coverage(true),
             diagnostics: lines.into_iter().collect(),
         }
     }
@@ -2742,22 +3079,28 @@ mod tests {
     /// interrupting rather than ending the session.
     #[test]
     fn a_cut_short_result_keeps_its_output_and_says_why() {
-        let out = cut_short(Ok("0x1000  41 42 43\n".to_string())).expect("still a result");
+        let out = cut_short(Ok(Output::text("0x1000  41 42 43\n")))
+            .expect("still a result")
+            .text;
         assert!(out.starts_with("0x1000  41 42 43"), "{out}");
         assert!(out.contains("interrupted on request"), "{out}");
 
         // And a failure keeps its debugger text: "this is why it stopped" is not a claim about
-        // what it would otherwise have said.
-        let err = cut_short(Err("Memory access error".to_string())).expect_err("still a failure");
-        assert!(err.starts_with("Memory access error"), "{err}");
-        assert!(err.contains("interrupted on request"), "{err}");
+        // what it would otherwise have said. It also stops calling itself a *debugger* failure,
+        // which is the half a caller acts on rather than reads.
+        let err = cut_short(Err(Failed::from("Memory access error"))).expect_err("still a failure");
+        assert!(err.message.starts_with("Memory access error"), "{err:?}");
+        assert!(err.message.contains("interrupted on request"), "{err:?}");
+        assert_eq!(err.category, Some(structured::ErrorCategory::Interrupted));
     }
 
     /// An operation interrupted before it printed anything still explains itself, rather than
     /// coming back as an empty success the caller would read as "found nothing".
     #[test]
     fn a_cut_short_result_with_no_output_is_still_an_explanation() {
-        let out = cut_short(Ok(String::new())).expect("still a result");
+        let out = cut_short(Ok(Output::text(String::new())))
+            .expect("still a result")
+            .text;
         assert!(out.contains("interrupted on request"), "{out}");
         assert!(
             !out.starts_with('\n'),

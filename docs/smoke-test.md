@@ -59,10 +59,12 @@ suppress it — not ship an advertisement clients will call into a dead end.
 **Tool surface golden.** `tests/golden/tools_list.json` records the *structural* `tools/list`
 surface as it appears on the wire: JSON Schema dialect, `$defs` usage (`true` since `debug_batch`
 introduced the first nested schema), tool count, and per tool its
-name, title, four behaviour hints, required arguments, and each parameter's type/format/enum. It
-deliberately excludes descriptions, so prose edits do not churn it while a `schemars` dialect
-switch, an `rmcp` annotation-casing change, or an accidental tool rename all land as a readable
-line diff.
+name, title, four behaviour hints, required arguments, each parameter's type/format/enum, and — for
+the tools that declare one — the shape of its `outputSchema`: the dialect, and for each branch of
+the result union its `status` const, the payload type it references, and what that branch requires.
+It deliberately excludes descriptions, so prose edits do not churn it while a `schemars` dialect
+switch, an `rmcp` annotation-casing change, a discriminator that stops being emitted, or an
+accidental tool rename all land as a readable line diff.
 
 Re-record after an *intended* change, and read the diff before committing:
 
@@ -93,6 +95,14 @@ session-handle contract on the wire (a stale handle is refused; the handle stops
 which DbgEng implements only in user mode, so on a kernel dump it must come back as a **tool error
 carrying the engine's message** — not a JSON-RPC error, and not a dead session. Read-only
 throughout, and it needs no symbols, so it runs offline.
+
+Those checks are made against **typed fields** wherever a tool has them (issue #84): the handle is
+read from `structuredContent`, not from a `session_id:` line; `nt` and `hal` are matched as module
+records rather than as the third token of a rendered row, which is what used to break on a column
+shift and name the wrong cause; the stale-handle refusal is checked by its `stale_session` category
+rather than by its wording. A field is a contract; the text beside it is a rendering, and rewording
+it must not fail a test. The one exception is deliberate: `tool_text` still exists and is still used
+where the *rendering* is the thing under test (a batch report, an interrupted call's note).
 
 It also covers process-per-session, which cannot be checked any other way — the claims are about
 processes, so they need real ones:

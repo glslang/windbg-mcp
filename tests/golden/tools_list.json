@@ -13,6 +13,25 @@
         "readOnly": false
       },
       "name": "attach_kernel",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/OpenedSession",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/OpenFailure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "connection: string|null",
         "profile: string|null"
@@ -28,6 +47,25 @@
         "readOnly": false
       },
       "name": "attach_kernel_local",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/OpenedSession",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/OpenFailure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [],
       "required": [],
       "title": "Attach to local kernel"
@@ -40,6 +78,25 @@
         "readOnly": false
       },
       "name": "attach_process",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/OpenedSession",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/OpenFailure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "pid: integer/uint32"
       ],
@@ -56,6 +113,7 @@
         "readOnly": true
       },
       "name": "backtrace",
+      "output": null,
       "params": [
         "session_id: string|null"
       ],
@@ -70,6 +128,7 @@
         "readOnly": false
       },
       "name": "debug_batch",
+      "output": null,
       "params": [
         "always: array<ref(#/$defs/BatchStep)>",
         "session_id: string|null",
@@ -89,6 +148,7 @@
         "readOnly": true
       },
       "name": "decode_ioctl",
+      "output": null,
       "params": [
         "code: string"
       ],
@@ -105,6 +165,7 @@
         "readOnly": true
       },
       "name": "device_object",
+      "output": null,
       "params": [
         "device: string",
         "session_id: string|null"
@@ -122,6 +183,7 @@
         "readOnly": true
       },
       "name": "disassemble",
+      "output": null,
       "params": [
         "address: string|null",
         "session_id: string|null"
@@ -137,6 +199,7 @@
         "readOnly": true
       },
       "name": "driver_object",
+      "output": null,
       "params": [
         "name: string",
         "session_id: string|null"
@@ -154,6 +217,7 @@
         "readOnly": false
       },
       "name": "dx",
+      "output": null,
       "params": [
         "expression: string",
         "session_id: string|null"
@@ -171,6 +235,25 @@
         "readOnly": false
       },
       "name": "end_session",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/SessionEnded",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "session_id: string|null"
       ],
@@ -185,6 +268,7 @@
         "readOnly": false
       },
       "name": "execute",
+      "output": null,
       "params": [
         "command: string",
         "session_id: string|null"
@@ -202,6 +286,25 @@
         "readOnly": false
       },
       "name": "go",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/StopReport",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "session_id: string|null"
       ],
@@ -216,6 +319,7 @@
         "readOnly": false
       },
       "name": "goto_position",
+      "output": null,
       "params": [
         "position: string",
         "session_id: string|null"
@@ -233,6 +337,7 @@
         "readOnly": false
       },
       "name": "index_trace",
+      "output": null,
       "params": [
         "session_id: string|null"
       ],
@@ -247,6 +352,7 @@
         "readOnly": false
       },
       "name": "interrupt",
+      "output": null,
       "params": [
         "session_id: string|null"
       ],
@@ -261,6 +367,7 @@
         "readOnly": false
       },
       "name": "ioctl_trace",
+      "output": null,
       "params": [
         "dispatch: string",
         "session_id: string|null"
@@ -278,6 +385,7 @@
         "readOnly": true
       },
       "name": "irp_stack",
+      "output": null,
       "params": [
         "irp: string|null",
         "session_id: string|null"
@@ -293,6 +401,25 @@
         "readOnly": false
       },
       "name": "launch",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/OpenedSession",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/OpenFailure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "command_line: string"
       ],
@@ -309,6 +436,25 @@
         "readOnly": true
       },
       "name": "modules",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/ModuleList",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "session_id: string|null"
       ],
@@ -323,6 +469,25 @@
         "readOnly": false
       },
       "name": "open_dump",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/OpenedSession",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/OpenFailure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "path: string"
       ],
@@ -339,6 +504,25 @@
         "readOnly": false
       },
       "name": "open_trace",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/OpenedSession",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/OpenFailure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "path: string"
       ],
@@ -355,6 +539,25 @@
         "readOnly": true
       },
       "name": "pool_census",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/PoolCensus",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "limit: integer|null/uint32",
         "refresh: boolean|null",
@@ -371,6 +574,25 @@
         "readOnly": true
       },
       "name": "pool_chunk",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/PoolChunkAt",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "address: string",
         "refresh: boolean|null",
@@ -389,6 +611,25 @@
         "readOnly": true
       },
       "name": "pool_diagnostics",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/PoolDiagnosticsReport",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "filter: string|null",
         "limit: integer|null/uint32",
@@ -406,6 +647,25 @@
         "readOnly": true
       },
       "name": "pool_find_tag",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/PoolTagMatches",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "limit: integer|null/uint32",
         "paged: boolean|null",
@@ -426,6 +686,7 @@
         "readOnly": true
       },
       "name": "reachable_from_dispatch",
+      "output": null,
       "params": [
         "address: string|null",
         "from: string",
@@ -449,6 +710,7 @@
         "readOnly": true
       },
       "name": "read_memory",
+      "output": null,
       "params": [
         "address: string",
         "session_id: string|null",
@@ -468,6 +730,7 @@
         "readOnly": false
       },
       "name": "record_trace",
+      "output": null,
       "params": [
         "env: array<string>",
         "out_dir: string",
@@ -488,7 +751,27 @@
         "readOnly": true
       },
       "name": "registers",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/RegisterSet",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
+        "all: boolean|null",
         "session_id: string|null"
       ],
       "required": [],
@@ -502,6 +785,25 @@
         "readOnly": false
       },
       "name": "reverse_go",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/StopReport",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "session_id: string|null"
       ],
@@ -516,6 +818,25 @@
         "readOnly": false
       },
       "name": "run_to_address",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/RunToReport",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "address: string",
         "session_id: string|null",
@@ -534,6 +855,25 @@
         "readOnly": true
       },
       "name": "session_status",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/SessionsReport",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "session_id: string|null"
       ],
@@ -548,6 +888,25 @@
         "readOnly": false
       },
       "name": "set_breakpoint",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/BreakpointSet",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "expression: string",
         "session_id: string|null"
@@ -565,6 +924,7 @@
         "readOnly": false
       },
       "name": "set_symbol_path",
+      "output": null,
       "params": [
         "append: boolean|null",
         "path: string",
@@ -584,6 +944,25 @@
         "readOnly": false
       },
       "name": "step_back",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/StopReport",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "session_id: string|null"
       ],
@@ -598,6 +977,25 @@
         "readOnly": false
       },
       "name": "step_into",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/StopReport",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "session_id: string|null"
       ],
@@ -612,6 +1010,25 @@
         "readOnly": false
       },
       "name": "step_over",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/StopReport",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "session_id: string|null"
       ],
@@ -626,6 +1043,25 @@
         "readOnly": false
       },
       "name": "step_over_back",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/StopReport",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "session_id: string|null"
       ],
@@ -640,6 +1076,7 @@
         "readOnly": true
       },
       "name": "threads",
+      "output": null,
       "params": [
         "session_id: string|null"
       ],
@@ -654,6 +1091,7 @@
         "readOnly": true
       },
       "name": "ttd_calls",
+      "output": null,
       "params": [
         "function: string",
         "session_id: string|null"
@@ -671,6 +1109,7 @@
         "readOnly": true
       },
       "name": "ttd_events",
+      "output": null,
       "params": [
         "session_id: string|null"
       ],
@@ -685,6 +1124,7 @@
         "readOnly": true
       },
       "name": "ttd_memory",
+      "output": null,
       "params": [
         "address: string",
         "mode: string|null",

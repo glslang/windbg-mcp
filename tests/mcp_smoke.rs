@@ -316,6 +316,61 @@ impl Server {
         text
     }
 
+    /// The **structured** result of a tool call that worked.
+    ///
+    /// The typed counterpart of [`Self::tool_text`], and the one to reach for: a field is a
+    /// contract, where the text it accompanies is a rendering that may be reworded at any time.
+    /// Asserts the outcome is the `ok` branch, so a test asking for `matches` cannot silently
+    /// read a failure that has no such field.
+    fn tool_data(&mut self, name: &str, args: Value, budget: Duration) -> Value {
+        let response = self.call_tool(name, args, budget);
+        assert_no_error(&response, &format!("tools/call {name}"));
+        let result = &response["result"];
+        let data = result["structuredContent"].clone();
+        assert!(
+            !data.is_null(),
+            "`{name}` declares an outputSchema, so every result must carry structuredContent; \
+             got:\n{}",
+            text_of(result)
+        );
+        assert_eq!(
+            data["status"],
+            "ok",
+            "`{name}` did not succeed: {}",
+            text_of(result)
+        );
+        data
+    }
+
+    /// Opens a target and hands back the handle, read as a field.
+    ///
+    /// The handle used to be recovered from the `session_id:` line an opener prints, which is the
+    /// single most-parsed piece of prose this server emits — and the one every client needs.
+    fn open_session(&mut self, tool: &str, args: Value, budget: Duration) -> String {
+        let data = self.tool_data(tool, args, budget);
+        data["session_id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("`{tool}` opened without minting a handle: {data}"))
+            .to_string()
+    }
+
+    /// The structured result of a call that was **expected** to fail, with its category checked.
+    fn tool_failure(&mut self, name: &str, args: Value, budget: Duration) -> Value {
+        let response = self.call_tool(name, args, budget);
+        assert_no_error(&response, &format!("tools/call {name}"));
+        assert!(
+            is_tool_error(&response),
+            "`{name}` was expected to fail but did not:\n{}",
+            text_of(&response["result"])
+        );
+        let data = response["result"]["structuredContent"].clone();
+        assert_eq!(
+            data["status"], "error",
+            "a failing `{name}` must carry the error branch of its own output schema, got: {data}"
+        );
+        data
+    }
+
     /// Terminates the supervisor outright, giving it no chance to run its own shutdown.
     ///
     /// Stdin is *not* closed first — that would be the graceful path this is the opposite of. The
@@ -670,6 +725,52 @@ fn digest_tool(tool: &Value) -> Value {
         },
         "required": required,
         "params": params,
+        "output": digest_output_schema(&tool["outputSchema"]),
+    })
+}
+
+/// The shape of a tool's declared `outputSchema`, or `null` for a tool that declares none.
+///
+/// Recorded because this is the half of the contract a client validates *results* against, and
+/// it is generated rather than written: a `schemars` bump that changed how a discriminated union
+/// is emitted would otherwise land silently on every consumer. The digest keeps the branch shape
+/// rather than the whole schema — the point is that the discriminator and its branches survive,
+/// not the wording of every field's description.
+fn digest_output_schema(schema: &Value) -> Value {
+    if schema.is_null() {
+        return Value::Null;
+    }
+    // Every result schema here is a `oneOf` over the outcome's branches; each branch pins
+    // `status` to a const and lists what that branch requires.
+    let branches: Vec<Value> = schema["oneOf"]
+        .as_array()
+        .map(|branches| {
+            branches
+                .iter()
+                .map(|branch| {
+                    let mut required: Vec<String> = branch["required"]
+                        .as_array()
+                        .map(|r| {
+                            r.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    required.sort();
+                    json!({
+                        "status": branch["properties"]["status"]["const"],
+                        // The payload rides in on a `$ref` beside the discriminator, so the
+                        // reference is what names *which* result this branch describes.
+                        "payload": branch["$ref"],
+                        "required": required,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "dialect": schema["$schema"],
+        "branches": branches,
     })
 }
 
@@ -823,6 +924,124 @@ fn tool_schemas_declare_one_dialect_and_are_self_contained() {
             "tools/list mixes JSON Schema dialects: `{first_tool}` declares {first_dialect}, \
              `{other_tool}` declares {other}"
         );
+    }
+}
+
+/// A tool that declares an `outputSchema` must return `structuredContent` — on **both** paths.
+///
+/// The spec's requirement is on the success path, and the failure path is where this would break
+/// in practice: every migrated tool has a validation refusal or a session check that returns long
+/// before the typed answer is built, and each is a separate `return` a future edit can add without
+/// the payload. A client that validates results against the schema then rejects the very message
+/// telling it what went wrong.
+///
+/// Driven with no session open, so every session-scoped tool takes its refusal path without a
+/// debugger anywhere near it — which is what keeps this in the default tier.
+///
+/// The table is checked *against* `tools/list` in both directions: a tool that grows a schema and
+/// is not listed here fails, so this cannot quietly stop covering the surface it is about.
+#[test]
+fn every_tool_with_an_output_schema_answers_with_structured_content() {
+    // `attach_kernel_local` is deliberately absent: it is the one schema-bearing tool whose
+    // failure path cannot be reached without trying the thing itself, and on a machine booted
+    // with debugging enabled it would *succeed* and leave this test holding the local kernel.
+    const UNREACHED: &[&str] = &["attach_kernel_local"];
+    let cases: &[(&str, Value, &str)] = &[
+        // Openers, each failing before anything is created: a path that does not exist, a pid
+        // that cannot be attached, an image that cannot be launched, a selector with neither
+        // half given.
+        ("open_dump", json!({ "path": "Z:\\no\\such.dmp" }), "error"),
+        ("open_trace", json!({ "path": "Z:\\no\\such.run" }), "error"),
+        ("attach_process", json!({ "pid": 0xffff_fffeu32 }), "error"),
+        (
+            "launch",
+            json!({ "command_line": "Z:\\no\\such\\image.exe" }),
+            "error",
+        ),
+        ("attach_kernel", json!({}), "error"),
+        // Answered from this server's own bookkeeping, so it succeeds with nothing open.
+        ("session_status", json!({}), "ok"),
+        // Everything else needs a session, and there is none.
+        ("end_session", json!({}), "error"),
+        ("registers", json!({}), "error"),
+        ("modules", json!({}), "error"),
+        (
+            "set_breakpoint",
+            json!({ "expression": "nt!KeBugCheckEx" }),
+            "error",
+        ),
+        (
+            "run_to_address",
+            json!({ "address": "nt!KeBugCheckEx" }),
+            "error",
+        ),
+        ("go", json!({}), "error"),
+        ("step_over", json!({}), "error"),
+        ("step_into", json!({}), "error"),
+        ("step_back", json!({}), "error"),
+        ("step_over_back", json!({}), "error"),
+        ("reverse_go", json!({}), "error"),
+        ("pool_find_tag", json!({ "tag": "Tgsm" }), "error"),
+        (
+            "pool_chunk",
+            json!({ "address": "0xffff800000000000" }),
+            "error",
+        ),
+        ("pool_census", json!({}), "error"),
+        ("pool_diagnostics", json!({}), "error"),
+    ];
+
+    let mut server = Server::started();
+    let response = server.request("tools/list", json!({}), STEP);
+    let tools = response["result"]["tools"]
+        .as_array()
+        .expect("tools/list returns an array")
+        .clone();
+    let mut declared: Vec<&str> = tools
+        .iter()
+        .filter(|t| !t["outputSchema"].is_null())
+        .filter_map(|t| t["name"].as_str())
+        .filter(|name| !UNREACHED.contains(name))
+        .collect();
+    declared.sort_unstable();
+    let mut covered: Vec<&str> = cases.iter().map(|(name, _, _)| *name).collect();
+    covered.sort_unstable();
+    assert_eq!(
+        declared, covered,
+        "every tool declaring an outputSchema has to be exercised here (or listed in UNREACHED \
+         with a reason), or this test stops covering the surface it is named for"
+    );
+
+    for (name, args, expected) in cases {
+        let response = server.call_tool(name, args.clone(), STEP);
+        assert_no_error(&response, &format!("tools/call {name}"));
+        let result = &response["result"];
+        let data = &result["structuredContent"];
+        assert!(
+            !data.is_null(),
+            "`{name}` declares an outputSchema but answered with text alone:\n{}",
+            text_of(result)
+        );
+        assert_eq!(
+            data["status"], *expected,
+            "`{name}` should have answered `{expected}`: {data}"
+        );
+        if *expected == "error" {
+            assert!(
+                is_tool_error(&response),
+                "`{name}` reported a structured error but did not set isError: {result}"
+            );
+            assert!(
+                data["error"]["category"].is_string(),
+                "`{name}` must name a category a caller can branch on: {data}"
+            );
+            // The text and the typed message are the same failure, not two accounts of it.
+            assert_eq!(
+                data["error"]["message"].as_str().unwrap_or_default(),
+                text_of(result),
+                "`{name}`'s structured message and its text should be one string"
+            );
+        }
     }
 }
 
@@ -1072,17 +1291,22 @@ fn a_dump_session_opens_reads_and_closes() {
     );
 
     // The handle is what routes every later call, so the open has to mint one.
-    let session_id = session_id_of(&opened);
+    let session_id = session_id_of(&response["result"]);
     assert!(
         session_id.starts_with("sess-"),
         "session handles are minted as `sess-…`, got `{session_id}` in:\n{opened}"
     );
 
-    let status = server.tool_text("session_status", json!({}), TARGET_STEP);
-    assert!(
-        status.contains(&session_id),
-        "session_status should report the open session `{session_id}`, got:\n{status}"
-    );
+    let status = server.tool_data("session_status", json!({}), TARGET_STEP);
+    let listed_session = status["sessions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|s| s["session_id"] == session_id.as_str())
+        .unwrap_or_else(|| panic!("session_status omitted the open session: {status}"));
+    assert_eq!(listed_session["kind"], "dump");
+    assert_eq!(listed_session["state"]["state"], "open");
+    assert_eq!(listed_session["current"], true);
 
     // Read-only inspection through the engine thread. These are the calls that break when a
     // DbgEng binding changes shape.
@@ -1090,30 +1314,95 @@ fn a_dump_session_opens_reads_and_closes() {
     // anchors — not `ntdll`. Symbols are not needed: the rows come from the dump's own module
     // list, which keeps this tier runnable offline.
     //
-    // Matched as whitespace-separated tokens rather than by column position: `lm` lays out its
-    // columns from the address width and the longest module name, so a layout shift would
-    // otherwise fail here and name the wrong cause.
-    let modules = server.tool_text("modules", json!({ "session_id": session_id }), TARGET_STEP);
-    let listed: Vec<&str> = modules
-        .lines()
-        // `start end name [flags]` — the module name is the third token on a row.
-        .filter_map(|line| line.split_whitespace().nth(2))
-        .collect();
+    // Read as module *records*, not as tokens on a rendered row: `lm` lays its columns out from
+    // the address width and the longest module name, so the third-token rule this replaces
+    // failed on a layout shift and named the wrong cause.
+    let modules = server.tool_data("modules", json!({ "session_id": session_id }), TARGET_STEP);
+    let by_name = |want: &str| -> Value {
+        modules["modules"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|m| m["name"] == want)
+            .cloned()
+            .unwrap_or_else(|| panic!("the module list should include `{want}`: {modules}"))
+    };
     for expected in ["nt", "hal"] {
+        let module = by_name(expected);
+        // The addresses are this server's one representation, and they bound a real image.
+        let start = address_of(&module["start"]);
+        let end = address_of(&module["end"]);
         assert!(
-            listed.contains(&expected),
-            "the module list should include `{expected}`, got:\n{modules}"
+            start != 0 && end > start,
+            "`{expected}` should span a real range, got {module}"
+        );
+        assert!(
+            module["symbols"].is_string(),
+            "symbol state is a value, not a parenthesis in a line: {module}"
         );
     }
-    for tool in ["registers", "backtrace"] {
-        let response = server.call_tool(tool, json!({ "session_id": session_id }), TARGET_STEP);
-        assert_no_error(&response, tool);
-        let text = text_of(&response["result"]);
-        assert!(
-            !is_tool_error(&response) && !text.trim().is_empty(),
-            "`{tool}` failed against the sample dump:\n{text}"
+    assert_eq!(
+        modules["loaded"].as_u64().unwrap_or_default() as usize,
+        modules["modules"].as_array().map_or(0, Vec::len),
+        "the count and the list have to be the same walk: {modules}"
+    );
+
+    // Registers come back as values too, with the instruction pointer called out.
+    let registers = server.tool_data(
+        "registers",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        registers["all_registers"], false,
+        "the integer set by default"
+    );
+    let rip = registers["instruction_pointer"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a stopped dump has an instruction pointer: {registers}"));
+    let named = |want: &str| -> Value {
+        registers["registers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|r| r["name"] == want)
+            .cloned()
+            .unwrap_or_else(|| panic!("`{want}` should be in the integer set: {registers}"))
+    };
+    assert_eq!(named("rip")["value"], rip, "the two must be the same read");
+    for name in ["rsp", "rax", "efl"] {
+        let register = named(name);
+        assert_eq!(register["kind"], "int", "{register}");
+        assert_eq!(
+            register["value"].as_str().map(str::len),
+            Some(18),
+            "one address representation, zero-padded: {register}"
         );
     }
+    // The whole bank is opt-in, and it is a superset.
+    let everything = server.tool_data(
+        "registers",
+        json!({ "session_id": session_id, "all": true }),
+        TARGET_STEP,
+    );
+    assert_eq!(everything["all_registers"], true);
+    assert!(
+        everything["registers"].as_array().map_or(0, Vec::len)
+            > registers["registers"].as_array().map_or(0, Vec::len),
+        "`all` should add the x87/vector registers and the subregister views"
+    );
+
+    let response = server.call_tool(
+        "backtrace",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
+    assert_no_error(&response, "backtrace");
+    assert!(
+        !is_tool_error(&response) && !text_of(&response["result"]).trim().is_empty(),
+        "`backtrace` failed against the sample dump:\n{}",
+        text_of(&response["result"])
+    );
 
     // `threads` is `~`, which DbgEng only implements in user mode — against this kernel dump
     // it fails, and that is the point: a real engine failure has to come back as a *tool*
@@ -1130,23 +1419,26 @@ fn a_dump_session_opens_reads_and_closes() {
     );
 
     // A handle this server never issued must be refused rather than silently answered against
-    // whatever happens to be open — the contract `Sessions::resolve` owns.
-    let stale = server.call_tool(
+    // whatever happens to be open — the contract `Sessions::resolve` owns. The refusal says so
+    // as a category, which is what lets a client tell it from a debugger error without reading.
+    let stale = server.tool_failure(
         "modules",
         json!({ "session_id": "sess-not-a-real-handle" }),
         TARGET_STEP,
     );
-    assert!(
-        is_tool_error(&stale) || !stale["error"].is_null(),
-        "a stale session handle must be refused, got {stale}"
-    );
+    assert_eq!(stale["error"]["category"], "stale_session", "{stale}");
+    assert_eq!(stale["error"]["session_id"], "sess-not-a-real-handle");
 
-    let ended = server.tool_text(
+    let ended = server.tool_data(
         "end_session",
         json!({ "session_id": session_id }),
         TARGET_STEP,
     );
-    assert!(!ended.trim().is_empty(), "end_session said nothing");
+    assert_eq!(ended["session_id"], session_id.as_str());
+    assert_eq!(
+        ended["released"], true,
+        "a dump session lets go of its target: {ended}"
+    );
 
     // After the session is gone, the old handle must not be honoured.
     let after = server.call_tool("modules", json!({ "session_id": session_id }), TARGET_STEP);
@@ -1173,7 +1465,7 @@ fn a_batch_commits_or_fails_and_its_rollback_runs_either_way() {
 
     let response = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
     assert_no_error(&response, "open_dump");
-    let session_id = session_id_of(&text_of(&response["result"]));
+    let session_id = session_id_of(&response["result"]);
 
     // A batch that should commit: a capture bound from one step and interpolated into the next,
     // which is the whole of the "named values" contract in three steps.
@@ -1276,7 +1568,7 @@ fn ending_a_session_stops_a_running_batch_and_rolls_it_back() {
     let mut server = Server::started();
     let response = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
     assert_no_error(&response, "open_dump");
-    let session_id = session_id_of(&text_of(&response["result"]));
+    let session_id = session_id_of(&response["result"]);
 
     let mut steps = vec![
         json!({ "op": "command", "command": format!(".logopen \"{}\"", running.display()) }),
@@ -1360,7 +1652,7 @@ fn interrupting_a_running_batch_stops_it_and_rolls_it_back() {
     let mut server = Server::started();
     let response = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
     assert_no_error(&response, "open_dump");
-    let session_id = session_id_of(&text_of(&response["result"]));
+    let session_id = session_id_of(&response["result"]);
 
     // Announce that the batch is inside its steps, spend long enough to be interrupted, and then —
     // the assertion that matters — write a second marker. A batch that carries on past the
@@ -1475,7 +1767,7 @@ fn interrupting_a_batch_during_its_rollback_is_refused() {
     let mut server = Server::started();
     let response = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
     assert_no_error(&response, "open_dump");
-    let session_id = session_id_of(&text_of(&response["result"]));
+    let session_id = session_id_of(&response["result"]);
 
     let batch = server.send_request(
         "tools/call",
@@ -1573,7 +1865,7 @@ fn a_disconnect_lets_a_running_batch_roll_back_first() {
     let mut server = Server::started();
     let response = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
     assert_no_error(&response, "open_dump");
-    let session_id = session_id_of(&text_of(&response["result"]));
+    let session_id = session_id_of(&response["result"]);
 
     // Steps: announce that the batch is running, then spend twenty seconds so the disconnect
     // lands squarely inside it. `always` leaves the second marker, and is the thing under test.
@@ -1671,15 +1963,23 @@ fn marker_path(what: &str) -> std::path::PathBuf {
 /// A **failed** opener can carry one too, and that is the case worth remembering: an open that
 /// fails *after* claiming its target hands the handle back deliberately, because the session
 /// exists and needs cleaning up. So cleanup must key on this, never on `isError`.
-fn maybe_session_id(text: &str) -> Option<String> {
-    text.lines()
-        .find_map(|line| line.trim().strip_prefix("session_id:"))
-        .map(|id| id.trim().to_string())
+fn maybe_session_id(result: &Value) -> Option<String> {
+    let data = &result["structuredContent"];
+    data["session_id"]
+        .as_str()
+        .or_else(|| data["error"]["session_id"].as_str())
+        .map(str::to_string)
 }
 
 /// [`maybe_session_id`], for a call that must have opened something.
-fn session_id_of(text: &str) -> String {
-    maybe_session_id(text).unwrap_or_else(|| panic!("expected a session_id in:\n{text}"))
+fn session_id_of(result: &Value) -> String {
+    maybe_session_id(result).unwrap_or_else(|| {
+        panic!(
+            "expected a session_id in the structured result:\n{}\n--- text ---\n{}",
+            result["structuredContent"],
+            text_of(result)
+        )
+    })
 }
 
 /// Whether a process is still running. Windows-only, like everything else here.
@@ -1692,19 +1992,49 @@ fn process_alive(pid: u32) -> bool {
     String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
 }
 
-/// The `pid` `session_status` reports for a session, from its `[engine pid N, …]` line.
-fn engine_pid_of(status: &str, session_id: &str) -> u32 {
-    let line = status
-        .lines()
-        .find(|l| l.contains(session_id) && l.contains("engine pid"))
-        .unwrap_or_else(|| panic!("no engine pid reported for `{session_id}` in:\n{status}"));
-    let after = line.split("engine pid ").nth(1).expect("checked above");
-    after
-        .chars()
-        .take_while(char::is_ascii_digit)
-        .collect::<String>()
-        .parse()
-        .unwrap_or_else(|e| panic!("unreadable engine pid in {line:?}: {e}"))
+/// Reads one of this server's addresses back to a number, checking the representation on the way.
+///
+/// Every address in a structured result is documented as a `0x`-prefixed, lowercase, 16-digit
+/// hex string, and it is documented because clients depend on it: the whole reason it is a string
+/// and not a JSON number is that a kernel pointer past 2^53 does not survive a parser that reads
+/// numbers as doubles. So the shape is asserted at every point a test reads one.
+fn address_of(value: &Value) -> u64 {
+    let text = value
+        .as_str()
+        .unwrap_or_else(|| panic!("an address is a string, got {value}"));
+    let digits = text
+        .strip_prefix("0x")
+        .unwrap_or_else(|| panic!("addresses carry a `0x` prefix, got {text:?}"));
+    assert_eq!(
+        digits.len(),
+        16,
+        "addresses are zero-padded to 16 digits so they sort: {text:?}"
+    );
+    assert!(
+        digits
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        "addresses are lowercase hex with no backtick: {text:?}"
+    );
+    u64::from_str_radix(digits, 16).unwrap_or_else(|e| panic!("unreadable address {text:?}: {e}"))
+}
+
+/// The pid of the engine process holding a session, from `session_status`'s typed report.
+///
+/// A field rather than the `[engine pid N, …]` fragment of a rendered line: these tests kill that
+/// process and then assert it is gone, so a misread number would make the whole check pass
+/// against a process nobody touched.
+fn engine_pid_of(status: &Value, session_id: &str) -> u32 {
+    let sessions = status["sessions"]
+        .as_array()
+        .unwrap_or_else(|| panic!("session_status reports a session list, got: {status}"));
+    let session = sessions
+        .iter()
+        .find(|s| s["session_id"] == session_id)
+        .unwrap_or_else(|| panic!("`{session_id}` is not in the report: {status}"));
+    session["engine_pid"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("`{session_id}` reports no engine pid: {session}")) as u32
 }
 
 /// Sessions are independent processes, so opening a second target must not disturb the first.
@@ -1718,9 +2048,8 @@ fn two_sessions_coexist_and_do_not_disturb_each_other() {
     let Some(dump) = target_tier() else { return };
     let mut server = Server::started();
 
-    let first = session_id_of(&server.tool_text("open_dump", json!({ "path": dump }), TARGET_STEP));
-    let second =
-        session_id_of(&server.tool_text("open_dump", json!({ "path": dump }), TARGET_STEP));
+    let first = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+    let second = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
     assert_ne!(first, second, "each open must get its own session");
 
     // The claim: the first handle still names a live target after the second open landed.
@@ -1791,11 +2120,18 @@ fn a_kernel_attach_that_never_connects_costs_one_session_and_can_be_ended() {
         }),
     );
 
-    // Wait for it to reach the parked state rather than assuming a timing.
+    // Wait for it to reach the parked state rather than assuming a timing. Read as a state, not
+    // as a phrase: "attaching" is what the session *is*, where the sentence describing it is
+    // several sentences long and rewritten whenever the advice changes.
     let deadline = Instant::now() + Duration::from_secs(30);
     let parked = loop {
-        let status = server.tool_text("session_status", json!({}), STEP);
-        if status.contains("waiting") && status.contains("kernel target") {
+        let status = server.tool_data("session_status", json!({}), STEP);
+        let attaching = status["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|s| s["kind"] == "kernel" && s["state"]["state"] == "attaching");
+        if attaching {
             break Some(status);
         }
         if Instant::now() >= deadline {
@@ -1809,11 +2145,14 @@ fn a_kernel_attach_that_never_connects_costs_one_session_and_can_be_ended() {
         skip("attach_kernel did not reach the parked state (port 50007 busy?)");
         return;
     };
-    let kernel_session = status
-        .lines()
-        .find(|l| l.contains("kernel target"))
-        .map(|l| l.split_whitespace().next().unwrap_or_default().to_string())
-        .expect("the kernel session should be listed");
+    let kernel_session = status["sessions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|s| s["kind"] == "kernel")
+        .and_then(|s| s["session_id"].as_str())
+        .expect("the kernel session should be listed")
+        .to_string();
 
     // The point. A parked session used to be the *server's* engine thread; now it is one worker,
     // and everything else carries on.
@@ -1824,30 +2163,41 @@ fn a_kernel_attach_that_never_connects_costs_one_session_and_can_be_ended() {
         "a parked kernel attach must not block another session:\n{}",
         text_of(&opened["result"])
     );
-    let dump_session = session_id_of(&text_of(&opened["result"]));
+    let dump_session = session_id_of(&opened["result"]);
 
     // …and the parked session reports itself honestly rather than as an ordinary pending open.
-    let asked = server.tool_text(
+    // The distinction is two fields: the target has been claimed (`attaching`, not `opening`),
+    // and this particular wait has no timeout and cannot be interrupted.
+    let asked = server.tool_data(
         "session_status",
         json!({ "session_id": kernel_session }),
         STEP,
     );
-    assert!(
-        asked.contains("Do not re-run the open"),
-        "the target exists, so re-attaching would be a second attach:\n{asked}"
+    let parked = &asked["sessions"][0]["state"];
+    assert_eq!(
+        parked["state"], "attaching",
+        "the target exists, so re-attaching would be a second attach: {asked}"
+    );
+    assert_eq!(
+        parked["waits_indefinitely"], true,
+        "a live kernel attach is the wait that cannot end on its own: {asked}"
     );
 
     // The recovery that did not exist before: `end_session` cannot be answered by a worker that
     // is parked, so the worker is killed. It has to come back, and the process has to be gone.
     let worker = engine_pid_of(&status, &kernel_session);
-    let ended = server.tool_text(
+    let ended = server.tool_data(
         "end_session",
         json!({ "session_id": kernel_session }),
         Duration::from_secs(120),
     );
-    assert!(
-        ended.contains("terminated"),
-        "a parked session ends by terminating its worker:\n{ended}"
+    assert_eq!(
+        ended["released"], false,
+        "a parked worker cannot let go of its target: {ended}"
+    );
+    assert_eq!(
+        ended["worker_terminated"], true,
+        "a parked session ends by terminating its worker: {ended}"
     );
     assert!(
         !process_alive(worker),
@@ -1961,9 +2311,8 @@ fn a_profile_attach_names_its_target_without_disclosing_the_key() {
 fn engine_workers_do_not_outlive_the_connection() {
     let Some(dump) = target_tier() else { return };
     let mut server = Server::started();
-    let session =
-        session_id_of(&server.tool_text("open_dump", json!({ "path": dump }), TARGET_STEP));
-    let status = server.tool_text("session_status", json!({}), TARGET_STEP);
+    let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+    let status = server.tool_data("session_status", json!({}), TARGET_STEP);
     let worker = engine_pid_of(&status, &session);
     assert!(process_alive(worker), "the worker should be running");
 
@@ -2002,9 +2351,8 @@ fn engine_workers_do_not_outlive_the_connection() {
 fn a_worker_lets_go_and_exits_when_its_supervisor_is_killed_outright() {
     let Some(dump) = target_tier() else { return };
     let mut server = Server::started();
-    let session =
-        session_id_of(&server.tool_text("open_dump", json!({ "path": dump }), TARGET_STEP));
-    let status = server.tool_text("session_status", json!({}), TARGET_STEP);
+    let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+    let status = server.tool_data("session_status", json!({}), TARGET_STEP);
     let worker = engine_pid_of(&status, &session);
     assert!(process_alive(worker), "the worker should be running");
 
@@ -2052,8 +2400,7 @@ fn a_failed_debugger_operation_is_a_tool_error_not_a_protocol_error() {
 
     // And the other half: a real engine failure, carrying the engine's own text. `~` is
     // user-mode-only, so DbgEng rejects it against this kernel dump.
-    let session_id =
-        session_id_of(&server.tool_text("open_dump", json!({ "path": dump }), TARGET_STEP));
+    let session_id = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
     let unsupported = server.call_tool("threads", json!({ "session_id": session_id }), TARGET_STEP);
     assert_no_error(&unsupported, "threads on a kernel dump");
     assert!(
@@ -2100,8 +2447,7 @@ fn a_pool_walk_takes_this_servers_deadline_not_the_walkers_default() {
         ("WINDBG_MCP_CALL_TIMEOUT_SECS", "60"),
         ("RUST_LOG", "windbg_mcp=debug"),
     ]);
-    let session =
-        session_id_of(&server.tool_text("open_dump", json!({ "path": dump }), TARGET_STEP));
+    let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
 
     // Not `tool_text`: whether the walk itself succeeds depends on symbols this tier does not
     // require, and the budget is derived before the first pool page is read either way.
@@ -2164,7 +2510,7 @@ fn a_pool_query_with_no_time_to_walk_is_refused_rather_than_run() {
         skip("the sample dump did not open inside a 10s call budget on this machine");
         return;
     }
-    let session = session_id_of(&text_of(&opened["result"]));
+    let session = session_id_of(&opened["result"]);
 
     // `refresh`, so the cached snapshot cannot answer it and a walk is unavoidable.
     let response = server.call_tool(
@@ -2217,8 +2563,7 @@ fn a_running_command_is_interrupted_on_request_and_frees_its_session() {
     // ends the runaway at the 15s floor and the assertions below say so, instead of this test
     // sitting out five minutes of the default timeout.
     let mut server = Server::started_with(&[("WINDBG_MCP_CALL_TIMEOUT_SECS", "30")]);
-    let session =
-        session_id_of(&server.tool_text("open_dump", json!({ "path": dump }), TARGET_STEP));
+    let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
 
     // An idle session says so and does nothing. Deterministic: the open above has been answered
     // and nothing else is outstanding.
@@ -2377,8 +2722,7 @@ fn a_bounded_runaway_command_aborts_and_leaves_its_session_usable() {
     // 30s of call budget leaves the watchdog its 15s floor, which keeps the test short while
     // still exercising the real arithmetic rather than a special case.
     let mut server = Server::started_with(&[("WINDBG_MCP_CALL_TIMEOUT_SECS", "30")]);
-    let session =
-        session_id_of(&server.tool_text("open_dump", json!({ "path": dump }), TARGET_STEP));
+    let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
 
     let started = Instant::now();
     let response = server.call_tool(
@@ -2448,8 +2792,7 @@ fn a_bounded_command_queued_behind_another_job_still_beats_its_caller() {
     const QUEUE_WAIT: Duration = Duration::from_secs(30);
 
     let mut server = Server::started_with(&[("WINDBG_MCP_CALL_TIMEOUT_SECS", "60")]);
-    let session =
-        session_id_of(&server.tool_text("open_dump", json!({ "path": dump }), TARGET_STEP));
+    let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
 
     // Occupy the session for a known time, then queue the runaway behind it. `.sleep` blocks the
     // engine exactly the way a long command does, and unlike a calibrated spin its duration does
@@ -2526,8 +2869,7 @@ fn measure_what_the_bounded_path_costs_a_quick_command() {
     const ROUNDS: usize = 20;
 
     let mut server = Server::started();
-    let session =
-        session_id_of(&server.tool_text("open_dump", json!({ "path": dump }), TARGET_STEP));
+    let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
 
     /// min / median / max, because a mean hides the two modes entirely.
     fn spread(mut samples: Vec<Duration>) -> String {
@@ -2730,7 +3072,7 @@ fn a_live_kernel_session_attaches_coexists_and_detaches_cleanly() {
     // attach that claims its target and then fails the wait comes back as a tool error carrying a
     // valid `session_id`, and that session is live, halted, and needs detaching just as much as a
     // successful one. Nothing below panics until that has happened.
-    let Some(session) = maybe_session_id(&report) else {
+    let Some(session) = maybe_session_id(&attached["result"]) else {
         assert_no_error(&attached, "attach_kernel");
         panic!(
             "the attach did not land, and left no session behind. The target must be booted with \
@@ -2756,10 +3098,10 @@ fn a_live_kernel_session_attaches_coexists_and_detaches_cleanly() {
         );
 
         // The milestones made it across: not still "attaching", which is where a parked one sits.
-        let status = server.tool_text("session_status", json!({ "session_id": session }), STEP);
-        assert!(
-            status.contains("ready for work"),
-            "a landed attach must report as open, not mid-attach:\n{status}"
+        let status = server.tool_data("session_status", json!({ "session_id": session }), STEP);
+        assert_eq!(
+            status["sessions"][0]["state"]["state"], "open",
+            "a landed attach must report as open, not mid-attach: {status}"
         );
 
         // The transport lives in the worker — the process `end_session` can terminate.
@@ -2800,7 +3142,7 @@ fn a_live_kernel_session_attaches_coexists_and_detaches_cleanly() {
                 "opening a dump must not be blocked by a live kernel session:\n{}",
                 text_of(&opened["result"])
             );
-            let dump_session = session_id_of(&text_of(&opened["result"]));
+            let dump_session = session_id_of(&opened["result"]);
             let after = server.call_tool("modules", json!({ "session_id": session }), TARGET_STEP);
             assert!(
                 !is_tool_error(&after),
@@ -2873,13 +3215,13 @@ fn disconnecting_releases_a_live_kernel_session_rather_than_killing_it() {
     // something to bail on. From here the disconnect is the release, so nothing needs a detach —
     // but the assertion order still has to survive an attach that half-failed.
     assert_no_error(&attached, "attach_kernel");
-    let session = maybe_session_id(&report)
+    let session = maybe_session_id(&attached["result"])
         .unwrap_or_else(|| panic!("the attach left no session behind:\n{report}"));
     assert!(
         !is_tool_error(&attached),
         "the attach claimed its target and then failed; this test needs one that landed:\n{report}"
     );
-    let status = server.tool_text("session_status", json!({}), STEP);
+    let status = server.tool_data("session_status", json!({}), STEP);
     let worker = engine_pid_of(&status, &session);
     // `call_tool`, for the reason the block below spells out: at this point the target is broken
     // in and the release is still several steps away, so a panic here would leave it halted. The
@@ -2950,7 +3292,7 @@ fn disconnecting_releases_a_live_kernel_session_rather_than_killing_it() {
     // Keyed on the handle, not on `landed`: a re-attach that claimed the target and then failed
     // its wait comes back as a tool error *with* a session, and skipping the release for it would
     // leave the target halted — the one thing this test exists to catch.
-    let (after, ended, released) = match maybe_session_id(&report) {
+    let (after, ended, released) = match maybe_session_id(&reattached["result"]) {
         Some(session) => {
             // `call_tool`, not `tool_text`. This `.time` is *expected* to fail on the very path
             // the handle-keyed match above exists for — a re-attach that claimed the target and
@@ -3296,152 +3638,55 @@ enum HeaviestTag {
     NothingListed,
 }
 
-/// The heaviest tag in `pool_census` output.
-fn heaviest_census_tag(census: &str) -> HeaviestTag {
-    let mut lines = census
-        .lines()
-        .skip_while(|line| !(line.starts_with("tag ") && line.contains("allocs")));
-    if lines.next().is_none() {
-        return HeaviestTag::NothingListed;
-    }
-    let Some(row) = lines.find(|line| !line.trim().is_empty()) else {
+/// The heaviest tag in a `pool_census` result.
+///
+/// Reads the first entry of the census's own ordering rather than parsing a fixed-width column
+/// out of the table. The column-reading version had a trap worth remembering: `display_tag`
+/// keeps trailing spaces, so a real tag like `Ntf ` had to be taken as exactly four characters
+/// and never split on whitespace, or the cross-check below queried a tag nobody allocated and
+/// blamed the walk for not finding it. A field cannot be mis-sliced.
+fn heaviest_census_tag(census: &Value) -> HeaviestTag {
+    let Some(first) = census["tags"].as_array().and_then(|tags| tags.first()) else {
         return HeaviestTag::NothingListed;
     };
-    // A fixed-width column, read as one. Splitting on whitespace looks equivalent and is not:
-    // `display_tag` keeps spaces, so a real tag like `Ntf ` would come back as `Ntf`, which is a
-    // *different* four bytes — the cross-check below would then query a tag nobody allocated and
-    // blame the walk for not finding it. Every rendering is exactly four characters.
-    let tag: String = row.chars().take(4).collect();
+    let tag = first["tag"].as_str().unwrap_or_default().to_string();
     if tag.chars().count() != 4 || tag.contains('.') {
+        // Still a rendering, and still ambiguous: the *tag* is four raw bytes, and every
+        // unprintable one — like a literal `.` — comes back as `.`.
         return HeaviestTag::Ambiguous;
     }
     HeaviestTag::Queryable(tag)
 }
 
-/// Pinned in the default tier, because the failure it guards against is a *silent skip*: the
-/// cross-check it feeds only runs on `Queryable`, so a parser that stops matching takes the proof
-/// with it and the live run still passes. The three-way split matters just as much — collapsing
-/// `Ambiguous` into `NothingListed` turns an unremarkable target into a test failure.
-#[test]
-fn a_census_table_yields_its_heaviest_tag() {
-    const HEADER: &str = "tag      allocs        bytes  nonpaged   paged";
-    let table = |rows: &str| {
-        format!(
-            "3 distinct tag(s) allocated, heaviest first.\n\n{HEADER}\n{rows}\n\
-             \n--- pool walk ---\nchunks walked: 5 (4 allocated), coverage: complete\n"
-        )
-    };
-
-    assert!(matches!(
-        heaviest_census_tag(&table(
-            "MmSt        912       0x1f40       912       0\n\
-             Tgsm          4         0x1a0         4       0"
-        )),
-        HeaviestTag::Queryable(tag) if tag == "MmSt"
-    ));
-
-    // A three-byte tag is rendered padded with the space it actually contains, and `parse_tag`
-    // takes it straight back. Splitting on whitespace would hand `pool_find_tag` the three-byte
-    // `Ntf` instead — a different tag, which nothing allocated, blamed on the walk.
-    assert!(matches!(
-        heaviest_census_tag(&table("Ntf         912       0x1f40       912       0")),
-        HeaviestTag::Queryable(tag) if tag == "Ntf "
-    ));
-
-    // A walk that found nothing has no heaviest tag, and nothing may invent one.
-    assert!(matches!(
-        heaviest_census_tag("The pool snapshot contains no allocated chunks."),
-        HeaviestTag::NothingListed
-    ));
-
-    // Unprintable tag bytes render as `.`, and so does a literal `.` — the rendering cannot be
-    // turned back into bytes. That is a fact about rendering, not about the pool, so it must not
-    // read as "the walk found nothing".
-    assert!(matches!(
-        heaviest_census_tag(&table("Nt.f        912       0x1f40       912       0")),
-        HeaviestTag::Ambiguous
-    ));
-}
-
-/// The walk's stated diagnostic total, and the per-category counts printed beneath it.
-fn diagnostic_counts(report: &str) -> Option<(usize, Vec<usize>)> {
-    let total = report.lines().find_map(|line| {
-        let (count, _) = line.split_once(" diagnostic(s) in ")?;
-        count.trim().parse::<usize>().ok()
-    })?;
-    let categories = report
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim_start();
-            let digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
-            // `x` and two spaces, or a `0x1f40` in some other table would read as a category.
-            (!digits.is_empty() && trimmed[digits.len()..].starts_with("x  "))
-                .then(|| digits.parse().ok())
-                .flatten()
-        })
-        .collect();
-    Some((total, categories))
-}
-
-/// A walk's diagnostic total has to account for the categories printed beneath it.
+/// A walk's diagnostic total has to account for the categories reported under it.
 ///
 /// The arithmetic is trivial — a sum is at least the part of it you can see — and it is exactly
 /// what broke. The total used to be the number of *lines that survived* the walk's collapsing, so
-/// a real run printed "71 diagnostic(s)" above a category reading "5621x" (#77): a statement about
-/// this code's own truncation, rendered as a measurement of the target. Fixtures cannot catch it
-/// because nothing collapses until a category floods, so this live tier is the only place the two
-/// numbers are ever far enough apart to disagree.
-fn assert_diagnostic_total_covers_its_categories(report: &str) {
-    if report.contains("the walk reported no diagnostics.") {
+/// a real run reported "71 diagnostic(s)" beside a category reading "5621x" (#77): a statement
+/// about this code's own truncation, presented as a measurement of the target. Fixtures cannot
+/// catch it because nothing collapses until a category floods, so this live tier is the only
+/// place the two numbers are ever far enough apart to disagree.
+fn assert_diagnostic_total_covers_its_categories(diagnostics: &Value) {
+    let emitted = diagnostics["walk"]["diagnostics_emitted"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the walk reports how much it complained: {diagnostics}"));
+    if emitted == 0 {
         return;
     }
-    let (total, categories) = diagnostic_counts(report)
-        .unwrap_or_else(|| panic!("no diagnostic summary to check in:\n{report}"));
+    let categories: Vec<u64> = diagnostics["categories"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|category| category["total"].as_u64())
+        .collect();
     assert!(
         !categories.is_empty(),
-        "a diagnostic total with no categories under it means this parser stopped matching, and \
-         a check that silently matches nothing is not a check:\n{report}"
+        "a diagnostic total with no categories under it means the walk grouped nothing, and a          check that silently matches nothing is not a check: {diagnostics}"
     );
-    let listed: usize = categories.iter().sum();
+    let listed: u64 = categories.iter().sum();
     assert!(
-        total >= listed,
-        "the walk reported {total} diagnostic(s) but the categories under it account for {listed} \
-         — so the total is counting something other than the messages the walk emitted, and a \
-         reader takes it for a property of the target (#77):\n{report}"
-    );
-}
-
-/// Pinned in the default tier for the same reason as the census parser above: the live check it
-/// feeds is the *only* one that can see this fault, so a parser that quietly stops matching would
-/// take the proof with it and leave the live run passing.
-#[test]
-fn a_walk_report_yields_its_diagnostic_counts() {
-    let report = "--- pool walk ---\nchunks walked: 413279 (234110 allocated), coverage: \
-                  INCOMPLETE - the walk did not reach everything it set out to\n\
-                  7731 diagnostic(s) in 24 categories:\n\
-                  \x205621x  rejecting implausible LFH metadata at #\n\
-                  \x201770x  cannot read LFH subsegment # sparse virtual range at #\n\
-                  \nlast 12 of the 71 kept verbatim (the rest are in the counts above):\n\
-                  \x20 rejecting implausible LFH metadata at 0xffff8c8f0de00260\n";
-
-    let (total, categories) = diagnostic_counts(report).expect("the summary is right there");
-    assert_eq!(total, 7731);
-    assert_eq!(categories, vec![5621, 1770]);
-    // The verbatim example carries an address, not a count, and must not be read as a category.
-    assert_diagnostic_total_covers_its_categories(report);
-
-    // The shape of the bug: a total that counted surviving lines instead of messages.
-    let understated = report.replace("7731 diagnostic(s)", "71 diagnostic(s)");
-    assert!(
-        std::panic::catch_unwind(|| assert_diagnostic_total_covers_its_categories(&understated))
-            .is_err(),
-        "the check has to reject the very output that motivated it"
-    );
-
-    // A quiet walk has nothing to reconcile, and must not be made to fail for it.
-    assert_diagnostic_total_covers_its_categories(
-        "--- pool walk ---\nchunks walked: 5 (4 allocated), coverage: complete\n\
-         the walk reported no diagnostics.\n",
+        emitted >= listed,
+        "the walk reported {emitted} diagnostic(s) but the categories under it account for          {listed} — so the total is counting something other than the messages the walk emitted,          and a reader takes it for a property of the target (#77): {diagnostics}"
     );
 }
 
@@ -3490,7 +3735,7 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
         TARGET_STEP,
     );
     let report = text_of(&attached["result"]);
-    let Some(session) = maybe_session_id(&report) else {
+    let Some(session) = maybe_session_id(&attached["result"]) else {
         assert_no_error(&attached, "attach_kernel");
         panic!(
             "the attach did not land, and left no session behind. The target must be booted with \
@@ -3568,11 +3813,11 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
         // caller's timeout fired, the walk carried on, and this call waited out the remainder.
         let follow_up = Instant::now();
         let registers =
-            server.tool_text("registers", json!({ "session_id": session }), TARGET_STEP);
+            server.tool_data("registers", json!({ "session_id": session }), TARGET_STEP);
         let waited = follow_up.elapsed();
         assert!(
-            registers.contains("rip="),
-            "the session should still be a broken-in kernel after a pool walk:\n{registers}"
+            registers["instruction_pointer"].is_string(),
+            "the session should still be a broken-in kernel after a pool walk: {registers}"
         );
         assert!(
             waited < NOT_QUEUED,
@@ -3581,13 +3826,18 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
         );
 
         // An empty answer has to say what the walk managed, or "no such chunk" and "the walk
-        // reached almost none of the pool" are the same sentence. Reachable only because the
-        // call succeeded — the first live run took this branch on an *error* text and announced
-        // that the tag existed, inventing a fact about the pool out of a failure to look at it.
-        if absent.contains("No allocated chunks carry tag") {
+        // reached almost none of the pool" are the same answer. As fields now: `matches: 0`
+        // beside the coverage the count came from, which is what makes a zero readable.
+        let empty = walk["result"]["structuredContent"].clone();
+        assert_eq!(empty["status"], "ok", "checked above: {absent}");
+        if empty["matches"] == 0 {
             assert!(
-                absent.contains("--- pool walk ---") && absent.contains("chunks walked:"),
-                "an empty result must carry the walk's own coverage:\n{absent}"
+                empty["walk"]["chunks_walked"].as_u64().unwrap_or_default() > 0,
+                "an empty result must carry the walk's own coverage: {empty}"
+            );
+            assert!(
+                empty["walk"]["coverage"].is_string(),
+                "coverage is one of complete/deadline_truncated/partial: {empty}"
             );
         } else {
             eprintln!(
@@ -3615,31 +3865,40 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
             !is_tool_error(&census_call),
             "pool_census failed:\n{census}"
         );
+        let totals = census_call["result"]["structuredContent"].clone();
         assert!(
-            census.contains("--- pool walk ---") && census.contains("chunks walked:"),
-            "the census must always report the walk behind it:\n{census}"
+            totals["walk"]["chunks_walked"].as_u64().unwrap_or_default() > 0,
+            "the census must always report the walk behind it: {totals}"
         );
-        let complete = census.contains("coverage: complete");
-        println!(
-            "the census reports this walk {}",
-            if complete { "complete" } else { "INCOMPLETE" }
-        );
+        let coverage = totals["walk"]["coverage"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let complete = coverage == "complete";
+        println!("the census reports this walk {coverage}");
         // An incomplete walk is an acceptable outcome, but "incomplete" on its own is not a
-        // finding — the categories are. The census already carries them, so printing that
-        // section costs nothing and turns a run of this tier into a measurement of the target
-        // rather than a pass. Measured 21.9s and INCOMPLETE against Server 26100, which is well
-        // inside the budget: on that target the coverage gap is *not* the deadline.
+        // finding — *why*, and the categories, are. `deadline_truncated` and `partial` want
+        // opposite responses, which is the whole reason coverage is three values and not a bool.
+        // Measured 21.9s and INCOMPLETE against Server 26100, which is well inside the budget:
+        // on that target the coverage gap is not the deadline, and now the result says so.
         if !complete {
-            let report: String = census
-                .lines()
-                .skip_while(|line| !line.starts_with("--- pool walk ---"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            println!("why the walk fell short:\n{report}");
-            assert_diagnostic_total_covers_its_categories(&report);
+            assert!(
+                coverage == "deadline_truncated" || coverage == "partial",
+                "a walk that fell short says which way: {totals}"
+            );
+            let diagnostics = server.tool_data(
+                "pool_diagnostics",
+                json!({ "session_id": session, "limit": 40 }),
+                POOL_CALL_BUDGET,
+            );
+            println!(
+                "why the walk fell short: {}",
+                text_of(&census_call["result"])
+            );
+            assert_diagnostic_total_covers_its_categories(&diagnostics);
         }
 
-        match heaviest_census_tag(&census) {
+        match heaviest_census_tag(&totals) {
             // What one tool saw, the other has to find. Only meaningful when the walk completed:
             // an incomplete snapshot is deliberately not cached, so these would be two separate
             // walks of a moving target and could honestly disagree.
@@ -3659,21 +3918,31 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
                      census's walk, not the first one"
                 );
                 let cached = Instant::now();
-                let call = server.call_tool(
+                let found = server.tool_data(
                     "pool_find_tag",
                     json!({ "tag": tag, "session_id": session }),
                     POOL_CALL_BUDGET,
                 );
                 let reuse = cached.elapsed();
-                let found = text_of(&call["result"]);
+                assert_eq!(found["tag"], tag.as_str(), "{found}");
                 assert!(
-                    !is_tool_error(&call),
-                    "looking up the census's own heaviest tag `{tag}` failed:\n{found}"
-                );
-                assert!(
-                    found.contains(&format!("tag `{tag}`")) && found.contains("allocation(s)"),
+                    found["matches"].as_u64().unwrap_or_default() > 0,
                     "the census called `{tag}` the heaviest tag, so find_tag must find it in the \
-                     same snapshot:\n{found}"
+                     same snapshot: {found}"
+                );
+                // The two tools drew on one walk, so their counts for this tag have to agree.
+                // Comparing numbers rather than the phrase `allocation(s)` is the point: a count
+                // that disagreed used to render identically to one that did not.
+                let censused = totals["tags"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|t| t["tag"] == tag.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| panic!("the census listed `{tag}`: {totals}"));
+                assert_eq!(
+                    censused["allocations"], found["matches"],
+                    "one snapshot, two answers about `{tag}`: {censused} vs {found}"
                 );
                 assert!(
                     reuse < CACHED_QUERY_CEILING,
@@ -3912,7 +4181,7 @@ fn with_live_kernel_session<R>(
     // The handle decides whether there is anything to clean up, not `isError`: an attach that
     // claimed its target and then failed the wait comes back as a tool error carrying a live,
     // halted session.
-    let Some(session) = maybe_session_id(&report) else {
+    let Some(session) = maybe_session_id(&attached["result"]) else {
         assert_no_error(&attached, "attach_kernel");
         panic!(
             "the attach did not land, and left no session behind. The target must be booted with \
@@ -4166,7 +4435,7 @@ fn a_disconnect_lets_a_live_kernel_batch_restore_its_patch_first() {
     );
     let report = text_of(&attached["result"]);
     assert_no_error(&attached, "attach_kernel");
-    let session = maybe_session_id(&report)
+    let session = maybe_session_id(&attached["result"])
         .unwrap_or_else(|| panic!("the attach left no session behind:\n{report}"));
     assert!(
         !is_tool_error(&attached),
@@ -4180,7 +4449,7 @@ fn a_disconnect_lets_a_live_kernel_batch_restore_its_patch_first() {
         // Read now, because the re-attach below has to wait for this process to be gone: the KD
         // transport is single-owner, so a second attach that races the first worker's exit fails
         // on the port rather than on anything this test is about.
-        let status = server.tool_text("session_status", json!({}), STEP);
+        let status = server.tool_data("session_status", json!({}), STEP);
         let worker = engine_pid_of(&status, &session);
         let scratch = kernel_scratch(&mut server, &session)?;
 
@@ -4337,7 +4606,7 @@ fn ending_a_live_kernel_session_mid_batch_restores_its_patch() {
     );
     let report = text_of(&attached["result"]);
     assert_no_error(&attached, "attach_kernel");
-    let session = maybe_session_id(&report)
+    let session = maybe_session_id(&attached["result"])
         .unwrap_or_else(|| panic!("the attach left no session behind:\n{report}"));
     assert!(
         !is_tool_error(&attached),
@@ -4349,7 +4618,7 @@ fn ending_a_live_kernel_session_mid_batch_restores_its_patch() {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         // The second attach has to wait for this worker to exit before it can claim the KD
         // transport, which is single-owner.
-        let status = server.tool_text("session_status", json!({}), STEP);
+        let status = server.tool_data("session_status", json!({}), STEP);
         let worker = engine_pid_of(&status, &session);
         let scratch = kernel_scratch(&mut server, &session)?;
         let mut steps = patch_steps(&scratch);
@@ -4568,7 +4837,7 @@ fn a_messagemanager_ctf_fixture_is_visible_through_mcp() {
         TARGET_STEP,
     );
     let report = text_of(&attached["result"]);
-    let Some(session) = maybe_session_id(&report) else {
+    let Some(session) = maybe_session_id(&attached["result"]) else {
         assert_no_error(&attached, "attach_kernel for MessageManager CTF");
         panic!(
             "the CTF attach did not land and left no session to release. Confirm the guest is \
@@ -4593,11 +4862,27 @@ fn a_messagemanager_ctf_fixture_is_visible_through_mcp() {
 
         // A fresh kernel attach may initially expose only `nt`; the unqualified reload above
         // populates DbgEng's full module inventory as well as loading the pool types.
-        let modules = server.tool_text("modules", json!({ "session_id": session }), TARGET_STEP);
+        // Matched against module *names*, not against a substring of the whole `lm` listing:
+        // "messagemanager appears somewhere in that text" was true of a symbol path echoed into
+        // the same output, which is the kind of accidental pass a field cannot give.
+        let modules = server.tool_data("modules", json!({ "session_id": session }), TARGET_STEP);
+        let driver = modules["modules"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|m| {
+                m["name"]
+                    .as_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("MessageManager"))
+            })
+            .cloned();
         assert!(
-            modules.to_ascii_lowercase().contains("messagemanager"),
+            driver.is_some(),
             "the fixture reported ready, but KD does not list MessageManager.sys after the full \
-             module reload:\n{modules}\n\nsymbol setup said:{}",
+             module reload:\n{}\n\nsymbol setup said:{}",
+            text_of(
+                &server.call_tool("modules", json!({ "session_id": session }), TARGET_STEP)["result"]
+            ),
             symbols.transcript
         );
 
@@ -4620,22 +4905,37 @@ fn a_messagemanager_ctf_fixture_is_visible_through_mcp() {
             "the structured pool query failed:\n{found}\n\nsymbol setup said:{}",
             symbols.transcript
         );
+        let matches = call["result"]["structuredContent"].clone();
         assert!(
-            found.contains("tag `Tgsm`") && found.contains("allocation(s)"),
+            matches["matches"].as_u64().unwrap_or_default() > 0,
             "the target fixture retained `Tgsm` messages, but the MCP pool snapshot did not find \
-             them. Read the attached coverage report before treating an incomplete walk as an \
-             allocator result:\n{found}"
+             them. Read the walk's coverage before treating an incomplete walk as an allocator \
+             result: {matches}"
         );
+        // Every chunk it hands back really carries the tag that was asked for, at an address in
+        // this server's one representation — the two claims a caller acts on.
+        for chunk in matches["chunks"].as_array().into_iter().flatten() {
+            assert_eq!(chunk["tag"], "Tgsm", "{chunk}");
+            assert_eq!(
+                chunk["state"], "allocated",
+                "find_tag indexes only allocated chunks"
+            );
+            assert!(address_of(&chunk["address"]) != 0, "{chunk}");
+        }
         println!(
-            "MessageManager `Tgsm` allocations found through MCP in {:?}:\n{found}",
-            started.elapsed()
+            "MessageManager `Tgsm` allocations found through MCP in {:?}: {} chunk(s), {} bytes, \
+             walk {}",
+            started.elapsed(),
+            matches["matches"],
+            matches["total_bytes"],
+            matches["walk"]["coverage"],
         );
 
         let registers =
-            server.tool_text("registers", json!({ "session_id": session }), TARGET_STEP);
+            server.tool_data("registers", json!({ "session_id": session }), TARGET_STEP);
         assert!(
-            registers.contains("rip="),
-            "the kernel session did not remain usable after the CTF pool walk:\n{registers}"
+            registers["instruction_pointer"].is_string(),
+            "the kernel session did not remain usable after the CTF pool walk: {registers}"
         );
     }));
 

@@ -280,6 +280,12 @@ iframe host.
   (events on a trace-position axis).
 - **Cheaper alternative, if those three ever need it:** `structuredContent` + `outputSchema`. Same
   data, lossless to the model, works in every client, no UI runtime. Do that before any HTML.
+- **Since done, for a different set of tools** ([#84](https://github.com/glslang/windbg-mcp/issues/84),
+  DECISIONS 2026-08-12): sessions, execution control, registers, modules, breakpoints and the pool
+  answers now carry both channels. The three outputs named above are *not* among them and are still
+  text — they are the ones whose structure is a graph or a tree rather than a record, which is the
+  same reason they were the candidates for Apps. The plumbing they would need now exists
+  (`src/structured.rs`, `proto::Output`), so the remaining work is their shapes, not the seam.
 
 ## 12. [win-kexp] Validate the opener split against a live KDNET target
 

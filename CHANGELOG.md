@@ -9,6 +9,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Typed results: `structuredContent` and `outputSchema` for the session, execution, register,
+  module, breakpoint and pool tools** ([#84](https://github.com/glslang/windbg-mcp/issues/84)).
+
+  Every tool answered in prose, so anything driving this server programmatically had to parse it.
+  The MessageManager batch client and its regression test matched on `VERDICT: HIT`, on
+  `allocation(s)`, on module-name substrings and on the exact spelling of the `session_id:` line —
+  which means a rewording here broke automation there without any debugger behaviour changing at
+  all. Twenty-two tools now return the same text **and** a typed result beside it, with a schema in
+  `tools/list` describing it. The text is unchanged: this adds a channel rather than replacing one.
+
+  What is typed, and why each one earns it: an opener's `session_id` (previously recoverable only
+  by finding a line in the report) and, when an open fails, **whether a target was created** — the
+  field that decides whether opening again is a recovery or a second attach; `session_status`'s
+  per-session `state`, with `waits_indefinitely` and `overdue` for the attach that can park for
+  ever; `end_session`'s `released` / `worker_terminated`; `run_to_address`'s verdict; where a
+  `go`/step left the target; the register set and the module list as records; the breakpoint a
+  `bp` just set, which prints *nothing at all* on success; and the four pool answers.
+
+  **One address representation**, documented once and used everywhere: a `0x`-prefixed, lowercase,
+  16-digit zero-padded hex string. A string because a `u64` past 2^53 does not survive a JSON
+  parser that reads numbers as doubles, and zero-padded so lexical order matches numeric order.
+
+  **A pool answer now says what its walk covered** — `complete`, `deadline_truncated` or `partial`
+  — because those need opposite responses and "incomplete" alone cannot tell them apart: more time
+  reaches more of the pool in the first case and changes nothing in the second. A walk that failed
+  or was interrupted is not a coverage state but an error, and an *interrupted* one no longer
+  reports itself as a debugger failure.
+
+  **Failures carry a category** (`invalid_argument`, `debugger`, `timeout`, `interrupted`,
+  `not_run`, `stale_session`, `worker_lost`, `capacity`) in the error branch of the same schema, so
+  a caller branches on a value rather than on wording. `not_run` is new information rather than a
+  renaming: a pool query refused for want of budget never touched the target, which is the opposite
+  of `timeout`, where the work may well still be running.
+
+  Nothing here is parsed out of debugger output. Each value is built from a value — which is why
+  `win-kexp` grew typed `register_values`, `modules` and `breakpoints` readers, and why its pool
+  walk now reports *why* it stopped rather than only that it did. Where the answer is the
+  supervisor's rather than the engine's, it is built from the session registry, not from the
+  sentence describing it.
+
 - **`interrupt`: stop the operation a session is running, keeping the session and its target**
   (FOLLOWUPS item 7).
 

@@ -5,6 +5,40 @@ status. Keep entries short; link to code with `file:line` where it helps a futur
 
 ---
 
+## A typed result is a second channel, not a replacement (2026-08-12, issue #84)
+
+**Context.** Every tool answered in prose, so the only way to drive this server programmatically was
+to parse it — `VERDICT: HIT`, `allocation(s)`, the `session_id:` line at the foot of an opener's
+report. A rewording here broke automation elsewhere with no debugger behaviour changing at all.
+
+**Decision.** The tools in #84 return the same text **and** MCP `structuredContent`, with an
+`outputSchema` in `tools/list`. The text is byte-for-byte what it was: adding a channel, not
+migrating one. A tool with no typed shape yet carries none, and is untouched.
+
+**One schema covers both outcomes.** Every result is internally tagged on `status` (`"ok"` /
+`"error"`), so a failure conforms to the same schema a success does. The alternative — structured
+content on success only — leaves the one question a caller most needs answered ("did this work?")
+readable only in prose, and risks a client that validates results rejecting the failure case.
+Failures carry a coarse `ErrorCategory`; the categories are the distinctions that change what a
+caller *does*, because one nobody can act on differently will drift.
+
+**Values are built where the values are, never re-derived from a rendering** — the same rule as
+#77, pointed at results. The worker builds its half from win-kexp types while it still holds them
+(`crate::structured`, carried over the pipe by `proto::Output`); the supervisor builds the session
+answers from its own registry. Where a value did not exist upstream it was added there first, which
+is why win-kexp grew `register_values`, `modules`, `breakpoints`, and a pool walk that reports *why*
+it stopped rather than only that it did.
+
+**Addresses are strings, in one form.** `0x`-prefixed, lowercase, 16-digit zero-padded. A JSON
+number cannot hold a kernel pointer past 2^53 through a parser that reads numbers as doubles, and
+fixed width means lexical order matches numeric order. The debugger's backtick form stays in the
+text, where it belongs.
+
+**Status.** Done for the twenty-two tools #84 lists. `reachable_from_dispatch`,
+`driver_object`/`device_object` and the TTD query tools remain text-only (FOLLOWUPS item 11).
+
+---
+
 ## An interrupt is bound to a job, not to a moment (2026-08-10, FOLLOWUPS item 7)
 
 **Context.** A runaway call had one way out: `end_session`, which ends it by discarding the target.

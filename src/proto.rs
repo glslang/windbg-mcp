@@ -88,7 +88,26 @@ pub enum EngineOp {
         command: String,
         timeout_ms: u32,
     },
-    Registers,
+    /// The target's registers, as text (`r`) *and* as values.
+    ///
+    /// `all` is the caller's choice between the integer registers — which is what `r` prints, and
+    /// what almost every question is about — and the whole bank including x87, vector and
+    /// subregister views, which on x64 is several hundred entries and would otherwise ride along
+    /// with every single call.
+    Registers {
+        all: bool,
+    },
+    /// The loaded modules, as text (`lm`) *and* as values.
+    Modules,
+    /// Set a breakpoint (`bp <expression>`) and report what the session now holds.
+    ///
+    /// A command rather than a typed `AddBreakpoint` because `bp`'s syntax is the point: a
+    /// condition, a command string to run on each hit, `/1` for one-shot. What the typed side
+    /// adds is the *answer* — a successful `bp` prints nothing at all, so "did that work, and
+    /// what is it now?" was previously only answerable with a second `bl`.
+    SetBreakpoint {
+        expression: String,
+    },
     ReadMemory {
         address: String,
         size: u32,
@@ -356,7 +375,7 @@ mod tests {
                 command: "s -b 0 L?0x1000 41".into(),
                 patience_ms: 0,
             },
-            EngineOp::Registers,
+            EngineOp::Registers { all: false },
             EngineOp::Pool {
                 query: PoolOp::census(None, None),
                 patience_ms: 0,
@@ -442,9 +461,112 @@ pub enum WorkerMessage {
     /// the rollback alone would expire mid-step, which is the whole failure being fixed, arriving a
     /// little later.
     RollingBack { id: u64, within_ms: u32 },
-    /// The op finished. `Err` is a debugger-level failure with the engine's own text.
+    /// The op finished. `Err` is a failure with the engine's own text, and — where the worker
+    /// knows better than "the debugger said no" — what kind of failure it was.
     Done {
         id: u64,
-        result: Result<String, String>,
+        result: Result<Output, Failed>,
     },
+}
+
+/// A failed op, as it crosses the pipe.
+///
+/// The message was once the whole of it, and a supervisor reading only a message has to call
+/// every failure a debugger failure. Two are emphatically not: a walk stopped because somebody
+/// asked it to stop, and a query that was **never run** because too little of the caller's budget
+/// was left to run it in. Both used to arrive looking like a target that had misbehaved, which is
+/// the opposite of what each one means.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Failed {
+    pub message: String,
+    /// `None` means the ordinary case: the debugger ran it and it failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<crate::structured::ErrorCategory>,
+}
+
+impl Failed {
+    /// A failure of a kind the worker can name.
+    pub fn categorised(
+        category: crate::structured::ErrorCategory,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            category: Some(category),
+        }
+    }
+}
+
+/// The ordinary case, so a bare `Err(message)?` keeps reading as it did.
+///
+/// Spelled out for the two string types rather than blanket over `ToString`, which cannot be
+/// written: it would overlap the reflexive `From<Failed> for Failed`.
+impl From<String> for Failed {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            category: None,
+        }
+    }
+}
+
+impl From<&str> for Failed {
+    fn from(message: &str) -> Self {
+        Self::from(message.to_string())
+    }
+}
+
+/// What an op produced: the text every client has always received, plus the typed answer for
+/// the tools that have one.
+///
+/// Two channels rather than one, because they answer to different readers and neither is a
+/// projection of the other. The text is a rendering — aligned columns, caveats, advice on what
+/// to do next — and a program reading it is parsing prose that exists to be reworded. `data` is
+/// the same answer as values, and it is built **here**, on the side of the pipe where the engine's
+/// own types are still in hand ([`crate::structured`]). Sending only the text and re-deriving
+/// values on the supervisor's side would be the mistake
+/// [#77](https://github.com/glslang/windbg-mcp/issues/77) was: a figure recovered from a
+/// rendering measures the rendering.
+///
+/// `data` is already the *whole* structured result — `{"status": "ok", …}` — rather than a bare
+/// payload, so the supervisor forwards it untouched and never has to know which tool asked.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Output {
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
+}
+
+impl Output {
+    /// A reply with text only — every op that has no typed shape yet.
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            data: None,
+        }
+    }
+
+    /// A reply carrying both, from a payload that is serialized here so no caller can forget
+    /// the `status` discriminator that makes an outcome one shape.
+    pub fn typed<T: Serialize>(text: impl Into<String>, payload: T) -> Self {
+        let data = serde_json::to_value(crate::structured::Outcome::Ok(payload));
+        Self {
+            text: text.into(),
+            // A payload that will not serialize is a bug in a `structured` type, not a debugger
+            // failure, and it must not cost the caller the text they asked for.
+            data: match data {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    tracing::error!("structured payload did not serialize: {error}");
+                    None
+                }
+            },
+        }
+    }
+}
+
+impl From<String> for Output {
+    fn from(text: String) -> Self {
+        Self::text(text)
+    }
 }
