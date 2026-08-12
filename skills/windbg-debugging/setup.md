@@ -23,6 +23,25 @@ option below lands it there.
 > still do the one-time **engine bundling below**, dropping those DLLs next to the
 > *client-extracted* `windbg-mcp.exe` (its `${__dirname}`).
 
+A package-manager install lands outside the plugin layout in the same way:
+
+> **Already installed with [Scoop](https://scoop.sh)** from the community
+> [`gitfool/scoop-dungeon`](https://github.com/gitfool/scoop-dungeon) bucket? That also skips
+> Options A/B — point the client at
+> `%USERPROFILE%\scoop\apps\windbg-mcp\current\windbg-mcp.exe` rather than the plugin path. Its
+> `post_install` does most of the **engine bundling below** — the DLLs plus `ttd\` and `winext\`,
+> copied from the `Microsoft.WinDbg` store package on the machine, when one is installed. It does
+> **not** copy `winxp\kdexts.dll`, so run that last pair of lines by hand if the kernel driver
+> tools are in play; check the directory for `dbgeng.dll` before repeating the rest.
+>
+> **Never run `scoop install` on the user's behalf.** That bucket is community-maintained, outside
+> this project's control, and a Scoop manifest is code: `post_install` is arbitrary PowerShell, run
+> against whatever download URL and hash the manifest carries at that moment — and excavator
+> rewrites both automatically on each new release, so what a reader once checked is not what a
+> later install fetches. Options A/B are the paths this project can vouch for: a SHA-256 published
+> with the release, and `gh attestation verify` tying the zip to the workflow that built it. If the
+> user wants Scoop, they ask for it and they run it.
+
 ### Option A — download a prebuilt release (no Rust required)
 
 Each `vX.Y.Z` tag publishes a Windows x64 build on the

@@ -119,6 +119,56 @@ cargo build --release
 stdio. Run it after a dependency bump or an MCP spec revision — see
 [`docs/smoke-test.md`](docs/smoke-test.md).
 
+### Install with Scoop
+
+A community-maintained [Scoop](https://scoop.sh) manifest lives in
+[`gitfool/scoop-dungeon`](https://github.com/gitfool/scoop-dungeon)
+([#109](https://github.com/glslang/windbg-mcp/issues/109)), which turns the download — and every
+later update — into one command:
+
+```pwsh
+scoop bucket add dungeon https://github.com/gitfool/scoop-dungeon
+scoop install windbg-mcp
+scoop update windbg-mcp    # later; the manifest's checkver/autoupdate tracks releases here
+```
+
+It unpacks the release zip and — when the `Microsoft.WinDbg` store package is installed on your
+machine — its `post_install` copies that package's engine DLLs (plus its `ttd\` and `winext\`
+subdirectories) next to the binary: most of the
+[*Bundling the WinDbg engine*](#bundling-the-windbg-engine) step below, done for you on install and
+on every update. That copy is local, from a WinDbg you already installed; neither the release zip
+nor the bucket redistributes Microsoft's engine. Without that package you get the in-box `System32`
+engine: live and crash-dump debugging work, TTD `.run` replay and `!analyze` don't.
+
+The one thing `post_install` doesn't copy is **`winxp\kdexts.dll`**, so if you use the kernel driver
+tools (`driver_object` / `device_object` / `irp_stack`) run that last pair of lines below by hand,
+with `$dst` set to `…\scoop\apps\windbg-mcp\current`.
+
+Point your MCP client at the `current` junction, so an update needs no config change:
+
+```jsonc
+{
+  "mcpServers": {
+    "windbg": { "command": "C:\\Users\\<you>\\scoop\\apps\\windbg-mcp\\current\\windbg-mcp.exe" }
+  }
+}
+```
+
+A connected client holds that binary open (and each engine worker re-executes the same image), so
+disconnect the `windbg` server — `/mcp` in Claude Code — before `scoop update`, then reconnect to
+actually run the new build.
+
+**The bucket is community-maintained — not by this repo, and not audited by it.** A Scoop manifest
+is code, not just a URL: `post_install` is arbitrary PowerShell, run against whatever download URL
+and hash the manifest carries at the time, and autoupdate rewrites both on each new release. So
+installing from it is a trust decision about that bucket, taken on your own judgement.
+
+Scoop is not required either way. It installs the same
+[release asset](https://github.com/glslang/windbg-mcp/releases) described above, which you can
+download directly, check against the published `SHA256SUMS.txt`, and verify with
+`gh attestation verify` — see [*Releasing*](#releasing) — none of which a third-party manifest can
+promise on this project's behalf.
+
 ### Bundling the WinDbg engine
 
 Needed for three things: TTD `.run` replay (System32's engine rejects traces with `0x80070057`),

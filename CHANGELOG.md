@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- README documents installing with [Scoop](https://scoop.sh) from the community
+  [`gitfool/scoop-dungeon`](https://github.com/gitfool/scoop-dungeon) bucket
+  ([#109](https://github.com/glslang/windbg-mcp/issues/109)), whose `post_install` also does the
+  engine bundling — copying from the machine's own `Microsoft.WinDbg` store package, when one is
+  installed — so `scoop install` covers most of the manual setup this README otherwise walks
+  through. Nothing about that path redistributes Microsoft's engine. Includes the client config to
+  use (the version-independent `current` junction), the disconnect-before-`scoop update` caveat
+  (a connected client holds the binary open), and the one file `post_install` leaves out.
+  Documented with the trust boundary stated: the bucket is community-maintained and unaudited by
+  this project, and a manifest is code — `post_install` is arbitrary PowerShell over a URL and hash
+  that autoupdate rewrites — so the skill's `setup.md` tells an agent never to run `scoop install`
+  on the user's behalf, and points at the release zip's checksum and build attestation as the paths
+  this project can actually vouch for.
 - README's engine-bundling section now copies **`winxp\kdexts.dll`**, which it had never listed
   even though `attach_kernel` auto-`.load`s it: without that file `driver_object` /
   `device_object` / `irp_stack` fail with *"No export drvobj found"*. The skill's `setup.md` and
