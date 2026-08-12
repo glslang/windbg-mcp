@@ -2,5 +2,5 @@
   "name": "flareauthenticator-z3",
   "private": true,
   "description": "Z3 solve for the FlareAuthenticator (Flare-On 12 #8) hash, from constants recovered with windbg-mcp TTD.",
-  "dependencies": { "z3-solver": "^4.13.0" }
+  "dependencies": { "z3-solver": "^5.0.0" }
 }
