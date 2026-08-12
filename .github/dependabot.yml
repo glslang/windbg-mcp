@@ -42,7 +42,9 @@ updates:
 
   # The Z3 solve script under examples/. No lockfile and nothing in CI installs it, so this
   # is a low-traffic manifest bump on a slower cadence — listed because an example that has
-  # quietly stopped installing is still a broken example.
+  # quietly stopped installing is still a broken example. Because no required check exercises
+  # it, `dependabot-auto-merge.yml` deliberately leaves these PRs for a human: the value here
+  # is being told a release exists, not merging it unread.
   - package-ecosystem: npm
     directory: /examples/flareauthenticator
     schedule:

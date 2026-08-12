@@ -20,7 +20,20 @@ jobs:
   dependabot-auto-merge:
     name: Dependabot auto-merge
     runs-on: ubuntu-latest
-    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    # Auto-merge is only honest for an ecosystem the required checks actually exercise.
+    # Build & test covers cargo, and both it and Documentation lint run the workflows that
+    # github_actions updates touch — but nothing in CI installs the npm example under
+    # examples/, so a breaking `z3-solver` bump would merge on green checks that never
+    # looked at it. Those PRs still get opened (being told a release exists is the point);
+    # they just wait for a human.
+    #
+    # This is an allowlist rather than a "not npm" test on purpose: the branch prefix is
+    # Dependabot's naming, not ours, so if it ever changes the wrong way an unrecognised
+    # prefix leaves the PR for review instead of silently merging it unchecked.
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]'
+      && (startsWith(github.head_ref, 'dependabot/cargo/')
+      || startsWith(github.head_ref, 'dependabot/github_actions/'))
     # Write scope lives on the job, not the workflow, so nothing else inherits
     # it. Dependabot-triggered runs start read-only; this elevates just this job.
     permissions:
