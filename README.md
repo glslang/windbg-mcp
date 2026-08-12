@@ -489,6 +489,37 @@ Four honest limits, none of them hidden in the report:
   of long steps stops at the end of the current one rather than where it stands — and it cannot undo
   what the batch never recorded, since `always` is still the only thing that puts anything back.
 
+### Structured results
+
+Every tool returns the same readable text it always has. The tools below **also** return MCP
+[`structuredContent`](https://modelcontextprotocol.io/specification/2025-06-18/server/tools), with a
+matching `outputSchema` in `tools/list`, so a program can read a field instead of parsing prose:
+
+| Tool | Typed answer |
+|------|--------------|
+| `open_dump`, `open_trace`, `attach_kernel`, `attach_kernel_local`, `attach_process`, `launch` | `session_id`, `kind`, `target`, `report` — and on failure, whether a target was created (`target: no \| yes \| pending`), which is what decides whether opening again is a recovery or a second attach |
+| `session_status` | each session's `state` (`opening`/`attaching`/`open`/`failed`/`retired`/`closed`), `engine_pid`, `in_state_for_ms`, and — for an attach — `waits_indefinitely` and `overdue` |
+| `end_session` | `released`, `worker_terminated`, `waited_ms` |
+| `registers` | `registers[]` as `{name, kind, value}` plus `instruction_pointer`; pass `all: true` for the x87/vector registers and subregister views |
+| `modules` | `modules[]` with `start`/`end`, `size` and a typed `symbols` state (`deferred` is *not* `none`) |
+| `set_breakpoint` | the ids this call `added`, and every breakpoint now set — a successful `bp` prints nothing at all |
+| `run_to_address` | `verdict` (`hit`/`stopped_elsewhere`/`timeout`), `target`, `stopped_at` |
+| `go`, `step_over`, `step_into`, `step_back`, `step_over_back`, `reverse_go` | `stopped_at` |
+| `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics` | the chunks/totals/diagnostics as values, each carrying the `walk` behind them |
+
+Two conventions hold across all of them:
+
+- **One address representation.** Every address, and every register-sized value, is a `0x`-prefixed,
+  lowercase, 16-digit zero-padded hex **string** — `"0xfffff8031ab10000"`. A string because a `u64`
+  past 2^53 does not survive a JSON parser that reads numbers as doubles; zero-padded so lexical
+  order matches numeric order. The debugger's backtick form (``fffff803`1ab10000``) appears only in
+  the text.
+- **A pool answer says what the walk covered.** `walk.coverage` is `complete`, `deadline_truncated`
+  (the call's budget ran out — more time reaches more of the pool) or `partial` (unreadable regions
+  or a traversal cap — more time changes nothing). Counts from anything but `complete` are floors,
+  not totals. A walk that failed outright, or was stopped by `interrupt`, is not a coverage state at
+  all: it is the error branch below, with category `debugger` or `interrupted`.
+
 ### Error reporting
 
 Anything scoped to a session comes back as a normal tool result with `isError: true` and the text
@@ -496,6 +527,13 @@ intact, so the model can read it and correct itself: a failed *debugger operatio
 symbol, an unreadable address, a target that never stopped), a refused handle, a timeout, a session
 whose worker is gone. Each has a next move. The only JSON-RPC protocol error is the one failure that
 is the server's rather than a session's — no engine worker could be started at all.
+
+For the tools listed above, a failure also carries structured content — the `error` branch of the
+same output schema — so a caller can branch on a stable category instead of on wording:
+`invalid_argument`, `debugger`, `timeout`, `interrupted`, `not_run` (the work never started, so
+nothing changed — unlike `timeout`, where it may still be running), `stale_session`, `worker_lost`,
+`capacity`. Both branches carry a `status` discriminator (`"ok"` / `"error"`), which is what lets one
+schema describe a result whichever way it went.
 
 The forward (`go`/`step_over`/`step_into`) and reverse (`reverse_go`/`step_over_back`/`step_back`)
 control tools mirror a debugger UI's F9/F8/F7 and Shift+F9/F8/F7, so an agent can drive a trace in

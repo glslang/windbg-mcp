@@ -12,6 +12,7 @@ mod engine;
 mod kdconn;
 mod proto;
 mod server;
+mod structured;
 mod ttd;
 mod worker;
 
