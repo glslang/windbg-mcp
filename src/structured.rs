@@ -520,9 +520,23 @@ impl From<&win_kexp::dbgeng::Module> for ModuleInfo {
 pub struct BreakpointSet {
     /// The ids this call added. Empty when the command set nothing — which `bp` reports by
     /// printing an error and is otherwise invisible, since a successful `bp` prints nothing.
+    ///
+    /// When `listed` is false this is empty because it is **unknown**, not because nothing was
+    /// added.
     pub added: Vec<u32>,
     /// Every breakpoint the session now holds, added or not.
     pub breakpoints: Vec<BreakpointInfo>,
+    /// Whether the breakpoints above are the session's real list.
+    ///
+    /// False does **not** mean the breakpoint was not set. The `bp` succeeded — that is why this
+    /// is a success and not an error — and the follow-up inspection is what failed. Reporting an
+    /// inspection failure as the mutation failing invites the one recovery that must not happen:
+    /// `bp` is not idempotent, so a caller who retries sets a second breakpoint. `bl` through
+    /// `execute` is the way to find out what is there.
+    pub listed: bool,
+    /// Why the listing is missing or incomplete, when it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub listing_error: Option<String>,
 }
 
 /// One breakpoint the session holds.

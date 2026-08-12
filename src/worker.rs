@@ -1269,29 +1269,121 @@ fn modules(e: &DebugEngine) -> Result<Output, Failed> {
 /// be right until the first time it was not.
 ///
 /// A successful `bp` prints nothing at all, so the text alone cannot distinguish "set" from
-/// "silently did nothing" — which is the gap this fills.
+/// "silently did nothing" — which is the gap this fills, in **both** channels: the listing is
+/// rendered into the text too, or a client that reads only text is left with the empty string
+/// this was meant to fix.
+///
+/// **Only the `bp` itself can fail this call.** The listing either side of it is an inspection,
+/// and an inspection that fails after a mutation must not be reported as the mutation failing:
+/// the breakpoint is set, and a caller who retries on that error sets a second one. So a listing
+/// failure comes back as a success that says the listing is missing —
+/// [`structured::BreakpointSet::listed`] — which is the same distinction `OpenError::PostCommit`
+/// draws for an opener, at a much smaller scale.
 fn set_breakpoint(e: &DebugEngine, expression: &str) -> Result<Output, Failed> {
-    let before: HashSet<u32> = e
+    // Best-effort, and taken first: a session whose breakpoint list cannot be read must still be
+    // able to set a breakpoint, so this cannot be a `?`.
+    let before: Option<HashSet<u32>> = e
         .breakpoints()
-        .map_err(failed)?
-        .iter()
-        .map(|breakpoint| breakpoint.id)
-        .collect();
-    let text = e
+        .ok()
+        .map(|held| held.iter().map(|breakpoint| breakpoint.id).collect());
+    let mut text = e
         .execute_command(&format!("bp {expression}"))
         .map_err(failed)?;
-    let after = e.breakpoints().map_err(failed)?;
-    Ok(Output::typed(
-        text,
-        structured::BreakpointSet {
+    // Past this point the breakpoint exists.
+    let set = match (e.breakpoints(), before) {
+        (Ok(after), Some(before)) => structured::BreakpointSet {
             added: after
                 .iter()
                 .map(|breakpoint| breakpoint.id)
                 .filter(|id| !before.contains(id))
                 .collect(),
             breakpoints: after.iter().map(structured::BreakpointInfo::from).collect(),
+            listed: true,
+            listing_error: None,
         },
-    ))
+        // The list read, but not the one before it — so what is set can be reported and which of
+        // them is new cannot. `added` is empty because it is unknown, and `listed` says so.
+        (Ok(after), None) => structured::BreakpointSet {
+            added: Vec::new(),
+            breakpoints: after.iter().map(structured::BreakpointInfo::from).collect(),
+            listed: false,
+            listing_error: Some(
+                "the breakpoints held before this call could not be read, so which of the \
+                 breakpoints below is the new one is unknown"
+                    .to_string(),
+            ),
+        },
+        (Err(why), _) => structured::BreakpointSet {
+            added: Vec::new(),
+            breakpoints: Vec::new(),
+            listed: false,
+            listing_error: Some(why.to_string()),
+        },
+    };
+    text.push_str(&render_breakpoints(&set));
+    Ok(Output::typed(text, set))
+}
+
+/// Renders what a `set_breakpoint` left the session holding, for the text channel.
+///
+/// Appended to the command's own output rather than replacing it: `bp` prints nothing when it
+/// succeeds and an error when it does not, and both are worth keeping.
+fn render_breakpoints(set: &structured::BreakpointSet) -> String {
+    if !set.listed && set.breakpoints.is_empty() {
+        return format!(
+            "\nThe breakpoint command ran and the breakpoint is set, but the session's breakpoint \
+             list could not be read: {}\n\nDo **not** re-run this call to find out what it did — \
+             `bp` is not idempotent and a second call sets a second breakpoint. Use `execute \
+             {{ \"command\": \"bl\" }}` instead.\n",
+            set.listing_error.as_deref().unwrap_or("no reason given")
+        );
+    }
+    let mut out = format!(
+        "\n{} breakpoint(s) set{}:\n",
+        set.breakpoints.len(),
+        match set.added.len() {
+            0 if set.listed => " (this call added none)".to_string(),
+            0 => String::new(),
+            n => format!(" ({n} added by this call, marked *)"),
+        }
+    );
+    for breakpoint in &set.breakpoints {
+        // Trimmed at the end, because the columns are padded for alignment and the last one on a
+        // row is usually empty — trailing spaces on every line of a tool result are noise.
+        let row = format!(
+            "{} {:<3} {:<18} {:<9}{}{}",
+            if set.added.contains(&breakpoint.id) {
+                "*"
+            } else {
+                " "
+            },
+            breakpoint.id,
+            // A deferred breakpoint has no address *yet*; printing a zero would name the null
+            // page as the place it will fire.
+            breakpoint.address.as_deref().unwrap_or("(unresolved)"),
+            if breakpoint.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            breakpoint
+                .expression
+                .as_deref()
+                .map(|expression| format!("  {expression}"))
+                .unwrap_or_default(),
+            if breakpoint.deferred {
+                "  (deferred)"
+            } else {
+                ""
+            },
+        );
+        out.push_str(row.trim_end());
+        out.push('\n');
+    }
+    if let Some(why) = &set.listing_error {
+        out.push_str(&format!("\nNote: {why}.\n"));
+    }
+    out
 }
 
 /// Reads target memory and renders it as a hex dump.
@@ -3034,6 +3126,71 @@ mod tests {
         assert!(
             !running.release(9),
             "a job that started after the interrupt must not answer for it"
+        );
+    }
+
+    // ---- what a set_breakpoint caller is told -------------------------------
+
+    fn breakpoint(id: u32, address: Option<&str>) -> structured::BreakpointInfo {
+        structured::BreakpointInfo {
+            id,
+            kind: structured::BreakpointKind::Code,
+            address: address.map(str::to_string),
+            expression: address.is_none().then(|| "nosuchmod!Sym".to_string()),
+            command: None,
+            thread: None,
+            enabled: true,
+            deferred: address.is_none(),
+            one_shot: false,
+            pass_count: 1,
+            passes_remaining: 1,
+        }
+    }
+
+    /// A successful `bp` prints **nothing**, so a text-only client saw an empty result and could
+    /// not tell it from silence. The listing goes into the text as well as into the typed answer,
+    /// or the fix only reaches half the clients it was written for.
+    #[test]
+    fn a_breakpoint_that_was_set_says_so_in_the_text_too() {
+        let out = render_breakpoints(&structured::BreakpointSet {
+            added: vec![1],
+            breakpoints: vec![
+                breakpoint(0, Some("0x00007ffb6e6a0e10")),
+                breakpoint(1, None),
+            ],
+            listed: true,
+            listing_error: None,
+        });
+        assert!(out.contains("2 breakpoint(s) set"), "{out}");
+        assert!(out.contains("1 added by this call"), "{out}");
+        // The new one is marked, and the deferred one says it has no address rather than
+        // printing a zero — which would name the null page as where it will fire.
+        assert!(out.lines().any(|l| l.starts_with("* 1")), "{out}");
+        assert!(out.lines().any(|l| l.starts_with("  0")), "{out}");
+        assert!(
+            out.contains("(unresolved)") && out.contains("nosuchmod!Sym"),
+            "{out}"
+        );
+    }
+
+    /// A listing that failed *after* the `bp` must not read as a breakpoint that was not set.
+    ///
+    /// This is the whole reason that case is a success rather than an error: `bp` is not
+    /// idempotent, so a caller who reads "failed" and retries ends up with two breakpoints. The
+    /// text has to say both things — it is set, and do not re-run this to find out what it did.
+    #[test]
+    fn a_listing_that_failed_after_the_bp_still_says_the_breakpoint_is_set() {
+        let out = render_breakpoints(&structured::BreakpointSet {
+            added: Vec::new(),
+            breakpoints: Vec::new(),
+            listed: false,
+            listing_error: Some("the engine refused: 0x80004005".to_string()),
+        });
+        assert!(out.contains("the breakpoint is set"), "{out}");
+        assert!(out.contains("0x80004005"), "{out}");
+        assert!(
+            out.contains("second breakpoint"),
+            "must warn against the retry: {out}"
         );
     }
 
