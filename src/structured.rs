@@ -395,8 +395,19 @@ pub struct RegisterInfo {
 pub enum RegisterValue {
     /// An integer register, in this module's one address representation.
     Int { value: String },
-    /// A floating-point register that an `f64` holds exactly.
+    /// A floating-point register that a JSON number holds exactly.
     Float { value: f64 },
+    /// A floating-point register holding a value JSON has **no literal for**: a NaN or an
+    /// infinity, which a register legitimately holds and which `serde_json` renders as `null` —
+    /// neither the value nor anything this schema allows, and not something that reads back.
+    /// Its own kind rather than a `null` inside `float`, so the field a consumer reads is a
+    /// number whenever it is present at all.
+    NonFinite {
+        value: NonFinite,
+        /// The exact bits, as lowercase hex, little-endian. A register the engine reported as
+        /// 32-bit was widened to 64 first — exact for every value except the payload of a NaN.
+        bytes: String,
+    },
     /// An x87 or vector register, as lowercase hex bytes in the engine's own order. Not
     /// narrowed to a number, because there is no number that holds it.
     Bytes { bytes: String },
@@ -405,12 +416,31 @@ pub enum RegisterValue {
     Unavailable,
 }
 
+/// Which value JSON could not express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NonFinite {
+    Nan,
+    Infinity,
+    NegativeInfinity,
+}
+
 impl From<&win_kexp::dbgeng::RegisterValue> for RegisterValue {
     fn from(value: &win_kexp::dbgeng::RegisterValue) -> Self {
         use win_kexp::dbgeng::RegisterValue as Engine;
         match value {
             Engine::Int(v) => Self::Int { value: addr(*v) },
-            Engine::Float(v) => Self::Float { value: *v },
+            Engine::Float(v) if v.is_finite() => Self::Float { value: *v },
+            Engine::Float(v) => Self::NonFinite {
+                value: if v.is_nan() {
+                    NonFinite::Nan
+                } else if v.is_sign_positive() {
+                    NonFinite::Infinity
+                } else {
+                    NonFinite::NegativeInfinity
+                },
+                bytes: v.to_le_bytes().iter().map(|b| format!("{b:02x}")).collect(),
+            },
             Engine::Bytes(bytes) => Self::Bytes {
                 bytes: bytes.iter().map(|b| format!("{b:02x}")).collect(),
             },
@@ -955,6 +985,42 @@ mod tests {
             serde_json::to_value(&missing).unwrap(),
             serde_json::json!({ "kind": "unavailable" })
         );
+    }
+
+    /// A register holding a NaN or an infinity must not answer with `null`.
+    ///
+    /// JSON has no literal for either, and `serde_json` renders both as `null` — silently, so
+    /// nothing on the server sees it happen. What reaches the client is then a `float` whose
+    /// `value` is null: not the value, not valid against the schema this tool declares, and not
+    /// something that deserializes back into the type it came from. A register legitimately holds
+    /// these (uninitialised x87 state, an ARM64 `d0`), so they get a kind of their own with the
+    /// exact bits beside the name.
+    #[test]
+    fn a_register_that_json_cannot_express_says_so_rather_than_saying_null() {
+        use win_kexp::dbgeng::RegisterValue as Engine;
+        let wire = |v: f64| serde_json::to_value(RegisterValue::from(&Engine::Float(v))).unwrap();
+
+        let nan = wire(f64::NAN);
+        assert_eq!(nan["kind"], "non_finite");
+        assert_eq!(nan["value"], "nan");
+        assert!(nan.get("value").is_some_and(|v| !v.is_null()));
+        assert_eq!(wire(f64::INFINITY)["value"], "infinity");
+        assert_eq!(wire(f64::NEG_INFINITY)["value"], "negative_infinity");
+        // The bits are kept, so nothing about the register is lost in the retelling.
+        assert_eq!(
+            wire(f64::INFINITY)["bytes"],
+            f64::INFINITY
+                .to_le_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+
+        // A finite float is untouched — it stays a number, which is the whole point of not
+        // making every float a string.
+        let finite = wire(1.5);
+        assert_eq!(finite["kind"], "float");
+        assert_eq!(finite["value"], 1.5);
     }
 
     /// The three coverage states stay distinct across the seam: collapsing `deadline_truncated`
