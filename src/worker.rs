@@ -1197,7 +1197,13 @@ fn told(run: CommandRun) -> String {
 fn resumed(e: &DebugEngine, command: &str, timeout_ms: u32) -> Result<Output, Failed> {
     let run = e.execute_and_wait(command, timeout_ms).map_err(failed)?;
     let stopped_at = e.instruction_pointer().ok().map(structured::addr);
-    let interrupted = run.cut_short.is_some();
+    // Matched on the variant rather than on "was it cut short at all", even though
+    // `execute_and_wait` produces only `OnRequest` today: a go/step that hits its own deadline is
+    // a *forced break at the bound*, which win-kexp deliberately does not report as a cut-short
+    // because the target simply had not stopped yet. That is an invariant of another crate and is
+    // invisible here, so naming the variant this field means keeps the two from drifting apart in
+    // silence — the field says "somebody asked", and only `OnRequest` is somebody asking.
+    let interrupted = matches!(run.cut_short, Some(Interruption::OnRequest));
     let text = told(run.clone());
     Ok(Output::typed(
         text,
