@@ -361,14 +361,15 @@ Flush + the missing-inc, and the missing-inc is produced by the **lockless unlin
 list** — so Flush AVs walking the corrupted list, or a re-touch double-frees, and the heap is
 corrupted *faster* than any controlled reclaim-then-Delete can run. Across ~10 crash/reboot cycles
 the same race fired from four distinct debugger-free sites — SetData's free (`+0x1654`), SetData's
-`ExAllocatePool2` for a new `Tfub` on a corrupted `Tfub` LFH (`+0x1668`), and Flush's unlink write
-`[Blink]=Flink` (`+0x14e9`, a `0x3B` AV — the **write-what-where** primitive firing on garbage) —
-but never the clean `0x4242` ordering. That ordering is exactly what KD buys in §9: precise control
-over *when* the free happens relative to the reclaim. Harness modes `drift` (winnability proof),
-`driftfire` (safe single-pass toward a controlled Delete), and `driftarb` (continuous race + planted
-`0x4242` reclaim) are all in `mm_exploit.c`.
+`ExAllocatePool2` for a new `Tfub` on a corrupted `Tfub` LFH (`+0x1668`), Flush's unlink write
+`[Blink]=Flink` (`+0x14e9`, a `0x3B` AV — the **write-what-where** primitive firing on garbage), and
+Flush's list-walk read `mov rax,[rcx+8]` (`+0x14de`, the `0x50`/`AV_VRF` §3 first met under Driver
+Verifier's special pool) — but never the clean `0x4242` ordering. That ordering is exactly what KD
+buys in §9: precise control over *when* the free happens relative to the reclaim. Harness modes
+`drift` (winnability proof), `driftfire` (safe single-pass toward a controlled Delete), and
+`driftarb` (continuous race + planted `0x4242` reclaim) are all in `mm_exploit.c`.
 
-A further presentation turned up during the 28-run batch, and it is the one worth knowing before you
+A fifth presentation turned up during the 28-run batch, and it is the one worth knowing before you
 triage a dump from this race:
 
 ```text
