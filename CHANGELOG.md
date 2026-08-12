@@ -47,10 +47,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of `timeout`, where the work may well still be running.
 
   Nothing here is parsed out of debugger output. Each value is built from a value — which is why
-  `win-kexp` grew typed `register_values`, `modules` and `breakpoints` readers, and why its pool
-  walk now reports *why* it stopped rather than only that it did. Where the answer is the
-  supervisor's rather than the engine's, it is built from the session registry, not from the
-  sentence describing it.
+  `win-kexp` grew typed `register_values`, `modules` and `breakpoints` readers, why its pool walk
+  now reports *why* it stopped rather than only that it did, and why its pool queries hand back
+  the walk their answer came from (`PoolAnswer`) instead of leaving a caller to ask separately:
+  an incomplete walk is deliberately not cached, so the second question could be answered by a
+  *different* walk, and the count and the coverage beside it would then describe two things.
+  Where the answer is the supervisor's rather than the engine's, it is built from the session
+  registry, not from the sentence describing it.
 
 - **`interrupt`: stop the operation a session is running, keeping the session and its target**
   (FOLLOWUPS item 7).

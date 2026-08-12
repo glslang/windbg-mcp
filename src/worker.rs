@@ -1608,27 +1608,17 @@ fn coverage_caveat(report: &query::PoolSnapshotReport) -> Option<String> {
     ))
 }
 
-/// Appends what the walk itself managed, so an empty answer explains itself.
+/// What the walk itself managed, so an empty answer explains itself.
 ///
-/// Without this, an empty result is ambiguous in the worst way: "the pool holds no such
-/// chunk" and "the walk reached almost none of the pool" render identically. The snapshot
-/// is already cached by the time this runs, so the extra query costs nothing.
+/// Without it, an empty result is ambiguous in the worst way: "the pool holds no such chunk" and
+/// "the walk reached almost none of the pool" render identically. The report rendered here is the
+/// one the query handed back *with* its answer, so this describes the walk that produced the list
+/// above it rather than whichever walk a later question happened to provoke.
 ///
-/// The diagnostics are *categorised* rather than listed: a real walk emits tens of
-/// thousands, and the first forty of those are a sample of whichever heap happened to be
-/// walked first, not of the problem. Counts per category say which failures actually
-/// dominate; the verbatim tail keeps concrete addresses available.
-fn append_walk_report(
-    out: &mut String,
-    report: Result<&query::PoolSnapshotReport, &query::PoolQueryError>,
-) {
-    match report {
-        Ok(report) => out.push_str(&render_walk_report(report)),
-        Err(error) => out.push_str(&format!("\n(could not summarise the walk: {error})\n")),
-    }
-}
-
-/// The body of [`append_walk_report`], split out so the counts can be tested without an engine.
+/// The diagnostics are *categorised* rather than listed: a real walk emits tens of thousands, and
+/// the first forty of those are a sample of whichever heap happened to be walked first, not of the
+/// problem. Counts per category say which failures actually dominate; the verbatim tail keeps
+/// concrete addresses available.
 fn render_walk_report(report: &query::PoolSnapshotReport) -> String {
     // `complete` is not implied by an empty diagnostics list: a walk can end partway
     // through without saying anything. Report it explicitly, or a caller reads a truncated
@@ -1696,13 +1686,10 @@ fn render_walk_report(report: &query::PoolSnapshotReport) -> String {
 /// rendering below carries how much of the pool the walk reached — so the cost of a short deadline
 /// is coverage, not an error.
 fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Failed> {
-    // `within` is a duration, and the walk report below is read *after* the query has spent most
-    // of it — so handing it `within` again would grant a second full-length walk (which is a real
-    // possibility, not a theoretical one: an incomplete snapshot is not cached, so the report can
-    // find nothing to read and start one). Anchored to a deadline here, and what is left of it is
-    // what the report gets.
-    let started = Instant::now();
-    let left = move || within.saturating_sub(started.elapsed());
+    // Every answer below carries `answer.walk` — the state of the walk it was *itself* drawn
+    // from, handed back by the query. Asking separately would be a second call, and an incomplete
+    // walk is deliberately not cached, so that call could walk again and report the coverage of a
+    // different walk as this one's (win-kexp's `PoolAnswer`).
     let walk = |refresh: bool| PoolWalk::from(refresh).within(within);
     match args {
         PoolOp::FindTag {
@@ -1718,18 +1705,14 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
                     PoolPageFilter::NonPaged
                 }
             });
-            let spans = query::find_tag(e, &tag, filter, walk(refresh)).map_err(pool_failure)?;
-            let mut out = render_find_tag(&tag, filter, &spans, limit);
-            // Reads the snapshot `find_tag` has just taken or reused — hence `refresh: false`,
-            // which cannot start a walk of its own whatever budget this query had.
-            let report = walk_report(e, left());
+            let answer = query::find_tag(e, &tag, filter, walk(refresh)).map_err(pool_failure)?;
+            let spans = &answer.found;
+            let mut out = render_find_tag(&tag, filter, spans, limit);
             if spans.is_empty() {
                 // An empty answer has to explain itself, or "the pool holds no such chunk" and
                 // "the walk reached almost none of the pool" read identically.
-                append_walk_report(&mut out, report.as_ref());
-            } else if let Ok(report) = &report
-                && let Some(caveat) = coverage_caveat(report)
-            {
+                out.push_str(&render_walk_report(&answer.walk));
+            } else if let Some(caveat) = coverage_caveat(&answer.walk) {
                 out.push_str(&caveat);
             }
             Ok(Output::typed(
@@ -1750,7 +1733,7 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
                         .take(limit)
                         .map(structured::PoolChunkInfo::from)
                         .collect(),
-                    walk: walk_info(report.as_ref()),
+                    walk: walk_info(&answer.walk),
                 },
             ))
         }
@@ -1761,8 +1744,9 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
             let address = parse_pool_addr(&address).map_err(|why| {
                 Failed::categorised(structured::ErrorCategory::InvalidArgument, why)
             })?;
-            let found = query::chunk_at(e, address, walk(refresh)).map_err(pool_failure)?;
-            let mut out = match &found {
+            let answer = query::chunk_at(e, address, walk(refresh)).map_err(pool_failure)?;
+            let found = &answer.found;
+            let mut out = match found {
                 Some(found) => render_chunk(address, found),
                 // "Not in the snapshot" and "free" are different answers, and reporting this one
                 // as free would manufacture a dangling pointer out of a gap in the walk.
@@ -1776,12 +1760,8 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
                     fmt_addr(address)
                 ),
             };
-            // Read once and spent twice: the text below and the typed answer describe the same
-            // walk, and asking again could start a second one — an incomplete snapshot is not
-            // cached, so a re-read is a re-walk.
-            let report = walk_report(e, left());
             if found.is_none() {
-                append_walk_report(&mut out, report.as_ref());
+                out.push_str(&render_walk_report(&answer.walk));
             }
             Ok(Output::typed(
                 out,
@@ -1802,7 +1782,7 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
                         .as_ref()
                         .and_then(|found| found.next.as_ref())
                         .map(structured::PoolChunkInfo::from),
-                    walk: walk_info(report.as_ref()),
+                    walk: walk_info(&answer.walk),
                 },
             ))
         }
@@ -1838,16 +1818,16 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
                         .take(example_rows)
                         .map(|line| (*line).clone())
                         .collect(),
-                    walk: walk_info(Ok(&report)),
+                    walk: walk_info(&report),
                 },
             ))
         }
         // The census *is* the state of the walk, so it always carries the report.
         PoolOp::Census { refresh, limit } => {
-            let census = query::tag_census(e, walk(refresh)).map_err(pool_failure)?;
-            let mut out = render_census(&census, limit);
-            let report = walk_report(e, left());
-            append_walk_report(&mut out, report.as_ref());
+            let answer = query::tag_census(e, walk(refresh)).map_err(pool_failure)?;
+            let census = &answer.found;
+            let mut out = render_census(census, limit);
+            out.push_str(&render_walk_report(&answer.walk));
             Ok(Output::typed(
                 out,
                 structured::PoolCensus {
@@ -1863,48 +1843,24 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
                             nonpaged_allocations: entry.nonpaged_allocations,
                         })
                         .collect(),
-                    walk: walk_info(report.as_ref()),
+                    walk: walk_info(&answer.walk),
                 },
             ))
         }
     }
 }
 
-/// The walk's own state, for an answer that has already been computed from it.
-///
-/// `refresh: false`, so this reads the snapshot the query just took or reused. It is bounded all
-/// the same, and by what is **left** of the caller's patience rather than by the whole of it: an
-/// *incomplete* walk is not cached, so this can find no snapshot and start one — and neither
-/// win-kexp's 120s default nor a second helping of a budget already spent is this call's to give.
-fn walk_report(
-    e: &DebugEngine,
-    left: Duration,
-) -> Result<query::PoolSnapshotReport, query::PoolQueryError> {
-    query::snapshot_report(e, PoolWalk::from(false).within(left))
-}
-
 /// The walk state every pool answer carries.
 ///
-/// A walk whose own summary could not be read reports `Partial` with nothing counted, which is
-/// the honest reading: something is not being covered here, and it is certainly not complete.
-fn walk_info(
-    report: Result<&query::PoolSnapshotReport, &query::PoolQueryError>,
-) -> structured::WalkInfo {
-    match report {
-        Ok(report) => structured::WalkInfo {
-            coverage: report.coverage.into(),
-            chunks_walked: report.total_chunks,
-            allocated_chunks: report.allocated_chunks,
-            diagnostics_emitted: report.diagnostics.emitted(),
-            diagnostic_categories: report.diagnostics.shapes().len(),
-        },
-        Err(_) => structured::WalkInfo {
-            coverage: structured::PoolCoverage::Partial,
-            chunks_walked: 0,
-            allocated_chunks: 0,
-            diagnostics_emitted: 0,
-            diagnostic_categories: 0,
-        },
+/// Infallible, because the report is no longer something to go and ask for: it arrives with the
+/// answer, from the same snapshot. There is no "could not read the walk" case left to render.
+fn walk_info(report: &query::PoolSnapshotReport) -> structured::WalkInfo {
+    structured::WalkInfo {
+        coverage: report.coverage.into(),
+        chunks_walked: report.total_chunks,
+        allocated_chunks: report.allocated_chunks,
+        diagnostics_emitted: report.diagnostics.emitted(),
+        diagnostic_categories: report.diagnostics.shapes().len(),
     }
 }
 
