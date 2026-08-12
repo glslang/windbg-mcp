@@ -73,7 +73,11 @@ process. Two things follow, and they are why it is built this way:
 `2025-03-26`, `2024-11-05`) — and serves whichever the client selects. A `2026-07-28` client gets the
 stateless, per-request model (`server/discover`, `resultType`, per-request `_meta`) and may open with
 `server/discover` instead of `initialize`; older clients keep the handshake, and a client that offers
-an unknown revision is answered with `2025-11-25`.
+an unknown revision is answered with `2025-11-25`. That revision also makes SEP-2549's cache fields
+mandatory on a paginated result, so `tools/list` answers a `2026-07-28` client with `ttlMs: 0` and
+`cacheScope: public`, and omits both for the older revisions, which never defined them. This is why
+the `rmcp` dependency has a `3.1.1` floor: every 3.x before it omitted the fields on every revision,
+and a client that validates against the spec schema then rejects the whole tool list.
 
 ## Requirements
 

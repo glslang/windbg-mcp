@@ -161,6 +161,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at all — and is checked against the serialized form, so an op with a `patience_ms` that does not
   hand it out fails a test rather than shipping with an unset deadline.
 
+### Fixed
+
+- **A `2026-07-28` client got a server with no tools at all**
+  ([`rmcp` #1114](https://github.com/modelcontextprotocol/rust-sdk/issues/1114)).
+
+  SEP-2549 added `ttlMs` and `cacheScope` to every paginated result, and the `2026-07-28` schema
+  makes both **required**. Every `rmcp` before 3.1.1 generated a `list_tools` that hardcoded the
+  pair to `None` and then skipped serializing them, so a client that validates responses against
+  the spec schema refused the entire reply: the process starts, `initialize` succeeds, the
+  capabilities advertise tools — and not one of the 43 is reachable. Neither side reports an
+  error, because the response is a well-formed JSON-RPC result; it is only invalid against the
+  schema. Clients on the handshake-era revisions were never affected, which is why this reached
+  a release: those revisions do not define the fields, and the server is correct without them.
+
+  The dependency now has an `rmcp = "3.1.1"` floor rather than `"3"`, because the fix lives in the
+  SDK's macro and a version requirement is the only part of this a downstream resolver reads. The
+  smoke test pins the resulting wire shape — the fields present on `2026-07-28`, absent on the
+  revisions that predate them, over both the `initialize` handshake and the stateless
+  `server/discover` opener — so an older 3.x fails the suite rather than shipping a server that
+  looks empty to the newest clients.
+
 ## [0.6.0] - 2026-08-10
 
 ### Added

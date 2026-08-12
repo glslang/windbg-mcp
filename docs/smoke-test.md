@@ -45,7 +45,12 @@ checks by pid.
 
 **Protocol revisions.** Every revision the README promises — `2026-07-28`, `2025-11-25`,
 `2025-06-18`, `2025-03-26`, `2024-11-05` — is offered a handshake, served *that* revision, and can
-reach `tools/list`. An unknown revision negotiates down to `2025-11-25`. `server/discover` opens a
+reach `tools/list` — whose reply carries SEP-2549's `ttlMs`/`cacheScope` on `2026-07-28` and omits
+them on the revisions that predate the fields. Those come from the SDK, so the assertion guards the
+`rmcp = "3.1.1"` floor: earlier 3.x omitted them everywhere, and a client validating against the
+spec schema then rejects the *whole* list, leaving a server that connects and appears to have no
+tools. The reply is a valid JSON-RPC result either way, so no error-shaped assertion can see it.
+An unknown revision negotiates down to `2025-11-25`. `server/discover` opens a
 session with no handshake at all, and — the rule that is easy to get wrong — in that stateless mode
 **every** request must carry the `_meta` protocol keys, not just the opener; a request without them
 is refused with `-32602`.

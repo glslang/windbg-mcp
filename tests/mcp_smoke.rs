@@ -542,6 +542,34 @@ fn every_documented_protocol_revision_is_served() {
                 .is_some_and(|t| !t.is_empty()),
             "tools/list must be non-empty on {revision}"
         );
+        assert_cache_fields_match_revision(&tools["result"], revision, "tools/list");
+    }
+}
+
+/// SEP-2549's `ttlMs`/`cacheScope`, which `2026-07-28` makes **required** on a paginated result.
+///
+/// A client that validates responses against the spec schema rejects the entire `tools/list`
+/// reply when they are missing — the server reads as connected with zero tools. That is not
+/// hypothetical: every `rmcp` before 3.1.1 generated exactly that response from the documented
+/// macro path, and it shipped (upstream issue #1114, fixed by #1120). The fields come from the
+/// SDK, so this is a guard on the dependency floor in `Cargo.toml` — the one test that fails if
+/// a resolver ever picks an older 3.x. Older revisions never defined the fields and must not be
+/// served them. `assert_no_error` sees none of this: both shapes are valid JSON-RPC results.
+fn assert_cache_fields_match_revision(result: &Value, revision: &str, what: &str) {
+    if revision >= "2026-07-28" {
+        assert_eq!(
+            result["ttlMs"], 0,
+            "{what} on {revision} must carry a numeric `ttlMs` (SEP-2549): {result}"
+        );
+        assert_eq!(
+            result["cacheScope"], "public",
+            "{what} on {revision} must carry `cacheScope` (SEP-2549): {result}"
+        );
+    } else {
+        assert!(
+            result["ttlMs"].is_null() && result["cacheScope"].is_null(),
+            "{what} on {revision} predates SEP-2549 and must not carry its fields: {result}"
+        );
     }
 }
 
@@ -612,6 +640,9 @@ fn discover_opens_a_session_without_initialize() {
             .is_some_and(|t| !t.is_empty()),
         "tools/list must be non-empty for a discover-first client: {tools}"
     );
+    // This client's revision arrives per-request rather than from a handshake, so it reaches
+    // the handler by a different route than the loop above covers.
+    assert_cache_fields_match_revision(&tools["result"], "2026-07-28", "stateless tools/list");
 
     // The stateless rule itself: with no handshake to remember the revision, a request that
     // omits the per-request `_meta` is refused. Pinned because a client library that sends it
