@@ -130,6 +130,8 @@ Copy-Item "$wd\dbgeng.dll","$wd\dbghelp.dll","$wd\dbgcore.dll","$wd\dbgmodel.dll
           "$wd\symsrv.dll","$wd\msdia140.dll" $dst -Force
 Copy-Item "$wd\ttd"    "$dst\ttd"    -Recurse -Force   # TTDReplay*.dll, TtdExt.dll, TTDAnalyze.dll, ...
 Copy-Item "$wd\winext" "$dst\winext" -Recurse -Force   # ext.dll (!analyze), kext.dll, … — crash-dump triage
+New-Item   "$dst\winxp" -ItemType Directory -Force | Out-Null
+Copy-Item "$wd\winxp\kdexts.dll" "$dst\winxp" -Force   # !drvobj/!devobj/!irp — the kernel driver tools
 ```
 
 - The `ttd\` subdir provides the `@$cursession.TTD` / `@$curprocess.TTD` data model and the `!tt`
@@ -138,6 +140,10 @@ Copy-Item "$wd\winext" "$dst\winext" -Recurse -Force   # ext.dll (!analyze), kex
   `open_dump` runs `.load ext` for you, but note the **unqualified `!analyze` does not resolve** on
   this minimal engine — use the module-qualified **`!ext.analyze -v`** for crash-dump triage. Without
   `winext\`, `!analyze` returns *"No export analyze found"*.
+- `winxp\kdexts.dll` provides `!drvobj`/`!devobj`/`!irp`, behind the
+  `driver_object`/`device_object`/`irp_stack` tools. `attach_kernel` / `attach_kernel_local`
+  `.load kdexts` for you, but without the file those tools return *"No export drvobj found"*. It
+  lives in `winxp\`, not `winext\` — the engine searches that subdir by name.
 - **`msdia140.dll` is required for PDB symbols.** Without it, `dbghelp` can't parse any PDB
   (`dia error 0x8007007e`) and silently falls back to *export* symbols — which makes `module!name`
   lookups (and so `ttd_calls("ucrtbase!__stdio_common_vfprintf")`) fail even with the right PDB in
