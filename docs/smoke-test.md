@@ -194,8 +194,9 @@ target fails on the open. Run it after touching `engine::spawn_worker` or `worke
 
 ### A dependency moved
 
-`rmcp`, `schemars`, `tokio`, or a `win-kexp` pin bump (`cargo update -p win-kexp`). Note Dependabot
-only watches GitHub Actions here, so cargo bumps arrive by hand.
+`rmcp`, `schemars`, `tokio`, or a `win-kexp` pin bump (`cargo update -p win-kexp`). Dependabot
+watches the cargo ecosystem too, so most of these arrive as a PR — including the `win-kexp` locked
+revision — and the run below is what you do on that PR, not only on a bump you made yourself.
 
 1. `cargo test` — the protocol tier plus the existing unit tests.
 2. For a `win-kexp` bump, add the debugger tier locally too — CI runs it on the PR, but a local

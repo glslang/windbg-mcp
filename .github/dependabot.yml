@@ -1,8 +1,50 @@
-# Keeps the SHA-pinned actions in .github/workflows current: Dependabot
-# bumps each pin (and its trailing version comment) when upstream releases.
+# Dependabot watches every dependency this repo has, in each ecosystem it has one in.
+# Listing the ecosystem is what makes staleness visible: while only `github-actions` was
+# listed, nothing ever reported that a newer `rmcp` had shipped, and the requirement drifted
+# far enough behind that a spec-current MCP client saw no tools at all.
 version: 2
 updates:
+  # Rust crates: Cargo.toml plus the committed Cargo.lock. This also covers `win-kexp`, the
+  # git dependency pinned to `main` — Dependabot bumps its locked revision, so a pushed
+  # win-kexp commit arrives as a PR instead of waiting for someone to remember
+  # `cargo update -p win-kexp`.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    # `auto` (the default, stated here because it is a choice): this crate ships a binary with
+    # a lockfile, so an in-range release lands as a lockfile bump and the requirement in
+    # Cargo.toml is rewritten only when the new version falls outside it. `increase` would
+    # rewrite `rmcp = "3.1.1"` on every release and silently invalidate the comment above it
+    # explaining why 3.1.1 is a floor rather than a preference.
+    versioning-strategy: auto
+    open-pull-requests-limit: 10
+    groups:
+      # Routine churn arrives as one PR; majors stay individual, so a breaking bump is
+      # reviewed — and auto-merged — on its own CI evidence rather than riding along with
+      # a batch. Groups apply to version updates only, so a security advisory still gets
+      # its own PR.
+      cargo-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # Keeps the SHA-pinned actions in .github/workflows current: Dependabot bumps each pin
+  # (and its trailing version comment) when upstream releases.
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    open-pull-requests-limit: 10
+    groups:
+      actions-minor-and-patch:
+        patterns: ["*"]
+        update-types: [minor, patch]
+
+  # The Z3 solve script under examples/. No lockfile and nothing in CI installs it, so this
+  # is a low-traffic manifest bump on a slower cadence — listed because an example that has
+  # quietly stopped installing is still a broken example.
+  - package-ecosystem: npm
+    directory: /examples/flareauthenticator
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
