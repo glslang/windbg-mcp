@@ -3,8 +3,16 @@ name: Dependabot auto-merge
 # Auto-approve Dependabot PRs and enable squash auto-merge. The approval here
 # satisfies the "Main Branch" ruleset's required review; GitHub still holds the
 # merge until that ruleset's required status checks (Build & test, Documentation
-# lint) pass, so a red CI run never merges. Requires the repo setting
-# "Allow GitHub Actions to create and approve pull requests".
+# lint, Smoke test (debugger tier)) pass, so a red CI run never merges. Requires
+# the repo setting "Allow GitHub Actions to create and approve pull requests".
+#
+# `--auto` waits on *required* checks only, so that list is load-bearing rather
+# than descriptive: a job CI runs but the ruleset does not require is one this
+# workflow will merge straight past, green or red. The debugger tier was in that
+# position until it was made required — which matters most for the case that put
+# it there, a `win-kexp` revision bump, whose regressions are exactly the ones
+# that compile cleanly and only show up once DbgEng opens a target. Anything
+# added to ci.yml as a real gate has to be added to the ruleset too.
 
 on:
   pull_request:
@@ -21,11 +29,11 @@ jobs:
     name: Dependabot auto-merge
     runs-on: ubuntu-latest
     # Auto-merge is only honest for an ecosystem the required checks actually exercise.
-    # Build & test covers cargo, and both it and Documentation lint run the workflows that
-    # github_actions updates touch — but nothing in CI installs the npm example under
-    # examples/, so a breaking `z3-solver` bump would merge on green checks that never
-    # looked at it. Those PRs still get opened (being told a release exists is the point);
-    # they just wait for a human.
+    # Build & test and the debugger tier cover cargo, and every required job runs the
+    # workflows a github_actions update touches — but nothing in CI installs the npm
+    # example under examples/, so a breaking `z3-solver` bump would merge on green checks
+    # that never looked at it. Those PRs still get opened (being told a release exists is
+    # the point); they just wait for a human.
     #
     # This is an allowlist rather than a "not npm" test on purpose: the branch prefix is
     # Dependabot's naming, not ours, so if it ever changes the wrong way an unrecognised
