@@ -125,9 +125,9 @@ Needed for three things: TTD `.run` replay (System32's engine rejects traces wit
 crash-dump `!analyze` (which lives in the `winext\` extensions that System32 doesn't ship), and the
 kernel driver tools `driver_object`/`device_object`/`irp_stack` (which need `winxp\kdexts.dll`).
 So a live-kernel-only user needs this section too, even though the attach itself works on the
-System32 engine. `DebugCreate` binds to whichever `dbgeng.dll` the loader finds first, and the app directory is
-searched before `System32`, so the copied **WinDbg** engine (which replays TTD traces and ships the
-extensions) wins. One-time, from the installed WinDbg store package:
+System32 engine. `DebugCreate` binds to whichever `dbgeng.dll` the loader finds first, and the app
+directory is searched before `System32`, so the copied **WinDbg** engine (which replays TTD traces
+and ships the extensions) wins. One-time, from the installed WinDbg store package:
 
 ```pwsh
 $wd  = (Get-AppxPackage Microsoft.WinDbg).InstallLocation + "\amd64"
