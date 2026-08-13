@@ -1387,7 +1387,14 @@ fn crash_triage(
     // prevent. What has already been read (the bug check, and whatever `!analyze` printed) still
     // comes back; the report says the walk was abandoned rather than empty, because "found
     // nothing" would be a claim about the crash and this is a claim about the call.
-    if analysis.interrupted() {
+    //
+    // Asked two ways, because one interrupt can arrive in two places. `Analysis::interrupted` sees
+    // a break that landed *inside* the `!analyze`; the engine's own pending flag sees one that
+    // landed anywhere else — between the analysis finishing and this line, or during a triage that
+    // never ran an analysis at all (`analyze: false`), neither of which the analysis state can
+    // know about. Deriving cancellation from the parsed output alone would make it depend on
+    // exactly when the break landed, which is the one thing a caller cannot aim.
+    if analysis.interrupted() || matches!(e.interrupted(), Ok(true)) {
         let report = triage::report(bug_check, &triage::Walk::Abandoned, None, analysis);
         return Ok(Output::typed(triage::render(&report), report));
     }
@@ -1531,17 +1538,21 @@ fn run_analyze(e: &DebugEngine, patience: Duration, before: Duration) -> Analysi
             Err(why) => last = Some(format!("`{command}` failed: {why}")),
         }
     }
-    let why = if let Some(on_request) = cut_short {
-        if on_request {
-            "it was interrupted on this session before it printed anything worth keeping, and was \
-             not retried — retrying would restart the very work the interrupt asked to stop. \
-             Triage again without interrupting."
-                .to_string()
-        } else {
-            "it hit this call's deadline before printing anything worth keeping. Raise \
-             WINDBG_MCP_CALL_TIMEOUT_SECS, or issue the triage on an idle session."
-                .to_string()
-        }
+    // An on-request break is *cancellation*, and it stays cancellation even when there was nothing
+    // readable to keep: the triage has to abandon the reads after this either way, so what it gets
+    // back has to say so rather than look like an ordinary unavailability.
+    if cut_short == Some(true) {
+        return Analysis::Interrupted(
+            "`!analyze -v` was interrupted on this session before it printed anything worth \
+             keeping, and was not retried — retrying would restart the very work the interrupt \
+             asked to stop. Triage again without interrupting."
+                .to_string(),
+        );
+    }
+    let why = if cut_short.is_some() {
+        "it hit this call's deadline before printing anything worth keeping. Raise \
+         WINDBG_MCP_CALL_TIMEOUT_SECS, or issue the triage on an idle session."
+            .to_string()
     } else if ran_out {
         format!(
             "this call had less than {}s of its timeout left{}, which is not enough to run an \

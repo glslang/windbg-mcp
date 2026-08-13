@@ -17,26 +17,38 @@ offending frame. No elevation needed; works on System32's engine.
    (not `nt`/`hal`, not a framework layer, not user-mode code past the system-call boundary).
    It runs `!analyze -v` for you (either spelling — see below) and reports the fields
    only `!analyze` computes (`pool_tag`, `failure_bucket_id`, the per-parameter explanations)
-   under `analysis`, so you get them without reading ~150 lines.
+   under `analysis`, so you get them without reading ~150 lines. **Those fields need the bundled
+   `winext\` extensions** ([setup.md](setup.md)) — without them `analysis.ran` is `false` and
+   `analysis.note` says why, while everything read from the engine (code, parameters, process,
+   frames, faulting frame) is unaffected. On such an engine, `crash_triage { "analyze": false }`
+   asks for the engine-only answer deliberately instead of trying and reporting the failure.
    — **`faulting_frame` and `analysis.module_name` are two guesses; `frames` settles them.** Every
    frame's `module+RVA` is *computed* from the load base, so it is right even for a driver with no
-   PDB — that part is not a guess. Which frame is the culprit is: the rule is positional, so a
-   stack routed through a framework layer this build doesn't know is a layer names that layer.
-   `!analyze`'s attribution is a different heuristic, and is often wrong for a PDB-less driver.
-   When they differ the text says so; read the stack.
+   PDB — that part is not a guess. *Which* frame is the culprit is. The rule picks the innermost
+   frame that could be a driver at all, so it is only as good as its list of what to skip: a crash
+   routed through a framework layer this build does not recognise as one is blamed on that layer
+   rather than on the driver behind it. `!analyze`'s attribution is a different heuristic, and is
+   often wrong for a PDB-less driver. When the two differ the text says so; read the stack and
+   decide.
    — `crash_triage { "analyze": false }` skips the `!analyze` and answers from engine reads alone —
    fast, and it still names the bug check. It walks **whichever context the session has selected**,
    which on a freshly opened dump is the crash: only run it on a session where you have moved the
    context yourself (`.thread`, `~Ns`, `.cxr`) if that is the stack you meant. The default
    `analyze: true` re-selects the faulting context on the bug checks that carry one — and, for the
    same reason, leaves it selected afterwards, so a later `registers` / `backtrace` can differ.
-   — **`faulting_frame` is not always there.** It is *absent* (the key is omitted, as every
-   optional field in this server's structured results is) when no captured frame could be a kernel
-   driver — they are all `nt`/`hal`, a framework layer, or user-mode code past the system-call
-   boundary — and `faulting_frame_note` says which of the two reasons applies. If it is the
-   frame cap, re-ask with `crash_triage { "frames": 64 }`. If it is the crash — a `0x9F` watchdog
-   fires on an idle CPU's timer DPC, so the driver holding the IRP is not on that stack at all —
-   the culprit has to come from the bug check *arguments* instead: that is step 7.
+   — **`faulting_frame` is not always there, and `faulting_frame_note` says why.** It is *absent*
+   (the key is omitted, as every optional field in this server's structured results is) for four
+   different reasons, and only two of them are findings about the crash. **Read the note before
+   concluding anything.**
+   - *No frame could be a driver* — they are all `nt`/`hal`, a framework layer, or user-mode code
+     past the system-call boundary. A real answer: a `0x9F` watchdog fires on an idle CPU's timer
+     DPC, so the driver holding the IRP is not on that stack at all, and the culprit has to come
+     from the bug check *arguments* instead (step 7).
+   - *The walk hit its frame cap* (`frames_truncated: true`) — re-ask with
+     `crash_triage { "frames": 64 }`.
+   - *The call was interrupted*, so the reads were abandoned rather than started. Says nothing
+     about the crash; triage again without interrupting.
+   - *The stack could not be walked at all.* Also says nothing about the crash.
 
 3. **Auto-analyze in full**, for the parts the triage summary leaves out (the exception record
    on a user-mode dump, the rendered stack, the hypervisor/blackbox detail):
