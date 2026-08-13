@@ -37,7 +37,8 @@ offending frame. No elevation needed; works on System32's engine.
    `analyze: true` walks the **target's default** context instead — the `!analyze -v` it runs
    first resets the scope there — and your scope is put back before the call returns, so a triage
    costs you nothing either way and a later `registers` / `backtrace` reads as before. If the
-   analysis did not actually run (`analysis.ran: false` — no time left, or no `ext.dll`), nothing
+   analysis did not run to completion (`ran: false` — no time left, no `ext.dll` — or
+   `truncated: true`, cut short before the reset it does partway through its output), nothing
    reset anything and you get the selected context after all.
    — **`faulting_frame` is not always there, and `faulting_frame_note` says why.** It is *absent*
    (the key is omitted, as every optional field in this server's structured results is) for four
