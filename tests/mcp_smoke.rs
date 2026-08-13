@@ -1821,10 +1821,15 @@ fn a_driver_crash_names_the_driver_frame_that_analyze_cannot() {
             "if `!analyze` learns to attribute a PDB-less driver, this test's premise is stale \
              and the docs claiming otherwise need revisiting: {triage}"
         );
-        assert_eq!(
-            analysis["process_name"], triage["process_name"],
-            "the audit name and `!analyze`'s PROCESS_NAME are the same process: {triage}"
-        );
+        // Only where the analysis got that far: a truncated run may have been cut off before
+        // `PROCESS_NAME`, and demanding a field the tool says may be missing would fail the tier
+        // for the one behaviour it exists to allow. Same guard as the other dump's check.
+        if analysis["truncated"] == false || !analysis["process_name"].is_null() {
+            assert_eq!(
+                analysis["process_name"], triage["process_name"],
+                "the audit name and `!analyze`'s PROCESS_NAME are the same process: {triage}"
+            );
+        }
         if analysis["truncated"] == false {
             // The pool tag exists only in `!analyze`'s output, and this bug check is one of the
             // few that produces one.

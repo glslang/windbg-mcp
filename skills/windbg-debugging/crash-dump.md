@@ -13,22 +13,27 @@ offending frame. No elevation needed; works on System32's engine.
 2. **Triage the bug check.** `crash_triage {}`
    — for a **kernel** dump (or a live kernel stopped at a bug check), this is the first call:
    the code and its four parameters, the crashing process, the stack with every frame as
-   `module+RVA`, and the **faulting frame** — the topmost frame outside `nt`/`hal`, which is the
-   driver. It runs `!analyze -v` for you (either spelling — see below) and reports the fields
+   `module+RVA`, and the **faulting frame** — the innermost frame that could be a driver at all
+   (not `nt`/`hal`, not a framework layer, not user-mode code past the system-call boundary).
+   It runs `!analyze -v` for you (either spelling — see below) and reports the fields
    only `!analyze` computes (`pool_tag`, `failure_bucket_id`, the per-parameter explanations)
    under `analysis`, so you get them without reading ~150 lines.
    — **`faulting_frame` and `analysis.module_name` are two guesses; `frames` settles them.** Every
    frame's `module+RVA` is *computed* from the load base, so it is right even for a driver with no
-   PDB — that part is not a guess. Which frame is the culprit is: `faulting_frame` is the innermost
-   one outside `nt`/`hal` and the framework layers (`Wdf01000`, Driver Verifier), so a stack routed
-   through a layer this build doesn't know is a layer names that layer. `!analyze`'s attribution is
-   a different heuristic, and is often wrong for a PDB-less driver. When they differ the text says
-   so; read the stack.
-   — `crash_triage { "analyze": false }` skips the `!analyze` and answers from engine reads
-   alone — fast, and it still names the bug check and the driver frame.
+   PDB — that part is not a guess. Which frame is the culprit is: the rule is positional, so a
+   stack routed through a framework layer this build doesn't know is a layer names that layer.
+   `!analyze`'s attribution is a different heuristic, and is often wrong for a PDB-less driver.
+   When they differ the text says so; read the stack.
+   — `crash_triage { "analyze": false }` skips the `!analyze` and answers from engine reads alone —
+   fast, and it still names the bug check. It walks **whichever context the session has selected**,
+   which on a freshly opened dump is the crash: only run it on a session where you have moved the
+   context yourself (`.thread`, `~Ns`, `.cxr`) if that is the stack you meant. The default
+   `analyze: true` re-selects the faulting context on the bug checks that carry one — and, for the
+   same reason, leaves it selected afterwards, so a later `registers` / `backtrace` can differ.
    — **`faulting_frame` is not always there.** It is *absent* (the key is omitted, as every
-   optional field in this server's structured results is) when every captured frame is in the
-   kernel image, and `faulting_frame_note` says which of the two reasons applies. If it is the
+   optional field in this server's structured results is) when no captured frame could be a kernel
+   driver — they are all `nt`/`hal`, a framework layer, or user-mode code past the system-call
+   boundary — and `faulting_frame_note` says which of the two reasons applies. If it is the
    frame cap, re-ask with `crash_triage { "frames": 64 }`. If it is the crash — a `0x9F` watchdog
    fires on an idle CPU's timer DPC, so the driver holding the IRP is not on that stack at all —
    the culprit has to come from the bug check *arguments* instead: that is step 7.
@@ -46,7 +51,8 @@ offending frame. No elevation needed; works on System32's engine.
    see step 7.
 
 4. **Locate the faulting context.** `threads {}` (`~`) to see all threads; `!ext.analyze -v`
-   already switches to the faulting thread. Confirm with `registers {}`.
+   switches to the faulting thread on the bug checks that carry an exception context — not on all
+   of them, so confirm with `registers {}` rather than assuming.
 
 5. **Read the stack.** `backtrace {}` (`k`). If frames show `module!name` you have symbols;
    if not, set up symbols (see [setup.md](setup.md)) and `execute { "command": ".reload /f" }`,

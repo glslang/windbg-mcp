@@ -2258,10 +2258,29 @@ impl WindbgServer {
     /// and does not depend on `!analyze`'s attribution, which for such a driver is often wrong.
     /// `!analyze`'s own conclusions (pool tag, failure bucket, blamed module) travel beside them
     /// under `analysis`, so the two can be compared; pass `analyze: false` to skip it.
+    /// Reads the target and never writes to it, but with the default `analyze: true` it runs
+    /// `!analyze -v`, which on a bug check carrying an exception context selects that context and
+    /// leaves it selected — so a later `registers` or `backtrace` on the same session can see a
+    /// different thread than before. `analyze: false` touches nothing.
     #[rmcp::tool(
         annotations(
             title = "Triage a bug check",
-            read_only_hint = true,
+            // **Not read-only, and the distinction is the session rather than the target.**
+            // Nothing here writes to the debuggee. But `!analyze -v` selects the faulting context
+            // on the bug checks that carry one and leaves it selected, so two identical
+            // `backtrace` calls either side of a triage can differ — which is a change to the
+            // environment the other tools read, and is what this hint is about. `ioctl_trace` is
+            // annotated the same way for the same kind of reason: session state moves, nothing is
+            // harmed.
+            //
+            // Per-tool rather than per-argument, so it describes the worst case: `analyze: false`
+            // really is a pure read, and cannot say so here.
+            //
+            // It could be earned back by saving the scope around the `!analyze` and restoring it
+            // (`IDebugSymbols3::GetScope`/`SetScope`), which is a win-kexp primitive this does not
+            // have yet. Until then the honest annotation is this one — the alternative is a
+            // promise that cannot be verified on the bug checks where it matters.
+            read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = true,
             open_world_hint = true
