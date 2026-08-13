@@ -1026,6 +1026,118 @@ pub struct AnalysisInfo {
     pub note: Option<String>,
 }
 
+// ---- memory walks ---------------------------------------------------------
+
+/// What `walk_memory` visited, what it read at each node, and why it stopped.
+///
+/// The shape exists because a walk's *holes* are its most valuable output. A MASM `.for` loop
+/// through `execute` answers all-or-nothing — one unmapped dereference and the whole script is
+/// `0x80040205` with no rows at all — and in pool work "some of these nodes are freed" is the
+/// normal case ([#103](https://github.com/glslang/windbg-mcp/issues/103)). So a value that could
+/// not be read is a `null` in its own field, a node where nothing could be read is counted, and
+/// the walk carries on.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryWalk {
+    pub mode: WalkMode,
+    /// The resolved address the walk started from. Absent for a list of addresses, which has no
+    /// start — every entry is one address among many rather than the place a traversal began.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start: Option<String>,
+    /// How many nodes the walk was asked for: `count`, or the length of the address list.
+    pub requested: u32,
+    /// How many it actually produced. Short of `requested` means it stopped early, and
+    /// [`Self::stopped`] says why — which is never "an address would not read", for an array or
+    /// a list.
+    pub walked: u32,
+    /// How many of those nodes yielded **no** readable value at all. A node with one unreadable
+    /// field among several is not one of these; per-field `value: null` marks those.
+    pub unreadable: u32,
+    pub nodes: Vec<WalkNode>,
+    pub stopped: WalkStop,
+    /// Why *nothing* could be read, when nothing could: the debugger's own words for the first
+    /// failed read.
+    ///
+    /// Present only when every node came back unreadable, which is the one case where this tool's
+    /// answer is ambiguous. A list of freed objects legitimately reads that way — and so does a
+    /// target that is not broken in, a session whose engine has let go, or a `start` pointing at
+    /// nothing. Without the engine's message those are the same table.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+}
+
+/// How a walk found its nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WalkMode {
+    /// Addresses supplied outright.
+    List,
+    /// `start + i * stride`.
+    Array,
+    /// The pointer at `node + next_offset`, followed.
+    Chain,
+}
+
+/// One node: where it was, what it held, and whether anything there could be read.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WalkNode {
+    /// Position in the walk, from 0.
+    pub index: u32,
+    pub address: String,
+    /// The link this node held, for a chain — the address the walk went to next. `null` when the
+    /// link could not be read, which for a chain is also where the walk ends.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+    pub fields: Vec<WalkFieldValue>,
+    /// Whether *anything* at this node could be read. `false` is the interesting case in a
+    /// use-after-free walk: the node's page is gone.
+    pub readable: bool,
+}
+
+/// One field of one node.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WalkFieldValue {
+    /// The column name, as the request gave it or defaulted to the offset (`+0x18`).
+    pub name: String,
+    /// Where this value was read from: the node's address plus the field's offset.
+    pub address: String,
+    /// Bytes read: 1, 2, 4 or 8.
+    pub size: u32,
+    /// The value, zero-extended to 64 bits and rendered in this module's one address form
+    /// whatever [`Self::size`] is — so a client never has to know a field's width to compare it.
+    /// `null` means the debugger could not read those bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
+/// Why a walk ended.
+///
+/// Seven reasons rather than a `complete` flag, because they call for opposite responses: a chain
+/// that hit a null link is *finished*, one that hit the cap has more to walk and says where from,
+/// one that hit an unreadable link has more that cannot be reached from here, and one the clock
+/// stopped may have all of it still there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum WalkStop {
+    /// Every node asked for was visited. Holes in an array or a list are reported per node and do
+    /// not stop the walk, so this is the ordinary outcome for both.
+    Complete,
+    /// A chain reached the requested `count` with the list still going. `next` is the address to
+    /// walk from to continue.
+    Cap { next: String },
+    /// A chain's next pointer is null: the list ends here.
+    NullLink,
+    /// A chain arrived at a node it had already visited. At the head that is the ordinary end of
+    /// a circular `_LIST_ENTRY`; anywhere else it is a corrupted list, which is a finding.
+    Loop { at: String },
+    /// A chain's next pointer could not be read, so there is no address to continue from. Only a
+    /// chain ends this way — an array's next address is arithmetic and a list's was supplied.
+    UnreadableLink { at: String },
+    /// The call's remaining time ran out. What is missing is unknown rather than absent.
+    Deadline,
+    /// `interrupt` was called on this session.
+    Interrupted,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

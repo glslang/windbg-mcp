@@ -15,6 +15,7 @@ mod server;
 mod structured;
 mod triage;
 mod ttd;
+mod walk;
 mod worker;
 
 use std::time::Duration;

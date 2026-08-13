@@ -57,6 +57,7 @@ use crate::server::{
 };
 use crate::structured;
 use crate::triage::{self, Analysis, AttributedFrame, Attribution};
+use crate::walk;
 
 /// The argument that turns this executable into a worker. Not a documented CLI: the supervisor
 /// re-executes itself with it, and nothing else should.
@@ -1071,6 +1072,34 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         EngineOp::ReadMemory { address, size } => read_memory(e, &address, size)
             .map(Output::text)
             .map_err(Failed::from),
+        // The caller's own deadline, on the same arithmetic as a pool walk's and for the same
+        // reason — with one difference that makes it matter more here. A pool walk is bounded by
+        // win-kexp *as well*; this one has no command behind it, so between-node checking is the
+        // only bound there is.
+        EngineOp::Walk(op) => {
+            let patience = Duration::from_millis(u64::from(op.patience_ms));
+            match walk_budget(patience, queued) {
+                Some(budget) => walk_memory(e, op, budget),
+                // Refused rather than attempted, as a pool query that must walk is. A walk with no
+                // time reads nothing and reports an empty table with `stopped: deadline`, which
+                // looks exactly like a target whose every node is missing — the one reading a
+                // caller must not take away from a call that never started.
+                None => Err(Failed::categorised(
+                    structured::ErrorCategory::NotRun,
+                    format!(
+                        "This walk was not run: it reached the engine with {}s of its caller's \
+                         timeout left, which is not enough to read a node and report back before \
+                         that timeout expires. Nothing was read and nothing changed. It waited \
+                         {}s behind other work on this session; issue it when the session is \
+                         idle, or raise the server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS \
+                         — the reply itself reserves {}s of headroom).",
+                        patience.saturating_sub(queued).as_secs(),
+                        queued.as_secs(),
+                        WATCHDOG_HEADROOM.as_secs(),
+                    ),
+                )),
+            }
+        }
         EngineOp::SymbolPath {
             path,
             append,
@@ -1794,6 +1823,105 @@ fn read_memory(e: &DebugEngine, address: &str, size: u32) -> Result<String, Stri
     }
     let bytes = e.read_memory(addr, size as usize).map_err(es)?;
     Ok(hexdump(addr, &bytes))
+}
+
+/// Resolves the address a walk starts from.
+///
+/// A number in any form the debugger prints costs nothing to recognise, so it is tried first. What
+/// is left is MASM — a symbol (`MessageManager!g_MessageTable`), an offset from one, a `poi()` of
+/// a list head that is not itself a node — and `?` is the only thing that reads those. One
+/// command for the whole walk, rather than one per node, which is the point of resolving here
+/// rather than making every address an expression.
+fn resolve_start(e: &DebugEngine, start: &str) -> Result<u64, Failed> {
+    if let Ok(address) = parse_pool_addr(start) {
+        return Ok(address);
+    }
+    let text = e.execute_command(&format!("? {start}")).map_err(|why| {
+        Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            format!("`start` = `{start}` could not be evaluated: {why}"),
+        )
+    })?;
+    // A `?` that *runs* but produces nothing an address can be read out of is the caller's
+    // mistake, not the target's — a misspelt symbol is the usual one — so it is categorised as
+    // such, and the debugger's own words go with it rather than a paraphrase.
+    parse_eval(&text).ok_or_else(|| {
+        Failed::categorised(
+            structured::ErrorCategory::InvalidArgument,
+            format!(
+                "`start` = `{start}` did not evaluate to an address. The debugger said: {}",
+                text.trim()
+            ),
+        )
+    })
+}
+
+/// Walks a list, an array or a pointer chain, reading named fields out of every node.
+///
+/// The engine appears here twice and nowhere else in the walk: once to resolve the start, and once
+/// as the closure that reads bytes. Everything about the traversal — the coalesced span read and
+/// its per-field fallback, the loop detection, the table — is [`crate::walk`], which has no engine
+/// and so can be tested against an address space with holes in exactly the places that matter.
+///
+/// **The deadline starts before the start expression is resolved**, because `?` on a symbol can
+/// block on a symbol server, and a budget that began after it would be a budget measured from an
+/// unknown point in the caller's wait.
+fn walk_memory(e: &DebugEngine, op: walk::WalkOp, within: Duration) -> Result<Output, Failed> {
+    let deadline = Instant::now() + within;
+    let source = match op.source {
+        walk::Source::List { addresses } => walk::Resolved::List(addresses),
+        walk::Source::Array {
+            start,
+            stride,
+            count,
+        } => walk::Resolved::Array {
+            start: resolve_start(e, &start)?,
+            stride,
+            count,
+        },
+        walk::Source::Chain {
+            start,
+            next_offset,
+            count,
+        } => walk::Resolved::Chain {
+            start: resolve_start(e, &start)?,
+            next_offset,
+            count,
+        },
+    };
+
+    // Kept for the one case the table cannot explain by itself: a walk where *nothing* read. Only
+    // the first is kept — a thousand copies of "memory read failed" is the table with the answer
+    // buried in it, which is the shape this tool exists to replace.
+    let mut first_failure: Option<String> = None;
+    let mut report = walk::run(
+        &source,
+        &op.fields,
+        |address, size| match e.read_memory(address, size) {
+            Ok(bytes) => Some(bytes),
+            Err(why) => {
+                first_failure.get_or_insert_with(|| why.to_string());
+                None
+            }
+        },
+        || {
+            // The interrupt is asked about first. Both can be true at once — a caller who gives up
+            // and a clock that ran out land in the same poll — and being told a call was cut short
+            // by a deadline it *also* passed sends them to the timeout setting instead of to the
+            // break they just asked for.
+            if matches!(e.interrupted(), Ok(true)) {
+                Some(walk::Halt::Interrupted)
+            } else if Instant::now() >= deadline {
+                Some(walk::Halt::Deadline)
+            } else {
+                None
+            }
+        },
+    );
+    if walk::read_nothing(&report) {
+        report.note = first_failure;
+    }
+    Ok(Output::typed(walk::render(&report), report))
 }
 
 /// How long a batch may run, given what it asked for and what its caller has left.

@@ -320,7 +320,7 @@ gh attestation verify <zip> --repo glslang/windbg-mcp `
 | Group | Tools |
 |-------|-------|
 | Session | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `interrupt`, `end_session`, `session_status` |
-| State   | `registers`, `read_memory`, `backtrace`, `modules`, `threads`, `disassemble`, `dx` |
+| State   | `registers`, `read_memory`, `walk_memory`, `backtrace`, `modules`, `threads`, `disassemble`, `dx` |
 | Crash   | `crash_triage` — a bug check as fields: code and parameters, crashing process, the stack as `module+RVA`, and the faulting driver frame |
 | Control | `go`, `step_over`, `step_into`, `set_breakpoint`, `run_to_address` |
 | Transaction | `debug_batch` — an ordered sequence with assertions and a rollback the engine process runs on every path |
@@ -481,6 +481,51 @@ that could retire the session handle.
 Nothing legitimate is lost: these parameters were always single operands. Use `execute` to run a
 command list — it is annotated destructive and retires the handle when a command changes the target.
 
+### Walking a structure (`walk_memory`)
+
+Walking a kernel list through `execute` is all-or-nothing. A single unmapped dereference inside a
+MASM `.for` loop ends the whole script with `An unexpected exception was raised (0x80040205)` — no
+rows, no iteration number, no indication of how many nodes were classified before it. In pool and
+use-after-free work that is precisely backwards: "some of these nodes are freed" is the normal case,
+and the pointer that will not read is usually the one worth looking at
+([#103](https://github.com/glslang/windbg-mcp/issues/103)).
+
+`walk_memory` reads each value on its own, so a hole is a row rather than an end. Three ways to name
+the nodes, one of them required:
+
+| | |
+|---|---|
+| `addresses` | walk these exactly — the bulk read |
+| `start` + `stride` | an array: element *i* is `start + i * stride` |
+| `start` + `next_offset` | a chain: the next node is the pointer at `node + next_offset` |
+
+`fields` says what to read out of each node (`{name, offset, size}`, size 1/2/4/8, **offsets may be
+negative** — a pool header sits 16 bytes before the address the allocator returned). `start` is any
+expression `?` evaluates, so a symbol or `poi(<head>)` works; the addresses in a list are numbers, in
+any form the debugger prints. Fields of one structure are fetched in a single read and fall back to
+per-field reads only where there is a hole, so a node costs one round trip in the ordinary case —
+which is what lets a 512-node walk finish over KDNET.
+
+```jsonc
+// Every message pointer in a 512-slot handle table, freed ones included.
+{ "start": "MessageManager!g_Handles", "stride": 16, "count": 512,
+  "fields": [{ "name": "msg", "offset": 8 }] }
+
+// Then the refcount out of each of those pointers — one call, holes and all.
+{ "addresses": ["0xffffc00f6ec02f90", "0xffffc00f6ec03000", …],
+  "fields": [{ "name": "refs", "offset": 16, "size": 4 },
+             { "name": "flink", "offset": 0 }] }
+```
+
+An unreadable value comes back as `null` in its own field (`0x????????????????` in the text), a node
+where *nothing* read is counted, and the walk carries on — for a list or an array. A **chain** is the
+exception, because the address of everything after an unreadable node lived in the bytes that would
+not read: it stops and says which node. It also stops on a null link, on a **loop** (reporting where
+the list closed — back at the head that is a healthy circular `_LIST_ENTRY`, anywhere else it is
+corruption), and at `count`, where it hands back the address to resume from. `count` past the cap of
+1024 is refused rather than clamped, so "every node asked for was visited" is never about a number
+this server lowered.
+
 ### Transactional batches (`debug_batch`)
 
 A sequence that *mutates* a target — patch a byte, arm a breakpoint, resume a thread — has to put
@@ -578,6 +623,7 @@ matching `outputSchema` in `tools/list`, so a program can read a field instead o
 | `run_to_address` | `verdict` (`hit`/`stopped_elsewhere`/`timeout`), `target`, `stopped_at` |
 | `go`, `step_over`, `step_into`, `step_back`, `step_over_back`, `reverse_go` | `stopped_at` |
 | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics` | the chunks/totals/diagnostics as values, each carrying the `walk` behind them |
+| `walk_memory` | `nodes[]` with each field's `value` — `null` where the debugger could not read it — plus `walked`/`unreadable` counts and a `stopped` reason (`complete`, `cap`, `null_link`, `loop`, `unreadable_link`, `deadline`, `interrupted`), each carrying the address it is about |
 | `crash_triage` | `bug_check` (`code`, `name`, four `parameters`), `process_name`, `frames[]` as `{module, rva, symbol}`, the `faulting_frame` picked out of them — and `!analyze`'s own conclusions kept apart under `analysis` |
 
 Two conventions hold across all of them:
@@ -701,6 +747,10 @@ timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressio
   clean "memory read error"; query the specific field you need (e.g.
   `dt nt!_DRIVER_OBJECT <addr> DriverName`) instead of dumping whole structures. See the
   [crash-dump walkthrough](docs/crash-dump-walkthrough.md).
+- **That failure is all-or-nothing inside a `.for` loop**, which is what `walk_memory` is for: one
+  unmapped dereference takes the whole script down with no rows at all, and the node it happened on
+  is usually the interesting one. Walk a list, an array or a chain with `walk_memory` and each hole
+  is a marked value instead.
 - Single-stepping is only valid once the target is stopped with a real thread context (after a
   `go`/step or a breakpoint hit). Stepping straight after a bare `goto_position` to the very start of
   a trace (before any thread is live) returns `0x80040205` — `go` to a breakpoint first.

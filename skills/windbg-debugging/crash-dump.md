@@ -100,6 +100,8 @@ offending frame. No elevation needed; works on System32's engine.
   page raises `An unexpected exception was raised (0x80040205)` (not a clean read error), and a
   full-struct `dt` can hit it just by following a pointer into a missing page — read the one
   field you need (`dt nt!_DRIVER_OBJECT <addr> DriverName`) and prefer the addresses
-  `!ext.analyze` already resolved (PDO, IRP, DRIVER_OBJECT live in the triage data).
+  `!ext.analyze` already resolved (PDO, IRP, DRIVER_OBJECT live in the triage data). To read the
+  same field across many objects, use `walk_memory` rather than a `.for` loop: one uncaptured page
+  aborts the whole loop, while the walk marks that node and reads the rest.
 - For a kernel dump, `!ext.analyze -v` reports the **bugcheck code and arguments** — start
   there rather than from the raw stack.

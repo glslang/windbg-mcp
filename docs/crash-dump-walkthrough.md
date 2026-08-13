@@ -199,6 +199,16 @@ a missing page, will hit this. **Query the exact field you need** (e.g.
 `dt _DRIVER_OBJECT <addr> DriverName`) rather than dumping whole structures, and prefer the
 addresses `!analyze` hands you (PDO, IRP, DRIVER_OBJECT) — those are in the triage data.
 
+Reading one field across *many* objects is where this bites hardest: inside a `.for` loop the
+first uncaptured page ends the whole script, so a table with one missing page in it comes back
+empty rather than nearly complete. Use **`walk_memory`** for that — it reads each value on its
+own, marks the ones it could not read, and walks the rest:
+
+```jsonc
+{ "addresses": ["0xffffb00a1c2d3000", "0xffffb00a1c2d4000", …],
+  "fields": [{ "name": "DriverName", "offset": 56 }] }
+```
+
 ## 6. Why `!ext.analyze` and not `!analyze`?
 
 The bundled WinDbg engine has no debugger extensions next to it unless you copy the

@@ -3,7 +3,7 @@
     "(none)",
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 44,
+  "toolCount": 45,
   "tools": [
     {
       "hints": {
@@ -1171,6 +1171,45 @@
         "size"
       ],
       "title": "TTD: find accesses to a memory range"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": true,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "walk_memory",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/MemoryWalk",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
+      "params": [
+        "addresses: array<string>",
+        "count: integer|null/uint32",
+        "fields: array<ref(#/$defs/FieldArg)>",
+        "next_offset: integer|null/int64",
+        "session_id: string|null",
+        "start: string|null",
+        "stride: integer|null/int64"
+      ],
+      "required": [],
+      "title": "Walk a structure in memory"
     }
   ],
   "usesDefs": true

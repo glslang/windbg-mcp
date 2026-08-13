@@ -5,6 +5,48 @@ status. Keep entries short; link to code with `file:line` where it helps a futur
 
 ---
 
+## A walk reports its holes; only a chain is stopped by one (2026-08-13, issue #103)
+
+**Context.** Inspecting a kernel list meant a MASM `.for` loop through `execute`, which is
+all-or-nothing: one unmapped `poi` ends the script with `0x80040205` and returns no rows, no
+iteration number, and no way to tell which node faulted. For a server whose subject is pool and
+use-after-free analysis that is exactly backwards — "some of these nodes are freed" is the normal
+case, and the pointer that will not read is the one the walk was for.
+
+**Decision.** `walk_memory` issues one `ReadVirtual` per value and reports what failed instead of
+propagating it: an unreadable value is `null` in its own field, an unreadable *node* is counted,
+and the walk continues. The traversal, the loop detection and the rendering live in `src/walk.rs`
+behind a reader closure, engine-free, so the holes that matter are testable against a fake address
+space rather than only against a target that happens to have one.
+
+**A chain is the exception, and it is a real one.** An array's next address is arithmetic and a
+list's was supplied, so a hole costs those walks one node. A chain's next address lived in the
+bytes that would not read, so a hole costs it everything after — it stops, and `stopped` names the
+node rather than reporting an end of list that was never observed. The same enum distinguishes a
+null link, a loop (with where the list closed), the count cap (with where to resume), the deadline
+and an interrupt: seven reasons rather than a `complete` flag, because they call for opposite
+responses.
+
+**The cap is refused, not clamped.** `count` past 1024 is an error. Clamping would answer a
+different question and then label it `complete` — and "every node asked for was visited" is the one
+sentence a caller reads to decide whether to look further.
+
+**Nothing read at all is the one ambiguous answer**, so the worker attaches the engine's own words
+for the first failed read (`MemoryWalk.note`). A list of freed objects reads identically to a target
+that is not broken in, or a `start` that is not where the caller thinks.
+
+**Bounded between nodes, because nothing else bounds it.** A walk is a long run of reads with no
+`Execute` behind it, so win-kexp's watchdog has nothing to interrupt. The deadline and the session's
+interrupt are polled once per node, *before* its reads — after them, a break landing during node 3
+would still buy node 4's round trips. A walk that reaches the engine with less than the reply's own
+headroom left is refused outright, as a pool query that must walk already is.
+
+**Status.** Done. Covered by `src/walk.rs` unit tests over an address space with holes in it, and
+by `mcp_smoke::a_walk_marks_what_it_cannot_read_and_keeps_going`, which asserts the *contrast*:
+the same dereference through `execute` fails, and the walk returns it as a row.
+
+---
+
 ## A typed result is a second channel, not a replacement (2026-08-12, issue #84)
 
 **Context.** Every tool answered in prose, so the only way to drive this server programmatically was

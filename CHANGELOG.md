@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`walk_memory`: a structure traversal where an unreadable node is a row, not an end**
+  ([#103](https://github.com/glslang/windbg-mcp/issues/103)). Walking a kernel list through
+  `execute` was all-or-nothing — one unmapped dereference inside a MASM `.for` loop ended the
+  whole script with `An unexpected exception was raised (0x80040205)`, leaving no rows, no
+  iteration number, and no way to tell which node faulted. Driving the MessageManager
+  use-after-free that meant bisecting a 512-entry handle table by hand to find the one bad
+  pointer, which was of course the pointer the walk existed to find.
+
+  The new tool names its nodes three ways — an explicit `addresses` list (the bulk read),
+  `start` + `stride` (an array), or `start` + `next_offset` (a pointer chain) — and reads named
+  `fields` out of each. Offsets may be negative, so a pool header 16 bytes before the address
+  the allocator returned is one argument rather than arithmetic per node. A value the debugger
+  cannot read comes back as `null` in its own field, a node where nothing read is counted, and
+  the walk carries on.
+
+  A **chain** is the one traversal a hole really does stop, because the address of everything
+  after it lived in the bytes that would not read — so it stops and says *which node*. It also
+  stops on a null link, on a loop (reporting where the list closed: back at the head that is a
+  healthy circular `_LIST_ENTRY`, anywhere else it is corruption), and at `count`, where it hands
+  back the address to resume from.
+
+  Fields of one structure are fetched in a single read, falling back to per-field reads only
+  where there is a hole — one round trip per node in the ordinary case, which is what lets a
+  512-node walk finish over KDNET. The walk checks its deadline and the session's interrupt
+  between nodes: there is no *command* behind it, so win-kexp's watchdog has nothing to bound,
+  and a walk cut short answers with what it really read rather than failing.
+
 ## [0.8.1] - 2026-08-13
 
 ### Fixed

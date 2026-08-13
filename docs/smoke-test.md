@@ -164,6 +164,15 @@ processes, so they need real ones:
   from one step and interpolated into the next) and one to `FAILED at step 2 of 3`, with the same
   `always` block on both. The claim only a real engine can settle is the second one: the rollback
   ran **inside the worker process**, on the failing path, before the tool call returned.
+- *A walk marks what it cannot read and keeps going.* The claim
+  [#103](https://github.com/glslang/windbg-mcp/issues/103) is about, and the one that needs a real
+  engine: `src/walk.rs` proves the traversal against a fake address space, and this proves the
+  holes behave the same when they are DbgEng's. It asserts the **contrast** rather than describing
+  it — `execute { "? poi(0x1000)" }` fails outright (the low 64 KB is reserved on every Windows
+  target, so it needs no knowledge of this dump), while `walk_memory` returns the same address as a
+  row between two module bases whose `MZ` it really read. Then array mode over the `nt` DOS header
+  at its own field widths, and a chain from that unmapped address, which must stop with
+  `unreadable_link` **naming the node** and carry the engine's reason for reading nothing at all.
 - *A pool walk takes this server's deadline, not the walker's default.* Asserted against the
   worker's log (`RUST_LOG=windbg_mcp=debug`) rather than against the answer, because on a dump the
   number has no visible consequence — the pool is local memory, so every budget from 15s to 120s
