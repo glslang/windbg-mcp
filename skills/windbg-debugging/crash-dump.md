@@ -17,10 +17,13 @@ offending frame. No elevation needed; works on System32's engine.
    driver. It runs `!analyze -v` for you (either spelling — see below) and reports the fields
    only `!analyze` computes (`pool_tag`, `failure_bucket_id`, the per-parameter explanations)
    under `analysis`, so you get them without reading ~150 lines.
-   — **Prefer `faulting_frame` over `analysis.module_name`.** The frame is computed from the
-   module's load base and is right even for a driver with no PDB; `!analyze`'s own attribution
-   is a heuristic and is often wrong for exactly those drivers. When the two differ, the text
-   says so.
+   — **`faulting_frame` and `analysis.module_name` are two guesses; `frames` settles them.** Every
+   frame's `module+RVA` is *computed* from the load base, so it is right even for a driver with no
+   PDB — that part is not a guess. Which frame is the culprit is: `faulting_frame` is the innermost
+   one outside `nt`/`hal` and the framework layers (`Wdf01000`, Driver Verifier), so a stack routed
+   through a layer this build doesn't know is a layer names that layer. `!analyze`'s attribution is
+   a different heuristic, and is often wrong for a PDB-less driver. When they differ the text says
+   so; read the stack.
    — `crash_triage { "analyze": false }` skips the `!analyze` and answers from engine reads
    alone — fast, and it still names the bug check and the driver frame.
    — **`faulting_frame` is not always there.** It is *absent* (the key is omitted, as every

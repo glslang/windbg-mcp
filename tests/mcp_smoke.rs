@@ -1623,11 +1623,17 @@ fn a_bug_check_is_triaged_into_its_fields() {
             );
         }
         // The two provenances agree about the process, which is the check that the extraction is
-        // reading the right block rather than something that happens to look like it.
-        assert_eq!(
-            analysis["process_name"], triage["process_name"],
-            "`!analyze`'s PROCESS_NAME and the EPROCESS read must be the same process: {triage}"
-        );
+        // reading the right block rather than something that happens to look like it. Required
+        // only of a *complete* run: a truncated one may have been cut off before `PROCESS_NAME`,
+        // and demanding a field the tool explicitly says may be missing would fail this tier for
+        // the one behaviour it is meant to allow.
+        if analysis["truncated"] == false || !analysis["process_name"].is_null() {
+            assert_eq!(
+                analysis["process_name"], triage["process_name"],
+                "`!analyze`'s PROCESS_NAME and the EPROCESS read must be the same process: \
+                 {triage}"
+            );
+        }
     } else {
         assert!(
             analysis["note"].as_str().is_some_and(|n| !n.is_empty()),
@@ -3344,6 +3350,32 @@ fn a_live_kernel_session_attaches_coexists_and_detaches_cleanly() {
         assert!(
             registers.contains("rip="),
             "a broken-in kernel should have a thread context:\n{registers}"
+        );
+
+        // `crash_triage` against a kernel that is merely *broken in* — the state the crash/reboot
+        // exploitation loop sits in between fires, and the one a dump can never be in. It has to
+        // refuse, and refuse for the right reason: this is a kernel target with no bug check, not
+        // the user-mode session the other refusal is about, and the two arms are only ever both
+        // reachable here.
+        let refused = server.tool_failure("crash_triage", json!({ "session_id": session }), STEP);
+        assert_eq!(refused["error"]["category"], "debugger", "{refused}");
+        let why = refused["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            why.contains("not stopped at a bug check"),
+            "a live kernel that has not crashed must be told so, not handed an HRESULT: {refused}"
+        );
+        assert!(
+            !why.contains("user-mode"),
+            "this is a kernel target; the user-mode arm must not be the one that fires: {refused}"
+        );
+
+        // And the refusal costs the session nothing — the loop attaches once and fires many times,
+        // so a triage that came too early must leave the session exactly as usable as it found it.
+        let after_refusal =
+            server.tool_text("registers", json!({ "session_id": session }), TARGET_STEP);
+        assert!(
+            after_refusal.contains("rip="),
+            "the session must survive a triage that had nothing to triage:\n{after_refusal}"
         );
 
         // The payoff, on the target it matters most for: another session opened and used while a
