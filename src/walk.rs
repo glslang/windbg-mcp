@@ -419,6 +419,14 @@ pub enum Halt {
 /// node 3 and still pay for node 4's round trips. What it stops is reported as the walk's outcome
 /// rather than as a failure, and the nodes already read come back — a walk cut short is this tool
 /// working, not this tool breaking.
+///
+/// **There is deliberately no poll after the last node**, which looks like a gap and is not. The
+/// loop leaves four ways: the count was reached, the address list ran out, a chain ended on its own
+/// terms, or `halt` fired — so the only path on which an interrupt *truncates* a walk is the one
+/// that already observes it. A break landing during the final read changed nothing, and recording
+/// it in [`structured::WalkStop`] would report a truncation that did not happen, telling a caller
+/// the rest is unknown when there is no rest. The interrupt is a fact about the **call**, and
+/// `worker::cut_short` says so in the prose, for every tool alike.
 pub fn run(
     source: &Resolved,
     fields: &[Field],
