@@ -1374,11 +1374,19 @@ fn crash_triage(
     // makes two triages of one session agree.
     //
     // **That normalisation is a side effect of the analysis, so it holds exactly when the analysis
-    // ran.** `run_analyze` declines to start when the patience is already spent, and both spellings
-    // can fail to resolve on an engine with no `ext.dll` — in either case nothing has moved the
-    // scope and the reads describe whatever the caller had selected, the same as `analyze: false`.
-    // `analysis.ran` is how a caller tells the two apart, and it is documented on the tool rather
-    // than papered over here.
+    // *completed*.** Two ways it does not. `run_analyze` declines to start when the patience is
+    // already spent, and both spellings can fail to resolve on an engine with no `ext.dll` —
+    // nothing has moved the scope, and the reads describe whatever the caller had selected, the
+    // same as `analyze: false`. And a run the **deadline** cut short is not a cancellation
+    // ([`Analysis::interrupted`] is false for it, deliberately), so the reads below still happen —
+    // but the reset is something `!analyze` does partway through its own output, not at the end,
+    // so a truncated run may or may not have reached it and this cannot tell which.
+    //
+    // Hence the qualification a caller is given is `ran` **and not** `truncated`, not `ran` alone.
+    // Not fixed by resetting the scope here instead: that would make the tool normalise a session
+    // it was not asked to normalise, and the claim would then be one no host with a working
+    // `ext.dll` can test — the whole point of this comment is that the reset is the analysis's,
+    // and where it does not happen there is nothing to demonstrate.
     //
     // With `analyze: false` nothing normalises anything, and the reads describe whichever scope
     // the session currently has — the same one `backtrace` would show. On a freshly opened crash

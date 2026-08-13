@@ -2262,10 +2262,12 @@ impl WindbgServer {
     /// `!analyze -v` it runs by default would otherwise reset the selected scope, so the scope is
     /// saved and restored around the call.
     /// The stack it reports is the target's default context — the crash, on a crash dump —
-    /// whenever the `!analyze` actually ran, since running it is what resets the scope there.
-    /// With `analyze: false`, and in the cases where the analysis is skipped (no time left in the
-    /// call, no `ext.dll` on the engine), it is instead whatever the session has selected, the
-    /// same stack `backtrace` would show. `analysis.ran` says which of the two you got.
+    /// whenever the `!analyze` ran to completion, since running it is what resets the scope
+    /// there. Otherwise it is whatever the session has selected, the same stack `backtrace`
+    /// would show: with `analyze: false`, when the analysis could not run (no time left in the
+    /// call, no `ext.dll` on the engine), and when it was cut short, since the reset happens
+    /// partway through the analysis and a truncated one may not have reached it.
+    /// `analysis.ran` and `analysis.truncated` are what tell those apart.
     #[rmcp::tool(
         annotations(
             title = "Triage a bug check",

@@ -27,9 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   So the stack `crash_triage` reports is the target's default context (the crash, on a crash dump)
   rather than "the thread the analysis blamed", regardless of where the caller had navigated —
   which is what makes two triages of one session agree. That normalisation is the analysis's own
-  side effect, so it holds exactly when the analysis ran: with `analyze: false`, or when it is
-  skipped for want of time or an `ext.dll`, the walk describes the selected context instead, and
-  `analysis.ran` is what tells them apart. The
+  side effect, so it holds exactly when the analysis *completed*: with `analyze: false`, when it is
+  skipped for want of time or an `ext.dll`, or when the deadline cut it short before the reset it
+  does partway through its output, the walk describes the selected context instead — `analysis.ran`
+  and `analysis.truncated` are what tell those apart. The
   smoke tier checks the promise from a scope the analysis would otherwise discard — frame 3, since
   a check starting at the default would pass whether the scope was restored or merely reset.
 
