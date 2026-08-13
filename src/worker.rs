@@ -1369,11 +1369,16 @@ fn crash_triage(
     // not for the reason it looks like. The analysis *does* go and look at the thread it blames:
     // on the `0x9F` sample its output says `Implicit thread is now …` partway through, naming a
     // thread that is not the one the dump opens on. But it puts that back before it returns, and
-    // leaves the scope at the default. So the reads below describe the **default context** — for
-    // a crash dump, the crash — whether or not the analysis ran, and running the analysis first
-    // is what guarantees that: it normalises a session a caller had navigated (`.frame`, `.cxr`)
-    // back to the default before the stack is walked, which is what makes two triages of one
-    // session agree.
+    // leaves the scope at the default. So running it first *normalises* a session a caller had
+    // navigated (`.frame`, `.cxr`) back to the default before the stack is walked, which is what
+    // makes two triages of one session agree.
+    //
+    // **That normalisation is a side effect of the analysis, so it holds exactly when the analysis
+    // ran.** `run_analyze` declines to start when the patience is already spent, and both spellings
+    // can fail to resolve on an engine with no `ext.dll` — in either case nothing has moved the
+    // scope and the reads describe whatever the caller had selected, the same as `analyze: false`.
+    // `analysis.ran` is how a caller tells the two apart, and it is documented on the tool rather
+    // than papered over here.
     //
     // With `analyze: false` nothing normalises anything, and the reads describe whichever scope
     // the session currently has — the same one `backtrace` would show. On a freshly opened crash

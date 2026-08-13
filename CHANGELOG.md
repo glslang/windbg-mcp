@@ -24,9 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a user-mode access violation). The implicit *thread* it does move — visibly, on the `0x9F`,
   where the thread it blames is not the one the dump opens on — and does put back.
 
-  So the stack `crash_triage` reports with `analyze: true` is the target's default context (the
-  crash, on a crash dump) rather than "the thread the analysis blamed", and it is that regardless
-  of where the caller had navigated, which is what makes two triages of one session agree. The
+  So the stack `crash_triage` reports is the target's default context (the crash, on a crash dump)
+  rather than "the thread the analysis blamed", regardless of where the caller had navigated —
+  which is what makes two triages of one session agree. That normalisation is the analysis's own
+  side effect, so it holds exactly when the analysis ran: with `analyze: false`, or when it is
+  skipped for want of time or an `ext.dll`, the walk describes the selected context instead, and
+  `analysis.ran` is what tells them apart. The
   smoke tier checks the promise from a scope the analysis would otherwise discard — frame 3, since
   a check starting at the default would pass whether the scope was restored or merely reset.
 
