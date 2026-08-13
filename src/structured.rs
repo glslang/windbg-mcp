@@ -494,14 +494,25 @@ impl From<&win_kexp::dbgeng::RegisterValue> for RegisterValue {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ModuleList {
-    /// The modules being listed: every loaded one, or those [`Self::filter`] matched.
-    ///
-    /// **Loaded modules only.** `lm` also prints a tail of images that have since *unloaded* —
-    /// twenty-six `nvhda64v.sys` rows on this repo's own sample — and those are not carried here;
-    /// they are a different question, asked of a module that no longer exists. A filtered listing
-    /// says so in its text when that tail is under it, because "no module matches" printed over a
-    /// list of matching unloaded rows is a contradiction a reader cannot resolve.
+    /// The **loaded** modules being listed: every one, or those [`Self::filter`] matched.
     pub modules: Vec<ModuleInfo>,
+    /// The modules that have **unloaded** — the tail `lm` prints under `Unloaded modules:`,
+    /// narrowed by the same filter.
+    ///
+    /// Their own list rather than rows mixed into [`Self::modules`], because they answer a
+    /// different question: `start`/`end` say where an image *was*, and the kernel keeps only a
+    /// bounded, truncated record of it (`WpdUpFltr.sy`), so counting them among the loaded
+    /// modules would overstate what is in the target now.
+    ///
+    /// Carried at all because the text beside these values lists them, and a listing whose two
+    /// halves disagree is worse than either half alone: a filter of `nvhda` on this repo's own
+    /// sample matches no loaded module and twenty-six unloaded ones, and the answer used to be
+    /// "nothing matched" printed directly above twenty-six matching rows. They are also the only
+    /// thing that can name a stack frame or pointer into a driver that is no longer there.
+    ///
+    /// **A module in this list has no [`ModuleInfo::name`]** — there is nothing left to qualify a
+    /// symbol with — so it is matched, and rendered, by its image name.
+    pub unloaded: Vec<ModuleInfo>,
     /// How many modules are loaded **in total** — which is the whole point of carrying it: a
     /// partial listing could otherwise be read as the inventory. Equal to `modules.len()` unless
     /// a filter narrowed the listing, and `modules.len()` is then how many matched.
@@ -535,6 +546,12 @@ pub struct ModuleInfo {
     pub user_mode: bool,
     pub timestamp: u32,
     pub checksum: u32,
+    /// True for a module that has **unloaded** — the rows in [`ModuleList::unloaded`], where
+    /// `start`/`end` are where the image *was*. Carried on the row as well as by which list it is
+    /// in, from the engine's own flag, so a record that has been lifted out of that list still
+    /// says so. Absent from the JSON when false, which is every ordinary module.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unloaded: bool,
 }
 
 /// How much symbol information the engine has for a module.
@@ -597,6 +614,7 @@ impl From<&win_kexp::dbgeng::Module> for ModuleInfo {
             user_mode: module.user_mode,
             timestamp: module.timestamp,
             checksum: module.checksum,
+            unloaded: module.unloaded,
         }
     }
 }
@@ -1405,6 +1423,7 @@ mod tests {
                 user_mode: false,
                 timestamp: 0,
                 checksum: 0,
+                unloaded: false,
             })
             .expect("serializes")
         };

@@ -108,12 +108,13 @@ itself against the table it replaced — it has to be the shorter of the two. An
 implementations of one pattern: the text is `lm m <pattern>`, the values are this server's own
 match over the engine's module list, and every module the values report has to be one the text
 printed. It also pins the two ways that pairing can come apart, both of them measured against this
-engine rather than assumed: a filter using the wildcards `lm m` honours and this server does not
-(`[fd]`, `#`, `+`) is **refused** rather than answered differently by each half, and a filter that
-matches only *unloaded* images — `nvhda` on this sample, which `lm` answers with twenty-six
-`nvhda64v.sys` rows and no loaded module — has to say whose rows those are instead of printing
-"nothing matched" above them. The other refusals are here too: a filter that narrows by nothing,
-and one carrying a `;` that would end the `lm m` it is interpolated into.
+engine rather than assumed. A filter using the wildcards `lm m` honours and this server does not
+(`[fd]`, `#`, `+`) is **refused**, rather than answered differently by each half. And a filter can
+match only *unloaded* images — `nvhda` on this sample, which `lm` answers with twenty-six
+`nvhda64v.sys` rows and no loaded module — so those are checked as values in their own `unloaded`
+list, matched by image name (the only name they have), each carrying the engine's `unloaded` flag,
+and every one of them present in the text above. The other refusals are here too: a filter that
+narrows by nothing, and one carrying a `;` that would end the `lm m` it is interpolated into.
 
 It also triages the dump's bug check (`crash_triage`), which is the one place the tier depends on
 the sample being a *crash* dump rather than any dump: the `0x9F` code and its four parameters read

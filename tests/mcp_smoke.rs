@@ -1671,6 +1671,30 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
         all["filter"].is_null(),
         "an unfiltered listing reports no filter: {all}"
     );
+    // The other half of what `lm` prints, carried as values rather than described in prose.
+    let every_unloaded = all["unloaded"]
+        .as_array()
+        .expect("the unloaded tail is a list, empty or not")
+        .len();
+    assert!(
+        every_unloaded > 0,
+        "this kernel dump carries unloaded modules; `lm` prints them: {all}"
+    );
+    for module in all["unloaded"].as_array().into_iter().flatten() {
+        assert_eq!(
+            module["unloaded"], true,
+            "a row in the unloaded half says so on the row too: {module}"
+        );
+        assert!(
+            module["name"].as_str().unwrap_or_default().is_empty(),
+            "an unloaded module has no module name — nothing is left to qualify a symbol \
+             with — so it is listed by its image: {module}"
+        );
+        assert!(
+            !module["image_name"].as_str().unwrap_or_default().is_empty(),
+            "…and that image name is the one thing it must still have: {module}"
+        );
+    }
 
     // A bare name is a substring, so this finds `nt` and everything else with `nt` in its name.
     let response = server.call_tool(
@@ -1749,40 +1773,63 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
         "{empty}"
     );
     assert_eq!(empty["loaded"].as_u64(), Some(loaded), "{empty}");
+    assert_eq!(
+        empty["unloaded"].as_array().map(Vec::len),
+        Some(0),
+        "neither half matched, which is what makes this the empty answer: {empty}"
+    );
     let text = text_of(&response["result"]);
     assert!(
-        text.contains("*nosuchmoduleanywhere*") && text.contains("No loaded module name matches"),
+        text.contains("*nosuchmoduleanywhere*") && text.contains("Nothing matches"),
         "a listing that found nothing has to say so:\n{text}"
     );
     assert!(
-        !text.contains("Unloaded modules:") && !text.contains("loaded modules only"),
-        "and says nothing about unloaded rows when `lm m` printed none:\n{text}"
+        !text.contains("unloaded"),
+        "and says nothing about unloaded modules when none matched either:\n{text}"
     );
 
-    // `lm` appends the images that have since unloaded — to a *filtered* listing as readily as to
-    // a whole one — and the values are loaded modules only. On the checked-in sample `nvhda`
-    // matches no loaded module and twenty-six unloaded `nvhda64v.sys` rows, which is the one case
-    // where a bare "nothing matched" would be denying the rows printed directly above it.
+    // A filter that matches **only unloaded** modules. `lm` appends those to a filtered listing as
+    // readily as to a whole one, so a listing that carried loaded modules alone would answer
+    // "nothing matched" directly above the rows that did. On the checked-in sample `nvhda` is
+    // exactly that case: no loaded module, and a pile of unloaded `nvhda64v.sys`.
     let response = server.call_tool(
         "modules",
         json!({ "session_id": session_id, "filter": "nvhda" }),
         TARGET_STEP,
     );
     assert_no_error(&response, "modules filtered to an unloaded driver");
-    let unloaded = response["result"]["structuredContent"].clone();
+    let gone = response["result"]["structuredContent"].clone();
     let text = text_of(&response["result"]);
     assert_eq!(
-        unloaded["modules"].as_array().map(Vec::len),
+        gone["modules"].as_array().map(Vec::len),
         Some(0),
-        "`nvhda64v` is unloaded in this dump, so no *loaded* module matches: {unloaded}"
+        "`nvhda64v` is unloaded in this dump, so no *loaded* module matches: {gone}"
     );
+    let matched_unloaded = gone["unloaded"]
+        .as_array()
+        .expect("the unloaded half is a list");
     assert!(
-        text.contains("Unloaded modules:"),
-        "this is the case that assertion exists for; the sample must still carry it:\n{text}"
+        !matched_unloaded.is_empty() && matched_unloaded.len() < every_unloaded,
+        "the filter narrows the unloaded half too, to some of the {every_unloaded} rows: {gone}"
     );
+    for module in matched_unloaded {
+        let image = module["image_name"].as_str().unwrap_or_default();
+        assert!(
+            image.to_ascii_lowercase().contains("nvhda"),
+            "`{image}` does not match the pattern it was matched by: {gone}"
+        );
+        // The same agreement demanded of the loaded half: these rows are in the text above.
+        assert!(
+            text.contains(image),
+            "the values report `{image}` but `lm m *nvhda*` did not print it:\n{text}"
+        );
+    }
     assert!(
-        text.contains("No loaded module name matches") && text.contains("loaded modules only"),
-        "the note must reconcile itself with the unloaded rows above it:\n{text}"
+        text.contains(&format!(
+            "{} that have since **unloaded** do",
+            matched_unloaded.len()
+        )),
+        "matching only unloaded modules is a finding, not a miss:\n{text}"
     );
 
     // Three refusals, all before the engine is touched: a filter that narrows by nothing, one

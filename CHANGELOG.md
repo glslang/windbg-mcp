@@ -46,9 +46,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prints *nothing at all* in that case, which reads as a target with no modules — naming the
   mistake callers actually make: the pattern matches the name symbols are qualified by (`nt`), not
   the image file (`ntkrnlmp.exe`), which is measured: `lm m ntkrnlmp*` finds nothing on a dump
-  whose kernel image is `ntkrnlmp.exe`. Where `lm` has appended its **unloaded** modules, the note
-  says which rows those are, since the values carry loaded modules only and "nothing matched" over
-  twenty-six matching `nvhda64v.sys` rows is a contradiction rather than an answer.
+  whose kernel image is `ntkrnlmp.exe`.
+
+  The modules that have **unloaded** come back in their own `unloaded` list, narrowed by the same
+  pattern ([win-kexp#101](https://github.com/glslang/win-kexp/pull/101)). `lm` appends them to a
+  filtered listing as readily as to a whole one, so values carrying only the loaded half described
+  a different set from the text above them: `{"filter": "nvhda"}` on this repo's sample matches no
+  loaded module and twenty-six unloaded `nvhda64v.sys` rows, and "nothing matched" printed over
+  twenty-six matching rows is a contradiction rather than an answer. Now it reports them as what
+  they are — *"no loaded module matches `*nvhda*`, but 26 that have since unloaded do"* — which is
+  also the only thing that can name an address in a driver that is no longer there. They are
+  matched and rendered by **image** name, since an unloaded module has no module name at all (there
+  is nothing left to qualify a symbol with), and each row carries the engine's own `unloaded` flag.
 
   Refused before a session is touched: an empty filter, one carrying a `;` that would end the
   command it is interpolated into, and one using the part of WinDbg's wildcard grammar this server

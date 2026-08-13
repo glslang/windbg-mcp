@@ -1319,18 +1319,20 @@ fn registers(e: &DebugEngine, all: bool) -> Result<Output, Failed> {
     ))
 }
 
-/// The header `lm` puts above the images that have since unloaded, which it appends to a filtered
-/// listing as readily as to a whole one.
-const UNLOADED_MODULES: &str = "Unloaded modules:";
-
-/// The loaded modules, as `lm` renders them and as values beside them — optionally narrowed to
-/// the ones whose name matches a pattern.
+/// The modules, as `lm` renders them and as values beside them — optionally narrowed to the ones
+/// whose name matches a pattern.
 ///
 /// **One pattern reaches both channels.** The text comes from `lm m <pattern>` and the values from
 /// this server's own match over the engine's module list, so the pattern is normalised *once*,
 /// here, and the same string is used for each. Normalising per channel — or letting the text use
 /// the caller's spelling and the values a tidied one — is how a listing ends up showing rows its
 /// own count disagrees with.
+///
+/// **Both halves of the engine's list, for the same reason.** `lm` appends the modules that have
+/// since unloaded — to a filtered listing as readily as to a whole one — so values that carried
+/// only the loaded ones described a different set from the text above them. On this repo's sample
+/// a filter of `nvhda` matches no loaded module and twenty-six unloaded ones, which is a listing
+/// this tool used to answer with "nothing matched" printed over the rows that did.
 fn modules(e: &DebugEngine, filter: Option<&str>) -> Result<Output, Failed> {
     let pattern = filter.map(module_pattern);
     let text = match &pattern {
@@ -1338,40 +1340,57 @@ fn modules(e: &DebugEngine, filter: Option<&str>) -> Result<Output, Failed> {
         None => e.execute_command("lm"),
     }
     .map_err(failed)?;
-    let all = e.modules().map_err(failed)?;
-    let matched: Vec<structured::ModuleInfo> = all
-        .iter()
-        .filter(|module| {
-            pattern
-                .as_deref()
-                .is_none_or(|pattern| matches_module_pattern(pattern, &module.name))
-        })
-        .map(structured::ModuleInfo::from)
-        .collect();
+    let loaded = e.modules().map_err(failed)?;
+    // Unloaded modules are best-effort: not every Windows version tracks them, the ones that do
+    // may have nothing to report, and a listing of what *is* loaded must not fail over what is
+    // not. An error here costs the tail and nothing else.
+    let unloaded = e
+        .unloaded_modules()
+        .inspect_err(|why| tracing::debug!("worker: unloaded modules could not be read: {why}"))
+        .unwrap_or_default();
+    let narrow = |modules: &[win_kexp::dbgeng::Module]| -> Vec<structured::ModuleInfo> {
+        modules
+            .iter()
+            .filter(|module| {
+                pattern
+                    .as_deref()
+                    .is_none_or(|pattern| matches_module_pattern(pattern, listed_name(module)))
+            })
+            .map(structured::ModuleInfo::from)
+            .collect()
+    };
+    let (matched, matched_unloaded) = (narrow(&loaded), narrow(&unloaded));
     let text = match &pattern {
         Some(pattern) => format!(
             "{}{}",
             text.trim_end(),
-            // Read off the text rather than asked of the engine, because it is a fact about *this
-            // rendering* — whether the rows the caller is looking at include unloaded ones — and
-            // not a value. Nothing is parsed out of it; the header's presence only picks wording.
-            narrowing_note(
-                pattern,
-                matched.len(),
-                all.len(),
-                text.contains(UNLOADED_MODULES)
-            )
+            narrowing_note(pattern, matched.len(), loaded.len(), matched_unloaded.len())
         ),
         None => text,
     };
     Ok(Output::typed(
         text,
         structured::ModuleList {
-            loaded: all.len(),
+            loaded: loaded.len(),
             filter: pattern,
             modules: matched,
+            unloaded: matched_unloaded,
         },
     ))
+}
+
+/// The name a module is listed under: its own, or — for one that has **unloaded** — its image's.
+///
+/// An unloaded module has no module name at all, because there is nothing left to qualify a
+/// symbol with, and the engine reports it that way (glslang/win-kexp#101). `lm` prints the image
+/// name in that column instead, and `lm m nvhda*` matches those rows, so a filter that tested
+/// only `name` would match nothing the text had shown.
+fn listed_name(module: &win_kexp::dbgeng::Module) -> &str {
+    if module.name.is_empty() {
+        &module.image_name
+    } else {
+        &module.name
+    }
 }
 
 /// What a narrowed listing says about the narrowing, under whatever `lm m` printed.
@@ -1384,26 +1403,35 @@ fn modules(e: &DebugEngine, filter: Option<&str>) -> Result<Output, Failed> {
 /// matches the name symbols are qualified by (`nt`), not the image file (`ntkrnlmp.exe`), which is
 /// measured behaviour — `lm m ntkrnlmp*` finds nothing on a dump whose kernel is `ntkrnlmp.exe`.
 ///
-/// **Unloaded modules.** `lm` — filtered or not — appends the images that have since unloaded, and
-/// `modules[]` carries loaded modules only. On this repo's own sample `lm m nvhda*` prints
-/// twenty-six unloaded `nvhda64v.sys` rows and matches no loaded module, so a note that said only
-/// "no module matches" would be contradicting the rows directly above it. When that section is
-/// there, this says which rows it is talking about.
-fn narrowing_note(pattern: &str, matched: usize, loaded: usize, unloaded_listed: bool) -> String {
-    let unloaded = if unloaded_listed {
-        " The `Unloaded modules:` rows above are images that have since unloaded; `lm` lists \
-         those, and this tool's `modules` values are loaded modules only."
-    } else {
-        ""
-    };
-    if matched == 0 {
-        return format!(
-            "\nNo loaded module name matches `{pattern}`; {loaded} module(s) are loaded. The \
-             pattern matches the name symbols are qualified by — `nt`, not `ntkrnlmp.exe` — with \
-             `*` and `?` as wildcards. Omit `filter` for the whole table.{unloaded}"
-        );
+/// **Which half of the list matched.** A pattern can match only modules that have since unloaded —
+/// `nvhda` on this repo's sample matches twenty-six of them and no loaded module — and that is an
+/// answer rather than a miss, so it is reported as a count of what was found and not as a caveat
+/// about what was not.
+fn narrowing_note(pattern: &str, matched: usize, loaded: usize, unloaded: usize) -> String {
+    // Where the unloaded rows are, said wherever any of them matched: they are in the text under
+    // their own header, and in a field of their own rather than among the loaded modules.
+    const WHERE: &str = "`lm` lists those under `Unloaded modules:` and they are the `unloaded` \
+                         values here, where the addresses say where an image was rather than where \
+                         it is.";
+    match (matched, unloaded) {
+        // Nothing at all. The only branch that offers advice, because it is the only one where the
+        // caller has nothing and may have asked the wrong question.
+        (0, 0) => format!(
+            "\nNothing matches `{pattern}`; {loaded} module(s) are loaded. The pattern matches the \
+             name symbols are qualified by — `nt`, not `ntkrnlmp.exe` — with `*` and `?` as \
+             wildcards. Omit `filter` for the whole table."
+        ),
+        // A find, not a miss: the driver is in this target's history rather than its present.
+        (0, unloaded) => format!(
+            "\nNo *loaded* module matches `{pattern}`, but {unloaded} that have since **unloaded** \
+             do — {WHERE} {loaded} module(s) are loaded."
+        ),
+        (matched, 0) => format!("\n\n{matched} of {loaded} loaded module(s) match `{pattern}`."),
+        (matched, unloaded) => format!(
+            "\n\n{matched} of {loaded} loaded module(s) match `{pattern}`, and {unloaded} that \
+             have since **unloaded** — {WHERE}"
+        ),
     }
-    format!("\n\n{matched} of {loaded} loaded module(s) match `{pattern}`.{unloaded}")
 }
 
 /// Everything a bug check is, gathered as one indivisible job.
@@ -4069,7 +4097,7 @@ mod tests {
     /// modules at all, or from a call that quietly failed.
     #[test]
     fn a_filter_that_matches_nothing_says_so_rather_than_printing_nothing() {
-        let note = narrowing_note("*nosuch*", 0, 227, false);
+        let note = narrowing_note("*nosuch*", 0, 227, 0);
         assert!(note.contains("*nosuch*"), "{note}");
         assert!(
             note.contains("227"),
@@ -4081,30 +4109,43 @@ mod tests {
         );
 
         // And a listing that did match says how much of the table it is showing.
-        let note = narrowing_note("*nt*", 3, 227, false);
+        let note = narrowing_note("*nt*", 3, 227, 0);
         assert!(note.contains("3 of 227"), "{note}");
+        // Nothing unloaded matched, so nothing is said about unloaded modules.
+        assert!(!note.contains("unloaded"), "{note}");
+        assert!(
+            !note.contains("ntkrnlmp.exe"),
+            "a listing that found what it was asked for is not corrected: {note}"
+        );
     }
 
-    /// **The note must not contradict the rows above it.** `lm m nvhda*` on this repo's own sample
-    /// matches no *loaded* module and still prints twenty-six unloaded `nvhda64v.sys` rows, so a
-    /// bare "no module matches" would be denying a listing the caller is looking at. Both branches
-    /// say "loaded", and the one that has unloaded rows above it says whose they are.
+    /// **A pattern that matches only unloaded modules has found something.** `lm m nvhda*` on this
+    /// repo's own sample matches no *loaded* module and twenty-six unloaded `nvhda64v.sys` rows, so
+    /// a bare "no module matches" would be denying the listing the caller is looking at — and,
+    /// since [`win_kexp::dbgeng::DebugEngine::unloaded_modules`], those rows are values here rather
+    /// than text this can only apologise for. The note reports them as a count of what was found.
     #[test]
-    fn a_listing_with_unloaded_rows_says_which_rows_the_values_do_not_carry() {
-        for note in [
-            narrowing_note("*nvhda*", 0, 227, true),
-            narrowing_note("*nt*", 3, 227, true),
-        ] {
-            assert!(
-                note.contains("Unloaded modules:") && note.contains("loaded modules only"),
-                "{note}"
-            );
-        }
-        // Said only where it is true: no such section, no sentence about one.
-        assert!(!narrowing_note("*nt*", 3, 227, false).contains("Unloaded"));
-        // Both branches are about *loaded* modules either way, because that is what is counted.
-        assert!(narrowing_note("*nosuch*", 0, 227, false).contains("No loaded module"));
-        assert!(narrowing_note("*nt*", 3, 227, false).contains("loaded module(s) match"));
+    fn a_pattern_that_matches_only_unloaded_modules_reports_them_as_matches() {
+        let note = narrowing_note("*nvhda*", 0, 227, 26);
+        assert!(
+            note.contains("26 that have since **unloaded** do"),
+            "{note}"
+        );
+        assert!(
+            note.contains("`unloaded` values"),
+            "the reader has to be told which field carries them: {note}"
+        );
+        assert!(
+            !note.contains("ntkrnlmp.exe"),
+            "twenty-six matches is a find; it must not read as a mistake to correct: {note}"
+        );
+
+        // A loaded match and an unloaded one are counted in their own halves.
+        let note = narrowing_note("*nt*", 3, 227, 2);
+        assert!(
+            note.contains("3 of 227 loaded") && note.contains("2 that have since **unloaded**"),
+            "{note}"
+        );
     }
 
     // ---- what an opener says about the target (#105) ------------------------
@@ -4120,7 +4161,37 @@ mod tests {
             checksum: 0,
             symbols: win_kexp::dbgeng::SymbolKind::Deferred,
             user_mode: false,
+            unloaded: false,
         }
+    }
+
+    /// An unloaded module as the engine really reports one: **no module name**, only the image's,
+    /// which the kernel has truncated to twelve characters (glslang/win-kexp#101).
+    fn unloaded_module(image: &str, base: u64) -> win_kexp::dbgeng::Module {
+        win_kexp::dbgeng::Module {
+            name: String::new(),
+            image_name: image.to_string(),
+            symbols: win_kexp::dbgeng::SymbolKind::None,
+            unloaded: true,
+            ..module("", base)
+        }
+    }
+
+    /// A filter has to match an unloaded module by the only name it has.
+    ///
+    /// Testing `name` alone would match nothing for every row in that half of the list — while
+    /// `lm m nvhda*` matches them, since it reads the same image name into the column it prints.
+    #[test]
+    fn an_unloaded_module_is_matched_by_its_image_name() {
+        let gone = unloaded_module("nvhda64v.sys", 0xfffff8033d680000);
+        assert_eq!(listed_name(&gone), "nvhda64v.sys");
+        assert!(matches_module_pattern(
+            &module_pattern("nvhda"),
+            listed_name(&gone)
+        ));
+
+        // A loaded module is still listed by its module name, not its image.
+        assert_eq!(listed_name(&module("nt", 0x1000)), "nt");
     }
 
     fn summary_of(modules: &[win_kexp::dbgeng::Module], kernel: bool) -> structured::TargetSummary {
