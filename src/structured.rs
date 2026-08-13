@@ -494,10 +494,17 @@ impl From<&win_kexp::dbgeng::RegisterValue> for RegisterValue {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ModuleList {
+    /// The modules being listed: every loaded one, or those [`Self::filter`] matched.
     pub modules: Vec<ModuleInfo>,
-    /// How many modules are loaded. Equal to `modules.len()`; carried so a truncated listing
-    /// could never be read as a total.
+    /// How many modules are loaded **in total** — which is the whole point of carrying it: a
+    /// partial listing could otherwise be read as the inventory. Equal to `modules.len()` unless
+    /// a filter narrowed the listing, and `modules.len()` is then how many matched.
     pub loaded: usize,
+    /// The pattern this listing was narrowed by, as it was actually applied rather than as it was
+    /// typed: a `filter` with no wildcards is widened to `*filter*` (see the tool's argument), and
+    /// this is what says so. Absent when nothing was filtered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
 }
 
 /// One loaded module.

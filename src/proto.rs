@@ -99,7 +99,14 @@ pub enum EngineOp {
         all: bool,
     },
     /// The loaded modules, as text (`lm`) *and* as values.
-    Modules,
+    ///
+    /// `filter` is a module-name pattern, already validated as an operand by the supervisor and
+    /// normalised in the worker — where it has to be, because the same normalised pattern must
+    /// reach `lm m` and the typed listing or the two channels would answer different questions.
+    Modules {
+        #[serde(default)]
+        filter: Option<String>,
+    },
     /// Set a breakpoint (`bp <expression>`) and report what the session now holds.
     ///
     /// A command rather than a typed `AddBreakpoint` because `bp`'s syntax is the point: a

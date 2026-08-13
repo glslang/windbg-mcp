@@ -1189,6 +1189,24 @@ pub struct SessionArgs {
     pub session_id: Option<String>,
 }
 
+/// Parameters for `modules`.
+#[derive(Deserialize, JsonSchema)]
+pub struct ModulesArgs {
+    /// List only the modules whose name matches this pattern, instead of the whole table —
+    /// `"MessageManager"` for one driver's load base. Matched against the name symbols are
+    /// qualified by (`nt`, not `ntkrnlmp.exe`), case-insensitively. A plain name matches
+    /// anywhere in a module name, so `"nt"` also finds `ntfs` and `WinNT`. `*` and `?` are
+    /// wildcards and a pattern using them is matched as written, so `"nt*"` is the names that
+    /// *start* with `nt`, and `"*"` is every module.
+    #[serde(default)]
+    pub filter: Option<String>,
+    /// Session handle returned by open_dump/open_trace/attach_*/launch. Optional: omit it
+    /// to act on whatever session is current, or pass it to have the call refuse to run if
+    /// this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 /// Parameters for `registers`.
 #[derive(Deserialize, JsonSchema)]
 pub struct RegistersArgs {
@@ -2810,7 +2828,8 @@ impl WindbgServer {
     /// List loaded modules, as `lm` prints them and as typed values beside it: each module's
     /// name, image name, start/end addresses and **symbol state** — `deferred` (not fetched
     /// yet) is not the same as `none` (this module has no symbols), which the `lm` text
-    /// renders as an easily-missed parenthesis.
+    /// renders as an easily-missed parenthesis. Pass `filter` to ask about one driver rather
+    /// than reading a table of two hundred; the answer still reports how many are loaded.
     #[rmcp::tool(
         annotations(
             title = "List modules",
@@ -2821,10 +2840,34 @@ impl WindbgServer {
     )]
     async fn modules(
         &self,
-        Parameters(args): Parameters<SessionArgs>,
+        Parameters(args): Parameters<ModulesArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        // The filter is interpolated into `lm m <pattern>`, so it is an operand like every other
+        // one this server builds a command around.
+        if let Some(filter) = &args.filter {
+            if let Err(e) = reject_command_breakers("filter", filter, Quotes::Rejected) {
+                return typed_error(ErrorCategory::InvalidArgument, e, args.session_id);
+            }
+            // Refused rather than ignored: a blank filter is a caller who meant to narrow and
+            // sent nothing to narrow by, and answering with the whole table would look like the
+            // filter had been applied and matched everything.
+            if filter.trim().is_empty() {
+                return typed_error(
+                    ErrorCategory::InvalidArgument,
+                    "`filter` is empty. Pass a module name (or a `lm m` pattern) to narrow the \
+                     listing, or omit `filter` for the whole table."
+                        .to_string(),
+                    args.session_id,
+                );
+            }
+        }
         let out = self
-            .run(args.session_id.as_deref(), EngineOp::Modules)
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::Modules {
+                    filter: args.filter,
+                },
+            )
             .await;
         engine_result_for(args.session_id.as_deref(), out)
     }

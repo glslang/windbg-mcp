@@ -491,6 +491,7 @@
         "dialect": "https://json-schema.org/draft/2020-12/schema"
       },
       "params": [
+        "filter: string|null",
         "session_id: string|null"
       ],
       "required": [],

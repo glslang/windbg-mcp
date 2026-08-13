@@ -1652,6 +1652,132 @@ fn an_open_summarises_the_target_instead_of_listing_its_modules() {
     assert!(report.contains("crash_triage"), "{report}");
 }
 
+/// `modules { "filter": … }` answers about one driver without the other two hundred rows — and
+/// its two halves describe the same set of modules.
+///
+/// That last part is the claim worth a real engine. The text comes from `lm m <pattern>` and the
+/// values from this server's own match over the engine's module list, so they are two independent
+/// implementations of one pattern: every row the values report has to be a row the text shows.
+#[test]
+fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
+    let Some(dump) = target_tier() else { return };
+    let mut server = Server::started();
+    let session_id = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+
+    let all = server.tool_data("modules", json!({ "session_id": session_id }), TARGET_STEP);
+    let loaded = all["loaded"].as_u64().unwrap_or_default();
+    assert!(loaded > 20, "the table this narrows is small: {loaded}");
+    assert!(
+        all["filter"].is_null(),
+        "an unfiltered listing reports no filter: {all}"
+    );
+
+    // A bare name is a substring, so this finds `nt` and everything else with `nt` in its name.
+    let response = server.call_tool(
+        "modules",
+        json!({ "session_id": session_id, "filter": "nt" }),
+        TARGET_STEP,
+    );
+    assert_no_error(&response, "modules with a filter");
+    let text = text_of(&response["result"]);
+    let narrowed = response["result"]["structuredContent"].clone();
+    assert_eq!(
+        narrowed["filter"], "*nt*",
+        "the applied pattern is reported as applied, not as typed: {narrowed}"
+    );
+    assert_eq!(
+        narrowed["loaded"].as_u64(),
+        Some(loaded),
+        "a narrowed listing still says how big the inventory is: {narrowed}"
+    );
+    let matched = narrowed["modules"]
+        .as_array()
+        .expect("a filtered listing is still a list");
+    assert!(
+        !matched.is_empty() && (matched.len() as u64) < loaded,
+        "`nt` should match some of the {loaded} modules, not all and not none: {narrowed}"
+    );
+    for module in matched {
+        let name = module["name"].as_str().unwrap_or_default();
+        assert!(
+            name.to_ascii_lowercase().contains("nt"),
+            "`{name}` does not contain the pattern it was matched by: {narrowed}"
+        );
+        // The agreement that matters: `lm m` and this server's own match name the same modules.
+        assert!(
+            text.contains(name),
+            "the values report `{name}` but `lm m *nt*` did not print it:\n{text}"
+        );
+    }
+    assert!(
+        matched.iter().any(|module| module["name"] == "nt"),
+        "the kernel itself matches `nt`: {narrowed}"
+    );
+    assert!(
+        text.contains(&format!("{} of {loaded}", matched.len())),
+        "the text says how much of the table this is:\n{text}"
+    );
+
+    // `*` is the same listing as no filter at all — the wildcard path and the plain path agree.
+    let everything = server.tool_data(
+        "modules",
+        json!({ "session_id": session_id, "filter": "*" }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        everything["modules"].as_array().map_or(0, Vec::len) as u64,
+        loaded,
+        "`*` matches every module: {everything}"
+    );
+
+    // A pattern that matches nothing is not an error, and must not be silence either: `lm m`
+    // prints nothing at all, which reads as a target with no modules.
+    let response = server.call_tool(
+        "modules",
+        json!({ "session_id": session_id, "filter": "nosuchmoduleanywhere" }),
+        TARGET_STEP,
+    );
+    assert_no_error(&response, "modules with a filter that matches nothing");
+    assert!(
+        !is_tool_error(&response),
+        "no match is an answer, not a failure: {response}"
+    );
+    let empty = response["result"]["structuredContent"].clone();
+    assert_eq!(
+        empty["modules"].as_array().map(Vec::len),
+        Some(0),
+        "{empty}"
+    );
+    assert_eq!(empty["loaded"].as_u64(), Some(loaded), "{empty}");
+    let text = text_of(&response["result"]);
+    assert!(
+        text.contains("*nosuchmoduleanywhere*") && text.contains("No module name matches"),
+        "a listing that found nothing has to say so:\n{text}"
+    );
+
+    // Two refusals, both before the engine is touched: a filter that narrows by nothing, and one
+    // that would end the `lm m` it is interpolated into.
+    let blank = server.tool_failure(
+        "modules",
+        json!({ "session_id": session_id, "filter": "  " }),
+        TARGET_STEP,
+    );
+    assert_eq!(blank["error"]["category"], "invalid_argument", "{blank}");
+    let injected = server.tool_failure(
+        "modules",
+        json!({ "session_id": session_id, "filter": "nt; .detach" }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        injected["error"]["category"], "invalid_argument",
+        "{injected}"
+    );
+
+    // The session is still the dump it was — the refused call reached nothing.
+    let after = server.tool_data("modules", json!({ "session_id": session_id }), TARGET_STEP);
+    assert_eq!(after["loaded"].as_u64(), Some(loaded), "{after}");
+}
+
 /// An address that is unmapped on **any** Windows target, so a hole needs no knowledge of this
 /// particular dump.
 ///
