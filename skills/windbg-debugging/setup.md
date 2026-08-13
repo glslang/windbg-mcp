@@ -29,10 +29,10 @@ A package-manager install lands outside the plugin layout in the same way:
 > [`gitfool/scoop-dungeon`](https://github.com/gitfool/scoop-dungeon) bucket? That also skips
 > Options A/B — point the client at
 > `%USERPROFILE%\scoop\apps\windbg-mcp\current\windbg-mcp.exe` rather than the plugin path. Its
-> `post_install` does most of the **engine bundling below** — the DLLs plus `ttd\` and `winext\`,
-> copied from the `Microsoft.WinDbg` store package on the machine, when one is installed. It does
-> **not** copy `winxp\kdexts.dll`, so run that last pair of lines by hand if the kernel driver
-> tools are in play; check the directory for `dbgeng.dll` before repeating the rest.
+> `post_install` does the **engine bundling below** — the DLLs plus `ttd\`, `winext\` and `winxp\`,
+> copied from the `Microsoft.WinDbg` store package on the machine, when one is installed. Check the
+> directory for `dbgeng.dll` before repeating any of it; if it is missing, WinDbg wasn't installed
+> when Scoop was, and the copy below (or `scoop update --force windbg-mcp`) is still needed.
 >
 > **Never run `scoop install` on the user's behalf.** That bucket is community-maintained, outside
 > this project's control, and a Scoop manifest is code: `post_install` is arbitrary PowerShell, run

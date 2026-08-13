@@ -13,10 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [`gitfool/scoop-dungeon`](https://github.com/gitfool/scoop-dungeon) bucket
   ([#109](https://github.com/glslang/windbg-mcp/issues/109)), whose `post_install` also does the
   engine bundling — copying from the machine's own `Microsoft.WinDbg` store package, when one is
-  installed — so `scoop install` covers most of the manual setup this README otherwise walks
-  through. Nothing about that path redistributes Microsoft's engine. Includes the client config to
-  use (the version-independent `current` junction), the disconnect-before-`scoop update` caveat
-  (a connected client holds the binary open), and the one file `post_install` leaves out.
+  installed — so `scoop install` covers the manual setup this README otherwise walks through.
+  Nothing about that path redistributes Microsoft's engine. Includes the client config to use (the
+  version-independent `current` junction), the disconnect-before-`scoop update` caveat (a connected
+  client holds the binary open), and how to bundle after the fact if WinDbg arrives later.
   Documented with the trust boundary stated: the bucket is community-maintained and unaudited by
   this project, and a manifest is code — `post_install` is arbitrary PowerShell over a URL and hash
   that autoupdate rewrites — so the skill's `setup.md` tells an agent never to run `scoop install`
