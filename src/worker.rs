@@ -56,7 +56,7 @@ use crate::server::{
     parse_windbg_addr, path_recipe, reachability,
 };
 use crate::structured;
-use crate::triage::{self, Analysis, AttributedFrame};
+use crate::triage::{self, Analysis, AttributedFrame, Attribution};
 
 /// The argument that turns this executable into a worker. Not a documented CLI: the supervisor
 /// re-executes itself with it, and nothing else should.
@@ -1381,6 +1381,17 @@ fn crash_triage(
         Analysis::NotRequested
     };
 
+    // **An interrupt stops here, before the reads rather than after them.** They are unbounded,
+    // so starting them now would mean the caller who just asked this call to stop waits for a
+    // stack walk that can block on a symbol server — which is the one thing `interrupt` exists to
+    // prevent. What has already been read (the bug check, and whatever `!analyze` printed) still
+    // comes back; the report says the walk was abandoned rather than empty, because "found
+    // nothing" would be a claim about the crash and this is a claim about the call.
+    if analysis.interrupted() {
+        let report = triage::report(bug_check, &triage::Walk::Abandoned, None, analysis);
+        return Ok(Output::typed(triage::render(&report), report));
+    }
+
     // Best-effort from here on. A stack walk that fails leaves no frames, which the report renders
     // as "no faulting frame" with the reason — strictly more than a failed call would say.
     //
@@ -1401,16 +1412,21 @@ fn crash_triage(
     let attributed: Vec<AttributedFrame> = walked
         .into_iter()
         .map(|frame| AttributedFrame {
-            // A lookup that *failed* is folded into "no module", unlike in win-kexp where the two
-            // are kept apart: here the frame's address is reported either way, and failing a whole
-            // triage because one frame could not be attributed would cost far more than it saves.
-            module: e.module_at(frame.instruction_offset).unwrap_or_else(|why| {
-                tracing::debug!(
-                    "worker: crash triage could not attribute frame {}: {why}",
-                    frame.index
-                );
-                None
-            }),
+            // The three answers are kept apart rather than collapsed into "no module". A lookup
+            // that *failed* says nothing about where the address is, and treating it as "in no
+            // module" would let it be blamed as the culprit — pre-empting the real driver frame
+            // below it on the strength of the engine having declined to answer.
+            module: match e.module_at(frame.instruction_offset) {
+                Ok(Some(module)) => Attribution::In(module),
+                Ok(None) => Attribution::NoModule,
+                Err(why) => {
+                    tracing::debug!(
+                        "worker: crash triage could not attribute frame {}: {why}",
+                        frame.index
+                    );
+                    Attribution::Unknown
+                }
+            },
             frame,
         })
         .collect();
@@ -1419,7 +1435,11 @@ fn crash_triage(
         .ok()
         .filter(|name| !name.trim().is_empty());
 
-    let report = triage::report(bug_check, &attributed, truncated, process_name, analysis);
+    let walk = triage::Walk::Done {
+        frames: attributed,
+        truncated,
+    };
+    let report = triage::report(bug_check, &walk, process_name, analysis);
     Ok(Output::typed(triage::render(&report), report))
 }
 

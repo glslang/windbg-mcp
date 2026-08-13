@@ -47,9 +47,39 @@ use crate::structured;
 /// Paired here rather than inside win-kexp's own frame because "which module holds this address"
 /// is a second question asked of the engine, and a stack walk that answers only the first is
 /// still a good stack walk.
+#[derive(Clone)]
 pub struct AttributedFrame {
     pub frame: StackFrame,
-    pub module: Option<Module>,
+    pub module: Attribution,
+}
+
+/// What the engine could say about which module holds a frame's address.
+///
+/// **Three states, not two, and the third is the one an `Option` loses.** "The engine established
+/// that no loaded module holds this address" and "the lookup failed, so nothing is known" are
+/// opposite facts that both arrive as an absent module — and they want opposite treatment when
+/// picking a culprit. The first is a *positive* finding, and one a driver bug produces constantly:
+/// a freed pool page, an unloaded driver, a corrupted return address. The second is an absence of
+/// information, and blaming a frame on it would let one failed lookup pre-empt the real driver
+/// frame further down the stack.
+#[derive(Clone)]
+pub enum Attribution {
+    /// The engine named the module holding the address.
+    In(Module),
+    /// The engine established that no loaded module holds it.
+    NoModule,
+    /// The lookup itself failed; whether a module holds it is unknown.
+    Unknown,
+}
+
+impl Attribution {
+    /// The module, where there is one — for the fields that only care whether it can be named.
+    fn module(&self) -> Option<&Module> {
+        match self {
+            Self::In(module) if !module.name.is_empty() => Some(module),
+            _ => None,
+        }
+    }
 }
 
 /// The modules a bug check passes *through* on its way to being one.
@@ -101,15 +131,22 @@ fn is_pass_through(name: &str) -> bool {
 /// faulting *driver* — which is not a thing a `.exe` can be. The engine has already answered this
 /// question (`Module::user_mode`), so it is asked rather than inferred from the address.
 ///
-/// **An address in no module at all is a candidate**, deliberately. That is what a freed pool page,
-/// an unloaded driver or a corrupted return address looks like, and all three are exactly what a
-/// driver bug leaves behind; none of them is ever the bug check machinery.
+/// **An address the engine placed in no module is a candidate**, deliberately. That is what a freed
+/// pool page, an unloaded driver or a corrupted return address looks like, and all three are
+/// exactly what a driver bug leaves behind; none of them is ever the bug check machinery.
+///
+/// **An address whose lookup *failed* is not**, and the difference is the whole reason
+/// [`Attribution`] has three states. A failure says nothing about where the address is, so blaming
+/// it would let one unreadable frame pre-empt the genuine driver frame below it — reporting a
+/// culprit on the strength of the engine having declined to answer.
 fn is_candidate_culprit(frame: &AttributedFrame) -> bool {
     match &frame.module {
-        Some(module) if module.user_mode => false,
-        Some(module) if !module.name.is_empty() => !is_pass_through(&module.name),
-        // No module, or one the engine could not name: unattributed, and a candidate.
-        _ => true,
+        Attribution::In(module) if module.user_mode => false,
+        Attribution::In(module) if !module.name.is_empty() => !is_pass_through(&module.name),
+        // Named as being in no module — or in a module the engine could not name, which is the
+        // same absence of a name to judge and the same positive finding about the address.
+        Attribution::In(_) | Attribution::NoModule => true,
+        Attribution::Unknown => false,
     }
 }
 
@@ -123,6 +160,31 @@ fn offset(value: u64) -> String {
     format!("{value:#x}")
 }
 
+/// The stack walk, or the reason there isn't one.
+///
+/// A state rather than an empty `Vec`, because "the walk found nothing" and "the walk was never
+/// attempted" are different answers and the second is not a fact about the crash. It also makes
+/// `truncated` unrepresentable where it would be meaningless.
+pub enum Walk {
+    /// It ran. `truncated` says whether the stack went on past the caller's cap.
+    Done {
+        frames: Vec<AttributedFrame>,
+        truncated: bool,
+    },
+    /// It was not attempted: the call was interrupted before the reads began, so nothing was
+    /// started that the caller had just asked to stop.
+    Abandoned,
+}
+
+impl Walk {
+    fn frames(&self) -> &[AttributedFrame] {
+        match self {
+            Self::Done { frames, .. } => frames,
+            Self::Abandoned => &[],
+        }
+    }
+}
+
 /// Assembles the report from values already read off the engine.
 ///
 /// Takes values rather than an engine so the whole shape of the answer — which frame is the
@@ -130,22 +192,34 @@ fn offset(value: u64) -> String {
 /// engine's — is testable without a debugger.
 pub fn report(
     bug_check: BugCheck,
-    attributed: &[AttributedFrame],
-    truncated: bool,
+    walk: &Walk,
     process_name: Option<String>,
     analysis: Analysis,
 ) -> structured::CrashTriage {
     let extracted = analysis.extracted();
+    let attributed = walk.frames();
+    let truncated = matches!(
+        walk,
+        Walk::Done {
+            truncated: true,
+            ..
+        }
+    );
     let frames: Vec<structured::FrameInfo> = attributed.iter().map(frame_info).collect();
 
     // The candidate is chosen over the *attributed* frames rather than the rendered ones, because
-    // the choice needs `Module::user_mode`, which the rendering has no field for and drops.
+    // the choice needs `Module::user_mode` and the failed-lookup state, neither of which the
+    // rendering has a field for.
     let faulting = attributed
         .iter()
         .position(is_candidate_culprit)
         .and_then(|index| frames.get(index).cloned());
     let faulting_note = match (&faulting, frames.first()) {
         (Some(_), _) => None,
+        (None, None) if matches!(walk, Walk::Abandoned) => Some(
+            "the stack was not walked: this call was interrupted, so the reads after the analysis              were abandoned rather than started. Nothing here is a finding about the crash —              triage again without interrupting."
+                .to_string(),
+        ),
         (None, None) => Some(
             "the stack walk returned no frames, so there is no faulting frame to name".to_string(),
         ),
@@ -196,10 +270,7 @@ pub fn report(
 
 fn frame_info(attributed: &AttributedFrame) -> structured::FrameInfo {
     let address = attributed.frame.instruction_offset;
-    let module = attributed
-        .module
-        .as_ref()
-        .filter(|module| !module.name.is_empty());
+    let module = attributed.module.module();
     let symbol = resolved_symbol(&attributed.frame);
     structured::FrameInfo {
         index: attributed.frame.index,
@@ -269,6 +340,22 @@ pub enum Analysis {
 }
 
 impl Analysis {
+    /// Whether a caller asked for this call to stop.
+    ///
+    /// The one state that must not be followed by more unbounded work: an `interrupt` is a request
+    /// to give back the session, and the reads after the analysis are exactly what would hold it.
+    /// A *deadline* is deliberately not this — that one has a budget which the reads are already
+    /// reserved out of, and abandoning them would throw away an answer nobody asked to abandon.
+    pub fn interrupted(&self) -> bool {
+        matches!(
+            self,
+            Self::Truncated {
+                on_request: true,
+                ..
+            }
+        )
+    }
+
     fn extracted(&self) -> structured::AnalysisInfo {
         match self {
             Self::NotRequested => structured::AnalysisInfo {
@@ -702,19 +789,19 @@ mod tests {
         vec![
             AttributedFrame {
                 frame: frame(0, NT_BASE + 0x1000, Some("nt!KeBugCheckEx"), 0),
-                module: Some(module("nt", NT_BASE)),
+                module: Attribution::In(module("nt", NT_BASE)),
             },
             AttributedFrame {
                 frame: frame(1, NT_BASE + 0x2040, Some("nt!RtlpHpVsContextFree"), 0x40),
-                module: Some(module("nt", NT_BASE)),
+                module: Attribution::In(module("nt", NT_BASE)),
             },
             AttributedFrame {
                 frame: frame(2, NT_BASE + 0x3010, Some("nt!ExFreePoolWithTag"), 0x10),
-                module: Some(module("nt", NT_BASE)),
+                module: Attribution::In(module("nt", NT_BASE)),
             },
             AttributedFrame {
                 frame: frame(3, DRIVER_BASE + 0x1654, None, 0),
-                module: Some(module("MessageManager", DRIVER_BASE)),
+                module: Attribution::In(module("MessageManager", DRIVER_BASE)),
             },
         ]
     }
@@ -728,8 +815,10 @@ mod tests {
                 code: 0x13A,
                 parameters: [0x11, 0xdead, 0xbeef, 0],
             },
-            &heap_corruption_frames(),
-            false,
+            &Walk::Done {
+                frames: heap_corruption_frames(),
+                truncated: false,
+            },
             Some("mm_exploit.exe".into()),
             Analysis::NotRequested,
         );
@@ -761,15 +850,17 @@ mod tests {
         let at = |base: u64, offset: u64| {
             let frames = vec![AttributedFrame {
                 frame: frame(0, base + offset, None, 0),
-                module: Some(module("MessageManager", base)),
+                module: Attribution::In(module("MessageManager", base)),
             }];
             report(
                 BugCheck {
                     code: 0x13A,
                     parameters: [0; 4],
                 },
-                &frames,
-                false,
+                &Walk::Done {
+                    frames,
+                    truncated: false,
+                },
                 None,
                 Analysis::NotRequested,
             )
@@ -791,11 +882,11 @@ mod tests {
         let frames = vec![
             AttributedFrame {
                 frame: frame(0, NT_BASE + 0x1000, Some("nt!KeBugCheckEx"), 0),
-                module: Some(module("nt", NT_BASE)),
+                module: Attribution::In(module("nt", NT_BASE)),
             },
             AttributedFrame {
                 frame: frame(1, NT_BASE + 0x2000, Some("nt!KiPageFault"), 0),
-                module: Some(module("HAL", NT_BASE)),
+                module: Attribution::In(module("HAL", NT_BASE)),
             },
         ];
         let triage = report(
@@ -803,8 +894,10 @@ mod tests {
                 code: 0x1A,
                 parameters: [0; 4],
             },
-            &frames,
-            false,
+            &Walk::Done {
+                frames,
+                truncated: false,
+            },
             None,
             Analysis::NotRequested,
         );
@@ -825,15 +918,17 @@ mod tests {
             // What DbgEng really returns for `MessageManager+0x1654` with no PDB: name
             // `MessageManager`, displacement `0x1654`.
             frame: frame(0, DRIVER_BASE + 0x1654, Some("MessageManager"), 0x1654),
-            module: Some(module("MessageManager", DRIVER_BASE)),
+            module: Attribution::In(module("MessageManager", DRIVER_BASE)),
         }];
         let triage = report(
             BugCheck {
                 code: 0x13A,
                 parameters: [0; 4],
             },
-            &frames,
-            false,
+            &Walk::Done {
+                frames,
+                truncated: false,
+            },
             None,
             Analysis::NotRequested,
         );
@@ -854,11 +949,13 @@ mod tests {
                 code: 0x13A,
                 parameters: [0; 4],
             },
-            &[AttributedFrame {
-                frame: frame(0, NT_BASE + 0x1000, Some("nt!ExFreePoolWithTag"), 0x10),
-                module: Some(module("nt", NT_BASE)),
-            }],
-            false,
+            &Walk::Done {
+                frames: vec![AttributedFrame {
+                    frame: frame(0, NT_BASE + 0x1000, Some("nt!ExFreePoolWithTag"), 0x10),
+                    module: Attribution::In(module("nt", NT_BASE)),
+                }],
+                truncated: false,
+            },
             None,
             Analysis::NotRequested,
         );
@@ -876,15 +973,15 @@ mod tests {
         let frames = vec![
             AttributedFrame {
                 frame: frame(0, NT_BASE + 0x1000, Some("nt!KeBugCheckEx"), 0),
-                module: Some(module("nt", NT_BASE)),
+                module: Attribution::In(module("nt", NT_BASE)),
             },
             AttributedFrame {
                 frame: frame(1, WDF_BASE + 0x2000, Some("Wdf01000!FxRequest"), 0x20),
-                module: Some(module("Wdf01000", WDF_BASE)),
+                module: Attribution::In(module("Wdf01000", WDF_BASE)),
             },
             AttributedFrame {
                 frame: frame(2, DRIVER_BASE + 0x1654, None, 0),
-                module: Some(module("MyDriver", DRIVER_BASE)),
+                module: Attribution::In(module("MyDriver", DRIVER_BASE)),
             },
         ];
         let triage = report(
@@ -892,8 +989,10 @@ mod tests {
                 code: 0xC4,
                 parameters: [0; 4],
             },
-            &frames,
-            false,
+            &Walk::Done {
+                frames,
+                truncated: false,
+            },
             None,
             Analysis::NotRequested,
         );
@@ -916,11 +1015,11 @@ mod tests {
         let across_the_boundary = vec![
             AttributedFrame {
                 frame: frame(0, NT_BASE + 0x1000, Some("nt!KeBugCheckEx"), 0),
-                module: Some(module("nt", NT_BASE)),
+                module: Attribution::In(module("nt", NT_BASE)),
             },
             AttributedFrame {
                 frame: frame(1, NT_BASE + 0x2000, Some("nt!NtDeviceIoControlFile"), 0x5e),
-                module: Some(module("nt", NT_BASE)),
+                module: Attribution::In(module("nt", NT_BASE)),
             },
             AttributedFrame {
                 frame: frame(
@@ -929,11 +1028,11 @@ mod tests {
                     Some("ntdll!NtDeviceIoControlFile"),
                     0x14,
                 ),
-                module: Some(user_module("ntdll", NTDLL_BASE)),
+                module: Attribution::In(user_module("ntdll", NTDLL_BASE)),
             },
             AttributedFrame {
                 frame: frame(3, EXE_BASE + 0x1200, None, 0),
-                module: Some(user_module("mm_exploit", EXE_BASE)),
+                module: Attribution::In(user_module("mm_exploit", EXE_BASE)),
             },
         ];
         let triage = report(
@@ -941,8 +1040,10 @@ mod tests {
                 code: 0x13A,
                 parameters: [0; 4],
             },
-            &across_the_boundary,
-            false,
+            &Walk::Done {
+                frames: across_the_boundary.clone(),
+                truncated: false,
+            },
             Some("mm_exploit.exe".into()),
             Analysis::NotRequested,
         );
@@ -964,7 +1065,7 @@ mod tests {
             2,
             AttributedFrame {
                 frame: frame(2, DRIVER_BASE + 0x1654, None, 0),
-                module: Some(module("MessageManager", DRIVER_BASE)),
+                module: Attribution::In(module("MessageManager", DRIVER_BASE)),
             },
         );
         let found = report(
@@ -972,8 +1073,10 @@ mod tests {
                 code: 0x13A,
                 parameters: [0; 4],
             },
-            &with_driver,
-            false,
+            &Walk::Done {
+                frames: with_driver,
+                truncated: false,
+            },
             None,
             Analysis::NotRequested,
         );
@@ -992,6 +1095,92 @@ mod tests {
         );
     }
 
+    /// "The engine says no module holds this" and "the lookup failed" both arrive without a
+    /// module, and they are opposite facts. The first is a finding a driver bug produces
+    /// constantly; the second is an absence of information, and blaming it would let one
+    /// unreadable frame pre-empt the real driver frame below it.
+    #[test]
+    fn a_failed_lookup_is_not_evidence_that_a_frame_is_the_culprit() {
+        let stack = |first: Attribution| {
+            report(
+                BugCheck {
+                    code: 0x13A,
+                    parameters: [0; 4],
+                },
+                &Walk::Done {
+                    frames: vec![
+                        AttributedFrame {
+                            frame: frame(0, NT_BASE + 0x1000, Some("nt!KeBugCheckEx"), 0),
+                            module: Attribution::In(module("nt", NT_BASE)),
+                        },
+                        AttributedFrame {
+                            frame: frame(1, 0xffffc000_12340000, None, 0),
+                            module: first,
+                        },
+                        AttributedFrame {
+                            frame: frame(2, DRIVER_BASE + 0x1654, None, 0),
+                            module: Attribution::In(module("MessageManager", DRIVER_BASE)),
+                        },
+                    ],
+                    truncated: false,
+                },
+                None,
+                Analysis::NotRequested,
+            )
+            .faulting_frame
+            .expect("a candidate")
+        };
+        // Established as being in no module: a freed page or an unloaded driver, and the culprit.
+        assert_eq!(stack(Attribution::NoModule).index, 1);
+        // The lookup failed: nothing is known about frame 1, so the driver below it is the answer
+        // — and it is still reported with its own RVA, not with frame 1's address.
+        let past_the_failure = stack(Attribution::Unknown);
+        assert_eq!(past_the_failure.index, 2);
+        assert_eq!(past_the_failure.module.as_deref(), Some("MessageManager"));
+        assert_eq!(past_the_failure.rva.as_deref(), Some("0x1654"));
+    }
+
+    /// An `interrupt` has to stop the *reads*, not just the retry. They are unbounded, so starting
+    /// them after the caller asked to stop is the one thing `interrupt` exists to prevent.
+    #[test]
+    fn an_interrupted_triage_reports_what_it_had_and_says_the_walk_was_abandoned() {
+        let triage = report(
+            BugCheck {
+                code: 0x13A,
+                parameters: [0x11, 0, 0, 0],
+            },
+            &Walk::Abandoned,
+            None,
+            Analysis::Truncated {
+                command: "!analyze -v".into(),
+                output: "KERNEL_MODE_HEAP_CORRUPTION (13a)\nFREED_POOL_TAG:  Tfub\n".into(),
+                on_request: true,
+            },
+        );
+        // What had already been read still comes back.
+        assert_eq!(triage.bug_check.code, "0x13a");
+        assert_eq!(triage.bug_check.parameters[0], "0x0000000000000011");
+        assert_eq!(triage.analysis.pool_tag.as_deref(), Some("Tfub"));
+        // And the absence of a stack is described as the call being stopped, not as a finding
+        // about the crash — "the walk found nothing" would be a claim this call never tested.
+        assert!(triage.frames.is_empty());
+        assert!(!triage.frames_truncated);
+        let note = triage.faulting_frame_note.expect("a reason");
+        assert!(note.contains("interrupted"), "{note}");
+        assert!(!note.contains("returned no frames"), "{note}");
+
+        // A *deadline*-truncated analysis is not this: its reads are already reserved for, so they
+        // run and the report is a whole one.
+        assert!(
+            !Analysis::Truncated {
+                command: "!analyze -v".into(),
+                output: String::new(),
+                on_request: false,
+            }
+            .interrupted()
+        );
+    }
+
     /// An address in no loaded module — a freed page, an unloaded driver — is a culprit, not a
     /// kernel frame to skip past.
     #[test]
@@ -999,11 +1188,11 @@ mod tests {
         let frames = vec![
             AttributedFrame {
                 frame: frame(0, NT_BASE + 0x1000, Some("nt!KeBugCheckEx"), 0),
-                module: Some(module("nt", NT_BASE)),
+                module: Attribution::In(module("nt", NT_BASE)),
             },
             AttributedFrame {
                 frame: frame(1, 0xffffc000_12340000, None, 0),
-                module: None,
+                module: Attribution::NoModule,
             },
         ];
         let triage = report(
@@ -1011,8 +1200,10 @@ mod tests {
                 code: 0xFC,
                 parameters: [0; 4],
             },
-            &frames,
-            false,
+            &Walk::Done {
+                frames,
+                truncated: false,
+            },
             None,
             Analysis::NotRequested,
         );
@@ -1125,8 +1316,10 @@ FAILURE_BUCKET_ID:  0x9F_3
                     code: 0x13A,
                     parameters: [0; 4],
                 },
-                &heap_corruption_frames(),
-                false,
+                &Walk::Done {
+                    frames: heap_corruption_frames(),
+                    truncated: false,
+                },
                 None,
                 analysis,
             )
@@ -1168,8 +1361,10 @@ FAILURE_BUCKET_ID:  0x9F_3
                 code: 0x1F0,
                 parameters: [0; 4],
             },
-            &[],
-            false,
+            &Walk::Done {
+                frames: Vec::new(),
+                truncated: false,
+            },
             None,
             Analysis::Ran {
                 command: "!analyze -v".into(),
@@ -1195,8 +1390,10 @@ FAILURE_BUCKET_ID:  0x9F_3
                 code: 0x9F,
                 parameters: [0; 4],
             },
-            &[],
-            false,
+            &Walk::Done {
+                frames: Vec::new(),
+                truncated: false,
+            },
             None,
             Analysis::Ran {
                 command: "!ext.analyze -v".into(),
@@ -1218,8 +1415,10 @@ FAILURE_BUCKET_ID:  0x9F_3
                 code: 0x13A,
                 parameters: [0; 4],
             },
-            &heap_corruption_frames(),
-            false,
+            &Walk::Done {
+                frames: heap_corruption_frames(),
+                truncated: false,
+            },
             Some("mm_exploit.exe".into()),
             Analysis::NotRequested,
         );
@@ -1248,8 +1447,10 @@ FAILURE_BUCKET_ID:  0x9F_3
                 code: 0x13A,
                 parameters: [0x11, 0, 0, 0],
             },
-            &heap_corruption_frames(),
-            false,
+            &Walk::Done {
+                frames: heap_corruption_frames(),
+                truncated: false,
+            },
             Some("mm_exploit.exe".into()),
             Analysis::Ran {
                 command: "!ext.analyze -v".into(),
@@ -1287,15 +1488,17 @@ FAILURE_BUCKET_ID:  0x9F_3
     fn a_truncated_walk_says_the_answer_may_be_the_caps_fault() {
         let all_kernel = vec![AttributedFrame {
             frame: frame(0, NT_BASE + 0x1000, Some("nt!KeBugCheckEx"), 0),
-            module: Some(module("nt", NT_BASE)),
+            module: Attribution::In(module("nt", NT_BASE)),
         }];
         let stopped_short = report(
             BugCheck {
                 code: 0x1A,
                 parameters: [0; 4],
             },
-            &all_kernel,
-            true,
+            &Walk::Done {
+                frames: all_kernel.clone(),
+                truncated: true,
+            },
             None,
             Analysis::NotRequested,
         );
@@ -1310,8 +1513,10 @@ FAILURE_BUCKET_ID:  0x9F_3
                 code: 0x1A,
                 parameters: [0; 4],
             },
-            &all_kernel,
-            false,
+            &Walk::Done {
+                frames: all_kernel.clone(),
+                truncated: false,
+            },
             None,
             Analysis::NotRequested,
         );
@@ -1333,8 +1538,10 @@ FAILURE_BUCKET_ID:  0x9F_3
                 code: 0x13A,
                 parameters: [0; 4],
             },
-            &heap_corruption_frames(),
-            false,
+            &Walk::Done {
+                frames: heap_corruption_frames(),
+                truncated: false,
+            },
             None,
             Analysis::NotRequested,
         );
@@ -1355,8 +1562,10 @@ FAILURE_BUCKET_ID:  0x9F_3
                     code: 0x13A,
                     parameters: [0; 4],
                 },
-                &heap_corruption_frames(),
-                false,
+                &Walk::Done {
+                    frames: heap_corruption_frames(),
+                    truncated: false,
+                },
                 None,
                 Analysis::Ran {
                     command: "!analyze -v".into(),
@@ -1378,15 +1587,17 @@ FAILURE_BUCKET_ID:  0x9F_3
     fn the_text_reports_the_lone_attribution_when_no_frame_was_named() {
         let all_kernel = vec![AttributedFrame {
             frame: frame(0, NT_BASE + 0x1000, Some("nt!KeBugCheckEx"), 0),
-            module: Some(module("nt", NT_BASE)),
+            module: Attribution::In(module("nt", NT_BASE)),
         }];
         let triage = report(
             BugCheck {
                 code: 0x9F,
                 parameters: [0; 4],
             },
-            &all_kernel,
-            false,
+            &Walk::Done {
+                frames: all_kernel.clone(),
+                truncated: false,
+            },
             None,
             Analysis::Ran {
                 command: "!analyze -v".into(),
