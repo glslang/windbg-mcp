@@ -30,9 +30,9 @@
 //! where it is loaded, and the offset falls out. That number is as good as the dump, and it is the
 //! one that survives a driver with no PDB and stays comparable across reboots.
 //!
-//! Which of those frames is the *culprit* is a **heuristic** — the innermost one outside the bug
-//! check machinery and the framework layers ([`KERNEL_IMAGES`]) — and it is positional, so a stack
-//! running through a layer this build does not recognise names that layer. `faulting_frame` is
+//! Which of those frames is the *culprit* is a **heuristic** — the innermost one that could be a
+//! kernel driver at all ([`is_candidate_culprit`]) — and it is positional, so a stack running
+//! through a layer this build does not recognise names that layer. `faulting_frame` is
 //! therefore a first guess to check against `frames`, not a verdict, and the rendering says so
 //! rather than telling a caller to prefer it over `!analyze` outright. That distinction was worth
 //! getting right: the two are wrong in different ways, and a caller who knows which is which can
@@ -89,6 +89,30 @@ fn is_pass_through(name: &str) -> bool {
         .any(|known| known.eq_ignore_ascii_case(name))
 }
 
+/// Whether this frame could be the driver a *kernel* bug check is about.
+///
+/// Three ways to be ruled out, and the third is the one that is easy to miss.
+///
+/// **A pass-through image** is the bug check's own path ([`KERNEL_IMAGES`]).
+///
+/// **A user-mode image cannot be a kernel driver.** A kernel stack that unwinds past the system
+/// call boundary keeps going into `ntdll` and the caller's own executable, and if every kernel
+/// frame above happened to be `nt`/HAL, the first of those would be picked and reported as the
+/// faulting *driver* — which is not a thing a `.exe` can be. The engine has already answered this
+/// question (`Module::user_mode`), so it is asked rather than inferred from the address.
+///
+/// **An address in no module at all is a candidate**, deliberately. That is what a freed pool page,
+/// an unloaded driver or a corrupted return address looks like, and all three are exactly what a
+/// driver bug leaves behind; none of them is ever the bug check machinery.
+fn is_candidate_culprit(frame: &AttributedFrame) -> bool {
+    match &frame.module {
+        Some(module) if module.user_mode => false,
+        Some(module) if !module.name.is_empty() => !is_pass_through(&module.name),
+        // No module, or one the engine could not name: unattributed, and a candidate.
+        _ => true,
+    }
+}
+
 /// Renders an offset within a module: `0x`-prefixed, lowercase, **unpadded**.
 ///
 /// Deliberately not [`structured::addr`]. That form exists so addresses sort lexically and
@@ -106,37 +130,29 @@ fn offset(value: u64) -> String {
 /// engine's — is testable without a debugger.
 pub fn report(
     bug_check: BugCheck,
-    frames: &[AttributedFrame],
+    attributed: &[AttributedFrame],
     truncated: bool,
     process_name: Option<String>,
     analysis: Analysis,
 ) -> structured::CrashTriage {
     let extracted = analysis.extracted();
-    let frames: Vec<structured::FrameInfo> = frames.iter().map(frame_info).collect();
+    let frames: Vec<structured::FrameInfo> = attributed.iter().map(frame_info).collect();
 
-    // The topmost frame outside the bug check machinery and the pass-through layers. A frame whose
-    // module is unknown counts as outside: an address in no loaded module is exactly the kind of
-    // thing a driver bug produces (a freed pool page, an unloaded driver), and it is never the bug
-    // check machinery.
-    let faulting = frames
+    // The candidate is chosen over the *attributed* frames rather than the rendered ones, because
+    // the choice needs `Module::user_mode`, which the rendering has no field for and drops.
+    let faulting = attributed
         .iter()
-        .find(|frame| {
-            frame
-                .module
-                .as_deref()
-                .is_none_or(|name| !is_pass_through(name))
-        })
-        .cloned();
+        .position(is_candidate_culprit)
+        .and_then(|index| frames.get(index).cloned());
     let faulting_note = match (&faulting, frames.first()) {
         (Some(_), _) => None,
         (None, None) => Some(
             "the stack walk returned no frames, so there is no faulting frame to name".to_string(),
         ),
         (None, Some(top)) => Some(format!(
-            "every one of the {} captured frames is in the kernel image, the HAL or a \
-             pass-through layer, so no driver frame can be named: the bug check is either in the \
-             kernel's own path or the stack did not reach the culprit. The innermost frame is \
-             {}.{}",
+            "none of the {} captured frames can be the driver — each is in the kernel image, the \
+             HAL, a pass-through layer, or user mode — so the bug check is either in the kernel's \
+             own path or the stack did not reach the culprit. The innermost frame is {}.{}",
             frames.len(),
             top.symbol
                 .clone()
@@ -668,6 +684,15 @@ mod tests {
         }
     }
 
+    /// A user-mode module, as a kernel target reports one: the same record with the flag set.
+    fn user_module(name: &str, base: u64) -> Module {
+        Module {
+            image_name: format!("{name}.dll"),
+            user_mode: true,
+            ..module(name, base)
+        }
+    }
+
     const NT_BASE: u64 = 0xfffff803_1a000000;
     const DRIVER_BASE: u64 = 0xfffff803_2b000000;
 
@@ -879,6 +904,92 @@ mod tests {
         assert_eq!(faulting.rva.as_deref(), Some("0x1654"));
         // The framework frame is still in the walk — skipping it as a *culprit* is not hiding it.
         assert_eq!(triage.frames[1].module.as_deref(), Some("Wdf01000"));
+    }
+
+    /// A kernel stack that unwinds past the system call boundary keeps going into user mode, and a
+    /// `.exe` cannot be the kernel driver this field names. Without the check, a crash whose kernel
+    /// frames are all `nt` would blame the caller's own executable.
+    #[test]
+    fn a_user_mode_frame_is_never_the_faulting_driver() {
+        const NTDLL_BASE: u64 = 0x00007ffb_00000000;
+        const EXE_BASE: u64 = 0x00007ff6_00000000;
+        let across_the_boundary = vec![
+            AttributedFrame {
+                frame: frame(0, NT_BASE + 0x1000, Some("nt!KeBugCheckEx"), 0),
+                module: Some(module("nt", NT_BASE)),
+            },
+            AttributedFrame {
+                frame: frame(1, NT_BASE + 0x2000, Some("nt!NtDeviceIoControlFile"), 0x5e),
+                module: Some(module("nt", NT_BASE)),
+            },
+            AttributedFrame {
+                frame: frame(
+                    2,
+                    NTDLL_BASE + 0x9d14,
+                    Some("ntdll!NtDeviceIoControlFile"),
+                    0x14,
+                ),
+                module: Some(user_module("ntdll", NTDLL_BASE)),
+            },
+            AttributedFrame {
+                frame: frame(3, EXE_BASE + 0x1200, None, 0),
+                module: Some(user_module("mm_exploit", EXE_BASE)),
+            },
+        ];
+        let triage = report(
+            BugCheck {
+                code: 0x13A,
+                parameters: [0; 4],
+            },
+            &across_the_boundary,
+            false,
+            Some("mm_exploit.exe".into()),
+            Analysis::NotRequested,
+        );
+        assert!(
+            triage.faulting_frame.is_none(),
+            "there is no driver on this stack: {:?}",
+            triage.faulting_frame
+        );
+        let note = triage.faulting_frame_note.expect("a reason");
+        assert!(note.contains("user mode"), "{note}");
+        // The user-mode frames are still reported — excluded from *blame*, not from the walk.
+        assert_eq!(triage.frames.len(), 4);
+        assert_eq!(triage.frames[2].module.as_deref(), Some("ntdll"));
+
+        // And a kernel driver below the same boundary is still found: the rule is about the mode
+        // of the module, not about position on the stack.
+        let mut with_driver = across_the_boundary;
+        with_driver.insert(
+            2,
+            AttributedFrame {
+                frame: frame(2, DRIVER_BASE + 0x1654, None, 0),
+                module: Some(module("MessageManager", DRIVER_BASE)),
+            },
+        );
+        let found = report(
+            BugCheck {
+                code: 0x13A,
+                parameters: [0; 4],
+            },
+            &with_driver,
+            false,
+            None,
+            Analysis::NotRequested,
+        );
+        assert_eq!(
+            found
+                .faulting_frame
+                .as_ref()
+                .and_then(|frame| frame.module.as_deref()),
+            Some("MessageManager")
+        );
+        // The frame carried back is the one at that position, not a different frame with the same
+        // index — the two lists are indexed together and this is what says so.
+        assert_eq!(
+            found.faulting_frame.and_then(|frame| frame.rva),
+            Some("0x1654".to_string())
+        );
     }
 
     /// An address in no loaded module — a freed page, an unloaded driver — is a culprit, not a

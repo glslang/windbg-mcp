@@ -1524,13 +1524,13 @@ fn run_analyze(e: &DebugEngine, patience: Duration, before: Duration) -> Analysi
         }
     } else if ran_out {
         format!(
-            "this call had less than {}s of its timeout left{}, which is not enough to bound an \
-             `!analyze` — one started with less would be armed with that floor anyway and would \
-             still be running after the call had returned. Raise WINDBG_MCP_CALL_TIMEOUT_SECS \
-             (the triage reserves {}s twice over: once for the reads after the analysis, which no \
-             watchdog can cut short, and once for the reply itself), issue the triage on an idle \
-             session, or pass `analyze: false` to skip it deliberately.",
-            WATCHDOG_HEADROOM.as_secs(),
+            "this call had less than {}s of its timeout left{}, which is not enough to run an \
+             `!analyze` *and* still have time to answer in: below that the watchdog is armed for \
+             the whole of what remains, so a command that ran to its deadline would leave nothing \
+             for the break to unwind in. Raise WINDBG_MCP_CALL_TIMEOUT_SECS (a triage also keeps \
+             {}s back for the reads after the analysis, which no watchdog can cut short), issue \
+             the triage on an idle session, or pass `analyze: false` to skip it deliberately.",
+            (2 * WATCHDOG_HEADROOM).as_secs(),
             match &last {
                 Some(first) => format!(" by the time the first attempt had been made and {first}"),
                 None => String::new(),
@@ -1550,17 +1550,22 @@ fn run_analyze(e: &DebugEngine, patience: Duration, before: Duration) -> Analysi
     ))
 }
 
-/// Whether an `!analyze` attempt can still be bounded inside what is left of the caller's patience.
+/// Whether an `!analyze` attempt can still be bounded inside what is left of the caller's patience
+/// **and leave the headroom the reply needs**.
 ///
-/// **Not "is any patience left".** [`watchdog_budget_ms`] floors at [`WATCHDOG_HEADROOM`] — a
-/// deliberate choice, because a command dequeued past its deadline must still be bounded by
-/// *something* — so an attempt begun with less than the floor remaining is armed with the floor
-/// regardless. Three seconds of patience buys a fifteen-second watchdog, and twelve of those
-/// seconds are spent on a session whose caller has already timed out and can no longer even
-/// interrupt it. The floor is therefore the amount the remaining patience must cover for the
-/// attempt to be worth starting at all, which is the property the test below pins.
+/// Not "is any patience left", and not "does the watchdog fit" either. [`watchdog_budget_ms`]
+/// subtracts [`WATCHDOG_HEADROOM`] precisely so that a command stopped at its deadline still has
+/// time for the Ctrl+Break to unwind and the answer to travel — but it also *floors* at that same
+/// figure, deliberately, because a command dequeued past its deadline must be bounded by
+/// something. Below twice the headroom the floor wins, and the subtraction it overrides is exactly
+/// the reserve the reply was relying on: with fifteen seconds left the watchdog is armed for
+/// fifteen, so a command that runs to its deadline leaves nothing at all to answer in.
+///
+/// Twice the headroom is therefore the threshold — the point below which `watchdog_budget_ms` stops
+/// keeping its own promise. The test below pins that as a *relationship* rather than as the
+/// number, so it survives either constant being retuned.
 fn analysis_fits(patience: Duration, spent: Duration) -> bool {
-    patience.saturating_sub(spent) >= WATCHDOG_HEADROOM
+    patience.saturating_sub(spent) >= 2 * WATCHDOG_HEADROOM
 }
 
 /// Whether output is an analysis rather than the engine declining to run one.
@@ -3174,42 +3179,45 @@ mod tests {
         assert_eq!(watchdog_budget_ms(Duration::ZERO, Duration::ZERO), 15_000);
     }
 
-    /// An `!analyze` is only started when its *watchdog* fits inside what is left, not merely when
-    /// something is left.
+    /// An `!analyze` is only started when its watchdog fits inside what is left **and still leaves
+    /// the headroom the reply needs** — not merely when something is left.
     ///
-    /// The property rather than the constant: whenever [`analysis_fits`] says yes, the budget
-    /// [`watchdog_budget_ms`] then arms is no longer than the patience remaining — so the command
-    /// cannot still be running after its caller has given up. That is what the check is *for*, and
-    /// it stays true if either the floor or the arithmetic is retuned.
+    /// The property rather than the constant, in both directions. Whenever [`analysis_fits`] says
+    /// yes, the budget [`watchdog_budget_ms`] then arms plus [`WATCHDOG_HEADROOM`] is within the
+    /// patience remaining — so a command that runs all the way to its deadline still has time for
+    /// the break to unwind and the answer to travel. Whenever it says no, that sum would have
+    /// overrun — so the check is not refusing time it could have used. Both halves stay true if
+    /// either constant is retuned, which is the point of testing them this way.
     #[test]
-    fn an_analysis_is_only_started_when_its_watchdog_fits_the_time_left() {
+    fn an_analysis_only_starts_when_its_watchdog_and_the_reply_both_fit() {
         let patience = Duration::from_secs(300);
         for spent in (0..=300).map(Duration::from_secs) {
             let left = patience.saturating_sub(spent);
             let budget = Duration::from_millis(u64::from(watchdog_budget_ms(patience, spent)));
+            let needed = budget + WATCHDOG_HEADROOM;
             if analysis_fits(patience, spent) {
                 assert!(
-                    budget <= left,
-                    "with {left:?} left the watchdog would be armed for {budget:?}, which \
-                     outlives the caller — `analysis_fits` must not have allowed it"
+                    needed <= left,
+                    "with {left:?} left, a watchdog of {budget:?} plus the reply's headroom needs \
+                     {needed:?} — `analysis_fits` must not have allowed it"
                 );
             } else {
-                // And the rejected cases are rejected *because* the floor would overrun, which is
-                // the only reason to reject them: a check that also refused affordable time would
-                // be skipping analyses for nothing.
                 assert!(
-                    budget > left,
-                    "with {left:?} left the watchdog would fit ({budget:?}); refusing to run is \
-                     time thrown away"
+                    needed > left,
+                    "with {left:?} left, {budget:?} plus headroom is {needed:?} and would have \
+                     fitted; refusing to run is time thrown away"
                 );
             }
         }
-        // The boundary, spelled out: exactly the floor is enough, a millisecond less is not.
-        assert!(analysis_fits(WATCHDOG_HEADROOM, Duration::ZERO));
+        // The boundary, spelled out: twice the headroom is enough, a millisecond less is not.
+        assert!(analysis_fits(2 * WATCHDOG_HEADROOM, Duration::ZERO));
         assert!(!analysis_fits(
-            WATCHDOG_HEADROOM - Duration::from_millis(1),
+            2 * WATCHDOG_HEADROOM - Duration::from_millis(1),
             Duration::ZERO
         ));
+        // The floor alone is *not* enough, which is the case this threshold exists for: the
+        // watchdog would be armed for the whole of it and leave nothing to answer in.
+        assert!(!analysis_fits(WATCHDOG_HEADROOM, Duration::ZERO));
         // A caller whose patience the supervisor could not fill in at all gets no analysis rather
         // than a floored one.
         assert!(!analysis_fits(Duration::ZERO, Duration::ZERO));
