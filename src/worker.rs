@@ -124,6 +124,20 @@ const MAX_READ_BYTES: usize = 1024 * 1024;
 /// has time to unwind, and this worker is free again before the tool call reports its timeout.
 const WATCHDOG_HEADROOM: Duration = Duration::from_secs(15);
 
+/// How much of a `crash_triage`'s patience is kept back for the reads that follow its `!analyze`.
+///
+/// Those reads — the stack walk, the per-frame module lookups, the process name — are direct engine
+/// calls rather than commands, so **no watchdog can cut them short**, and a frame whose symbol has
+/// to be fetched from a symbol server can block for a long time inside one. Time nothing can bound
+/// is time that has to be reserved instead, and this is the reservation.
+///
+/// [`WATCHDOG_HEADROOM`] again, deliberately: it is already this file's answer to "how long does
+/// the part after the bounded work need?", and a second constant beside it would be a second
+/// number to keep in step with the first for no reason. With the default 300s call timeout it
+/// costs nothing; on a host configured much tighter it is what makes the triage skip its analysis
+/// and *say so*, rather than run one that outlives the caller.
+const TRIAGE_READ_RESERVE: Duration = WATCHDOG_HEADROOM;
+
 /// The watchdog deadline for a command that waited `queued` in this worker's queue, given the
 /// `patience` its caller had left when the supervisor sent it.
 ///
@@ -1350,8 +1364,19 @@ fn crash_triage(
     // `~Ns`, `.cxr`) it is wherever they moved it, and this mode has no way to tell. Said plainly
     // in the tool's own documentation rather than papered over, because the alternative is a
     // report that labels an unrelated thread's stack as the crash.
+    //
+    // The ordering has one cost, and it is paid here rather than left to bite. The reads below are
+    // *unbounded* — they are direct engine calls, not commands, so no watchdog can cut them short,
+    // and resolving a frame's symbol can block on a symbol server. While they came first that was
+    // harmless, because the analysis after them was bounded by whatever they had left. Now they
+    // come last, so the analysis is handed a patience with [`TRIAGE_READ_RESERVE`] already taken
+    // out of it: time this side of the pipe cannot bound, and therefore has to reserve.
     let analysis = if analyze {
-        run_analyze(e, patience, queued.saturating_add(started.elapsed()))
+        run_analyze(
+            e,
+            patience.saturating_sub(TRIAGE_READ_RESERVE),
+            queued.saturating_add(started.elapsed()),
+        )
     } else {
         Analysis::NotRequested
     };
@@ -1429,7 +1454,7 @@ fn run_analyze(e: &DebugEngine, patience: Duration, before: Duration) -> Analysi
     let mut cut_short: Option<bool> = None;
     for command in ["!analyze -v", "!ext.analyze -v"] {
         let spent = before.saturating_add(started.elapsed());
-        if spent >= patience {
+        if !analysis_fits(patience, spent) {
             ran_out = true;
             break;
         }
@@ -1499,15 +1524,18 @@ fn run_analyze(e: &DebugEngine, patience: Duration, before: Duration) -> Analysi
         }
     } else if ran_out {
         format!(
-            "there was no time left in this call to run it{}. Raise \
-             WINDBG_MCP_CALL_TIMEOUT_SECS, issue the triage on an idle session, or pass \
-             `analyze: false` to say so deliberately.",
+            "this call had less than {}s of its timeout left{}, which is not enough to bound an \
+             `!analyze` — one started with less would be armed with that floor anyway and would \
+             still be running after the call had returned. Raise WINDBG_MCP_CALL_TIMEOUT_SECS \
+             (the triage reserves {}s twice over: once for the reads after the analysis, which no \
+             watchdog can cut short, and once for the reply itself), issue the triage on an idle \
+             session, or pass `analyze: false` to skip it deliberately.",
+            WATCHDOG_HEADROOM.as_secs(),
             match &last {
-                Some(first) => format!(" — the first attempt had already been made and {first}"),
-                None => String::from(
-                    ", because the reads above had already spent the caller's patience"
-                ),
-            }
+                Some(first) => format!(" by the time the first attempt had been made and {first}"),
+                None => String::new(),
+            },
+            WATCHDOG_HEADROOM.as_secs(),
         )
     } else {
         format!(
@@ -1520,6 +1548,19 @@ fn run_analyze(e: &DebugEngine, patience: Duration, before: Duration) -> Analysi
         "`!analyze -v` did not run, so the pool tag and failure bucket are missing; everything \
          else here is read from the engine and is unaffected. Reason: {why}"
     ))
+}
+
+/// Whether an `!analyze` attempt can still be bounded inside what is left of the caller's patience.
+///
+/// **Not "is any patience left".** [`watchdog_budget_ms`] floors at [`WATCHDOG_HEADROOM`] — a
+/// deliberate choice, because a command dequeued past its deadline must still be bounded by
+/// *something* — so an attempt begun with less than the floor remaining is armed with the floor
+/// regardless. Three seconds of patience buys a fifteen-second watchdog, and twelve of those
+/// seconds are spent on a session whose caller has already timed out and can no longer even
+/// interrupt it. The floor is therefore the amount the remaining patience must cover for the
+/// attempt to be worth starting at all, which is the property the test below pins.
+fn analysis_fits(patience: Duration, spent: Duration) -> bool {
+    patience.saturating_sub(spent) >= WATCHDOG_HEADROOM
 }
 
 /// Whether output is an analysis rather than the engine declining to run one.
@@ -3131,6 +3172,47 @@ mod tests {
     #[test]
     fn no_patience_left_still_arms_the_watchdog() {
         assert_eq!(watchdog_budget_ms(Duration::ZERO, Duration::ZERO), 15_000);
+    }
+
+    /// An `!analyze` is only started when its *watchdog* fits inside what is left, not merely when
+    /// something is left.
+    ///
+    /// The property rather than the constant: whenever [`analysis_fits`] says yes, the budget
+    /// [`watchdog_budget_ms`] then arms is no longer than the patience remaining — so the command
+    /// cannot still be running after its caller has given up. That is what the check is *for*, and
+    /// it stays true if either the floor or the arithmetic is retuned.
+    #[test]
+    fn an_analysis_is_only_started_when_its_watchdog_fits_the_time_left() {
+        let patience = Duration::from_secs(300);
+        for spent in (0..=300).map(Duration::from_secs) {
+            let left = patience.saturating_sub(spent);
+            let budget = Duration::from_millis(u64::from(watchdog_budget_ms(patience, spent)));
+            if analysis_fits(patience, spent) {
+                assert!(
+                    budget <= left,
+                    "with {left:?} left the watchdog would be armed for {budget:?}, which \
+                     outlives the caller — `analysis_fits` must not have allowed it"
+                );
+            } else {
+                // And the rejected cases are rejected *because* the floor would overrun, which is
+                // the only reason to reject them: a check that also refused affordable time would
+                // be skipping analyses for nothing.
+                assert!(
+                    budget > left,
+                    "with {left:?} left the watchdog would fit ({budget:?}); refusing to run is \
+                     time thrown away"
+                );
+            }
+        }
+        // The boundary, spelled out: exactly the floor is enough, a millisecond less is not.
+        assert!(analysis_fits(WATCHDOG_HEADROOM, Duration::ZERO));
+        assert!(!analysis_fits(
+            WATCHDOG_HEADROOM - Duration::from_millis(1),
+            Duration::ZERO
+        ));
+        // A caller whose patience the supervisor could not fill in at all gets no analysis rather
+        // than a floored one.
+        assert!(!analysis_fits(Duration::ZERO, Duration::ZERO));
     }
 
     /// A patience beyond `u32::MAX` milliseconds (~49 days) must saturate, not wrap: a wrapped
