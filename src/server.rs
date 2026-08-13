@@ -2922,11 +2922,13 @@ impl WindbgServer {
         engine_result(out)
     }
 
-    /// List loaded modules, as `lm` prints them and as typed values beside it: each module's
-    /// name, image name, start/end addresses and **symbol state** — `deferred` (not fetched
-    /// yet) is not the same as `none` (this module has no symbols), which the `lm` text
-    /// renders as an easily-missed parenthesis. Pass `filter` to ask about one driver rather
-    /// than reading a table of two hundred; the answer still reports how many are loaded.
+    /// List modules, as `lm` prints them and as typed values beside it: each module's name, image
+    /// name, start/end addresses and **symbol state** — `deferred` (not fetched yet) is not the
+    /// same as `none` (this module has no symbols), which the `lm` text renders as an
+    /// easily-missed parenthesis. Pass `filter` to ask about one driver rather than reading a
+    /// table of two hundred; the answer still reports how many are loaded. The modules that have
+    /// **unloaded** come back in their own `unloaded` list, narrowed by the same filter — that is
+    /// what can name an address in a driver that is no longer there.
     #[rmcp::tool(
         annotations(
             title = "List modules",

@@ -792,6 +792,7 @@ mod tests {
             checksum: 0,
             symbols: win_kexp::dbgeng::SymbolKind::None,
             user_mode: false,
+            unloaded: false,
         }
     }
 
