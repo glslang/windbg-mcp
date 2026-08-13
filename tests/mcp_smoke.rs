@@ -1636,9 +1636,15 @@ fn a_walk_marks_what_it_cannot_read_and_keeps_going() {
     assert_eq!(walk["stopped"]["reason"], "complete", "{walk}");
     let node = |i: usize| walk["nodes"][i].clone();
     assert_eq!(node(1)["readable"], false, "{walk}");
+    // `get`, not indexing: indexing a missing key also yields `Null`, so the weaker assertion
+    // would pass against a payload that had dropped the field entirely — and an omitted key makes
+    // "the debugger could not read this" and "this object is malformed" the same observation for
+    // every client. The value is a null, and it is *there*.
     assert!(
-        node(1)["fields"][0]["value"].is_null(),
-        "an unreadable value is absent, not zero: {walk}"
+        node(1)["fields"][0]
+            .get("value")
+            .is_some_and(Value::is_null),
+        "an unreadable value is an explicit null, not a missing key and not zero: {walk}"
     );
     for i in [0, 2] {
         assert_eq!(node(i)["readable"], true, "{walk}");

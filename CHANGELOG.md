@@ -34,7 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   where there is a hole — one round trip per node in the ordinary case, which is what lets a
   512-node walk finish over KDNET. The walk checks its deadline and the session's interrupt
   between nodes: there is no *command* behind it, so win-kexp's watchdog has nothing to bound,
-  and a walk cut short answers with what it really read rather than failing.
+  and a walk cut short answers with what it really read rather than failing. The one part that
+  *is* a command — the `?` resolving a symbolic `start`, which can block on a symbol server —
+  takes the watchdog with what is left of the walk's budget.
 
 ## [0.8.1] - 2026-08-13
 

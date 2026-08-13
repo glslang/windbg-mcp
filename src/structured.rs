@@ -1084,8 +1084,13 @@ pub struct WalkNode {
     pub index: u32,
     pub address: String,
     /// The link this node held, for a chain — the address the walk went to next. `null` when the
-    /// link could not be read, which for a chain is also where the walk ends.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// link could not be read, which for a chain is also where the walk ends, and always for a
+    /// list or an array, which follow no link.
+    ///
+    /// **Always present, `null` included.** The two nullable fields on a walk are the ones a
+    /// caller reads to find the holes, so an omitted key would make "this node's link is
+    /// unreadable" and "this object came back malformed" the same observation — see
+    /// [`WalkFieldValue::value`].
     pub next: Option<String>,
     pub fields: Vec<WalkFieldValue>,
     /// Whether *anything* at this node could be read. `false` is the interesting case in a
@@ -1105,7 +1110,13 @@ pub struct WalkFieldValue {
     /// The value, zero-extended to 64 bits and rendered in this module's one address form
     /// whatever [`Self::size`] is — so a client never has to know a field's width to compare it.
     /// `null` means the debugger could not read those bytes.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    ///
+    /// **Always present, `null` included** — the one place in this module where an absent key
+    /// would be wrong rather than tidy. Everywhere else `null` is the boring case and omitting it
+    /// saves noise; here it *is* the finding, and a client that has to tell a missing key from a
+    /// null one is doing extra work to read the answer the tool exists to give. `MemoryWalk`'s own
+    /// optional fields ([`MemoryWalk::start`], [`MemoryWalk::note`]) keep the usual treatment,
+    /// because "there is no start" and "nothing needed explaining" really are absences.
     pub value: Option<String>,
 }
 
@@ -1369,6 +1380,56 @@ mod tests {
         let inline = breakpoint(BreakpointKind::Other { kind_code: 3 });
         assert_eq!(inline["kind"], "other");
         assert_eq!(inline["kind_code"], 3);
+    }
+
+    /// A walk's two nullable fields are **present and null**, never absent.
+    ///
+    /// They are the ones a caller reads to find the holes, which is the whole point of the tool,
+    /// so an omitted key would make "the debugger could not read this" and "this object came back
+    /// malformed" the same observation — and leave every client writing missing-key handling to
+    /// read the ordinary answer. The rest of the module keeps `skip_serializing_if`, where an
+    /// absence really is one.
+    #[test]
+    fn an_unreadable_value_is_a_null_not_a_missing_key() {
+        let node = WalkNode {
+            index: 0,
+            address: addr(0x1000),
+            next: None,
+            fields: vec![WalkFieldValue {
+                name: "value".into(),
+                address: addr(0x1000),
+                size: 8,
+                value: None,
+            }],
+            readable: false,
+        };
+        let wire = serde_json::to_value(&node).unwrap();
+        assert!(
+            wire.get("next").is_some_and(serde_json::Value::is_null),
+            "{wire}"
+        );
+        assert!(
+            wire["fields"][0]
+                .get("value")
+                .is_some_and(serde_json::Value::is_null),
+            "{wire}"
+        );
+
+        // The walk's own optionals keep the usual treatment: "there is no start" and "nothing
+        // needed explaining" are absences, not findings.
+        let walk = MemoryWalk {
+            mode: WalkMode::List,
+            start: None,
+            requested: 1,
+            walked: 1,
+            unreadable: 1,
+            nodes: vec![node],
+            stopped: WalkStop::Complete,
+            note: None,
+        };
+        let wire = serde_json::to_value(&walk).unwrap();
+        assert!(wire.get("start").is_none(), "{wire}");
+        assert!(wire.get("note").is_none(), "{wire}");
     }
 
     /// A chunk's state is four named values, and the fourth is not a kind of free.

@@ -41,6 +41,23 @@ interrupt are polled once per node, *before* its reads — after them, a break l
 would still buy node 4's round trips. A walk that reaches the engine with less than the reply's own
 headroom left is refused outright, as a pool query that must walk already is.
 
+**The one exception is a command, so it takes the watchdog.** Resolving a symbolic `start` runs a
+`?`, which can send the engine to a symbol server; the between-node deadline cannot bound it,
+because it is not polled until the resolve returns. So the resolve is handed what is left of the
+walk's budget, floored at 1ms — zero *disarms* win-kexp's watchdog, which would leave the one
+blocking part of the call as the only unbounded thing in it. A resolve cut short is reported as
+`NotRun`, never as a bad expression: being stopped says nothing about whether the symbol exists.
+
+**Two fields are `null`, not absent**, against this module's own habit of eliding `None`. A walk's
+unreadable value and unread chain link are the findings, and an omitted key makes "the debugger
+could not read this" and "this object came back malformed" the same observation for every client.
+`start` and `note` keep the elision, because those absences really are absences.
+
+**Field names are capped at 64 characters** — the only argument that is *amplified*. Every other
+input is spent once; a name is copied into each field of each node, up to 16,384 times, so a single
+large one can take the worker out of memory and cost the caller the session that the node and field
+caps exist to protect.
+
 **Status.** Done. Covered by `src/walk.rs` unit tests over an address space with holes in it, and
 by `mcp_smoke::a_walk_marks_what_it_cannot_read_and_keeps_going`, which asserts the *contrast*:
 the same dereference through `execute` fails, and the walk returns it as a row.
