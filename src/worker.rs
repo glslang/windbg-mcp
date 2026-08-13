@@ -1344,8 +1344,12 @@ fn crash_triage(
     // idempotent: run twice, and the second call re-selects the same context before reading rather
     // than reading whatever the first one left selected.
     //
-    // With `analyze: false` nothing moves the context and nothing needs to — the reads describe
-    // the context the target is already stopped in, which is what `backtrace` would show too.
+    // With `analyze: false` nothing selects a context at all, and the reads describe whichever one
+    // the session currently has — the same one `backtrace` would show. On a freshly opened crash
+    // dump that *is* the crash context; on a session where a caller has moved it (`.thread`,
+    // `~Ns`, `.cxr`) it is wherever they moved it, and this mode has no way to tell. Said plainly
+    // in the tool's own documentation rather than papered over, because the alternative is a
+    // report that labels an unrelated thread's stack as the crash.
     let analysis = if analyze {
         run_analyze(e, patience, queued.saturating_add(started.elapsed()))
     } else {
@@ -1354,16 +1358,21 @@ fn crash_triage(
 
     // Best-effort from here on. A stack walk that fails leaves no frames, which the report renders
     // as "no faulting frame" with the reason — strictly more than a failed call would say.
-    let walked = e.stack_frames(frames).unwrap_or_else(|why| {
-        tracing::debug!("worker: crash triage could not walk the stack: {why}");
-        Vec::new()
-    });
-    // A walk that came back exactly full is the only evidence there is that the stack went on:
-    // `GetStackTrace` fills the buffer and says how much, not how much it left. Reported as "may
-    // be truncated" rather than resolved by walking again one frame deeper, because the answer
-    // only changes what a caller does when there is no driver frame — and then re-asking with a
-    // larger `frames` is the same work done once instead of on every triage.
-    let truncated = walked.len() == frames;
+    //
+    // **One frame more than the caller asked for**, so that "the stack went on" and "the stack was
+    // exactly this long" are different observations rather than the same one. `GetStackTrace` says
+    // how much of the buffer it filled, never how much it left, so a walk that came back exactly
+    // full is ambiguous — and the ambiguity is not cosmetic: it decides whether a missing
+    // `faulting_frame` is a fact about the crash or an artefact of the cap. The extra frame is
+    // trimmed before anything sees it; it exists only to be counted.
+    let mut walked = e
+        .stack_frames(frames.saturating_add(1))
+        .unwrap_or_else(|why| {
+            tracing::debug!("worker: crash triage could not walk the stack: {why}");
+            Vec::new()
+        });
+    let truncated = walked.len() > frames;
+    walked.truncate(frames);
     let attributed: Vec<AttributedFrame> = walked
         .into_iter()
         .map(|frame| AttributedFrame {
@@ -1408,13 +1417,16 @@ fn crash_triage(
 /// frame's symbol can pull a PDB over the network, and an `!analyze` handed the full patience
 /// afterwards would run on past its caller either way.
 ///
-/// **Why it did not run matters**, so the two ways of failing are kept apart: no time left, and
-/// both spellings tried and neither resolving. Reporting the first as the second sends a caller
-/// looking for an `ext.dll` that is sitting right where it should be.
+/// **Why it did not run matters**, so the three ways of failing are kept apart: no time left, the
+/// run cut short before it printed anything readable, and both spellings tried with neither
+/// resolving. Reporting any of them as the last sends a caller looking for an `ext.dll` that is
+/// sitting right where it should be.
 fn run_analyze(e: &DebugEngine, patience: Duration, before: Duration) -> Analysis {
     let started = Instant::now();
     let mut last: Option<String> = None;
     let mut ran_out = false;
+    // `Some(on_request)` once an attempt has been cut short with nothing readable to keep.
+    let mut cut_short: Option<bool> = None;
     for command in ["!analyze -v", "!ext.analyze -v"] {
         let spent = before.saturating_add(started.elapsed());
         if spent >= patience {
@@ -1430,12 +1442,31 @@ fn run_analyze(e: &DebugEngine, patience: Duration, before: Duration) -> Analysi
             // The *cause* travels with it. A deadline and a caller's `interrupt` both land here
             // and the advice differs: one says raise the timeout, the other is a caller who
             // already knows, having asked.
-            Ok(run) if run.cut_short.is_some() && looks_analysed(&run.output) => {
-                return Analysis::Truncated {
-                    command: command.to_string(),
-                    output: run.output,
-                    on_request: matches!(run.cut_short, Some(Interruption::OnRequest)),
-                };
+            // **Any cut-short ends the attempts, whether or not it left anything readable.**
+            //
+            // The fallback spelling exists for one failure and one only: an engine on which the
+            // command does not *resolve*. A command that got far enough to be cut short plainly
+            // resolved, so the other spelling has nothing to add — and trying it anyway is
+            // actively wrong for both causes. After an `interrupt` it would restart, under a fresh
+            // watchdog, the very work the caller just asked to stop. After a deadline it would run
+            // for another floor's worth past a caller who has gone: the `spent >= patience` check
+            // above does not catch that one, because a deadline fires with the reply's headroom
+            // still nominally unspent.
+            Ok(run) if run.cut_short.is_some() => {
+                let on_request = matches!(run.cut_short, Some(Interruption::OnRequest));
+                if looks_analysed(&run.output) {
+                    return Analysis::Truncated {
+                        command: command.to_string(),
+                        output: run.output,
+                        on_request,
+                    };
+                }
+                // Cut short before it printed anything this can read. There is no partial
+                // analysis to keep, so it is not `Truncated` — but it is still terminal, and the
+                // reason a caller gets has to be the interruption rather than the missing
+                // `ext.dll` the fallback path would otherwise blame.
+                cut_short = Some(on_request);
+                break;
             }
             // An engine without the extension answers with "No export analyze found" and an
             // otherwise empty result, which is a *successful* command that analysed nothing — so
@@ -1455,7 +1486,18 @@ fn run_analyze(e: &DebugEngine, patience: Duration, before: Duration) -> Analysi
             Err(why) => last = Some(format!("`{command}` failed: {why}")),
         }
     }
-    let why = if ran_out {
+    let why = if let Some(on_request) = cut_short {
+        if on_request {
+            "it was interrupted on this session before it printed anything worth keeping, and was \
+             not retried — retrying would restart the very work the interrupt asked to stop. \
+             Triage again without interrupting."
+                .to_string()
+        } else {
+            "it hit this call's deadline before printing anything worth keeping. Raise \
+             WINDBG_MCP_CALL_TIMEOUT_SECS, or issue the triage on an idle session."
+                .to_string()
+        }
+    } else if ran_out {
         format!(
             "there was no time left in this call to run it{}. Raise \
              WINDBG_MCP_CALL_TIMEOUT_SECS, issue the triage on an idle session, or pass \

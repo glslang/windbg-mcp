@@ -244,7 +244,9 @@ gh attestation verify <zip> --repo glslang/windbg-mcp `
   minidump ([`docs/samples/052126-34312-01.dmp`](docs/samples/052126-34312-01.dmp)): a
   `0x9F DRIVER_POWER_STATE_FAILURE` traced to `nvlddmkm.sys` — `crash_triage` for the bug check as
   fields, then `!ext.analyze -v` and a manual device-stack walk for the culprit it cannot name, with
-  the real outputs and the partial-minidump (`0x80040205`) gotcha.
+  the real outputs and the partial-minidump (`0x80040205`) gotcha. Ends on a second sample, a
+  `0x13A` in a **PDB-less driver**, where `!analyze` says `Unknown_Module` and the frame says
+  `MessageManager+0x1654` — the same offset in five dumps that loaded the driver at five addresses.
 - [`docs/ttd-walkthrough.md`](docs/ttd-walkthrough.md) — a hands-on tour of the TTD tools against the
   [`xusheng6/TTD_lab`](https://github.com/xusheng6/TTD_lab) `helloworld` sample: opening a `.run`,
   surveying events/threads, forward/reverse navigation, memory analysis, and counting `printf` calls
@@ -611,7 +613,8 @@ timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressio
   reports the **neighbouring** chunks, which is what tells you what a reclaim would land next to. `pool_diagnostics` returns the walk's own diagnostics filtered by substring: a real walk emits tens of thousands across a hundred-plus categories, so any per-call summary truncates and the one line explaining a specific heap is never in the truncated head — filter by a heap address or a phrase to reach it.
 - **`crash_triage` reads a bug check two ways, and keeps them apart.** The code and its parameters
   (`ReadBugCheckData`), the stack, each frame's module, and the crashing process (out of the current
-  `_EPROCESS`, which is where `!analyze` reads `PROCESS_NAME`) are engine reads. The pool tag, the
+  `_EPROCESS`'s audit name — its full image path, not the 15-byte `ImageFileName` that turns
+  `mm_exploit_v5.exe` into `mm_exploit_v5.`) are engine reads. The pool tag, the
   failure bucket, the blamed module and the per-parameter explanations exist nowhere but `!analyze`'s
   own output, so they are extracted from it and confined to the `analysis` object. **Prefer
   `faulting_frame` to `analysis.module_name`**: the frame's `module+RVA` is computed from the load

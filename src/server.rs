@@ -1454,6 +1454,10 @@ pub struct CrashTriageArgs {
     /// Run `!analyze -v` and report its conclusions beside the engine's values (default true).
     /// It is what supplies the pool tag, the failure bucket and the per-parameter explanations,
     /// and it is also the slow part — set false for a fast answer of code, parameters and frames.
+    /// It is also what re-selects the faulting context on the bug checks that carry one, so with
+    /// false the stack is whichever context the session currently has selected — the same one
+    /// `backtrace` would print. On a freshly opened dump those are the same thing; on a session
+    /// where the context has been moved (`.thread`, `~Ns`, `.cxr`) they are not.
     #[serde(default)]
     pub analyze: Option<bool>,
     /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to

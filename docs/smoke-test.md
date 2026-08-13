@@ -113,6 +113,24 @@ parameter notes stay positional, and that the bucket is derived from the bug che
 than for exact strings, which belong to whichever `ext.dll` the host has and would fail this tier
 on a different WinDbg instead of on a change here.
 
+**A second dump, because the first one could not fail the right way.** The `0x9F` sample is a
+watchdog bug check: it fires on an idle CPU's timer DPC, so there is no driver frame on its stack
+at all, and it exercises the *absent* `faulting_frame` branch and never the one the tool exists
+for. Its process is `System`, short enough to fit the 15-byte `_EPROCESS::ImageFileName` field the
+process read originally used — so the truncation that field causes was invisible here too, and
+turned up only against a real driver crash whose process was `mm_exploit_v5.exe` (reported as
+`mm_exploit_v5.`). Two bugs hiding behind a green tier, both because a convenient fixture is not a
+representative one.
+
+So [`docs/samples/081226-2187-01.dmp`](samples/081226-2187-01.dmp) is checked in beside it: a
+`0x13A` raised out of `nt!ExFreePoolWithTag` by a **PDB-less** third-party driver. It pins the
+claims the other dump structurally cannot — a `faulting_frame` that exists, six frames below the
+top and under a stack of allocator internals that a "blame frame 0" rule would name instead; that
+frame as `MessageManager+0x1654`, an RVA asserted as a literal because it is a fixed offset into a
+fixed image and was identical across five dumps that loaded the driver at five different
+addresses; `symbol` absent rather than filled in with the module's own name; a `pool_tag`, which
+only `!analyze` produces; and a process name longer than fifteen characters.
+
 Those checks are made against **typed fields** wherever a tool has them (issue #84): the handle is
 read from `structuredContent`, not from a `session_id:` line; `nt` and `hal` are matched as module
 records rather than as the third token of a rendered row, which is what used to break on a column
