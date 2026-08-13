@@ -686,8 +686,9 @@ timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressio
   default, so a `.frame`/`.cxr` a caller had chosen would be silently discarded — `crash_triage`
   saves that scope and restores it (`ScopeGuard`, [win-kexp#98](https://github.com/glslang/win-kexp/issues/98)),
   which is why the tool reports itself read-only. The stack it walks is the **default** context
-  (the crash, on a crash dump) with `analyze: true`, and whatever the session has selected with
-  `analyze: false`. Needs a kernel target
+  (the crash, on a crash dump) whenever the analysis actually ran — running it is what resets the
+  scope there — and whatever the session has selected when it did not (`analyze: false`, no time
+  left, or an engine with no `ext.dll`); `analysis.ran` distinguishes them. Needs a kernel target
   *stopped at a bug check* — a live kernel that has not crashed yet, and a dump that is not a crash
   dump, are both **refused** with a message saying which of the two they are.
 - **`crash_triage` tries `!analyze -v` and then `!ext.analyze -v`**, and reports which one worked

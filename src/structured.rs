@@ -908,13 +908,14 @@ pub struct CrashTriage {
     /// The stack of **the context the session has selected**, innermost first, capped by the
     /// call's `frames` argument.
     ///
-    /// On a freshly opened crash dump that context is the crash. With `analyze: true` it is the
-    /// crash even on a session a caller had navigated away from, because the `!analyze -v` that
-    /// runs first leaves the scope at the target's default — and the scope the caller chose is
-    /// restored after the walk, so the normalisation costs them nothing. With `analyze: false`
-    /// nothing normalises it: a caller who has moved it (`.thread`, `~Ns`, `.cxr` through
-    /// `execute`) gets the stack they moved it to. Either way this is the same stack `backtrace`
-    /// would print from that context, not a separately-discovered crash stack.
+    /// On a freshly opened crash dump that context is the crash. It is the crash even on a session
+    /// a caller had navigated away from **when the `!analyze -v` ran** ([`AnalysisInfo::ran`]),
+    /// because running it leaves the scope at the target's default — and the scope the caller
+    /// chose is restored after the walk, so that normalisation costs them nothing. When it did not
+    /// run — `analyze: false`, no time left, or an engine with no extensions — nothing normalises
+    /// anything: a caller who has moved the context (`.thread`, `~Ns`, `.cxr` through `execute`)
+    /// gets the stack they moved it to. Either way this is the same stack `backtrace` would print
+    /// from that context, not a separately-discovered crash stack.
     pub frames: Vec<FrameInfo>,
     /// Whether the stack went on past the cap.
     ///

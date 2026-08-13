@@ -2261,9 +2261,11 @@ impl WindbgServer {
     /// Reads the target and never writes to it, and leaves the session where it found it: the
     /// `!analyze -v` it runs by default would otherwise reset the selected scope, so the scope is
     /// saved and restored around the call.
-    /// The stack it reports is the target's default context — the crash, on a crash dump — not
-    /// wherever a caller had navigated to; with `analyze: false` it is whatever the session
-    /// currently has selected, the same one `backtrace` would show.
+    /// The stack it reports is the target's default context — the crash, on a crash dump —
+    /// whenever the `!analyze` actually ran, since running it is what resets the scope there.
+    /// With `analyze: false`, and in the cases where the analysis is skipped (no time left in the
+    /// call, no `ext.dll` on the engine), it is instead whatever the session has selected, the
+    /// same stack `backtrace` would show. `analysis.ran` says which of the two you got.
     #[rmcp::tool(
         annotations(
             title = "Triage a bug check",
