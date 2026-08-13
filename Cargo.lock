@@ -883,7 +883,7 @@ dependencies = [
 [[package]]
 name = "win-kexp"
 version = "0.1.0"
-source = "git+https://github.com/glslang/win-kexp?branch=main#84ee234c4eaefb1447f4bf800139a2d66c9e3b9f"
+source = "git+https://github.com/glslang/win-kexp?branch=main#d4aa1a5aa5c1e731ba12dfb7448800a0ff02e129"
 dependencies = [
  "byte-strings",
  "goblin",
@@ -896,7 +896,7 @@ dependencies = [
 
 [[package]]
 name = "windbg-mcp"
-version = "0.7.0"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "rmcp",
