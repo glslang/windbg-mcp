@@ -2258,30 +2258,31 @@ impl WindbgServer {
     /// and does not depend on `!analyze`'s attribution, which for such a driver is often wrong.
     /// `!analyze`'s own conclusions (pool tag, failure bucket, blamed module) travel beside them
     /// under `analysis`, so the two can be compared; pass `analyze: false` to skip it.
-    /// Reads the target and never writes to it, but with the default `analyze: true` it runs
-    /// `!analyze -v`, which on a bug check carrying an exception context selects that context and
-    /// leaves it selected — so a later `registers` or `backtrace` on the same session can see a
-    /// different thread than before. `analyze: false` touches nothing.
+    /// Reads the target and never writes to it, and leaves the session where it found it: the
+    /// `!analyze -v` it runs by default would otherwise reset the selected scope, so the scope is
+    /// saved and restored around the call.
+    /// The stack it reports is the target's default context — the crash, on a crash dump — not
+    /// wherever a caller had navigated to; with `analyze: false` it is whatever the session
+    /// currently has selected, the same one `backtrace` would show.
     #[rmcp::tool(
         annotations(
             title = "Triage a bug check",
-            // **Not read-only, and the distinction is the session rather than the target.**
-            // Nothing here writes to the debuggee. But `!analyze -v` selects the faulting context
-            // on the bug checks that carry one and leaves it selected, so two identical
-            // `backtrace` calls either side of a triage can differ — which is a change to the
-            // environment the other tools read, and is what this hint is about. `ioctl_trace` is
-            // annotated the same way for the same kind of reason: session state moves, nothing is
-            // harmed.
+            // **Read-only, and earned rather than assumed.** Nothing here writes to the debuggee,
+            // but until glslang/win-kexp#98 this said `false` anyway, because `!analyze -v` moves
+            // the session's selected scope and two identical `backtrace` calls either side of a
+            // triage could therefore differ — a change to what every other tool reads.
             //
-            // Per-tool rather than per-argument, so it describes the worst case: `analyze: false`
-            // really is a pure read, and cannot say so here.
+            // The measurement that settled it also corrected the reason. `!analyze` does not
+            // *select* a faulting context and leave it, as this comment used to claim: it ends
+            // with the scope at the target's **default**, discarding whatever the caller had
+            // chosen. (Four targets: `0x13A`, `0xD1`, `0x9F`, and a user-mode AV.) The implicit
+            // thread it really does move — visibly, on the `0x9F` — and really does put back.
             //
-            // It can be earned back by saving the scope around the `!analyze` and restoring it
-            // (`IDebugSymbols3::GetScope`/`SetScope`), which is a win-kexp primitive this does not
-            // have yet: glslang/win-kexp#98. Until then the honest annotation is this one — the
-            // alternative is a promise that cannot be verified on the bug checks where it matters,
-            // and no dump to hand carries an exception context to verify it against.
-            read_only_hint = false,
+            // So the scope is what needed a guard, and `crash_triage` now takes one for the whole
+            // call (`worker::crash_triage`): the analysis runs, the reads run at the default
+            // context, and the caller's scope is restored on the way out, including on the
+            // interrupt path. `ioctl_trace` keeps `false` for its own reasons — it is not this.
+            read_only_hint = true,
             destructive_hint = false,
             idempotent_hint = true,
             open_world_hint = true

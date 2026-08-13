@@ -34,8 +34,9 @@ offending frame. No elevation needed; works on System32's engine.
    fast, and it still names the bug check. It walks **whichever context the session has selected**,
    which on a freshly opened dump is the crash: only run it on a session where you have moved the
    context yourself (`.thread`, `~Ns`, `.cxr`) if that is the stack you meant. The default
-   `analyze: true` re-selects the faulting context on the bug checks that carry one — and, for the
-   same reason, leaves it selected afterwards, so a later `registers` / `backtrace` can differ.
+   `analyze: true` walks the **target's default** context instead, because the `!analyze -v` it
+   runs first resets the scope there — and your scope is put back before the call returns, so a
+   triage costs you nothing either way and a later `registers` / `backtrace` reads as before.
    — **`faulting_frame` is not always there, and `faulting_frame_note` says why.** It is *absent*
    (the key is omitted, as every optional field in this server's structured results is) for four
    different reasons, and only two of them are findings about the crash. **Read the note before

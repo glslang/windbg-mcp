@@ -1350,15 +1350,32 @@ fn crash_triage(
         }
     };
 
-    // **`!analyze` runs before the reads, not after**, and the ordering is load-bearing twice
-    // over. `!analyze -v` selects the faulting context — on an exception bug check (`0x8E`,
-    // `0x7E`, `0x3B`: the common driver crash) it `.cxr`s to the context record, which is a
-    // different stack from the one the dump opens on. Reading afterwards means the frames describe
-    // the thread the analysis blamed, which is the stack worth having. It also makes the tool
-    // idempotent: run twice, and the second call re-selects the same context before reading rather
-    // than reading whatever the first one left selected.
+    // **The scope is saved here and restored when this returns.** `!analyze -v` leaves the
+    // session's scope at the target's *default*, discarding whatever the caller had selected —
+    // measured on a `0x13A`, a `0xD1`, a `0x9F` and a user-mode AV (glslang/win-kexp#98). Nothing
+    // is written to the debuggee, but a `.frame 3` or `.ecxr` a caller set before calling this is
+    // gone afterwards, and that is a change to what every other tool on the session reads. The
+    // guard is what lets this tool be annotated read-only; it restores on every path out,
+    // including the interrupt return below.
     //
-    // With `analyze: false` nothing selects a context at all, and the reads describe whichever one
+    // Best-effort by design: the bug check above already read through this engine, so a scope that
+    // cannot be read here is not a state this can reach — and failing a triage over the bookkeeping
+    // around it would trade the whole answer for tidiness.
+    let _scope = e.scope_guard().inspect_err(|why| {
+        tracing::debug!("worker: crash triage could not save the debugger scope: {why}");
+    });
+
+    // **`!analyze` runs before the reads, not after**, and the ordering is load-bearing — though
+    // not for the reason it looks like. The analysis *does* go and look at the thread it blames:
+    // on the `0x9F` sample its output says `Implicit thread is now …` partway through, naming a
+    // thread that is not the one the dump opens on. But it puts that back before it returns, and
+    // leaves the scope at the default. So the reads below describe the **default context** — for
+    // a crash dump, the crash — whether or not the analysis ran, and running the analysis first
+    // is what guarantees that: it normalises a session a caller had navigated (`.frame`, `.cxr`)
+    // back to the default before the stack is walked, which is what makes two triages of one
+    // session agree.
+    //
+    // With `analyze: false` nothing normalises anything, and the reads describe whichever scope
     // the session currently has — the same one `backtrace` would show. On a freshly opened crash
     // dump that *is* the crash context; on a session where a caller has moved it (`.thread`,
     // `~Ns`, `.cxr`) it is wherever they moved it, and this mode has no way to tell. Said plainly

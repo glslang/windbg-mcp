@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`crash_triage` is read-only again, and now earns it**
+  ([win-kexp#98](https://github.com/glslang/win-kexp/issues/98)). It ran `!analyze -v` for the
+  fields no API returns — the pool tag, the failure bucket, the per-parameter notes — and paid for
+  them with the session's selected scope, which is why the tool was annotated
+  `read_only_hint = false` despite never writing to the debuggee. It now saves the scope and
+  restores it (win-kexp's new `ScopeGuard`), on every path out including the interrupt one, so a
+  `.frame` or `.cxr` a caller had chosen survives a triage.
+
+  The measurement that made this possible also **corrected the reason**, which had been wrong in
+  this repo's comments, its README and its `crash-dump` skill. `!analyze -v` does not select a
+  faulting context and leave it selected: it ends with the scope at the target's **default**,
+  discarding whatever the caller had chosen — measured on four targets (`0x13A`, `0xD1`, `0x9F`
+  and a user-mode access violation). The implicit *thread* it does move — visibly, on the `0x9F`,
+  where the thread it blames is not the one the dump opens on — and does put back.
+
+  So the stack `crash_triage` reports with `analyze: true` is the target's default context (the
+  crash, on a crash dump) rather than "the thread the analysis blamed", and it is that regardless
+  of where the caller had navigated, which is what makes two triages of one session agree. The
+  smoke tier checks the promise from a scope the analysis would otherwise discard — frame 3, since
+  a check starting at the default would pass whether the scope was restored or merely reset.
+
 ### Documentation
 
 - README documents installing with [Scoop](https://scoop.sh) from the community
