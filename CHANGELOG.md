@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A `profiles.json` with a **UTF-8 BOM** is read rather than refused. Windows PowerShell
+  5.1's `Set-Content -Encoding utf8` — the obvious way to write the one config file this
+  server asks a Windows user to write by hand — puts a BOM in front, and `serde_json`
+  rejected the whole file with `expected value at line 1 column 1`: a message that reads as
+  "your JSON is malformed" about a file whose JSON is perfect. Found by configuring a real
+  KDNET profile and having the first attempt refused.
+
 ## [0.8.0] - 2026-08-13
 
 ### Changed
