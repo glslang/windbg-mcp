@@ -560,7 +560,20 @@ fn read_profile_file(path: &Path) -> Result<BTreeMap<String, String>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
         Err(e) => return Err(format!("{} could not be read ({e})", path.display())),
     };
-    let parsed: serde_json::Value = serde_json::from_str(&text)
+    // **A leading UTF-8 BOM is not a broken file.** This is the one config file a Windows user
+    // writes by hand, and Windows PowerShell 5.1's own `Set-Content -Encoding utf8` — the obvious
+    // way to write it — puts a BOM in front. `serde_json` then rejects the whole file with
+    // "expected value at line 1 column 1", which reads as "your JSON is malformed" about a file
+    // whose JSON is perfect. Skipping it costs nothing and the alternative is a config that
+    // cannot be written with the platform's default text writer.
+    // **A leading UTF-8 BOM is not a broken file.** This is the one config file a Windows user
+    // writes by hand, and Windows PowerShell 5.1's own `Set-Content -Encoding utf8` — the obvious
+    // way to write it — puts a BOM in front. `serde_json` then rejects the whole file with
+    // "expected value at line 1 column 1", which reads as "your JSON is malformed" about a file
+    // whose JSON is perfect. Skipping it costs nothing and the alternative is a config that
+    // cannot be written with the platform's default text writer.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(text.as_str());
+    let parsed: serde_json::Value = serde_json::from_str(text)
         .map_err(|e| format!("{} is not valid JSON ({e})", path.display()))?;
     let object = parsed.as_object().ok_or_else(|| {
         format!(
@@ -1310,6 +1323,19 @@ mod tests {
         assert!(
             !parsed.contains_key("blank"),
             "an empty value is not a profile"
+        );
+
+        // Written the way Windows PowerShell 5.1 writes UTF-8: with a BOM in front. Not a
+        // hypothetical — it is what `Set-Content -Encoding utf8` produces, and before this was
+        // handled the file it wrote was rejected as malformed JSON.
+        let bom = dir.join("bom.json");
+        std::fs::write(&bom, format!("\u{feff}{{ \"ctf-vm\": \"{FAKE}\" }}")).unwrap();
+        assert_eq!(
+            read_profile_file(&bom)
+                .expect("a UTF-8 BOM is not a broken profile file")
+                .get("ctf-vm")
+                .map(String::as_str),
+            Some(FAKE)
         );
 
         let bad = dir.join("bad.json");
