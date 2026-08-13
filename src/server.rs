@@ -2276,10 +2276,11 @@ impl WindbgServer {
             // Per-tool rather than per-argument, so it describes the worst case: `analyze: false`
             // really is a pure read, and cannot say so here.
             //
-            // It could be earned back by saving the scope around the `!analyze` and restoring it
+            // It can be earned back by saving the scope around the `!analyze` and restoring it
             // (`IDebugSymbols3::GetScope`/`SetScope`), which is a win-kexp primitive this does not
-            // have yet. Until then the honest annotation is this one — the alternative is a
-            // promise that cannot be verified on the bug checks where it matters.
+            // have yet: glslang/win-kexp#98. Until then the honest annotation is this one — the
+            // alternative is a promise that cannot be verified on the bug checks where it matters,
+            // and no dump to hand carries an exception context to verify it against.
             read_only_hint = false,
             destructive_hint = false,
             idempotent_hint = true,
