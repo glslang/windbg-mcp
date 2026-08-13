@@ -108,7 +108,10 @@ process read out of the current `_EPROCESS` — asserted as `System`, because th
 `GetCurrentProcessExecutableName` answers `ntkrnlmp.exe` there for every process that has ever run
 and that regression is invisible in any other check. `!analyze`'s half is checked for coherence
 rather than for having run: a host with no `winext\ext.dll` has to say *why* the analysis is
-missing, not silently omit it.
+missing rather than silently omit it, and a run that *did* happen is checked for shape — that its
+parameter notes stay positional, and that the bucket is derived from the bug check code — rather
+than for exact strings, which belong to whichever `ext.dll` the host has and would fail this tier
+on a different WinDbg instead of on a change here.
 
 Those checks are made against **typed fields** wherever a tool has them (issue #84): the handle is
 read from `structuredContent`, not from a `session_id:` line; `nt` and `hal` are matched as module

@@ -403,6 +403,11 @@ mod tests {
                 query: PoolOp::census(None, None),
                 patience_ms: 0,
             },
+            EngineOp::CrashTriage {
+                frames: 16,
+                analyze: true,
+                patience_ms: 0,
+            },
             EngineOp::Batch(BatchOp {
                 budget_ms: 1_000,
                 patience_ms: 0,

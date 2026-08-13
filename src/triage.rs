@@ -184,6 +184,13 @@ pub enum Analysis {
     Unavailable(String),
     /// It ran. Carries the command that worked and its full output, to be extracted below.
     Ran { command: String, output: String },
+    /// It started, printed a recognisable analysis, and was cut short before it finished.
+    ///
+    /// A separate state from [`Self::Ran`] because the *missing* fields mean something different:
+    /// `!analyze` prints its summary block early, so a truncated run usually still carries the
+    /// code and the arguments, and a `pool_tag` that was simply never reached would otherwise be
+    /// indistinguishable from one `!analyze` decided the bug check does not have.
+    Truncated { command: String, output: String },
 }
 
 impl Analysis {
@@ -210,6 +217,24 @@ impl Analysis {
                 info.command = Some(command.clone());
                 info
             }
+            // `ran` is still true — it did run, and what it printed is real — with `truncated`
+            // carrying the qualification. Reporting it as not having run would throw away fields
+            // that are perfectly good, and reporting it as complete would lend the missing ones a
+            // meaning they have not earned.
+            Self::Truncated { command, output } => {
+                let mut info = extract(output);
+                info.ran = true;
+                info.truncated = true;
+                info.command = Some(command.clone());
+                info.note = Some(format!(
+                    "`{command}` was cut short by this call's deadline before it finished. What \
+                     it had printed is below and is sound as far as it goes, but a field missing \
+                     here may simply not have been reached — it is not `!analyze` saying there is \
+                     none. Raise WINDBG_MCP_CALL_TIMEOUT_SECS, or issue the triage on an idle \
+                     session, to get the whole analysis."
+                ));
+                info
+            }
         }
     }
 }
@@ -217,6 +242,7 @@ impl Analysis {
 fn empty_analysis() -> structured::AnalysisInfo {
     structured::AnalysisInfo {
         ran: false,
+        truncated: false,
         command: None,
         bug_check_name: None,
         pool_tag: None,
@@ -375,7 +401,10 @@ pub fn render(triage: &structured::CrashTriage) -> String {
             .as_ref()
             .and_then(|frame| frame.module.as_deref())
         {
-            Some(named) if named == module => {}
+            // Case-insensitively, as [`is_kernel_image`] compares: `!analyze` does not always
+            // spell `MODULE_NAME` the way the engine names the module, and a `messagemanager`
+            // beside a `MessageManager` is agreement, not the disagreement this line is for.
+            Some(named) if named.eq_ignore_ascii_case(module) => {}
             Some(_) => text.push_str(&format!(
                 "!analyze blamed: {module} (differs from the faulting frame above, which is \
                  computed from the module's load base — prefer it)\n"
@@ -802,6 +831,49 @@ FAILURE_BUCKET_ID:  0x9F_3
         );
     }
 
+    /// An analysis cut short by the deadline keeps what it printed and says it is partial — the
+    /// distinction that stops a field it never reached reading as a field `!analyze` ruled out.
+    #[test]
+    fn a_truncated_analysis_keeps_its_fields_and_says_it_is_partial() {
+        let cut_short = |analysis| {
+            report(
+                BugCheck {
+                    code: 0x13A,
+                    parameters: [0; 4],
+                },
+                &heap_corruption_frames(),
+                false,
+                None,
+                analysis,
+            )
+            .analysis
+        };
+        // `!analyze` prints its summary first, so a run cut off partway still carries real values.
+        let partial = "KERNEL_MODE_HEAP_CORRUPTION (13a)\nArg1: 0000000000000011, corrupt chunk\n";
+        let truncated = cut_short(Analysis::Truncated {
+            command: "!analyze -v".into(),
+            output: partial.into(),
+        });
+        assert!(truncated.ran, "it did run, and what it printed is real");
+        assert!(truncated.truncated);
+        assert_eq!(truncated.parameter_notes, vec!["corrupt chunk"]);
+        // The pool tag is absent because the run never reached it — which is exactly what the note
+        // has to say, or a caller reads "no pool tag" as `!analyze`'s conclusion.
+        assert!(truncated.pool_tag.is_none());
+        let note = truncated.note.expect("a truncated run explains itself");
+        assert!(note.contains("cut short"), "{note}");
+
+        // The same output from a run that finished says nothing about truncation, and its missing
+        // pool tag really is `!analyze`'s answer.
+        let complete = cut_short(Analysis::Ran {
+            command: "!analyze -v".into(),
+            output: partial.into(),
+        });
+        assert!(complete.ran);
+        assert!(!complete.truncated);
+        assert!(complete.note.is_none());
+    }
+
     /// A code this build's table does not know is still named, from `!analyze`'s header line —
     /// and the code itself is reported either way.
     #[test]
@@ -992,20 +1064,27 @@ FAILURE_BUCKET_ID:  0x9F_3
     /// frame, or the line would appear on every crash it got right.
     #[test]
     fn the_text_stays_quiet_when_analyze_agrees() {
-        let triage = report(
-            BugCheck {
-                code: 0x13A,
-                parameters: [0; 4],
-            },
-            &heap_corruption_frames(),
-            false,
-            None,
-            Analysis::Ran {
-                command: "!analyze -v".into(),
-                output: "MODULE_NAME: MessageManager\n".into(),
-            },
-        );
-        assert!(!render(&triage).contains("!analyze blamed"));
+        let blamed = |module_name: &str| {
+            render(&report(
+                BugCheck {
+                    code: 0x13A,
+                    parameters: [0; 4],
+                },
+                &heap_corruption_frames(),
+                false,
+                None,
+                Analysis::Ran {
+                    command: "!analyze -v".into(),
+                    output: format!("MODULE_NAME: {module_name}\n"),
+                },
+            ))
+            .contains("!analyze blamed")
+        };
+        assert!(!blamed("MessageManager"));
+        // `!analyze` does not always spell a module the way the engine names it, and a difference
+        // of case is not a difference of module.
+        assert!(!blamed("messagemanager"));
+        assert!(blamed("mpsdrv"));
     }
 
     /// With no frame to disagree with, `!analyze`'s attribution is the only guess there is — so it

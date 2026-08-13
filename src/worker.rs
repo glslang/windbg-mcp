@@ -1297,6 +1297,11 @@ fn crash_triage(
     patience: Duration,
     queued: Duration,
 ) -> Result<Output, Failed> {
+    // Started before the first engine read, not before the `!analyze`. Everything below is on the
+    // caller's clock, and the reads are not free — resolving a frame's symbol can pull a PDB over
+    // the network — so an `!analyze` that measured only its own elapsed time would be handed a
+    // budget the caller had mostly already spent.
+    let started = Instant::now();
     let bug_check = match e.bug_check() {
         Ok(Some(bug_check)) => bug_check,
         // A kernel target that did not bug check. Both cases are named because they want opposite
@@ -1346,7 +1351,16 @@ fn crash_triage(
     let attributed: Vec<AttributedFrame> = walked
         .into_iter()
         .map(|frame| AttributedFrame {
-            module: e.module_at(frame.instruction_offset).unwrap_or(None),
+            // A lookup that *failed* is folded into "no module", unlike in win-kexp where the two
+            // are kept apart: here the frame's address is reported either way, and failing a whole
+            // triage because one frame could not be attributed would cost far more than it saves.
+            module: e.module_at(frame.instruction_offset).unwrap_or_else(|why| {
+                tracing::debug!(
+                    "worker: crash triage could not attribute frame {}: {why}",
+                    frame.index
+                );
+                None
+            }),
             frame,
         })
         .collect();
@@ -1356,7 +1370,7 @@ fn crash_triage(
         .filter(|name| !name.trim().is_empty());
 
     let analysis = if analyze {
-        run_analyze(e, patience, queued)
+        run_analyze(e, patience, queued.saturating_add(started.elapsed()))
     } else {
         Analysis::NotRequested
     };
@@ -1372,15 +1386,39 @@ fn crash_triage(
 /// So the plain form is tried first and the qualified one is the fallback, and which one worked
 /// is reported rather than assumed.
 ///
-/// Both attempts share **one** deadline. Giving each the caller's full patience would let a slow
-/// first attempt plus a slow second one overrun the caller twice over, which is the arithmetic
-/// [`crate::batch`] does per step for the same reason.
-fn run_analyze(e: &DebugEngine, patience: Duration, queued: Duration) -> Analysis {
+/// **Both attempts share one deadline, and the second only runs if there is deadline left.**
+/// `watchdog_budget_ms` floors at [`WATCHDOG_HEADROOM`] — deliberately, because a command dequeued
+/// past its deadline must still be bounded by *something* — so two attempts taken unconditionally
+/// could between them run two floors past the moment their caller gave up. What has been spent is
+/// therefore checked against the caller's patience before the fallback rather than left to that
+/// floor, which is the arithmetic [`crate::batch`] does per step and for the same reason.
+///
+/// `before` is what the whole triage has already spent, not just what it queued for: the reads
+/// ahead of this can pull a PDB over the network, and an `!analyze` handed the full patience
+/// afterwards would run on past the caller either way.
+fn run_analyze(e: &DebugEngine, patience: Duration, before: Duration) -> Analysis {
     let started = Instant::now();
     let mut last: Option<String> = None;
-    for command in ["!analyze -v", "!ext.analyze -v"] {
-        let budget = watchdog_budget_ms(patience, queued.saturating_add(started.elapsed()));
-        match e.execute_command_bounded(command, budget) {
+    for (attempt, command) in ["!analyze -v", "!ext.analyze -v"].into_iter().enumerate() {
+        let spent = before.saturating_add(started.elapsed());
+        if attempt > 0 && spent >= patience {
+            last = Some(format!(
+                "{}; there was no time left to try `{command}` as well",
+                last.unwrap_or_else(|| "the first attempt produced nothing".to_string())
+            ));
+            break;
+        }
+        match e.execute_command_bounded(command, watchdog_budget_ms(patience, spent)) {
+            // Cut short by the watchdog. The output is *not* discarded — `!analyze` prints its
+            // summary block early, so a truncated run usually still carries the code and the
+            // arguments — but it is reported as truncated, because otherwise a `pool_tag` that was
+            // merely never reached is indistinguishable from one `!analyze` decided there was none.
+            Ok(run) if run.cut_short.is_some() && looks_analysed(&run.output) => {
+                return Analysis::Truncated {
+                    command: command.to_string(),
+                    output: run.output,
+                };
+            }
             // An engine without the extension answers with "No export analyze found" and an
             // otherwise empty result, which is a *successful* command that analysed nothing — so
             // emptiness, not the HRESULT, is what decides whether to try the other spelling.
