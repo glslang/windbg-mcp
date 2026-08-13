@@ -111,7 +111,8 @@ printed. It also pins the two ways that pairing can come apart, both of them mea
 engine rather than assumed. A filter using the wildcards `lm m` honours and this server does not
 (`[fd]`, `#`, `+`, `\`) is **refused**, rather than answered differently by each half — as is one
 containing a space, since `lm m` takes a single operand and reads the next token as its own
-options (`lm m nt v` prints the *verbose* listing for `nt`). And a filter can
+options (`lm m nt v` prints the *verbose* listing for `nt`), and one carrying a character outside
+ASCII, whose case this server and the engine may fold differently. And a filter can
 match only *unloaded* images — `nvhda` on this sample, which `lm` answers with twenty-six
 `nvhda64v.sys` rows and no loaded module — so those are checked as values in their own `unloaded`
 list, matched by image name (the only name they have), each carrying the engine's `unloaded` flag,

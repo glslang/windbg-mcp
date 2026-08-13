@@ -1849,6 +1849,10 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
         ),
         (r"n\t*", "the escape character, same grammar"),
         ("nt v", "a space, which `lm m` reads as its own option"),
+        (
+            "nté",
+            "a character outside the range this server folds case in",
+        ),
     ] {
         let refused = server.tool_failure(
             "modules",
