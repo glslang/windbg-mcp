@@ -133,16 +133,15 @@ scoop update windbg-mcp    # later; the manifest's checkver/autoupdate tracks re
 ```
 
 It unpacks the release zip and — when the `Microsoft.WinDbg` store package is installed on your
-machine — its `post_install` copies that package's engine DLLs (plus its `ttd\` and `winext\`
-subdirectories) next to the binary: most of the
+machine — its `post_install` copies that package's engine DLLs and its `ttd\`, `winext\` and
+`winxp\` subdirectories next to the binary: the whole
 [*Bundling the WinDbg engine*](#bundling-the-windbg-engine) step below, done for you on install and
 on every update. That copy is local, from a WinDbg you already installed; neither the release zip
 nor the bucket redistributes Microsoft's engine. Without that package you get the in-box `System32`
-engine: live and crash-dump debugging work, TTD `.run` replay and `!analyze` don't.
-
-The one thing `post_install` doesn't copy is **`winxp\kdexts.dll`**, so if you use the kernel driver
-tools (`driver_object` / `device_object` / `irp_stack`) run that last pair of lines below by hand,
-with `$dst` set to `…\scoop\apps\windbg-mcp\current`.
+engine: live and crash-dump debugging work, TTD `.run` replay, `!analyze` and the kernel driver
+tools don't. The copy happens at install time, so if you add WinDbg afterwards, re-run
+`post_install` with `scoop update --force windbg-mcp` (`scoop reset` won't — it only re-links) or
+copy the files by hand as below, with `$dst` set to `…\scoop\apps\windbg-mcp\current`.
 
 Point your MCP client at the `current` junction, so an update needs no config change:
 
