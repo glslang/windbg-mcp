@@ -1041,6 +1041,14 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
         ("pool_census", json!({}), "error"),
         ("pool_diagnostics", json!({}), "error"),
         ("crash_triage", json!({}), "error"),
+        // A well-formed request, so it takes the *session* refusal path like every row above it
+        // rather than the argument one — which this tool also has, and which is checked in
+        // `a_malformed_walk_is_refused_before_a_session_is_needed`.
+        (
+            "walk_memory",
+            json!({ "addresses": ["0xffff800000000000"] }),
+            "error",
+        ),
     ];
 
     let mut server = Server::started();
@@ -1162,6 +1170,52 @@ fn bad_calls_are_rejected_without_killing_the_session() {
     assert!(
         text.contains("METHOD_BUFFERED"),
         "the session must still work after bad calls, got:\n{text}"
+    );
+}
+
+/// `walk_memory`'s traversal arguments are exclusive, and — the part worth a wire test — the
+/// refusal happens **before a session is chosen**.
+///
+/// It is a fact about the request, not about a target, so a caller finds out now rather than after
+/// queueing behind whatever that session is busy with. Driven with nothing open at all: a check
+/// that reached the session registry would come back "no session" instead, and the two messages
+/// send a caller to opposite places.
+#[test]
+fn a_malformed_walk_is_refused_before_a_session_is_needed() {
+    let mut server = Server::started();
+
+    let both = server.call_tool(
+        "walk_memory",
+        json!({ "start": "0x1000", "stride": 8, "next_offset": 0 }),
+        STEP,
+    );
+    assert!(is_tool_error(&both), "two traversals must be refused");
+    let text = text_of(&both["result"]);
+    assert!(
+        text.contains("Pass one"),
+        "the refusal must name the conflict, got:\n{text}"
+    );
+    assert!(
+        !text.contains("session"),
+        "this is refused before any session is needed, got:\n{text}"
+    );
+    assert_eq!(
+        both["result"]["structuredContent"]["error"]["category"], "invalid_argument",
+        "a caller branches on the category, not the wording: {both}"
+    );
+
+    // And the cap is a refusal rather than a silent clamp, so "every node asked for was visited"
+    // is never about a count this server lowered.
+    let too_many = server.call_tool(
+        "walk_memory",
+        json!({ "start": "0x1000", "stride": 8, "count": 100_000 }),
+        STEP,
+    );
+    assert!(is_tool_error(&too_many), "a count past the cap is refused");
+    assert!(
+        text_of(&too_many["result"]).contains("at most"),
+        "the refusal must name the cap, got:\n{}",
+        text_of(&too_many["result"])
     );
 }
 
@@ -1506,6 +1560,159 @@ fn a_dump_session_opens_reads_and_closes() {
     assert!(
         is_tool_error(&after) || !after["error"].is_null(),
         "a handle from an ended session must be refused, got {after}"
+    );
+}
+
+/// An address that is unmapped on **any** Windows target, so a hole needs no knowledge of this
+/// particular dump.
+///
+/// The low 64 KB of every process is permanently reserved — that is what makes a null-pointer
+/// dereference an access violation rather than a read — so nothing is ever mapped here, in user
+/// mode or in the user half of a kernel target's address space.
+const UNMAPPED: &str = "0x1000";
+
+/// The claim [#103](https://github.com/glslang/windbg-mcp/issues/103) is about, made against a
+/// real engine: a walk with a hole in it comes back with the hole *marked* and everything after it
+/// still walked.
+///
+/// The contrast is the point, so it is asserted rather than described. The same dereference
+/// through `execute` — which is how this was done before — fails outright, and a `.for` loop
+/// around it takes the whole script down with it, leaving no rows and no iteration number. That
+/// failure is what cost a MessageManager session an afternoon of hand-bisecting a 512-entry table.
+///
+/// Everything here is read-only against the checked-in dump, and the one address it assumes
+/// anything about is [`UNMAPPED`], which is unmapped on every Windows target there is.
+#[test]
+fn a_walk_marks_what_it_cannot_read_and_keeps_going() {
+    let Some(dump) = target_tier() else { return };
+    let mut server = Server::started();
+    let session_id = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+
+    // The two anchors of a kernel dump's module list, used as addresses that certainly *are*
+    // readable — the alternative is a literal, and a literal would make this test a fact about
+    // one file.
+    let modules = server.tool_data("modules", json!({ "session_id": session_id }), TARGET_STEP);
+    let base = |want: &str| -> String {
+        modules["modules"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|m| m["name"] == want)
+            .and_then(|m| m["start"].as_str())
+            .unwrap_or_else(|| panic!("the module list should include `{want}`: {modules}"))
+            .to_string()
+    };
+    let (nt, hal) = (base("nt"), base("hal"));
+
+    // The old way, first, so the improvement is measured rather than claimed: one unreadable
+    // dereference is a failed call with nothing in it.
+    let old = server.call_tool(
+        "execute",
+        json!({ "session_id": session_id, "command": format!("? poi({UNMAPPED})") }),
+        TARGET_STEP,
+    );
+    assert!(
+        is_tool_error(&old),
+        "the premise of #103 is that this fails; if it no longer does, this test is measuring \
+         nothing:\n{}",
+        text_of(&old["result"])
+    );
+
+    // The new way: the same address, in the middle of a list, is one row.
+    let walk = server.tool_data(
+        "walk_memory",
+        json!({
+            "session_id": session_id,
+            "addresses": [nt, UNMAPPED, hal],
+        }),
+        TARGET_STEP,
+    );
+    assert_eq!(walk["mode"], "list", "{walk}");
+    assert_eq!(
+        walk["walked"], 3,
+        "the hole must not shorten the walk: {walk}"
+    );
+    assert_eq!(walk["unreadable"], 1, "{walk}");
+    assert_eq!(walk["stopped"]["reason"], "complete", "{walk}");
+    let node = |i: usize| walk["nodes"][i].clone();
+    assert_eq!(node(1)["readable"], false, "{walk}");
+    assert!(
+        node(1)["fields"][0]["value"].is_null(),
+        "an unreadable value is absent, not zero: {walk}"
+    );
+    for i in [0, 2] {
+        assert_eq!(node(i)["readable"], true, "{walk}");
+        // Both anchors are PE images, so the qword at their base carries `MZ` — which is what
+        // makes this a real read of the target rather than an address echoed back.
+        let value = address_of(&node(i)["fields"][0]["value"]);
+        assert_eq!(
+            value & 0xffff,
+            0x5a4d,
+            "node {i} should read the `MZ` at a module base: {walk}"
+        );
+    }
+
+    // Array mode over the same header, with narrow fields: `e_magic` is two bytes and `e_lfanew`
+    // four, and reading them at their own widths is what a caller does to a real structure.
+    let header = server.tool_data(
+        "walk_memory",
+        json!({
+            "session_id": session_id,
+            "start": nt,
+            "stride": 0,
+            "count": 1,
+            "fields": [
+                { "name": "e_magic", "offset": 0, "size": 2 },
+                { "name": "e_lfanew", "offset": 0x3c, "size": 4 },
+            ],
+        }),
+        TARGET_STEP,
+    );
+    assert_eq!(header["mode"], "array", "{header}");
+    assert_eq!(
+        address_of(&header["nodes"][0]["fields"][0]["value"]),
+        0x5a4d,
+        "{header}"
+    );
+    let lfanew = address_of(&header["nodes"][0]["fields"][1]["value"]);
+    assert!(
+        (0x40..0x400).contains(&lfanew),
+        "`e_lfanew` should point at the PE header just past the DOS stub, got {lfanew:#x}: \
+         {header}"
+    );
+
+    // A chain is the one traversal a hole really does stop — the address after it lived in the
+    // bytes that would not read — and it has to say which node rather than come back empty.
+    let chain = server.tool_data(
+        "walk_memory",
+        json!({
+            "session_id": session_id,
+            "start": UNMAPPED,
+            "next_offset": 0,
+        }),
+        TARGET_STEP,
+    );
+    assert_eq!(chain["mode"], "chain", "{chain}");
+    assert_eq!(
+        chain["walked"], 1,
+        "the node it could not read is still a row: {chain}"
+    );
+    assert_eq!(chain["stopped"]["reason"], "unreadable_link", "{chain}");
+    assert_eq!(
+        chain["stopped"]["at"], "0x0000000000001000",
+        "the stop names the node, so a caller knows where to look: {chain}"
+    );
+    // Nothing read at all is the one answer this tool cannot make on its own, so the engine's
+    // reason rides along with it.
+    assert!(
+        chain["note"].as_str().is_some_and(|n| !n.is_empty()),
+        "a walk that read nothing has to explain itself: {chain}"
+    );
+
+    server.tool_data(
+        "end_session",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
     );
 }
 

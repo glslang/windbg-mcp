@@ -31,7 +31,7 @@ already does the job.
 | Group | Tools |
 |-------|-------|
 | Session | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `end_session`, `session_status` |
-| State | `registers`, `read_memory`, `backtrace`, `modules`, `threads`, `disassemble`, `dx` |
+| State | `registers`, `read_memory`, `walk_memory`, `backtrace`, `modules`, `threads`, `disassemble`, `dx` |
 | Control | `go`, `step_over`, `step_into`, `set_breakpoint`, `run_to_address` |
 | Transaction | `debug_batch` — an ordered sequence with assertions and a rollback the engine runs, not the client |
 | TTD nav | `step_back` (`t-`), `step_over_back` (`p-`), `reverse_go` (`g-`), `goto_position` (`!tt`) |
@@ -129,6 +129,14 @@ inside the debugger, so a batch built from long steps waits out the one it is in
   `open_dump` runs `.load ext` for you.
 - **`read_memory` takes a numeric/`0x`-hex address only.** For a register/symbol
   expression use `execute` with `db`/`dd` (e.g. `db @rip`).
+- **Never walk a list with a MASM `.for` loop — use `walk_memory`.** One unmapped `poi` aborts
+  the *whole* script with `0x80040205` and returns nothing, so a table with one freed entry in it
+  tells you only that something failed. `walk_memory` marks the hole and keeps going. Name the
+  nodes with `addresses` (an explicit list), `start` + `stride` (an array), or `start` +
+  `next_offset` (a chain), and `fields` to read out of each; offsets may be negative, so a pool
+  header at `-16` is an argument. A chain is the one walk a hole stops — it says which node —
+  and it also reports null links, loops (with where the list closed), and the resume address
+  when it hits `count`.
 - **Single-stepping needs a live thread context** — valid only once the target is stopped
   after a `go`/step or a breakpoint hit. Stepping straight after `goto_position 0` (before
   any thread is live) returns `0x80040205`; `go` to a breakpoint first.

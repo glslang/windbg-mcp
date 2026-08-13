@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::batch::BatchOp;
 use crate::kdconn::Connection;
+use crate::walk::WalkOp;
 
 /// One unit of debugger work, as it crosses the process boundary.
 ///
@@ -112,6 +113,20 @@ pub enum EngineOp {
         address: String,
         size: u32,
     },
+    /// A structure traversal: a list of addresses, an array, or a pointer chain, with named
+    /// fields read out of every node ([`crate::walk`]).
+    ///
+    /// One indivisible job for the usual reason and one of its own. The usual one: it is up to a
+    /// thousand reads, and letting another call for the same session interleave would let the
+    /// table describe a target that moved between its rows. Its own: the walk is a **long run of
+    /// reads with no command behind it**, so win-kexp's watchdog — which bounds an `Execute` —
+    /// has nothing to bound. The only thing that keeps it inside its caller's wait is the
+    /// deadline it checks between nodes, and that arithmetic needs the queue wait only the worker
+    /// can see.
+    ///
+    /// `patience_ms` lives inside [`WalkOp`], filled in and derived exactly as
+    /// [`Self::BoundedCommand`]'s is.
+    Walk(WalkOp),
     SymbolPath {
         path: String,
         append: bool,
@@ -227,6 +242,7 @@ impl EngineOp {
             Self::BoundedCommand { patience_ms, .. }
             | Self::Pool { patience_ms, .. }
             | Self::CrashTriage { patience_ms, .. }
+            | Self::Walk(WalkOp { patience_ms, .. })
             | Self::Batch(BatchOp { patience_ms, .. }) => Some(patience_ms),
             _ => None,
         }
@@ -408,6 +424,10 @@ mod tests {
                 analyze: true,
                 patience_ms: 0,
             },
+            EngineOp::Walk(
+                WalkOp::new(Some(vec!["0x1000".into()]), None, None, None, None, None)
+                    .expect("a one-address walk"),
+            ),
             EngineOp::Batch(BatchOp {
                 budget_ms: 1_000,
                 patience_ms: 0,

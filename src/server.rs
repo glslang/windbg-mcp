@@ -24,6 +24,7 @@ use crate::kdconn;
 use crate::proto::{EngineOp, Output, PoolOp, ReachabilityOp};
 use crate::structured::{self, ErrorCategory, Outcome, TargetCreated};
 use crate::ttd;
+use crate::walk;
 
 /// How long to wait for an execution-control command (go/step/reverse) to reach its
 /// next stop (ms).
@@ -1255,6 +1256,39 @@ pub struct ReadMemoryArgs {
     pub address: String,
     /// Number of bytes to read.
     pub size: u32,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct WalkMemoryArgs {
+    /// Walk these addresses exactly, in this order. The bulk read: pass the pointers you already
+    /// have and get a value for each, with the unreadable ones marked instead of ending the walk.
+    /// Each is decimal, "0x"-hex, or the debugger's backtick form ("ffffc00f`6ec02f90"); a bare
+    /// run of 8+ hex digits is read as hex. Mutually exclusive with `start`.
+    #[serde(default)]
+    pub addresses: Option<Vec<String>>,
+    /// Where an array or a chain starts. An address, or any expression `?` evaluates — a symbol
+    /// ("MessageManager!g_Table"), an offset from one, or "poi(<head>)" when the list head is a
+    /// link rather than a node. Needs `stride` or `next_offset` beside it.
+    #[serde(default)]
+    pub start: Option<String>,
+    /// Array mode: bytes from one element to the next. Negative walks downwards.
+    #[serde(default)]
+    pub stride: Option<i64>,
+    /// Chain mode: byte offset within a node of the pointer to the next node (0 for a
+    /// `_LIST_ENTRY.Flink` at the top of the structure).
+    #[serde(default)]
+    pub next_offset: Option<i64>,
+    /// Most nodes to walk (default 64, max 1024). Not for `addresses`, which is its own count.
+    #[serde(default)]
+    pub count: Option<u32>,
+    /// Values to read out of each node. Omit for one pointer at offset 0 — or, for a chain,
+    /// nothing beyond the links it already reports.
+    #[serde(default)]
+    pub fields: Option<Vec<walk::FieldArg>>,
     /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
     /// refuse the call if this server's debug target has been replaced since you opened it.
     #[serde(default)]
@@ -2690,6 +2724,65 @@ impl WindbgServer {
         engine_result(out)
     }
 
+    /// Walk a structure and read named fields out of every node — **without one unreadable
+    /// address ending the walk**.
+    /// This is the tool for a list, a handle table or a pointer array where some entries are
+    /// freed: a MASM `.for` loop through `execute` aborts on the first unmapped dereference with
+    /// `0x80040205` and no partial output, which loses exactly the node worth looking at. Here an
+    /// unreadable value is `null` in its own field, an unreadable node is counted, and the walk
+    /// carries on.
+    /// Three ways to name the nodes, one of them required: `addresses` (an explicit list — the
+    /// bulk read), `start` + `stride` (an array), or `start` + `next_offset` (a pointer chain).
+    /// `fields` says what to read from each node; offsets may be negative, so a pool header at
+    /// -16 is one argument.
+    /// A chain is the exception to "a hole does not stop it": a node whose next pointer will not
+    /// read has no address after it, so the walk stops and says which node. It also stops on a
+    /// null link, on a loop (reporting where the list closed — at the head that is a healthy
+    /// circular `_LIST_ENTRY`, anywhere else it is corruption), and at `count`, where it hands
+    /// back the address to resume from.
+    /// Two calls answer the usual question: walk the table for the object pointers, then walk
+    /// those pointers as `addresses` for their fields.
+    #[rmcp::tool(
+        annotations(
+            title = "Walk a structure in memory",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::MemoryWalk>>()
+    )]
+    async fn walk_memory(
+        &self,
+        Parameters(args): Parameters<WalkMemoryArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // `start` is interpolated into a `?`, so it is an operand like every other one this
+        // server builds a command around.
+        if let Some(start) = &args.start
+            && let Err(e) = reject_command_breakers("start", start, Quotes::Rejected)
+        {
+            return typed_error(ErrorCategory::InvalidArgument, e, args.session_id);
+        }
+        let op = match walk::WalkOp::new(
+            args.addresses,
+            args.start,
+            args.stride,
+            args.next_offset,
+            args.count,
+            args.fields,
+        ) {
+            Ok(op) => op,
+            // Refused here, before a session is chosen. Every one of these is a fact about the
+            // request rather than about a target, so a caller learns about it now instead of
+            // after queueing behind whatever that session is busy with.
+            Err(why) => return typed_error(ErrorCategory::InvalidArgument, why, args.session_id),
+        };
+        let out = self
+            .run(args.session_id.as_deref(), EngineOp::Walk(op))
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
     /// Show the call stack of the current thread (`k`).
     #[rmcp::tool(annotations(
         title = "Show call stack",
@@ -3550,7 +3643,13 @@ mod tests {
             assert_eq!(ann(name).destructive_hint, Some(true), "`{name}`");
         }
 
-        for name in ["read_memory", "backtrace", "modules", "decode_ioctl"] {
+        for name in [
+            "read_memory",
+            "walk_memory",
+            "backtrace",
+            "modules",
+            "decode_ioctl",
+        ] {
             assert_eq!(
                 ann(name).read_only_hint,
                 Some(true),

@@ -1,12 +1,13 @@
 # Follow-ups
 
-Deferred work, in five clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in six clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/win-kexp#71, 2026-08-01), items 13–14 from the bounded-command coverage review
-(#46, 2026-08-02), item 15 from the private worker channel (#65 / #72, 2026-08-04), and items 16–18
+(#46, 2026-08-02), item 15 from the private worker channel (#65 / #72, 2026-08-04), items 16–18
 from transactional batches (#82, 2026-08-09/10 — item 17 is what validating the tool against the CTF
-session's own transcript turned up, and item 18 what reviewing it did). Each item notes its repo,
+session's own transcript turned up, and item 18 what reviewing it did), and item 19 from
+`walk_memory` (#103, 2026-08-13). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -488,3 +489,24 @@ killed outright still gets the rollback rather than a truncated transaction.
   running" unreachable and the remaining-budget figure the grace is sized from, and the dump tier
   drives both teardowns end to end — the disconnect one asserting against a file the rollback wrote,
   because by then there is no client, supervisor or worker left to ask.
+
+## 19. [windbg-mcp] Let a `debug_batch` step walk a structure
+
+`walk_memory` (#103) is a supervisor-validated op like the pool queries, and item 17 already built
+the machinery a batch needs to call one: a `StepAction` variant, a `Debuggee` method, and a
+rendering the step's `expect` checks can match on. It was left out because the two tools answer
+different questions — a batch exists so that a *mutation* is undone on every path, and a walk
+mutates nothing.
+
+Where it would earn its place is the assertion half. A batch that patches a driver's dispatch table
+and has to prove it put every entry back currently asserts on `execute` text, which is exactly the
+all-or-nothing read this issue removed everywhere else: one unreadable entry and the assertion fails
+for a reason that has nothing to do with the restore. A `walk` step whose `expect` matched on the
+rendered table would state the postcondition as what it is — "these sixteen pointers are these
+sixteen values" — instead of on a command that may not survive being asked.
+
+Picks up at `batch::StepAction` (the variant and its `owns` keys), `batch::Debuggee::walk`
+alongside `pool`, and `worker::walk_memory`, which already returns the text a check would run
+against. The one design question is the budget: a walk step is up to 1024 reads inside a
+transaction whose whole point is that its rollback still fits, so the step's share has to come out
+of the batch's deadline the way `pool`'s does rather than out of the call's.

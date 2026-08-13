@@ -589,8 +589,11 @@ so the loop is deliberately KD-free and reads the crash afterwards:
   enlarging its `memcpy` to widen the mutex hold silently no-ops the call. The missing-inc window is a
   few instructions; millions of cross-move attempts win it, one-per-message does not (§8).
 - **A single unmapped `poi` aborts a whole `execute` script with `0x80040205`** — walking a list where
-  some nodes point at freed/unmapped chunks fails opaquely with no partial result. Read defensively
-  (bisect the range, or print pointers without dereferencing first) rather than trusting one big walk.
+  some nodes point at freed/unmapped chunks fails opaquely with no partial result. That is what cost
+  this session an afternoon of hand-bisecting the 512-entry handle table, and it is now
+  [fixed](https://github.com/glslang/windbg-mcp/issues/103): use **`walk_memory`**, which reads each
+  value on its own and marks the holes instead of aborting. The table above is two calls — the slots
+  as an array for their `msg*`, then those pointers as `addresses` for their refcount and links.
 - **A full pool walk is expensive on a *live* KDNET target** — `pool_find_tag`/`pool_census`
   traverse every free tree node-by-node over the wire, and a live target mutates the lists under
   the walk (stale pointers get chased, diagnostics balloon), so the call can exceed the engine
