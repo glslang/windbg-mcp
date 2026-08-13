@@ -33,6 +33,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`modules` takes a `filter`**, so "where is that driver loaded?" costs one row rather than the
+  whole table ([#105](https://github.com/glslang/windbg-mcp/issues/105)). A plain name matches
+  anywhere in a module name — `{"filter": "MessageManager"}` — and `*`/`?` work as `lm m` reads
+  them, for the caller who means to anchor. The pattern is normalised **once** and used for both
+  halves of the answer: the text is `lm m <pattern>` and the values are this server's own match
+  over the engine's module list, so the rows and the count can never describe different sets. The
+  answer still carries `loaded`, the size of the whole inventory, and echoes the `filter` as
+  applied rather than as typed.
+
+  A filter that matches nothing is an answer rather than an error, and says so in words — `lm m`
+  prints *nothing at all* in that case, which reads as a target with no modules — naming the
+  mistake callers actually make: the pattern matches the name symbols are qualified by (`nt`), not
+  the image file (`ntkrnlmp.exe`). An empty filter, and one carrying a `;` that would end the
+  command it is interpolated into, are refused before a session is touched.
+
 - **`walk_memory`: a structure traversal where an unreadable node is a row, not an end**
   ([#103](https://github.com/glslang/windbg-mcp/issues/103)). Walking a kernel list through
   `execute` was all-or-nothing — one unmapped dereference inside a MASM `.for` loop ended the

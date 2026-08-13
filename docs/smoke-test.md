@@ -101,6 +101,15 @@ which DbgEng implements only in user mode, so on a kernel dump it must come back
 carrying the engine's message** — not a JSON-RPC error, and not a dead session. Read-only
 throughout, and it needs no symbols, so it runs offline.
 
+It checks what an **open** hands back, which is a summary rather than the module table: the count
+and the kernel's base against `modules`, the bug check against `crash_triage`, and the report
+itself against the table it replaced — it has to be the shorter of the two. And it checks
+`modules { "filter": … }` from both ends at once, because the two halves of that answer are two
+implementations of one pattern: the text is `lm m <pattern>`, the values are this server's own
+match over the engine's module list, and every module the values report has to be one the text
+printed. The refusals are here too — a filter that narrows by nothing, and one carrying a `;` that
+would end the `lm m` it is interpolated into.
+
 It also triages the dump's bug check (`crash_triage`), which is the one place the tier depends on
 the sample being a *crash* dump rather than any dump: the `0x9F` code and its four parameters read
 through `ReadBugCheckData`, the stack walked and attributed to `nt` by load base, and the crashing

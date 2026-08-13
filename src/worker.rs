@@ -1077,7 +1077,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             timeout_ms,
         } => resumed(e, &command, timeout_ms),
         EngineOp::Registers { all } => registers(e, all),
-        EngineOp::Modules => modules(e),
+        EngineOp::Modules { filter } => modules(e, filter.as_deref()),
         EngineOp::SetBreakpoint { expression } => set_breakpoint(e, &expression),
         EngineOp::ReadMemory { address, size } => read_memory(e, &address, size)
             .map(Output::text)
@@ -1319,17 +1319,116 @@ fn registers(e: &DebugEngine, all: bool) -> Result<Output, Failed> {
     ))
 }
 
-/// The loaded modules, as `lm` renders them and as values beside them.
-fn modules(e: &DebugEngine) -> Result<Output, Failed> {
-    let text = e.execute_command("lm").map_err(failed)?;
-    let modules = e.modules().map_err(failed)?;
+/// The loaded modules, as `lm` renders them and as values beside them — optionally narrowed to
+/// the ones whose name matches a pattern.
+///
+/// **One pattern reaches both channels.** The text comes from `lm m <pattern>` and the values from
+/// this server's own match over the engine's module list, so the pattern is normalised *once*,
+/// here, and the same string is used for each. Normalising per channel — or letting the text use
+/// the caller's spelling and the values a tidied one — is how a listing ends up showing rows its
+/// own count disagrees with.
+fn modules(e: &DebugEngine, filter: Option<&str>) -> Result<Output, Failed> {
+    let pattern = filter.map(module_pattern);
+    let text = match &pattern {
+        Some(pattern) => e.execute_command(&format!("lm m {pattern}")),
+        None => e.execute_command("lm"),
+    }
+    .map_err(failed)?;
+    let all = e.modules().map_err(failed)?;
+    let matched: Vec<structured::ModuleInfo> = all
+        .iter()
+        .filter(|module| {
+            pattern
+                .as_deref()
+                .is_none_or(|pattern| matches_module_pattern(pattern, &module.name))
+        })
+        .map(structured::ModuleInfo::from)
+        .collect();
+    let text = match &pattern {
+        Some(pattern) => format!(
+            "{}{}",
+            text.trim_end(),
+            narrowing_note(pattern, matched.len(), all.len())
+        ),
+        None => text,
+    };
     Ok(Output::typed(
         text,
         structured::ModuleList {
-            loaded: modules.len(),
-            modules: modules.iter().map(structured::ModuleInfo::from).collect(),
+            loaded: all.len(),
+            filter: pattern,
+            modules: matched,
         },
     ))
+}
+
+/// The pattern a `filter` argument really means.
+///
+/// A bare name matches **anywhere in** a module name, because that is what a caller asking for
+/// `MessageManager` wants and what every other `filter` in this server does
+/// ([`crate::proto::PoolOp::Diagnostics`] is a case-insensitive substring too). A filter that
+/// already carries `*` or `?` is somebody writing a `lm m` pattern deliberately, and it is left
+/// exactly as written — including the anchored form `nt`, which they can ask for as `nt` with no
+/// wildcards... which this would widen. Hence the rule: wildcards mean "I know what I am doing",
+/// no wildcards means "find this".
+fn module_pattern(filter: &str) -> String {
+    let filter = filter.trim();
+    if filter.contains(['*', '?']) {
+        filter.to_string()
+    } else {
+        format!("*{filter}*")
+    }
+}
+
+/// Whether a module name matches a `lm m` pattern: `*` for any run, `?` for one character, case
+/// insensitive.
+///
+/// Written out rather than delegated to the engine because the *values* have to be filtered here —
+/// there is no DbgEng call that lists modules matching a pattern, only a command that prints them.
+/// This is the same match `lm m` performs, which is what keeps the two halves of one answer
+/// describing one set.
+fn matches_module_pattern(pattern: &str, name: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let name: Vec<char> = name.chars().collect();
+    // The standard greedy walk: take the last `*` as the point to give ground at, so a pattern
+    // that runs out of name backtracks to it instead of failing outright.
+    let (mut p, mut n) = (0, 0);
+    let (mut star, mut resume) = (None, 0);
+    while n < name.len() {
+        if p < pattern.len() && (pattern[p] == '?' || pattern[p].eq_ignore_ascii_case(&name[n])) {
+            p += 1;
+            n += 1;
+        } else if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            resume = n;
+            p += 1;
+        } else if let Some(star) = star {
+            resume += 1;
+            n = resume;
+            p = star + 1;
+        } else {
+            return false;
+        }
+    }
+    pattern[p..].iter().all(|c| *c == '*')
+}
+
+/// What a narrowed listing says about the narrowing, under whatever `lm m` printed.
+///
+/// The no-match case is the one worth writing prose for: `lm m` prints **nothing at all** when its
+/// pattern matches nothing, so a filtered call used to be indistinguishable from a target with no
+/// modules, or from a call that silently failed. It also names the one thing a caller most often
+/// gets wrong — that the pattern matches the *module name* (`nt`), not the image file
+/// (`ntkrnlmp.exe`).
+fn narrowing_note(pattern: &str, matched: usize, loaded: usize) -> String {
+    if matched == 0 {
+        return format!(
+            "\nNo module name matches `{pattern}`; {loaded} module(s) are loaded. The pattern \
+             matches the name symbols are qualified by — `nt`, not `ntkrnlmp.exe` — with `*` and \
+             `?` as wildcards. Omit `filter` for the whole table."
+        );
+    }
+    format!("\n\n{matched} of {loaded} module(s) match `{pattern}`.")
 }
 
 /// Everything a bug check is, gathered as one indivisible job.
@@ -2949,10 +3048,14 @@ fn summary_text(diagnostic: &str, summary: &structured::TargetSummary) -> String
     if let Some(loaded) = summary.modules_loaded {
         lines.push(match &summary.primary_module {
             Some(module) => format!(
-                "{loaded} module(s) loaded, {} at {}; `modules` lists the table.",
+                "{loaded} module(s) loaded, {} at {}; `modules` lists the table and \
+                 `modules {{ \"filter\": \"<name>\" }}` answers for one.",
                 module.name, module.start
             ),
-            None => format!("{loaded} module(s) loaded; `modules` lists the table."),
+            None => format!(
+                "{loaded} module(s) loaded; `modules` lists the table and \
+                 `modules {{ \"filter\": \"<name>\" }}` answers for one."
+            ),
         });
     }
     let diagnostic = diagnostic.trim_end();
@@ -3982,6 +4085,67 @@ mod tests {
             !out.starts_with('\n'),
             "no blank lead-in when there is nothing above it: {out:?}"
         );
+    }
+
+    // ---- narrowing a module listing ----------------------------------------
+
+    /// A `filter` a caller types as a name finds that name **anywhere**, which is what makes
+    /// `{"filter": "MessageManager"}` answer "where is that driver loaded" rather than nothing.
+    #[test]
+    fn a_filter_without_wildcards_is_a_substring() {
+        assert_eq!(module_pattern("MessageManager"), "*MessageManager*");
+        assert_eq!(module_pattern("  nt  "), "*nt*");
+        // …and one with wildcards is a pattern the caller wrote deliberately, left alone.
+        assert_eq!(module_pattern("nt*"), "nt*");
+        assert_eq!(module_pattern("*"), "*");
+        assert_eq!(module_pattern("k?32"), "k?32");
+    }
+
+    /// The match this server performs over the *values* has to be the match `lm m` performs over
+    /// the text, or one answer's two halves describe two different sets of modules.
+    #[test]
+    fn a_module_pattern_matches_the_way_lm_m_does() {
+        // Case-insensitive, and `*` spans any run — including an empty one.
+        assert!(matches_module_pattern("*nt*", "nt"));
+        assert!(matches_module_pattern("*nt*", "ntfs"));
+        assert!(matches_module_pattern("*NT*", "WinNT"));
+        assert!(matches_module_pattern("*", "anything"));
+        assert!(matches_module_pattern("nt", "NT"));
+
+        // Anchored where the caller anchored it.
+        assert!(matches_module_pattern("nt*", "ntoskrnl"));
+        assert!(!matches_module_pattern("nt*", "WinNT"));
+        assert!(!matches_module_pattern("nt", "ntfs"));
+
+        // `?` is exactly one character, and a pattern that runs out of name does not match.
+        assert!(matches_module_pattern("k?32", "k132"));
+        assert!(!matches_module_pattern("k?32", "k32"));
+        assert!(!matches_module_pattern("*manager", "MessageManagerX"));
+
+        // The backtracking case: the first `*` has to give ground for the tail to land.
+        assert!(matches_module_pattern("*a*b", "xaybzb"));
+        assert!(!matches_module_pattern("*a*b", "xayb z"));
+    }
+
+    /// `lm m` prints **nothing** when its pattern matches nothing, so a filtered call that found
+    /// no module has to say so itself — otherwise it is indistinguishable from a target with no
+    /// modules at all, or from a call that quietly failed.
+    #[test]
+    fn a_filter_that_matches_nothing_says_so_rather_than_printing_nothing() {
+        let note = narrowing_note("*nosuch*", 0, 227);
+        assert!(note.contains("*nosuch*"), "{note}");
+        assert!(
+            note.contains("227"),
+            "the inventory is still a fact worth having: {note}"
+        );
+        assert!(
+            note.contains("ntkrnlmp.exe"),
+            "it must name the mistake a caller actually makes — filtering on the image: {note}"
+        );
+
+        // And a listing that did match says how much of the table it is showing.
+        let note = narrowing_note("*nt*", 3, 227);
+        assert!(note.contains("3 of 227"), "{note}");
     }
 
     // ---- what an opener says about the target (#105) ------------------------
