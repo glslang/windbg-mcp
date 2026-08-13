@@ -613,7 +613,7 @@ timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressio
   reports the **neighbouring** chunks, which is what tells you what a reclaim would land next to. `pool_diagnostics` returns the walk's own diagnostics filtered by substring: a real walk emits tens of thousands across a hundred-plus categories, so any per-call summary truncates and the one line explaining a specific heap is never in the truncated head — filter by a heap address or a phrase to reach it.
 - **`crash_triage` reads a bug check two ways, and keeps them apart.** The code and its parameters
   (`ReadBugCheckData`), the stack, each frame's module, and the crashing process (out of the current
-  `_EPROCESS`'s audit name — its full image path, not the 15-byte `ImageFileName` that turns
+  `_EPROCESS`'s audit name — the full image name, not the 15-byte `ImageFileName` that turns
   `mm_exploit_v5.exe` into `mm_exploit_v5.`) are engine reads. The pool tag, the
   failure bucket, the blamed module and the per-parameter explanations exist nowhere but `!analyze`'s
   own output, so they are extracted from it and confined to the `analysis` object. **Prefer
