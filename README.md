@@ -620,9 +620,12 @@ timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressio
   `faulting_frame` to `analysis.module_name`**: the frame's `module+RVA` is computed from the load
   base and is right for a driver with no PDB, which is exactly where `!analyze`'s attribution goes
   wrong. **Which frame is the culprit is still a guess, though — only the offset is computed.**
-  `faulting_frame` is the innermost frame outside `nt`/`hal` and the framework layers that sit on a
-  stack on somebody else's behalf (KMDF's `Wdf01000`, Driver Verifier), so a crash routed through a
-  layer this build does not recognise names that layer instead of the driver behind it. The text
+  `faulting_frame` is the innermost frame that *could* be a kernel driver: not `nt`/`hal`, not the
+  framework layers that sit on a stack on somebody else's behalf (KMDF's `Wdf01000`, Driver
+  Verifier), and not a user-mode module — a kernel stack that unwinds past the system call boundary
+  runs on into `ntdll` and the caller's own `.exe`, and neither can be a driver. It is still
+  positional, so a crash routed through a layer this build does not recognise names that layer
+  instead of the driver behind it. The text
   prints `!analyze`'s attribution beside it whenever the two disagree and tells you to settle it
   from `frames`, where every `module+RVA` is sound whichever guess is right. `faulting_frame` is
   **absent** when the whole captured stack is in those images; `faulting_frame_note` then says

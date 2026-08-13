@@ -882,8 +882,14 @@ pub struct CrashTriage {
     /// a name that long to `mm_exploit_v5.` — a string that looks like an answer and is not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_name: Option<String>,
-    /// The innermost frame outside the kernel image, the HAL and the framework layers that sit on
-    /// the stack on somebody else's behalf (KMDF, Driver Verifier) — in a driver bug, the driver.
+    /// The innermost frame that could be a kernel driver at all — in a driver bug, the driver.
+    ///
+    /// Ruled out: the kernel image and the HAL (which carry the bug check itself), the framework
+    /// layers that sit on a stack on somebody else's behalf (KMDF, Driver Verifier), and any
+    /// **user-mode** module, since a kernel stack that unwinds past the system call boundary keeps
+    /// going into `ntdll` and the caller's own `.exe`, neither of which can be a driver. A frame in
+    /// *no* module is not ruled out: a freed pool page or an unloaded driver looks exactly like
+    /// that, and both are what a driver bug leaves behind.
     ///
     /// **A first guess, not a verdict.** The rule is positional, so a crash whose stack runs
     /// through a layer this build does not recognise as a layer names that layer instead of the
@@ -891,8 +897,8 @@ pub struct CrashTriage {
     /// engine's load bases — so [`Self::frames`] is what settles a disagreement, and
     /// `analysis.module_name` is `!analyze`'s independent guess beside this one.
     ///
-    /// `None` when every captured frame is in one of those images, which is a real answer (the bug
-    /// is in the kernel's own path, or the stack did not reach the culprit) and not a failure;
+    /// `None` when no captured frame qualifies, which is a real answer (the bug is in the kernel's
+    /// own path, or the stack did not reach the culprit) and not a failure;
     /// [`Self::faulting_frame_note`] says which.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub faulting_frame: Option<FrameInfo>,
