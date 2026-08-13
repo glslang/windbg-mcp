@@ -495,6 +495,12 @@ impl From<&win_kexp::dbgeng::RegisterValue> for RegisterValue {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ModuleList {
     /// The modules being listed: every loaded one, or those [`Self::filter`] matched.
+    ///
+    /// **Loaded modules only.** `lm` also prints a tail of images that have since *unloaded* —
+    /// twenty-six `nvhda64v.sys` rows on this repo's own sample — and those are not carried here;
+    /// they are a different question, asked of a module that no longer exists. A filtered listing
+    /// says so in its text when that tail is under it, because "no module matches" printed over a
+    /// list of matching unloaded rows is a contradiction a reader cannot resolve.
     pub modules: Vec<ModuleInfo>,
     /// How many modules are loaded **in total** — which is the whole point of carrying it: a
     /// partial listing could otherwise be read as the inventory. Equal to `modules.len()` unless

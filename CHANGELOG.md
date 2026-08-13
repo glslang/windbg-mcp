@@ -45,8 +45,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A filter that matches nothing is an answer rather than an error, and says so in words — `lm m`
   prints *nothing at all* in that case, which reads as a target with no modules — naming the
   mistake callers actually make: the pattern matches the name symbols are qualified by (`nt`), not
-  the image file (`ntkrnlmp.exe`). An empty filter, and one carrying a `;` that would end the
-  command it is interpolated into, are refused before a session is touched.
+  the image file (`ntkrnlmp.exe`), which is measured: `lm m ntkrnlmp*` finds nothing on a dump
+  whose kernel image is `ntkrnlmp.exe`. Where `lm` has appended its **unloaded** modules, the note
+  says which rows those are, since the values carry loaded modules only and "nothing matched" over
+  twenty-six matching `nvhda64v.sys` rows is a contradiction rather than an answer.
+
+  Refused before a session is touched: an empty filter, one carrying a `;` that would end the
+  command it is interpolated into, and one using the part of WinDbg's wildcard grammar this server
+  does not implement — character sets and ranges (`[fd]`, `[a-z]`), `#` and `+`. Those are real
+  and were measured (`lm m nt[fd]*` prints `Ntfs`, `lm m ha+l` prints `hal`), so honouring them in
+  the text while matching them literally in the values is exactly the divergence the one-pattern
+  rule exists to prevent. `execute { "command": "lm m <pattern>" }` runs the engine's own matcher
+  for anyone who wants the full grammar.
 
 - **`walk_memory`: a structure traversal where an unreadable node is a row, not an end**
   ([#103](https://github.com/glslang/windbg-mcp/issues/103)). Walking a kernel list through

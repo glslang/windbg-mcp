@@ -1751,12 +1751,44 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
     assert_eq!(empty["loaded"].as_u64(), Some(loaded), "{empty}");
     let text = text_of(&response["result"]);
     assert!(
-        text.contains("*nosuchmoduleanywhere*") && text.contains("No module name matches"),
+        text.contains("*nosuchmoduleanywhere*") && text.contains("No loaded module name matches"),
         "a listing that found nothing has to say so:\n{text}"
     );
+    assert!(
+        !text.contains("Unloaded modules:") && !text.contains("loaded modules only"),
+        "and says nothing about unloaded rows when `lm m` printed none:\n{text}"
+    );
 
-    // Two refusals, both before the engine is touched: a filter that narrows by nothing, and one
-    // that would end the `lm m` it is interpolated into.
+    // `lm` appends the images that have since unloaded — to a *filtered* listing as readily as to
+    // a whole one — and the values are loaded modules only. On the checked-in sample `nvhda`
+    // matches no loaded module and twenty-six unloaded `nvhda64v.sys` rows, which is the one case
+    // where a bare "nothing matched" would be denying the rows printed directly above it.
+    let response = server.call_tool(
+        "modules",
+        json!({ "session_id": session_id, "filter": "nvhda" }),
+        TARGET_STEP,
+    );
+    assert_no_error(&response, "modules filtered to an unloaded driver");
+    let unloaded = response["result"]["structuredContent"].clone();
+    let text = text_of(&response["result"]);
+    assert_eq!(
+        unloaded["modules"].as_array().map(Vec::len),
+        Some(0),
+        "`nvhda64v` is unloaded in this dump, so no *loaded* module matches: {unloaded}"
+    );
+    assert!(
+        text.contains("Unloaded modules:"),
+        "this is the case that assertion exists for; the sample must still carry it:\n{text}"
+    );
+    assert!(
+        text.contains("No loaded module name matches") && text.contains("loaded modules only"),
+        "the note must reconcile itself with the unloaded rows above it:\n{text}"
+    );
+
+    // Three refusals, all before the engine is touched: a filter that narrows by nothing, one
+    // that would end the `lm m` it is interpolated into, and one whose wildcards `lm m` honours
+    // and this server does not — `lm m nt[fd]*` prints `Ntfs`, while matching `[fd]` literally
+    // (which is what the values would do) matches nothing at all.
     let blank = server.tool_failure(
         "modules",
         json!({ "session_id": session_id, "filter": "  " }),
@@ -1771,6 +1803,21 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
     assert_eq!(
         injected["error"]["category"], "invalid_argument",
         "{injected}"
+    );
+    let unsupported = server.tool_failure(
+        "modules",
+        json!({ "session_id": session_id, "filter": "nt[fd]*" }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        unsupported["error"]["category"], "invalid_argument",
+        "{unsupported}"
+    );
+    assert!(
+        unsupported["error"]["message"]
+            .as_str()
+            .is_some_and(|why| why.contains("execute")),
+        "the refusal names the tool that does run WinDbg's full grammar: {unsupported}"
     );
 
     // The session is still the dump it was — the refused call reached nothing.
