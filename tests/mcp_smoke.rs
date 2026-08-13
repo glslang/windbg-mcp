@@ -1563,6 +1563,95 @@ fn a_dump_session_opens_reads_and_closes() {
     );
 }
 
+/// An open answers the three questions it is asked every time — which build, where the target's
+/// own image is, which bug check — and **does not** print the module table to do it
+/// ([#105](https://github.com/glslang/windbg-mcp/issues/105)).
+///
+/// The size claim is asserted as a comparison against the table itself rather than a line budget
+/// pulled from the air: the report has to be shorter than the inventory it used to carry, on
+/// whatever dump this tier runs against.
+///
+/// Each typed field is checked against the tool that owns it — `modules` for the count and the
+/// kernel's base, `crash_triage` for the bug check — because the point of the summary is that it
+/// saves those calls, and a summary that disagrees with them would cost more than it saves.
+#[test]
+fn an_open_summarises_the_target_instead_of_listing_its_modules() {
+    let Some(dump) = target_tier() else { return };
+    let mut server = Server::started();
+
+    let opened = server.tool_data("open_dump", json!({ "path": dump }), TARGET_STEP);
+    let session_id = opened["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("open_dump mints a handle: {opened}"))
+        .to_string();
+    let summary = opened["summary"].clone();
+    assert_eq!(
+        summary["kernel_mode"], true,
+        "the checked-in sample is a kernel crash dump: {summary}"
+    );
+
+    // The inventory, from the tool that owns it. Nothing loads between the two calls in a dump,
+    // so the counts are comparable — and they are the same walk, not two renderings of one.
+    let modules = server.tool_data("modules", json!({ "session_id": session_id }), TARGET_STEP);
+    let loaded = modules["loaded"].as_u64().unwrap_or_default();
+    assert!(
+        loaded > 20,
+        "this claim is about a table worth not printing; got {loaded} modules"
+    );
+    assert_eq!(
+        summary["modules_loaded"].as_u64(),
+        Some(loaded),
+        "the open counted {loaded} modules differently: {summary}"
+    );
+    let kernel = modules["modules"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|module| module["name"] == "nt")
+        .unwrap_or_else(|| panic!("a kernel dump loads `nt`: {modules}"));
+    assert_eq!(summary["primary_module"]["name"], "nt", "{summary}");
+    assert_eq!(
+        summary["primary_module"]["start"], kernel["start"],
+        "the base an open reports is the one `modules` reports: {summary}"
+    );
+
+    // The report is a summary now: shorter than the table it used to be, and still carrying the
+    // build line that answers "which Windows is this?".
+    let report = opened["report"].as_str().unwrap_or_default();
+    assert!(
+        (report.lines().count() as u64) < loaded,
+        "the report is longer than the {loaded}-module table it replaced:\n{report}"
+    );
+    assert!(
+        report.contains("Kernel base"),
+        "`vertarget`'s own answer is what the open is for:\n{report}"
+    );
+    assert!(
+        report.contains("modules"),
+        "the table has to be one named call away:\n{report}"
+    );
+
+    // The bug check: the same three fields `crash_triage` reports, spelled the same way. Both
+    // read `ReadBugCheckData` through one renderer, so a code rendered two ways here would mean a
+    // consumer had to know which tool a value came from. `analyze: false` keeps this cheap —
+    // `!analyze`'s own conclusions are that tool's business, not the summary's.
+    let triage = server.tool_data(
+        "crash_triage",
+        json!({ "session_id": session_id, "analyze": false }),
+        TARGET_STEP,
+    );
+    assert_eq!(summary["bug_check"], triage["bug_check"], "{summary}");
+    assert_eq!(
+        summary["bug_check"]["code"], "0x9f",
+        "the sample is a 0x9F: {summary}"
+    );
+    assert!(
+        report.contains("0x9f DRIVER_POWER_STATE_FAILURE"),
+        "the text says it too, and points at the tool that reads the rest:\n{report}"
+    );
+    assert!(report.contains("crash_triage"), "{report}");
+}
+
 /// An address that is unmapped on **any** Windows target, so a hole needs no knowledge of this
 /// particular dump.
 ///

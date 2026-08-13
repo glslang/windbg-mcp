@@ -1918,7 +1918,11 @@ impl WindbgServer {
         // it from the report the debugger printed.
         let target = what.clone();
         match self.sessions.open(kind, what, op).await {
-            Ok(OpenReport { id, report }) => outcome_result(
+            Ok(OpenReport {
+                id,
+                report,
+                summary,
+            }) => outcome_result(
                 format!(
                     "{report}\n\nsession_id: {id}\nPass this as `session_id` on later calls to \
                      route them to this session and to fail loudly rather than act on a different \
@@ -1929,6 +1933,7 @@ impl WindbgServer {
                     kind: kind.into(),
                     target,
                     report,
+                    summary,
                 }),
             ),
             // No worker, so no session — and no argument the model can change fixes that.
@@ -2006,6 +2011,8 @@ impl WindbgServer {
     /// Open a crash dump (.dmp) or a Time Travel Debugging trace (.run) and wait for it to load.
     /// Opens a new session in its own engine process — sessions already open are left alone —
     /// and returns a `session_id` that routes later calls to it. End it with `end_session`.
+    /// The result is a summary of the target — build, kernel/primary image base, module count and
+    /// the bug check a crash dump stopped on — not its module table, which `modules` lists.
     #[rmcp::tool(
         annotations(
             title = "Open crash dump or TTD trace",
@@ -2685,19 +2692,15 @@ impl WindbgServer {
         // module-load break, or a bare goto_position to the very start of a trace). The
         // structured half says the same thing by carrying no registers, so this replaces only
         // the text — and only when the text is the empty one.
-        let out = out.map(|out| {
+        let out = out.map(|mut out| {
             if out.text.trim().is_empty() {
-                Output {
-                    text: "(no thread register context at this position — e.g. a module-load \
-                           break or the start of a trace. Travel to a settled position after a \
-                           go/breakpoint, or read a specific register with execute \
-                           { \"command\": \"r rip\" }.)"
-                        .to_string(),
-                    data: out.data,
-                }
-            } else {
-                out
+                out.text = "(no thread register context at this position — e.g. a module-load \
+                            break or the start of a trace. Travel to a settled position after a \
+                            go/breakpoint, or read a specific register with execute \
+                            { \"command\": \"r rip\" }.)"
+                    .to_string();
             }
+            out
         });
         engine_result_for(args.session_id.as_deref(), out)
     }
@@ -3542,7 +3545,10 @@ impl WindbgServer {
 Open a dump or .run trace, attach to a process or the kernel, inspect registers/memory/stacks/modules, and set breakpoints. \
 Each open target is a separate session in its own engine process, so several can be open at once (up to 4) without \
 disturbing each other; pass the `session_id` an opener returns on later calls to route them to that target, and \
-`end_session` when done. `session_status` lists what is open and what state each session is in — ask it when an open \
+`end_session` when done. An opener answers with a summary of the target — the build, the kernel or primary image and \
+its base, how many modules are loaded, and a crash dump's bug check — rather than the module table; `modules` lists \
+that table when you actually need it, and `crash_triage` reads a bug check with its stack. \
+`session_status` lists what is open and what state each session is in — ask it when an open \
 reports a timeout rather than re-running the open, which would attach or launch a second time. To stop a call that is \
 taking too long without losing the target, call `interrupt` on its session while it is still outstanding: it Ctrl+Breaks \
 the engine, the running call returns whatever it had reached, and the session is free for the next one. A live kernel \

@@ -20,9 +20,22 @@ open_dump { "path": "…/docs/samples/052126-34312-01.dmp" }
 ```
 
 `open_dump` loads the dump, waits for it to settle, **loads `ext.dll`** so
-`!ext.analyze` resolves (see [§6](#6-why-extanalyze-and-not-analyze)), and returns the
-module list (`lm`). The module list already tells a story: third-party drivers present
-include `nvlddmkm` (NVIDIA), `nvhda64v` (NVIDIA HD-audio, many unloaded instances),
+`!ext.analyze` resolves (see [§6](#6-why-extanalyze-and-not-analyze)), and answers with a
+summary of the target — `vertarget`'s build and kernel base, the bug check, and how many
+modules are loaded:
+
+```text
+Windows 10 Kernel Version 26100 MP (12 procs) Free x64
+Kernel base = 0xfffff803`89200000 PsLoadedModuleList = 0xfffff803`8a0f52d0
+Debug session time: Thu May 21 12:44:54.667 2026 (UTC + 1:00)
+
+Bug check 0x9f DRIVER_POWER_STATE_FAILURE, parameters 0x0000000000000003 …
+227 module(s) loaded, nt at 0xfffff80389200000; `modules` lists the table.
+```
+
+The same fields come back as `structuredContent.summary`. The **table** is `modules`, which is
+worth one call here because it already tells a story: third-party drivers present include
+`nvlddmkm` (NVIDIA), `nvhda64v` (NVIDIA HD-audio, many unloaded instances),
 `RzDev_*`/`RzCommon` (Razer), and the virtualization stack (`VBox*`, `vmx86`/`hcmon`/`vmnet*`,
 plus Hyper-V `Vid`/`winhvr`). `nt` resolves to `(pdb symbols)`.
 

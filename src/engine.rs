@@ -667,6 +667,9 @@ pub struct SessionSnapshot {
 pub struct OpenReport {
     pub id: String,
     pub report: String,
+    /// The target's own facts, as the worker read them off the engine. Defaulted — every field
+    /// absent — only for a reply that carried none, which the openers do not produce.
+    pub summary: crate::structured::TargetSummary,
 }
 
 /// How an open failed. The variants exist because they need different recovery advice, and
@@ -1047,6 +1050,7 @@ impl Sessions {
                 Ok(OpenReport {
                     id,
                     report: report.text,
+                    summary: report.summary.unwrap_or_default(),
                 })
             }
             Err(EngineError::Timeout(message)) => Err(OpenError::Timeout { id, message }),
