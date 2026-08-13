@@ -217,7 +217,9 @@ pub fn report(
     let faulting_note = match (&faulting, frames.first()) {
         (Some(_), _) => None,
         (None, None) if matches!(walk, Walk::Abandoned) => Some(
-            "the stack was not walked: this call was interrupted, so the reads after the analysis              were abandoned rather than started. Nothing here is a finding about the crash —              triage again without interrupting."
+            "the stack was not walked: this call was interrupted, so the reads after the \
+             analysis were abandoned rather than started. Nothing here is a finding about the \
+             crash — triage again without interrupting."
                 .to_string(),
         ),
         (None, None) => Some(
@@ -1179,6 +1181,10 @@ mod tests {
         let note = triage.faulting_frame_note.expect("a reason");
         assert!(note.contains("interrupted"), "{note}");
         assert!(!note.contains("returned no frames"), "{note}");
+        // A multi-line literal that loses its `\` continuations keeps the source indentation, and
+        // the note then reads with a dozen spaces in the middle of a sentence. Cheap to assert,
+        // invisible in a diff, and it has happened here once already.
+        assert!(!note.contains("  "), "run of spaces in the note: {note:?}");
 
         // A *deadline*-truncated analysis is not this: its reads are already reserved for, so they
         // run and the report is a whole one.
