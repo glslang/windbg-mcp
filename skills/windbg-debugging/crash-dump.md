@@ -23,9 +23,12 @@ offending frame. No elevation needed; works on System32's engine.
    says so.
    — `crash_triage { "analyze": false }` skips the `!analyze` and answers from engine reads
    alone — fast, and it still names the bug check and the driver frame.
-   — `faulting_frame: null` means every captured frame is in the kernel image;
-   `faulting_frame_note` says whether that is the crash or the frame cap
-   (`crash_triage { "frames": 64 }` if it is the cap).
+   — **`faulting_frame` is not always there.** It is *absent* (the key is omitted, as every
+   optional field in this server's structured results is) when every captured frame is in the
+   kernel image, and `faulting_frame_note` says which of the two reasons applies. If it is the
+   frame cap, re-ask with `crash_triage { "frames": 64 }`. If it is the crash — a `0x9F` watchdog
+   fires on an idle CPU's timer DPC, so the driver holding the IRP is not on that stack at all —
+   the culprit has to come from the bug check *arguments* instead: that is step 7.
 
 3. **Auto-analyze in full**, for the parts the triage summary leaves out (the exception record
    on a user-mode dump, the rendered stack, the hypervisor/blackbox detail):

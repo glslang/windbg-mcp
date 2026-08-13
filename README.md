@@ -617,14 +617,17 @@ timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressio
   `faulting_frame` to `analysis.module_name`**: the frame's `module+RVA` is computed from the load
   base and is right for a driver with no PDB, which is exactly where `!analyze`'s attribution goes
   wrong — the text points the disagreement out when there is one. `faulting_frame` is the topmost
-  frame outside `nt`/`hal`; `null` means the whole captured stack is in the kernel image, and
-  `faulting_frame_note` says whether that is the crash or the 16-frame default cap
-  (`frames` raises it, up to 128). `analyze: false` skips `!analyze` for a fast answer of everything
-  else. Needs a kernel target *stopped at a bug check*: a live kernel that has not crashed and a
-  dump that is not a crash dump both report bug check code 0, and say so.
-- **Crash-dump triage uses `!ext.analyze -v`**, not `!analyze` — the bundled engine only resolves
-  the module-qualified form (see *Bundling the WinDbg engine*). `crash_triage` tries both spellings
-  and reports which worked; a bare `execute` has to pick. On a **partial minidump**, reads of
+  frame outside `nt`/`hal`, and is **absent** when the whole captured stack is in the kernel image;
+  `faulting_frame_note` then says whether that is the crash itself (a `0x9F` watchdog fires on an
+  idle CPU — the culprit is not on that stack, and the bug check *arguments* are where to go next)
+  or merely the 16-frame default cap, which `frames` raises to 128. `analyze: false` skips
+  `!analyze` for a fast answer of everything else. Needs a kernel target *stopped at a bug check*:
+  a live kernel that has not crashed and a dump that is not a crash dump both report bug check
+  code 0, and say so.
+- **`crash_triage` tries `!analyze -v` and then `!ext.analyze -v`**, and reports which one worked
+  under `analysis.command`. A **manual** `execute` has to pick, and on the bundled engine the
+  answer is the module-qualified `!ext.analyze -v` — the unqualified form does not resolve there
+  even after `.load ext` (see *Bundling the WinDbg engine*). On a **partial minidump**, reads of
   pages that weren't captured raise `An unexpected exception was raised (0x80040205)` rather than a
   clean "memory read error"; query the specific field you need (e.g.
   `dt nt!_DRIVER_OBJECT <addr> DriverName`) instead of dumping whole structures. See the

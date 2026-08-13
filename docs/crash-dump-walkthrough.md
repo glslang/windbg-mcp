@@ -73,9 +73,11 @@ and the same answer as `structuredContent`, which is what a script reads:
     // …
   ],
   "frames_truncated": false,
+  // no "faulting_frame" key at all — every optional field in this server's structured results is
+  // omitted rather than null, so this is how "there isn't one" looks. The note says why:
   "faulting_frame_note": "every one of the 7 captured frames is in the kernel image or the HAL…",
   "analysis": {
-    "ran": true, "command": "!analyze -v", "failure_bucket_id": "0x9F_3",
+    "ran": true, "truncated": false, "command": "!analyze -v", "failure_bucket_id": "0x9F_3",
     "module_name": "Unknown_Module", "image_name": "Unknown_Image", "process_name": "System",
     "parameter_notes": ["A device object has been blocking an IRP for too long a time", /* … */]
   }
@@ -84,7 +86,7 @@ and the same answer as `structuredContent`, which is what a script reads:
 
 Two things to read off this crash in particular:
 
-- **`faulting_frame` is `null`, and that is the finding.** `0x9F` is a *watchdog* bug check: it
+- **`faulting_frame` is absent, and that is the finding.** `0x9F` is a *watchdog* bug check: it
   fires on an idle CPU's timer DPC, so the stack that bug-checked belongs to the watchdog and not
   to the driver holding the IRP. `frames_truncated: false` says the walk saw the whole stack, so
   raising `frames` would not help — the culprit genuinely is not on this stack, and §4 goes and

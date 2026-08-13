@@ -955,6 +955,13 @@ pub struct AnalysisInfo {
     /// Whether `!analyze -v` ran and produced output. `false` is ordinary rather than a failure:
     /// the call may have asked for `analyze: false`, or the engine may have no extensions.
     pub ran: bool,
+    /// Whether it was cut short by this call's deadline before it finished.
+    ///
+    /// The one qualification that changes how an *absent* field below reads: `!analyze` prints its
+    /// summary block early, so a truncated run still carries real values — but a `pool_tag` that
+    /// is missing may simply never have been reached, rather than `!analyze` having decided this
+    /// bug check has none.
+    pub truncated: bool,
     /// Which spelling produced it — `!analyze -v`, or `!ext.analyze -v` on an engine where the
     /// unqualified form does not resolve.
     #[serde(skip_serializing_if = "Option::is_none")]
