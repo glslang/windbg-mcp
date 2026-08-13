@@ -52,8 +52,8 @@ use crate::proto::{
     EngineOp, Failed, Output, PoolOp, ReachabilityOp, WorkerMessage, WorkerRequest,
 };
 use crate::server::{
-    fmt_addr, format_recipe, format_report, hexdump, parse_eval, parse_lm_base, parse_u64,
-    parse_windbg_addr, path_recipe, reachability,
+    fmt_addr, format_recipe, format_report, hexdump, matches_module_pattern, module_pattern,
+    parse_eval, parse_lm_base, parse_u64, parse_windbg_addr, path_recipe, reachability,
 };
 use crate::structured;
 use crate::triage::{self, Analysis, AttributedFrame, Attribution};
@@ -1319,6 +1319,10 @@ fn registers(e: &DebugEngine, all: bool) -> Result<Output, Failed> {
     ))
 }
 
+/// The header `lm` puts above the images that have since unloaded, which it appends to a filtered
+/// listing as readily as to a whole one.
+const UNLOADED_MODULES: &str = "Unloaded modules:";
+
 /// The loaded modules, as `lm` renders them and as values beside them — optionally narrowed to
 /// the ones whose name matches a pattern.
 ///
@@ -1348,7 +1352,15 @@ fn modules(e: &DebugEngine, filter: Option<&str>) -> Result<Output, Failed> {
         Some(pattern) => format!(
             "{}{}",
             text.trim_end(),
-            narrowing_note(pattern, matched.len(), all.len())
+            // Read off the text rather than asked of the engine, because it is a fact about *this
+            // rendering* — whether the rows the caller is looking at include unloaded ones — and
+            // not a value. Nothing is parsed out of it; the header's presence only picks wording.
+            narrowing_note(
+                pattern,
+                matched.len(),
+                all.len(),
+                text.contains(UNLOADED_MODULES)
+            )
         ),
         None => text,
     };
@@ -1362,73 +1374,36 @@ fn modules(e: &DebugEngine, filter: Option<&str>) -> Result<Output, Failed> {
     ))
 }
 
-/// The pattern a `filter` argument really means.
-///
-/// A bare name matches **anywhere in** a module name, because that is what a caller asking for
-/// `MessageManager` wants and what every other `filter` in this server does
-/// ([`crate::proto::PoolOp::Diagnostics`] is a case-insensitive substring too). A filter that
-/// already carries `*` or `?` is somebody writing a `lm m` pattern deliberately, and it is left
-/// exactly as written — including the anchored form `nt`, which they can ask for as `nt` with no
-/// wildcards... which this would widen. Hence the rule: wildcards mean "I know what I am doing",
-/// no wildcards means "find this".
-fn module_pattern(filter: &str) -> String {
-    let filter = filter.trim();
-    if filter.contains(['*', '?']) {
-        filter.to_string()
-    } else {
-        format!("*{filter}*")
-    }
-}
-
-/// Whether a module name matches a `lm m` pattern: `*` for any run, `?` for one character, case
-/// insensitive.
-///
-/// Written out rather than delegated to the engine because the *values* have to be filtered here —
-/// there is no DbgEng call that lists modules matching a pattern, only a command that prints them.
-/// This is the same match `lm m` performs, which is what keeps the two halves of one answer
-/// describing one set.
-fn matches_module_pattern(pattern: &str, name: &str) -> bool {
-    let pattern: Vec<char> = pattern.chars().collect();
-    let name: Vec<char> = name.chars().collect();
-    // The standard greedy walk: take the last `*` as the point to give ground at, so a pattern
-    // that runs out of name backtracks to it instead of failing outright.
-    let (mut p, mut n) = (0, 0);
-    let (mut star, mut resume) = (None, 0);
-    while n < name.len() {
-        if p < pattern.len() && (pattern[p] == '?' || pattern[p].eq_ignore_ascii_case(&name[n])) {
-            p += 1;
-            n += 1;
-        } else if p < pattern.len() && pattern[p] == '*' {
-            star = Some(p);
-            resume = n;
-            p += 1;
-        } else if let Some(star) = star {
-            resume += 1;
-            n = resume;
-            p = star + 1;
-        } else {
-            return false;
-        }
-    }
-    pattern[p..].iter().all(|c| *c == '*')
-}
-
 /// What a narrowed listing says about the narrowing, under whatever `lm m` printed.
 ///
-/// The no-match case is the one worth writing prose for: `lm m` prints **nothing at all** when its
-/// pattern matches nothing, so a filtered call used to be indistinguishable from a target with no
-/// modules, or from a call that silently failed. It also names the one thing a caller most often
-/// gets wrong — that the pattern matches the *module name* (`nt`), not the image file
-/// (`ntkrnlmp.exe`).
-fn narrowing_note(pattern: &str, matched: usize, loaded: usize) -> String {
+/// Two things the text above it cannot say for itself.
+///
+/// **A pattern that matched nothing** prints *nothing at all* — `lm m` has no "no match" line — so
+/// a filtered call was otherwise indistinguishable from a target with no modules, or from a call
+/// that quietly failed. The message also names the mistake callers actually make: the pattern
+/// matches the name symbols are qualified by (`nt`), not the image file (`ntkrnlmp.exe`), which is
+/// measured behaviour — `lm m ntkrnlmp*` finds nothing on a dump whose kernel is `ntkrnlmp.exe`.
+///
+/// **Unloaded modules.** `lm` — filtered or not — appends the images that have since unloaded, and
+/// `modules[]` carries loaded modules only. On this repo's own sample `lm m nvhda*` prints
+/// twenty-six unloaded `nvhda64v.sys` rows and matches no loaded module, so a note that said only
+/// "no module matches" would be contradicting the rows directly above it. When that section is
+/// there, this says which rows it is talking about.
+fn narrowing_note(pattern: &str, matched: usize, loaded: usize, unloaded_listed: bool) -> String {
+    let unloaded = if unloaded_listed {
+        " The `Unloaded modules:` rows above are images that have since unloaded; `lm` lists \
+         those, and this tool's `modules` values are loaded modules only."
+    } else {
+        ""
+    };
     if matched == 0 {
         return format!(
-            "\nNo module name matches `{pattern}`; {loaded} module(s) are loaded. The pattern \
-             matches the name symbols are qualified by — `nt`, not `ntkrnlmp.exe` — with `*` and \
-             `?` as wildcards. Omit `filter` for the whole table."
+            "\nNo loaded module name matches `{pattern}`; {loaded} module(s) are loaded. The \
+             pattern matches the name symbols are qualified by — `nt`, not `ntkrnlmp.exe` — with \
+             `*` and `?` as wildcards. Omit `filter` for the whole table.{unloaded}"
         );
     }
-    format!("\n\n{matched} of {loaded} module(s) match `{pattern}`.")
+    format!("\n\n{matched} of {loaded} loaded module(s) match `{pattern}`.{unloaded}")
 }
 
 /// Everything a bug check is, gathered as one indivisible job.
@@ -4089,50 +4064,12 @@ mod tests {
 
     // ---- narrowing a module listing ----------------------------------------
 
-    /// A `filter` a caller types as a name finds that name **anywhere**, which is what makes
-    /// `{"filter": "MessageManager"}` answer "where is that driver loaded" rather than nothing.
-    #[test]
-    fn a_filter_without_wildcards_is_a_substring() {
-        assert_eq!(module_pattern("MessageManager"), "*MessageManager*");
-        assert_eq!(module_pattern("  nt  "), "*nt*");
-        // …and one with wildcards is a pattern the caller wrote deliberately, left alone.
-        assert_eq!(module_pattern("nt*"), "nt*");
-        assert_eq!(module_pattern("*"), "*");
-        assert_eq!(module_pattern("k?32"), "k?32");
-    }
-
-    /// The match this server performs over the *values* has to be the match `lm m` performs over
-    /// the text, or one answer's two halves describe two different sets of modules.
-    #[test]
-    fn a_module_pattern_matches_the_way_lm_m_does() {
-        // Case-insensitive, and `*` spans any run — including an empty one.
-        assert!(matches_module_pattern("*nt*", "nt"));
-        assert!(matches_module_pattern("*nt*", "ntfs"));
-        assert!(matches_module_pattern("*NT*", "WinNT"));
-        assert!(matches_module_pattern("*", "anything"));
-        assert!(matches_module_pattern("nt", "NT"));
-
-        // Anchored where the caller anchored it.
-        assert!(matches_module_pattern("nt*", "ntoskrnl"));
-        assert!(!matches_module_pattern("nt*", "WinNT"));
-        assert!(!matches_module_pattern("nt", "ntfs"));
-
-        // `?` is exactly one character, and a pattern that runs out of name does not match.
-        assert!(matches_module_pattern("k?32", "k132"));
-        assert!(!matches_module_pattern("k?32", "k32"));
-        assert!(!matches_module_pattern("*manager", "MessageManagerX"));
-
-        // The backtracking case: the first `*` has to give ground for the tail to land.
-        assert!(matches_module_pattern("*a*b", "xaybzb"));
-        assert!(!matches_module_pattern("*a*b", "xayb z"));
-    }
-
     /// `lm m` prints **nothing** when its pattern matches nothing, so a filtered call that found
     /// no module has to say so itself — otherwise it is indistinguishable from a target with no
     /// modules at all, or from a call that quietly failed.
     #[test]
     fn a_filter_that_matches_nothing_says_so_rather_than_printing_nothing() {
-        let note = narrowing_note("*nosuch*", 0, 227);
+        let note = narrowing_note("*nosuch*", 0, 227, false);
         assert!(note.contains("*nosuch*"), "{note}");
         assert!(
             note.contains("227"),
@@ -4144,8 +4081,30 @@ mod tests {
         );
 
         // And a listing that did match says how much of the table it is showing.
-        let note = narrowing_note("*nt*", 3, 227);
+        let note = narrowing_note("*nt*", 3, 227, false);
         assert!(note.contains("3 of 227"), "{note}");
+    }
+
+    /// **The note must not contradict the rows above it.** `lm m nvhda*` on this repo's own sample
+    /// matches no *loaded* module and still prints twenty-six unloaded `nvhda64v.sys` rows, so a
+    /// bare "no module matches" would be denying a listing the caller is looking at. Both branches
+    /// say "loaded", and the one that has unloaded rows above it says whose they are.
+    #[test]
+    fn a_listing_with_unloaded_rows_says_which_rows_the_values_do_not_carry() {
+        for note in [
+            narrowing_note("*nvhda*", 0, 227, true),
+            narrowing_note("*nt*", 3, 227, true),
+        ] {
+            assert!(
+                note.contains("Unloaded modules:") && note.contains("loaded modules only"),
+                "{note}"
+            );
+        }
+        // Said only where it is true: no such section, no sentence about one.
+        assert!(!narrowing_note("*nt*", 3, 227, false).contains("Unloaded"));
+        // Both branches are about *loaded* modules either way, because that is what is counted.
+        assert!(narrowing_note("*nosuch*", 0, 227, false).contains("No loaded module"));
+        assert!(narrowing_note("*nt*", 3, 227, false).contains("loaded module(s) match"));
     }
 
     // ---- what an opener says about the target (#105) ------------------------
