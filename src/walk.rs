@@ -68,6 +68,19 @@ pub const MAX_NODES: u32 = 1024;
 /// Most fields one node may be asked for.
 pub const MAX_FIELDS: usize = 16;
 
+/// Longest a field's name may be.
+///
+/// The one argument here that is **amplified**, which is why it needs a bound of its own on top of
+/// [`MAX_NODES`] and [`MAX_FIELDS`]. Every other input is spent once — an address is parsed to a
+/// `u64` and dropped — but a name is cloned into each field of each node, rendered into the table,
+/// and serialized again, so a single large one becomes up to 16,384 copies and can take the worker
+/// out of memory. That costs the caller their session, which is exactly what the node and field
+/// caps exist to prevent, arriving through the argument they do not cover.
+///
+/// 64 characters, because this is a **column header**. The generated default is `+0x18`; a name
+/// wider than the value beneath it has already stopped helping anyone read the table.
+pub const MAX_FIELD_NAME: usize = 64;
+
 /// Nodes a walk visits when the caller names no `count`.
 const DEFAULT_NODES: u32 = 64;
 
@@ -127,7 +140,7 @@ pub struct Field {
 /// place that cannot see the rest of the request to make it consistently.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct FieldArg {
-    /// Column name for this value. Defaults to the offset, e.g. `+0x18`.
+    /// Column name for this value, at most 64 characters. Defaults to the offset, e.g. `+0x18`.
     #[serde(default)]
     pub name: Option<String>,
     /// Byte offset within the node. Negative reads *behind* it — a pool header is at -16.
@@ -287,6 +300,18 @@ impl WalkOp {
                 if !FIELD_SIZES.contains(&size) {
                     return Err(format!(
                         "field size {size} is not a width the debugger reads: pass 1, 2, 4 or 8."
+                    ));
+                }
+                // Counted in `char`s rather than bytes, so the limit a caller is told is the one
+                // they can see: a name of accented or CJK characters must not be refused at a
+                // third of its apparent length.
+                if let Some(name) = &field.name
+                    && name.chars().count() > MAX_FIELD_NAME
+                {
+                    return Err(format!(
+                        "a field name is {} characters; this tool allows {MAX_FIELD_NAME}. It is \
+                         a column header, and it is copied into every node the walk returns.",
+                        name.chars().count()
                     ));
                 }
                 Ok(Field {
@@ -1222,6 +1247,44 @@ mod tests {
 
         let chain = WalkOp::new(None, Some("0x1000".into()), None, Some(0), None, None).unwrap();
         assert!(chain.fields.is_empty());
+    }
+
+    /// The one argument that is *amplified* — a name is copied into every field of every node —
+    /// so the node and field caps do not bound it and it needs its own.
+    #[test]
+    fn a_field_name_is_bounded_because_it_is_copied_per_node() {
+        let err = WalkOp::new(
+            None,
+            Some("0x1000".into()),
+            Some(8),
+            None,
+            None,
+            Some(vec![FieldArg {
+                name: Some("n".repeat(MAX_FIELD_NAME + 1)),
+                offset: 0,
+                size: None,
+            }]),
+        )
+        .unwrap_err();
+        assert!(err.contains("column header"), "{err}");
+
+        // And the bound is on characters a reader sees, not on the bytes they encode to: a name
+        // of CJK characters must not be refused at a third of its apparent length.
+        assert!(
+            WalkOp::new(
+                None,
+                Some("0x1000".into()),
+                Some(8),
+                None,
+                None,
+                Some(vec![FieldArg {
+                    name: Some("識".repeat(MAX_FIELD_NAME)),
+                    offset: 0,
+                    size: None,
+                }]),
+            )
+            .is_ok()
+        );
     }
 
     #[test]

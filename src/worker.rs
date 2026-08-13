@@ -1825,32 +1825,85 @@ fn read_memory(e: &DebugEngine, address: &str, size: u32) -> Result<String, Stri
     Ok(hexdump(addr, &bytes))
 }
 
-/// Resolves the address a walk starts from.
+/// Resolves the address a walk starts from, **inside the walk's own deadline**.
 ///
-/// A number in any form the debugger prints costs nothing to recognise, so it is tried first. What
-/// is left is MASM — a symbol (`MessageManager!g_MessageTable`), an offset from one, a `poi()` of
-/// a list head that is not itself a node — and `?` is the only thing that reads those. One
-/// command for the whole walk, rather than one per node, which is the point of resolving here
-/// rather than making every address an expression.
-fn resolve_start(e: &DebugEngine, start: &str) -> Result<u64, Failed> {
+/// A number in any form the debugger prints costs nothing to recognise, so it is tried first, and
+/// the commonest shapes — an address list, a table base pasted out of another tool — never reach
+/// the engine at all. What is left is MASM — a symbol (`MessageManager!g_MessageTable`), an offset
+/// from one, a `poi()` of a list head that is not itself a node — and `?` is the only thing that
+/// reads those. One command for the whole walk, rather than one per node, which is the point of
+/// resolving here rather than making every address an expression.
+///
+/// **Bounded, because this one command is the one part of a walk a watchdog can reach.** Resolving
+/// a symbol can send the engine to a symbol server, and an unbounded `Execute` there outlives the
+/// caller's whole timeout with the session held — the walk's between-node deadline cannot help,
+/// since it is not polled until this returns. So the remaining budget is handed to win-kexp's
+/// watchdog, and what it costs (up to one 200ms watchdog join) is paid only by a caller who passed
+/// an expression rather than a number.
+/// The watchdog budget for [`resolve_start`]'s one command: what the walk has left, in ms.
+///
+/// **Floored at 1 and never 0**, which is the whole reason this is a named function rather than a
+/// cast at the call site. `execute_command_bounded(cmd, 0)` arms no watchdog at all, so a walk
+/// whose budget rounds down to nothing would run its `?` — the one part of the call that can block
+/// on a symbol server for minutes — as the single *unbounded* thing in it. That is the wedge the
+/// bound exists to prevent, reachable by sub-millisecond arithmetic alone.
+///
+/// The same reasoning as [`watchdog_budget_ms`]'s floor and deliberately not the same number: that
+/// one keeps a headroom because its command is already running and the job left is to free the
+/// worker. Here there is nothing to be generous to — 1ms means the resolve is cut short at once,
+/// which is the correct answer for a caller with no time, and it is reported as `NotRun` rather
+/// than as a bad expression.
+fn resolve_budget_ms(within: Duration) -> u32 {
+    u32::try_from(within.as_millis()).unwrap_or(u32::MAX).max(1)
+}
+
+fn resolve_start(e: &DebugEngine, start: &str, within: Duration) -> Result<u64, Failed> {
     if let Ok(address) = parse_pool_addr(start) {
         return Ok(address);
     }
-    let text = e.execute_command(&format!("? {start}")).map_err(|why| {
-        Failed::categorised(
-            structured::ErrorCategory::InvalidArgument,
-            format!("`start` = `{start}` could not be evaluated: {why}"),
-        )
-    })?;
+    let budget = resolve_budget_ms(within);
+    let run = e
+        .execute_command_bounded(&format!("? {start}"), budget)
+        .map_err(|why| {
+            Failed::categorised(
+                structured::ErrorCategory::InvalidArgument,
+                format!("`start` = `{start}` could not be evaluated: {why}"),
+            )
+        })?;
+    // A resolve that was cut short is not a bad expression, and must not be reported as one: it
+    // says nothing about whether the symbol exists. Both origins mean the same thing for the walk
+    // — nothing was read — but they call for opposite responses, so they are categorised apart.
+    if let Some(interruption) = run.cut_short {
+        return Err(match interruption {
+            Interruption::Deadline { after_ms } => Failed::categorised(
+                structured::ErrorCategory::NotRun,
+                format!(
+                    "Resolving `start` = `{start}` was still running after {after_ms}ms, which \
+                     was all the time this call had, so it was stopped and no node was walked. \
+                     Resolving a symbol can send the debugger to a symbol server; pass the \
+                     numeric address instead (`execute {{\"command\": \"? {start}\"}}` once, then \
+                     walk from what it prints), or raise the server's call timeout \
+                     (WINDBG_MCP_CALL_TIMEOUT_SECS)."
+                ),
+            ),
+            Interruption::OnRequest => Failed::categorised(
+                structured::ErrorCategory::Interrupted,
+                format!(
+                    "Resolving `start` = `{start}` was interrupted before the walk began, so \
+                     nothing was read."
+                ),
+            ),
+        });
+    }
     // A `?` that *runs* but produces nothing an address can be read out of is the caller's
     // mistake, not the target's — a misspelt symbol is the usual one — so it is categorised as
     // such, and the debugger's own words go with it rather than a paraphrase.
-    parse_eval(&text).ok_or_else(|| {
+    parse_eval(&run.output).ok_or_else(|| {
         Failed::categorised(
             structured::ErrorCategory::InvalidArgument,
             format!(
                 "`start` = `{start}` did not evaluate to an address. The debugger said: {}",
-                text.trim()
+                run.output.trim()
             ),
         )
     })
@@ -1863,11 +1916,15 @@ fn resolve_start(e: &DebugEngine, start: &str) -> Result<u64, Failed> {
 /// its per-field fallback, the loop detection, the table — is [`crate::walk`], which has no engine
 /// and so can be tested against an address space with holes in exactly the places that matter.
 ///
-/// **The deadline starts before the start expression is resolved**, because `?` on a symbol can
-/// block on a symbol server, and a budget that began after it would be a budget measured from an
-/// unknown point in the caller's wait.
+/// **The deadline starts before the start expression is resolved**, and the resolve is bounded by
+/// what is left of it ([`resolve_start`]) — `?` on a symbol can block on a symbol server, and a
+/// budget that began after it would be a budget measured from an unknown point in the caller's
+/// wait.
 fn walk_memory(e: &DebugEngine, op: walk::WalkOp, within: Duration) -> Result<Output, Failed> {
     let deadline = Instant::now() + within;
+    // What is left *now*, so the resolve cannot spend time the walk has already used and the walk
+    // cannot be handed time the resolve already spent. One deadline, read twice.
+    let left = || deadline.saturating_duration_since(Instant::now());
     let source = match op.source {
         walk::Source::List { addresses } => walk::Resolved::List(addresses),
         walk::Source::Array {
@@ -1875,7 +1932,7 @@ fn walk_memory(e: &DebugEngine, op: walk::WalkOp, within: Duration) -> Result<Ou
             stride,
             count,
         } => walk::Resolved::Array {
-            start: resolve_start(e, &start)?,
+            start: resolve_start(e, &start, left())?,
             stride,
             count,
         },
@@ -1884,7 +1941,7 @@ fn walk_memory(e: &DebugEngine, op: walk::WalkOp, within: Duration) -> Result<Ou
             next_offset,
             count,
         } => walk::Resolved::Chain {
-            start: resolve_start(e, &start)?,
+            start: resolve_start(e, &start, left())?,
             next_offset,
             count,
         },
@@ -3366,6 +3423,27 @@ mod tests {
     #[test]
     fn no_patience_left_still_arms_the_watchdog() {
         assert_eq!(watchdog_budget_ms(Duration::ZERO, Duration::ZERO), 15_000);
+    }
+
+    /// And a walk's start resolution is armed too, whatever is left of the clock.
+    ///
+    /// A walk is a run of reads that no watchdog can bound — the between-node deadline is the only
+    /// thing holding it — with exactly one exception: the `?` that resolves a symbolic `start`,
+    /// which is a command, can block on a symbol server, and *can* be bounded. Zero would leave
+    /// that one command unbounded inside a call whose every other part is bounded, so the floor is
+    /// what makes the exception hold at every budget rather than at most of them.
+    #[test]
+    fn resolving_a_symbolic_start_is_bounded_at_every_budget() {
+        assert_eq!(resolve_budget_ms(Duration::from_secs(30)), 30_000);
+        // Sub-millisecond, which truncates to zero — and zero disarms the watchdog entirely.
+        assert_ne!(resolve_budget_ms(Duration::from_micros(1)), 0);
+        assert_ne!(resolve_budget_ms(Duration::ZERO), 0);
+        // And a budget past what the API can carry saturates rather than wrapping to something
+        // small, which would cut a healthy resolve short.
+        assert_eq!(
+            resolve_budget_ms(Duration::from_secs(u32::MAX as u64)),
+            u32::MAX
+        );
     }
 
     /// An `!analyze` is only started when its watchdog fits inside what is left **and still leaves
