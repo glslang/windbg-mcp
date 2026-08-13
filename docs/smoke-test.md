@@ -309,6 +309,14 @@ about. This is the other half — an attach that lands:
   no longer reclaimable and the fix is undone.
 - **A second session works alongside it** — a dump opened and used while the kernel attach is held,
   with the kernel session unaffected. Impossible by construction before.
+- **`crash_triage` refuses a kernel that has not crashed, and refuses it correctly.** This is the
+  state the debugger-free exploitation loop sits in *between* fires — attached, working, nothing
+  bug-checked yet — and a dump can never be in it: a dump either is a crash dump or is not, while a
+  live kernel moves between the two. So this is the only place both arms of the refusal are
+  reachable, and the only place it can be checked that a kernel target does not take the *user-mode*
+  arm. It also checks that the refusal costs the session nothing: the loop attaches once and fires
+  many times, so a triage that came too early has to leave the session exactly as usable as it
+  found it.
 - **`end_session` detaches gracefully rather than killing the worker.** This one has teeth: DbgEng
   leaves a detached-but-halted kernel *frozen*, so win-kexp resumes and actively detaches. A run
   that took the kill path instead would leave the guest halted with a wedged KD stub, needing a

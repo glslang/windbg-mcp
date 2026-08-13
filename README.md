@@ -616,14 +616,20 @@ timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressio
   own output, so they are extracted from it and confined to the `analysis` object. **Prefer
   `faulting_frame` to `analysis.module_name`**: the frame's `module+RVA` is computed from the load
   base and is right for a driver with no PDB, which is exactly where `!analyze`'s attribution goes
-  wrong — the text points the disagreement out when there is one. `faulting_frame` is the topmost
-  frame outside `nt`/`hal`, and is **absent** when the whole captured stack is in the kernel image;
-  `faulting_frame_note` then says whether that is the crash itself (a `0x9F` watchdog fires on an
-  idle CPU — the culprit is not on that stack, and the bug check *arguments* are where to go next)
-  or merely the 16-frame default cap, which `frames` raises to 128. `analyze: false` skips
-  `!analyze` for a fast answer of everything else. Needs a kernel target *stopped at a bug check*:
-  a live kernel that has not crashed and a dump that is not a crash dump both report bug check
-  code 0, and say so.
+  wrong. **Which frame is the culprit is still a guess, though — only the offset is computed.**
+  `faulting_frame` is the innermost frame outside `nt`/`hal` and the framework layers that sit on a
+  stack on somebody else's behalf (KMDF's `Wdf01000`, Driver Verifier), so a crash routed through a
+  layer this build does not recognise names that layer instead of the driver behind it. The text
+  prints `!analyze`'s attribution beside it whenever the two disagree and tells you to settle it
+  from `frames`, where every `module+RVA` is sound whichever guess is right. `faulting_frame` is
+  **absent** when the whole captured stack is in those images; `faulting_frame_note` then says
+  whether that is the crash itself (a `0x9F` watchdog fires on an idle CPU — the culprit is not on
+  that stack, and the bug check *arguments* are where to go next) or merely the 16-frame default
+  cap, which `frames` raises to 128. `analyze: false` skips `!analyze` for a fast answer of
+  everything else; with it on, note that `!analyze -v` may leave the session's context on the
+  faulting thread it selected, exactly as running it through `execute` would. Needs a kernel target
+  *stopped at a bug check* — a live kernel that has not crashed yet, and a dump that is not a crash
+  dump, are both **refused** with a message saying which of the two they are.
 - **`crash_triage` tries `!analyze -v` and then `!ext.analyze -v`**, and reports which one worked
   under `analysis.command`. A **manual** `execute` has to pick, and on the bundled engine the
   answer is the module-qualified `!ext.analyze -v` — the unqualified form does not resolve there

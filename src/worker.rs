@@ -1336,6 +1336,22 @@ fn crash_triage(
         }
     };
 
+    // **`!analyze` runs before the reads, not after**, and the ordering is load-bearing twice
+    // over. `!analyze -v` selects the faulting context — on an exception bug check (`0x8E`,
+    // `0x7E`, `0x3B`: the common driver crash) it `.cxr`s to the context record, which is a
+    // different stack from the one the dump opens on. Reading afterwards means the frames describe
+    // the thread the analysis blamed, which is the stack worth having. It also makes the tool
+    // idempotent: run twice, and the second call re-selects the same context before reading rather
+    // than reading whatever the first one left selected.
+    //
+    // With `analyze: false` nothing moves the context and nothing needs to — the reads describe
+    // the context the target is already stopped in, which is what `backtrace` would show too.
+    let analysis = if analyze {
+        run_analyze(e, patience, queued.saturating_add(started.elapsed()))
+    } else {
+        Analysis::NotRequested
+    };
+
     // Best-effort from here on. A stack walk that fails leaves no frames, which the report renders
     // as "no faulting frame" with the reason — strictly more than a failed call would say.
     let walked = e.stack_frames(frames).unwrap_or_else(|why| {
@@ -1369,12 +1385,6 @@ fn crash_triage(
         .ok()
         .filter(|name| !name.trim().is_empty());
 
-    let analysis = if analyze {
-        run_analyze(e, patience, queued.saturating_add(started.elapsed()))
-    } else {
-        Analysis::NotRequested
-    };
-
     let report = triage::report(bug_check, &attributed, truncated, process_name, analysis);
     Ok(Output::typed(triage::render(&report), report))
 }
@@ -1386,37 +1396,45 @@ fn crash_triage(
 /// So the plain form is tried first and the qualified one is the fallback, and which one worked
 /// is reported rather than assumed.
 ///
-/// **Both attempts share one deadline, and the second only runs if there is deadline left.**
+/// **The deadline is checked before *every* attempt, not just the fallback.**
 /// `watchdog_budget_ms` floors at [`WATCHDOG_HEADROOM`] — deliberately, because a command dequeued
-/// past its deadline must still be bounded by *something* — so two attempts taken unconditionally
-/// could between them run two floors past the moment their caller gave up. What has been spent is
-/// therefore checked against the caller's patience before the fallback rather than left to that
-/// floor, which is the arithmetic [`crate::batch`] does per step and for the same reason.
+/// past its deadline must still be bounded by *something* — so an attempt started with nothing left
+/// still runs for a floor's worth, and two of them for two floors, all of it after the caller has
+/// given up. Checking first is the arithmetic [`crate::batch`] does per step and for the same
+/// reason. Note the reads *ahead* of this can exhaust the patience on their own, so the very first
+/// attempt is as capable of being skipped as the second.
 ///
-/// `before` is what the whole triage has already spent, not just what it queued for: the reads
-/// ahead of this can pull a PDB over the network, and an `!analyze` handed the full patience
-/// afterwards would run on past the caller either way.
+/// `before` is what the whole triage has already spent, not just what it queued for: resolving a
+/// frame's symbol can pull a PDB over the network, and an `!analyze` handed the full patience
+/// afterwards would run on past its caller either way.
+///
+/// **Why it did not run matters**, so the two ways of failing are kept apart: no time left, and
+/// both spellings tried and neither resolving. Reporting the first as the second sends a caller
+/// looking for an `ext.dll` that is sitting right where it should be.
 fn run_analyze(e: &DebugEngine, patience: Duration, before: Duration) -> Analysis {
     let started = Instant::now();
     let mut last: Option<String> = None;
-    for (attempt, command) in ["!analyze -v", "!ext.analyze -v"].into_iter().enumerate() {
+    let mut ran_out = false;
+    for command in ["!analyze -v", "!ext.analyze -v"] {
         let spent = before.saturating_add(started.elapsed());
-        if attempt > 0 && spent >= patience {
-            last = Some(format!(
-                "{}; there was no time left to try `{command}` as well",
-                last.unwrap_or_else(|| "the first attempt produced nothing".to_string())
-            ));
+        if spent >= patience {
+            ran_out = true;
             break;
         }
         match e.execute_command_bounded(command, watchdog_budget_ms(patience, spent)) {
-            // Cut short by the watchdog. The output is *not* discarded — `!analyze` prints its
-            // summary block early, so a truncated run usually still carries the code and the
-            // arguments — but it is reported as truncated, because otherwise a `pool_tag` that was
-            // merely never reached is indistinguishable from one `!analyze` decided there was none.
+            // Cut short. The output is *not* discarded — `!analyze` prints its summary block
+            // early, so a truncated run usually still carries the code and the arguments — but it
+            // is reported as truncated, because otherwise a `pool_tag` that was merely never
+            // reached is indistinguishable from one `!analyze` decided there was none.
+            //
+            // The *cause* travels with it. A deadline and a caller's `interrupt` both land here
+            // and the advice differs: one says raise the timeout, the other is a caller who
+            // already knows, having asked.
             Ok(run) if run.cut_short.is_some() && looks_analysed(&run.output) => {
                 return Analysis::Truncated {
                     command: command.to_string(),
                     output: run.output,
+                    on_request: matches!(run.cut_short, Some(Interruption::OnRequest)),
                 };
             }
             // An engine without the extension answers with "No export analyze found" and an
@@ -1437,12 +1455,28 @@ fn run_analyze(e: &DebugEngine, patience: Duration, before: Duration) -> Analysi
             Err(why) => last = Some(format!("`{command}` failed: {why}")),
         }
     }
+    let why = if ran_out {
+        format!(
+            "there was no time left in this call to run it{}. Raise \
+             WINDBG_MCP_CALL_TIMEOUT_SECS, issue the triage on an idle session, or pass \
+             `analyze: false` to say so deliberately.",
+            match &last {
+                Some(first) => format!(" — the first attempt had already been made and {first}"),
+                None => String::from(
+                    ", because the reads above had already spent the caller's patience"
+                ),
+            }
+        )
+    } else {
+        format!(
+            "neither `!analyze -v` nor `!ext.analyze -v` resolved — the engine most likely has no \
+             `winext\\ext.dll` beside it (see the README's engine setup). Last attempt: {}",
+            last.unwrap_or_else(|| "no output".to_string())
+        )
+    };
     Analysis::Unavailable(format!(
-        "`!analyze -v` could not be run, so the pool tag and failure bucket are missing; \
-         everything else here is read from the engine and is unaffected. Neither spelling \
-         worked — the engine most likely has no `winext\\ext.dll` beside it (see the README's \
-         engine setup). Last attempt: {}",
-        last.unwrap_or_else(|| "no output".to_string())
+        "`!analyze -v` did not run, so the pool tag and failure bucket are missing; everything \
+         else here is read from the engine and is unaffected. Reason: {why}"
     ))
 }
 

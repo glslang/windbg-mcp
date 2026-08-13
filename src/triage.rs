@@ -21,9 +21,22 @@
 //! That split is not tidiness. `!analyze` attributes a crash to a module by heuristic, and on a
 //! driver with no PDB it is often wrong — it named `mpsdrv` for a crash in `MessageManager` in the
 //! run this tool came out of. So the frames here are attributed **independently**, from the load
-//! bases the engine reports, and `module+RVA` computed that way is the field to trust. `!analyze`'s
-//! own answer travels beside it, under `analysis.module_name`, precisely so the two can be
-//! compared rather than confused.
+//! bases the engine reports. `!analyze`'s own answer travels beside them, under
+//! `analysis.module_name`, precisely so the two can be compared rather than confused.
+//!
+//! # What is reliable here, and what is a guess
+//!
+//! Each frame's `module` + `rva` is **computed**: the engine says which image holds the address and
+//! where it is loaded, and the offset falls out. That number is as good as the dump, and it is the
+//! one that survives a driver with no PDB and stays comparable across reboots.
+//!
+//! Which of those frames is the *culprit* is a **heuristic** — the innermost one outside the bug
+//! check machinery and the framework layers ([`KERNEL_IMAGES`]) — and it is positional, so a stack
+//! running through a layer this build does not recognise names that layer. `faulting_frame` is
+//! therefore a first guess to check against `frames`, not a verdict, and the rendering says so
+//! rather than telling a caller to prefer it over `!analyze` outright. That distinction was worth
+//! getting right: the two are wrong in different ways, and a caller who knows which is which can
+//! settle it from the stack in one look.
 
 use win_kexp::dbgeng::{BugCheck, Module, StackFrame};
 
@@ -41,19 +54,38 @@ pub struct AttributedFrame {
 
 /// The modules a bug check passes *through* on its way to being one.
 ///
-/// Frames in these are skipped when picking the faulting frame: `nt!KeBugCheckEx` is on top of
-/// every single crash, so it is never the answer. The list is exact rather than a prefix match, so
-/// a driver called `halcyon.sys` is not mistaken for the HAL — the cost of a kernel image this
-/// list does not name is that its frame gets picked as the culprit, which shows a caller something
-/// slightly wrong rather than hiding something right.
+/// Two groups, because they are skipped for two different reasons and the second is far less
+/// certain than the first.
+///
+/// **The kernel image and the HAL** carry the bug check itself. `nt!KeBugCheckEx` is on top of
+/// every crash there has ever been, so it is never the answer.
+///
+/// **The pass-through layers** sit between the kernel and a client driver by construction: a KMDF
+/// driver's stack is `nt -> Wdf01000 -> TheDriver`, and picking `Wdf01000` would name the
+/// framework for every KMDF bug in existence. Driver Verifier is the same shape — it is on the
+/// stack precisely because it is watching somebody else.
+///
+/// **This list is a heuristic and the shorter one on purpose.** A pass-through layer really can be
+/// the culprit (a framework bug is a bug), and plenty of layers are not here — `ndis`, `storport`,
+/// `fltmgr` and the rest are *not* listed, because a crash inside them is as often theirs as their
+/// caller's and skipping them would hide the answer rather than find it. So this narrows the first
+/// guess; it does not decide guilt, which is why `frames` carries the whole walk and the rendering
+/// says the attribution is a starting point.
+///
+/// Matched exactly, never by prefix, so a driver called `halcyon.sys` is not mistaken for the HAL.
 const KERNEL_IMAGES: &[&str] = &[
     "nt", "ntoskrnl", "ntkrnlmp", "ntkrnlpa", "ntkrpamp", "hal", "halmacpi", "halacpi", "halaacpi",
     "halx86",
 ];
 
-fn is_kernel_image(name: &str) -> bool {
+/// See [`KERNEL_IMAGES`]: layers that are on the stack on somebody else's behalf.
+const PASS_THROUGH_IMAGES: &[&str] = &["wdf01000", "wdfldr", "verifier", "vrfcore"];
+
+/// Whether a frame in this module is bug check machinery rather than a candidate culprit.
+fn is_pass_through(name: &str) -> bool {
     KERNEL_IMAGES
         .iter()
+        .chain(PASS_THROUGH_IMAGES)
         .any(|known| known.eq_ignore_ascii_case(name))
 }
 
@@ -82,16 +114,17 @@ pub fn report(
     let extracted = analysis.extracted();
     let frames: Vec<structured::FrameInfo> = frames.iter().map(frame_info).collect();
 
-    // The topmost frame outside the kernel image and the HAL. A frame whose module is unknown
-    // counts as outside: an address in no loaded module is exactly the kind of thing a driver bug
-    // produces (a freed pool page, an unloaded driver), and it is never the bug check machinery.
+    // The topmost frame outside the bug check machinery and the pass-through layers. A frame whose
+    // module is unknown counts as outside: an address in no loaded module is exactly the kind of
+    // thing a driver bug produces (a freed pool page, an unloaded driver), and it is never the bug
+    // check machinery.
     let faulting = frames
         .iter()
         .find(|frame| {
             frame
                 .module
                 .as_deref()
-                .is_none_or(|name| !is_kernel_image(name))
+                .is_none_or(|name| !is_pass_through(name))
         })
         .cloned();
     let faulting_note = match (&faulting, frames.first()) {
@@ -100,9 +133,10 @@ pub fn report(
             "the stack walk returned no frames, so there is no faulting frame to name".to_string(),
         ),
         (None, Some(top)) => Some(format!(
-            "every one of the {} captured frames is in the kernel image or the HAL, so no driver \
-             frame can be named: the bug check is either in the kernel's own path or the stack \
-             did not reach the culprit. The innermost frame is {}.{}",
+            "every one of the {} captured frames is in the kernel image, the HAL or a \
+             pass-through layer, so no driver frame can be named: the bug check is either in the \
+             kernel's own path or the stack did not reach the culprit. The innermost frame is \
+             {}.{}",
             frames.len(),
             top.symbol
                 .clone()
@@ -190,7 +224,15 @@ pub enum Analysis {
     /// `!analyze` prints its summary block early, so a truncated run usually still carries the
     /// code and the arguments, and a `pool_tag` that was simply never reached would otherwise be
     /// indistinguishable from one `!analyze` decided the bug check does not have.
-    Truncated { command: String, output: String },
+    Truncated {
+        command: String,
+        output: String,
+        /// Whether a caller asked for the break, rather than the deadline forcing it. The two want
+        /// different advice — "raise the timeout" is useless to someone who called `interrupt`
+        /// deliberately — and telling one as the other is the sort of note that sends a reader
+        /// looking for a problem that is not there.
+        on_request: bool,
+    },
 }
 
 impl Analysis {
@@ -221,17 +263,31 @@ impl Analysis {
             // carrying the qualification. Reporting it as not having run would throw away fields
             // that are perfectly good, and reporting it as complete would lend the missing ones a
             // meaning they have not earned.
-            Self::Truncated { command, output } => {
+            Self::Truncated {
+                command,
+                output,
+                on_request,
+            } => {
                 let mut info = extract(output);
                 info.ran = true;
                 info.truncated = true;
                 info.command = Some(command.clone());
                 info.note = Some(format!(
-                    "`{command}` was cut short by this call's deadline before it finished. What \
-                     it had printed is below and is sound as far as it goes, but a field missing \
-                     here may simply not have been reached — it is not `!analyze` saying there is \
-                     none. Raise WINDBG_MCP_CALL_TIMEOUT_SECS, or issue the triage on an idle \
-                     session, to get the whole analysis."
+                    "`{command}` was cut short {} before it finished. What it had printed is here \
+                     and is sound as far as it goes, but a field missing from this object may \
+                     simply not have been reached — it is not `!analyze` saying the bug check has \
+                     none. {}",
+                    if *on_request {
+                        "by an `interrupt` on this session"
+                    } else {
+                        "by this call's deadline"
+                    },
+                    if *on_request {
+                        "Triage again without interrupting to get the whole analysis."
+                    } else {
+                        "Raise WINDBG_MCP_CALL_TIMEOUT_SECS, or issue the triage on an idle \
+                         session, to get the whole analysis."
+                    }
                 ));
                 info
             }
@@ -401,13 +457,22 @@ pub fn render(triage: &structured::CrashTriage) -> String {
             .as_ref()
             .and_then(|frame| frame.module.as_deref())
         {
-            // Case-insensitively, as [`is_kernel_image`] compares: `!analyze` does not always
+            // Case-insensitively, as [`is_pass_through`] compares: `!analyze` does not always
             // spell `MODULE_NAME` the way the engine names the module, and a `messagemanager`
             // beside a `MessageManager` is agreement, not the disagreement this line is for.
             Some(named) if named.eq_ignore_ascii_case(module) => {}
+            // Two guesses that disagree, and this says so without picking a winner. The *offset*
+            // above is computed from the load base and is reliable; which frame is guilty is a
+            // heuristic — the innermost one outside the kernel and the pass-through layers — and
+            // `!analyze`'s attribution is a different heuristic. Telling a caller to prefer the
+            // frame outright was the earlier wording and it over-claimed: on a stack that runs
+            // through a layer this build does not know is a layer, the frame is the wrong one.
             Some(_) => text.push_str(&format!(
-                "!analyze blamed: {module} (differs from the faulting frame above, which is \
-                 computed from the module's load base — prefer it)\n"
+                "!analyze blamed: {module} — it disagrees with the faulting frame above. Neither \
+                 is authoritative: the frame is the innermost one outside `nt`/`hal` and the \
+                 framework layers, `!analyze`'s is its own heuristic. Read STACK below to settle \
+                 it — every frame's `module+RVA` is computed from the load base and is sound \
+                 whichever of the two is right.\n"
             )),
             None => text.push_str(&format!("!analyze blamed: {module}\n")),
         }
@@ -708,6 +773,45 @@ mod tests {
         assert_eq!(triage.frames.len(), 2);
     }
 
+    /// A KMDF driver's stack is `nt -> Wdf01000 -> TheDriver`, and the framework is on it because
+    /// it is calling somebody else. Naming `Wdf01000` would blame the framework for every KMDF bug
+    /// there is.
+    #[test]
+    fn a_framework_layer_is_skipped_to_reach_the_driver_behind_it() {
+        const WDF_BASE: u64 = 0xfffff803_3c000000;
+        let frames = vec![
+            AttributedFrame {
+                frame: frame(0, NT_BASE + 0x1000, Some("nt!KeBugCheckEx"), 0),
+                module: Some(module("nt", NT_BASE)),
+            },
+            AttributedFrame {
+                frame: frame(1, WDF_BASE + 0x2000, Some("Wdf01000!FxRequest"), 0x20),
+                module: Some(module("Wdf01000", WDF_BASE)),
+            },
+            AttributedFrame {
+                frame: frame(2, DRIVER_BASE + 0x1654, None, 0),
+                module: Some(module("MyDriver", DRIVER_BASE)),
+            },
+        ];
+        let triage = report(
+            BugCheck {
+                code: 0xC4,
+                parameters: [0; 4],
+            },
+            &frames,
+            false,
+            None,
+            Analysis::NotRequested,
+        );
+        let faulting = triage
+            .faulting_frame
+            .expect("the driver behind the framework");
+        assert_eq!(faulting.module.as_deref(), Some("MyDriver"));
+        assert_eq!(faulting.rva.as_deref(), Some("0x1654"));
+        // The framework frame is still in the walk — skipping it as a *culprit* is not hiding it.
+        assert_eq!(triage.frames[1].module.as_deref(), Some("Wdf01000"));
+    }
+
     /// An address in no loaded module — a freed page, an unloaded driver — is a culprit, not a
     /// kernel frame to skip past.
     #[test]
@@ -853,6 +957,7 @@ FAILURE_BUCKET_ID:  0x9F_3
         let truncated = cut_short(Analysis::Truncated {
             command: "!analyze -v".into(),
             output: partial.into(),
+            on_request: false,
         });
         assert!(truncated.ran, "it did run, and what it printed is real");
         assert!(truncated.truncated);

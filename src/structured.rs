@@ -878,12 +878,18 @@ pub struct CrashTriage {
     /// than off `!analyze`. Absent when the engine could not name it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_name: Option<String>,
-    /// The topmost frame outside the kernel image and the HAL — in a driver bug, the driver.
+    /// The innermost frame outside the kernel image, the HAL and the framework layers that sit on
+    /// the stack on somebody else's behalf (KMDF, Driver Verifier) — in a driver bug, the driver.
     ///
-    /// `None` when every captured frame is in `nt`/`hal`, which is a real answer (the bug is in
-    /// the kernel's own path, or the stack did not reach the culprit) and not a failure;
-    /// [`Self::faulting_frame_note`] says which, and [`Self::frames`] is the whole walk either
-    /// way.
+    /// **A first guess, not a verdict.** The rule is positional, so a crash whose stack runs
+    /// through a layer this build does not recognise as a layer names that layer instead of the
+    /// driver behind it. What *is* reliable is each frame's `module` + `rva`, computed from the
+    /// engine's load bases — so [`Self::frames`] is what settles a disagreement, and
+    /// `analysis.module_name` is `!analyze`'s independent guess beside this one.
+    ///
+    /// `None` when every captured frame is in one of those images, which is a real answer (the bug
+    /// is in the kernel's own path, or the stack did not reach the culprit) and not a failure;
+    /// [`Self::faulting_frame_note`] says which.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub faulting_frame: Option<FrameInfo>,
     /// Why there is no [`Self::faulting_frame`], when there is none.
