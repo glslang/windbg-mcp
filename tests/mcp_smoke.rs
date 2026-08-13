@@ -1832,40 +1832,40 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
         "matching only unloaded modules is a finding, not a miss:\n{text}"
     );
 
-    // Three refusals, all before the engine is touched: a filter that narrows by nothing, one
-    // that would end the `lm m` it is interpolated into, and one whose wildcards `lm m` honours
-    // and this server does not — `lm m nt[fd]*` prints `Ntfs`, while matching `[fd]` literally
-    // (which is what the values would do) matches nothing at all.
-    let blank = server.tool_failure(
-        "modules",
-        json!({ "session_id": session_id, "filter": "  " }),
-        TARGET_STEP,
-    );
-    assert_eq!(blank["error"]["category"], "invalid_argument", "{blank}");
-    let injected = server.tool_failure(
-        "modules",
-        json!({ "session_id": session_id, "filter": "nt; .detach" }),
-        TARGET_STEP,
-    );
-    assert_eq!(
-        injected["error"]["category"], "invalid_argument",
-        "{injected}"
-    );
-    let unsupported = server.tool_failure(
-        "modules",
-        json!({ "session_id": session_id, "filter": "nt[fd]*" }),
-        TARGET_STEP,
-    );
-    assert_eq!(
-        unsupported["error"]["category"], "invalid_argument",
-        "{unsupported}"
-    );
-    assert!(
-        unsupported["error"]["message"]
-            .as_str()
-            .is_some_and(|why| why.contains("execute")),
-        "the refusal names the tool that does run WinDbg's full grammar: {unsupported}"
-    );
+    // The refusals, all before the engine is touched. Each of the last three is a filter this
+    // server cannot match the way `lm m` would, measured on this very engine:
+    //   `lm m nt[fd]*` prints `Ntfs`         — a character set, matched literally here
+    //   `lm m n\t*`    prints `nt`, `Ntfs`   — the escape making `t` literal
+    //   `lm m nt v`    prints `nt` verbosely — a space starts lm's own options, not more pattern
+    for (filter, why) in [
+        ("  ", "a filter that narrows by nothing"),
+        (
+            "nt; .detach",
+            "a filter that would end the command it is in",
+        ),
+        (
+            "nt[fd]*",
+            "a wildcard grammar this server does not implement",
+        ),
+        (r"n\t*", "the escape character, same grammar"),
+        ("nt v", "a space, which `lm m` reads as its own option"),
+    ] {
+        let refused = server.tool_failure(
+            "modules",
+            json!({ "session_id": session_id, "filter": filter }),
+            TARGET_STEP,
+        );
+        assert_eq!(
+            refused["error"]["category"], "invalid_argument",
+            "{why} (`{filter}`) must be refused as an argument fault: {refused}"
+        );
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "a refusal has to say what is wrong: {refused}"
+        );
+    }
 
     // The session is still the dump it was — the refused call reached nothing.
     let after = server.tool_data("modules", json!({ "session_id": session_id }), TARGET_STEP);

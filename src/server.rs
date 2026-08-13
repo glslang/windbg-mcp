@@ -526,36 +526,72 @@ pub(crate) fn parse_lm_base(text: &str) -> Option<u64> {
 /// implements.
 const MODULE_WILDCARDS: [char; 2] = ['*', '?'];
 
-/// The rest of WinDbg's [string wildcard grammar][syntax], which `lm m` reads and this server
-/// does not implement: character sets and ranges (`[fd]`, `[a-z]`), `#` (zero or more of the
-/// preceding character) and `+` (one or more).
+/// Whether a character may appear in a module filter: something a module or image name is made
+/// of, or one of the two wildcards above.
+///
+/// **An allowlist, not a list of the metacharacters to refuse**, and that is the point. WinDbg's
+/// [string wildcard grammar][syntax] is bigger than it looks — `[fd]` and `[a-z]` character sets,
+/// `#` for zero or more of the preceding character, `+` for one or more, and `\` escaping any of
+/// them — and a blocklist is only ever as complete as the last reading of that page. Two review
+/// rounds bore that out: the sets came first, then the escape. Everything not spelled here is
+/// refused, so a feature of the grammar nobody has noticed yet is refused too, rather than
+/// honoured by `lm m` and matched literally here.
+///
+/// `-` and `.` are in: they appear in image names (`api-ms-win-core-file-l1-1-0.dll`,
+/// `nvhda64v.sys`) and are literal on both sides — the docs make hyphens literal outside brackets,
+/// and brackets cannot get here.
 ///
 /// [syntax]: https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/string-wildcard-syntax
-const UNIMPLEMENTED_WILDCARDS: [char; 4] = ['[', ']', '#', '+'];
+fn is_module_filter_char(c: char) -> bool {
+    c.is_alphanumeric() || MODULE_WILDCARDS.contains(&c) || matches!(c, '_' | '.' | '-')
+}
 
-/// Refuses a filter whose wildcards `lm m` would honour and this server would not.
+/// Refuses a filter this server cannot match the way `lm m` will.
 ///
-/// **Measured, not assumed**: on this repo's sample dump `lm m nt[fd]*` prints `Ntfs`, `lm m nt#f*`
-/// prints `Ntfs`, and `lm m ha+l` prints `hal` — so a filter carrying one of these narrows the
-/// *text* by a grammar the *values* would match literally, and one answer would report two
-/// different sets of modules. That is the single property this whole feature promises, so the
-/// third option — implement the grammar — is the one not taken: a hand-written re-implementation
-/// of DbgEng's matcher is a claim that can only be checked corner by corner, and every corner
+/// Two ways that happens, both **measured on this engine rather than assumed**, and both of them
+/// producing one answer whose text and values describe different sets of modules — the single
+/// property this feature promises.
+///
+/// **Grammar `lm m` implements and this does not.** `lm m nt[fd]*` and `lm m nt#f*` print `Ntfs`,
+/// `lm m ha+l` prints `hal`, and `lm m n\t*` prints `nt`, `Ntfs` and `ntosext` — the backslash
+/// escaping the `t` into a literal. Matched literally, which is what the value side would do, every
+/// one of those matches nothing. Implementing the grammar is the option deliberately not taken: a
+/// second implementation of DbgEng's matcher can only be checked corner by corner, and a corner
 /// missed is a silent disagreement rather than a refusal.
 ///
+/// **Whitespace inside the operand**, which is worse than a mismatched pattern. `lm m` takes one
+/// operand and reads what follows as *its own options*: `lm m nt v` matched `nt` and printed the
+/// verbose listing, so the text is not a differently-filtered answer but a different command.
+/// Module names have no spaces in them, so nothing legitimate is lost.
+///
 /// Costs a caller nothing they cannot get another way: `execute { "command": "lm m nt[fd]*" }` runs
-/// the engine's own matcher, and these characters do not appear in real module names.
-pub(crate) fn reject_unsupported_wildcards(filter: &str) -> Result<(), String> {
-    let Some(found) = filter.chars().find(|c| UNIMPLEMENTED_WILDCARDS.contains(c)) else {
+/// the engine's own matcher on anything this refuses.
+pub(crate) fn reject_unmatchable_filter(filter: &str) -> Result<(), String> {
+    // Trimmed exactly as `module_pattern` trims it, so the two agree on what the operand is:
+    // surrounding space is the caller's formatting, and only space *within* it reaches `lm m`.
+    let filter = filter.trim();
+    if filter.chars().any(char::is_whitespace) {
+        return Err(
+            "`filter` contains a space, and `lm m` takes a single operand — it reads what follows \
+             as its own options rather than as more of the pattern. Measured on this engine: \
+             `lm m nt v` matches `nt` and prints lm's *verbose* listing, so the text would answer \
+             a different question from the values beside it. Module names contain no spaces; use \
+             `*` if a wildcard is what was meant."
+                .to_string(),
+        );
+    }
+    let Some(found) = filter.chars().find(|c| !is_module_filter_char(*c)) else {
         return Ok(());
     };
     Err(format!(
-        "`filter` contains `{found}`, which WinDbg's `lm m` reads as a wildcard — character sets \
-         (`[fd]`, `[a-z]`), `#` (zero or more of the previous character) and `+` (one or more) — \
-         and this tool does not implement. Honouring it in the listing text but not in the values \
-         beside it would make one answer describe two different sets of modules, so it is refused \
-         instead. This filter takes `*` (any run of characters) and `?` (exactly one); for the \
-         full grammar use execute {{ \"command\": \"lm m <pattern>\" }}."
+        "`filter` contains `{found}`, which is not part of a module name and which WinDbg's \
+         `lm m` may read as a wildcard: its grammar has `[fd]`/`[a-z]` character sets, `#` (zero \
+         or more of the previous character), `+` (one or more) and `\\` (escape the next \
+         character), none of which this tool implements. Honouring them in the listing text but \
+         not in the values beside it would make one answer describe two different sets of modules, \
+         so anything outside a name is refused instead. This filter takes a module or image name \
+         plus `*` (any run of characters) and `?` (exactly one); for the full grammar use \
+         execute {{ \"command\": \"lm m <pattern>\" }}."
     ))
 }
 
@@ -1292,9 +1328,11 @@ pub struct ModulesArgs {
     /// qualified by (`nt`, not `ntkrnlmp.exe`), case-insensitively. A plain name matches
     /// anywhere in a module name, so `"nt"` also finds `ntfs` and `WinNT`. `*` and `?` are
     /// wildcards and a pattern using them is matched as written, so `"nt*"` is the names that
-    /// *start* with `nt`, and `"*"` is every module. Those two are the whole grammar here:
-    /// WinDbg's other wildcards (`[fd]`, `#`, `+`) are refused rather than applied to the text
-    /// and not to the values — run `execute { "command": "lm m <pattern>" }` for those.
+    /// *start* with `nt`, and `"*"` is every module. Those two are the whole grammar here: a
+    /// filter takes a name plus `*` and `?`, and anything else — WinDbg's other wildcards
+    /// (`[fd]`, `#`, `+`, `\`), or a space, which `lm m` reads as the start of its own options —
+    /// is refused rather than applied to the text and not to the values. Run
+    /// `execute { "command": "lm m <pattern>" }` for the full grammar.
     #[serde(default)]
     pub filter: Option<String>,
     /// Session handle returned by open_dump/open_trace/attach_*/launch. Optional: omit it
@@ -2960,7 +2998,7 @@ impl WindbgServer {
                     args.session_id,
                 );
             }
-            if let Err(e) = reject_unsupported_wildcards(filter) {
+            if let Err(e) = reject_unmatchable_filter(filter) {
                 return typed_error(ErrorCategory::InvalidArgument, e, args.session_id);
             }
         }
@@ -4231,26 +4269,58 @@ mod tests {
     /// does implement it.
     ///
     /// Each of these was measured against the sample dump before being refused: `lm m nt[fd]*` and
-    /// `lm m nt#f*` print `Ntfs`, `lm m ha+l` prints `hal`. Matched literally — which is what the
-    /// value side would do — every one of them matches nothing, so the listing and its own count
-    /// would disagree.
+    /// `lm m nt#f*` print `Ntfs`, `lm m ha+l` prints `hal`, and `lm m n\t*` prints `nt`, `Ntfs`
+    /// and `ntosext` — the backslash escaping the `t`. Matched literally, which is what the value
+    /// side would do, every one of them matches nothing, so the listing and its own count would
+    /// disagree.
     #[test]
     fn wildcards_this_server_cannot_honour_are_refused_not_passed_through() {
-        for filter in ["nt[fd]*", "nt[a-z]", "nt#f*", "ha+l", "]"] {
-            let why = reject_unsupported_wildcards(filter)
-                .expect_err("`{filter}` must not reach `lm m` unmatched by the values");
+        for filter in ["nt[fd]*", "nt[a-z]", "nt#f*", "ha+l", "]", r"n\t*", r"\"] {
+            let Err(why) = reject_unmatchable_filter(filter) else {
+                panic!("`{filter}` must not reach `lm m` unmatched by the values");
+            };
             assert!(
                 why.contains("execute"),
                 "the refusal has to name the way to run it anyway: {why}"
             );
         }
-        // The two it does implement, and the ordinary case, all pass.
-        for filter in ["nt", "nt*", "k?32", "*", "MessageManager"] {
+        // The names and wildcards it does implement all pass — including the punctuation real
+        // image names carry, which is the half an allowlist could get wrong.
+        for filter in [
+            "nt",
+            "nt*",
+            "k?32",
+            "*",
+            "MessageManager",
+            "nvhda64v.sys",
+            "RzDev_0228",
+            "api-ms-win-core-file-l1-1-0.dll",
+            "  nt  ",
+        ] {
             assert!(
-                reject_unsupported_wildcards(filter).is_ok(),
-                "`{filter}` is the grammar this tool documents"
+                reject_unmatchable_filter(filter).is_ok(),
+                "`{filter}` is what this tool documents"
             );
         }
+    }
+
+    /// A space in the filter is not a narrower pattern, it is a **different command**.
+    ///
+    /// `lm m` takes one operand and reads the next token as its own option: measured on the sample
+    /// dump, `lm m nt v` matches `nt` and prints lm's verbose listing. So the halves would not
+    /// merely disagree about which modules matched — the text would be answering something else.
+    #[test]
+    fn a_filter_with_a_space_in_it_is_refused_because_lm_would_read_an_option() {
+        for filter in ["nt v", "nt\tv", "nvhda 64v"] {
+            let Err(why) = reject_unmatchable_filter(filter) else {
+                panic!("`{filter}` must not reach `lm m`");
+            };
+            assert!(why.contains("single operand"), "{why}");
+        }
+        // Space *around* the filter is the caller's formatting, and `module_pattern` trims it —
+        // so this check has to trim identically or it refuses what the matcher would have taken.
+        assert!(reject_unmatchable_filter(" nt ").is_ok());
+        assert_eq!(module_pattern(" nt "), "*nt*");
     }
 
     /// `dx` reaches command execution through the data model, so it retires the handle too
