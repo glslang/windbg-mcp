@@ -60,12 +60,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is nothing left to qualify a symbol with), and each row carries the engine's own `unloaded` flag.
 
   Refused before a session is touched: an empty filter, one carrying a `;` that would end the
-  command it is interpolated into, and one using the part of WinDbg's wildcard grammar this server
-  does not implement — character sets and ranges (`[fd]`, `[a-z]`), `#` and `+`. Those are real
-  and were measured (`lm m nt[fd]*` prints `Ntfs`, `lm m ha+l` prints `hal`), so honouring them in
-  the text while matching them literally in the values is exactly the divergence the one-pattern
-  rule exists to prevent. `execute { "command": "lm m <pattern>" }` runs the engine's own matcher
-  for anyone who wants the full grammar.
+  command it is interpolated into, and — by **allowlist** — anything that is not a name plus `*`
+  and `?`. WinDbg's wildcard grammar is bigger than it looks (`[fd]`/`[a-z]` character sets, `#`,
+  `+`, and `\` escaping any of them) and all of it is live: measured on this repo's sample,
+  `lm m nt[fd]*` and `lm m nt#f*` print `Ntfs`, `lm m ha+l` prints `hal`, and `lm m n\t*` prints
+  `nt`, `Ntfs` and `ntosext`. Matched literally — which is what the value side does — every one of
+  those finds nothing. A space is refused for a sharper reason: `lm m` takes a single operand and
+  reads the next token as *its own options*, so `lm m nt v` matches `nt` and prints the verbose
+  listing — the text answering a different question rather than a differently-filtered one. An
+  allowlist rather than a blocklist because a blocklist is only as complete as the last reading of
+  the grammar page, and this one has to hold for the features nobody has noticed yet.
+  `execute { "command": "lm m <pattern>" }` runs the engine's own matcher for anyone who wants the
+  full grammar.
 
 - **`walk_memory`: a structure traversal where an unreadable node is a row, not an end**
   ([#103](https://github.com/glslang/windbg-mcp/issues/103)). Walking a kernel list through
