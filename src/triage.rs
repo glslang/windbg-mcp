@@ -320,6 +320,12 @@ pub enum Analysis {
     NotRequested,
     /// It was asked for and could not be run; the string says why.
     Unavailable(String),
+    /// A caller interrupted it before it printed anything this could read.
+    ///
+    /// Separate from [`Self::Unavailable`] even though both carry only a reason, because this one
+    /// is *cancellation* and the triage has to act on it — an interrupt that produced no readable
+    /// output is exactly as much a request to stop as one that produced some.
+    Interrupted(String),
     /// It ran. Carries the command that worked and its full output, to be extracted below.
     Ran { command: String, output: String },
     /// It started, printed a recognisable analysis, and was cut short before it finished.
@@ -342,17 +348,22 @@ pub enum Analysis {
 impl Analysis {
     /// Whether a caller asked for this call to stop.
     ///
-    /// The one state that must not be followed by more unbounded work: an `interrupt` is a request
-    /// to give back the session, and the reads after the analysis are exactly what would hold it.
-    /// A *deadline* is deliberately not this — that one has a budget which the reads are already
+    /// The states that must not be followed by more unbounded work: an `interrupt` is a request to
+    /// give back the session, and the reads after the analysis are exactly what would hold it.
+    /// **Both** interrupted states count — whether the break arrived after `!analyze` had printed
+    /// something readable or before it, the caller asked the same thing, and deciding from what
+    /// happened to be parseable would make cancellation depend on timing.
+    ///
+    /// A *deadline* is deliberately not this. That one has a budget which the reads are already
     /// reserved out of, and abandoning them would throw away an answer nobody asked to abandon.
     pub fn interrupted(&self) -> bool {
         matches!(
             self,
-            Self::Truncated {
-                on_request: true,
-                ..
-            }
+            Self::Interrupted(_)
+                | Self::Truncated {
+                    on_request: true,
+                    ..
+                }
         )
     }
 
@@ -368,7 +379,7 @@ impl Analysis {
                 ),
                 ..empty_analysis()
             },
-            Self::Unavailable(why) => structured::AnalysisInfo {
+            Self::Unavailable(why) | Self::Interrupted(why) => structured::AnalysisInfo {
                 ran: false,
                 note: Some(why.clone()),
                 ..empty_analysis()
@@ -1179,6 +1190,37 @@ mod tests {
             }
             .interrupted()
         );
+        // Nor is an analysis that simply could not be run — nobody asked for anything to stop.
+        assert!(!Analysis::Unavailable("no ext.dll".into()).interrupted());
+        assert!(!Analysis::NotRequested.interrupted());
+
+        // **A break that landed before `!analyze` printed anything readable is still a break.**
+        // There is no partial analysis to keep, so it is not `Truncated` — and deciding
+        // cancellation from what happened to be parseable would make it depend on exactly when
+        // the break landed, which a caller cannot aim.
+        let early = Analysis::Interrupted("interrupted before it printed anything".into());
+        assert!(early.interrupted());
+        let triage = report(
+            BugCheck {
+                code: 0x13A,
+                parameters: [0; 4],
+            },
+            &Walk::Abandoned,
+            None,
+            early,
+        );
+        assert!(!triage.analysis.ran);
+        assert!(triage.analysis.pool_tag.is_none());
+        assert!(
+            triage
+                .analysis
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("interrupted")),
+            "{:?}",
+            triage.analysis.note
+        );
+        assert!(triage.frames.is_empty());
     }
 
     /// An address in no loaded module — a freed page, an unloaded driver — is a culprit, not a
