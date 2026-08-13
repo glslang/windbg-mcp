@@ -246,27 +246,38 @@ pub fn report(
         )),
     };
 
+    let mut bug_check = bug_check_info(&bug_check);
+    // This build's table first, `!analyze`'s header line second. The table is the reason a name
+    // survives `analyze: false` and an engine with no extensions at all; the header line is the
+    // reason a code newer than this build still gets named.
+    bug_check.name = bug_check.name.or_else(|| extracted.bug_check_name.clone());
+
     structured::CrashTriage {
-        bug_check: structured::BugCheckInfo {
-            code: offset(u64::from(bug_check.code)),
-            // This build's table first, `!analyze`'s header line second. The table is the reason
-            // a name survives `analyze: false` and an engine with no extensions at all; the
-            // header line is the reason a code newer than this build still gets named.
-            name: bug_check_name(bug_check.code)
-                .map(str::to_string)
-                .or_else(|| extracted.bug_check_name.clone()),
-            parameters: bug_check
-                .parameters
-                .iter()
-                .map(|value| structured::addr(*value))
-                .collect(),
-        },
+        bug_check,
         process_name,
         faulting_frame: faulting,
         faulting_frame_note: faulting_note,
         frames,
         frames_truncated: truncated,
         analysis: extracted,
+    }
+}
+
+/// A bug check as fields: the code, the name this build's table gives it, and the four parameters.
+///
+/// Shared with the opener summary ([`structured::TargetSummary`]), which reports the same three
+/// facts and must spell them the same way — a code rendered `0x9f` here and `0x0000009f` there is
+/// two representations of one value, and a consumer would have to know which tool it came from.
+/// [`report`] adds `!analyze`'s own name on top, which is the one thing only it can know.
+pub fn bug_check_info(bug_check: &BugCheck) -> structured::BugCheckInfo {
+    structured::BugCheckInfo {
+        code: offset(u64::from(bug_check.code)),
+        name: bug_check_name(bug_check.code).map(str::to_string),
+        parameters: bug_check
+            .parameters
+            .iter()
+            .map(|value| structured::addr(*value))
+            .collect(),
     }
 }
 

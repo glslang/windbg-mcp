@@ -583,6 +583,16 @@ pub struct Output {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
+    /// An opener's typed facts about the target it just opened, and nothing else's.
+    ///
+    /// Its own field rather than [`Self::data`] because an opener is the one op whose typed answer
+    /// **cannot be finished here**: it is keyed by a session handle the supervisor mints, and this
+    /// process does not know it. So the worker sends the half it does know — as a value, on the
+    /// side of the pipe where the engine's own types are in hand — and the supervisor folds it
+    /// into [`crate::structured::OpenedSession`]. Re-deriving it over there from the report text
+    /// would be [#77](https://github.com/glslang/windbg-mcp/issues/77) again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<crate::structured::TargetSummary>,
 }
 
 impl Output {
@@ -591,6 +601,7 @@ impl Output {
         Self {
             text: text.into(),
             data: None,
+            summary: None,
         }
     }
 
@@ -609,6 +620,16 @@ impl Output {
                     None
                 }
             },
+            summary: None,
+        }
+    }
+
+    /// An opener's reply: the report, and the facts behind it for the supervisor to fold in.
+    pub fn opened(text: impl Into<String>, summary: crate::structured::TargetSummary) -> Self {
+        Self {
+            text: text.into(),
+            data: None,
+            summary: Some(summary),
         }
     }
 }

@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **An opener summarises its target instead of printing the module table**
+  ([#105](https://github.com/glslang/windbg-mcp/issues/105)). `open_dump` answered with `lm` —
+  the whole inventory, ~230 lines on a kernel dump, unprompted — when what a caller reads off an
+  open is three things: which build, where the target's own image is, and (for a crash dump)
+  which bug check. Triaging five minidumps in one session meant paying for that table five times
+  to answer them.
+
+  Every opener now returns those facts instead, as text and as a typed `summary`:
+  `kernel_mode`, `modules_loaded`, the `primary_module` (the kernel on a kernel target, the
+  process's own image otherwise — a base to compute `module+RVA` against), and the `bug_check`
+  the target stopped on, read from the engine's `ReadBugCheckData` and rendered by the same code
+  `crash_triage` uses, so the two spell one value one way. `open_dump`'s own diagnostic is
+  `vertarget` rather than `lm`; the kernel openers already ran it.
+
+  The inventory itself is unchanged and one call away — `modules`, which is where it belongs, and
+  which the report names. Every summary field is best-effort and independently optional: the
+  target is open by the time they are read, and a field that could not be read costs its own
+  field rather than a session that exists. That also makes the summary honest about the case in
+  [#85](https://github.com/glslang/windbg-mcp/issues/85), where a fresh kernel attach has nothing
+  but `nt` in the engine's inventory yet — it says one module, rather than implying a complete
+  list.
+
 ### Added
 
 - **`walk_memory`: a structure traversal where an unreadable node is a row, not an end**

@@ -814,14 +814,14 @@ fn cut_short(result: Result<Output, Failed>) -> Result<Output, Failed> {
         // a fact about this *call*, and rewriting an answer the engine did produce — a stop
         // position, a chunk listing — to say it did not would throw away the very thing that
         // makes interrupting better than ending the session.
-        Ok(out) => Ok(Output {
-            text: match out.text {
+        Ok(mut out) => {
+            out.text = match std::mem::take(&mut out.text) {
                 text if text.is_empty() => NOTE.to_string(),
                 text if text.ends_with('\n') => format!("{text}\n{NOTE}"),
                 text => format!("{text}\n\n{NOTE}"),
-            },
-            data: out.data,
-        }),
+            };
+            Ok(out)
+        }
         // The category matters as much as the note: an interrupted operation reported as a
         // debugger failure tells its caller the target misbehaved, when what happened is that
         // somebody — quite possibly that same caller — asked for it to stop.
@@ -911,6 +911,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         // Each reads the same way: side effect, `commit`, wait, `opened`, report. That order is
         // the contract the milestones exist to express — see [`open`].
         EngineOp::OpenDump { path } => open(
+            e,
             id,
             |commit| {
                 // `open_dump` is the call that claims the target, so commit right after it: a
@@ -927,11 +928,16 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
                 // engine without a bundled `winext\` directory simply won't have ext.dll, which
                 // must not fail the open (live/dump state is still usable).
                 let _ = e.execute_command(".load ext");
-                e.execute_command("lm").map_err(es)
+                // `vertarget`, not `lm`: which build this dump is from, and — on a kernel dump —
+                // where the kernel is loaded, in six lines rather than the couple of hundred the
+                // module table took (#105). The bug check and the module count come from
+                // `target_summary` below; the table itself is what `modules` is for.
+                e.execute_command("vertarget").map_err(es)
             },
         ),
 
         EngineOp::OpenTrace { path } => open(
+            e,
             id,
             |commit| {
                 // As in `OpenDump`: commit before the load wait, because a wait that times out
@@ -974,6 +980,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         ),
 
         EngineOp::AttachKernelLocal => open(
+            e,
             id,
             |commit| {
                 // The engine has claimed the local kernel once `_begin` returns; the break-in
@@ -987,6 +994,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         ),
 
         EngineOp::AttachKernel { connection } => open(
+            e,
             id,
             |commit| {
                 // `_begin` takes the connection; the KD link is dialed and the break-in awaited
@@ -1006,6 +1014,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         ),
 
         EngineOp::AttachProcess { pid } => open(
+            e,
             id,
             |commit| {
                 // Attached once `_begin` returns; the break-in wait follows the commit, so a
@@ -1019,6 +1028,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         ),
 
         EngineOp::Launch { command_line } => open(
+            e,
             id,
             |commit| {
                 // The commit point is *before* the process actually starts: CreateProcessWide is
@@ -2822,7 +2832,7 @@ fn render_census(census: &[query::PoolTagSummary], limit: usize) -> String {
 /// win-kexp's openers expose the first seam as `x_begin()` returning a `PendingTarget` guard,
 /// which cannot exist unless the side effect succeeded — so `commit()` between the guard and its
 /// `wait()` is enforced by the type rather than by convention (glslang/win-kexp#71).
-fn open<T, R>(id: u64, transition: T, report: R) -> Result<Output, Failed>
+fn open<T, R>(e: &DebugEngine, id: u64, transition: T, report: R) -> Result<Output, Failed>
 where
     T: FnOnce(&dyn Fn()) -> Result<(), String>,
     R: FnOnce() -> Result<String, String>,
@@ -2831,10 +2841,12 @@ where
         emit(&WorkerMessage::Committed { id });
     })?;
     emit(&WorkerMessage::Opened { id });
-    // The opener's *typed* answer is assembled by the supervisor, which is the only side that
-    // knows the handle it minted and the state it settled the session into; this side owns the
-    // report text and nothing else.
-    report().map(Output::text).map_err(Failed::from)
+    let diagnostic = report().map_err(Failed::from)?;
+    // Read *after* the diagnostic, and only if it worked: the diagnostic is the answer, and a
+    // summary is a few facts to read it by. The supervisor finishes the typed side, because it is
+    // the only side that knows the handle it minted and the state it settled the session into.
+    let summary = target_summary(e);
+    Ok(Output::opened(summary_text(&diagnostic, &summary), summary))
 }
 
 /// The post-attach diagnostic shared by both kernel openers.
@@ -2845,6 +2857,110 @@ fn kernel_report(e: &DebugEngine) -> Result<String, String> {
     // (those tools then report a clean "no export").
     let _ = e.execute_command(".load kdexts");
     e.execute_command("vertarget").map_err(es)
+}
+
+/// The handful of facts every opener reports about the target it just opened
+/// ([#105](https://github.com/glslang/windbg-mcp/issues/105)).
+///
+/// **Every read here is best-effort, and deliberately so.** The target is open by the time this
+/// runs; failing the open over a summary field would throw away a session that exists, and each
+/// of these has an ordinary reason to be unavailable — `bug_check` fails outright on a user-mode
+/// target, and a kernel attach that has not synchronised its module list yet answers with one
+/// module (#85). An absent field says "not available", and the fields that did read say what they
+/// know.
+///
+/// Cheap, too, which is what makes it affordable on every open: three engine queries against the
+/// engine's own bookkeeping — no symbol resolution, no command, and nothing that goes near a
+/// symbol server.
+fn target_summary(e: &DebugEngine) -> structured::TargetSummary {
+    let kernel_mode = e
+        .is_kernel_target()
+        .inspect_err(|why| {
+            tracing::debug!("worker: open summary could not read target type: {why}")
+        })
+        .ok();
+    let modules = e
+        .modules()
+        .inspect_err(|why| tracing::debug!("worker: open summary could not list modules: {why}"))
+        .ok();
+    structured::TargetSummary {
+        kernel_mode,
+        modules_loaded: modules.as_ref().map(Vec::len),
+        primary_module: modules
+            .as_deref()
+            .and_then(|modules| primary_module(modules, kernel_mode))
+            .map(|module| Box::new(structured::ModuleInfo::from(module))),
+        // `Ok(None)` is the target that did not bug check, and `Err` is the target that has no
+        // bug check data to read at all (user mode). Both are simply "no bug check here".
+        bug_check: e
+            .bug_check()
+            .ok()
+            .flatten()
+            .as_ref()
+            .map(triage::bug_check_info),
+    }
+}
+
+/// The image a target is *about*, out of everything the engine has loaded.
+///
+/// On a kernel target that is the kernel, which the engine always names `nt` whichever image the
+/// build shipped (`ntkrnlmp.exe` and friends) — so it is matched by that name, and the name is what
+/// every `nt!Symbol` in the session is qualified by. Anywhere else it is the first module in the
+/// engine's list, which is load order, which is the process's own executable.
+///
+/// The kernel lookup falls back to the same first entry rather than to nothing: `nt` is first on
+/// every kernel target seen, and a build that ordered it differently should cost a caller a
+/// slightly odd answer, not an empty one.
+fn primary_module(
+    modules: &[win_kexp::dbgeng::Module],
+    kernel_mode: Option<bool>,
+) -> Option<&win_kexp::dbgeng::Module> {
+    if kernel_mode == Some(true)
+        && let Some(kernel) = modules
+            .iter()
+            .find(|module| module.name.eq_ignore_ascii_case("nt"))
+    {
+        return Some(kernel);
+    }
+    modules.first()
+}
+
+/// The opener's diagnostic with the summary rendered under it.
+///
+/// Three lines at most, and each is there because it answers a question its reader would otherwise
+/// spend a whole tool call on: which bug check this dump is (and that `crash_triage` reads the rest
+/// of it), and where the target's own image is loaded — with the pointer to `modules` for the table
+/// that used to arrive here unasked.
+fn summary_text(diagnostic: &str, summary: &structured::TargetSummary) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    if let Some(bug_check) = &summary.bug_check {
+        lines.push(format!(
+            "Bug check {}{}, parameters {}.\n  `crash_triage` reads it as fields, with the \
+             crashing stack and the module each frame belongs to.",
+            bug_check.code,
+            bug_check
+                .name
+                .as_deref()
+                .map(|name| format!(" {name}"))
+                .unwrap_or_default(),
+            bug_check.parameters.join(" "),
+        ));
+    }
+    if let Some(loaded) = summary.modules_loaded {
+        lines.push(match &summary.primary_module {
+            Some(module) => format!(
+                "{loaded} module(s) loaded, {} at {}; `modules` lists the table.",
+                module.name, module.start
+            ),
+            None => format!("{loaded} module(s) loaded; `modules` lists the table."),
+        });
+    }
+    let diagnostic = diagnostic.trim_end();
+    match (diagnostic.is_empty(), lines.is_empty()) {
+        (_, true) => diagnostic.to_string(),
+        (true, false) => lines.join("\n"),
+        (false, false) => format!("{diagnostic}\n\n{}", lines.join("\n")),
+    }
 }
 
 /// Resolve an address/offset expression the way `uf`/WinDbg read it: evaluate `? <expr>` first
@@ -3866,6 +3982,124 @@ mod tests {
             !out.starts_with('\n'),
             "no blank lead-in when there is nothing above it: {out:?}"
         );
+    }
+
+    // ---- what an opener says about the target (#105) ------------------------
+
+    fn module(name: &str, base: u64) -> win_kexp::dbgeng::Module {
+        win_kexp::dbgeng::Module {
+            base,
+            size: 0x1000,
+            name: name.to_string(),
+            image_name: format!("{name}.sys"),
+            loaded_image_name: String::new(),
+            timestamp: 0,
+            checksum: 0,
+            symbols: win_kexp::dbgeng::SymbolKind::Deferred,
+            user_mode: false,
+        }
+    }
+
+    fn summary_of(modules: &[win_kexp::dbgeng::Module], kernel: bool) -> structured::TargetSummary {
+        structured::TargetSummary {
+            kernel_mode: Some(kernel),
+            modules_loaded: Some(modules.len()),
+            primary_module: primary_module(modules, Some(kernel))
+                .map(|module| Box::new(structured::ModuleInfo::from(module))),
+            bug_check: None,
+        }
+    }
+
+    /// The kernel is the image a kernel target is about, wherever the engine happens to list it.
+    ///
+    /// Position is the tempting test — `nt` is first on every kernel target this has been run
+    /// against — and it is the one that would quietly name a driver on the target where it is not.
+    #[test]
+    fn a_kernel_targets_primary_module_is_the_kernel_by_name() {
+        let modules = [
+            module("MessageManager", 0xfffff8000f000000),
+            module("nt", 0xfffff80312000000),
+        ];
+        let picked = primary_module(&modules, Some(true)).expect("a kernel target has a kernel");
+        assert_eq!(picked.name, "nt");
+
+        // The same list read as user mode is load order, which is that process's own image.
+        let picked =
+            primary_module(&modules, Some(false)).expect("a user-mode target has an image");
+        assert_eq!(picked.name, "MessageManager");
+
+        // And a target with nothing loaded has no primary module rather than a made-up one.
+        assert!(primary_module(&[], Some(true)).is_none());
+    }
+
+    /// The diagnostic is the answer; the summary is a couple of lines under it.
+    ///
+    /// The measurement that matters is the one in the issue: what an opener emits must be a
+    /// summary rather than the whole module table `open_dump` used to print — 227 lines on this
+    /// repo's own sample dump ([#105](https://github.com/glslang/windbg-mcp/issues/105)). So this
+    /// asserts a *bound* on what the summary adds, not merely that it says something.
+    #[test]
+    fn an_open_summary_adds_a_couple_of_lines_to_the_diagnostic() {
+        let modules: Vec<_> = (0..233)
+            .map(|i| module(&format!("mod{i}"), 0x1000 * i))
+            .collect();
+        let diagnostic = "Windows 10 Kernel Version 26100 MP (4 procs) Free x64\n\
+                          Kernel base = 0xfffff803`12000000 PsLoadedModuleList = 0xfffff803`12c33cf0";
+        let mut summary = summary_of(&modules, true);
+        summary.primary_module = primary_module(&[module("nt", 0xfffff80312000000)], Some(true))
+            .map(|module| Box::new(structured::ModuleInfo::from(module)));
+
+        let text = summary_text(diagnostic, &summary);
+        assert!(
+            text.starts_with(diagnostic),
+            "the diagnostic is the answer and stays first:\n{text}"
+        );
+        assert!(
+            text.lines().count() <= diagnostic.lines().count() + 3,
+            "233 modules must not become 233 lines again:\n{text}"
+        );
+        assert!(text.contains("233 module(s) loaded"), "{text}");
+        assert!(text.contains("nt at 0xfffff80312000000"), "{text}");
+        assert!(
+            text.contains("`modules`"),
+            "the table has to be nameable on demand: {text}"
+        );
+    }
+
+    /// A dump that stopped on a bug check says which one, and where the rest of it is.
+    #[test]
+    fn a_bug_check_is_named_where_a_dump_is_opened() {
+        let mut summary = summary_of(&[module("nt", 0xfffff80312000000)], true);
+        summary.bug_check = Some(triage::bug_check_info(&win_kexp::dbgeng::BugCheck {
+            code: 0x9f,
+            parameters: [3, 0xffffe284ffe59060, 0, 0],
+        }));
+
+        let text = summary_text("Windows 10 Kernel Version 26100 MP", &summary);
+        assert!(text.contains("0x9f DRIVER_POWER_STATE_FAILURE"), "{text}");
+        assert!(
+            text.contains("0xffffe284ffe59060"),
+            "the parameters are the half a caller reads first: {text}"
+        );
+        assert!(
+            text.contains("crash_triage"),
+            "two lines here, the whole crash one call away: {text}"
+        );
+    }
+
+    /// Nothing read, nothing claimed. A summary whose every field is absent leaves the diagnostic
+    /// exactly as the engine printed it — an open that worked must not grow a line saying the
+    /// bookkeeping around it did not.
+    #[test]
+    fn a_summary_that_read_nothing_leaves_the_diagnostic_alone() {
+        let diagnostic = "Windows 10 Kernel Version 26100 MP";
+        assert_eq!(
+            summary_text(diagnostic, &structured::TargetSummary::default()),
+            diagnostic
+        );
+        // And a target that simply did not bug check says nothing about bug checks.
+        let text = summary_text(diagnostic, &summary_of(&[module("nt", 0x1000)], true));
+        assert!(!text.contains("Bug check"), "{text}");
     }
 
     // ---- the pool walk budget (#75) ----------------------------------------

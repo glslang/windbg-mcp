@@ -175,8 +175,51 @@ pub struct OpenedSession {
     pub kind: SessionKindName,
     /// What was opened — a path, a pid, a redacted connection label. Never carries a debug key.
     pub target: String,
-    /// The opener's own diagnostic (`lm`, `vertarget`, `r`, the TTD lifetime query), verbatim.
+    /// The opener's own diagnostic (`vertarget`, `r`, the TTD lifetime query), verbatim, with
+    /// [`Self::summary`] rendered under it.
     pub report: String,
+    /// The same few facts as values.
+    pub summary: TargetSummary,
+}
+
+/// What a caller reads off an open every single time: which build, where the kernel is, and —
+/// for a crash dump — which bug check.
+///
+/// This is the *replacement* for the module table openers used to print. That table is 227 lines
+/// on the kernel dump this repo ships, it arrived unprompted, and an agent opening five dumps in a
+/// session paid for it five times to answer three questions this struct answers in four fields
+/// ([#105](https://github.com/glslang/windbg-mcp/issues/105)). The inventory itself belongs to
+/// `modules`, which is where it now stays until somebody asks.
+///
+/// **Every field is optional, and each is absent for its own reason** rather than because the open
+/// failed: an open that produced a target hands back everything it could read about it. A
+/// user-mode target has no bug check data at all, a freshly attached kernel may have nothing but
+/// `nt` in the engine's inventory yet (#85), and a read that fails costs its own field and nothing
+/// else.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct TargetSummary {
+    /// Whether the engine calls this a kernel target. Absent only if the query itself failed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel_mode: Option<bool>,
+    /// How many modules the engine holds **at this moment**, which is what makes it worth
+    /// carrying: a fresh kernel attach can report one. The table is `modules`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub modules_loaded: Option<usize>,
+    /// The image this target is *about*: the kernel (`nt`) on a kernel target, and on a user-mode
+    /// one the first image the engine lists, which is the process's own executable. A base to
+    /// compute `module+RVA` against without asking for the whole table first.
+    ///
+    /// One row of exactly what `modules` returns, rather than a name/base pair of its own, so a
+    /// consumer reads one module shape everywhere. Boxed — which JSON never sees — because this
+    /// summary travels inside two enums whose other variants are a fraction of its size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub primary_module: Option<Box<ModuleInfo>>,
+    /// The bug check this target stopped on, when it stopped on one — read from the engine's
+    /// `ReadBugCheckData`, not from `!analyze`. Absent for a user-mode target, a live kernel that
+    /// has not crashed, and a kernel dump that is not a crash dump. `crash_triage` is the same
+    /// code with the stack and the faulting driver beside it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bug_check: Option<BugCheckInfo>,
 }
 
 /// A failed open, and the one thing a caller must know about it.
