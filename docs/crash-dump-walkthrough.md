@@ -1,8 +1,9 @@
 # Crash-dump walkthrough: a `0x9F DRIVER_POWER_STATE_FAILURE`
 
-A hands-on tour of the crash-dump tools against a real kernel minidump,
-[`docs/samples/052126-34312-01.dmp`](samples/052126-34312-01.dmp) (a 5.8 MB
-kernel-generated triage dump). It mirrors the skill's
+A hands-on tour of the crash-dump tools against two real kernel minidumps:
+[`052126-34312-01.dmp`](samples/052126-34312-01.dmp) (5.8 MB) for §1–§6, and
+[`081226-2187-01.dmp`](samples/081226-2187-01.dmp) in [§7](#7-the-other-shape-of-crash-a-driver-frame-analyze-cant-name),
+where a driver crashes in its own code and `!analyze` cannot name it. It mirrors the skill's
 [`crash-dump.md`](../skills/windbg-debugging/crash-dump.md) playbook and shows the
 real `windbg` MCP tool calls, their output, and the gotchas — from `crash_triage`'s
 one-call summary through to the culprit driver named by a manual device-stack walk
@@ -211,3 +212,66 @@ The bundled WinDbg engine has no debugger extensions next to it unless you copy 
   module-qualified form or an explicit `.load`.
 
 That's why this walkthrough uses `!ext.analyze -v`.
+
+## 7. The other shape of crash: a driver frame `!analyze` can't name
+
+The `0x9F` above is a *watchdog* bug check, and its stack belongs to the watchdog. The
+commoner case — and the one `crash_triage` was written for — is a third-party driver
+crashing in its own code. A second sample is checked in for it,
+[`docs/samples/081226-2187-01.dmp`](samples/081226-2187-01.dmp): a `0x13A` raised out of
+`nt!ExFreePoolWithTag` by **`MessageManager.sys`**, a CTF driver with **no PDB**.
+
+```jsonc
+open_dump { "path": "…/docs/samples/081226-2187-01.dmp" }
+crash_triage {}
+```
+
+```text
+BUG CHECK: 0x13a KERNEL_MODE_HEAP_CORRUPTION
+  Arg1: 0x0000000000000008  A free block was passed to an operation that is only valid for busy blocks.
+  Arg2: 0xffff998228000140  Address of the heap that reported the corruption
+  Arg3: 0xffff99823034eb10  Address at which the corruption was detected
+  Arg4: 0x0000000000000000
+PROCESS: mm_exploit_v5.exe
+POOL TAG: TNf_
+FAULTING FRAME: MessageManager+0x1654 (frame 07)
+FAILURE BUCKET: 0x13a_8_TNf_
+!analyze blamed: Unknown_Module — it disagrees with the faulting frame above. …
+
+STACK (11 frames):
+  00 nt!KeBugCheckEx  [nt+0x4f93c0]
+  01 nt!RtlpHeapHandleError+0x40  [nt+0x5ea108]
+  02 nt!RtlpHpHeapHandleError+0x58  [nt+0x5ea168]
+  03 nt!RtlpLogHeapFailure+0x45  [nt+0x2e14e9]
+  04 nt!RtlpHpVsSlotFreeList+0x150  [nt+0x2e1d00]
+  05 nt!RtlpHpVsContextFree+0x155  [nt+0x2e1715]
+  06 nt!ExFreePoolWithTag+0xc79  [nt+0xb68949]
+  07 MessageManager+0x1654
+  08 0xffff99823034eb30
+  09 0xffff8784f840ee10
+  10 0xffff998228000000
+```
+
+Four things to read off this, none of which the `0x9F` can show:
+
+- **`!analyze` says `Unknown_Module`; the frame says `MessageManager+0x1654`.** The driver has
+  no PDB, which is the case `!analyze`'s attribution handles worst and the case `module+RVA`
+  handles fine — the engine knows which image holds the address and where it is loaded, and the
+  offset falls out. Frame 07 is six frames below the top, under a stack of kernel allocator
+  internals that a "blame frame 0" rule would have named instead.
+- **`0x1654` is the whole point of an RVA.** Five dumps from the same crash/reboot loop reported
+  that frame at five *different* addresses — `0xfffff8020a5e1654`, `0xfffff80561281654`,
+  `0xfffff8070b001654`, … — because the driver loads somewhere new after every reboot. The RVA is
+  identical in all five, so it is what tells an intended fire (`+0x1654`, the `SetData` free)
+  from an incidental one.
+- **Frames 08–10 are in no module and say so.** They are stack residue past the driver frame,
+  reported as bare addresses rather than attributed to whatever image happens to be nearest.
+- **`symbol` is absent, not invented.** The engine will happily answer an address in a PDB-less
+  module with the *module's own name* and a displacement; that is `module`+`rva` in disguise, so
+  it is not reported as a symbol. Compare frames 01–06, which have real `nt!` symbols and carry
+  their displacements.
+
+`analysis.pool_tag` (`TNf_` here) is the one field with no API behind it at all — `!analyze`
+recovers it from the header of the chunk the bug check is about, and on this crash that header is
+already corrupt, which is why the tag reads as garbage rather than as the driver's own `Tfub`.
+That is a true reading of a corrupted chunk, not a parsing failure.

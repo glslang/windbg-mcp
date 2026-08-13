@@ -876,6 +876,10 @@ pub struct CrashTriage {
     pub bug_check: BugCheckInfo,
     /// The process the crashing context was in — `PROCESS_NAME`, read through the engine rather
     /// than off `!analyze`. Absent when the engine could not name it.
+    ///
+    /// On a kernel target this is the current `_EPROCESS`'s **audit name**, so it is the full
+    /// image name (`mm_exploit_v5.exe`) rather than the 15-byte `ImageFileName` field, which cuts
+    /// a name that long to `mm_exploit_v5.` — a string that looks like an answer and is not.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_name: Option<String>,
     /// The innermost frame outside the kernel image, the HAL and the framework layers that sit on
@@ -895,11 +899,21 @@ pub struct CrashTriage {
     /// Why there is no [`Self::faulting_frame`], when there is none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub faulting_frame_note: Option<String>,
-    /// The crashing thread's stack, innermost first, capped by the call's `frames` argument.
+    /// The stack of **the context the session has selected**, innermost first, capped by the
+    /// call's `frames` argument.
+    ///
+    /// On a freshly opened crash dump that context is the crash, and with `analyze: true` it is
+    /// re-selected by `!analyze` for the bug checks that carry an exception context. But it is a
+    /// *selection*, and a caller who has moved it (`.thread`, `~Ns`, `.cxr` through `execute`)
+    /// gets the stack they moved it to — this is the same stack `backtrace` would print, not a
+    /// separately-discovered crash stack.
     pub frames: Vec<FrameInfo>,
-    /// Whether the walk stopped at that cap rather than at the end of the stack — so there may be
-    /// more frames, and a `faulting_frame` of `null` may be an artefact of the cap rather than a
-    /// fact about the crash. Raise `frames` and ask again.
+    /// Whether the stack went on past the cap.
+    ///
+    /// Established by walking one frame further than was asked for and discarding it, so a stack
+    /// that happens to be exactly `frames` long reports `false` — the distinction matters, because
+    /// it decides whether an absent `faulting_frame` is a fact about the crash or an artefact of
+    /// the cap. When `true`, raise `frames` and ask again.
     pub frames_truncated: bool,
     pub analysis: AnalysisInfo,
 }

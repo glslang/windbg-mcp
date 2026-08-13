@@ -77,6 +77,20 @@ const SAMPLE_DUMP: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/docs/samples/052126-34312-01.dmp"
 );
+/// A second crash dump, and a deliberately *different* kind of crash: a third-party driver
+/// (`MessageManager`, no PDB) freeing a chunk it had already freed, taken from the CTF loop
+/// `crash_triage` was written for.
+///
+/// [`SAMPLE_DUMP`] cannot stand in for it. That one is a `0x9F` watchdog, which fires on an idle
+/// CPU's timer DPC: there is no driver frame on its stack at all, so it exercises the *absent*
+/// `faulting_frame` branch and never the one the tool exists for. Its process is `System`, which
+/// is short enough to fit the 15-byte `_EPROCESS::ImageFileName` field — so it also cannot see the
+/// truncation that field caused (`mm_exploit_v5.exe` → `mm_exploit_v5.`), which is exactly how
+/// that bug survived a full green run of this tier.
+const DRIVER_CRASH_DUMP: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/docs/samples/081226-2187-01.dmp"
+);
 
 // ---- harness ------------------------------------------------------------------
 
@@ -1548,6 +1562,41 @@ fn a_bug_check_is_triaged_into_its_fields() {
         "a crash dump has a stack to walk: {triage}"
     );
     assert!(frames.len() <= 16, "the default frame cap is 16: {triage}");
+    // The sample's stack is well short of the cap, so nothing was cut off. Worth asserting because
+    // the flag is established by walking one frame *past* the cap and discarding it: a stack that
+    // merely reaches the cap exactly must not report as truncated, or an absent `faulting_frame`
+    // reads as an artefact of the cap rather than as a fact about the crash.
+    assert_eq!(
+        triage["frames_truncated"], false,
+        "a stack shorter than the cap was not truncated: {triage}"
+    );
+    // Asking for exactly as many frames as the stack has is the case an equality test on the
+    // returned count gets wrong — it is complete, not capped.
+    let exact = server.tool_data(
+        "crash_triage",
+        json!({ "session_id": session_id, "analyze": false, "frames": frames.len() }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        exact["frames"].as_array().map_or(0, Vec::len),
+        frames.len(),
+        "{exact}"
+    );
+    assert_eq!(
+        exact["frames_truncated"], false,
+        "a walk that exactly fills its cap is complete, not truncated: {exact}"
+    );
+    // One frame short of the stack really is truncated, which is what keeps the check above from
+    // passing for the trivial reason that nothing ever reports truncation.
+    let capped = server.tool_data(
+        "crash_triage",
+        json!({ "session_id": session_id, "analyze": false, "frames": frames.len() - 1 }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        capped["frames_truncated"], true,
+        "a walk that stopped short of the end has to say so: {capped}"
+    );
     let top = &frames[0];
     assert_eq!(top["index"], 0, "{triage}");
     assert_eq!(
@@ -1653,6 +1702,151 @@ fn a_bug_check_is_triaged_into_its_fields() {
         "{text}"
     );
     assert!(text.contains("STACK ("), "{text}");
+
+    server.tool_data(
+        "end_session",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
+}
+
+/// `crash_triage` against a **driver** crash — the case the tool was written for, and the one the
+/// `0x9F` sample structurally cannot cover.
+///
+/// [`DRIVER_CRASH_DUMP`] is a `0x13A KERNEL_MODE_HEAP_CORRUPTION` raised out of
+/// `nt!ExFreePoolWithTag` by `MessageManager.sys`, a driver with **no PDB**. Everything the issue
+/// behind this tool asked for is here and nowhere else in the suite:
+///
+/// * a `faulting_frame` that exists, six frames below the top, under a stack of kernel allocator
+///   internals that would otherwise be blamed;
+/// * that frame named `module+RVA` off the load base, because there is no symbol to name it with —
+///   and `!analyze` calling the same crash `Unknown_Module`, which is why the frame is computed
+///   here rather than taken from it;
+/// * a `pool_tag`, which only `!analyze` can produce;
+/// * a process name longer than 15 characters, which is what caught `_EPROCESS::ImageFileName`
+///   silently truncating `mm_exploit_v5.exe` to `mm_exploit_v5.`.
+///
+/// The RVA is asserted as a literal. That is the point rather than brittleness: `0x1654` is a
+/// fixed offset into a fixed image, so it is reproducible across every reboot and load base — five
+/// dumps from the same loop reported it at five different addresses — and a change in it means the
+/// attribution arithmetic moved.
+#[test]
+fn a_driver_crash_names_the_driver_frame_that_analyze_cannot() {
+    if target_tier().is_none() {
+        return;
+    }
+    if !std::path::Path::new(DRIVER_CRASH_DUMP).exists() {
+        skip(&format!(
+            "driver crash dump not found at {DRIVER_CRASH_DUMP}"
+        ));
+        return;
+    }
+    let mut server = Server::started();
+    let opened = server.call_tool(
+        "open_dump",
+        json!({ "path": DRIVER_CRASH_DUMP }),
+        TARGET_STEP,
+    );
+    assert_no_error(&opened, "open_dump");
+    assert!(
+        !is_tool_error(&opened),
+        "opening the driver crash dump failed:\n{}",
+        text_of(&opened["result"])
+    );
+    let session_id = session_id_of(&opened["result"]);
+
+    let triage = server.tool_data(
+        "crash_triage",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
+
+    assert_eq!(triage["bug_check"]["code"], "0x13a", "{triage}");
+    assert_eq!(
+        triage["bug_check"]["name"], "KERNEL_MODE_HEAP_CORRUPTION",
+        "{triage}"
+    );
+
+    // The headline: a driver frame, found past the kernel's allocator frames.
+    let faulting = &triage["faulting_frame"];
+    assert!(
+        !faulting.is_null(),
+        "this crash has a driver frame — finding it is what the tool is for: {triage}"
+    );
+    assert_eq!(faulting["module"], "MessageManager", "{triage}");
+    assert_eq!(
+        faulting["rva"], "0x1654",
+        "the RVA is a fixed offset into a fixed image, so it is the same in every dump this bug \
+         produces however the driver was loaded: {triage}"
+    );
+    assert!(
+        faulting["index"].as_u64().is_some_and(|index| index > 0),
+        "the driver is never frame 0 — `nt!KeBugCheckEx` is: {triage}"
+    );
+    // No PDB, so no symbol. Reported as absent rather than filled in with the module's own name,
+    // which is what the engine offers and which would read as "this frame resolved".
+    assert!(faulting["symbol"].is_null(), "{triage}");
+    assert!(faulting["displacement"].is_null(), "{triage}");
+    assert_eq!(
+        triage["frames_truncated"], false,
+        "this stack is well inside the default cap: {triage}"
+    );
+
+    // The frames above it are the allocator path, symbolised from `nt`'s own PDB — so the same
+    // walk carries both kinds of frame, which is the mix a real driver crash always has.
+    let frames = triage["frames"].as_array().expect("frames");
+    assert!(
+        frames.iter().any(|frame| frame["symbol"]
+            .as_str()
+            .is_some_and(|s| s.starts_with("nt!ExFreePoolWithTag"))),
+        "the free that raised the bug check should be on the stack: {triage}"
+    );
+
+    // A name longer than `_EPROCESS::ImageFileName` can hold, which is the whole point of reading
+    // the audit name instead.
+    let process = triage["process_name"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the crashing process should be named: {triage}"));
+    assert!(
+        process.len() > 15 && process.ends_with(".exe"),
+        "the full image name, not the 15-byte field's truncation of it: {triage}"
+    );
+
+    let analysis = &triage["analysis"];
+    if analysis["ran"] == true {
+        // `!analyze` cannot name this driver — it has no PDB — which is precisely why the frame
+        // above is computed from the load base instead of taken from here.
+        assert_ne!(
+            analysis["module_name"], "MessageManager",
+            "if `!analyze` learns to attribute a PDB-less driver, this test's premise is stale \
+             and the docs claiming otherwise need revisiting: {triage}"
+        );
+        assert_eq!(
+            analysis["process_name"], triage["process_name"],
+            "the audit name and `!analyze`'s PROCESS_NAME are the same process: {triage}"
+        );
+        if analysis["truncated"] == false {
+            // The pool tag exists only in `!analyze`'s output, and this bug check is one of the
+            // few that produces one.
+            assert!(
+                analysis["pool_tag"].as_str().is_some_and(|t| !t.is_empty()),
+                "a 0x13A carries a freed-pool tag: {triage}"
+            );
+        }
+    }
+
+    // The text names the driver once, not twice — the bare module name is not re-rendered as a
+    // symbol beside the offset it already is.
+    let text = server.tool_text(
+        "crash_triage",
+        json!({ "session_id": session_id, "analyze": false }),
+        TARGET_STEP,
+    );
+    assert!(
+        text.contains("FAULTING FRAME: MessageManager+0x1654"),
+        "{text}"
+    );
+    assert!(!text.contains("[MessageManager+0x1654]"), "{text}");
 
     server.tool_data(
         "end_session",

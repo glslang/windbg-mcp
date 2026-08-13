@@ -10,7 +10,7 @@
 //!
 //! **The engine's values.** The bug check code and parameters come from `ReadBugCheckData`, the
 //! stack from a stack walk, each frame's module from the engine's own containment test, and the
-//! process from the current `_EPROCESS`. These are reads of the dump.
+//! process from the current `_EPROCESS`'s audit name. These are reads of the dump.
 //!
 //! **`!analyze`'s conclusions.** The pool tag, the failure bucket, the culprit module, and the
 //! per-parameter explanations exist nowhere else: they are the extension's analysis, and there is
@@ -184,6 +184,7 @@ fn frame_info(attributed: &AttributedFrame) -> structured::FrameInfo {
         .module
         .as_ref()
         .filter(|module| !module.name.is_empty());
+    let symbol = resolved_symbol(&attributed.frame);
     structured::FrameInfo {
         index: attributed.frame.index,
         address: structured::addr(address),
@@ -192,13 +193,29 @@ fn frame_info(attributed: &AttributedFrame) -> structured::FrameInfo {
         // address from a stack walk, and an underflow here would print a 16-exabyte RVA rather
         // than fail, which is the sort of number nobody double-checks.
         rva: module.map(|module| offset(address.saturating_sub(module.base))),
-        symbol: attributed.frame.symbol.clone(),
-        displacement: attributed
-            .frame
-            .symbol
-            .as_ref()
-            .map(|_| offset(attributed.frame.displacement)),
+        symbol: symbol.clone(),
+        displacement: symbol.map(|_| offset(attributed.frame.displacement)),
     }
+}
+
+/// The frame's symbol, if what the engine resolved is actually a symbol.
+///
+/// **A bare module name is not one.** For an address in a module with no symbols the engine
+/// answers with the module itself — `MessageManager`, displacement `0x1654` — which is the same
+/// fact as `module` + `rva` wearing a symbol's clothes. Reported verbatim it produced
+/// `MessageManager+0x1654  [MessageManager+0x1654]` in the rendering, and, worse, a `symbol` field
+/// that a consumer would read as "this frame resolved" for the one case the whole tool exists to
+/// handle: a driver with no PDB. Measured on the MessageManager crash dumps.
+///
+/// The test is the `!` that qualifies a real symbol. win-kexp reports what the engine said, which
+/// is right for a binding; deciding that a module name does not count is this tool's judgement to
+/// make, and it has `module`/`rva` to say the same thing unambiguously.
+fn resolved_symbol(frame: &StackFrame) -> Option<String> {
+    frame
+        .symbol
+        .as_ref()
+        .filter(|symbol| symbol.contains('!'))
+        .cloned()
 }
 
 /// `module+0xrva`, where the frame has a module.
@@ -771,6 +788,58 @@ mod tests {
         assert!(note.contains("nt!KeBugCheckEx"), "{note}");
         // The whole walk is still there to read.
         assert_eq!(triage.frames.len(), 2);
+    }
+
+    /// The engine answers an address in a PDB-less module with the *module's* name and a
+    /// displacement, which is `module`+`rva` in disguise — not a symbol. Reporting it as one told
+    /// a consumer the frame had resolved for the exact case this tool exists to handle, and
+    /// rendered as `MessageManager+0x1654  [MessageManager+0x1654]`.
+    #[test]
+    fn a_bare_module_name_is_not_a_symbol() {
+        let frames = vec![AttributedFrame {
+            // What DbgEng really returns for `MessageManager+0x1654` with no PDB: name
+            // `MessageManager`, displacement `0x1654`.
+            frame: frame(0, DRIVER_BASE + 0x1654, Some("MessageManager"), 0x1654),
+            module: Some(module("MessageManager", DRIVER_BASE)),
+        }];
+        let triage = report(
+            BugCheck {
+                code: 0x13A,
+                parameters: [0; 4],
+            },
+            &frames,
+            false,
+            None,
+            Analysis::NotRequested,
+        );
+        let faulting = triage.faulting_frame.clone().expect("the driver frame");
+        assert_eq!(faulting.symbol, None, "a module name is not a symbol");
+        assert_eq!(faulting.displacement, None, "and so has no displacement");
+        // The frame is still fully named — by the two fields that were always the answer.
+        assert_eq!(faulting.module.as_deref(), Some("MessageManager"));
+        assert_eq!(faulting.rva.as_deref(), Some("0x1654"));
+        // Rendered once, not twice.
+        let line = render(&triage);
+        assert!(line.contains("00 MessageManager+0x1654\n"), "{line}");
+        assert!(!line.contains("[MessageManager+0x1654]"), "{line}");
+
+        // A real symbol keeps both halves.
+        let symbolised = report(
+            BugCheck {
+                code: 0x13A,
+                parameters: [0; 4],
+            },
+            &[AttributedFrame {
+                frame: frame(0, NT_BASE + 0x1000, Some("nt!ExFreePoolWithTag"), 0x10),
+                module: Some(module("nt", NT_BASE)),
+            }],
+            false,
+            None,
+            Analysis::NotRequested,
+        );
+        let frame = &symbolised.frames[0];
+        assert_eq!(frame.symbol.as_deref(), Some("nt!ExFreePoolWithTag"));
+        assert_eq!(frame.displacement.as_deref(), Some("0x10"));
     }
 
     /// A KMDF driver's stack is `nt -> Wdf01000 -> TheDriver`, and the framework is on it because
