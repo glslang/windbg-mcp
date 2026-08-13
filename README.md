@@ -681,8 +681,13 @@ timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressio
   whether that is the crash itself (a `0x9F` watchdog fires on an idle CPU — the culprit is not on
   that stack, and the bug check *arguments* are where to go next) or merely the 16-frame default
   cap, which `frames` raises to 128. `analyze: false` skips `!analyze` for a fast answer of
-  everything else; with it on, note that `!analyze -v` may leave the session's context on the
-  faulting thread it selected, exactly as running it through `execute` would. Needs a kernel target
+  everything else. **The call leaves the session exactly as it found it**, which running the same
+  `!analyze -v` through `execute` does not: the analysis resets the selected scope to the target's
+  default, so a `.frame`/`.cxr` a caller had chosen would be silently discarded — `crash_triage`
+  saves that scope and restores it (`ScopeGuard`, [win-kexp#98](https://github.com/glslang/win-kexp/issues/98)),
+  which is why the tool reports itself read-only. The stack it walks is the **default** context
+  (the crash, on a crash dump) with `analyze: true`, and whatever the session has selected with
+  `analyze: false`. Needs a kernel target
   *stopped at a bug check* — a live kernel that has not crashed yet, and a dump that is not a crash
   dump, are both **refused** with a message saying which of the two they are.
 - **`crash_triage` tries `!analyze -v` and then `!ext.analyze -v`**, and reports which one worked

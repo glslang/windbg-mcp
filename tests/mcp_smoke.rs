@@ -1703,6 +1703,44 @@ fn a_bug_check_is_triaged_into_its_fields() {
     );
     assert!(text.contains("STACK ("), "{text}");
 
+    // **The session is where it was left, which is what `read_only_hint = true` claims.** The
+    // `!analyze -v` a triage runs resets the debugger's selected scope to the target's default —
+    // measured on four targets (glslang/win-kexp#98) — so a caller who had chosen a frame would
+    // silently lose it. `crash_triage` saves and restores it; this is that promise, checked the
+    // only way it can be: from a scope the analysis would otherwise discard.
+    //
+    // Frame 3, not frame 0: frame 0 *is* the default, and a check that started there would pass
+    // whether the scope was restored or merely reset.
+    let moved = server.tool_text(
+        "execute",
+        json!({ "session_id": session_id, "command": ".frame 3" }),
+        TARGET_STEP,
+    );
+    // The whole rendered frame line — index, offsets and symbol if there is one — so the check
+    // does not depend on symbols being available on the host running this.
+    let selected = moved
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("03 "))
+        .unwrap_or_else(|| panic!("`.frame 3` selected no frame 3 on this dump: {moved}"))
+        .to_string();
+
+    // With the analysis on, since that is the half that moves the scope.
+    server.tool_data(
+        "crash_triage",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
+    let after = server.tool_text(
+        "execute",
+        json!({ "session_id": session_id, "command": ".frame" }),
+        TARGET_STEP,
+    );
+    assert!(
+        after.lines().map(str::trim).any(|line| line == selected),
+        "crash_triage moved the session's scope: it was `{selected}`, and `.frame` now says:\n{after}"
+    );
+
     server.tool_data(
         "end_session",
         json!({ "session_id": session_id }),

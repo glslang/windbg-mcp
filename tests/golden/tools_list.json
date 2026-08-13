@@ -125,7 +125,7 @@
         "destructive": false,
         "idempotent": true,
         "openWorld": true,
-        "readOnly": false
+        "readOnly": true
       },
       "name": "crash_triage",
       "output": {
