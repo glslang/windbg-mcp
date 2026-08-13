@@ -541,9 +541,17 @@ const MODULE_WILDCARDS: [char; 2] = ['*', '?'];
 /// `nvhda64v.sys`) and are literal on both sides — the docs make hyphens literal outside brackets,
 /// and brackets cannot get here.
 ///
+/// **ASCII, deliberately.** [`matches_module_pattern`] folds case with
+/// [`char::eq_ignore_ascii_case`], so an accented letter in the *pattern* would be compared
+/// case-sensitively here while DbgEng's own matcher folds it by Windows' rules — a lowercase
+/// filter matching an uppercase name in the text and missing it in the values. Which fold
+/// Windows applies to a given code point is not something this side can check, so the pattern
+/// stays inside the domain the two agree on. `?` matches any single character, including a
+/// non-ASCII one, which is how a name carrying one is still reachable.
+///
 /// [syntax]: https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/string-wildcard-syntax
 fn is_module_filter_char(c: char) -> bool {
-    c.is_alphanumeric() || MODULE_WILDCARDS.contains(&c) || matches!(c, '_' | '.' | '-')
+    c.is_ascii_alphanumeric() || MODULE_WILDCARDS.contains(&c) || matches!(c, '_' | '.' | '-')
 }
 
 /// Refuses a filter this server cannot match the way `lm m` will.
@@ -564,6 +572,11 @@ fn is_module_filter_char(c: char) -> bool {
 /// verbose listing, so the text is not a differently-filtered answer but a different command.
 /// Module names have no spaces in them, so nothing legitimate is lost.
 ///
+/// **A character outside ASCII**, which is the one of the three that is about *this* side rather
+/// than the engine's: the matcher folds case with ASCII rules, so an accented letter in a pattern
+/// would be compared case-sensitively here and case-insensitively there. Refused rather than
+/// guessed at, because which fold Windows applies to a code point is not checkable from here.
+///
 /// Costs a caller nothing they cannot get another way: `execute { "command": "lm m nt[fd]*" }` runs
 /// the engine's own matcher on anything this refuses.
 pub(crate) fn reject_unmatchable_filter(filter: &str) -> Result<(), String> {
@@ -579,6 +592,18 @@ pub(crate) fn reject_unmatchable_filter(filter: &str) -> Result<(), String> {
              `*` if a wildcard is what was meant."
                 .to_string(),
         );
+    }
+    // Ahead of the general check because it needs a different explanation: this one is not about
+    // WinDbg's grammar at all, it is about what this side can fold.
+    if let Some(found) = filter.chars().find(|c| !c.is_ascii()) {
+        return Err(format!(
+            "`filter` contains `{found}`, which is outside the ASCII range this tool matches \
+             case-insensitively. DbgEng folds case by Windows' own rules, so a lowercase filter \
+             could match an uppercase name in the listing text and miss it in the values beside \
+             it — and which fold applies to a given character is not something this side can \
+             check. Put `?` where that character is (it matches any single one), or run \
+             execute {{ \"command\": \"lm m <pattern>\" }} for the engine's own matcher."
+        ));
     }
     let Some(found) = filter.chars().find(|c| !is_module_filter_char(*c)) else {
         return Ok(());
@@ -617,8 +642,15 @@ pub(crate) fn module_pattern(filter: &str) -> String {
 ///
 /// Written out rather than delegated to the engine because the **values** have to be filtered
 /// somewhere, and there is no DbgEng call that lists modules matching a pattern — only a command
-/// that prints them. So this is the second implementation of one grammar, kept to the subset
-/// [`reject_unsupported_wildcards`] guarantees is all that can arrive.
+/// that prints them. So this is the second implementation of one grammar, and what keeps it
+/// honest is that it never sees anything outside the subset [`reject_unmatchable_filter`] admits:
+/// literal characters, `*` and `?`, all ASCII.
+///
+/// **Case folding is ASCII**, which is exactly as far as the pattern can reach. Every letter in a
+/// pattern is ASCII by then, so the only comparison a wider fold would change is an ASCII pattern
+/// character against a non-ASCII one in a *name* — where both implementations have to decide
+/// whether `İ` is an `i`, and only the engine's answer is authoritative. A pattern of `?` matches
+/// such a character regardless, which is the reachable way to name it.
 pub(crate) fn matches_module_pattern(pattern: &str, name: &str) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let name: Vec<char> = name.chars().collect();
@@ -1329,10 +1361,12 @@ pub struct ModulesArgs {
     /// anywhere in a module name, so `"nt"` also finds `ntfs` and `WinNT`. `*` and `?` are
     /// wildcards and a pattern using them is matched as written, so `"nt*"` is the names that
     /// *start* with `nt`, and `"*"` is every module. Those two are the whole grammar here: a
-    /// filter takes a name plus `*` and `?`, and anything else — WinDbg's other wildcards
-    /// (`[fd]`, `#`, `+`, `\`), or a space, which `lm m` reads as the start of its own options —
-    /// is refused rather than applied to the text and not to the values. Run
-    /// `execute { "command": "lm m <pattern>" }` for the full grammar.
+    /// filter takes an ASCII name plus `*` and `?`, and anything else — WinDbg's other wildcards
+    /// (`[fd]`, `#`, `+`, `\`), a space, which `lm m` reads as the start of its own options, or a
+    /// character outside ASCII, whose case this tool and the engine may fold differently — is
+    /// refused rather than applied to the text and not to the values. `?` matches any single
+    /// character including a non-ASCII one; run `execute { "command": "lm m <pattern>" }` for the
+    /// full grammar.
     #[serde(default)]
     pub filter: Option<String>,
     /// Session handle returned by open_dump/open_trace/attach_*/launch. Optional: omit it
@@ -4302,6 +4336,26 @@ mod tests {
                 "`{filter}` is what this tool documents"
             );
         }
+    }
+
+    /// A filter stays inside the range this server folds case in.
+    ///
+    /// The matcher compares with ASCII case rules; DbgEng folds by Windows'. Accepting `é` would
+    /// mean claiming those agree about it — so it is refused, with the workaround that does work.
+    #[test]
+    fn a_filter_outside_ascii_is_refused_because_the_two_folds_may_differ() {
+        for filter in ["nvhdaé", "Ä*", "日本語"] {
+            let Err(why) = reject_unmatchable_filter(filter) else {
+                panic!("`{filter}` is outside the range this server can fold");
+            };
+            assert!(
+                why.contains("ASCII") && why.contains('?'),
+                "the refusal has to name the wildcard that reaches it anyway: {why}"
+            );
+        }
+        // The wildcard that does: `?` is any single character, non-ASCII included.
+        assert!(reject_unmatchable_filter("nvhda?4v").is_ok());
+        assert!(matches_module_pattern("nvhda?4v", "nvhdaé4v"));
     }
 
     /// A space in the filter is not a narrower pattern, it is a **different command**.

@@ -67,9 +67,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `nt`, `Ntfs` and `ntosext`. Matched literally — which is what the value side does — every one of
   those finds nothing. A space is refused for a sharper reason: `lm m` takes a single operand and
   reads the next token as *its own options*, so `lm m nt v` matches `nt` and prints the verbose
-  listing — the text answering a different question rather than a differently-filtered one. An
-  allowlist rather than a blocklist because a blocklist is only as complete as the last reading of
-  the grammar page, and this one has to hold for the features nobody has noticed yet.
+  listing — the text answering a different question rather than a differently-filtered one. And a
+  character outside ASCII is refused for a reason about *this* side: the matcher folds case with
+  ASCII rules while DbgEng folds by Windows', so `é` in a pattern would be compared
+  case-sensitively here and case-insensitively there — `?` matches any single character, non-ASCII
+  included, which is how such a name stays reachable. An allowlist rather than a blocklist because
+  a blocklist is only as complete as the last reading of the grammar page, and this one has to
+  hold for the features nobody has noticed yet.
   `execute { "command": "lm m <pattern>" }` runs the engine's own matcher for anyone who wants the
   full grammar.
 
