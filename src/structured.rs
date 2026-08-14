@@ -772,8 +772,8 @@ pub struct WalkInfo {
 /// beside them count *occurrences of a shape*, not bytes or chunks.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct WalkGaps {
-    /// Pages the debugger's valid-region query could not advance over. The walk steps over one
-    /// and asks again rather than abandoning the rest of the region behind it.
+    /// Pages the debugger's valid-region query could not advance over, stepped over one at a
+    /// time rather than abandoning the rest of the region behind them.
     pub stalled_pages: u64,
     /// Bytes those steps filed as unreadable.
     pub skipped_bytes: u64,
@@ -781,10 +781,10 @@ pub struct WalkGaps {
     /// walk that gave up at the first stall would have reported as nothing at all. Large next to
     /// `skipped_bytes` means the stalls were isolated pages in otherwise healthy regions.
     pub recovered_bytes: u64,
-    /// Chunk headers a backend decoder refused, resynchronising sixteen bytes at a time past
-    /// each. A refusal costs more than the chunk: every header after it in that extent is
-    /// decoded at a guessed offset, so a large number here means the chunks reported from those
-    /// extents are worth less than their count suggests.
+    /// Chunk headers a backend decoder refused. A refusal costs more than its own chunk —
+    /// every header after it in that extent is then decoded at a guessed offset — so a large
+    /// number here means the chunks reported from those extents are worth less than their
+    /// count suggests.
     pub refused_chunks: u64,
 }
 
@@ -1484,9 +1484,23 @@ mod tests {
         // Any one of them alone is still worth reporting — a walk can refuse chunks without
         // ever stalling, and reporting nothing there would hide the refusals entirely.
         assert!(WalkGaps::of(&report(win_kexp::pool::WalkStalls::default(), 1)).is_some());
-        let wire = serde_json::to_value(gaps).unwrap();
-        assert_eq!(wire["recovered_bytes"], 0x40000);
-        assert_eq!(wire["refused_chunks"], 884);
+
+        // The omission has to be asserted where it happens, on `WalkInfo`. `of` returning
+        // `None` says nothing about whether the field then serialises as `"gaps": null`, which
+        // would be a shape change on every healthy pool answer — the ones that are fine.
+        let walk = |gaps| WalkInfo {
+            coverage: PoolCoverage::Partial,
+            chunks_walked: 0,
+            allocated_chunks: 0,
+            diagnostics_emitted: 0,
+            diagnostic_categories: 0,
+            gaps,
+        };
+        let quiet = serde_json::to_value(walk(None)).unwrap();
+        assert!(quiet.get("gaps").is_none(), "{quiet}");
+        let wire = serde_json::to_value(walk(Some(gaps))).unwrap();
+        assert_eq!(wire["gaps"]["recovered_bytes"], 0x40000);
+        assert_eq!(wire["gaps"]["refused_chunks"], 884);
     }
 
     /// A field's JSON type must not depend on its value.
