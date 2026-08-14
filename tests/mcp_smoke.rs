@@ -1040,6 +1040,15 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
         ),
         ("pool_census", json!({}), "error"),
         ("pool_diagnostics", json!({}), "error"),
+        ("heap_list", json!({}), "error"),
+        ("heap_allocations", json!({}), "error"),
+        (
+            "heap_chunk",
+            json!({ "address": "0x0000000000010000" }),
+            "error",
+        ),
+        ("heap_census", json!({}), "error"),
+        ("heap_diagnostics", json!({}), "error"),
         ("crash_triage", json!({}), "error"),
         // A well-formed request, so it takes the *session* refusal path like every row above it
         // rather than the argument one — which this tool also has, and which is checked in
@@ -4807,7 +4816,7 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
         assert!(
             !is_tool_error(&walk),
             "the pool walk failed outright, so nothing below would be measuring a walk. If this \
-             names missing kernel pool symbols after the probe above resolved, then the walker \
+             names missing allocator symbols after the probe above resolved, then the walker \
              wants type information the public store does not carry, which is a different \
              problem from an unset symbol path.\n{absent}\n\nsymbol setup said:{transcript}"
         );

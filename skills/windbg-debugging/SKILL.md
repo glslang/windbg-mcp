@@ -20,6 +20,7 @@ session of a workflow you haven't run yet in this environment.
 | Build / engine bundling / symbols / elevation | [setup.md](setup.md) |
 | Triage a `.dmp` crash dump | [crash-dump.md](crash-dump.md) |
 | Launch/attach a process, or debug the kernel | [live-and-kernel.md](live-and-kernel.md) |
+| Walk kernel pools or user Segment Heaps | [heap-walking.md](heap-walking.md) |
 | Record / open / navigate / analyze a `.run` trace | [ttd.md](ttd.md) |
 | Enumerate a driver's IOCTLs & test user-mode reachability | [driver-ioctl.md](driver-ioctl.md) |
 
@@ -36,6 +37,8 @@ already does the job.
 | Transaction | `debug_batch` — an ordered sequence with assertions and a rollback the engine runs, not the client |
 | TTD nav | `step_back` (`t-`), `step_over_back` (`p-`), `reverse_go` (`g-`), `goto_position` (`!tt`) |
 | TTD analysis | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
+| Kernel pool | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics` |
+| User Segment Heap | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` |
 | Raw | `execute` — run any debugger command, returns full text output |
 
 The forward control tools (`go`/`step_over`/`step_into`) and the reverse ones
@@ -120,9 +123,10 @@ inside the debugger, so a batch built from long steps waits out the one it is in
   Verify with `lm m <mod>` (`(pdb symbols)` vs `(export symbols)`) — never with
   `x <mod>!<sym>`, which prints *nothing* when unresolved, so its silence proves nothing.
   Details in [setup.md](setup.md).
-- **The pool tools need *private* `nt` types, not exports** — they decode segment-heap
-  internals, so `missing kernel pool symbols (ExPoolState)` is a symbol problem on *this*
-  host (symbols never come over the KD wire), not a statement about the target's pool.
+- **Allocator tools need private PDB types, not exports** — `pool_*` resolves `nt` and `heap_*`
+  resolves `ntdll`. Reload only the matching module (`.reload /f nt` or `.reload /f ntdll.dll`) and
+  confirm `(pdb symbols)` with `lm m <mod>`. Missing types are a symbol problem on this host;
+  symbols never come over the KD wire. See [heap-walking.md](heap-walking.md).
 - **`!`-extension commands need the WinDbg `winext\` extensions bundled** next to the engine
   ([setup.md](setup.md)) **and** the module-qualified form: use `!ext.analyze -v`, not bare
   `!analyze` (which this engine resolves to *"No export analyze found"* even after `.load ext`).

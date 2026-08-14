@@ -43,13 +43,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use win_kexp::dbgeng::{CommandRun, DebugEngine, InterruptHandle, Interruption, RunToOutcome};
+use win_kexp::heap::{self as heap_query, HeapAllocation, HeapBackend, HeapState, HeapWalk};
 use win_kexp::pool::query::{self, PoolPageFilter, PoolWalk};
 use win_kexp::pool::{DiagnosticShape, PoolDiagnostics, PoolSpan, PoolState};
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
 use crate::batch::{self, BatchOp, Debuggee, Ran};
 use crate::proto::{
-    EngineOp, Failed, Output, PoolOp, ReachabilityOp, WorkerMessage, WorkerRequest,
+    EngineOp, Failed, HeapBackendFilter, HeapOp, HeapStateFilter, Output, PoolOp, ReachabilityOp,
+    WorkerMessage, WorkerRequest,
 };
 use crate::server::{
     fmt_addr, format_recipe, format_report, hexdump, matches_module_pattern, module_pattern,
@@ -1196,6 +1198,31 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
                 None => pool(e, query, Duration::ZERO),
             }
         }
+        EngineOp::Heap { query, patience_ms } => {
+            let patience = Duration::from_millis(u64::from(patience_ms));
+            match walk_budget(patience, queued) {
+                Some(budget) => {
+                    tracing::debug!("worker: heap walk budget {budget:?} (queued {queued:?})");
+                    heap(e, query, budget)
+                }
+                None if query.refreshes() => Err(Failed::categorised(
+                    structured::ErrorCategory::NotRun,
+                    format!(
+                        "This heap query was not run: it reached the engine with {}s of its \
+                         caller's timeout left, which is not enough to walk the heap and report \
+                         back before that timeout expires. It requested `refresh`, so no cached \
+                         snapshot can answer it. Nothing was read and nothing changed. It waited \
+                         {}s behind other work on this session; issue it when the session is idle, \
+                         or raise WINDBG_MCP_CALL_TIMEOUT_SECS (an allocator walk reserves {}s of \
+                         reply headroom).",
+                        patience.saturating_sub(queued).as_secs(),
+                        queued.as_secs(),
+                        WATCHDOG_HEADROOM.as_secs()
+                    ),
+                )),
+                None => heap(e, query, Duration::ZERO),
+            }
+        }
         // `id` is passed because a batch is the one op that can stop *itself*: it checks between
         // steps whether an interrupt has been raised for the job it is running as.
         EngineOp::Batch(op) => run_batch(e, id, op, queued)
@@ -1209,10 +1236,14 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         )),
         // Reaching here means any batch has already been told to stop and has finished unwinding —
         // the reader saw this request go past and said so, and this thread runs one job at a time.
-        EngineOp::EndSession => e
-            .end_session()
-            .map(|_| Output::text("session ended"))
-            .map_err(failed),
+        EngineOp::EndSession => {
+            let ended = e
+                .end_session()
+                .map(|_| Output::text("session ended"))
+                .map_err(failed);
+            query::invalidate_allocator_caches();
+            ended
+        }
     }
 }
 
@@ -1261,6 +1292,7 @@ fn told(run: CommandRun) -> String {
 /// pointer to report and saying `0` would name the null page as the answer.
 fn resumed(e: &DebugEngine, command: &str, timeout_ms: u32) -> Result<Output, Failed> {
     let run = e.execute_and_wait(command, timeout_ms).map_err(failed)?;
+    query::invalidate_allocator_snapshots();
     let stopped_at = e.instruction_pointer().ok().map(structured::addr);
     // Matched on the variant rather than on "was it cut short at all", even though
     // `execute_and_wait` produces only `OnRequest` today: a go/step that hits its own deadline is
@@ -2176,6 +2208,7 @@ impl Debuggee for BatchEngine<'_> {
     fn resume(&mut self, command: &str, timeout_ms: u32) -> Result<Ran, String> {
         self.e
             .execute_and_wait(command, timeout_ms)
+            .inspect(|_| query::invalidate_allocator_snapshots())
             .map(|run| self.ran(run))
             .map_err(es)
     }
@@ -2496,6 +2529,7 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
             Ok(Output::typed(
                 out,
                 structured::PoolTagMatches {
+                    layout: (&answer.walk.layout).into(),
                     tag,
                     scope: match filter {
                         None => structured::PoolScope::Both,
@@ -2544,6 +2578,7 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
             Ok(Output::typed(
                 out,
                 structured::PoolChunkAt {
+                    layout: (&answer.walk.layout).into(),
                     address: structured::addr(address),
                     covered: found.is_some(),
                     offset: found
@@ -2578,6 +2613,7 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
             Ok(Output::typed(
                 out,
                 structured::PoolDiagnosticsReport {
+                    layout: (&report.layout).into(),
                     filter,
                     matched_categories: categories.len(),
                     matched_examples: examples.len(),
@@ -2609,6 +2645,7 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
             Ok(Output::typed(
                 out,
                 structured::PoolCensus {
+                    layout: (&answer.walk.layout).into(),
                     distinct_tags: census.len(),
                     tags: census
                         .iter()
@@ -2622,6 +2659,355 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
                         })
                         .collect(),
                     walk: walk_info(&answer.walk),
+                },
+            ))
+        }
+    }
+}
+
+fn heap_backend_name(backend: HeapBackend) -> structured::HeapBackendName {
+    match backend {
+        HeapBackend::Lfh => structured::HeapBackendName::Lfh,
+        HeapBackend::Vs => structured::HeapBackendName::Vs,
+        HeapBackend::Segment => structured::HeapBackendName::Segment,
+        HeapBackend::Large => structured::HeapBackendName::Large,
+    }
+}
+
+fn heap_state_name(state: HeapState) -> structured::HeapChunkState {
+    match state {
+        HeapState::Allocated => structured::HeapChunkState::Allocated,
+        HeapState::ReusableFree => structured::HeapChunkState::ReusableFree,
+        HeapState::CachedFree => structured::HeapChunkState::CachedFree,
+        HeapState::Unreadable => structured::HeapChunkState::Unreadable,
+    }
+}
+
+fn heap_failure(error: heap_query::HeapQueryError) -> Failed {
+    match error {
+        heap_query::HeapQueryError::Interrupted => {
+            Failed::categorised(structured::ErrorCategory::Interrupted, error.to_string())
+        }
+        heap_query::HeapQueryError::InvalidPeb(_) => {
+            Failed::categorised(structured::ErrorCategory::Debugger, error.to_string())
+        }
+        other => Failed::from(other.to_string()),
+    }
+}
+
+fn heap_walk_text(walk: &heap_query::HeapWalkReport) -> String {
+    format!(
+        "coverage={:?}; {} chunks ({} allocated); {} diagnostics; {} unreadable gaps; {} \
+         refused headers",
+        walk.coverage,
+        walk.total_chunks,
+        walk.allocated_chunks,
+        walk.diagnostic_count,
+        walk.unreadable_gaps,
+        walk.refused_headers
+    )
+}
+
+fn heap_row(allocation: &HeapAllocation) -> String {
+    format!(
+        "{}  {:>8}  {:<13}  {:<7}  heap {}  class {:#x}",
+        fmt_addr(allocation.user_address),
+        format!("{:#x}", allocation.capacity),
+        format!("{:?}", allocation.state),
+        format!("{:?}", allocation.backend),
+        fmt_addr(allocation.heap),
+        allocation.size_class,
+    )
+}
+
+/// Answers one user Segment Heap question under the caller-derived deadline.
+fn heap(e: &DebugEngine, args: HeapOp, within: Duration) -> Result<Output, Failed> {
+    let walk = |refresh: bool| HeapWalk::from(refresh).within(within);
+    match args {
+        HeapOp::List { refresh } => {
+            let answer = heap_query::list(e, walk(refresh)).map_err(heap_failure)?;
+            let mut text = format!(
+                "{} PEB heap(s); {}\n\nindex  address             kind        supported\n",
+                answer.found.len(),
+                heap_walk_text(&answer.walk)
+            );
+            for root in &answer.found {
+                text.push_str(&format!(
+                    "{:>5}  {}  {:<11} {}{}\n",
+                    root.index,
+                    fmt_addr(root.address),
+                    format!("{:?}", root.kind),
+                    root.supported,
+                    root.reason
+                        .as_deref()
+                        .map(|reason| format!(" — {reason}"))
+                        .unwrap_or_default()
+                ));
+            }
+            Ok(Output::typed(
+                text,
+                structured::HeapListResult {
+                    layout: (&answer.layout).into(),
+                    scope: (&answer.scope).into(),
+                    walk: (&answer.walk).into(),
+                    heaps: answer
+                        .found
+                        .iter()
+                        .map(structured::HeapRootInfo::from)
+                        .collect(),
+                },
+            ))
+        }
+        HeapOp::Allocations {
+            heap,
+            backend,
+            state,
+            min_capacity,
+            max_capacity,
+            refresh,
+            limit,
+        } => {
+            if min_capacity
+                .zip(max_capacity)
+                .is_some_and(|(min, max)| min > max)
+            {
+                return Err(Failed::categorised(
+                    structured::ErrorCategory::InvalidArgument,
+                    "min_capacity cannot exceed max_capacity",
+                ));
+            }
+            let heap = heap
+                .as_deref()
+                .map(parse_pool_addr)
+                .transpose()
+                .map_err(|error| {
+                    Failed::categorised(structured::ErrorCategory::InvalidArgument, error)
+                })?;
+            let backend = backend.map(|backend| match backend {
+                HeapBackendFilter::Lfh => HeapBackend::Lfh,
+                HeapBackendFilter::Vs => HeapBackend::Vs,
+                HeapBackendFilter::Segment => HeapBackend::Segment,
+                HeapBackendFilter::Large => HeapBackend::Large,
+            });
+            let state = match state {
+                HeapStateFilter::Allocated => HeapState::Allocated,
+                HeapStateFilter::ReusableFree => HeapState::ReusableFree,
+                HeapStateFilter::CachedFree => HeapState::CachedFree,
+                HeapStateFilter::Unreadable => HeapState::Unreadable,
+            };
+            let answer = heap_query::allocations(e, walk(refresh)).map_err(heap_failure)?;
+            let matches: Vec<_> = answer
+                .found
+                .iter()
+                .filter(|allocation| heap.is_none_or(|heap| allocation.heap == heap))
+                .filter(|allocation| backend.is_none_or(|backend| allocation.backend == backend))
+                .filter(|allocation| allocation.state == state)
+                .filter(|allocation| {
+                    min_capacity.is_none_or(|minimum| allocation.capacity >= minimum)
+                })
+                .filter(|allocation| {
+                    max_capacity.is_none_or(|maximum| allocation.capacity <= maximum)
+                })
+                .collect();
+            let mut text = format!(
+                "{} matching allocation(s); {}\n\naddress             capacity  state          backend  heap/class\n",
+                matches.len(),
+                heap_walk_text(&answer.walk)
+            );
+            for allocation in matches.iter().take(limit) {
+                text.push_str(&heap_row(allocation));
+                text.push('\n');
+            }
+            Ok(Output::typed(
+                text,
+                structured::HeapAllocationsResult {
+                    layout: (&answer.layout).into(),
+                    scope: (&answer.scope).into(),
+                    walk: (&answer.walk).into(),
+                    matches: matches.len(),
+                    allocations: matches
+                        .into_iter()
+                        .take(limit)
+                        .map(structured::HeapAllocationInfo::from)
+                        .collect(),
+                },
+            ))
+        }
+        HeapOp::Chunk { address, refresh } => {
+            let address = parse_pool_addr(&address).map_err(|error| {
+                Failed::categorised(structured::ErrorCategory::InvalidArgument, error)
+            })?;
+            let answer = heap_query::chunk_at(e, address, walk(refresh)).map_err(heap_failure)?;
+            let text = match &answer.found {
+                Some(found) => format!(
+                    "{} is {:#x} from user address {}\n{}\n{}",
+                    fmt_addr(address),
+                    found.offset,
+                    fmt_addr(found.allocation.user_address),
+                    heap_row(&found.allocation),
+                    heap_walk_text(&answer.walk)
+                ),
+                None => format!(
+                    "{} is not covered by the Segment Heap snapshot. This is not evidence that \
+                     it is free; inspect coverage and retry with refresh=true after execution.\n{}",
+                    fmt_addr(address),
+                    heap_walk_text(&answer.walk)
+                ),
+            };
+            Ok(Output::typed(
+                text,
+                structured::HeapChunkResult {
+                    layout: (&answer.layout).into(),
+                    scope: (&answer.scope).into(),
+                    walk: (&answer.walk).into(),
+                    address: structured::addr(address),
+                    covered: answer.found.is_some(),
+                    offset: answer.found.as_ref().map(|found| found.offset),
+                    allocation: answer
+                        .found
+                        .as_ref()
+                        .map(|found| (&found.allocation).into()),
+                    previous: answer
+                        .found
+                        .as_ref()
+                        .and_then(|found| found.previous.as_ref())
+                        .map(Into::into),
+                    next: answer
+                        .found
+                        .as_ref()
+                        .and_then(|found| found.next.as_ref())
+                        .map(Into::into),
+                },
+            ))
+        }
+        HeapOp::Census {
+            heap,
+            refresh,
+            limit,
+        } => {
+            let heap = heap
+                .as_deref()
+                .map(parse_pool_addr)
+                .transpose()
+                .map_err(|error| {
+                    Failed::categorised(structured::ErrorCategory::InvalidArgument, error)
+                })?;
+            let answer = heap_query::census(e, walk(refresh)).map_err(heap_failure)?;
+            let rows: Vec<_> = answer
+                .found
+                .iter()
+                .filter(|row| heap.is_none_or(|heap| row.heap == heap))
+                .collect();
+            let mut text = format!(
+                "{} census group(s), heaviest first; {}\n\n",
+                rows.len(),
+                heap_walk_text(&answer.walk)
+            );
+            for row in rows.iter().take(limit) {
+                text.push_str(&format!(
+                    "heap {} {:?}/{:?} class {:#x}: {} chunks, {:#x} bytes\n",
+                    fmt_addr(row.heap),
+                    row.backend,
+                    row.state,
+                    row.size_class,
+                    row.chunks,
+                    row.total_capacity
+                ));
+            }
+            Ok(Output::typed(
+                text,
+                structured::HeapCensusResult {
+                    layout: (&answer.layout).into(),
+                    scope: (&answer.scope).into(),
+                    walk: (&answer.walk).into(),
+                    groups: rows.len(),
+                    rows: rows
+                        .into_iter()
+                        .take(limit)
+                        .map(|row| structured::HeapCensusRowInfo {
+                            heap: structured::addr(row.heap),
+                            backend: heap_backend_name(row.backend),
+                            state: heap_state_name(row.state),
+                            size_class: row.size_class,
+                            chunks: row.chunks,
+                            total_capacity: row.total_capacity,
+                        })
+                        .collect(),
+                },
+            ))
+        }
+        HeapOp::Diagnostics {
+            heap,
+            filter,
+            refresh,
+            limit,
+        } => {
+            let heap = heap
+                .as_deref()
+                .map(parse_pool_addr)
+                .transpose()
+                .map_err(|error| {
+                    Failed::categorised(structured::ErrorCategory::InvalidArgument, error)
+                })?;
+            let answer = heap_query::diagnostics(e, walk(refresh)).map_err(heap_failure)?;
+            let heap_needle = heap.map(|heap| format!("{heap:#x}"));
+            let filter_needle = filter.as_ref().map(|filter| filter.to_ascii_lowercase());
+            let selected = |text: &str| {
+                let text = text.to_ascii_lowercase();
+                heap_needle
+                    .as_ref()
+                    .is_none_or(|needle| text.contains(needle))
+                    && filter_needle
+                        .as_ref()
+                        .is_none_or(|needle| text.contains(needle))
+            };
+            let categories: Vec<_> = answer
+                .found
+                .categories
+                .iter()
+                .filter(|category| selected(&category.shape))
+                .collect();
+            let examples: Vec<_> = answer
+                .found
+                .examples
+                .iter()
+                .filter(|example| selected(example))
+                .collect();
+            let (example_rows, category_rows) =
+                split_row_budget(limit, examples.len(), categories.len());
+            let mut text = format!(
+                "{} matching categories, {} kept examples; {}\n",
+                categories.len(),
+                examples.len(),
+                heap_walk_text(&answer.walk)
+            );
+            for category in categories.iter().take(category_rows) {
+                text.push_str(&format!("{} × {}\n", category.total, category.shape));
+            }
+            for example in examples.iter().take(example_rows) {
+                text.push_str("  ");
+                text.push_str(example);
+                text.push('\n');
+            }
+            Ok(Output::typed(
+                text,
+                structured::HeapDiagnosticsResult {
+                    layout: (&answer.layout).into(),
+                    scope: (&answer.scope).into(),
+                    walk: (&answer.walk).into(),
+                    heap: heap.map(structured::addr),
+                    filter,
+                    matched_categories: categories.len(),
+                    matched_examples: examples.len(),
+                    categories: categories
+                        .into_iter()
+                        .take(category_rows)
+                        .map(|category| structured::DiagnosticCategory {
+                            shape: category.shape.trim().to_string(),
+                            total: category.total,
+                        })
+                        .collect(),
+                    examples: examples.into_iter().take(example_rows).cloned().collect(),
                 },
             ))
         }
@@ -3087,6 +3473,7 @@ fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, F
     let target =
         resolve(e, address).ok_or_else(|| format!("could not resolve address `{address}`"))?;
     let res = e.run_to_address(target, wait).map_err(failed)?;
+    query::invalidate_allocator_snapshots();
     let mut msg = match res.outcome {
         RunToOutcome::Hit => format!("VERDICT: HIT — execution reached {}\n", fmt_addr(target)),
         RunToOutcome::StoppedElsewhere { stopped_at } => format!(
@@ -3203,6 +3590,7 @@ mod tests {
     /// the gap figures do with a walk that met either is `structured`'s question.
     fn quiet_walk() -> query::PoolSnapshotReport {
         query::PoolSnapshotReport {
+            layout: Default::default(),
             total_chunks: 0,
             allocated_chunks: 0,
             coverage: coverage(true),
@@ -4455,5 +4843,10 @@ mod tests {
         // The default, and the reason the distinction is worth making at all.
         assert!(!PoolOp::census(None, None).refreshes());
         assert!(!PoolOp::chunk("0x1000".into(), Some(false)).refreshes());
+
+        assert!(HeapOp::list(Some(true)).refreshes());
+        assert!(HeapOp::chunk("0x1000".into(), Some(true)).refreshes());
+        assert!(!HeapOp::census(None, None, None).refreshes());
+        assert!(!HeapOp::diagnostics(None, None, Some(false), None).refreshes());
     }
 }

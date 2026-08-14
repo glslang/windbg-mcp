@@ -159,6 +159,12 @@ pub enum EngineOp {
         query: PoolOp,
         patience_ms: u32,
     },
+    /// A user-mode Segment Heap query, with the same queue-aware deadline and interrupt
+    /// semantics as [`Self::Pool`].
+    Heap {
+        query: HeapOp,
+        patience_ms: u32,
+    },
     /// Everything a bug check is, in one job: the code and its four parameters, the crashing
     /// stack with each frame attributed to a module, the process — and, when `analyze` is set,
     /// `!analyze -v`'s own conclusions beside them ([`crate::triage`]).
@@ -248,6 +254,7 @@ impl EngineOp {
         match self {
             Self::BoundedCommand { patience_ms, .. }
             | Self::Pool { patience_ms, .. }
+            | Self::Heap { patience_ms, .. }
             | Self::CrashTriage { patience_ms, .. }
             | Self::Walk(WalkOp { patience_ms, .. })
             | Self::Batch(BatchOp { patience_ms, .. }) => Some(patience_ms),
@@ -400,6 +407,131 @@ impl PoolOp {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum HeapBackendFilter {
+    Lfh,
+    Vs,
+    Segment,
+    Large,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub enum HeapStateFilter {
+    Allocated,
+    ReusableFree,
+    CachedFree,
+    Unreadable,
+}
+
+/// The five user Segment Heap tools after defaults and output caps are applied.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum HeapOp {
+    List {
+        refresh: bool,
+    },
+    Allocations {
+        heap: Option<String>,
+        backend: Option<HeapBackendFilter>,
+        state: HeapStateFilter,
+        min_capacity: Option<u64>,
+        max_capacity: Option<u64>,
+        refresh: bool,
+        limit: usize,
+    },
+    Chunk {
+        address: String,
+        refresh: bool,
+    },
+    Census {
+        heap: Option<String>,
+        refresh: bool,
+        limit: usize,
+    },
+    Diagnostics {
+        heap: Option<String>,
+        filter: Option<String>,
+        refresh: bool,
+        limit: usize,
+    },
+}
+
+impl HeapOp {
+    pub const MAX_ROWS: u32 = 2000;
+    const ALLOCATION_ROWS: u32 = 64;
+    const CENSUS_ROWS: u32 = 40;
+    const DIAGNOSTIC_ROWS: u32 = 60;
+
+    fn rows(limit: Option<u32>, default: u32) -> usize {
+        limit.unwrap_or(default).min(Self::MAX_ROWS) as usize
+    }
+
+    pub fn list(refresh: Option<bool>) -> Self {
+        Self::List {
+            refresh: refresh.unwrap_or(false),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn allocations(
+        heap: Option<String>,
+        backend: Option<HeapBackendFilter>,
+        state: Option<HeapStateFilter>,
+        min_capacity: Option<u64>,
+        max_capacity: Option<u64>,
+        refresh: Option<bool>,
+        limit: Option<u32>,
+    ) -> Self {
+        Self::Allocations {
+            heap,
+            backend,
+            state: state.unwrap_or(HeapStateFilter::Allocated),
+            min_capacity,
+            max_capacity,
+            refresh: refresh.unwrap_or(false),
+            limit: Self::rows(limit, Self::ALLOCATION_ROWS),
+        }
+    }
+
+    pub fn chunk(address: String, refresh: Option<bool>) -> Self {
+        Self::Chunk {
+            address,
+            refresh: refresh.unwrap_or(false),
+        }
+    }
+
+    pub fn census(heap: Option<String>, refresh: Option<bool>, limit: Option<u32>) -> Self {
+        Self::Census {
+            heap,
+            refresh: refresh.unwrap_or(false),
+            limit: Self::rows(limit, Self::CENSUS_ROWS),
+        }
+    }
+
+    pub fn diagnostics(
+        heap: Option<String>,
+        filter: Option<String>,
+        refresh: Option<bool>,
+        limit: Option<u32>,
+    ) -> Self {
+        Self::Diagnostics {
+            heap,
+            filter,
+            refresh: refresh.unwrap_or(false),
+            limit: Self::rows(limit, Self::DIAGNOSTIC_ROWS),
+        }
+    }
+
+    pub fn refreshes(&self) -> bool {
+        match self {
+            Self::List { refresh }
+            | Self::Allocations { refresh, .. }
+            | Self::Chunk { refresh, .. }
+            | Self::Census { refresh, .. }
+            | Self::Diagnostics { refresh, .. } => *refresh,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -424,6 +556,10 @@ mod tests {
             EngineOp::Registers { all: false },
             EngineOp::Pool {
                 query: PoolOp::census(None, None),
+                patience_ms: 0,
+            },
+            EngineOp::Heap {
+                query: HeapOp::list(None),
                 patience_ms: 0,
             },
             EngineOp::CrashTriage {
@@ -470,6 +606,26 @@ mod tests {
             unreachable!("still a pool query")
         };
         assert_eq!(patience_ms, 42_000);
+    }
+
+    #[test]
+    fn heap_defaults_and_row_caps_are_applied_before_crossing_the_worker_pipe() {
+        let HeapOp::Allocations { state, limit, .. } =
+            HeapOp::allocations(None, None, None, None, None, None, Some(u32::MAX))
+        else {
+            unreachable!()
+        };
+        assert!(matches!(state, HeapStateFilter::Allocated));
+        assert_eq!(limit, HeapOp::MAX_ROWS as usize);
+
+        let HeapOp::Census { limit, .. } = HeapOp::census(None, None, None) else {
+            unreachable!()
+        };
+        assert_eq!(limit, 40);
+        let HeapOp::Diagnostics { limit, .. } = HeapOp::diagnostics(None, None, None, None) else {
+            unreachable!()
+        };
+        assert_eq!(limit, 60);
     }
 }
 
