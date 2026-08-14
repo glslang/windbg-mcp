@@ -896,24 +896,37 @@ pub struct WalkGaps {
     /// and are worth less than their count suggests — rather than as a population of bad
     /// chunks, which it overstates by orders of magnitude.
     pub refused_chunks: u64,
+    /// Committed bytes of a variable-size subsegment the walk declined to decode, because it
+    /// could not say where a chunk began in them.
+    ///
+    /// A chunk of that kind is only findable from the end of the one before it, and a walk that
+    /// has lost that thread does not guess: guessing is what filled a snapshot with chunks
+    /// decoded at arbitrary offsets. This is what declining costs — coverage, in bytes — so that
+    /// a clean `refused_chunks` cannot be mistaken for a walk that read everything.
+    pub unplaced_bytes: u64,
 }
 
 impl WalkGaps {
     /// `None` when the walk met none of this, so the ordinary answer does not carry four zeroes.
     pub(crate) fn of(report: &win_kexp::pool::query::PoolSnapshotReport) -> Option<Self> {
-        Self::from_measurements(report.stalls, report.refused_chunks)
+        Self::from_measurements(report.stalls, report.refused_chunks, report.unplaced_bytes)
     }
 
     pub(crate) fn of_heap(report: &win_kexp::heap::HeapWalkReport) -> Option<Self> {
-        Self::from_measurements(report.stalls, report.refused_headers)
+        Self::from_measurements(report.stalls, report.refused_headers, report.unplaced_bytes)
     }
 
-    fn from_measurements(stalls: win_kexp::pool::WalkStalls, refused_chunks: u64) -> Option<Self> {
+    fn from_measurements(
+        stalls: win_kexp::pool::WalkStalls,
+        refused_chunks: u64,
+        unplaced_bytes: u64,
+    ) -> Option<Self> {
         let gaps = Self {
             stalled_pages: stalls.pages,
             skipped_bytes: stalls.skipped_bytes,
             recovered_bytes: stalls.recovered_bytes,
             refused_chunks,
+            unplaced_bytes,
         };
         (gaps != Self::default()).then_some(gaps)
     }
@@ -1859,6 +1872,7 @@ mod tests {
             diagnostics: win_kexp::pool::PoolDiagnostics::default(),
             stalls,
             refused_chunks,
+            unplaced_bytes: 0,
         };
 
         // The ordinary walk meets none of this, and says so by saying nothing: four zeroes on
@@ -1916,6 +1930,7 @@ mod tests {
             unreadable_gaps: 0,
             refused_headers,
             stalls,
+            unplaced_bytes: 0,
         };
 
         let quiet = serde_json::to_value(HeapWalkInfo::from(&report(

@@ -5068,6 +5068,11 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
             .to_string();
         let complete = coverage == "complete";
         println!("the census reports this walk {coverage}");
+        // The gap figures, printed rather than asserted on: they are the only place a live run
+        // reports what the walk could not decode, and the two issues they were built for
+        // (glslang/win-kexp#103, #104) are settled by comparing them across runs. A threshold
+        // here would fail on an idle machine or pass on a busy one; a number in the log will not.
+        println!("what the walk did and could not reach: {}", totals["walk"]);
         // An incomplete walk is an acceptable outcome, but "incomplete" on its own is not a
         // finding — *why*, and the categories, are. `deadline_truncated` and `partial` want
         // opposite responses, which is the whole reason coverage is three values and not a bool.
@@ -5090,6 +5095,11 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
                 "why the walk fell short ({} diagnostic(s)): {}",
                 diagnostics["walk"]["diagnostics_emitted"], diagnostics["categories"]
             );
+            // The categories fold every number into `#`, which is what makes them countable and
+            // also what makes them useless for reading a *value* back off a live target. The
+            // verbatim samples are the only place those survive, and this tier is the only place
+            // they are ever produced.
+            println!("verbatim samples: {}", diagnostics["examples"]);
             assert_diagnostic_total_covers_its_categories(&diagnostics);
         }
 
