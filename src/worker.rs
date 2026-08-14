@@ -1061,8 +1061,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         // Zero costs nothing to say. It spawns no watchdog at all — which is the whole reason these
         // ops are off the bounded path (DECISIONS.md, 2026-08-02: arming one rounds a command up to
         // a multiple of 200ms) — so this stays unbounded, as `index_trace` in particular must.
-        EngineOp::Command { command } => e
-            .execute_command_bounded(&command, 0)
+        EngineOp::Command { command } => raw_command(e, &command, 0)
             .map(|run| Output::text(told(run)))
             .map_err(failed),
         EngineOp::BoundedCommand {
@@ -1070,7 +1069,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             patience_ms,
         } => {
             let budget = watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), queued);
-            e.execute_command_bounded(&command, budget)
+            raw_command(e, &command, budget)
                 .map(|run| Output::text(told(run)))
                 .map_err(failed)
         }
@@ -1279,6 +1278,17 @@ fn told(run: CommandRun) -> String {
         ));
     }
     out
+}
+
+/// Executes arbitrary debugger text and conservatively retires allocator snapshots afterward.
+///
+/// A raw command can resume the target or write allocator memory, and DbgEng does not expose a
+/// reliable classification of those effects. Invalidate even when execution reports an error:
+/// the command may have changed memory before its failing token was reached.
+fn raw_command(e: &DebugEngine, command: &str, budget_ms: u32) -> Result<CommandRun, String> {
+    let result = e.execute_command_bounded(command, budget_ms).map_err(es);
+    query::invalidate_allocator_snapshots();
+    result
 }
 
 /// Runs a command that moves the target, and reports where it ended up.
@@ -2199,10 +2209,7 @@ impl Debuggee for BatchEngine<'_> {
     fn command(&mut self, command: &str, budget_ms: u32) -> Result<Ran, String> {
         // Bounded, always. A batch is the one place a runaway command would also strand a
         // rollback, so the step self-aborts rather than eating the reserve.
-        self.e
-            .execute_command_bounded(command, budget_ms)
-            .map(|run| self.ran(run))
-            .map_err(es)
+        raw_command(self.e, command, budget_ms).map(|run| self.ran(run))
     }
 
     fn resume(&mut self, command: &str, timeout_ms: u32) -> Result<Ran, String> {
