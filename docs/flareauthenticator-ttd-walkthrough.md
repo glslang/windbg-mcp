@@ -49,7 +49,7 @@ failing run captures the whole validation, replayable in both directions.
 
 ```text
 open_trace { "path": "…\\801.run" }        → @$curprocess.TTD.Lifetime : [32:0, 11674:AB4]
-modules {}                                  → FlareAuthenticator 00007ff6`5c150000 (no PDB); Qt6*, bcryptPrimitives…
+modules {}                                  → FlareAuthenticator 0x00007ff65c150000 (symbols: none); Qt6*, bcryptPrimitives…
 ```
 
 The strongest anchor in a wrong run is the failure dialog. `ttd_calls` finds every call to a Win32/Qt

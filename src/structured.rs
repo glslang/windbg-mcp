@@ -496,8 +496,8 @@ impl From<&win_kexp::dbgeng::RegisterValue> for RegisterValue {
 pub struct ModuleList {
     /// The **loaded** modules being listed: every one, or those [`Self::filter`] matched.
     pub modules: Vec<ModuleInfo>,
-    /// The modules that have **unloaded** — the tail `lm` prints under `Unloaded modules:`,
-    /// narrowed by the same filter.
+    /// The modules that have **unloaded** — the engine's second list, narrowed by the same
+    /// filter and rendered under its own heading in the text.
     ///
     /// Their own list rather than rows mixed into [`Self::modules`], because they answer a
     /// different question: `start`/`end` say where an image *was*, and the kernel keeps only a
@@ -522,6 +522,24 @@ pub struct ModuleList {
     /// this is what says so. Absent when nothing was filtered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
+}
+
+impl ModuleInfo {
+    /// The name this row is **listed and matched by**: its module name, or — for one that has
+    /// unloaded — its image's.
+    ///
+    /// One definition for both, because a filter that matched on something other than what the
+    /// listing prints is exactly the disagreement
+    /// [#120](https://github.com/glslang/windbg-mcp/issues/120) removed. An unloaded module has no
+    /// module name at all (glslang/win-kexp#101): there is nothing left to qualify a symbol with,
+    /// so the image name is the only name it has.
+    pub fn listed_name(&self) -> &str {
+        if self.name.is_empty() {
+            &self.image_name
+        } else {
+            &self.name
+        }
+    }
 }
 
 /// One loaded module.
@@ -596,6 +614,30 @@ impl From<win_kexp::dbgeng::SymbolKind> for SymbolState {
             Engine::Other(code) => Self::Other {
                 symbol_type_code: code,
             },
+        }
+    }
+}
+
+/// The word a listing prints for a symbol state, which is **the word the values carry** — the
+/// serde tag, spelled once.
+///
+/// A rendering built from these values has to name them; writing that mapping out a second time is
+/// how a text saying `codeview` ends up beside a value saying `code_view`. The test below walks
+/// every variant through `serde_json` and asserts the two agree.
+impl std::fmt::Display for SymbolState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::None => f.write_str("none"),
+            Self::Deferred => f.write_str("deferred"),
+            Self::Coff => f.write_str("coff"),
+            Self::CodeView => f.write_str("code_view"),
+            Self::Pdb => f.write_str("pdb"),
+            Self::Export => f.write_str("export"),
+            Self::Sym => f.write_str("sym"),
+            Self::Dia => f.write_str("dia"),
+            // The one variant carrying a value: the engine's own code, so an unnamed symbol type
+            // is still identifiable from the text rather than reading as "something".
+            Self::Other { symbol_type_code } => write!(f, "other ({symbol_type_code:#x})"),
         }
     }
 }
@@ -1999,6 +2041,44 @@ mod tests {
         let wire = serde_json::to_value(&walk).unwrap();
         assert!(wire.get("start").is_none(), "{wire}");
         assert!(wire.get("note").is_none(), "{wire}");
+    }
+
+    /// The word a module listing prints for a symbol state is the word its value carries.
+    ///
+    /// `modules` renders its own text now ([#120](https://github.com/glslang/windbg-mcp/issues/120)),
+    /// so this column is written here rather than read out of `lm` — and a hand-written mapping
+    /// beside a derived one is how `code_view` becomes `codeview` in the half a person reads. Every
+    /// variant is walked, so a state added later fails this rather than diverging quietly.
+    #[test]
+    fn a_symbol_state_is_spelled_the_same_in_both_channels() {
+        for state in [
+            SymbolState::None,
+            SymbolState::Deferred,
+            SymbolState::Coff,
+            SymbolState::CodeView,
+            SymbolState::Pdb,
+            SymbolState::Export,
+            SymbolState::Sym,
+            SymbolState::Dia,
+        ] {
+            let wire = serde_json::to_value(state).unwrap();
+            assert_eq!(
+                wire["symbols"],
+                serde_json::Value::from(state.to_string()),
+                "the rendered word and the serialised tag are one spelling: {wire}"
+            );
+        }
+
+        // The one variant a tag cannot carry alone: the code travels with the word, in this
+        // module's hex, so an unnamed symbol type is still identifiable in the text.
+        let other = SymbolState::Other {
+            symbol_type_code: 0x2a,
+        };
+        assert_eq!(other.to_string(), "other (0x2a)");
+        assert_eq!(
+            serde_json::to_value(other).unwrap()["symbol_type_code"],
+            0x2a
+        );
     }
 
     /// A chunk's state is four named values, and the fourth is not a kind of free.

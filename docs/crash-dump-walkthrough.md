@@ -37,7 +37,9 @@ The same fields come back as `structuredContent.summary`. The **table** is `modu
 worth one call here because it already tells a story: third-party drivers present include
 `nvlddmkm` (NVIDIA), `nvhda64v` (NVIDIA HD-audio, many unloaded instances),
 `RzDev_*`/`RzCommon` (Razer), and the virtualization stack (`VBox*`, `vmx86`/`hcmon`/`vmnet*`,
-plus Hyper-V `Vid`/`winhvr`). `nt` resolves to `(pdb symbols)`.
+plus Hyper-V `Vid`/`winhvr`). Each row carries its symbol state as its own column — `nt` reads
+`pdb` on a host with symbols for this build, and `deferred` (not fetched *yet*) is not the same
+answer as `none`.
 
 ## 2. Triage in one call
 

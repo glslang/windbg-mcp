@@ -104,20 +104,22 @@ throughout, and it needs no symbols, so it runs offline.
 It checks what an **open** hands back, which is a summary rather than the module table: the count
 and the kernel's base against `modules`, the bug check against `crash_triage`, and the report
 itself against the table it replaced — it has to be the shorter of the two. And it checks
-`modules { "filter": … }` from both ends at once, because the two halves of that answer are two
-implementations of one pattern: the text is `lm m <pattern>`, the values are this server's own
-match over the engine's module list, and every module the values report has to be one the text
-printed. It also pins the two ways that pairing can come apart, both of them measured against this
-engine rather than assumed. A filter using the wildcards `lm m` honours and this server does not
-(`[fd]`, `#`, `+`, `\`) is **refused**, rather than answered differently by each half — as is one
-containing a space, since `lm m` takes a single operand and reads the next token as its own
-options (`lm m nt v` prints the *verbose* listing for `nt`), and one carrying a character outside
-ASCII, whose case this server and the engine may fold differently. And a filter can
-match only *unloaded* images — `nvhda` on this sample, which `lm` answers with twenty-six
-`nvhda64v.sys` rows and no loaded module — so those are checked as values in their own `unloaded`
-list, matched by image name (the only name they have), each carrying the engine's `unloaded` flag,
-and every one of them present in the text above. The other refusals are here too: a filter that
-narrows by nothing, and one carrying a `;` that would end the `lm m` it is interpolated into.
+`modules { "filter": … }` from both ends at once: the listing's rows are **parsed back as records**
+and compared to the values for equality — same rows, same order, no others — filtered and
+unfiltered alike. That is a stronger claim than the one this tier used to make ("every module the
+values report appears somewhere in the text"), and it is the claim that
+[#120](https://github.com/glslang/windbg-mcp/issues/120) made checkable: both halves are rendered
+from one set of `IDebugSymbols3` records, where the text used to come from `lm m <pattern>` and the
+values from a second implementation of its pattern grammar. It is also what proves no `lm` runs
+here — that listing's backtick addresses, `Browse full module list` line and `Unloaded modules:`
+tail do not parse as rows. A filter can match only *unloaded* images — `nvhda` on this sample,
+twenty-six `nvhda64v.sys` and no loaded module — so those are checked in their own `unloaded` list,
+matched by image name (the only name they have), each carrying the engine's `unloaded` flag, and
+row-for-row against the text above. What used to be refused is checked as being *matched
+literally* now: `nt[fd]*`, `n\t*`, `nt v`, `nté` and `nt; .detach` each come back as an empty
+listing in both channels rather than as an error, and the session is still the dump it was
+afterwards — there is no command for a `;` to end. The one refusal left is a filter that narrows by
+nothing.
 
 It also triages the dump's bug check (`crash_triage`), which is the one place the tier depends on
 the sample being a *crash* dump rather than any dump: the `0x9F` code and its four parameters read

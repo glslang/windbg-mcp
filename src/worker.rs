@@ -1361,27 +1361,25 @@ fn registers(e: &DebugEngine, all: bool) -> Result<Output, Failed> {
     ))
 }
 
-/// The modules, as `lm` renders them and as values beside them — optionally narrowed to the ones
-/// whose name matches a pattern.
+/// The modules, as values and as a listing rendered **from those same values** — optionally
+/// narrowed to the ones whose name matches a pattern.
 ///
-/// **One pattern reaches both channels.** The text comes from `lm m <pattern>` and the values from
-/// this server's own match over the engine's module list, so the pattern is normalised *once*,
-/// here, and the same string is used for each. Normalising per channel — or letting the text use
-/// the caller's spelling and the values a tidied one — is how a listing ends up showing rows its
-/// own count disagrees with.
+/// **One list, both channels.** The records come from `IDebugSymbols3` (win-kexp's `modules()` and
+/// `unloaded_modules()`); nothing here runs `lm`. That is the whole point of
+/// [#120](https://github.com/glslang/windbg-mcp/issues/120): while the text was DbgEng's rendering
+/// and the values were this process's match over the engine's list, one answer had two independent
+/// implementations of one filter, and they disagreed about character sets, the `\` escape,
+/// whitespace, case folding and the unloaded tail — five ways for a listing to show rows its own
+/// count denies. Rendering here leaves one implementation, so the filter's syntax is this server's
+/// to define rather than something that has to track `lm m`'s. `execute { "command": "lm" }` still
+/// runs the engine's own listing for anyone who wants it verbatim.
 ///
-/// **Both halves of the engine's list, for the same reason.** `lm` appends the modules that have
-/// since unloaded — to a filtered listing as readily as to a whole one — so values that carried
-/// only the loaded ones described a different set from the text above them. On this repo's sample
-/// a filter of `nvhda` matches no loaded module and twenty-six unloaded ones, which is a listing
-/// this tool used to answer with "nothing matched" printed over the rows that did.
+/// **Both halves of the engine's list.** The modules that have since unloaded are a second list,
+/// narrowed by the same pattern and rendered under their own heading: on this repo's sample a
+/// filter of `nvhda` matches no loaded module and twenty-six unloaded ones, which is an answer
+/// rather than the "nothing matched" it once read as.
 fn modules(e: &DebugEngine, filter: Option<&str>) -> Result<Output, Failed> {
     let pattern = filter.map(module_pattern);
-    let text = match &pattern {
-        Some(pattern) => e.execute_command(&format!("lm m {pattern}")),
-        None => e.execute_command("lm"),
-    }
-    .map_err(failed)?;
     let loaded = e.modules().map_err(failed)?;
     // Unloaded modules are best-effort: not every Windows version tracks them, the ones that do
     // may have nothing to report, and a listing of what *is* loaded must not fail over what is
@@ -1390,88 +1388,151 @@ fn modules(e: &DebugEngine, filter: Option<&str>) -> Result<Output, Failed> {
         .unloaded_modules()
         .inspect_err(|why| tracing::debug!("worker: unloaded modules could not be read: {why}"))
         .unwrap_or_default();
+    // Converted first, then filtered, so the name a row is *matched* by is read from the same
+    // record — by the same accessor — as the name it is *listed* by.
     let narrow = |modules: &[win_kexp::dbgeng::Module]| -> Vec<structured::ModuleInfo> {
         modules
             .iter()
+            .map(structured::ModuleInfo::from)
             .filter(|module| {
                 pattern
                     .as_deref()
-                    .is_none_or(|pattern| matches_module_pattern(pattern, listed_name(module)))
+                    .is_none_or(|pattern| matches_module_pattern(pattern, module.listed_name()))
             })
-            .map(structured::ModuleInfo::from)
             .collect()
     };
     let (matched, matched_unloaded) = (narrow(&loaded), narrow(&unloaded));
-    let text = match &pattern {
-        Some(pattern) => format!(
-            "{}{}",
-            text.trim_end(),
-            narrowing_note(pattern, matched.len(), loaded.len(), matched_unloaded.len())
-        ),
-        None => text,
+    let list = structured::ModuleList {
+        loaded: loaded.len(),
+        filter: pattern,
+        modules: matched,
+        unloaded: matched_unloaded,
     };
-    Ok(Output::typed(
-        text,
-        structured::ModuleList {
-            loaded: loaded.len(),
-            filter: pattern,
-            modules: matched,
-            unloaded: matched_unloaded,
-        },
-    ))
+    Ok(Output::typed(render_modules(&list), list))
 }
 
-/// The name a module is listed under: its own, or — for one that has **unloaded** — its image's.
+/// The listing a person reads, built from the records beside it.
 ///
-/// An unloaded module has no module name at all, because there is nothing left to qualify a
-/// symbol with, and the engine reports it that way (glslang/win-kexp#101). `lm` prints the image
-/// name in that column instead, and `lm m nvhda*` matches those rows, so a filter that tested
-/// only `name` would match nothing the text had shown.
-fn listed_name(module: &win_kexp::dbgeng::Module) -> &str {
-    if module.name.is_empty() {
-        &module.image_name
-    } else {
-        &module.name
+/// Two tables at most — the loaded modules and the unloaded ones, each under a heading naming
+/// which it is — and then one line about the listing as a whole. Neither table is printed when it
+/// is empty: a filter that matched only unloaded images should not be preceded by an empty column
+/// header, and one that matched nothing at all is the note alone.
+fn render_modules(list: &structured::ModuleList) -> String {
+    let mut out = String::new();
+    if !list.modules.is_empty() {
+        out.push_str(&module_table(&list.modules, "module"));
+    }
+    if !list.unloaded.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        // Said above the rows rather than in the note below them, because it is what the two
+        // address columns *mean* here and a reader meets them first.
+        out.push_str(
+            "Unloaded modules — `start` and `end` are where the image was, not where it is:\n\n",
+        );
+        out.push_str(&module_table(&list.unloaded, "image"));
+    }
+    let note = listing_note(list);
+    if out.is_empty() {
+        return note;
+    }
+    format!("{out}\n{note}")
+}
+
+/// One table: a header, then a row per module.
+///
+/// The name column is sized from the rows it holds — every other column has a fixed width, since
+/// the addresses are this module's one representation (`0x` and sixteen digits, always) and the
+/// symbol state is a short word. Names are never truncated to fit: a listing whose text and values
+/// disagree about a *name* is the disagreement this rendering exists to remove.
+fn module_table(rows: &[structured::ModuleInfo], names: &str) -> String {
+    // At least as wide as the column's own header, which is also the answer for a table with no
+    // rows in it — `format!`'s width counts characters, so this does too.
+    let width = rows.iter().fold(names.chars().count(), |width, row| {
+        width.max(row.listed_name().chars().count())
+    });
+    let mut out = format!("{:<18}  {:<18}  {names:<width$}  symbols\n", "start", "end");
+    for row in rows {
+        // Trimmed at the end: the last column is padded for nothing, and trailing spaces on every
+        // line of a tool result are noise.
+        out.push_str(
+            format!(
+                "{}  {}  {:<width$}  {}",
+                row.start,
+                row.end,
+                row.listed_name(),
+                row.symbols
+            )
+            .trim_end(),
+        );
+        out.push('\n');
+    }
+    out
+}
+
+/// The one line under the rows: what this listing is, and what it is a part of.
+fn listing_note(list: &structured::ModuleList) -> String {
+    match &list.filter {
+        Some(pattern) => narrowing_note(
+            pattern,
+            list.modules.len(),
+            list.loaded,
+            list.unloaded.len(),
+        ),
+        // The whole table. `loaded` is still worth printing under it — it is the number a reader
+        // would otherwise count — and the unloaded half is named as the separate thing it is.
+        None if list.unloaded.is_empty() => format!("{} module(s) loaded.", list.loaded),
+        None => format!(
+            "{} module(s) loaded, and {} that have since **unloaded** — {WHERE_UNLOADED}",
+            list.loaded,
+            list.unloaded.len()
+        ),
     }
 }
 
-/// What a narrowed listing says about the narrowing, under whatever `lm m` printed.
+/// Where the unloaded rows are, said wherever any of them are in the answer: above under their own
+/// heading, and in a field of their own rather than among the loaded modules.
+const WHERE_UNLOADED: &str = "listed above under `Unloaded modules` and carried as the `unloaded` \
+                              values here, where the addresses say where an image was rather than \
+                              where it is.";
+
+/// What a narrowed listing says about the narrowing, under the rows.
 ///
-/// Two things the text above it cannot say for itself.
+/// Two things the rows above cannot say for themselves.
 ///
-/// **A pattern that matched nothing** prints *nothing at all* — `lm m` has no "no match" line — so
-/// a filtered call was otherwise indistinguishable from a target with no modules, or from a call
-/// that quietly failed. The message also names the mistake callers actually make: the pattern
-/// matches the name symbols are qualified by (`nt`), not the image file (`ntkrnlmp.exe`), which is
-/// measured behaviour — `lm m ntkrnlmp*` finds nothing on a dump whose kernel is `ntkrnlmp.exe`.
+/// **A pattern that matched nothing** has no rows at all, so without this a filtered call is
+/// indistinguishable from a target with no modules, or from a call that quietly failed. The
+/// message also names the mistake callers actually make: the pattern matches the name symbols are
+/// qualified by (`nt`), not the image file (`ntkrnlmp.exe`) — measured behaviour, since a dump
+/// whose kernel image is `ntkrnlmp.exe` has no module of that name. And it names the other
+/// mistake, which the refused-wildcard errors used to: `*` and `?` are the whole grammar here, so
+/// a WinDbg pattern that leans on the rest of it (`nt[fd]*`) is matched literally and finds
+/// nothing.
 ///
 /// **Which half of the list matched.** A pattern can match only modules that have since unloaded —
 /// `nvhda` on this repo's sample matches twenty-six of them and no loaded module — and that is an
 /// answer rather than a miss, so it is reported as a count of what was found and not as a caveat
 /// about what was not.
 fn narrowing_note(pattern: &str, matched: usize, loaded: usize, unloaded: usize) -> String {
-    // Where the unloaded rows are, said wherever any of them matched: they are in the text under
-    // their own header, and in a field of their own rather than among the loaded modules.
-    const WHERE: &str = "`lm` lists those under `Unloaded modules:` and they are the `unloaded` \
-                         values here, where the addresses say where an image was rather than where \
-                         it is.";
     match (matched, unloaded) {
         // Nothing at all. The only branch that offers advice, because it is the only one where the
         // caller has nothing and may have asked the wrong question.
         (0, 0) => format!(
-            "\nNothing matches `{pattern}`; {loaded} module(s) are loaded. The pattern matches the \
-             name symbols are qualified by — `nt`, not `ntkrnlmp.exe` — with `*` and `?` as \
-             wildcards. Omit `filter` for the whole table."
+            "Nothing matches `{pattern}`; {loaded} module(s) are loaded. The pattern matches the \
+             name symbols are qualified by — `nt`, not `ntkrnlmp.exe` — with `*` and `?` as the \
+             only wildcards and every other character literal. Omit `filter` for the whole table, \
+             or run execute {{ \"command\": \"lm m <pattern>\" }} for WinDbg's own wildcard grammar."
         ),
         // A find, not a miss: the driver is in this target's history rather than its present.
         (0, unloaded) => format!(
-            "\nNo *loaded* module matches `{pattern}`, but {unloaded} that have since **unloaded** \
-             do — {WHERE} {loaded} module(s) are loaded."
+            "No *loaded* module matches `{pattern}`, but {unloaded} that have since **unloaded** \
+             do — {WHERE_UNLOADED} {loaded} module(s) are loaded."
         ),
-        (matched, 0) => format!("\n\n{matched} of {loaded} loaded module(s) match `{pattern}`."),
+        (matched, 0) => format!("{matched} of {loaded} loaded module(s) match `{pattern}`."),
         (matched, unloaded) => format!(
-            "\n\n{matched} of {loaded} loaded module(s) match `{pattern}`, and {unloaded} that \
-             have since **unloaded** — {WHERE}"
+            "{matched} of {loaded} loaded module(s) match `{pattern}`, and {unloaded} that have \
+             since **unloaded** — {WHERE_UNLOADED}"
         ),
     }
 }
@@ -4735,11 +4796,180 @@ mod tests {
         );
     }
 
+    // ---- rendering a module listing ----------------------------------------
+
+    /// Every row the listing prints, read back out of the text as `(start, name)`.
+    ///
+    /// The rendering is this server's now, so a test can read it as records rather than matching
+    /// substrings — which is the point of [#120] and also what keeps this from repeating the smoke
+    /// tier's old mistake of matching the wrong token in a table `lm` had laid out.
+    ///
+    /// [#120]: https://github.com/glslang/windbg-mcp/issues/120
+    fn listed_rows(text: &str) -> Vec<(String, String)> {
+        text.lines()
+            .filter(|line| line.starts_with("0x"))
+            .map(|line| {
+                let mut columns = line.split_whitespace();
+                let start = columns.next().unwrap_or_default().to_string();
+                let _end = columns.next();
+                (start, columns.next().unwrap_or_default().to_string())
+            })
+            .collect()
+    }
+
+    /// A listing of three modules and one that has since unloaded, as the engine reports them.
+    fn sample_list(filter: Option<&str>) -> structured::ModuleList {
+        let pdb = |name: &str, base| win_kexp::dbgeng::Module {
+            symbols: win_kexp::dbgeng::SymbolKind::Pdb,
+            ..module(name, base)
+        };
+        let loaded = [
+            module("ntosext", 0xfffff803_1afe0000),
+            module("Ntfs", 0xfffff803_1c770000),
+            pdb("nt", 0xfffff803_89200000),
+        ];
+        let unloaded = [unloaded_module("nvhda64v.sys", 0xfffff803_3d680000)];
+        let narrow = |modules: &[win_kexp::dbgeng::Module]| -> Vec<structured::ModuleInfo> {
+            modules
+                .iter()
+                .map(structured::ModuleInfo::from)
+                .filter(|module| {
+                    filter.is_none_or(|filter| {
+                        matches_module_pattern(&module_pattern(filter), module.listed_name())
+                    })
+                })
+                .collect()
+        };
+        structured::ModuleList {
+            loaded: loaded.len(),
+            filter: filter.map(module_pattern),
+            modules: narrow(&loaded),
+            unloaded: narrow(&unloaded),
+        }
+    }
+
+    /// The claim [#120](https://github.com/glslang/windbg-mcp/issues/120) is about: the listing and
+    /// the values name **exactly** the same modules.
+    ///
+    /// Not "every value appears in the text", which is what could be asserted while the text was
+    /// `lm`'s and which cannot catch a row the text has and the values do not — the direction all
+    /// five of the measured divergences ran in. Read as records and compared as a sequence, so an
+    /// extra row, a missing row and a reordered one all fail.
+    #[test]
+    fn the_listing_names_exactly_the_modules_its_values_do() {
+        for filter in [None, Some("nt"), Some("nvhda"), Some("nosuchmodule")] {
+            let list = sample_list(filter);
+            let expected: Vec<(String, String)> = list
+                .modules
+                .iter()
+                .chain(&list.unloaded)
+                .map(|module| (module.start.clone(), module.listed_name().to_string()))
+                .collect();
+            let text = render_modules(&list);
+            assert_eq!(
+                listed_rows(&text),
+                expected,
+                "the rows and the values disagree for `{filter:?}`:\n{text}"
+            );
+        }
+    }
+
+    /// What the columns carry, and what they do not.
+    #[test]
+    fn a_rendered_listing_carries_the_addresses_and_the_symbol_state() {
+        let text = render_modules(&sample_list(None));
+        assert_eq!(
+            text.lines()
+                .next()
+                .map(|header| header.split_whitespace().collect::<Vec<_>>()),
+            Some(vec!["start", "end", "module", "symbols"]),
+            "the loaded half is a table with a header:\n{text}"
+        );
+        assert!(
+            text.contains("0xfffff80389200000  0xfffff80389201000  nt       pdb"),
+            "one address representation, and the symbol state as its own column:\n{text}"
+        );
+        assert!(
+            text.lines()
+                .all(|line| !line.contains("fffff803`") && !line.contains("`89200000")),
+            "`lm`'s backtick addresses are not this rendering's:\n{text}"
+        );
+        assert!(
+            text.lines().all(|line| !line.ends_with(' ')),
+            "columns are padded for alignment, not for trailing space:\n{text}"
+        );
+        assert!(
+            text.contains("3 module(s) loaded, and 1 that have since **unloaded**"),
+            "an unfiltered listing says how big it is, in both halves:\n{text}"
+        );
+    }
+
+    /// The unloaded half is rendered under its own heading, by the only name it has, and says what
+    /// its addresses mean — a row whose `start` is where an image *was* is not a row in the table
+    /// above.
+    #[test]
+    fn the_unloaded_half_is_rendered_as_the_different_thing_it_is() {
+        let text = render_modules(&sample_list(Some("nvhda")));
+        assert!(
+            text.contains("Unloaded modules — `start` and `end` are where the image was"),
+            "{text}"
+        );
+        assert!(
+            text.contains("image") && !text.contains("  module  "),
+            "its name column is the image's, since an unloaded module has no module name:\n{text}"
+        );
+        assert!(text.contains("nvhda64v.sys"), "{text}");
+        assert!(
+            text.contains("1 that have since **unloaded** do"),
+            "matching only unloaded modules is a finding, not a miss:\n{text}"
+        );
+
+        // A filter that matched nothing at all is the note by itself — no headers over no rows.
+        let text = render_modules(&sample_list(Some("nosuchmodule")));
+        assert!(
+            text.starts_with("Nothing matches `*nosuchmodule*`"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("start ") && !text.contains("unloaded"),
+            "nothing matched, so there is no table and nothing to say about either half:\n{text}"
+        );
+    }
+
+    /// A name is never truncated to fit the column, and the column is never narrower than its own
+    /// header.
+    ///
+    /// Truncation would be the one rendering bug that breaks the property above: a row naming a
+    /// module the values do not.
+    #[test]
+    fn the_name_column_is_sized_from_the_names_it_holds() {
+        let long = "api_ms_win_core_synch_l1_2_0";
+        let list = structured::ModuleList {
+            loaded: 2,
+            filter: None,
+            modules: [module(long, 0x1000), module("nt", 0x2000)]
+                .iter()
+                .map(structured::ModuleInfo::from)
+                .collect(),
+            unloaded: Vec::new(),
+        };
+        let text = render_modules(&list);
+        assert!(text.contains(long), "a long name is printed whole:\n{text}");
+        // The short row's symbol column lines up under the long row's, which is what the width is
+        // computed for.
+        let column = |name: &str| {
+            text.lines()
+                .find(|line| line.contains(name))
+                .and_then(|line| line.find("deferred"))
+        };
+        assert_eq!(column(long), column("  nt "), "{text}");
+    }
+
     // ---- narrowing a module listing ----------------------------------------
 
-    /// `lm m` prints **nothing** when its pattern matches nothing, so a filtered call that found
-    /// no module has to say so itself — otherwise it is indistinguishable from a target with no
-    /// modules at all, or from a call that quietly failed.
+    /// A filtered listing that found nothing prints no rows, so it has to say so itself —
+    /// otherwise it is indistinguishable from a target with no modules at all, or from a call
+    /// that quietly failed.
     #[test]
     fn a_filter_that_matches_nothing_says_so_rather_than_printing_nothing() {
         let note = narrowing_note("*nosuch*", 0, 227, 0);
@@ -4822,21 +5052,26 @@ mod tests {
         }
     }
 
-    /// A filter has to match an unloaded module by the only name it has.
+    /// A filter has to match an unloaded module by the only name it has — which is also the name
+    /// the listing prints for it.
     ///
-    /// Testing `name` alone would match nothing for every row in that half of the list — while
-    /// `lm m nvhda*` matches them, since it reads the same image name into the column it prints.
+    /// Testing `name` alone would match nothing for every row in that half of the list, while the
+    /// rows themselves showed the image name they were listed under.
     #[test]
     fn an_unloaded_module_is_matched_by_its_image_name() {
-        let gone = unloaded_module("nvhda64v.sys", 0xfffff8033d680000);
-        assert_eq!(listed_name(&gone), "nvhda64v.sys");
+        let gone =
+            structured::ModuleInfo::from(&unloaded_module("nvhda64v.sys", 0xfffff803_3d680000));
+        assert_eq!(gone.listed_name(), "nvhda64v.sys");
         assert!(matches_module_pattern(
             &module_pattern("nvhda"),
-            listed_name(&gone)
+            gone.listed_name()
         ));
 
         // A loaded module is still listed by its module name, not its image.
-        assert_eq!(listed_name(&module("nt", 0x1000)), "nt");
+        assert_eq!(
+            structured::ModuleInfo::from(&module("nt", 0x1000)).listed_name(),
+            "nt"
+        );
     }
 
     fn summary_of(modules: &[win_kexp::dbgeng::Module], kernel: bool) -> structured::TargetSummary {
