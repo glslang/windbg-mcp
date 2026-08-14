@@ -19,7 +19,9 @@ out to need something its entry did not anticipate — item 18 needed much less 
 claimed to, item 17 needed a walk deadline nothing had asked for, and item 16 needed a probe before
 it could measure anything at all. **Item 7 has landed** too (2026-08-10, the `interrupt` tool), and
 is kept because item 8 rests on it: what it built is the job binding, and what it deliberately did
-not build is the queued-job half that only `tasks/cancel` can ask for.
+not build is the queued-job half that only `tasks/cancel` can ask for. **Item 12 has landed**
+(2026-08-02) and is kept because what validating it *disproved* outlives what it confirmed: a kernel
+attach whose target never dials in has no bound at all, which is the constraint item 10 contains.
 
 ## 1. [win-kexp] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -288,28 +290,53 @@ iframe host.
   same reason they were the candidates for Apps. The plumbing they would need now exists
   (`src/structured.rs`, `proto::Output`), so the remaining work is their shapes, not the seam.
 
-## 12. [win-kexp] Validate the opener split against a live KDNET target
+## 12. [win-kexp] Validate the opener split against a live KDNET target — **done** (2026-08-02)
 
 The split that made per-opener handle commits possible (glslang/win-kexp#71) was validated on
 user-mode targets only — split launch, fused launch, split attach, via `examples/split_open.rs`.
 The two **kernel** halves ran on no hardware: `attach_local_kernel_begin`/`wait` and
 `attach_kernel_begin`/`wait`.
 
-- **What specifically needs a target:** the connection-string buffer now rides across the seam
-  inside the `PendingTarget` guard, because a KDNET link is only established during the wait and
-  DbgEng may still read the string after `AttachKernel` returns. Before the split that buffer
-  stayed alive by accident of scope, so nothing proves the engine reads it late — only that
-  assuming it doesn't is unsafe. A real attach over `net:port=...,key=...` settles it. Second,
-  `wait_for_kernel_break_in`'s bookkeeping (clear `INITIAL_BREAK`, absorb the spurious re-break,
-  map a watchdog-forced return to `KernelBreakTimeout`) all moved behind the guard and wants a
-  live break-in plus a deliberate timeout against an unreachable target.
-- **Why deferred:** no KDNET target was available. The split cannot change *whether* an attach
-  succeeds — `x_begin` makes the identical `AttachKernel` call — so the buffer lifetime is the
-  only genuinely new failure mode.
-- **Where it picks up:** `examples/kdtest.rs` already drives `attach_kernel` over KDNET; add a
-  `attach_kernel_begin` + `wait()` pass beside the existing fused one. Prefer a
-  snapshot-restorable VM, per item 1.
-- **Tracked as:** [glslang/win-kexp#73](https://github.com/glslang/win-kexp/issues/73).
+`attach_kernel_begin`/`wait` then ran against a Windows Server 26100 guest over KDNET, from the
+harness added in win-kexp#77 (`examples/kdtest.rs` now drives the split path beside the fused one),
+and passes on both counts. `attach_local_kernel_begin` shares `wait_for_kernel_break_in` and differs
+only in its begin half; on a host with local KD off it can exercise nothing but that half's
+`E_NOTIMPL`, which is not evidence about the wait.
+
+- **The connection string outlives the seam.** `AttachKernel` returned in **28.5ms** with the link
+  demonstrably not up, and the link came up **5.7s later, inside `wait()`** — on the far side of the
+  seam — after which `vertarget` read a real machine. Stated as precisely as the item was written:
+  this proves the parking is correct, not that the engine reads the string late. Had the buffer been
+  freed at the end of `attach_kernel_begin` the attach would very likely still have *appeared* to
+  work, freed memory usually retaining its contents — which is why holding it was the right call
+  rather than something a test could have argued for.
+- **The bookkeeping runs on the `wait()` side.** `go` stopped at `Breakpoint 0 hit`. That is the
+  discriminator: an `INITIAL_BREAK` left armed, or its spurious re-break left unabsorbed, stops the
+  target at `nt!DbgBreakPointWithStatus` and never reaches the breakpoint.
+
+**The third thing this item asked for does not exist, and finding that out is what it was worth.**
+It wanted "a deliberate timeout against an unreachable target". Dialing a dead port returned from
+`AttachKernel` in 7.9ms and then blocked past **300s** — five times the 60s `KERNEL_ATTACH_WAIT_MS`
+— before the run was killed, and the same VM booted *without* `bcdedit /debug on` did the same at
+0.7s of CPU, parked in the transport rather than spinning. The watchdog is `SetInterrupt`, which
+only reaches a wait whose target has **connected**, so the bound covers a connected-but-unresponsive
+guest and nothing else. `KernelBreakTimeout` is reachable only from a target that connects and
+*then* fails to break in — wedged, or spinning at high IRQL — and stays unexercised. It is also
+three lines the split did not touch (`wait_for_kernel_break_in` is byte-identical; only its call
+site moved), which is why win-kexp#73 closed without it.
+
+What that leaves this repo is not a test but a constraint, and it is the one item 10 exists for: the
+most common kernel-debugging mistake there is — a guest not booted with `/debug on` — blocks the
+attaching thread with **no bound at all**, and no in-process mitigation is possible, because the
+inability to cancel is DbgEng's. A caller that must stay responsive needs a process it can abandon.
+This server has one: the attach parks a *worker*, `session_status` reports how long it has waited,
+and `end_session` terminates it — covered end to end by the live smoke tier (a kernel attach parked
+on a dead port, reclaimed by `end_session`). win-kexp now documents the bound's real reach on
+`attach_kernel` itself ("Blocks indefinitely if the target never connects", `src/dbgeng.rs`), so the
+next caller does not have to measure it again.
+
+- **Tracked as:** [glslang/win-kexp#73](https://github.com/glslang/win-kexp/issues/73) — closed
+  2026-08-14.
 
 ## 13. [windbg-mcp] A job-level deadline for `reachable_from_dispatch`
 
