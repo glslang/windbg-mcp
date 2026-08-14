@@ -5100,6 +5100,22 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
             // verbatim samples are the only place those survive, and this tier is the only place
             // they are ever produced.
             println!("verbatim samples: {}", diagnostics["examples"]);
+            // Filtered, because the unfiltered sample is shared across every shape the walk met
+            // and the interesting one is crowded out. glslang/win-kexp#104 turns on which of two
+            // answers the engine gives when it cannot advance — a region reported *behind* the
+            // cursor, meaning the region is over and the page step is pointless, or a zero-length
+            // region reported ahead of it, meaning the step is right. The numbers separate them
+            // and exist nowhere but here.
+            let stalls = server.tool_data(
+                "pool_diagnostics",
+                json!({
+                    "session_id": session,
+                    "filter": "made no progress",
+                    "limit": 40,
+                }),
+                POOL_CALL_BUDGET,
+            );
+            println!("stall samples: {}", stalls["examples"]);
             assert_diagnostic_total_covers_its_categories(&diagnostics);
         }
 
