@@ -1420,7 +1420,7 @@ fn modules(e: &DebugEngine, filter: Option<&str>) -> Result<Output, Failed> {
 fn render_modules(list: &structured::ModuleList) -> String {
     let mut out = String::new();
     if !list.modules.is_empty() {
-        out.push_str(&module_table(&list.modules, "module"));
+        out.push_str(&fenced(&module_table(&list.modules, "module")));
     }
     if !list.unloaded.is_empty() {
         if !out.is_empty() {
@@ -1431,7 +1431,7 @@ fn render_modules(list: &structured::ModuleList) -> String {
         out.push_str(
             "Unloaded modules — `start` and `end` are where the image was, not where it is:\n\n",
         );
-        out.push_str(&module_table(&list.unloaded, "image"));
+        out.push_str(&fenced(&module_table(&list.unloaded, "image")));
     }
     let note = listing_note(list);
     if out.is_empty() {
@@ -1447,17 +1447,17 @@ fn render_modules(list: &structured::ModuleList) -> String {
 /// symbol state is a short word. Names are never truncated to fit: a listing whose text and values
 /// disagree about a *name* is the disagreement this rendering exists to remove.
 ///
-/// **The names are the target's, not this server's**, so they go through
-/// [`renderable_unquoted`] like any other untrusted string — and the width is measured on what is
-/// actually printed, so an escaped name still lines its row up.
+/// **The names are the target's, not this server's**, so they go through [`renderable`] like any
+/// other untrusted string — and the width is measured on what is actually printed, so an escaped
+/// name still lines its row up.
 ///
-/// *Unquoted*, because these rows are the one place a target-supplied string is printed with no
-/// code span around it. See that function for what a bare row lets a name do that a quoted one
-/// does not.
+/// What the rows are printed *into* is the other half of that, and it is [`fenced`]'s: the
+/// alignment below only means anything in a monospaced block, and so does the promise that a name
+/// is shown as itself rather than as markup.
 fn module_table(rows: &[structured::ModuleInfo], names: &str) -> String {
     let listed: Vec<_> = rows
         .iter()
-        .map(|row| renderable_unquoted(row.listed_name()))
+        .map(|row| renderable(row.listed_name()))
         .collect();
     // At least as wide as the column's own header, which is also the answer for a table with no
     // rows in it — `format!`'s width counts characters, so this does too.
@@ -1607,51 +1607,26 @@ fn escapes_the_listing(c: char) -> bool {
     c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '`')
 }
 
-/// The same guard for a string printed **bare**, with no code span around it.
+/// Puts a table in a fenced block, which is the container its rows are written for.
 ///
-/// [`renderable`] is enough inside backticks, and only inside them: a code span renders its
-/// contents literally, so the one way out is the delimiter and that is escaped. A module row has
-/// no such container — the table is plain aligned text — so a name reaches a Markdown-rendering
-/// client as *markup*, and `[ntdll.dll](https://elsewhere)` is shown as `ntdll.dll` with the rest
-/// hidden. The name in `structuredContent` is still the truth; the listing a person reads is not,
-/// which is the one thing the table is for.
+/// The columns are padded to line up, and that only means anything in a monospaced,
+/// whitespace-preserving context. Printed bare, a Markdown-rendering client reflows the rows into
+/// a paragraph and the alignment the padding paid for is gone — so the fence is what the table
+/// always needed to render as a table at all.
 ///
-/// That is the whole difference between the two call sites, and why one guard could not serve
-/// both: the filter is quoted, the names are not.
-fn renderable_unquoted(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text.contains(|c| escapes_the_listing(c) || substitutes_what_is_shown(c)) {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '`' => out.push_str("\\u{60}"),
-            c if escapes_the_listing(c) => out.extend(c.escape_debug()),
-            c if substitutes_what_is_shown(c) => {
-                out.push('\\');
-                out.push(c);
-            }
-            c => out.push(c),
-        }
-    }
-    std::borrow::Cow::Owned(out)
-}
-
-/// Whether a character lets the text around it be *displayed as something else*.
+/// It also settles what the rows may contain, which is the reason it went in. A name is the
+/// target's to choose and was being printed with no container around it, so
+/// `[ntdll.dll](https://elsewhere)` — a legal Windows file name — displayed as `ntdll.dll` with
+/// the rest hidden: nothing broke out of the row, the row simply stated a different name than the
+/// module had, while `structuredContent` carried the truth. Inside a fence every one of those
+/// constructs is literal text, so there is no set of Markdown metacharacters to keep escaping and
+/// keep up to date, and ordinary names stay exactly as the target spells them.
 ///
-/// Deliberately not CommonMark's whole escapable set. Escaping every character Markdown will
-/// accept a backslash before turns `foo-bar.sys` into `foo\-bar\.sys`, and a guard that makes
-/// every ordinary name unreadable to contain a hostile one has cost more than it saved. These are
-/// the constructs that *hide* characters:
-///
-/// * `[` and `]` open a link or image label, which shows the label and swallows the target;
-/// * `<` and `>` open raw HTML and autolinks, which do the same;
-/// * `*` emphasises — and unlike `_` it works inside a word, so `nt*dll*.sys` loses its asterisks
-///   where `my_driver.sys` is safe and stays untouched;
-/// * `~` is GFM strikethrough, on the same footing as `*`;
-/// * `\` escapes whatever follows it, so leaving it alone would let a name cancel this guard.
-fn substitutes_what_is_shown(c: char) -> bool {
-    matches!(c, '[' | ']' | '<' | '>' | '*' | '~' | '\\')
+/// **The one way out of a fence is its own delimiter**, and [`renderable`] already escapes the
+/// backtick for the note's code span. That guard is what holds this container shut too, which is
+/// why it is not repeated here.
+fn fenced(table: &str) -> String {
+    format!("```\n{table}```\n")
 }
 
 /// Everything a bug check is, gathered as one indivisible job.
@@ -3679,10 +3654,18 @@ fn summary_text(diagnostic: &str, summary: &structured::TargetSummary) -> String
     }
     if let Some(loaded) = summary.modules_loaded {
         lines.push(match &summary.primary_module {
+            // Quoted, and through the same guard the filter goes through. This name is the
+            // target's and the sentence around it is prose, so bare it would reach a
+            // Markdown-rendering client as markup — `[ntdll](https://elsewhere)` displaying as
+            // `ntdll` and the opener naming a module that is not the one it opened. A code span
+            // renders its contents literally, and `renderable` escapes the one character that
+            // closes one. The table solves the same problem with a fence; a sentence cannot carry
+            // a fence, so it carries the span instead.
             Some(module) => format!(
-                "{loaded} module(s) loaded, {} at {}; `modules` lists the table and \
+                "{loaded} module(s) loaded, `{}` at {}; `modules` lists the table and \
                  `modules {{ \"filter\": \"<name>\" }}` answers for one.",
-                module.name, module.start
+                renderable(&module.name),
+                module.start
             ),
             None => format!(
                 "{loaded} module(s) loaded; `modules` lists the table and \
@@ -4996,8 +4979,15 @@ mod tests {
     #[test]
     fn a_rendered_listing_carries_the_addresses_and_the_symbol_state() {
         let text = render_modules(&sample_list(None));
+        let mut lines = text.lines();
         assert_eq!(
-            text.lines()
+            lines.next(),
+            Some("```"),
+            "the table opens its own fenced block — the columns are padded to line up, and that \
+             only means anything in a monospaced one:\n{text}"
+        );
+        assert_eq!(
+            lines
                 .next()
                 .map(|header| header.split_whitespace().collect::<Vec<_>>()),
             Some(vec!["start", "end", "module", "symbols"]),
@@ -5204,13 +5194,14 @@ mod tests {
         assert_eq!(column("drv"), column("  nt "), "{text}");
     }
 
-    /// A row is printed **bare**, and that is a different guard from the quoted filter's.
+    /// A row's *container*, which is a different question from what a row may contain.
     ///
     /// The escaping above answers "can a name break out of its row". This answers "can a name be
-    /// *shown as something else while sitting in it*" — which a code span makes impossible and a
-    /// plain table does not. `[ntdll.dll](https://elsewhere)` is a legal Windows file name and a
-    /// Markdown-rendering client displays it as `ntdll.dll`, so an analyst reading the listing is
-    /// told the wrong name for a module while `structuredContent` quietly carries the right one.
+    /// *shown as something else while sitting in it*". `[ntdll.dll](https://elsewhere)` is a legal
+    /// Windows file name, and printed with nothing around it a Markdown-rendering client displays
+    /// it as `ntdll.dll` — so an analyst reads the wrong name for a module while
+    /// `structuredContent` quietly carries the right one. The fence makes every such construct
+    /// literal, and takes the whole class rather than a list of metacharacters to keep current.
     ///
     /// Reported by chatgpt-codex-connector on #126.
     #[test]
@@ -5227,43 +5218,66 @@ mod tests {
         };
         let text = render_modules(&list);
 
+        // Verbatim, not escaped: inside a fence the name needs no mangling to be shown as itself,
+        // which is the advantage this has over escaping the metacharacters one at a time.
         assert!(
-            text.contains("\\[ntdll.dll\\](https://elsewhere)"),
-            "the label syntax is escaped, so the whole name is what renders:\n{text}"
+            text.contains(hostile),
+            "the name renders exactly as the target spells it:\n{text}"
         );
         assert!(
-            !text.contains("[ntdll.dll]("),
-            "and no unescaped link label survives anywhere in the listing:\n{text}"
+            fenced_body(&text).is_some_and(|body| body.contains(hostile)),
+            "and it is inside the fence, which is what makes that literal:\n{text}"
         );
         assert_eq!(
             listed_rows(&text).len(),
             2,
-            "escaping a name must not cost its row:\n{text}"
+            "fencing the table must not cost a row:\n{text}"
         );
-
-        // The width is measured on what is printed, so the backslashes are counted like any other
-        // character and the column still lines up — the same invariant the separator test pins.
-        let column = |name: &str| {
-            text.lines()
-                .find(|line| line.contains(name))
-                .and_then(|line| line.find("deferred"))
-        };
-        assert_eq!(column("ntdll"), column("  nt "), "{text}");
     }
 
-    /// The other half of the same judgement: a guard that escaped everything Markdown *can* take
-    /// a backslash before would make every ordinary name unreadable to contain a hostile one.
-    /// `_` is safe inside a word by CommonMark's own flanking rules, and `-` and `.` are not
-    /// markup at all, so a name built from them has to come through untouched.
+    /// The fence is only a container while the target cannot close it, and the target names the
+    /// rows. A backtick already goes through [`renderable`] for the note's code span — this is the
+    /// same guard doing the other job, and the reason [`fenced`] does not repeat it.
     #[test]
-    fn an_ordinary_name_is_not_escaped_for_the_sake_of_a_hostile_one() {
-        for name in ["my_driver.sys", "foo-bar.sys", "WdFilter.sys", "nt"] {
-            assert_eq!(
-                renderable_unquoted(name),
-                name,
-                "{name} carries no markup and must render as itself"
-            );
-        }
+    fn a_module_name_cannot_close_the_fence_it_is_printed_in() {
+        let hostile = "a```\n```elsewhere";
+        let list = structured::ModuleList {
+            loaded: 1,
+            filter: None,
+            modules: [module(hostile, 0x1000)]
+                .iter()
+                .map(structured::ModuleInfo::from)
+                .collect(),
+            unloaded: Vec::new(),
+        };
+        let text = render_modules(&list);
+
+        assert_eq!(
+            text.matches("```").count(),
+            2,
+            "exactly one fence opens and one closes it:\n{text}"
+        );
+        assert_eq!(
+            listed_rows(&text).len(),
+            1,
+            "one record is one row, whatever it is called:\n{text}"
+        );
+        let body = fenced_body(&text).expect("the block opens and closes");
+        assert!(
+            !body.contains('`'),
+            "no backtick reaches the block at all, so none of it can be a delimiter:\n{body}"
+        );
+        assert!(
+            body.contains("\\u{60}"),
+            "the name is still listed, with its backticks shown as escapes:\n{body}"
+        );
+    }
+
+    /// The rows between the fence markers, or `None` if the block is not opened and closed.
+    fn fenced_body(text: &str) -> Option<&str> {
+        let (_, rest) = text.split_once("```\n")?;
+        let (body, _) = rest.split_once("```")?;
+        Some(body)
     }
 
     // ---- narrowing a module listing ----------------------------------------
@@ -5434,10 +5448,47 @@ mod tests {
             "233 modules must not become 233 lines again:\n{text}"
         );
         assert!(text.contains("233 module(s) loaded"), "{text}");
-        assert!(text.contains("nt at 0xfffff80312000000"), "{text}");
+        // Quoted, because the name is the target's: see `a_primary_module_cannot_rename_itself`.
+        assert!(text.contains("`nt` at 0xfffff80312000000"), "{text}");
         assert!(
             text.contains("`modules`"),
             "the table has to be nameable on demand: {text}"
+        );
+    }
+
+    /// The summary names the target's own image, in a sentence, and the name is the target's.
+    ///
+    /// The rows solved this with a fence; a sentence cannot carry one, so it carries a code span
+    /// instead — which renders its contents literally, and whose only delimiter [`renderable`]
+    /// already escapes. Without it the opener's first line names a module that is not the one it
+    /// opened: `[ntdll](https://elsewhere)` displays as `ntdll`, and this line is the one thing a
+    /// reader takes from an open without calling anything else.
+    #[test]
+    fn a_primary_module_cannot_rename_itself_in_the_summary() {
+        let hostile = "[ntdll](https://elsewhere)";
+        let mut summary = summary_of(&[module(hostile, 0x1000)], true);
+        summary.primary_module = primary_module(&[module(hostile, 0x1000)], Some(true))
+            .map(|module| Box::new(structured::ModuleInfo::from(module)));
+
+        let text = summary_text("", &summary);
+        assert!(
+            text.contains(&format!("`{hostile}`")),
+            "the name is quoted whole, so the span is what renders and not a link:\n{text}"
+        );
+
+        // And the span cannot be closed from inside it, which is the only way out of one.
+        let breaker = "nt`x`y";
+        summary.primary_module = primary_module(&[module(breaker, 0x1000)], Some(true))
+            .map(|module| Box::new(structured::ModuleInfo::from(module)));
+        let text = summary_text("", &summary);
+        assert_eq!(
+            text.matches('`').count() % 2,
+            0,
+            "every span opened in the line is closed:\n{text}"
+        );
+        assert!(
+            !text.contains("nt`x`y"),
+            "the name's own backticks are escaped rather than printed:\n{text}"
         );
     }
 
