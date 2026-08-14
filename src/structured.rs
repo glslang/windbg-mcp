@@ -758,6 +758,47 @@ pub struct WalkInfo {
     pub diagnostics_emitted: usize,
     /// How many distinct kinds of complaint those fell into.
     pub diagnostic_categories: usize,
+    /// What the walk could not read, in bytes and chunks, when there was anything. Absent on a
+    /// walk that met none of it, which is the ordinary case.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gaps: Option<WalkGaps>,
+}
+
+/// What a walk could not read, and what it read anyway by stepping over rather than giving up.
+///
+/// Sizes what `coverage` only names. `partial` says a walk fell short; these say by how much,
+/// which is the difference between "a page was unreadable" and "a third of the pool was" — and
+/// the diagnostics cannot answer it, because they collapse messages by shape and the counts
+/// beside them count *occurrences of a shape*, not bytes or chunks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WalkGaps {
+    /// Pages the debugger's valid-region query could not advance over. The walk steps over one
+    /// and asks again rather than abandoning the rest of the region behind it.
+    pub stalled_pages: u64,
+    /// Bytes those steps filed as unreadable.
+    pub skipped_bytes: u64,
+    /// Bytes of committed memory read *after* a stall, in the regions that stalled — coverage a
+    /// walk that gave up at the first stall would have reported as nothing at all. Large next to
+    /// `skipped_bytes` means the stalls were isolated pages in otherwise healthy regions.
+    pub recovered_bytes: u64,
+    /// Chunk headers a backend decoder refused, resynchronising sixteen bytes at a time past
+    /// each. A refusal costs more than the chunk: every header after it in that extent is
+    /// decoded at a guessed offset, so a large number here means the chunks reported from those
+    /// extents are worth less than their count suggests.
+    pub refused_chunks: u64,
+}
+
+impl WalkGaps {
+    /// `None` when the walk met none of this, so the ordinary answer does not carry four zeroes.
+    pub(crate) fn of(report: &win_kexp::pool::query::PoolSnapshotReport) -> Option<Self> {
+        let gaps = Self {
+            stalled_pages: report.stalls.pages,
+            skipped_bytes: report.stalls.skipped_bytes,
+            recovered_bytes: report.stalls.recovered_bytes,
+            refused_chunks: report.refused_chunks,
+        };
+        (gaps != Self::default()).then_some(gaps)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1400,6 +1441,52 @@ mod tests {
             assert_eq!(PoolCoverage::from(engine), expected);
             assert_eq!(serde_json::to_value(expected).unwrap(), wire);
         }
+    }
+
+    /// The gap figures answer the question `coverage` raises and cannot settle: `partial` says
+    /// a walk fell short, and these say by how much. They have to come from the walk as numbers
+    /// — the diagnostics cannot supply them, because they collapse messages by shape and the
+    /// count beside a shape counts occurrences of *that shape*, not bytes or chunks.
+    #[test]
+    fn walk_gaps_carry_what_the_diagnostics_cannot() {
+        let report = |stalls, refused_chunks| win_kexp::pool::query::PoolSnapshotReport {
+            total_chunks: 0,
+            allocated_chunks: 0,
+            coverage: win_kexp::pool::query::WalkCoverage::Partial,
+            diagnostics: win_kexp::pool::PoolDiagnostics::default(),
+            stalls,
+            refused_chunks,
+        };
+
+        // The ordinary walk meets none of this, and says so by saying nothing: four zeroes on
+        // every pool answer would be noise on the answers that are fine.
+        assert_eq!(
+            WalkGaps::of(&report(win_kexp::pool::WalkStalls::default(), 0)),
+            None
+        );
+
+        let gaps = WalkGaps::of(&report(
+            win_kexp::pool::WalkStalls {
+                pages: 3,
+                skipped_bytes: 0x3000,
+                recovered_bytes: 0x40000,
+            },
+            884,
+        ))
+        .expect("a walk that stalled has gaps to report");
+        assert_eq!(gaps.stalled_pages, 3);
+        assert_eq!(gaps.skipped_bytes, 0x3000);
+        // The figure the whole measurement is for: committed memory read on the far side of a
+        // stall, which a walk that abandoned the region at the first one reports as nothing.
+        assert_eq!(gaps.recovered_bytes, 0x40000);
+        assert_eq!(gaps.refused_chunks, 884);
+
+        // Any one of them alone is still worth reporting — a walk can refuse chunks without
+        // ever stalling, and reporting nothing there would hide the refusals entirely.
+        assert!(WalkGaps::of(&report(win_kexp::pool::WalkStalls::default(), 1)).is_some());
+        let wire = serde_json::to_value(gaps).unwrap();
+        assert_eq!(wire["recovered_bytes"], 0x40000);
+        assert_eq!(wire["refused_chunks"], 884);
     }
 
     /// A field's JSON type must not depend on its value.
