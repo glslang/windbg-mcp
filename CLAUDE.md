@@ -118,8 +118,26 @@ $env:WINDBG_MCP_SMOKE_KERNEL = "net:port=50000,key=<w.x.y.z>"
 cargo test --test mcp_smoke -- --ignored --nocapture --test-threads=1 live_kernel
 ```
 
+**Do not ask for that string before checking whether a profile already holds it.** The same
+connection is usually configured for `attach_kernel { "profile": … }`, in
+`%USERPROFILE%\.windbg-mcp\profiles.json` or a `WINDBG_MCP_PROFILE_<NAME>` variable, and the tier
+takes the *raw* string only because it has to exercise the explicit path — not because it needs a
+second copy. Read the profile and set the variable from it in one step, so the key never lands in a
+command line, a tool argument or this transcript; print the profile *name* and the port when
+reporting what you are attaching to, never the value. `attach_kernel {}` lists the configured names
+without disclosing any of them. Only ask the user for a raw connection when no profile is
+configured at all.
+
 `--test-threads=1` is not optional: the filter matches **eight** tests, and the KD transport is
 single-owner, so in parallel the second attach fails and can leave the target halted.
+
+**Check the target is reachable before starting the tier, not by starting it.** A KDNET attach that
+finds nothing parks its worker in `WaitForEvent(INFINITE)` for the whole run and reports a timeout
+that measures the environment rather than the code. This debugger host is itself a Hyper-V guest —
+`Get-VM` does not exist here and there is no local VM to start — so the target is a *sibling* guest:
+find it in the neighbour table (`Get-NetNeighbor | ? LinkLayerAddress -like '00-15-5D*'`) and probe
+**TCP 5985**, since it answers WinRM and nothing else. ICMP and 445 are closed, so a failed ping
+proves nothing.
 
 ## Live kernel + driver IOCTL gotchas (learned driving HEVD over KDNET)
 
