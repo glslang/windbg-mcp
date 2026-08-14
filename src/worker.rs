@@ -3788,6 +3788,7 @@ mod tests {
             diagnostics: PoolDiagnostics::default(),
             stalls: WalkStalls::default(),
             refused_chunks: 0,
+            unplaced_bytes: 0,
         }
     }
 
