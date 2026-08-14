@@ -1736,6 +1736,7 @@ pub struct HeapChunkArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct HeapCensusArgs {
+    /// Optional Segment Heap root address.
     #[serde(default)]
     pub heap: Option<String>,
     #[serde(default)]
@@ -1749,6 +1750,7 @@ pub struct HeapCensusArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct HeapDiagnosticsArgs {
+    /// Optional Segment Heap root address.
     #[serde(default)]
     pub heap: Option<String>,
     /// Case-insensitive substring applied to diagnostic categories and kept examples.
@@ -2583,7 +2585,8 @@ impl WindbgServer {
 
     /// List every heap root in the current process PEB. Segment Heaps are marked supported;
     /// classic NT heaps are listed but deliberately excluded from v1 coverage and should be
-    /// inspected with `!heap`.
+    /// inspected with `!heap`. Requires a stopped x64 live target or sufficiently complete dump
+    /// and matching `ntdll` PDB type information.
     #[rmcp::tool(
         annotations(
             title = "List user-mode heaps",
@@ -2624,6 +2627,17 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<HeapAllocationsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if args
+            .min_capacity
+            .zip(args.max_capacity)
+            .is_some_and(|(minimum, maximum)| minimum > maximum)
+        {
+            return typed_error(
+                ErrorCategory::InvalidArgument,
+                "min_capacity cannot exceed max_capacity".into(),
+                args.session_id,
+            );
+        }
         let backend = args.backend.map(|backend| match backend {
             HeapBackendArg::Lfh => HeapBackendFilter::Lfh,
             HeapBackendArg::Vs => HeapBackendFilter::Vs,
@@ -2655,7 +2669,8 @@ impl WindbgServer {
 
     /// Locate the user allocation containing an address and return its contiguous neighbours
     /// from the same heap, backend, and subsegment. An uncovered address is not reported as free;
-    /// inspect the returned coverage before treating absence as evidence.
+    /// inspect the returned coverage before treating absence as evidence. Requires a stopped x64
+    /// live target or sufficiently complete dump and matching `ntdll` PDB type information.
     #[rmcp::tool(
         annotations(
             title = "Locate a Segment Heap chunk",
@@ -2679,7 +2694,9 @@ impl WindbgServer {
         engine_result_for(args.session_id.as_deref(), out)
     }
 
-    /// Group Segment Heap chunks by heap, backend, state, and size class, heaviest first.
+    /// Group Segment Heap chunks by heap, backend, state, and size class, heaviest first. Requires
+    /// a stopped x64 live target or sufficiently complete dump and matching `ntdll` PDB type
+    /// information.
     #[rmcp::tool(
         annotations(
             title = "Census Segment Heap usage",
@@ -2704,7 +2721,8 @@ impl WindbgServer {
     }
 
     /// Inspect Segment Heap walk diagnostic categories and kept examples, optionally scoped to
-    /// one heap root and narrowed by a case-insensitive substring.
+    /// one heap root and narrowed by a case-insensitive substring. Requires a stopped x64 live
+    /// target or sufficiently complete dump and matching `ntdll` PDB type information.
     #[rmcp::tool(
         annotations(
             title = "Filter Segment Heap diagnostics",

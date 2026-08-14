@@ -732,6 +732,8 @@ pub struct AllocatorModuleInfo {
     pub size: u32,
     pub timestamp: u32,
     pub checksum: u32,
+    #[serde(flatten)]
+    pub symbols: SymbolState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -753,6 +755,7 @@ impl From<&win_kexp::allocator::LayoutProvenance> for AllocatorLayoutInfo {
                 size: layout.module.size,
                 timestamp: layout.module.timestamp,
                 checksum: layout.module.checksum,
+                symbols: layout.module.symbols.into(),
             },
             pdb: layout.module.symbol_file.clone(),
             fingerprint: layout.fingerprint.clone(),
@@ -764,16 +767,17 @@ impl From<&win_kexp::allocator::LayoutProvenance> for AllocatorLayoutInfo {
     }
 }
 
-/// How much of the pool the walk behind an answer actually covered.
+/// How much of an allocator the walk behind an answer actually covered.
 ///
-/// Every pool answer carries this, because every one of them is drawn from a snapshot and a
+/// Every allocator answer carries this, because every one of them is drawn from a snapshot and a
 /// count taken from a partial snapshot is a floor rather than a total. The three ways of falling
 /// short are separate values because they need different responses; a fourth — the walk failing
 /// outright, or being interrupted — is not a coverage state at all but the `error` branch of
 /// [`Outcome`], with category [`ErrorCategory::Debugger`] or [`ErrorCategory::Interrupted`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
-pub enum PoolCoverage {
+#[schemars(rename = "PoolCoverage")]
+pub enum AllocatorCoverage {
     /// The walk covered everything it set out to. Counts here are totals.
     Complete,
     /// It stopped because its deadline — what was left of this call's budget — ran out. What it
@@ -786,7 +790,17 @@ pub enum PoolCoverage {
     Partial,
 }
 
-impl From<win_kexp::pool::query::WalkCoverage> for PoolCoverage {
+impl AllocatorCoverage {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Complete => "complete",
+            Self::DeadlineTruncated => "deadline_truncated",
+            Self::Partial => "partial",
+        }
+    }
+}
+
+impl From<win_kexp::pool::query::WalkCoverage> for AllocatorCoverage {
     fn from(coverage: win_kexp::pool::query::WalkCoverage) -> Self {
         use win_kexp::pool::query::WalkCoverage as Engine;
         match coverage {
@@ -800,7 +814,7 @@ impl From<win_kexp::pool::query::WalkCoverage> for PoolCoverage {
 /// The state of the walk an answer was drawn from.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WalkInfo {
-    pub coverage: PoolCoverage,
+    pub coverage: AllocatorCoverage,
     /// Chunks the walk indexed, allocated and free.
     pub chunks_walked: usize,
     pub allocated_chunks: usize,
@@ -845,11 +859,19 @@ pub struct WalkGaps {
 impl WalkGaps {
     /// `None` when the walk met none of this, so the ordinary answer does not carry four zeroes.
     pub(crate) fn of(report: &win_kexp::pool::query::PoolSnapshotReport) -> Option<Self> {
+        Self::from_measurements(report.stalls, report.refused_chunks)
+    }
+
+    pub(crate) fn of_heap(report: &win_kexp::heap::HeapWalkReport) -> Option<Self> {
+        Self::from_measurements(report.stalls, report.refused_headers)
+    }
+
+    fn from_measurements(stalls: win_kexp::pool::WalkStalls, refused_chunks: u64) -> Option<Self> {
         let gaps = Self {
-            stalled_pages: report.stalls.pages,
-            skipped_bytes: report.stalls.skipped_bytes,
-            recovered_bytes: report.stalls.recovered_bytes,
-            refused_chunks: report.refused_chunks,
+            stalled_pages: stalls.pages,
+            skipped_bytes: stalls.skipped_bytes,
+            recovered_bytes: stalls.recovered_bytes,
+            refused_chunks,
         };
         (gaps != Self::default()).then_some(gaps)
     }
@@ -982,7 +1004,6 @@ pub struct PoolChunkAt {
     pub chunk: Option<PoolChunkInfo>,
     /// How far into that chunk the address sits.
     #[serde(skip_serializing_if = "Option::is_none")]
-    /// Signed displacement from `allocation.user_address`; header addresses are negative.
     pub offset: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous: Option<PoolChunkInfo>,
@@ -1173,15 +1194,14 @@ impl From<&win_kexp::heap::HeapScope> for HeapScopeInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HeapWalkInfo {
-    pub coverage: PoolCoverage,
+    pub coverage: AllocatorCoverage,
     pub chunks_walked: usize,
     pub allocated_chunks: usize,
     pub diagnostics_emitted: usize,
     pub unreadable_gaps: usize,
-    pub refused_headers: u64,
-    pub stalled_pages: u64,
-    pub skipped_bytes: u64,
-    pub recovered_bytes: u64,
+    /// What the walk could not read or decode, when there was anything. Healthy results omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gaps: Option<WalkGaps>,
 }
 
 impl From<&win_kexp::heap::HeapWalkReport> for HeapWalkInfo {
@@ -1192,10 +1212,7 @@ impl From<&win_kexp::heap::HeapWalkReport> for HeapWalkInfo {
             allocated_chunks: walk.allocated_chunks,
             diagnostics_emitted: walk.diagnostic_count,
             unreadable_gaps: walk.unreadable_gaps,
-            refused_headers: walk.refused_headers,
-            stalled_pages: walk.stalls.pages,
-            skipped_bytes: walk.stalls.skipped_bytes,
-            recovered_bytes: walk.stalls.recovered_bytes,
+            gaps: WalkGaps::of_heap(walk),
         }
     }
 }
@@ -1223,13 +1240,19 @@ pub struct HeapChunkResult {
     pub scope: HeapScopeInfo,
     pub walk: HeapWalkInfo,
     pub address: String,
+    /// Whether the Segment Heap snapshot covers this address at all. False is not "free": the
+    /// address may not be user heap, or may sit in a region this walk never reached. Read
+    /// `walk.coverage` before treating absence as evidence.
     pub covered: bool,
+    /// Signed displacement from `allocation.user_address`; a header address is negative.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offset: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allocation: Option<HeapAllocationInfo>,
+    /// The contiguous previous allocation in the same heap, backend, and subsegment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous: Option<HeapAllocationInfo>,
+    /// The contiguous next allocation in the same heap, backend, and subsegment.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next: Option<HeapAllocationInfo>,
 }
@@ -1719,15 +1742,16 @@ mod tests {
     fn pool_coverage_keeps_the_walks_own_reason() {
         use win_kexp::pool::query::WalkCoverage as Engine;
         for (engine, expected, wire) in [
-            (Engine::Complete, PoolCoverage::Complete, "complete"),
+            (Engine::Complete, AllocatorCoverage::Complete, "complete"),
             (
                 Engine::BudgetExpired,
-                PoolCoverage::DeadlineTruncated,
+                AllocatorCoverage::DeadlineTruncated,
                 "deadline_truncated",
             ),
-            (Engine::Partial, PoolCoverage::Partial, "partial"),
+            (Engine::Partial, AllocatorCoverage::Partial, "partial"),
         ] {
-            assert_eq!(PoolCoverage::from(engine), expected);
+            assert_eq!(AllocatorCoverage::from(engine), expected);
+            assert_eq!(expected.as_str(), wire);
             assert_eq!(serde_json::to_value(expected).unwrap(), wire);
         }
     }
@@ -1756,6 +1780,7 @@ mod tests {
         assert_eq!(wire["fingerprint"], "fnv1a64:0123456789abcdef");
         assert_eq!(wire["semantic_family"], "affinity_slot_vs");
         assert_eq!(wire["module"]["base"], "0x00007ffb12340000");
+        assert_eq!(wire["module"]["symbols"], "pdb");
     }
 
     #[test]
@@ -1825,7 +1850,7 @@ mod tests {
         // `None` says nothing about whether the field then serialises as `"gaps": null`, which
         // would be a shape change on every healthy pool answer — the ones that are fine.
         let walk = |gaps| WalkInfo {
-            coverage: PoolCoverage::Partial,
+            coverage: AllocatorCoverage::Partial,
             chunks_walked: 0,
             allocated_chunks: 0,
             diagnostics_emitted: 0,
@@ -1837,6 +1862,38 @@ mod tests {
         let wire = serde_json::to_value(walk(Some(gaps))).unwrap();
         assert_eq!(wire["gaps"]["recovered_bytes"], 0x40000);
         assert_eq!(wire["gaps"]["refused_chunks"], 884);
+    }
+
+    #[test]
+    fn heap_walk_gaps_use_the_shared_optional_shape() {
+        let report = |stalls, refused_headers| win_kexp::heap::HeapWalkReport {
+            coverage: win_kexp::pool::query::WalkCoverage::Complete,
+            total_chunks: 0,
+            allocated_chunks: 0,
+            diagnostic_count: 0,
+            unreadable_gaps: 0,
+            refused_headers,
+            stalls,
+        };
+
+        let quiet = serde_json::to_value(HeapWalkInfo::from(&report(
+            win_kexp::pool::WalkStalls::default(),
+            0,
+        )))
+        .unwrap();
+        assert!(quiet.get("gaps").is_none(), "{quiet}");
+
+        let wire = serde_json::to_value(HeapWalkInfo::from(&report(
+            win_kexp::pool::WalkStalls {
+                pages: 2,
+                skipped_bytes: 0x2000,
+                recovered_bytes: 0x8000,
+            },
+            17,
+        )))
+        .unwrap();
+        assert_eq!(wire["gaps"]["stalled_pages"], 2);
+        assert_eq!(wire["gaps"]["refused_chunks"], 17);
     }
 
     /// A field's JSON type must not depend on its value.

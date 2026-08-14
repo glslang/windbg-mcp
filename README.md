@@ -636,7 +636,7 @@ Two conventions hold across all of them:
   order matches numeric order. The debugger's backtick form (``fffff803`1ab10000``) appears only in
   the text.
 - **An allocator answer says what the walk covered.** `walk.coverage` is `complete`, `deadline_truncated`
-  (the call's budget ran out — more time reaches more of the pool) or `partial` (unreadable regions
+  (the call's budget ran out — more time reaches more of the allocator) or `partial` (unreadable regions
   or a traversal cap — more time changes nothing). Counts from anything but `complete` are floors,
   not totals. A walk that failed outright, or was stopped by `interrupt`, is not a coverage state at
   all: it is the error branch below, with category `debugger` or `interrupted`.
@@ -716,8 +716,9 @@ timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressio
   Snapshots are cached per target/PEB/`ntdll` image and invalidated when execution resumes; pass
   `refresh: true` for the final observation after target execution. Allocation `capacity` is always
   allocator-backed, while `requested_size` is optional and appears only when the selected schema
-  validates exact unused-byte metadata. Read `layout`, `scope`, and `walk` before treating an absent
-  allocation as evidence. The agent workflow is in
+  validates exact unused-byte metadata. `heap_allocations` defaults to `state: allocated`; when
+  investigating freed memory, pass `state: reusable_free` or `state: cached_free` explicitly. Read
+  `layout`, `scope`, and `walk` before treating an absent allocation as evidence. The agent workflow is in
   [`skills/windbg-debugging/heap-walking.md`](skills/windbg-debugging/heap-walking.md).
 - **`crash_triage` reads a bug check two ways, and keeps them apart.** The code and its parameters
   (`ReadBugCheckData`), the stack, each frame's module, and the crashing process (out of the current
