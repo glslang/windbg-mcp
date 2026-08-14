@@ -525,116 +525,23 @@ pub(crate) fn parse_lm_base(text: &str) -> Option<u64> {
 
 // ---- what a module filter means -------------------------------------------
 //
-// One definition, in one place, because it is applied **twice**: the supervisor refuses a
-// pattern it cannot honour ([`reject_unsupported_wildcards`]) and the worker matches the engine's
-// module list with it ([`matches_module_pattern`]), while DbgEng matches the same string for the
-// text. The two implementations sitting side by side is what makes "do these agree?" a question
-// somebody reviewing one of them can answer.
+// One definition, in one place, and — since #120 — applied exactly **once**, by the worker, over
+// the records it renders the listing from. While `modules` pasted `lm m`'s output there were two
+// implementations of one pattern (this one and DbgEng's), which is why this section used to open
+// with an allowlist refusing everything the two could disagree about. The grammar below is now
+// this server's own, so it is documented rather than defended: `execute { "command": "lm m …" }`
+// is where WinDbg's fuller wildcard grammar lives.
 
 /// The wildcards a `modules` filter honours, which is exactly what [`matches_module_pattern`]
-/// implements.
+/// implements. Every other character is literal.
 const MODULE_WILDCARDS: [char; 2] = ['*', '?'];
-
-/// Whether a character may appear in a module filter: something a module or image name is made
-/// of, or one of the two wildcards above.
-///
-/// **An allowlist, not a list of the metacharacters to refuse**, and that is the point. WinDbg's
-/// [string wildcard grammar][syntax] is bigger than it looks — `[fd]` and `[a-z]` character sets,
-/// `#` for zero or more of the preceding character, `+` for one or more, and `\` escaping any of
-/// them — and a blocklist is only ever as complete as the last reading of that page. Two review
-/// rounds bore that out: the sets came first, then the escape. Everything not spelled here is
-/// refused, so a feature of the grammar nobody has noticed yet is refused too, rather than
-/// honoured by `lm m` and matched literally here.
-///
-/// `-` and `.` are in: they appear in image names (`api-ms-win-core-file-l1-1-0.dll`,
-/// `nvhda64v.sys`) and are literal on both sides — the docs make hyphens literal outside brackets,
-/// and brackets cannot get here.
-///
-/// **ASCII, deliberately.** [`matches_module_pattern`] folds case with
-/// [`char::eq_ignore_ascii_case`], so an accented letter in the *pattern* would be compared
-/// case-sensitively here while DbgEng's own matcher folds it by Windows' rules — a lowercase
-/// filter matching an uppercase name in the text and missing it in the values. Which fold
-/// Windows applies to a given code point is not something this side can check, so the pattern
-/// stays inside the domain the two agree on. `?` matches any single character, including a
-/// non-ASCII one, which is how a name carrying one is still reachable.
-///
-/// [syntax]: https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/string-wildcard-syntax
-fn is_module_filter_char(c: char) -> bool {
-    c.is_ascii_alphanumeric() || MODULE_WILDCARDS.contains(&c) || matches!(c, '_' | '.' | '-')
-}
-
-/// Refuses a filter this server cannot match the way `lm m` will.
-///
-/// Two ways that happens, both **measured on this engine rather than assumed**, and both of them
-/// producing one answer whose text and values describe different sets of modules — the single
-/// property this feature promises.
-///
-/// **Grammar `lm m` implements and this does not.** `lm m nt[fd]*` and `lm m nt#f*` print `Ntfs`,
-/// `lm m ha+l` prints `hal`, and `lm m n\t*` prints `nt`, `Ntfs` and `ntosext` — the backslash
-/// escaping the `t` into a literal. Matched literally, which is what the value side would do, every
-/// one of those matches nothing. Implementing the grammar is the option deliberately not taken: a
-/// second implementation of DbgEng's matcher can only be checked corner by corner, and a corner
-/// missed is a silent disagreement rather than a refusal.
-///
-/// **Whitespace inside the operand**, which is worse than a mismatched pattern. `lm m` takes one
-/// operand and reads what follows as *its own options*: `lm m nt v` matched `nt` and printed the
-/// verbose listing, so the text is not a differently-filtered answer but a different command.
-/// Module names have no spaces in them, so nothing legitimate is lost.
-///
-/// **A character outside ASCII**, which is the one of the three that is about *this* side rather
-/// than the engine's: the matcher folds case with ASCII rules, so an accented letter in a pattern
-/// would be compared case-sensitively here and case-insensitively there. Refused rather than
-/// guessed at, because which fold Windows applies to a code point is not checkable from here.
-///
-/// Costs a caller nothing they cannot get another way: `execute { "command": "lm m nt[fd]*" }` runs
-/// the engine's own matcher on anything this refuses.
-pub(crate) fn reject_unmatchable_filter(filter: &str) -> Result<(), String> {
-    // Trimmed exactly as `module_pattern` trims it, so the two agree on what the operand is:
-    // surrounding space is the caller's formatting, and only space *within* it reaches `lm m`.
-    let filter = filter.trim();
-    if filter.chars().any(char::is_whitespace) {
-        return Err(
-            "`filter` contains a space, and `lm m` takes a single operand — it reads what follows \
-             as its own options rather than as more of the pattern. Measured on this engine: \
-             `lm m nt v` matches `nt` and prints lm's *verbose* listing, so the text would answer \
-             a different question from the values beside it. Module names contain no spaces; use \
-             `*` if a wildcard is what was meant."
-                .to_string(),
-        );
-    }
-    // Ahead of the general check because it needs a different explanation: this one is not about
-    // WinDbg's grammar at all, it is about what this side can fold.
-    if let Some(found) = filter.chars().find(|c| !c.is_ascii()) {
-        return Err(format!(
-            "`filter` contains `{found}`, which is outside the ASCII range this tool matches \
-             case-insensitively. DbgEng folds case by Windows' own rules, so a lowercase filter \
-             could match an uppercase name in the listing text and miss it in the values beside \
-             it — and which fold applies to a given character is not something this side can \
-             check. Put `?` where that character is (it matches any single one), or run \
-             execute {{ \"command\": \"lm m <pattern>\" }} for the engine's own matcher."
-        ));
-    }
-    let Some(found) = filter.chars().find(|c| !is_module_filter_char(*c)) else {
-        return Ok(());
-    };
-    Err(format!(
-        "`filter` contains `{found}`, which is not part of a module name and which WinDbg's \
-         `lm m` may read as a wildcard: its grammar has `[fd]`/`[a-z]` character sets, `#` (zero \
-         or more of the previous character), `+` (one or more) and `\\` (escape the next \
-         character), none of which this tool implements. Honouring them in the listing text but \
-         not in the values beside it would make one answer describe two different sets of modules, \
-         so anything outside a name is refused instead. This filter takes a module or image name \
-         plus `*` (any run of characters) and `?` (exactly one); for the full grammar use \
-         execute {{ \"command\": \"lm m <pattern>\" }}."
-    ))
-}
 
 /// The pattern a `filter` argument really means.
 ///
 /// A bare name matches **anywhere in** a module name, because that is what a caller asking for
 /// `MessageManager` wants, and what every other `filter` in this server does (`pool_diagnostics`'
 /// is a case-insensitive substring too). A filter that already carries a wildcard is somebody
-/// writing a `lm m` pattern deliberately and is left exactly as written — which is also how an
+/// writing a pattern deliberately and is left exactly as written — which is also how an
 /// *anchored* match is asked for, since `nt` alone would otherwise be widened: `nt*` is names
 /// beginning with `nt`, `nt` is names containing it.
 pub(crate) fn module_pattern(filter: &str) -> String {
@@ -646,20 +553,22 @@ pub(crate) fn module_pattern(filter: &str) -> String {
     }
 }
 
-/// Whether a module name matches a `lm m` pattern: `*` for any run of characters, `?` for exactly
-/// one, case-insensitively.
+/// Whether a module name matches a `modules` filter: `*` for any run of characters, `?` for
+/// exactly one, everything else literal, case-insensitively.
 ///
-/// Written out rather than delegated to the engine because the **values** have to be filtered
-/// somewhere, and there is no DbgEng call that lists modules matching a pattern — only a command
-/// that prints them. So this is the second implementation of one grammar, and what keeps it
-/// honest is that it never sees anything outside the subset [`reject_unmatchable_filter`] admits:
-/// literal characters, `*` and `?`, all ASCII.
+/// **This is the whole definition.** There is no DbgEng call that lists modules matching a pattern
+/// — only `lm m`, which prints them — so a tool that answers with values has to match here; and
+/// since the listing text is rendered from those same values ([#120]), here is the only place a
+/// filter is applied. A pattern this does not implement is therefore not a disagreement between
+/// two matchers but simply a literal, which is what it now documents.
 ///
-/// **Case folding is ASCII**, which is exactly as far as the pattern can reach. Every letter in a
-/// pattern is ASCII by then, so the only comparison a wider fold would change is an ASCII pattern
-/// character against a non-ASCII one in a *name* — where both implementations have to decide
-/// whether `İ` is an `i`, and only the engine's answer is authoritative. A pattern of `?` matches
-/// such a character regardless, which is the reachable way to name it.
+/// **Case folds per character, by Unicode's lowercase mapping.** ASCII is the interesting part —
+/// module names are ASCII — but `é`/`É` folding too costs one comparison and removes the caveat
+/// that used to have to be explained (and enforced) to keep this in step with whatever fold
+/// Windows applied on the other side. Per character, so a name whose case changes its *length*
+/// (`ß`/`SS`) is not folded; `?` matches any single character, which is the way to reach one.
+///
+/// [#120]: https://github.com/glslang/windbg-mcp/issues/120
 pub(crate) fn matches_module_pattern(pattern: &str, name: &str) -> bool {
     let pattern: Vec<char> = pattern.chars().collect();
     let name: Vec<char> = name.chars().collect();
@@ -668,7 +577,7 @@ pub(crate) fn matches_module_pattern(pattern: &str, name: &str) -> bool {
     let (mut p, mut n) = (0, 0);
     let (mut star, mut resume) = (None, 0);
     while n < name.len() {
-        if p < pattern.len() && (pattern[p] == '?' || pattern[p].eq_ignore_ascii_case(&name[n])) {
+        if p < pattern.len() && (pattern[p] == '?' || folds_to_same(pattern[p], name[n])) {
             p += 1;
             n += 1;
         } else if p < pattern.len() && pattern[p] == '*' {
@@ -684,6 +593,14 @@ pub(crate) fn matches_module_pattern(pattern: &str, name: &str) -> bool {
         }
     }
     pattern[p..].iter().all(|c| *c == '*')
+}
+
+/// Whether two characters are the same letter in different cases.
+///
+/// The equality test first: it is the answer for every character that is not a letter, and for the
+/// overwhelmingly common case of a name and a pattern that already agree.
+fn folds_to_same(a: char, b: char) -> bool {
+    a == b || a.to_lowercase().eq(b.to_lowercase())
 }
 
 /// Parses the value from WinDbg `?` (evaluate-expression) output, e.g.
@@ -1366,16 +1283,15 @@ pub struct SessionArgs {
 pub struct ModulesArgs {
     /// List only the modules whose name matches this pattern, instead of the whole table —
     /// `"MessageManager"` for one driver's load base. Matched against the name symbols are
-    /// qualified by (`nt`, not `ntkrnlmp.exe`), case-insensitively. A plain name matches
-    /// anywhere in a module name, so `"nt"` also finds `ntfs` and `WinNT`. `*` and `?` are
-    /// wildcards and a pattern using them is matched as written, so `"nt*"` is the names that
-    /// *start* with `nt`, and `"*"` is every module. Those two are the whole grammar here: a
-    /// filter takes an ASCII name plus `*` and `?`, and anything else — WinDbg's other wildcards
-    /// (`[fd]`, `#`, `+`, `\`), a space, which `lm m` reads as the start of its own options, or a
-    /// character outside ASCII, whose case this tool and the engine may fold differently — is
-    /// refused rather than applied to the text and not to the values. `?` matches any single
-    /// character including a non-ASCII one; run `execute { "command": "lm m <pattern>" }` for the
-    /// full grammar.
+    /// qualified by (`nt`, not `ntkrnlmp.exe`), case-insensitively; an unloaded module has no such
+    /// name, so those are matched by their image (`nvhda64v.sys`). A plain name matches anywhere
+    /// in a module name, so `"nt"` also finds `ntfs` and `WinNT`. `*` (any run of characters) and
+    /// `?` (exactly one) are wildcards and a pattern using them is matched as written, so `"nt*"`
+    /// is the names that *start* with `nt`, and `"*"` is every module. Those two are the whole
+    /// grammar: **every other character is literal**, including the rest of WinDbg's wildcard
+    /// syntax (`[fd]`, `#`, `+`, `\`), so `"nt[fd]*"` matches a module actually called that and
+    /// otherwise nothing — run `execute { "command": "lm m <pattern>" }` for the engine's own
+    /// matcher.
     #[serde(default)]
     pub filter: Option<String>,
     /// Session handle returned by open_dump/open_trace/attach_*/launch. Optional: omit it
@@ -3268,13 +3184,14 @@ impl WindbgServer {
         engine_result(out)
     }
 
-    /// List modules, as `lm` prints them and as typed values beside it: each module's name, image
-    /// name, start/end addresses and **symbol state** — `deferred` (not fetched yet) is not the
-    /// same as `none` (this module has no symbols), which the `lm` text renders as an
-    /// easily-missed parenthesis. Pass `filter` to ask about one driver rather than reading a
+    /// List modules, as typed values and as a listing rendered from those same values: each
+    /// module's name, image name, start/end addresses and **symbol state** — `deferred` (not
+    /// fetched yet) is not the same as `none` (this module has no symbols), which `lm` renders as
+    /// an easily-missed parenthesis. Pass `filter` to ask about one driver rather than reading a
     /// table of two hundred; the answer still reports how many are loaded. The modules that have
     /// **unloaded** come back in their own `unloaded` list, narrowed by the same filter — that is
-    /// what can name an address in a driver that is no longer there.
+    /// what can name an address in a driver that is no longer there. For the engine's own listing
+    /// verbatim, `execute { "command": "lm" }`.
     #[rmcp::tool(
         annotations(
             title = "List modules",
@@ -3287,28 +3204,26 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<ModulesArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        // Three refusals, all of them before a session is chosen. The filter is interpolated into
-        // `lm m <pattern>`, so it is an operand like every other one this server builds a command
-        // around — and it is also *matched* here, which the third one is about.
-        if let Some(filter) = &args.filter {
-            if let Err(e) = reject_command_breakers("filter", filter, Quotes::Rejected) {
-                return typed_error(ErrorCategory::InvalidArgument, e, args.session_id);
-            }
+        // One refusal, where there used to be three. The other two were about a filter reaching
+        // `lm m <pattern>` as command text — a `;` that would end the command, and the grammar
+        // DbgEng would honour there but the values would not — and this tool builds no command
+        // any more ([#120]). A `;` in a filter is now a character no module name contains, which
+        // matches nothing and says so.
+        //
+        // [#120]: https://github.com/glslang/windbg-mcp/issues/120
+        if let Some(filter) = &args.filter
+            && filter.trim().is_empty()
+        {
             // Refused rather than ignored: a blank filter is a caller who meant to narrow and
             // sent nothing to narrow by, and answering with the whole table would look like the
             // filter had been applied and matched everything.
-            if filter.trim().is_empty() {
-                return typed_error(
-                    ErrorCategory::InvalidArgument,
-                    "`filter` is empty. Pass a module name (or a `lm m` pattern) to narrow the \
-                     listing, or omit `filter` for the whole table."
-                        .to_string(),
-                    args.session_id,
-                );
-            }
-            if let Err(e) = reject_unmatchable_filter(filter) {
-                return typed_error(ErrorCategory::InvalidArgument, e, args.session_id);
-            }
+            return typed_error(
+                ErrorCategory::InvalidArgument,
+                "`filter` is empty. Pass a module name (or a pattern using `*`/`?`) to narrow the \
+                 listing, or omit `filter` for the whole table."
+                    .to_string(),
+                args.session_id,
+            );
         }
         let out = self
             .run(
@@ -4547,10 +4462,10 @@ mod tests {
         assert_eq!(module_pattern("k?32"), "k?32");
     }
 
-    /// The match this server performs over the **values** has to be the match `lm m` performs over
-    /// the text, or one answer's two halves describe two different sets of modules.
+    /// The one match a `modules` listing performs — over the records both of its halves are built
+    /// from.
     #[test]
-    fn a_module_pattern_matches_the_way_lm_m_does() {
+    fn a_module_pattern_matches_names_by_wildcard_and_case() {
         // Case-insensitive, and `*` spans any run — including an empty one.
         assert!(matches_module_pattern("*nt*", "nt"));
         assert!(matches_module_pattern("*nt*", "ntfs"));
@@ -4573,82 +4488,65 @@ mod tests {
         assert!(!matches_module_pattern("*a*b", "xayb z"));
     }
 
-    /// The grammar this does **not** implement is refused rather than passed to `lm m`, which
-    /// does implement it.
+    /// The grammar WinDbg has and this does not is **literal**, not refused.
     ///
-    /// Each of these was measured against the sample dump before being refused: `lm m nt[fd]*` and
-    /// `lm m nt#f*` print `Ntfs`, `lm m ha+l` prints `hal`, and `lm m n\t*` prints `nt`, `Ntfs`
-    /// and `ntosext` — the backslash escaping the `t`. Matched literally, which is what the value
-    /// side would do, every one of them matches nothing, so the listing and its own count would
-    /// disagree.
+    /// Each of these was measured against the sample dump back when the text came from `lm m`:
+    /// `lm m nt[fd]*` and `lm m nt#f*` print `Ntfs`, `lm m ha+l` prints `hal`, and `lm m n\t*`
+    /// prints `nt`, `Ntfs` and `ntosext` — the backslash escaping the `t`. Every one of them was
+    /// refused, because honouring it in the text and not in the values would make one answer
+    /// describe two sets of modules. With one matcher there is nothing to disagree with: the
+    /// characters are matched as themselves, and a filter carrying them finds whatever is actually
+    /// named that — on a real target, nothing.
     #[test]
-    fn wildcards_this_server_cannot_honour_are_refused_not_passed_through() {
-        for filter in ["nt[fd]*", "nt[a-z]", "nt#f*", "ha+l", "]", r"n\t*", r"\"] {
-            let Err(why) = reject_unmatchable_filter(filter) else {
-                panic!("`{filter}` must not reach `lm m` unmatched by the values");
-            };
+    fn wildcards_this_server_does_not_implement_are_matched_literally() {
+        for filter in ["nt[fd]*", "nt#f*", "ha+l", r"n\t*", "nt v", "nvhdaé"] {
             assert!(
-                why.contains("execute"),
-                "the refusal has to name the way to run it anyway: {why}"
+                !matches_module_pattern(&module_pattern(filter), "Ntfs"),
+                "`{filter}` is not a wildcard pattern here, so it must not match `Ntfs`"
             );
         }
-        // The names and wildcards it does implement all pass — including the punctuation real
-        // image names carry, which is the half an allowlist could get wrong.
-        for filter in [
-            "nt",
-            "nt*",
-            "k?32",
-            "*",
-            "MessageManager",
-            "nvhda64v.sys",
-            "RzDev_0228",
-            "api-ms-win-core-file-l1-1-0.dll",
-            "  nt  ",
+        // Literal means literal in both directions: a module actually called `nt[fd]` matches the
+        // filter that spells it, which is the property that makes "everything else is a character"
+        // a rule rather than a hole.
+        assert!(matches_module_pattern(&module_pattern("nt[fd]"), "nt[fd]"));
+        assert!(matches_module_pattern(
+            &module_pattern("nt v"),
+            "my nt v drv"
+        ));
+
+        // The names real targets carry — punctuation and all — go through untouched.
+        for (filter, name) in [
+            ("nvhda64v.sys", "nvhda64v.sys"),
+            ("RzDev_0228", "RzDev_0228"),
+            (
+                "api-ms-win-core-file-l1-1-0.dll",
+                "api-ms-win-core-file-l1-1-0.dll",
+            ),
+            ("  nt  ", "nt"),
         ] {
             assert!(
-                reject_unmatchable_filter(filter).is_ok(),
-                "`{filter}` is what this tool documents"
+                matches_module_pattern(&module_pattern(filter), name),
+                "`{filter}` has to find `{name}`"
             );
         }
     }
 
-    /// A filter stays inside the range this server folds case in.
+    /// Case folds beyond ASCII, because with one matcher there is no second fold to stay in step
+    /// with.
     ///
-    /// The matcher compares with ASCII case rules; DbgEng folds by Windows'. Accepting `é` would
-    /// mean claiming those agree about it — so it is refused, with the workaround that does work.
+    /// This is what the ASCII-only refusal used to buy: DbgEng folded `é` by Windows' rules while
+    /// this side compared it case-sensitively, so a filter could match in the listing text and
+    /// miss in the values. Now the fold here is the only fold there is.
     #[test]
-    fn a_filter_outside_ascii_is_refused_because_the_two_folds_may_differ() {
-        for filter in ["nvhdaé", "Ä*", "日本語"] {
-            let Err(why) = reject_unmatchable_filter(filter) else {
-                panic!("`{filter}` is outside the range this server can fold");
-            };
-            assert!(
-                why.contains("ASCII") && why.contains('?'),
-                "the refusal has to name the wildcard that reaches it anyway: {why}"
-            );
-        }
-        // The wildcard that does: `?` is any single character, non-ASCII included.
-        assert!(reject_unmatchable_filter("nvhda?4v").is_ok());
+    fn a_filter_folds_case_outside_ascii_too() {
+        assert!(matches_module_pattern(&module_pattern("nvhdaé"), "NVHDAÉ"));
+        assert!(matches_module_pattern(&module_pattern("Ä"), "wä32"));
+        assert!(matches_module_pattern(&module_pattern("日本語"), "日本語"));
+        assert!(!matches_module_pattern(&module_pattern("nvhdaé"), "nvhdae"));
+
+        // `?` still matches any single character, non-ASCII included — the escape hatch for a
+        // name whose case does not fold per character at all.
         assert!(matches_module_pattern("nvhda?4v", "nvhdaé4v"));
-    }
-
-    /// A space in the filter is not a narrower pattern, it is a **different command**.
-    ///
-    /// `lm m` takes one operand and reads the next token as its own option: measured on the sample
-    /// dump, `lm m nt v` matches `nt` and prints lm's verbose listing. So the halves would not
-    /// merely disagree about which modules matched — the text would be answering something else.
-    #[test]
-    fn a_filter_with_a_space_in_it_is_refused_because_lm_would_read_an_option() {
-        for filter in ["nt v", "nt\tv", "nvhda 64v"] {
-            let Err(why) = reject_unmatchable_filter(filter) else {
-                panic!("`{filter}` must not reach `lm m`");
-            };
-            assert!(why.contains("single operand"), "{why}");
-        }
-        // Space *around* the filter is the caller's formatting, and `module_pattern` trims it —
-        // so this check has to trim identically or it refuses what the matcher would have taken.
-        assert!(reject_unmatchable_filter(" nt ").is_ok());
-        assert_eq!(module_pattern(" nt "), "*nt*");
     }
 
     /// `dx` reaches command execution through the data model, so it retires the handle too

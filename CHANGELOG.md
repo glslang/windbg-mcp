@@ -9,6 +9,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`modules` renders its listing from its own values, and no longer runs `lm`**
+  ([#120](https://github.com/glslang/windbg-mcp/issues/120)). It was the one tool whose text was
+  the *debugger's* rendering rather than a rendering of its own records: the text came from
+  `lm` / `lm m <pattern>` inside DbgEng and the values from `IDebugSymbols3` records matched in
+  this process, so one answer had two independent implementations of one filter. They disagreed in
+  five measured ways — character sets (`lm m nt[fd]*` prints `Ntfs`; matched literally, nothing),
+  the `\` escape (`lm m n\t*` prints `nt`, `Ntfs`, `ntosext`), whitespace (`lm m nt v` matches `nt`
+  and prints lm's *verbose* listing, a different command rather than a different filter), case
+  folding, and the unloaded tail `lm` appends to a filtered listing — and four of them were being
+  held shut by **refusing input**, which is a strange thing to have to tell a caller about a
+  listing tool.
+
+  The enumeration was already there (win-kexp's `modules()` and `unloaded_modules()`); only the
+  command had to go. The listing is now printed from those records, one table for the loaded
+  modules and one for the unloaded ones, each with the symbol state as a column of its own
+  (`deferred` is still not `none`) and addresses in this server's one representation — so `lm`'s
+  backtick form (``fffff803`89200000``) is gone from this tool's output. `execute { "command":
+  "lm" }` runs the engine's own listing verbatim for anyone who wants it.
+
+  Consequences worth having:
+
+  - **The filter is matched exactly once**, so its syntax is this server's to define rather than
+    something that has to track DbgEng's: a name plus `*` (any run of characters) and `?` (exactly
+    one), **every other character literal**. The three refusals that existed only to keep the two
+    matchers in step are gone — `nt[fd]*`, `n\t*`, `nt v`, `nté` and `nt; .detach` are now patterns
+    that match whatever is actually named that, which on a real target is nothing, answered as an
+    empty listing rather than as an error. (The `;` refusal went with them: the filter reaches no
+    command any more. The one refusal left is an *empty* filter, which is a caller who meant to
+    narrow and sent nothing to narrow by.) Case now folds beyond ASCII too, since there is no
+    second fold to stay in step with.
+  - **The unloaded half is rendered the same way**, from `unloaded[]`, under its own heading that
+    says what its addresses mean — where an image *was* — instead of a note explaining the
+    relationship between the values and a tail `lm` had printed.
+  - The smoke tier's claim gets stronger with them: it parses the listing's rows back as records
+    and asserts they are **exactly** the values, row for row, rather than "every value appears
+    somewhere in the text" — which could never have caught a row the text had and the values did
+    not, the direction every one of those five divergences ran in.
+
+  **Visible change for existing clients**: the listing text has a different shape (it is within
+  contract — the module docs have always said the text is a rendering that exists to be reworded,
+  and `tools_list`'s golden records input schemas only — but it is a change a client reading the
+  prose will see). The `symbols` **value** is unchanged. One thing deliberately not carried over:
+  `lm`'s symbol-*file* column (the loaded PDB's path), which is not in the typed record;
+  `execute { "command": "lmv m <module>" }` and `!lmi` still print it.
+
 - **An opener summarises its target instead of printing the module table**
   ([#105](https://github.com/glslang/windbg-mcp/issues/105)). `open_dump` answered with `lm` —
   the whole inventory, ~230 lines on a kernel dump, unprompted — when what a caller reads off an
@@ -35,47 +80,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`modules` takes a `filter`**, so "where is that driver loaded?" costs one row rather than the
   whole table ([#105](https://github.com/glslang/windbg-mcp/issues/105)). A plain name matches
-  anywhere in a module name — `{"filter": "MessageManager"}` — and `*`/`?` work as `lm m` reads
-  them, for the caller who means to anchor. The pattern is normalised **once** and used for both
-  halves of the answer: the text is `lm m <pattern>` and the values are this server's own match
-  over the engine's module list, so the rows and the count can never describe different sets. The
-  answer still carries `loaded`, the size of the whole inventory, and echoes the `filter` as
-  applied rather than as typed.
+  anywhere in a module name — `{"filter": "MessageManager"}` — and `*` (any run of characters) and
+  `?` (exactly one) are there for the caller who means to anchor: `nt*` is the names beginning with
+  `nt`, `nt` is the names containing it. Every other character is literal. The answer still carries
+  `loaded`, the size of the whole inventory, and echoes the `filter` as applied rather than as
+  typed.
 
-  A filter that matches nothing is an answer rather than an error, and says so in words — `lm m`
-  prints *nothing at all* in that case, which reads as a target with no modules — naming the
-  mistake callers actually make: the pattern matches the name symbols are qualified by (`nt`), not
-  the image file (`ntkrnlmp.exe`), which is measured: `lm m ntkrnlmp*` finds nothing on a dump
-  whose kernel image is `ntkrnlmp.exe`.
+  A filter that matches nothing is an answer rather than an error, and says so in words — a listing
+  with no rows in it otherwise reads as a target with no modules — naming the mistake callers
+  actually make: the pattern matches the name symbols are qualified by (`nt`), not the image file
+  (`ntkrnlmp.exe`), which is measured, since a dump whose kernel image is `ntkrnlmp.exe` has no
+  module of that name. An **empty** filter is the one thing refused: it is a caller who meant to
+  narrow and sent nothing to narrow by, and answering with the whole table would look like the
+  filter had been applied and matched everything.
 
   The modules that have **unloaded** come back in their own `unloaded` list, narrowed by the same
-  pattern ([win-kexp#101](https://github.com/glslang/win-kexp/pull/101)). `lm` appends them to a
-  filtered listing as readily as to a whole one, so values carrying only the loaded half described
-  a different set from the text above them: `{"filter": "nvhda"}` on this repo's sample matches no
-  loaded module and twenty-six unloaded `nvhda64v.sys` rows, and "nothing matched" printed over
-  twenty-six matching rows is a contradiction rather than an answer. Now it reports them as what
-  they are — *"no loaded module matches `*nvhda*`, but 26 that have since unloaded do"* — which is
-  also the only thing that can name an address in a driver that is no longer there. They are
-  matched and rendered by **image** name, since an unloaded module has no module name at all (there
-  is nothing left to qualify a symbol with), and each row carries the engine's own `unloaded` flag.
+  pattern ([win-kexp#101](https://github.com/glslang/win-kexp/pull/101)) — the only thing that can
+  name an address in a driver that is no longer there. `{"filter": "nvhda"}` on this repo's sample
+  matches no loaded module and twenty-six unloaded `nvhda64v.sys` rows, and is reported as what it
+  is: *"no loaded module matches `*nvhda*`, but 26 that have since unloaded do"*. They are matched
+  and rendered by **image** name, since an unloaded module has no module name at all (there is
+  nothing left to qualify a symbol with), and each row carries the engine's own `unloaded` flag.
 
-  Refused before a session is touched: an empty filter, one carrying a `;` that would end the
-  command it is interpolated into, and — by **allowlist** — anything that is not a name plus `*`
-  and `?`. WinDbg's wildcard grammar is bigger than it looks (`[fd]`/`[a-z]` character sets, `#`,
-  `+`, and `\` escaping any of them) and all of it is live: measured on this repo's sample,
-  `lm m nt[fd]*` and `lm m nt#f*` print `Ntfs`, `lm m ha+l` prints `hal`, and `lm m n\t*` prints
-  `nt`, `Ntfs` and `ntosext`. Matched literally — which is what the value side does — every one of
-  those finds nothing. A space is refused for a sharper reason: `lm m` takes a single operand and
-  reads the next token as *its own options*, so `lm m nt v` matches `nt` and prints the verbose
-  listing — the text answering a different question rather than a differently-filtered one. And a
-  character outside ASCII is refused for a reason about *this* side: the matcher folds case with
-  ASCII rules while DbgEng folds by Windows', so `é` in a pattern would be compared
-  case-sensitively here and case-insensitively there — `?` matches any single character, non-ASCII
-  included, which is how such a name stays reachable. An allowlist rather than a blocklist because
-  a blocklist is only as complete as the last reading of the grammar page, and this one has to
-  hold for the features nobody has noticed yet.
-  `execute { "command": "lm m <pattern>" }` runs the engine's own matcher for anyone who wants the
-  full grammar.
+  The filter was originally matched twice — once by this server for the values, once by `lm m` for
+  the text — which is what the wildcard grammar, whitespace and case-folding refusals in earlier
+  builds of this release were for. See the `modules` entry under **Changed** above: one rendering,
+  one matcher, and `execute { "command": "lm m <pattern>" }` for WinDbg's own.
 
 - **`walk_memory`: a structure traversal where an unreadable node is a row, not an end**
   ([#103](https://github.com/glslang/windbg-mcp/issues/103)). Walking a kernel list through

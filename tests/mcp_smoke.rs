@@ -1744,24 +1744,82 @@ fn an_open_summarises_the_target_instead_of_listing_its_modules() {
     assert!(report.contains("crash_triage"), "{report}");
 }
 
-/// `modules { "filter": … }` answers about one driver without the other two hundred rows — and
-/// its two halves describe the same set of modules.
+/// Every row a `modules` listing prints, as `(start, end, name)` read back out of its text.
 ///
-/// That last part is the claim worth a real engine. The text comes from `lm m <pattern>` and the
-/// values from this server's own match over the engine's module list, so they are two independent
-/// implementations of one pattern: every row the values report has to be a row the text shows.
+/// Read as records rather than matched as substrings, which is what the rendering being this
+/// server's own makes possible ([#120](https://github.com/glslang/windbg-mcp/issues/120)) — and
+/// what an earlier version of this tier got wrong, matching the wrong token in a table `lm` had
+/// laid out from the address width and the longest module name.
+///
+/// The two address columns are fixed width (`0x` and sixteen digits, this server's one
+/// representation), and the name is what precedes the last two-space gap on the line — so a name
+/// carrying a space, or a symbol state rendered as `other (0x2a)`, still parses.
+fn listed_rows(text: &str) -> Vec<(String, String, String)> {
+    text.lines()
+        .filter(|line| line.starts_with("0x"))
+        .map(|line| {
+            let (start, rest) = line.split_at(18);
+            let (end, rest) = rest.trim_start().split_at(18);
+            let name = rest.rsplit_once("  ").map_or(rest, |(name, _)| name);
+            (start.into(), end.into(), name.trim().into())
+        })
+        .collect()
+}
+
+/// The same rows as the values name them, in the order they are listed: the loaded half, then the
+/// unloaded one. A module that has unloaded has no module name at all, so it is named — in both
+/// channels — by its image.
+fn valued_rows(data: &Value) -> Vec<(String, String, String)> {
+    let field = |module: &Value, name: &str| module[name].as_str().unwrap_or_default().to_string();
+    ["modules", "unloaded"]
+        .iter()
+        .flat_map(|half| data[half].as_array().into_iter().flatten())
+        .map(|module| {
+            let name = match field(module, "name") {
+                name if name.is_empty() => field(module, "image_name"),
+                name => name,
+            };
+            (field(module, "start"), field(module, "end"), name)
+        })
+        .collect()
+}
+
+/// `modules { "filter": … }` answers about one driver without the other two hundred rows — and its
+/// two halves describe **exactly** the same set of modules.
+///
+/// That last part is the claim worth a real engine. Both halves are now rendered from one set of
+/// `IDebugSymbols3` records ([#120](https://github.com/glslang/windbg-mcp/issues/120)) rather than
+/// the text coming from `lm m <pattern>` and the values from a second implementation of its
+/// pattern grammar — so the assertion is equality of the two row-for-row, which is the direction
+/// the old "every value appears in the text" could not catch: a row the text had and the values
+/// did not. It is also what proves no `lm` ran: its own listing carries backtick addresses, a
+/// `Browse full module list` line and an `Unloaded modules:` tail, none of which parse as a row
+/// here.
 #[test]
 fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
     let Some(dump) = target_tier() else { return };
     let mut server = Server::started();
     let session_id = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
 
-    let all = server.tool_data("modules", json!({ "session_id": session_id }), TARGET_STEP);
+    let response = server.call_tool("modules", json!({ "session_id": session_id }), TARGET_STEP);
+    assert_no_error(&response, "modules");
+    let all = response["result"]["structuredContent"].clone();
     let loaded = all["loaded"].as_u64().unwrap_or_default();
     assert!(loaded > 20, "the table this narrows is small: {loaded}");
     assert!(
         all["filter"].is_null(),
         "an unfiltered listing reports no filter: {all}"
+    );
+    // The whole claim, on the whole table: the rows and the values are one set of records.
+    let text = text_of(&response["result"]);
+    assert_eq!(
+        listed_rows(&text),
+        valued_rows(&all),
+        "the listing and its values must name exactly the same modules:\n{text}"
+    );
+    assert!(
+        text.contains(&format!("{loaded} module(s) loaded")),
+        "the listing says how big it is:\n{text}"
     );
     // The other half of what `lm` prints, carried as values rather than described in prose.
     let every_unloaded = all["unloaded"]
@@ -1819,12 +1877,14 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
             name.to_ascii_lowercase().contains("nt"),
             "`{name}` does not contain the pattern it was matched by: {narrowed}"
         );
-        // The agreement that matters: `lm m` and this server's own match name the same modules.
-        assert!(
-            text.contains(name),
-            "the values report `{name}` but `lm m *nt*` did not print it:\n{text}"
-        );
     }
+    // The agreement that matters, on a narrowed listing too: not "every value appears somewhere in
+    // the text", but the same rows, in the same order, and no others.
+    assert_eq!(
+        listed_rows(&text),
+        valued_rows(&narrowed),
+        "a filtered listing and its values must name exactly the same modules:\n{text}"
+    );
     assert!(
         matched.iter().any(|module| module["name"] == "nt"),
         "the kernel itself matches `nt`: {narrowed}"
@@ -1846,8 +1906,8 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
         "`*` matches every module: {everything}"
     );
 
-    // A pattern that matches nothing is not an error, and must not be silence either: `lm m`
-    // prints nothing at all, which reads as a target with no modules.
+    // A pattern that matches nothing is not an error, and must not be silence either: a listing
+    // with no rows in it reads as a target with no modules.
     let response = server.call_tool(
         "modules",
         json!({ "session_id": session_id, "filter": "nosuchmoduleanywhere" }),
@@ -1879,11 +1939,15 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
         !text.contains("unloaded"),
         "and says nothing about unloaded modules when none matched either:\n{text}"
     );
+    assert!(
+        listed_rows(&text).is_empty(),
+        "no rows either — a heading over nothing is not an empty answer:\n{text}"
+    );
 
-    // A filter that matches **only unloaded** modules. `lm` appends those to a filtered listing as
-    // readily as to a whole one, so a listing that carried loaded modules alone would answer
-    // "nothing matched" directly above the rows that did. On the checked-in sample `nvhda` is
-    // exactly that case: no loaded module, and a pile of unloaded `nvhda64v.sys`.
+    // A filter that matches **only unloaded** modules. The engine tracks those in a second list,
+    // and a listing that carried the loaded one alone would answer "nothing matched" where there
+    // are rows to show. On the checked-in sample `nvhda` is exactly that case: no loaded module,
+    // and a pile of unloaded `nvhda64v.sys`.
     let response = server.call_tool(
         "modules",
         json!({ "session_id": session_id, "filter": "nvhda" }),
@@ -1910,12 +1974,18 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
             image.to_ascii_lowercase().contains("nvhda"),
             "`{image}` does not match the pattern it was matched by: {gone}"
         );
-        // The same agreement demanded of the loaded half: these rows are in the text above.
-        assert!(
-            text.contains(image),
-            "the values report `{image}` but `lm m *nvhda*` did not print it:\n{text}"
-        );
     }
+    // The same agreement demanded of the loaded half — and this is the half that could only ever
+    // be checked loosely while the rows were `lm`'s: these images are the rows, and the only rows.
+    assert_eq!(
+        listed_rows(&text),
+        valued_rows(&gone),
+        "the unloaded half's rows and values must match exactly:\n{text}"
+    );
+    assert!(
+        text.contains("Unloaded modules"),
+        "and stay distinguishable from the loaded half in the text as well:\n{text}"
+    );
     assert!(
         text.contains(&format!(
             "{} that have since **unloaded** do",
@@ -1924,46 +1994,57 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
         "matching only unloaded modules is a finding, not a miss:\n{text}"
     );
 
-    // The refusals, all before the engine is touched. Each of the last three is a filter this
-    // server cannot match the way `lm m` would, measured on this very engine:
-    //   `lm m nt[fd]*` prints `Ntfs`         — a character set, matched literally here
-    //   `lm m n\t*`    prints `nt`, `Ntfs`   — the escape making `t` literal
-    //   `lm m nt v`    prints `nt` verbosely — a space starts lm's own options, not more pattern
-    for (filter, why) in [
-        ("  ", "a filter that narrows by nothing"),
-        (
-            "nt; .detach",
-            "a filter that would end the command it is in",
-        ),
-        (
-            "nt[fd]*",
-            "a wildcard grammar this server does not implement",
-        ),
-        (r"n\t*", "the escape character, same grammar"),
-        ("nt v", "a space, which `lm m` reads as its own option"),
-        (
-            "nté",
-            "a character outside the range this server folds case in",
-        ),
-    ] {
-        let refused = server.tool_failure(
+    // The one refusal left. There used to be three more, all of them there to keep this server's
+    // matcher in step with the one inside `lm m`: a `;` that would have ended the command the
+    // filter was interpolated into, WinDbg's wider wildcard grammar (`nt[fd]*`, `n\t*`), a space
+    // — which `lm m` reads as the start of its own options — and a character outside the range
+    // the two folded case alike in. No command and no second matcher, so each of those is now
+    // just a character, matched as itself; the loop below is what says so.
+    let refused = server.tool_failure(
+        "modules",
+        json!({ "session_id": session_id, "filter": "  " }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        refused["error"]["category"], "invalid_argument",
+        "a filter that narrows by nothing is still an argument fault: {refused}"
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty()),
+        "a refusal has to say what is wrong: {refused}"
+    );
+
+    // What those refusals were protecting: each of these is a pattern with no module named by it,
+    // answered as an empty listing rather than as an error — and, crucially, as an empty listing
+    // in *both* channels. `nt; .detach` is the one to read twice: it reaches no command, and the
+    // session is still the dump it was afterwards.
+    for filter in ["nt; .detach", "nt[fd]*", r"n\t*", "nt v", "nté"] {
+        let response = server.call_tool(
             "modules",
             json!({ "session_id": session_id, "filter": filter }),
             TARGET_STEP,
         );
+        assert_no_error(&response, "modules with a literal-matching filter");
+        assert!(
+            !is_tool_error(&response),
+            "`{filter}` is a pattern that matches nothing, not a fault: {response}"
+        );
+        let data = response["result"]["structuredContent"].clone();
+        let text = text_of(&response["result"]);
         assert_eq!(
-            refused["error"]["category"], "invalid_argument",
-            "{why} (`{filter}`) must be refused as an argument fault: {refused}"
+            valued_rows(&data),
+            Vec::<(String, String, String)>::new(),
+            "no module on this target is named `{filter}`: {data}"
         );
         assert!(
-            refused["error"]["message"]
-                .as_str()
-                .is_some_and(|message| !message.is_empty()),
-            "a refusal has to say what is wrong: {refused}"
+            listed_rows(&text).is_empty() && text.contains("Nothing matches"),
+            "…and the text says the same, rather than showing rows the values do not have:\n{text}"
         );
     }
 
-    // The session is still the dump it was — the refused call reached nothing.
+    // The session is still the dump it was — nothing above reached a command.
     let after = server.tool_data("modules", json!({ "session_id": session_id }), TARGET_STEP);
     assert_eq!(after["loaded"].as_u64(), Some(loaded), "{after}");
 }
@@ -5143,17 +5224,27 @@ impl KernelScratch {
     }
 }
 
-/// `nt`'s load base, from the module list.
+/// `nt`'s load base, from the module list — read as a **value**, not off the listing.
+///
+/// This used to pick the first token of the line whose third token was `nt` and strip the backtick
+/// out of it, which was reading `lm`'s rendering back in. The listing is this server's own now
+/// ([#120](https://github.com/glslang/windbg-mcp/issues/120)) and the field was always there.
 fn nt_base(server: &mut Server, session: &str) -> u64 {
-    let modules = server.tool_text("modules", json!({ "session_id": session }), TARGET_STEP);
-    let start = modules
-        .lines()
-        .find(|line| line.split_whitespace().nth(2) == Some("nt"))
-        .and_then(|line| line.split_whitespace().next())
-        .unwrap_or_else(|| panic!("no `nt` in the module list:\n{modules}"))
-        .replace('`', "");
-    u64::from_str_radix(&start, 16)
-        .unwrap_or_else(|e| panic!("`{start}` is not a module base ({e}):\n{modules}"))
+    let modules = server.tool_data(
+        "modules",
+        json!({ "session_id": session, "filter": "nt" }),
+        TARGET_STEP,
+    );
+    let start = modules["modules"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|module| module["name"] == "nt")
+        .and_then(|module| module["start"].as_str())
+        .unwrap_or_else(|| panic!("no `nt` in the module list: {modules}"))
+        .to_string();
+    u64::from_str_radix(start.trim_start_matches("0x"), 16)
+        .unwrap_or_else(|e| panic!("`{start}` is not a module base ({e})"))
 }
 
 /// What the debugger makes of a MASM expression, or `None` if it would not say.
