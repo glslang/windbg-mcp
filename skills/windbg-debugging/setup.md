@@ -204,8 +204,8 @@ Symbols are never fetched from the target over the KD wire, so all of this is ab
 
 ### Allocator tools need private `nt` or `ntdll` types
 
-`pool_find_tag`, `pool_census`, `pool_chunk` and `pool_diagnostics` decode segment-heap
-internals (`_EX_POOL_HEAP_MANAGER_STATE`, the page-range descriptors, the VS and LFH
+`pool_find_tag`, `pool_census`, `pool_chunk` and `pool_diagnostics` decode the kernel pool's
+segment allocator internals (`_EX_POOL_HEAP_MANAGER_STATE`, the page-range descriptors, the VS and LFH
 headers). Exports are not enough. Without full type information every pool query fails up
 front with `missing allocator symbols (ExPoolState); run '.reload /f nt' and retry` — which
 is a symbol problem on this host, not a statement about the target's pool.

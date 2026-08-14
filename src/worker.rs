@@ -2377,6 +2377,19 @@ fn parse_pool_addr(text: &str) -> Result<u64, String> {
     parse_windbg_addr(text).map_or_else(|| parse_u64(text), Ok)
 }
 
+/// Parses a user-heap address using WinDbg's hexadecimal default radix.
+///
+/// User-mode pointers can be much shorter than kernel pointers, so every nonempty bare hex run
+/// is hexadecimal here. Prefixed and backtick-separated inputs keep the common parser's
+/// validation and error text.
+fn parse_heap_addr(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    if !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return u64::from_str_radix(text, 16).map_err(|_| format!("invalid address: {text:?}"));
+    }
+    parse_pool_addr(text)
+}
+
 /// The walk's own diagnostic categories, commonest first.
 ///
 /// The grouping is the walk's, not ours: it collapses floods as it goes and keeps a total per
@@ -2696,16 +2709,42 @@ fn heap_failure(error: heap_query::HeapQueryError) -> Failed {
 }
 
 fn heap_walk_text(walk: &heap_query::HeapWalkReport) -> String {
+    let coverage = structured::AllocatorCoverage::from(walk.coverage);
     format!(
-        "coverage={:?}; {} chunks ({} allocated); {} diagnostics; {} unreadable gaps; {} \
+        "coverage={}; {} chunks ({} allocated); {} diagnostics; {} unreadable gaps; {} \
          refused headers",
-        walk.coverage,
+        coverage.as_str(),
         walk.total_chunks,
         walk.allocated_chunks,
         walk.diagnostic_count,
         walk.unreadable_gaps,
         walk.refused_headers
     )
+}
+
+fn heap_root_matches(candidate: u64, selected: Option<u64>) -> bool {
+    selected.is_none_or(|selected| candidate == selected)
+}
+
+fn heap_allocation_matches(
+    allocation: &HeapAllocation,
+    heap: Option<u64>,
+    backend: Option<HeapBackend>,
+    state: HeapState,
+    min_capacity: Option<u64>,
+    max_capacity: Option<u64>,
+) -> bool {
+    heap_root_matches(allocation.heap, heap)
+        && backend.is_none_or(|backend| allocation.backend == backend)
+        && allocation.state == state
+        && min_capacity.is_none_or(|minimum| allocation.capacity >= minimum)
+        && max_capacity.is_none_or(|maximum| allocation.capacity <= maximum)
+}
+
+fn heap_diagnostic_selected(text: &str, heap: Option<u64>, filter: Option<&str>) -> bool {
+    let text = text.to_ascii_lowercase();
+    heap.is_none_or(|heap| text.contains(&format!("{heap:#x}")))
+        && filter.is_none_or(|filter| text.contains(&filter.to_ascii_lowercase()))
 }
 
 fn heap_row(allocation: &HeapAllocation) -> String {
@@ -2778,7 +2817,7 @@ fn heap(e: &DebugEngine, args: HeapOp, within: Duration) -> Result<Output, Faile
             }
             let heap = heap
                 .as_deref()
-                .map(parse_pool_addr)
+                .map(parse_heap_addr)
                 .transpose()
                 .map_err(|error| {
                     Failed::categorised(structured::ErrorCategory::InvalidArgument, error)
@@ -2799,14 +2838,15 @@ fn heap(e: &DebugEngine, args: HeapOp, within: Duration) -> Result<Output, Faile
             let matches: Vec<_> = answer
                 .found
                 .iter()
-                .filter(|allocation| heap.is_none_or(|heap| allocation.heap == heap))
-                .filter(|allocation| backend.is_none_or(|backend| allocation.backend == backend))
-                .filter(|allocation| allocation.state == state)
                 .filter(|allocation| {
-                    min_capacity.is_none_or(|minimum| allocation.capacity >= minimum)
-                })
-                .filter(|allocation| {
-                    max_capacity.is_none_or(|maximum| allocation.capacity <= maximum)
+                    heap_allocation_matches(
+                        allocation,
+                        heap,
+                        backend,
+                        state,
+                        min_capacity,
+                        max_capacity,
+                    )
                 })
                 .collect();
             let mut text = format!(
@@ -2834,7 +2874,7 @@ fn heap(e: &DebugEngine, args: HeapOp, within: Duration) -> Result<Output, Faile
             ))
         }
         HeapOp::Chunk { address, refresh } => {
-            let address = parse_pool_addr(&address).map_err(|error| {
+            let address = parse_heap_addr(&address).map_err(|error| {
                 Failed::categorised(structured::ErrorCategory::InvalidArgument, error)
             })?;
             let answer = heap_query::chunk_at(e, address, walk(refresh)).map_err(heap_failure)?;
@@ -2887,7 +2927,7 @@ fn heap(e: &DebugEngine, args: HeapOp, within: Duration) -> Result<Output, Faile
         } => {
             let heap = heap
                 .as_deref()
-                .map(parse_pool_addr)
+                .map(parse_heap_addr)
                 .transpose()
                 .map_err(|error| {
                     Failed::categorised(structured::ErrorCategory::InvalidArgument, error)
@@ -2896,7 +2936,7 @@ fn heap(e: &DebugEngine, args: HeapOp, within: Duration) -> Result<Output, Faile
             let rows: Vec<_> = answer
                 .found
                 .iter()
-                .filter(|row| heap.is_none_or(|heap| row.heap == heap))
+                .filter(|row| heap_root_matches(row.heap, heap))
                 .collect();
             let mut text = format!(
                 "{} census group(s), heaviest first; {}\n\n",
@@ -2944,34 +2984,25 @@ fn heap(e: &DebugEngine, args: HeapOp, within: Duration) -> Result<Output, Faile
         } => {
             let heap = heap
                 .as_deref()
-                .map(parse_pool_addr)
+                .map(parse_heap_addr)
                 .transpose()
                 .map_err(|error| {
                     Failed::categorised(structured::ErrorCategory::InvalidArgument, error)
                 })?;
             let answer = heap_query::diagnostics(e, walk(refresh)).map_err(heap_failure)?;
-            let heap_needle = heap.map(|heap| format!("{heap:#x}"));
-            let filter_needle = filter.as_ref().map(|filter| filter.to_ascii_lowercase());
-            let selected = |text: &str| {
-                let text = text.to_ascii_lowercase();
-                heap_needle
-                    .as_ref()
-                    .is_none_or(|needle| text.contains(needle))
-                    && filter_needle
-                        .as_ref()
-                        .is_none_or(|needle| text.contains(needle))
-            };
             let categories: Vec<_> = answer
                 .found
                 .categories
                 .iter()
-                .filter(|category| selected(&category.shape))
+                .filter(|category| {
+                    heap_diagnostic_selected(&category.shape, heap, filter.as_deref())
+                })
                 .collect();
             let examples: Vec<_> = answer
                 .found
                 .examples
                 .iter()
-                .filter(|example| selected(example))
+                .filter(|example| heap_diagnostic_selected(example, heap, filter.as_deref()))
                 .collect();
             let (example_rows, category_rows) =
                 split_row_budget(limit, examples.len(), categories.len());
@@ -3970,6 +4001,114 @@ mod tests {
     fn pool_addr_rejects_nonsense() {
         assert!(parse_pool_addr("not-an-address").is_err());
         assert!(parse_pool_addr("").is_err());
+    }
+
+    #[test]
+    fn heap_addr_reads_a_short_bare_run_as_hex() {
+        assert_eq!(parse_heap_addr("10000"), Ok(0x1_0000));
+        assert_eq!(parse_heap_addr("ffff"), Ok(0xffff));
+        assert_eq!(parse_heap_addr("0x10000"), Ok(0x1_0000));
+    }
+
+    fn heap_filter_fixture() -> HeapAllocation {
+        HeapAllocation {
+            heap: 0x10000,
+            backend: HeapBackend::Vs,
+            state: HeapState::Allocated,
+            header_address: 0x20000,
+            user_address: 0x20010,
+            capacity: 0x80,
+            requested_size: None,
+            subsegment: Some(0x30000),
+            size_class: 0x80,
+        }
+    }
+
+    #[test]
+    fn heap_filter_rejects_capacity_below_minimum() {
+        let allocation = heap_filter_fixture();
+        assert!(!heap_allocation_matches(
+            &allocation,
+            None,
+            None,
+            HeapState::Allocated,
+            Some(0x81),
+            None,
+        ));
+        assert!(heap_allocation_matches(
+            &allocation,
+            None,
+            None,
+            HeapState::Allocated,
+            Some(0x80),
+            None,
+        ));
+    }
+
+    #[test]
+    fn heap_filter_rejects_capacity_above_maximum() {
+        let allocation = heap_filter_fixture();
+        assert!(!heap_allocation_matches(
+            &allocation,
+            None,
+            None,
+            HeapState::Allocated,
+            None,
+            Some(0x7f),
+        ));
+        assert!(heap_allocation_matches(
+            &allocation,
+            None,
+            None,
+            HeapState::Allocated,
+            None,
+            Some(0x80),
+        ));
+    }
+
+    #[test]
+    fn heap_filter_requires_the_selected_allocator_identity() {
+        let allocation = heap_filter_fixture();
+        assert!(!heap_allocation_matches(
+            &allocation,
+            Some(0x20000),
+            Some(HeapBackend::Vs),
+            HeapState::Allocated,
+            None,
+            None,
+        ));
+        assert!(!heap_allocation_matches(
+            &allocation,
+            Some(0x10000),
+            Some(HeapBackend::Lfh),
+            HeapState::Allocated,
+            None,
+            None,
+        ));
+        assert!(heap_allocation_matches(
+            &allocation,
+            Some(0x10000),
+            Some(HeapBackend::Vs),
+            HeapState::Allocated,
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn heap_diagnostic_filter_uses_the_hex_heap_needle() {
+        let example = "cannot discover heap 0x10000: VS free tree unreadable";
+        assert!(heap_diagnostic_selected(
+            example,
+            Some(0x10000),
+            Some("free TREE")
+        ));
+        assert!(!heap_diagnostic_selected(example, Some(0x20000), None));
+        assert!(!heap_diagnostic_selected(
+            example,
+            Some(0x10000),
+            Some("LFH")
+        ));
     }
 
     // ---- the protocol channel this worker was handed -------------------------------

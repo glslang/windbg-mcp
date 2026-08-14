@@ -708,9 +708,37 @@ fn capabilities_advertise_only_what_is_implemented() {
 /// Describes a schema node tightly enough that a dialect or codegen change shows up, without
 /// churning on prose edits.
 fn describe_type(node: &Value) -> String {
-    if let Some(variants) = node.get("enum").and_then(|e| e.as_array()) {
+    describe_type_with_defs(node, None)
+}
+
+fn enum_values<'a>(
+    node: &'a Value,
+    definitions: Option<&'a serde_json::Map<String, Value>>,
+) -> Option<&'a Vec<Value>> {
+    node.get("enum").and_then(Value::as_array).or_else(|| {
+        let name = node.get("$ref")?.as_str()?.strip_prefix("#/$defs/")?;
+        definitions?.get(name)?.get("enum")?.as_array()
+    })
+}
+
+fn describe_type_with_defs(
+    node: &Value,
+    definitions: Option<&serde_json::Map<String, Value>>,
+) -> String {
+    if let Some(variants) = enum_values(node, definitions) {
         let names: Vec<String> = variants.iter().map(|v| v.to_string()).collect();
         return format!("enum[{}]", names.join("|"));
+    }
+    if let Some(branches) = node.get("anyOf").and_then(Value::as_array)
+        && branches
+            .iter()
+            .any(|branch| enum_values(branch, definitions).is_some())
+    {
+        return branches
+            .iter()
+            .map(|branch| describe_type_with_defs(branch, definitions))
+            .collect::<Vec<_>>()
+            .join("|");
     }
     if let Some(reference) = node.get("$ref").and_then(|r| r.as_str()) {
         return format!("ref({reference})");
@@ -725,7 +753,9 @@ fn describe_type(node: &Value) -> String {
         _ => "any".to_string(),
     };
     let base = match node.get("items") {
-        Some(items) if base.starts_with("array") => format!("array<{}>", describe_type(items)),
+        Some(items) if base.starts_with("array") => {
+            format!("array<{}>", describe_type_with_defs(items, definitions))
+        }
         _ => base,
     };
     match node.get("format").and_then(|f| f.as_str()) {
@@ -734,15 +764,49 @@ fn describe_type(node: &Value) -> String {
     }
 }
 
+#[test]
+fn nullable_enum_keeps_its_allowed_values_in_the_golden_digest() {
+    let schema = json!({
+        "anyOf": [
+            { "type": "string", "enum": ["lfh", "vs", "segment", "large"] },
+            { "type": "null" }
+        ]
+    });
+    assert_eq!(
+        describe_type(&schema),
+        "enum[\"lfh\"|\"vs\"|\"segment\"|\"large\"]|null"
+    );
+
+    let definitions = json!({
+        "HeapBackendArg": {
+            "type": "string",
+            "enum": ["lfh", "vs", "segment", "large"]
+        }
+    });
+    let referenced = json!({
+        "anyOf": [
+            { "$ref": "#/$defs/HeapBackendArg" },
+            { "type": "null" }
+        ]
+    });
+    assert_eq!(
+        describe_type_with_defs(&referenced, definitions.as_object()),
+        "enum[\"lfh\"|\"vs\"|\"segment\"|\"large\"]|null"
+    );
+}
+
 /// The structural contract of one tool: everything a client binds against, minus the prose.
 fn digest_tool(tool: &Value) -> Value {
     let schema = &tool["inputSchema"];
+    let definitions = schema["$defs"].as_object();
     let mut params: Vec<String> = schema["properties"]
         .as_object()
         .map(|props| {
             props
                 .iter()
-                .map(|(name, node)| format!("{name}: {}", describe_type(node)))
+                .map(|(name, node)| {
+                    format!("{name}: {}", describe_type_with_defs(node, definitions))
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -1225,6 +1289,25 @@ fn a_malformed_walk_is_refused_before_a_session_is_needed() {
         text_of(&too_many["result"]).contains("at most"),
         "the refusal must name the cap, got:\n{}",
         text_of(&too_many["result"])
+    );
+}
+
+#[test]
+fn an_inverted_heap_capacity_range_is_refused_before_a_session_is_needed() {
+    let mut server = Server::started();
+    let response = server.call_tool(
+        "heap_allocations",
+        json!({ "min_capacity": 0x2000, "max_capacity": 0x1000 }),
+        STEP,
+    );
+    assert!(is_tool_error(&response), "{response}");
+    assert_eq!(
+        response["result"]["structuredContent"]["error"]["category"], "invalid_argument",
+        "the malformed range must be rejected before session routing: {response}"
+    );
+    assert!(
+        text_of(&response["result"]).contains("min_capacity cannot exceed max_capacity"),
+        "{response}"
     );
 }
 

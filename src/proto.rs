@@ -332,23 +332,23 @@ pub enum PoolOp {
     },
 }
 
-impl PoolOp {
-    /// Most rows or lines a pool answer will render in one response.
-    ///
-    /// The worker builds the whole reply as a single `String` before it crosses the pipe, so an
-    /// unbounded `limit` is a request to allocate a snapshot-sized buffer — hundreds of thousands
-    /// of chunks, or ~19k diagnostic lines on an idle machine. Clamping costs a caller nothing
-    /// they can act on; a worker killed mid-session costs them the session.
-    pub const MAX_ROWS: u32 = 2000;
+/// Most rows or lines an allocator answer will render in one response.
+///
+/// The worker builds the whole reply as a single `String` before it crosses the pipe, so an
+/// unbounded `limit` is a request to allocate a snapshot-sized buffer — hundreds of thousands
+/// of chunks, or ~19k diagnostic lines on an idle machine. Clamping costs a caller nothing
+/// they can act on; a worker killed mid-session costs them the session.
+pub const MAX_ROWS: u32 = 2000;
 
+fn clamp_rows(limit: Option<u32>, default: u32) -> usize {
+    limit.unwrap_or(default).min(MAX_ROWS) as usize
+}
+
+impl PoolOp {
     /// Rows each question prints when the caller names no `limit`.
     const FIND_TAG_ROWS: u32 = 64;
     const CENSUS_ROWS: u32 = 40;
     const DIAGNOSTIC_LINES: u32 = 60;
-
-    fn rows(limit: Option<u32>, default: u32) -> usize {
-        limit.unwrap_or(default).min(Self::MAX_ROWS) as usize
-    }
 
     /// Every allocated chunk carrying `tag`.
     pub fn find_tag(
@@ -361,7 +361,7 @@ impl PoolOp {
             tag,
             paged,
             refresh: refresh.unwrap_or(false),
-            limit: Self::rows(limit, Self::FIND_TAG_ROWS),
+            limit: clamp_rows(limit, Self::FIND_TAG_ROWS),
         }
     }
 
@@ -377,7 +377,7 @@ impl PoolOp {
     pub fn census(refresh: Option<bool>, limit: Option<u32>) -> Self {
         Self::Census {
             refresh: refresh.unwrap_or(false),
-            limit: Self::rows(limit, Self::CENSUS_ROWS),
+            limit: clamp_rows(limit, Self::CENSUS_ROWS),
         }
     }
 
@@ -386,7 +386,7 @@ impl PoolOp {
         Self::Diagnostics {
             filter,
             refresh: refresh.unwrap_or(false),
-            limit: Self::rows(limit, Self::DIAGNOSTIC_LINES),
+            limit: clamp_rows(limit, Self::DIAGNOSTIC_LINES),
         }
     }
 
@@ -456,14 +456,9 @@ pub enum HeapOp {
 }
 
 impl HeapOp {
-    pub const MAX_ROWS: u32 = 2000;
     const ALLOCATION_ROWS: u32 = 64;
     const CENSUS_ROWS: u32 = 40;
     const DIAGNOSTIC_ROWS: u32 = 60;
-
-    fn rows(limit: Option<u32>, default: u32) -> usize {
-        limit.unwrap_or(default).min(Self::MAX_ROWS) as usize
-    }
 
     pub fn list(refresh: Option<bool>) -> Self {
         Self::List {
@@ -488,7 +483,7 @@ impl HeapOp {
             min_capacity,
             max_capacity,
             refresh: refresh.unwrap_or(false),
-            limit: Self::rows(limit, Self::ALLOCATION_ROWS),
+            limit: clamp_rows(limit, Self::ALLOCATION_ROWS),
         }
     }
 
@@ -503,7 +498,7 @@ impl HeapOp {
         Self::Census {
             heap,
             refresh: refresh.unwrap_or(false),
-            limit: Self::rows(limit, Self::CENSUS_ROWS),
+            limit: clamp_rows(limit, Self::CENSUS_ROWS),
         }
     }
 
@@ -517,7 +512,7 @@ impl HeapOp {
             heap,
             filter,
             refresh: refresh.unwrap_or(false),
-            limit: Self::rows(limit, Self::DIAGNOSTIC_ROWS),
+            limit: clamp_rows(limit, Self::DIAGNOSTIC_ROWS),
         }
     }
 
@@ -616,7 +611,7 @@ mod tests {
             unreachable!()
         };
         assert!(matches!(state, HeapStateFilter::Allocated));
-        assert_eq!(limit, HeapOp::MAX_ROWS as usize);
+        assert_eq!(limit, MAX_ROWS as usize);
 
         let HeapOp::Census { limit, .. } = HeapOp::census(None, None, None) else {
             unreachable!()

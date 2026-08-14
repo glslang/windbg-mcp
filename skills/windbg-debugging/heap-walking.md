@@ -44,7 +44,8 @@ Start with `heap_list`. It lists every PEB heap root and separates:
 Then use:
 
 - `heap_allocations` for capped filters by heap, backend (`lfh`, `vs`, `segment`, `large`), state,
-  and capacity;
+  and capacity. It defaults to `state: allocated`; when investigating freed memory, pass
+  `state: reusable_free` or `state: cached_free` explicitly;
 - `heap_chunk` for the allocation containing an address, its offset, and same-heap neighbours;
 - `heap_census` for heaviest heap/backend/state/size-class groups; and
 - `heap_diagnostics` for categories and examples, optionally scoped to one heap.

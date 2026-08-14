@@ -529,7 +529,10 @@ before a release, or when a change touches the relevant path. Drivers live in
   backend, writes a temporary `/ma` full-memory dump, reopens it, and repeats the checks. Set
   `WIN_KEXP_USER_HEAP_SYMBOLS` (or `_NT_SYMBOL_PATH`) when the default Microsoft symbol-store path
   is not appropriate. Missing private types are a failed prerequisite; export symbols must not be
-  accepted as a layout. The helper removes its temporary dump after a successful run.
+  accepted as a layout. The dump is written to the operating system temporary directory as
+  `win-kexp-user-heap-<pid>.dmp`, outside either checkout. The helper removes it after a successful
+  run; after a failed run, delete that file from the temporary directory manually and never add it
+  to version control.
 - **Ctrl+C teardown** — `examples/ctrl_c_teardown.ps1`: a console Ctrl+C must leave a worker time
   to release its target, not kill it where it stands. Unattended, and it needs no target beyond the
   sample dump — but it is here rather than in `cargo test` because Ctrl+C cannot be aimed: the

@@ -392,14 +392,14 @@
         "dialect": "https://json-schema.org/draft/2020-12/schema"
       },
       "params": [
-        "backend: any",
+        "backend: enum[\"lfh\"|\"vs\"|\"segment\"|\"large\"]|null",
         "heap: string|null",
         "limit: integer|null/uint32",
         "max_capacity: integer|null/uint64",
         "min_capacity: integer|null/uint64",
         "refresh: boolean|null",
         "session_id: string|null",
-        "state: any"
+        "state: enum[\"allocated\"|\"reusable_free\"|\"cached_free\"|\"unreadable\"]|null"
       ],
       "required": [],
       "title": "List Segment Heap allocations"
