@@ -883,7 +883,7 @@ dependencies = [
 [[package]]
 name = "win-kexp"
 version = "0.1.0"
-source = "git+https://github.com/glslang/win-kexp?rev=37dc18ef3a55f52a7c7495705fa686e593f934d5#37dc18ef3a55f52a7c7495705fa686e593f934d5"
+source = "git+https://github.com/glslang/win-kexp?rev=239b4e4b1f1afd92e96da6a7101ada8a79c80164#239b4e4b1f1afd92e96da6a7101ada8a79c80164"
 dependencies = [
  "byte-strings",
  "goblin",
