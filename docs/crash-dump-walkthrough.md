@@ -30,7 +30,7 @@ Kernel base = 0xfffff803`89200000 PsLoadedModuleList = 0xfffff803`8a0f52d0
 Debug session time: Thu May 21 12:44:54.667 2026 (UTC + 1:00)
 
 Bug check 0x9f DRIVER_POWER_STATE_FAILURE, parameters 0x0000000000000003 …
-227 module(s) loaded, nt at 0xfffff80389200000; `modules` lists the table.
+227 module(s) loaded, `nt` at 0xfffff80389200000; `modules` lists the table and `modules { "filter": "<name>" }` answers for one.
 ```
 
 The same fields come back as `structuredContent.summary`. The **table** is `modules`, which is
