@@ -781,10 +781,14 @@ pub struct WalkGaps {
     /// walk that gave up at the first stall would have reported as nothing at all. Large next to
     /// `skipped_bytes` means the stalls were isolated pages in otherwise healthy regions.
     pub recovered_bytes: u64,
-    /// Chunk headers a backend decoder refused. A refusal costs more than its own chunk —
-    /// every header after it in that extent is then decoded at a guessed offset — so a large
-    /// number here means the chunks reported from those extents are worth less than their
-    /// count suggests.
+    /// Chunk headers a backend decoder refused.
+    ///
+    /// **Not a count of chunks lost.** A refusal resynchronises sixteen bytes along and tries
+    /// again, so one lost sync bills a refusal per sixteen bytes until it recovers: a live
+    /// 26100 walk reported 106,516 of these from 542 affected extents. Read it as the size of
+    /// the disruption — the chunks reported from those extents were decoded at guessed offsets
+    /// and are worth less than their count suggests — rather than as a population of bad
+    /// chunks, which it overstates by orders of magnitude.
     pub refused_chunks: u64,
 }
 
