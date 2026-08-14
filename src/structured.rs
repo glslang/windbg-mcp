@@ -880,6 +880,12 @@ pub struct WalkInfo {
 pub struct WalkGaps {
     /// Pages the debugger's valid-region query could not advance over, stepped over one at a
     /// time rather than abandoning the rest of the region behind them.
+    ///
+    /// Narrower than it reads, and zero on a healthy walk. A query that reports finding *nothing*
+    /// in the span it was asked about has answered for every byte through to the end of it, so
+    /// that ends the region rather than being stepped over, and is not counted here. What remains
+    /// is the query that reports a region and cannot size it — which has said nothing about what
+    /// lies behind it, and is the case stepping exists for.
     pub stalled_pages: u64,
     /// Bytes those steps filed as unreadable.
     pub skipped_bytes: u64,
@@ -907,7 +913,7 @@ pub struct WalkGaps {
 }
 
 impl WalkGaps {
-    /// `None` when the walk met none of this, so the ordinary answer does not carry four zeroes.
+    /// `None` when the walk met none of this, so the ordinary answer does not carry five zeroes.
     pub(crate) fn of(report: &win_kexp::pool::query::PoolSnapshotReport) -> Option<Self> {
         Self::from_measurements(report.stalls, report.refused_chunks, report.unplaced_bytes)
     }
@@ -1875,7 +1881,7 @@ mod tests {
             unplaced_bytes: 0,
         };
 
-        // The ordinary walk meets none of this, and says so by saying nothing: four zeroes on
+        // The ordinary walk meets none of this, and says so by saying nothing: five zeroes on
         // every pool answer would be noise on the answers that are fine.
         assert_eq!(
             WalkGaps::of(&report(win_kexp::pool::WalkStalls::default(), 0)),
