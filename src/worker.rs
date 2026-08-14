@@ -2748,9 +2748,39 @@ fn heap_allocation_matches(
         && max_capacity.is_none_or(|maximum| allocation.capacity <= maximum)
 }
 
-fn heap_diagnostic_matches_filter(text: &str, filter: Option<&str>) -> bool {
-    let text = text.to_ascii_lowercase();
-    filter.is_none_or(|filter| text.contains(&filter.to_ascii_lowercase()))
+fn query_heap_diagnostics<T, E>(
+    heap: Option<u64>,
+    all: impl FnOnce() -> Result<T, E>,
+    scoped: impl FnOnce(u64) -> Result<T, E>,
+) -> Result<T, E> {
+    match heap {
+        Some(heap) => scoped(heap),
+        None => all(),
+    }
+}
+
+struct HeapDiagnosticSelection<'a> {
+    categories: Vec<&'a DiagnosticShape>,
+    examples: Vec<&'a String>,
+}
+
+fn select_heap_diagnostics<'a>(
+    report: &'a heap_query::HeapDiagnosticReport,
+    filter: Option<&str>,
+) -> HeapDiagnosticSelection<'a> {
+    let needle = filter.map(str::to_ascii_lowercase);
+    HeapDiagnosticSelection {
+        categories: report
+            .categories
+            .iter()
+            .filter(|category| matches_filter(&category.shape, needle.as_deref()))
+            .collect(),
+        examples: report
+            .examples
+            .iter()
+            .filter(|example| matches_filter(example, needle.as_deref()))
+            .collect(),
+    }
 }
 
 fn heap_row(allocation: &HeapAllocation) -> String {
@@ -2998,25 +3028,15 @@ fn heap(e: &DebugEngine, args: HeapOp, within: Duration) -> Result<Output, Faile
             // Scope before win-kexp aggregates diagnostic shapes: those shapes deliberately
             // generalise addresses, so filtering them for the heap address afterwards loses the
             // category totals and leaves only incidental examples.
-            let answer = match heap {
-                Some(heap) => heap_query::diagnostics_for_heap(e, heap, walk(refresh)),
-                None => heap_query::diagnostics(e, walk(refresh)),
-            }
+            let answer = query_heap_diagnostics(
+                heap,
+                || heap_query::diagnostics(e, walk(refresh)),
+                |heap| heap_query::diagnostics_for_heap(e, heap, walk(refresh)),
+            )
             .map_err(heap_failure)?;
-            let categories: Vec<_> = answer
-                .found
-                .categories
-                .iter()
-                .filter(|category| {
-                    heap_diagnostic_matches_filter(&category.shape, filter.as_deref())
-                })
-                .collect();
-            let examples: Vec<_> = answer
-                .found
-                .examples
-                .iter()
-                .filter(|example| heap_diagnostic_matches_filter(example, filter.as_deref()))
-                .collect();
+            let selected = select_heap_diagnostics(&answer.found, filter.as_deref());
+            let categories = selected.categories;
+            let examples = selected.examples;
             let (example_rows, category_rows) =
                 split_row_budget(limit, examples.len(), categories.len());
             let mut text = format!(
@@ -4109,11 +4129,53 @@ mod tests {
     }
 
     #[test]
-    fn heap_diagnostic_filter_matches_generalised_categories_case_insensitively() {
-        let category = "unreadable VS free tree node <address>: sparse memory";
-        assert!(heap_diagnostic_matches_filter(category, None));
-        assert!(heap_diagnostic_matches_filter(category, Some("free TREE")));
-        assert!(!heap_diagnostic_matches_filter(category, Some("LFH")));
+    fn heap_diagnostic_scope_and_filter_preserve_scoped_totals_and_examples() {
+        let (routed_heap, report) = query_heap_diagnostics(
+            Some(0x20000),
+            || {
+                Ok::<_, ()>((
+                    None,
+                    heap_query::HeapDiagnosticReport {
+                        categories: Vec::new(),
+                        examples: Vec::new(),
+                    },
+                ))
+            },
+            |heap| {
+                Ok::<_, ()>((
+                    Some(heap),
+                    heap_query::HeapDiagnosticReport {
+                        categories: vec![
+                            DiagnosticShape {
+                                shape: "unreadable VS free tree node <address>: sparse memory"
+                                    .into(),
+                                total: 17,
+                            },
+                            DiagnosticShape {
+                                shape: "invalid LFH bitmap at <address>".into(),
+                                total: 3,
+                            },
+                        ],
+                        examples: vec![
+                            "unreadable VS free tree node 0x20100: sparse memory".into(),
+                            "invalid LFH bitmap at 0x20200".into(),
+                        ],
+                    },
+                ))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(routed_heap, Some(0x20000));
+        let selected = select_heap_diagnostics(&report, Some("free TREE"));
+        assert_eq!(selected.categories.len(), 1);
+        assert_eq!(selected.categories[0].total, 17);
+        assert_eq!(selected.examples.len(), 1);
+        assert!(selected.examples[0].contains("0x20100"));
+
+        let unfiltered = select_heap_diagnostics(&report, None);
+        assert_eq!(unfiltered.categories.len(), 2);
+        assert_eq!(unfiltered.examples.len(), 2);
     }
 
     // ---- the protocol channel this worker was handed -------------------------------
