@@ -1447,13 +1447,17 @@ fn render_modules(list: &structured::ModuleList) -> String {
 /// symbol state is a short word. Names are never truncated to fit: a listing whose text and values
 /// disagree about a *name* is the disagreement this rendering exists to remove.
 ///
-/// **The names are the target's, not this server's**, so they go through [`renderable`] like any
-/// other untrusted string — and the width is measured on what is actually printed, so an escaped
-/// name still lines its row up.
+/// **The names are the target's, not this server's**, so they go through
+/// [`renderable_unquoted`] like any other untrusted string — and the width is measured on what is
+/// actually printed, so an escaped name still lines its row up.
+///
+/// *Unquoted*, because these rows are the one place a target-supplied string is printed with no
+/// code span around it. See that function for what a bare row lets a name do that a quoted one
+/// does not.
 fn module_table(rows: &[structured::ModuleInfo], names: &str) -> String {
     let listed: Vec<_> = rows
         .iter()
-        .map(|row| renderable(row.listed_name()))
+        .map(|row| renderable_unquoted(row.listed_name()))
         .collect();
     // At least as wide as the column's own header, which is also the answer for a table with no
     // rows in it — `format!`'s width counts characters, so this does too.
@@ -1601,6 +1605,53 @@ fn renderable(text: &str) -> std::borrow::Cow<'_, str> {
 /// renders Markdown — `<br>` included, which is a line break this would otherwise never see.
 fn escapes_the_listing(c: char) -> bool {
     c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '`')
+}
+
+/// The same guard for a string printed **bare**, with no code span around it.
+///
+/// [`renderable`] is enough inside backticks, and only inside them: a code span renders its
+/// contents literally, so the one way out is the delimiter and that is escaped. A module row has
+/// no such container — the table is plain aligned text — so a name reaches a Markdown-rendering
+/// client as *markup*, and `[ntdll.dll](https://elsewhere)` is shown as `ntdll.dll` with the rest
+/// hidden. The name in `structuredContent` is still the truth; the listing a person reads is not,
+/// which is the one thing the table is for.
+///
+/// That is the whole difference between the two call sites, and why one guard could not serve
+/// both: the filter is quoted, the names are not.
+fn renderable_unquoted(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(|c| escapes_the_listing(c) || substitutes_what_is_shown(c)) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '`' => out.push_str("\\u{60}"),
+            c if escapes_the_listing(c) => out.extend(c.escape_debug()),
+            c if substitutes_what_is_shown(c) => {
+                out.push('\\');
+                out.push(c);
+            }
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Whether a character lets the text around it be *displayed as something else*.
+///
+/// Deliberately not CommonMark's whole escapable set. Escaping every character Markdown will
+/// accept a backslash before turns `foo-bar.sys` into `foo\-bar\.sys`, and a guard that makes
+/// every ordinary name unreadable to contain a hostile one has cost more than it saved. These are
+/// the constructs that *hide* characters:
+///
+/// * `[` and `]` open a link or image label, which shows the label and swallows the target;
+/// * `<` and `>` open raw HTML and autolinks, which do the same;
+/// * `*` emphasises — and unlike `_` it works inside a word, so `nt*dll*.sys` loses its asterisks
+///   where `my_driver.sys` is safe and stays untouched;
+/// * `~` is GFM strikethrough, on the same footing as `*`;
+/// * `\` escapes whatever follows it, so leaving it alone would let a name cancel this guard.
+fn substitutes_what_is_shown(c: char) -> bool {
+    matches!(c, '[' | ']' | '<' | '>' | '*' | '~' | '\\')
 }
 
 /// Everything a bug check is, gathered as one indivisible job.
@@ -5151,6 +5202,68 @@ mod tests {
                 .and_then(|line| line.find("deferred"))
         };
         assert_eq!(column("drv"), column("  nt "), "{text}");
+    }
+
+    /// A row is printed **bare**, and that is a different guard from the quoted filter's.
+    ///
+    /// The escaping above answers "can a name break out of its row". This answers "can a name be
+    /// *shown as something else while sitting in it*" — which a code span makes impossible and a
+    /// plain table does not. `[ntdll.dll](https://elsewhere)` is a legal Windows file name and a
+    /// Markdown-rendering client displays it as `ntdll.dll`, so an analyst reading the listing is
+    /// told the wrong name for a module while `structuredContent` quietly carries the right one.
+    ///
+    /// Reported by chatgpt-codex-connector on #126.
+    #[test]
+    fn a_module_name_cannot_be_displayed_as_a_different_one() {
+        let hostile = "[ntdll.dll](https://elsewhere)";
+        let list = structured::ModuleList {
+            loaded: 2,
+            filter: None,
+            modules: [module(hostile, 0x1000), module("nt", 0x2000)]
+                .iter()
+                .map(structured::ModuleInfo::from)
+                .collect(),
+            unloaded: Vec::new(),
+        };
+        let text = render_modules(&list);
+
+        assert!(
+            text.contains("\\[ntdll.dll\\](https://elsewhere)"),
+            "the label syntax is escaped, so the whole name is what renders:\n{text}"
+        );
+        assert!(
+            !text.contains("[ntdll.dll]("),
+            "and no unescaped link label survives anywhere in the listing:\n{text}"
+        );
+        assert_eq!(
+            listed_rows(&text).len(),
+            2,
+            "escaping a name must not cost its row:\n{text}"
+        );
+
+        // The width is measured on what is printed, so the backslashes are counted like any other
+        // character and the column still lines up — the same invariant the separator test pins.
+        let column = |name: &str| {
+            text.lines()
+                .find(|line| line.contains(name))
+                .and_then(|line| line.find("deferred"))
+        };
+        assert_eq!(column("ntdll"), column("  nt "), "{text}");
+    }
+
+    /// The other half of the same judgement: a guard that escaped everything Markdown *can* take
+    /// a backslash before would make every ordinary name unreadable to contain a hostile one.
+    /// `_` is safe inside a word by CommonMark's own flanking rules, and `-` and `.` are not
+    /// markup at all, so a name built from them has to come through untouched.
+    #[test]
+    fn an_ordinary_name_is_not_escaped_for_the_sake_of_a_hostile_one() {
+        for name in ["my_driver.sys", "foo-bar.sys", "WdFilter.sys", "nt"] {
+            assert_eq!(
+                renderable_unquoted(name),
+                name,
+                "{name} carries no markup and must render as itself"
+            );
+        }
     }
 
     // ---- narrowing a module listing ----------------------------------------
