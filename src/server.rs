@@ -599,8 +599,22 @@ pub(crate) fn matches_module_pattern(pattern: &str, name: &str) -> bool {
 ///
 /// The equality test first: it is the answer for every character that is not a letter, and for the
 /// overwhelmingly common case of a name and a pattern that already agree.
+///
+/// **Both directions, because one is not enough.** Lowercasing alone is the obvious test and it
+/// misses the pairs that only converge upward: `Σ` lowercases to `σ`, while final sigma `ς`
+/// lowercases to itself, so a filter of `Σ` would not have found a name containing `ς` — a promise
+/// of case-insensitive matching that quietly is not. Uppercasing catches those (both map to `Σ`),
+/// and lowercasing catches the ones that only converge downward (`ẞ`/`ß`).
+///
+/// This is Unicode's *simple* case mapping applied per character, not full case folding — Rust's
+/// standard library has no folding API and this is not worth a dependency for names that are, in
+/// practice, file names. Where the two differ it errs toward **matching**: dotless `ı` uppercases
+/// to `I`, so a filter of `i` finds it, which full folding would not. For a listing filter that is
+/// the right direction to be wrong in — the caller sees a row and the row names itself, rather than
+/// missing one and concluding the module is not loaded. `?` matches any single character, which is
+/// the way to sidestep the question entirely.
 fn folds_to_same(a: char, b: char) -> bool {
-    a == b || a.to_lowercase().eq(b.to_lowercase())
+    a == b || a.to_lowercase().eq(b.to_lowercase()) || a.to_uppercase().eq(b.to_uppercase())
 }
 
 /// Parses the value from WinDbg `?` (evaluate-expression) output, e.g.
@@ -4543,6 +4557,16 @@ mod tests {
         assert!(matches_module_pattern(&module_pattern("Ä"), "wä32"));
         assert!(matches_module_pattern(&module_pattern("日本語"), "日本語"));
         assert!(!matches_module_pattern(&module_pattern("nvhdaé"), "nvhdae"));
+
+        // **The pairs that only converge upward.** Lowercasing alone is the obvious fold and it
+        // misses these: `Σ` lowercases to `σ` while final sigma `ς` lowercases to itself, so a
+        // filter of `Σ` would not have found a name spelled with `ς` — case-insensitive right up
+        // until the first name that needed it. Both mappings are compared, in both directions.
+        assert!(matches_module_pattern(&module_pattern("Σ"), "drvς"));
+        assert!(matches_module_pattern(&module_pattern("ς"), "DRVΣ"));
+        assert!(matches_module_pattern(&module_pattern("Σ"), "drvσ"));
+        // …and the ones that only converge downward, which is why lowercasing stays.
+        assert!(matches_module_pattern(&module_pattern("ẞ"), "straße"));
 
         // `?` still matches any single character, non-ASCII included — the escape hatch for a
         // name whose case does not fold per character at all.

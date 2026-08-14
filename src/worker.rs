@@ -1555,18 +1555,33 @@ fn narrowing_note(pattern: &str, matched: usize, loaded: usize, unloaded: usize)
 /// Only the pattern needs it. Everything else in the listing comes from the engine's module table,
 /// where the names are Windows file names — which cannot contain a character below `0x20`.
 fn quotable(pattern: &str) -> std::borrow::Cow<'_, str> {
-    if !pattern.contains(char::is_control) {
+    if !pattern.contains(starts_a_new_line) {
         return std::borrow::Cow::Borrowed(pattern);
     }
     let mut out = String::with_capacity(pattern.len());
     for c in pattern.chars() {
-        if c.is_control() {
+        if starts_a_new_line(c) {
             out.extend(c.escape_debug());
         } else {
             out.push(c);
         }
     }
     std::borrow::Cow::Owned(out)
+}
+
+/// Whether a character could put what follows it on a line of its own — **in any renderer**, not
+/// only in [`str::lines`].
+///
+/// [`char::is_control`] is the obvious test and is not enough: it is the `Cc` category, which holds
+/// `\n`, `\r`, `\u{b}`, `\u{c}` and NEL, but *not* `U+2028 LINE SEPARATOR` or
+/// `U+2029 PARAGRAPH SEPARATOR` — which are `Zl`/`Zp`, break a line in a Unicode-aware renderer,
+/// and are invisible to `lines()` and so to a test written against it. Those two are the rest of
+/// Unicode's line-break set, which is what this is.
+///
+/// The controls that are *not* line breaks stay in for a second reason: an ESC in a listing is an
+/// ANSI sequence a terminal acts on.
+fn starts_a_new_line(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
 }
 
 /// Everything a bug check is, gathered as one indivisible job.
@@ -5039,6 +5054,26 @@ mod tests {
             !text.contains('\r') && !text.contains('\u{1b}'),
             "nothing a terminal acts on reaches it: {text:?}"
         );
+
+        // **The line breaks `char::is_control` does not name.** `U+2028 LINE SEPARATOR` and
+        // `U+2029 PARAGRAPH SEPARATOR` are `Zl`/`Zp`, not `Cc`, so the obvious guard lets them
+        // through — and `str::lines` does not see them either, so a test written around it passes
+        // while a Unicode-aware renderer puts the smuggled row on a line of its own. Asserted on
+        // the characters themselves for that reason, not on a line count.
+        for separator in ['\u{2028}', '\u{2029}'] {
+            let text = listing(&format!(
+                "zzz{separator}0xfffff80389200000  0xfffff8038a650000  smuggled  pdb"
+            ));
+            assert!(
+                !text.contains(separator),
+                "{separator:?} breaks a line in a renderer that knows Unicode: {text:?}"
+            );
+            assert!(
+                text.contains(r"\u{202"),
+                "…and is shown as an escape: {text}"
+            );
+            assert!(listed_rows(&text).is_empty(), "{text}");
+        }
 
         // An ordinary pattern is quoted exactly as it was applied — this guard is invisible to
         // every filter anyone actually types.

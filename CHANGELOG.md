@@ -40,13 +40,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     narrow and sent nothing to narrow by.) Case now folds beyond ASCII too, since there is no
     second fold to stay in step with.
   - **A filter cannot add a line to the listing.** It is quoted into the text, and the listing is
-    line-oriented, so a control character in it is rendered as an escape rather than acted on —
-    otherwise a pattern carrying a newline and something shaped like a row would put a module in
-    the text that the values beside it do not have, which is the one property this change is for.
-    (Until now the filter was command text, and the `;` check refused line breaks along with the
-    separator; the command went, and that refusal with it.) Escaped rather than refused, because
-    "nothing matches this" is a good answer to a pattern nothing is named — and because it covers
-    `\r` and an ANSI escape for the same money.
+    line-oriented, so anything in it that could start a new line is rendered as an escape rather
+    than acted on — otherwise a pattern carrying a newline and something shaped like a row would
+    put a module in the text that the values beside it do not have, which is the one property this
+    change is for. (Until now the filter was command text, and the `;` check refused line breaks
+    along with the separator; the command went, and that refusal with it.) Escaped rather than
+    refused, because "nothing matches this" is a good answer to a pattern nothing is named — and
+    because it covers `\r` and an ANSI escape for the same money. The guard is Unicode's whole
+    line-break set, not `char::is_control`: `U+2028`/`U+2029` are `Zl`/`Zp` rather than `Cc`, break
+    a line in a renderer that knows Unicode, and are invisible to `str::lines` — so to a test
+    written around it.
+  - **Case-insensitive means both directions.** The filter compares Unicode's simple case mappings
+    per character, upward as well as down: `Σ` lowercases to `σ` while final sigma `ς` lowercases
+    to itself, so lowercasing alone would have missed a name spelled with `ς` — case-insensitive
+    right up until the first name that needed it. It is not full case folding (no dependency for
+    that), and where the two differ it errs toward matching, which for a listing filter is the
+    right direction: a caller sees a row that names itself rather than missing one.
   - **The unloaded half is rendered the same way**, from `unloaded[]`, under its own heading that
     says what its addresses mean — where an image *was* — instead of a note explaining the
     relationship between the values and a tail `lm` had printed.
