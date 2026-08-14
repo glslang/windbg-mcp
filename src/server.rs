@@ -21,7 +21,9 @@ use crate::engine::{
     SessionState, Sessions,
 };
 use crate::kdconn;
-use crate::proto::{EngineOp, Output, PoolOp, ReachabilityOp};
+use crate::proto::{
+    EngineOp, HeapBackendFilter, HeapOp, HeapStateFilter, Output, PoolOp, ReachabilityOp,
+};
 use crate::structured::{self, ErrorCategory, Outcome, TargetCreated};
 use crate::ttd;
 use crate::walk;
@@ -227,6 +229,13 @@ fn engine_result_for(
 /// of nothing.
 fn pool_op(query: PoolOp) -> EngineOp {
     EngineOp::Pool {
+        query,
+        patience_ms: 0,
+    }
+}
+
+fn heap_op(query: HeapOp) -> EngineOp {
+    EngineOp::Heap {
         query,
         patience_ms: 0,
     }
@@ -1666,6 +1675,95 @@ pub struct PoolDiagnosticsArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct HeapListArgs {
+    /// Force a fresh snapshot instead of reusing the one cached for this stopped target.
+    #[serde(default)]
+    pub refresh: Option<bool>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HeapBackendArg {
+    Lfh,
+    Vs,
+    Segment,
+    Large,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HeapStateArg {
+    Allocated,
+    ReusableFree,
+    CachedFree,
+    Unreadable,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct HeapAllocationsArgs {
+    /// Optional Segment Heap root address.
+    #[serde(default)]
+    pub heap: Option<String>,
+    #[serde(default)]
+    pub backend: Option<HeapBackendArg>,
+    /// Defaults to `allocated`.
+    #[serde(default)]
+    pub state: Option<HeapStateArg>,
+    #[serde(default)]
+    pub min_capacity: Option<u64>,
+    #[serde(default)]
+    pub max_capacity: Option<u64>,
+    #[serde(default)]
+    pub refresh: Option<bool>,
+    /// Maximum rows to return (default 64, maximum 2000).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct HeapChunkArgs {
+    /// Address anywhere in the allocator header or user capacity.
+    pub address: String,
+    #[serde(default)]
+    pub refresh: Option<bool>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct HeapCensusArgs {
+    #[serde(default)]
+    pub heap: Option<String>,
+    #[serde(default)]
+    pub refresh: Option<bool>,
+    /// Maximum groups to return (default 40, maximum 2000).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct HeapDiagnosticsArgs {
+    #[serde(default)]
+    pub heap: Option<String>,
+    /// Case-insensitive substring applied to diagnostic categories and kept examples.
+    #[serde(default)]
+    pub filter: Option<String>,
+    #[serde(default)]
+    pub refresh: Option<bool>,
+    /// Maximum rows to return (default 60, maximum 2000).
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct CrashTriageArgs {
     /// How many stack frames to walk (default 16, maximum 128). The default reaches past the
     /// kernel's own bug-check path to the driver frame on every crash seen so far; raise it for a
@@ -2478,6 +2576,158 @@ impl WindbgServer {
             .run(
                 args.session_id.as_deref(),
                 pool_op(PoolOp::census(args.refresh, args.limit)),
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// List every heap root in the current process PEB. Segment Heaps are marked supported;
+    /// classic NT heaps are listed but deliberately excluded from v1 coverage and should be
+    /// inspected with `!heap`.
+    #[rmcp::tool(
+        annotations(
+            title = "List user-mode heaps",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::HeapListResult>>()
+    )]
+    async fn heap_list(
+        &self,
+        Parameters(args): Parameters<HeapListArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                heap_op(HeapOp::list(args.refresh)),
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// List user Segment Heap chunks, filtered by heap, backend, state, and capacity. Defaults
+    /// to allocated chunks. Requires a stopped x64 live target or sufficiently complete dump and
+    /// matching `ntdll` PDB type information.
+    #[rmcp::tool(
+        annotations(
+            title = "List Segment Heap allocations",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::HeapAllocationsResult>>()
+    )]
+    async fn heap_allocations(
+        &self,
+        Parameters(args): Parameters<HeapAllocationsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let backend = args.backend.map(|backend| match backend {
+            HeapBackendArg::Lfh => HeapBackendFilter::Lfh,
+            HeapBackendArg::Vs => HeapBackendFilter::Vs,
+            HeapBackendArg::Segment => HeapBackendFilter::Segment,
+            HeapBackendArg::Large => HeapBackendFilter::Large,
+        });
+        let state = args.state.map(|state| match state {
+            HeapStateArg::Allocated => HeapStateFilter::Allocated,
+            HeapStateArg::ReusableFree => HeapStateFilter::ReusableFree,
+            HeapStateArg::CachedFree => HeapStateFilter::CachedFree,
+            HeapStateArg::Unreadable => HeapStateFilter::Unreadable,
+        });
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                heap_op(HeapOp::allocations(
+                    args.heap,
+                    backend,
+                    state,
+                    args.min_capacity,
+                    args.max_capacity,
+                    args.refresh,
+                    args.limit,
+                )),
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Locate the user allocation containing an address and return its contiguous neighbours
+    /// from the same heap, backend, and subsegment. An uncovered address is not reported as free;
+    /// inspect the returned coverage before treating absence as evidence.
+    #[rmcp::tool(
+        annotations(
+            title = "Locate a Segment Heap chunk",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::HeapChunkResult>>()
+    )]
+    async fn heap_chunk(
+        &self,
+        Parameters(args): Parameters<HeapChunkArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                heap_op(HeapOp::chunk(args.address, args.refresh)),
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Group Segment Heap chunks by heap, backend, state, and size class, heaviest first.
+    #[rmcp::tool(
+        annotations(
+            title = "Census Segment Heap usage",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::HeapCensusResult>>()
+    )]
+    async fn heap_census(
+        &self,
+        Parameters(args): Parameters<HeapCensusArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                heap_op(HeapOp::census(args.heap, args.refresh, args.limit)),
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Inspect Segment Heap walk diagnostic categories and kept examples, optionally scoped to
+    /// one heap root and narrowed by a case-insensitive substring.
+    #[rmcp::tool(
+        annotations(
+            title = "Filter Segment Heap diagnostics",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::HeapDiagnosticsResult>>()
+    )]
+    async fn heap_diagnostics(
+        &self,
+        Parameters(args): Parameters<HeapDiagnosticsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                heap_op(HeapOp::diagnostics(
+                    args.heap,
+                    args.filter,
+                    args.refresh,
+                    args.limit,
+                )),
             )
             .await;
         engine_result_for(args.session_id.as_deref(), out)

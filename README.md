@@ -328,6 +328,7 @@ gh attestation verify <zip> --repo glslang/windbg-mcp `
 | TTD analysis | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
 | Driver IOCTL | `decode_ioctl`, `driver_object`, `device_object`, `irp_stack`, `ioctl_trace`, `reachable_from_dispatch` |
 | Kernel pool | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics` |
+| User Segment Heap | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` |
 | Raw     | `execute` — run any debugger command, returns full text output |
 
 ### Sessions and session handles
@@ -623,6 +624,7 @@ matching `outputSchema` in `tools/list`, so a program can read a field instead o
 | `run_to_address` | `verdict` (`hit`/`stopped_elsewhere`/`timeout`), `target`, `stopped_at` |
 | `go`, `step_over`, `step_into`, `step_back`, `step_over_back`, `reverse_go` | `stopped_at` |
 | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics` | the chunks/totals/diagnostics as values, each carrying the `walk` behind them |
+| `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` | PEB heap roots and Segment Heap allocations/totals/diagnostics, each carrying exact `ntdll` layout provenance, skipped-heap scope, and walk coverage |
 | `walk_memory` | `nodes[]` with each field's `value` — `null` where the debugger could not read it — plus `walked`/`unreadable` counts and a `stopped` reason (`complete`, `cap`, `null_link`, `loop`, `unreadable_link`, `deadline`, `interrupted`), each carrying the address it is about |
 | `crash_triage` | `bug_check` (`code`, `name`, four `parameters`), `process_name`, `frames[]` as `{module, rva, symbol}`, the `faulting_frame` picked out of them — and `!analyze`'s own conclusions kept apart under `analysis` |
 
@@ -633,7 +635,7 @@ Two conventions hold across all of them:
   past 2^53 does not survive a JSON parser that reads numbers as doubles; zero-padded so lexical
   order matches numeric order. The debugger's backtick form (``fffff803`1ab10000``) appears only in
   the text.
-- **A pool answer says what the walk covered.** `walk.coverage` is `complete`, `deadline_truncated`
+- **An allocator answer says what the walk covered.** `walk.coverage` is `complete`, `deadline_truncated`
   (the call's budget ran out — more time reaches more of the pool) or `partial` (unreadable regions
   or a traversal cap — more time changes nothing). Counts from anything but `complete` are floors,
   not totals. A walk that failed outright, or was stopped by `interrupt`, is not a coverage state at
@@ -706,6 +708,17 @@ timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressio
   `Unreadable` is the walk's own limit (a Verifier guard page reads that way) and says nothing
   about whether the allocator freed anything. `pool_chunk` also
   reports the **neighbouring** chunks, which is what tells you what a reclaim would land next to. `pool_diagnostics` returns the walk's own diagnostics filtered by substring: a real walk emits tens of thousands across a hundred-plus categories, so any per-call summary truncates and the one line explaining a specific heap is never in the truncated head — filter by a heap address or a phrase to reach it.
+- The **user Segment Heap** tools share that typed decoder but discover roots through the current
+  process's PDB-resolved `_PEB.NumberOfHeaps` and `ProcessHeaps`. They require a stopped x64 user
+  target (or a dump with sufficient memory) and the exact loaded `ntdll` PDB. `heap_list` reports
+  every root and explicitly separates Segment Heaps walked from classic NT, unknown, and unreadable
+  heaps skipped. V1 does not decode classic NT heaps, WOW64, or ARM64; use `!heap` for classic heaps.
+  Snapshots are cached per target/PEB/`ntdll` image and invalidated when execution resumes; pass
+  `refresh: true` for the final observation after target execution. Allocation `capacity` is always
+  allocator-backed, while `requested_size` is optional and appears only when the selected schema
+  validates exact unused-byte metadata. Read `layout`, `scope`, and `walk` before treating an absent
+  allocation as evidence. The agent workflow is in
+  [`skills/windbg-debugging/heap-walking.md`](skills/windbg-debugging/heap-walking.md).
 - **`crash_triage` reads a bug check two ways, and keeps them apart.** The code and its parameters
   (`ReadBugCheckData`), the stack, each frame's module, and the crashing process (out of the current
   `_EPROCESS`'s audit name — the full image name, not the 15-byte `ImageFileName` that turns

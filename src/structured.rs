@@ -714,6 +714,56 @@ impl From<&win_kexp::dbgeng::BreakpointInfo> for BreakpointInfo {
 
 // ---- pool -----------------------------------------------------------------
 
+/// The exact image and PDB-backed structural family used by an allocator walk.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AllocatorLayoutInfo {
+    pub module: AllocatorModuleInfo,
+    pub pdb: String,
+    pub fingerprint: String,
+    pub semantic_family: AllocatorSemanticFamily,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AllocatorModuleInfo {
+    pub name: String,
+    pub image_name: String,
+    pub loaded_image_name: String,
+    pub base: String,
+    pub size: u32,
+    pub timestamp: u32,
+    pub checksum: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AllocatorSemanticFamily {
+    InlineVs,
+    AffinitySlotVs,
+}
+
+impl From<&win_kexp::allocator::LayoutProvenance> for AllocatorLayoutInfo {
+    fn from(layout: &win_kexp::allocator::LayoutProvenance) -> Self {
+        use win_kexp::allocator::VsSemanticFamily;
+        Self {
+            module: AllocatorModuleInfo {
+                name: layout.module.name.clone(),
+                image_name: layout.module.image_name.clone(),
+                loaded_image_name: layout.module.loaded_image_name.clone(),
+                base: addr(layout.module.base),
+                size: layout.module.size,
+                timestamp: layout.module.timestamp,
+                checksum: layout.module.checksum,
+            },
+            pdb: layout.module.symbol_file.clone(),
+            fingerprint: layout.fingerprint.clone(),
+            semantic_family: match layout.semantic_family {
+                VsSemanticFamily::Inline => AllocatorSemanticFamily::InlineVs,
+                VsSemanticFamily::AffinitySlots => AllocatorSemanticFamily::AffinitySlotVs,
+            },
+        }
+    }
+}
+
 /// How much of the pool the walk behind an answer actually covered.
 ///
 /// Every pool answer carries this, because every one of them is drawn from a snapshot and a
@@ -896,6 +946,7 @@ impl From<&win_kexp::pool::PoolSpan> for PoolChunkInfo {
 /// What `pool_find_tag` found.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PoolTagMatches {
+    pub layout: AllocatorLayoutInfo,
     pub tag: String,
     pub scope: PoolScope,
     /// How many allocated chunks carry the tag. A floor rather than a total unless
@@ -919,6 +970,7 @@ pub enum PoolScope {
 /// What `pool_chunk` found at an address.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PoolChunkAt {
+    pub layout: AllocatorLayoutInfo,
     /// The address asked about.
     pub address: String,
     /// Whether the snapshot covers this address at all. False is *not* "free": it means the
@@ -930,6 +982,7 @@ pub struct PoolChunkAt {
     pub chunk: Option<PoolChunkInfo>,
     /// How far into that chunk the address sits.
     #[serde(skip_serializing_if = "Option::is_none")]
+    /// Signed displacement from `allocation.user_address`; header addresses are negative.
     pub offset: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous: Option<PoolChunkInfo>,
@@ -941,6 +994,7 @@ pub struct PoolChunkAt {
 /// What `pool_census` totalled.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PoolCensus {
+    pub layout: AllocatorLayoutInfo,
     /// How many distinct tags are allocated. The listing below is capped by `limit`.
     pub distinct_tags: usize,
     pub tags: Vec<PoolTagTotals>,
@@ -959,6 +1013,7 @@ pub struct PoolTagTotals {
 /// What `pool_diagnostics` selected.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PoolDiagnosticsReport {
+    pub layout: AllocatorLayoutInfo,
     /// The substring the listing was narrowed to, when it was.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
@@ -981,6 +1036,236 @@ pub struct DiagnosticCategory {
     pub shape: String,
     /// Every message of this shape the walk emitted, not just the ones kept verbatim.
     pub total: usize,
+}
+
+// ---- user Segment Heap ----------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HeapKindName {
+    Segment,
+    Nt,
+    Unknown,
+    Unreadable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HeapBackendName {
+    Lfh,
+    Vs,
+    Segment,
+    Large,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HeapChunkState {
+    Allocated,
+    ReusableFree,
+    CachedFree,
+    Unreadable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HeapRootInfo {
+    pub index: usize,
+    pub address: String,
+    pub kind: HeapKindName,
+    pub supported: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl From<&win_kexp::heap::HeapRoot> for HeapRootInfo {
+    fn from(root: &win_kexp::heap::HeapRoot) -> Self {
+        use win_kexp::heap::HeapKind;
+        Self {
+            index: root.index,
+            address: addr(root.address),
+            kind: match root.kind {
+                HeapKind::Segment => HeapKindName::Segment,
+                HeapKind::Nt => HeapKindName::Nt,
+                HeapKind::Unknown => HeapKindName::Unknown,
+                HeapKind::Unreadable => HeapKindName::Unreadable,
+            },
+            supported: root.supported,
+            reason: root.reason.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HeapAllocationInfo {
+    pub heap: String,
+    pub backend: HeapBackendName,
+    pub state: HeapChunkState,
+    pub header_address: String,
+    pub user_address: String,
+    pub capacity: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subsegment: Option<String>,
+    pub size_class: u32,
+}
+
+impl From<&win_kexp::heap::HeapAllocation> for HeapAllocationInfo {
+    fn from(allocation: &win_kexp::heap::HeapAllocation) -> Self {
+        use win_kexp::heap::{HeapBackend, HeapState};
+        Self {
+            heap: addr(allocation.heap),
+            backend: match allocation.backend {
+                HeapBackend::Lfh => HeapBackendName::Lfh,
+                HeapBackend::Vs => HeapBackendName::Vs,
+                HeapBackend::Segment => HeapBackendName::Segment,
+                HeapBackend::Large => HeapBackendName::Large,
+            },
+            state: match allocation.state {
+                HeapState::Allocated => HeapChunkState::Allocated,
+                HeapState::ReusableFree => HeapChunkState::ReusableFree,
+                HeapState::CachedFree => HeapChunkState::CachedFree,
+                HeapState::Unreadable => HeapChunkState::Unreadable,
+            },
+            header_address: addr(allocation.header_address),
+            user_address: addr(allocation.user_address),
+            capacity: allocation.capacity,
+            requested_size: allocation.requested_size,
+            subsegment: allocation.subsegment.map(addr),
+            size_class: allocation.size_class,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HeapScopeInfo {
+    pub segment_heaps_walked: Vec<String>,
+    pub nt_heaps_skipped: Vec<String>,
+    pub unknown_heaps_skipped: Vec<String>,
+    pub unreadable_heaps_skipped: Vec<String>,
+}
+
+impl From<&win_kexp::heap::HeapScope> for HeapScopeInfo {
+    fn from(scope: &win_kexp::heap::HeapScope) -> Self {
+        Self {
+            segment_heaps_walked: scope
+                .segment_heaps_walked
+                .iter()
+                .copied()
+                .map(addr)
+                .collect(),
+            nt_heaps_skipped: scope.nt_heaps_skipped.iter().copied().map(addr).collect(),
+            unknown_heaps_skipped: scope
+                .unknown_heaps_skipped
+                .iter()
+                .copied()
+                .map(addr)
+                .collect(),
+            unreadable_heaps_skipped: scope
+                .unreadable_heaps_skipped
+                .iter()
+                .copied()
+                .map(addr)
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HeapWalkInfo {
+    pub coverage: PoolCoverage,
+    pub chunks_walked: usize,
+    pub allocated_chunks: usize,
+    pub diagnostics_emitted: usize,
+    pub unreadable_gaps: usize,
+    pub refused_headers: u64,
+    pub stalled_pages: u64,
+    pub skipped_bytes: u64,
+    pub recovered_bytes: u64,
+}
+
+impl From<&win_kexp::heap::HeapWalkReport> for HeapWalkInfo {
+    fn from(walk: &win_kexp::heap::HeapWalkReport) -> Self {
+        Self {
+            coverage: walk.coverage.into(),
+            chunks_walked: walk.total_chunks,
+            allocated_chunks: walk.allocated_chunks,
+            diagnostics_emitted: walk.diagnostic_count,
+            unreadable_gaps: walk.unreadable_gaps,
+            refused_headers: walk.refused_headers,
+            stalled_pages: walk.stalls.pages,
+            skipped_bytes: walk.stalls.skipped_bytes,
+            recovered_bytes: walk.stalls.recovered_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HeapListResult {
+    pub layout: AllocatorLayoutInfo,
+    pub scope: HeapScopeInfo,
+    pub walk: HeapWalkInfo,
+    pub heaps: Vec<HeapRootInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HeapAllocationsResult {
+    pub layout: AllocatorLayoutInfo,
+    pub scope: HeapScopeInfo,
+    pub walk: HeapWalkInfo,
+    pub matches: usize,
+    pub allocations: Vec<HeapAllocationInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HeapChunkResult {
+    pub layout: AllocatorLayoutInfo,
+    pub scope: HeapScopeInfo,
+    pub walk: HeapWalkInfo,
+    pub address: String,
+    pub covered: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub offset: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allocation: Option<HeapAllocationInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous: Option<HeapAllocationInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next: Option<HeapAllocationInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HeapCensusRowInfo {
+    pub heap: String,
+    pub backend: HeapBackendName,
+    pub state: HeapChunkState,
+    pub size_class: u32,
+    pub chunks: usize,
+    pub total_capacity: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HeapCensusResult {
+    pub layout: AllocatorLayoutInfo,
+    pub scope: HeapScopeInfo,
+    pub walk: HeapWalkInfo,
+    pub groups: usize,
+    pub rows: Vec<HeapCensusRowInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HeapDiagnosticsResult {
+    pub layout: AllocatorLayoutInfo,
+    pub scope: HeapScopeInfo,
+    pub walk: HeapWalkInfo,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heap: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter: Option<String>,
+    pub matched_categories: usize,
+    pub matched_examples: usize,
+    pub categories: Vec<DiagnosticCategory>,
+    pub examples: Vec<String>,
 }
 
 /// What `crash_triage` read off a bug check.
@@ -1447,6 +1732,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn allocator_layout_keeps_exact_image_pdb_and_structural_family() {
+        let engine = win_kexp::allocator::LayoutProvenance {
+            module: win_kexp::dbgeng::ModuleIdentity {
+                name: "ntdll".into(),
+                image_name: "ntdll.dll".into(),
+                loaded_image_name: r"C:\Windows\System32\ntdll.dll".into(),
+                symbol_file: r"C:\symbols\ntdll.pdb".into(),
+                symbols: win_kexp::dbgeng::SymbolKind::Pdb,
+                base: 0x7ffb_1234_0000,
+                size: 0x234000,
+                timestamp: 0x1234_5678,
+                checksum: 0xabcdef,
+            },
+            fingerprint: "fnv1a64:0123456789abcdef".into(),
+            semantic_family: win_kexp::allocator::VsSemanticFamily::AffinitySlots,
+        };
+
+        let wire = serde_json::to_value(AllocatorLayoutInfo::from(&engine)).unwrap();
+        assert_eq!(wire["module"]["name"], "ntdll");
+        assert_eq!(wire["pdb"], r"C:\symbols\ntdll.pdb");
+        assert_eq!(wire["fingerprint"], "fnv1a64:0123456789abcdef");
+        assert_eq!(wire["semantic_family"], "affinity_slot_vs");
+        assert_eq!(wire["module"]["base"], "0x00007ffb12340000");
+    }
+
+    #[test]
+    fn heap_requested_size_is_optional_rather_than_inferred_from_capacity() {
+        let allocation = |requested_size| win_kexp::heap::HeapAllocation {
+            heap: 0x10000,
+            backend: win_kexp::heap::HeapBackend::Large,
+            state: win_kexp::heap::HeapState::Allocated,
+            header_address: 0x20000,
+            user_address: 0x20000,
+            capacity: 0x20000,
+            requested_size,
+            subsegment: None,
+            size_class: 0x20000,
+        };
+        let unknown = serde_json::to_value(HeapAllocationInfo::from(&allocation(None))).unwrap();
+        assert!(unknown.get("requested_size").is_none(), "{unknown}");
+        let exact =
+            serde_json::to_value(HeapAllocationInfo::from(&allocation(Some(0x1f234)))).unwrap();
+        assert_eq!(exact["requested_size"], 0x1f234);
+    }
+
     /// The gap figures answer the question `coverage` raises and cannot settle: `partial` says
     /// a walk fell short, and these say by how much. They have to come from the walk as numbers
     /// — the diagnostics cannot supply them, because they collapse messages by shape and the
@@ -1454,6 +1785,7 @@ mod tests {
     #[test]
     fn walk_gaps_carry_what_the_diagnostics_cannot() {
         let report = |stalls, refused_chunks| win_kexp::pool::query::PoolSnapshotReport {
+            layout: Default::default(),
             total_chunks: 0,
             allocated_chunks: 0,
             coverage: win_kexp::pool::query::WalkCoverage::Partial,

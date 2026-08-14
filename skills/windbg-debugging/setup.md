@@ -202,16 +202,22 @@ Two more things that mislead here:
 Symbols are never fetched from the target over the KD wire, so all of this is about the
 **debugging host**, whatever the target is.
 
-### Kernel pool tools need *private* `nt` types
+### Allocator tools need private `nt` or `ntdll` types
 
 `pool_find_tag`, `pool_census`, `pool_chunk` and `pool_diagnostics` decode segment-heap
 internals (`_EX_POOL_HEAP_MANAGER_STATE`, the page-range descriptors, the VS and LFH
 headers). Exports are not enough. Without full type information every pool query fails up
-front with `missing kernel pool symbols (ExPoolState); run '.reload /f nt' and retry` — which
+front with `missing allocator symbols (ExPoolState); run '.reload /f nt' and retry` — which
 is a symbol problem on this host, not a statement about the target's pool.
 
 Offline / no symbols? Navigation, memory reads, disassembly, and the data model still work
 — query by address instead of by name.
+
+The user-mode `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census` and
+`heap_diagnostics` tools have the same requirement for the exact loaded `ntdll` PDB. Use
+`.reload /f ntdll.dll` for them, and `.reload /f nt` for `pool_*`; the error guidance is deliberately
+module-specific. `heap_list` still lists classic NT heaps as unsupported once the PDB is loaded;
+use `!heap` for those rather than treating them as missing Segment Heap coverage.
 
 ## Kernel connection profiles — configure once, keep the key out of the transcript
 

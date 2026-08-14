@@ -3,7 +3,7 @@
     "(none)",
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 45,
+  "toolCount": 50,
   "tools": [
     {
       "hints": {
@@ -363,6 +363,190 @@
         "position"
       ],
       "title": "Go to TTD position"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": true,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "heap_allocations",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/HeapAllocationsResult",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
+      "params": [
+        "backend: any",
+        "heap: string|null",
+        "limit: integer|null/uint32",
+        "max_capacity: integer|null/uint64",
+        "min_capacity: integer|null/uint64",
+        "refresh: boolean|null",
+        "session_id: string|null",
+        "state: any"
+      ],
+      "required": [],
+      "title": "List Segment Heap allocations"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": true,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "heap_census",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/HeapCensusResult",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
+      "params": [
+        "heap: string|null",
+        "limit: integer|null/uint32",
+        "refresh: boolean|null",
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Census Segment Heap usage"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": true,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "heap_chunk",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/HeapChunkResult",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
+      "params": [
+        "address: string",
+        "refresh: boolean|null",
+        "session_id: string|null"
+      ],
+      "required": [
+        "address"
+      ],
+      "title": "Locate a Segment Heap chunk"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": true,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "heap_diagnostics",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/HeapDiagnosticsResult",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
+      "params": [
+        "filter: string|null",
+        "heap: string|null",
+        "limit: integer|null/uint32",
+        "refresh: boolean|null",
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Filter Segment Heap diagnostics"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": true,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "heap_list",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/HeapListResult",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
+      "params": [
+        "refresh: boolean|null",
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "List user-mode heaps"
     },
     {
       "hints": {

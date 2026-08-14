@@ -523,6 +523,13 @@ before a release, or when a change touches the relevant path. Drivers live in
 
 - **Live user-mode** — `examples/test_usermode.ps1`: launch `cmd.exe` under the debugger, break in,
   read registers/modules, set a breakpoint.
+- **Typed user Segment Heap** — from a sibling `win-kexp` checkout, run
+  `cargo run --example user_heap_smoke`. The helper launches an x64 child that retains known
+  LFH/VS/backend/large allocations, reloads the exact `ntdll` PDB, verifies each pointer and
+  backend, writes a temporary `/ma` full-memory dump, reopens it, and repeats the checks. Set
+  `WIN_KEXP_USER_HEAP_SYMBOLS` (or `_NT_SYMBOL_PATH`) when the default Microsoft symbol-store path
+  is not appropriate. Missing private types are a failed prerequisite; export symbols must not be
+  accepted as a layout. The helper removes its temporary dump after a successful run.
 - **Ctrl+C teardown** — `examples/ctrl_c_teardown.ps1`: a console Ctrl+C must leave a worker time
   to release its target, not kill it where it stands. Unattended, and it needs no target beyond the
   sample dump — but it is here rather than in `cargo test` because Ctrl+C cannot be aimed: the
