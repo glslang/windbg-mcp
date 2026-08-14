@@ -39,6 +39,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     command any more. The one refusal left is an *empty* filter, which is a caller who meant to
     narrow and sent nothing to narrow by.) Case now folds beyond ASCII too, since there is no
     second fold to stay in step with.
+  - **A filter cannot add a line to the listing.** It is quoted into the text, and the listing is
+    line-oriented, so a control character in it is rendered as an escape rather than acted on —
+    otherwise a pattern carrying a newline and something shaped like a row would put a module in
+    the text that the values beside it do not have, which is the one property this change is for.
+    (Until now the filter was command text, and the `;` check refused line breaks along with the
+    separator; the command went, and that refusal with it.) Escaped rather than refused, because
+    "nothing matches this" is a good answer to a pattern nothing is named — and because it covers
+    `\r` and an ANSI escape for the same money.
   - **The unloaded half is rendered the same way**, from `unloaded[]`, under its own heading that
     says what its addresses mean — where an image *was* — instead of a note explaining the
     relationship between the values and a tail `lm` had printed.

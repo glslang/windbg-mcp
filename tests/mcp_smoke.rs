@@ -2019,8 +2019,18 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
     // What those refusals were protecting: each of these is a pattern with no module named by it,
     // answered as an empty listing rather than as an error — and, crucially, as an empty listing
     // in *both* channels. `nt; .detach` is the one to read twice: it reaches no command, and the
-    // session is still the dump it was afterwards.
-    for filter in ["nt; .detach", "nt[fd]*", r"n\t*", "nt v", "nté"] {
+    // session is still the dump it was afterwards. The last is the one the *rendering* has to hold
+    // rather than the engine: a filter is quoted into the listing, and this one is shaped to add a
+    // row to it — a module in the text that the values do not have, which is the property this
+    // whole change is for. The pattern is printed with its newline escaped, so it stays one line.
+    for filter in [
+        "nt; .detach",
+        "nt[fd]*",
+        r"n\t*",
+        "nt v",
+        "nté",
+        "zzz\n0xfffff80389200000  0xfffff8038a650000  smuggled  pdb",
+    ] {
         let response = server.call_tool(
             "modules",
             json!({ "session_id": session_id, "filter": filter }),

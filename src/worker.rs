@@ -1515,6 +1515,7 @@ const WHERE_UNLOADED: &str = "listed above under `Unloaded modules` and carried 
 /// answer rather than a miss, so it is reported as a count of what was found and not as a caveat
 /// about what was not.
 fn narrowing_note(pattern: &str, matched: usize, loaded: usize, unloaded: usize) -> String {
+    let pattern = quotable(pattern);
     match (matched, unloaded) {
         // Nothing at all. The only branch that offers advice, because it is the only one where the
         // caller has nothing and may have asked the wrong question.
@@ -1535,6 +1536,37 @@ fn narrowing_note(pattern: &str, matched: usize, loaded: usize, unloaded: usize)
              since **unloaded** — {WHERE_UNLOADED}"
         ),
     }
+}
+
+/// The caller's own pattern, made safe to **quote into** the listing: a control character is
+/// rendered as an escape rather than acted on.
+///
+/// The listing is line-oriented and its rows begin with an address, so a filter carrying a newline
+/// would print as *two* lines — and the second can be shaped exactly like a row, putting a module
+/// in the text that the values beside it do not have. That is the one property this rendering
+/// exists to hold, and it must not depend on what a caller typed. Until #120 the filter was
+/// command text and `reject_command_breakers` refused line breaks along with `;`; the command went,
+/// and the refusal with it, which is what left this open.
+///
+/// Escaped rather than refused, because "nothing matches this" is a perfectly good answer to a
+/// pattern no module is named — and because it covers `\r` and an ANSI escape for the same money,
+/// where a line-break refusal would let those through to a terminal.
+///
+/// Only the pattern needs it. Everything else in the listing comes from the engine's module table,
+/// where the names are Windows file names — which cannot contain a character below `0x20`.
+fn quotable(pattern: &str) -> std::borrow::Cow<'_, str> {
+    if !pattern.contains(char::is_control) {
+        return std::borrow::Cow::Borrowed(pattern);
+    }
+    let mut out = String::with_capacity(pattern.len());
+    for c in pattern.chars() {
+        if c.is_control() {
+            out.extend(c.escape_debug());
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// Everything a bug check is, gathered as one indivisible job.
@@ -4963,6 +4995,54 @@ mod tests {
                 .and_then(|line| line.find("deferred"))
         };
         assert_eq!(column(long), column("  nt "), "{text}");
+    }
+
+    /// A filter is **quoted into** the listing, so it must not be able to add a line to it.
+    ///
+    /// The rows and the values agreeing is the property this rendering exists for, and it cannot
+    /// be one a caller can undo: a filter carrying a newline followed by something shaped like a
+    /// row would put a module in the text that the values beside it do not have. What used to make
+    /// that impossible was `reject_command_breakers`, which refused line breaks because the filter
+    /// was command text — and it went with the command.
+    #[test]
+    fn a_filter_cannot_smuggle_a_row_into_the_listing() {
+        let listing = |filter: &str| {
+            render_modules(&structured::ModuleList {
+                loaded: 227,
+                filter: Some(module_pattern(filter)),
+                modules: Vec::new(),
+                unloaded: Vec::new(),
+            })
+        };
+
+        let text = listing("zzz\n0xfffff80389200000  0xfffff8038a650000  smuggled  pdb");
+        assert!(
+            listed_rows(&text).is_empty(),
+            "a filter must not be able to print a row:\n{text}"
+        );
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "the note is one line, whatever the pattern contains:\n{text}"
+        );
+        assert!(
+            text.contains(r"\n") && text.contains("smuggled"),
+            "the newline is shown rather than obeyed, and the pattern is still reported as \
+             applied:\n{text}"
+        );
+
+        // A carriage return and an ANSI escape go the same way — neither is a line break to
+        // `str::lines`, and both are things a terminal acts on.
+        let text = listing("nt\r\u{1b}[2J");
+        assert_eq!(text.lines().count(), 1, "{text}");
+        assert!(
+            !text.contains('\r') && !text.contains('\u{1b}'),
+            "nothing a terminal acts on reaches it: {text:?}"
+        );
+
+        // An ordinary pattern is quoted exactly as it was applied — this guard is invisible to
+        // every filter anyone actually types.
+        assert!(listing("nt[fd]*").contains("`nt[fd]*`"));
     }
 
     // ---- narrowing a module listing ----------------------------------------
