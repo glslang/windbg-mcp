@@ -2748,10 +2748,9 @@ fn heap_allocation_matches(
         && max_capacity.is_none_or(|maximum| allocation.capacity <= maximum)
 }
 
-fn heap_diagnostic_selected(text: &str, heap: Option<u64>, filter: Option<&str>) -> bool {
+fn heap_diagnostic_matches_filter(text: &str, filter: Option<&str>) -> bool {
     let text = text.to_ascii_lowercase();
-    heap.is_none_or(|heap| text.contains(&format!("{heap:#x}")))
-        && filter.is_none_or(|filter| text.contains(&filter.to_ascii_lowercase()))
+    filter.is_none_or(|filter| text.contains(&filter.to_ascii_lowercase()))
 }
 
 fn heap_row(allocation: &HeapAllocation) -> String {
@@ -2996,20 +2995,27 @@ fn heap(e: &DebugEngine, args: HeapOp, within: Duration) -> Result<Output, Faile
                 .map_err(|error| {
                     Failed::categorised(structured::ErrorCategory::InvalidArgument, error)
                 })?;
-            let answer = heap_query::diagnostics(e, walk(refresh)).map_err(heap_failure)?;
+            // Scope before win-kexp aggregates diagnostic shapes: those shapes deliberately
+            // generalise addresses, so filtering them for the heap address afterwards loses the
+            // category totals and leaves only incidental examples.
+            let answer = match heap {
+                Some(heap) => heap_query::diagnostics_for_heap(e, heap, walk(refresh)),
+                None => heap_query::diagnostics(e, walk(refresh)),
+            }
+            .map_err(heap_failure)?;
             let categories: Vec<_> = answer
                 .found
                 .categories
                 .iter()
                 .filter(|category| {
-                    heap_diagnostic_selected(&category.shape, heap, filter.as_deref())
+                    heap_diagnostic_matches_filter(&category.shape, filter.as_deref())
                 })
                 .collect();
             let examples: Vec<_> = answer
                 .found
                 .examples
                 .iter()
-                .filter(|example| heap_diagnostic_selected(example, heap, filter.as_deref()))
+                .filter(|example| heap_diagnostic_matches_filter(example, filter.as_deref()))
                 .collect();
             let (example_rows, category_rows) =
                 split_row_budget(limit, examples.len(), categories.len());
@@ -4103,19 +4109,11 @@ mod tests {
     }
 
     #[test]
-    fn heap_diagnostic_filter_uses_the_hex_heap_needle() {
-        let example = "cannot discover heap 0x10000: VS free tree unreadable";
-        assert!(heap_diagnostic_selected(
-            example,
-            Some(0x10000),
-            Some("free TREE")
-        ));
-        assert!(!heap_diagnostic_selected(example, Some(0x20000), None));
-        assert!(!heap_diagnostic_selected(
-            example,
-            Some(0x10000),
-            Some("LFH")
-        ));
+    fn heap_diagnostic_filter_matches_generalised_categories_case_insensitively() {
+        let category = "unreadable VS free tree node <address>: sparse memory";
+        assert!(heap_diagnostic_matches_filter(category, None));
+        assert!(heap_diagnostic_matches_filter(category, Some("free TREE")));
+        assert!(!heap_diagnostic_matches_filter(category, Some("LFH")));
     }
 
     // ---- the protocol channel this worker was handed -------------------------------

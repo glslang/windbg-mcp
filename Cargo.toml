@@ -4,7 +4,7 @@ version = "0.8.1"
 edition = "2024"
 
 [dependencies]
-win-kexp = { git = "https://github.com/glslang/win-kexp", branch = "main" }
+win-kexp = { git = "https://github.com/glslang/win-kexp", rev = "a5a044ee41fc521c1cb2fa5cf1b07e5282eca2ec" }
 # 3.1.1 is a floor, not a preference: every 3.x before it generates a `tools/list` that omits
 # SEP-2549's required `ttlMs`/`cacheScope`, which a spec-strict `2026-07-28` client rejects
 # outright — the server connects and appears to expose no tools at all (upstream issue #1114).
