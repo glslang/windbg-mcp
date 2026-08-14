@@ -1446,23 +1446,28 @@ fn render_modules(list: &structured::ModuleList) -> String {
 /// the addresses are this module's one representation (`0x` and sixteen digits, always) and the
 /// symbol state is a short word. Names are never truncated to fit: a listing whose text and values
 /// disagree about a *name* is the disagreement this rendering exists to remove.
+///
+/// **The names are the target's, not this server's**, so they go through [`renderable`] like any
+/// other untrusted string — and the width is measured on what is actually printed, so an escaped
+/// name still lines its row up.
 fn module_table(rows: &[structured::ModuleInfo], names: &str) -> String {
+    let listed: Vec<_> = rows
+        .iter()
+        .map(|row| renderable(row.listed_name()))
+        .collect();
     // At least as wide as the column's own header, which is also the answer for a table with no
     // rows in it — `format!`'s width counts characters, so this does too.
-    let width = rows.iter().fold(names.chars().count(), |width, row| {
-        width.max(row.listed_name().chars().count())
+    let width = listed.iter().fold(names.chars().count(), |width, name| {
+        width.max(name.chars().count())
     });
     let mut out = format!("{:<18}  {:<18}  {names:<width$}  symbols\n", "start", "end");
-    for row in rows {
+    for (row, name) in rows.iter().zip(&listed) {
         // Trimmed at the end: the last column is padded for nothing, and trailing spaces on every
         // line of a tool result are noise.
         out.push_str(
             format!(
-                "{}  {}  {:<width$}  {}",
-                row.start,
-                row.end,
-                row.listed_name(),
-                row.symbols
+                "{}  {}  {name:<width$}  {}",
+                row.start, row.end, row.symbols
             )
             .trim_end(),
         );
@@ -1515,7 +1520,7 @@ const WHERE_UNLOADED: &str = "listed above under `Unloaded modules` and carried 
 /// answer rather than a miss, so it is reported as a count of what was found and not as a caveat
 /// about what was not.
 fn narrowing_note(pattern: &str, matched: usize, loaded: usize, unloaded: usize) -> String {
-    let pattern = quotable(pattern);
+    let pattern = renderable(pattern);
     match (matched, unloaded) {
         // Nothing at all. The only branch that offers advice, because it is the only one where the
         // caller has nothing and may have asked the wrong question.
@@ -1538,50 +1543,64 @@ fn narrowing_note(pattern: &str, matched: usize, loaded: usize, unloaded: usize)
     }
 }
 
-/// The caller's own pattern, made safe to **quote into** the listing: a control character is
-/// rendered as an escape rather than acted on.
+/// A string from **outside this server**, made safe to put in the listing: anything that could
+/// break out of the row or the span it is printed in is rendered as an escape rather than acted on.
 ///
-/// The listing is line-oriented and its rows begin with an address, so a filter carrying a newline
-/// would print as *two* lines — and the second can be shaped exactly like a row, putting a module
-/// in the text that the values beside it do not have. That is the one property this rendering
-/// exists to hold, and it must not depend on what a caller typed. Until #120 the filter was
-/// command text and `reject_command_breakers` refused line breaks along with `;`; the command went,
-/// and the refusal with it, which is what left this open.
+/// Two such strings, and the reason is the same for both. The listing is line-oriented and its rows
+/// begin with an address, so a string carrying a line break prints as *two* lines — and the second
+/// can be shaped exactly like a row, putting a module in the text that the values beside it do not
+/// have. That is the one property this rendering exists to hold, and it must not depend on what a
+/// caller typed or on what the target calls itself:
+///
+/// * **the caller's `filter`**, quoted into the note. Until #120 it was command text and
+///   `reject_command_breakers` refused line breaks along with `;`; the command went, and the
+///   refusal with it, which is what left this open.
+/// * **the module and image names**, which come from the target. Windows file names exclude the
+///   characters below `0x20`, and nothing else: a driver may legally be named with a `U+2028`, and
+///   a target being *analysed* is the last place to assume it is not — this server is pointed at
+///   malware on purpose.
 ///
 /// Escaped rather than refused, because "nothing matches this" is a perfectly good answer to a
-/// pattern no module is named — and because it covers `\r` and an ANSI escape for the same money,
-/// where a line-break refusal would let those through to a terminal.
+/// pattern no module is named, and because a module named something hostile still has to be
+/// listable. It also covers `\r` and an ANSI escape for the same money, where refusing line breaks
+/// would let those through to a terminal.
 ///
-/// Only the pattern needs it. Everything else in the listing comes from the engine's module table,
-/// where the names are Windows file names — which cannot contain a character below `0x20`.
-fn quotable(pattern: &str) -> std::borrow::Cow<'_, str> {
-    if !pattern.contains(starts_a_new_line) {
-        return std::borrow::Cow::Borrowed(pattern);
+/// [`renderable`] is not Markdown escaping and does not try to be — the backtick is in the set
+/// because it is the delimiter this listing quotes with, so a string carrying one can hand what
+/// follows it to a Markdown-rendering client as markup.
+fn renderable(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(escapes_the_listing) {
+        return std::borrow::Cow::Borrowed(text);
     }
-    let mut out = String::with_capacity(pattern.len());
-    for c in pattern.chars() {
-        if starts_a_new_line(c) {
-            out.extend(c.escape_debug());
-        } else {
-            out.push(c);
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            // `escape_debug` leaves a *printable* character alone, and a backtick is printable: it
+            // is escaped here for what it does to the container, not for what it is.
+            '`' => out.push_str("\\u{60}"),
+            c if escapes_the_listing(c) => out.extend(c.escape_debug()),
+            c => out.push(c),
         }
     }
     std::borrow::Cow::Owned(out)
 }
 
-/// Whether a character could put what follows it on a line of its own — **in any renderer**, not
-/// only in [`str::lines`].
+/// Whether a character could put what follows it outside the row or the span it was printed in.
 ///
-/// [`char::is_control`] is the obvious test and is not enough: it is the `Cc` category, which holds
-/// `\n`, `\r`, `\u{b}`, `\u{c}` and NEL, but *not* `U+2028 LINE SEPARATOR` or
-/// `U+2029 PARAGRAPH SEPARATOR` — which are `Zl`/`Zp`, break a line in a Unicode-aware renderer,
-/// and are invisible to `lines()` and so to a test written against it. Those two are the rest of
-/// Unicode's line-break set, which is what this is.
+/// **Line breaks, in any renderer** — not only in [`str::lines`]. [`char::is_control`] is the
+/// obvious test and is not enough: it is the `Cc` category, which holds `\n`, `\r`, `\u{b}`,
+/// `\u{c}` and NEL, but *not* `U+2028 LINE SEPARATOR` or `U+2029 PARAGRAPH SEPARATOR` — which are
+/// `Zl`/`Zp`, break a line in a Unicode-aware renderer, and are invisible to `lines()` and so to a
+/// test written against it. Those two are the rest of Unicode's line-break set.
 ///
 /// The controls that are *not* line breaks stay in for a second reason: an ESC in a listing is an
 /// ANSI sequence a terminal acts on.
-fn starts_a_new_line(c: char) -> bool {
-    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}')
+///
+/// **And the backtick**, which is the listing's own quoting delimiter: a pattern containing one
+/// closes the code span it was quoted into, and everything after it is markup to a client that
+/// renders Markdown — `<br>` included, which is a line break this would otherwise never see.
+fn escapes_the_listing(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '`')
 }
 
 /// Everything a bug check is, gathered as one indivisible job.
@@ -5075,9 +5094,62 @@ mod tests {
             assert!(listed_rows(&text).is_empty(), "{text}");
         }
 
+        // **The delimiter itself.** The pattern is quoted in a code span, so a backtick in it ends
+        // the span — and everything after it is markup to a client that renders Markdown, `<br>`
+        // included, which is a line break no character-level guard would ever see.
+        let text = listing("zzz`<br>0xfffff80389200000  0xfffff8038a650000  smuggled  pdb");
+        assert!(
+            !text.contains("zzz`"),
+            "a pattern must not be able to close the span it is quoted in:\n{text}"
+        );
+        assert!(
+            text.contains(r"\u{60}"),
+            "…and the backtick is shown: {text}"
+        );
+        assert!(listed_rows(&text).is_empty(), "{text}");
+
         // An ordinary pattern is quoted exactly as it was applied — this guard is invisible to
         // every filter anyone actually types.
         assert!(listing("nt[fd]*").contains("`nt[fd]*`"));
+    }
+
+    /// A **module name** is the target's to choose, so the same guard covers the rows.
+    ///
+    /// Windows file names exclude the characters below `0x20` and nothing else, so a driver may
+    /// legally be called something carrying a `U+2028` — and a server pointed at malware on
+    /// purpose is the last place to assume nobody will. Escaped, not refused: a module named
+    /// something hostile still has to be listable, and its row still has to be its row.
+    #[test]
+    fn a_module_name_cannot_smuggle_a_row_either() {
+        let hostile = "drv\u{2028}0xfffff80389200000  0xfffff8038a650000  nt";
+        let list = structured::ModuleList {
+            loaded: 2,
+            filter: None,
+            modules: [module(hostile, 0x1000), module("nt", 0x2000)]
+                .iter()
+                .map(structured::ModuleInfo::from)
+                .collect(),
+            unloaded: Vec::new(),
+        };
+        let text = render_modules(&list);
+        assert_eq!(
+            listed_rows(&text).len(),
+            2,
+            "two records are two rows, whatever they are called:\n{text}"
+        );
+        assert!(
+            !text.contains('\u{2028}'),
+            "the separator is escaped rather than printed: {text:?}"
+        );
+
+        // The column is measured on what is printed, so the escaped row still lines up — the
+        // width and the rendering cannot disagree about the same name.
+        let column = |name: &str| {
+            text.lines()
+                .find(|line| line.contains(name))
+                .and_then(|line| line.find("deferred"))
+        };
+        assert_eq!(column("drv"), column("  nt "), "{text}");
     }
 
     // ---- narrowing a module listing ----------------------------------------

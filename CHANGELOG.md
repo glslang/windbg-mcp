@@ -39,17 +39,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     command any more. The one refusal left is an *empty* filter, which is a caller who meant to
     narrow and sent nothing to narrow by.) Case now folds beyond ASCII too, since there is no
     second fold to stay in step with.
-  - **A filter cannot add a line to the listing.** It is quoted into the text, and the listing is
-    line-oriented, so anything in it that could start a new line is rendered as an escape rather
-    than acted on — otherwise a pattern carrying a newline and something shaped like a row would
-    put a module in the text that the values beside it do not have, which is the one property this
-    change is for. (Until now the filter was command text, and the `;` check refused line breaks
-    along with the separator; the command went, and that refusal with it.) Escaped rather than
-    refused, because "nothing matches this" is a good answer to a pattern nothing is named — and
-    because it covers `\r` and an ANSI escape for the same money. The guard is Unicode's whole
-    line-break set, not `char::is_control`: `U+2028`/`U+2029` are `Zl`/`Zp` rather than `Cc`, break
+  - **Nothing from outside can add a line to the listing.** The listing is line-oriented and its
+    rows begin with an address, so a string carrying a line break prints as two lines — and the
+    second can be shaped exactly like a row, putting a module in the text that the values beside it
+    do not have, which is the one property this change is for. Both strings that come from outside
+    this server are escaped rather than acted on: the caller's `filter`, quoted into the note (until
+    now it was command text, and the `;` check refused line breaks along with the separator — the
+    command went, and that refusal with it), and the **module and image names**, which are the
+    target's to choose. Windows file names exclude the characters below `0x20` and nothing else, so
+    a driver may legally be named with a `U+2028`, and a server pointed at malware on purpose is the
+    last place to assume none is.
+
+    Escaped, not refused: "nothing matches this" is a good answer to a pattern nothing is named, and
+    a module named something hostile still has to be listable — its row is still its row, and the
+    name column is measured on what is printed so it still lines up. The guard is Unicode's whole
+    line-break set rather than `char::is_control` (`U+2028`/`U+2029` are `Zl`/`Zp`, not `Cc`, break
     a line in a renderer that knows Unicode, and are invisible to `str::lines` — so to a test
-    written around it.
+    written around it), the other control characters (an ANSI escape is a thing a terminal acts on),
+    and the backtick, which is the delimiter the note quotes with: a pattern containing one closes
+    the code span, handing what follows to a Markdown-rendering client as markup.
   - **Case-insensitive means both directions.** The filter compares Unicode's simple case mappings
     per character, upward as well as down: `Σ` lowercases to `σ` while final sigma `ς` lowercases
     to itself, so lowercasing alone would have missed a name spelled with `ς` — case-insensitive
