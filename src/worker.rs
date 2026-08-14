@@ -3212,6 +3212,37 @@ mod tests {
         }
     }
 
+    /// The gap figures reach an answer through `walk_info`, which is a struct literal: a field
+    /// wired to `None`, or to the wrong half of the report, compiles and silently drops what the
+    /// walk measured. `structured` proves the mapping; this proves the assignment.
+    #[test]
+    fn walk_info_carries_what_the_walk_measured() {
+        let mut report = quiet_walk();
+        assert!(
+            walk_info(&report).gaps.is_none(),
+            "a walk that met none of it reports none"
+        );
+
+        report.stalls = WalkStalls {
+            pages: 2,
+            skipped_bytes: 0x2000,
+            recovered_bytes: 0x8000,
+        };
+        report.refused_chunks = 7;
+        let gaps = walk_info(&report)
+            .gaps
+            .expect("a walk that stalled has gaps to report");
+        assert_eq!(
+            (
+                gaps.stalled_pages,
+                gaps.skipped_bytes,
+                gaps.recovered_bytes,
+                gaps.refused_chunks
+            ),
+            (2, 0x2000, 0x8000, 7)
+        );
+    }
+
     fn report_with(complete: bool, diagnostics: &[&str]) -> query::PoolSnapshotReport {
         query::PoolSnapshotReport {
             total_chunks: 4211,
