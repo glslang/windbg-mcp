@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-08-14
+
 ### Changed
 
 - **`modules` renders its listing from its own values, and no longer runs `lm`**
@@ -101,7 +103,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   but `nt` in the engine's inventory yet — it says one module, rather than implying a complete
   list.
 
+- **An allocator answer says what decoded it, and sizes what a partial walk missed**
+  ([#121](https://github.com/glslang/windbg-mcp/pull/121),
+  [#126](https://github.com/glslang/windbg-mcp/pull/126),
+  [win-kexp#102](https://github.com/glslang/win-kexp/pull/102),
+  [win-kexp#103](https://github.com/glslang/win-kexp/issues/103)). Every `pool_*` answer — and every
+  `heap_*` answer added below — now carries `layout`: the image the decoder read, its PDB, a
+  fingerprint, and the validated structural family. A walk is only as trustworthy as the types
+  behind it, and until now the answer named none of them.
+
+  Beside it, `walk.gaps` turns `coverage: partial` into a quantity. `partial` said a walk did not
+  cover the allocator; it could not say by how much, and `pool_diagnostics` could not either — it
+  collapses messages by shape, so the count beside a category counts occurrences of that shape, not
+  bytes and not chunks. One unreadable page and a third of the pool read identically. The five
+  figures are `stalled_pages` (pages a valid-region query could not advance over), `skipped_bytes`
+  (what those steps wrote off), `recovered_bytes` (committed memory read *past* them in the same
+  regions — the number the walker's stall handling is judged by, and meaningless except next to
+  `skipped_bytes`, which is why they travel together rather than as one "how bad was it" score),
+  `refused_chunks`, and `unplaced_bytes`.
+
+  The last two are a pair, and both had to be reported for either to be honest. `refused_chunks`
+  counts headers a decoder refused and resynchronised past — the first live 26100 walk to report it
+  returned 106,516 refusals across 542 extents, which is not a population of 106,516 bad chunks: a
+  refusal resynchronises sixteen bytes along and tries again, so one lost sync bills a refusal per
+  sixteen bytes until it recovers, about 3 KB of brute-force scanning per affected extent. It sizes
+  the disruption, and how far to discount the chunks reported from those extents.
+  `unplaced_bytes` is its counterpart: committed bytes of a variable-size subsegment the walk
+  declined to decode at all because it could not say where a chunk began in them. A walk that stops
+  guessing has to report what stopping cost, or a clean refusal count reads as a walk that saw
+  everything.
+
+  `gaps` is **absent** when a walk met none of it, which is the ordinary case — five zeroes on every
+  healthy answer are noise on the answers that are fine.
+
 ### Added
+
+- **User Segment Heap walking, as five typed tools**: `heap_list`, `heap_allocations`, `heap_chunk`,
+  `heap_census` and `heap_diagnostics` ([#122](https://github.com/glslang/windbg-mcp/pull/122),
+  [win-kexp#105](https://github.com/glslang/win-kexp/pull/105)). 0.7.0 gave the kernel pool a
+  decoder that answers in values; a *user* heap was still `!heap` text to scrape. These are the same
+  decoder pointed at the other allocator, and they ride the same worker path the `pool_*` tools do —
+  queue budgeting, the caller's deadline, `interrupt`, partial coverage and the per-session snapshot
+  all behave as they do there.
+
+  The roots come from the current process's PEB, resolved through `ntdll`'s own PDB types
+  (`NumberOfHeaps`, `ProcessHeaps`) rather than an offset table. `heap_list` reports every one of
+  them and, more usefully, says which it did *not* walk and why: Segment Heaps walked, classic NT
+  heaps listed and skipped, roots whose signature was unrecognised, roots whose signature could not
+  be read. Then `heap_allocations` filters chunks by heap, backend (`lfh`, `vs`, `segment`, `large`),
+  state and capacity; `heap_chunk` names the allocation containing an address, the offset into it,
+  and its contiguous neighbours in the same heap, backend and subsegment; `heap_census` groups the
+  heaviest heap/backend/state/size-class combinations; and `heap_diagnostics` filters the walk's own
+  diagnostic categories and kept examples, optionally scoped to one heap root.
+
+  What the answers carry beyond the chunks is the point of having them typed:
+
+  - **`layout` says what decoded this** — the exact loaded image, its PDB, a fingerprint, and the
+    structurally validated VS family (`inline_vs` or `affinity_slot_vs`). That last field is why
+    these are described as version-aware: the variable-size metadata moved *out* of
+    `_HEAP_VS_CONTEXT` in current builds, so a decoder keyed to a build number is correct until the
+    build it was not tried on, and reports plausible chunks rather than failing. The family is
+    chosen by validating the structure the PDB describes, and an ambiguous or unfamiliar one is
+    refused rather than guessed at.
+  - **`capacity` is allocator-backed; `requested_size` is not always there.** Capacity is what the
+    allocation occupies. The size originally asked for is reported only when the selected schema
+    validates the exact unused-byte metadata — its absence means *unknown*, and specifically not
+    "equal to capacity".
+  - **`scope` and `walk`** say which roots were in the answer and how much of them was covered, on
+    the same `complete`/`deadline_truncated`/`partial` terms as a pool answer. An address the walk
+    never reached is not an address that was freed.
+  - **`state` defaults to `allocated`**, so a question about freed memory has to ask for
+    `reusable_free` or `cached_free` by name — the alternative is a caller reasoning about
+    use-after-free from a listing that quietly omitted the frees.
+
+  V1 covers x64 Segment Heaps in a stopped live target or a dump with the memory to walk. Classic NT
+  heaps, WOW64 and ARM64 are out of scope and say so; `execute { "command": "!heap ..." }` remains
+  the answer for a classic heap, and is what `heap_list` points at. The agent-facing workflow is
+  [`skills/windbg-debugging/heap-walking.md`](skills/windbg-debugging/heap-walking.md).
 
 - **`modules` takes a `filter`**, so "where is that driver loaded?" costs one row rather than the
   whole table ([#105](https://github.com/glslang/windbg-mcp/issues/105)). A plain name matches
@@ -160,6 +238,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a walk cut short answers with what it really read rather than failing. The one part that
   *is* a command — the `?` resolving a symbolic `start`, which can block on a symbol server —
   takes the watchdog with what is left of the walk's budget.
+
+### Fixed
+
+- **An allocator snapshot is retired when the target could have moved under it**, instead of waiting
+  for a caller to remember `refresh: true`. The pool snapshot has been cached per session since
+  0.7.0, and the contract was that a caller who let the target run said so on the next query — which
+  makes a stale answer the default outcome of forgetting, and a stale pool answer is not obviously
+  wrong to the person reading it. Anything that resumes or steps the target now invalidates it
+  (`go`, the steps, `reverse_go`, `run_to_address`, and a `debug_batch`'s resume steps), and so does
+  any raw command — `execute` and a batch's command steps — because DbgEng offers no reliable way to
+  classify what arbitrary debugger text did, and `eb`, `.reload` and `g` are all just text. The
+  invalidation happens even when the command *failed*: a command list can change memory before
+  reaching the token it fails on. `refresh: true` still exists and is still worth passing at the
+  observation an argument rests on, but it is now a statement of intent rather than the only thing
+  standing between a caller and a snapshot of a target that has since moved.
 
 ## [0.8.1] - 2026-08-13
 
@@ -1158,7 +1251,8 @@ Initial release, packaged as a single-plugin Claude Code marketplace.
 - Crash-dump `!analyze` support via automatic WinDbg extension DLL loading.
 - Windows CI (format, clippy, build, test) and walkthrough docs with sample dumps.
 
-[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/glslang/windbg-mcp/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/glslang/windbg-mcp/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/glslang/windbg-mcp/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/glslang/windbg-mcp/compare/v0.6.0...v0.7.0
