@@ -133,11 +133,21 @@ single-owner, so in parallel the second attach fails and can leave the target ha
 
 **Check the target is reachable before starting the tier, not by starting it.** A KDNET attach that
 finds nothing parks its worker in `WaitForEvent(INFINITE)` for the whole run and reports a timeout
-that measures the environment rather than the code. This debugger host is itself a Hyper-V guest —
-`Get-VM` does not exist here and there is no local VM to start — so the target is a *sibling* guest:
-find it in the neighbour table (`Get-NetNeighbor | ? LinkLayerAddress -like '00-15-5D*'`) and probe
-**TCP 5985**, since it answers WinRM and nothing else. ICMP and 445 are closed, so a failed ping
-proves nothing.
+that measures the environment rather than the code.
+
+What settles it is not "can I reach the guest" but **does the guest's `bcdedit /dbgsettings hostip`
+equal this debugger host's current IP**, on the port the profile names — that is what makes the
+target dial in, and the host IP moves between sessions. Read it on the guest and compare the key by
+*hash* rather than printing it. That check is the same everywhere; how you reach the guest to run it
+is not.
+
+*Finding* the guest is topology-specific, so what follows is one instance and not the procedure. On
+the machine this was written for, the debugger host is itself a Hyper-V guest — `Get-VM` does not
+exist and there is no local VM to start — so the target is a *sibling*: it appears in the neighbour
+table (`Get-NetNeighbor | ? LinkLayerAddress -like '00-15-5D*'`) and answers **TCP 5985** and
+nothing else, ICMP and 445 being closed, so a failed ping proves nothing there. Elsewhere it may be
+a local VM, another hypervisor, or one of several neighbours — and with several, the neighbour table
+alone will happily validate the wrong guest, which is what the `hostip` comparison above is for.
 
 ## Live kernel + driver IOCTL gotchas (learned driving HEVD over KDNET)
 
