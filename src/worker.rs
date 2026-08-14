@@ -2639,6 +2639,7 @@ fn walk_info(report: &query::PoolSnapshotReport) -> structured::WalkInfo {
         allocated_chunks: report.allocated_chunks,
         diagnostics_emitted: report.diagnostics.emitted(),
         diagnostic_categories: report.diagnostics.shapes().len(),
+        gaps: structured::WalkGaps::of(report),
     }
 }
 
@@ -3191,9 +3192,25 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
+    use win_kexp::pool::WalkStalls;
+
     use super::*;
 
     // ---- pool walk diagnostics ------------------------------------------------------
+
+    /// A report from a walk that met no unreadable page and refused no chunk, for the fixtures
+    /// below to spread over their own fields. They exercise the diagnostic *rendering*; what
+    /// the gap figures do with a walk that met either is `structured`'s question.
+    fn quiet_walk() -> query::PoolSnapshotReport {
+        query::PoolSnapshotReport {
+            total_chunks: 0,
+            allocated_chunks: 0,
+            coverage: coverage(true),
+            diagnostics: PoolDiagnostics::default(),
+            stalls: WalkStalls::default(),
+            refused_chunks: 0,
+        }
+    }
 
     fn report_with(complete: bool, diagnostics: &[&str]) -> query::PoolSnapshotReport {
         query::PoolSnapshotReport {
@@ -3201,6 +3218,7 @@ mod tests {
             allocated_chunks: 3007,
             coverage: coverage(complete),
             diagnostics: diagnostics.iter().map(|line| line.to_string()).collect(),
+            ..quiet_walk()
         }
     }
 
@@ -3227,6 +3245,7 @@ mod tests {
             allocated_chunks: 3007,
             coverage: coverage(false),
             diagnostics: lines.into_iter().collect(),
+            ..quiet_walk()
         }
     }
 
@@ -3335,6 +3354,7 @@ mod tests {
             allocated_chunks: 3007,
             coverage: coverage(true),
             diagnostics: lines.into_iter().collect(),
+            ..quiet_walk()
         }
     }
 

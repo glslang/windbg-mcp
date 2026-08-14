@@ -2426,6 +2426,10 @@ impl WindbgServer {
     /// hundred-plus categories, so the summaries the other tools print are necessarily
     /// truncated — and the one line explaining a specific heap is reliably not in the
     /// truncated head. Filter by a heap address or a phrase to get at it.
+    /// For *how much* a walk missed rather than why, `walk.gaps` on any pool answer already says
+    /// it — pages stepped over, bytes skipped against bytes read past them, chunk headers
+    /// refused — and the diagnostics cannot, since a category's count counts occurrences of a
+    /// message shape rather than bytes or chunks.
     #[rmcp::tool(
         annotations(
             title = "Filter pool walk diagnostics",
