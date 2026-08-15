@@ -163,8 +163,8 @@ pool_diagnostics { "filter": "13a0" }   // a plain case-insensitive substring, n
 ## 5. Defeating ASLR from outside the driver
 
 There is **no read-back IOCTL**, so the exploit cannot leak addresses through the driver. Everything
-it needs comes from `NtQuerySystemInformation`, all available at medium IL
-(`examples/messagemanager/mm_exploit.c`, `leak` mode):
+it needs comes from `NtQuerySystemInformation` (`examples/messagemanager/mm_exploit.c`, `leak` mode) —
+**at administrative / high integrity**, which is the integrity level these outputs were captured at:
 
 ```text
 [leaks]
@@ -185,6 +185,14 @@ it needs comes from `NtQuerySystemInformation`, all available at medium IL
 Each value cross-checks against the debugger: `x nt!PsInitialSystemProcess` prints exactly
 `0xfffff806777c5ab0`, and `lm` gives the same driver base — so the leak plumbing is sound before a
 single byte of the driver is corrupted.
+
+> **Integrity matters here, and it is a genuine limit.** Re-run as a real non-administrative
+> `lowuser`, every one of these classes returns its kernel pointers **zeroed** — `ntoskrnl base`,
+> `_EPROCESS`, `_KTHREAD`, and each big-pool VA all come back `0x0`, though the big-pool *count* still
+> returns. That is the 24H2/2025 hardening that withholds kernel addresses from medium integrity
+> without `SeDebugPrivilege`. So the disclosure step is an **admin capability**; the escalation this
+> walkthrough builds is **admin → SYSTEM** unless paired with a separate medium-IL info leak. The
+> reclaim primitive (§9) *is* medium-IL — only the address disclosure is not.
 
 ## 6. Measure grooming before trusting it
 
@@ -604,7 +612,80 @@ owed the debugger, the `+0x08` write-what is retired by `FSCTL_PIPE_LISTEN` — 
 freed `Tgsm` slots at 15/31 — and the reciprocal store by the forged `_DRIVER_OBJECT`, leaving the
 clean chosen-target ordering as the last one."**
 
-## 10. Streamlining the next kernel CTF
+## 10. From write-what-where to SYSTEM
+
+§9 proves a *pointer install* — the unlink writes an attacker pointer to an attacker address. Two
+questions remained: does that write actually land (rather than fault), and do the primitives compose
+into privilege escalation? Both are answered below, and both surfaced a correction to an assumption
+this walkthrough had carried since §5.
+
+### The unlink write lands
+
+Reversing Flush's free path (`MessageManager+0x14de`) shows the unlink is a textbook
+`RemoveEntryList`, and it fires on *every* node it frees, before the refcount check:
+
+```text
++0x14de  mov rax,[rcx+8]     ; Blink        (rcx = &msg->LIST_ENTRY = msg+0x08)
++0x14e6  mov rbp,[rcx]       ; Flink
++0x14e9  mov [rax],rbp       ; [Blink]   = Flink
++0x14ec  mov [rbp+8],rax     ; [Flink+8] = Blink
+```
+
+Driven deterministically (park three messages, set one target's `Flink` to a chosen address `A` and
+`RefCount` to 1 under KD, then a single user-mode `Flush`), the store `[Flink+8]=Blink` wrote to
+`A+0x08` — a destination fully chosen — and the qword there changed with no fault. That run also
+corrected the model: `Blink` came back as the *list head*, not the value placed, because the walk
+removes every node and the earlier removals collapse a later node's `Blink` before it is reached. **To
+control both unlink pointers the fake must be the first message on the list**, so its `Blink` survives.
+
+### An arbitrary read from the write
+
+Every step beyond a pointer install wants a *read* — the RIP route needs `DeviceObject =
+[FILE_OBJECT+0x08]`, and a token swap needs the System token value — and `PreviousMode = 0`, the
+read-free shortcut, bugchecks `0x1F9` on this build. So the read is built from the write.
+
+`_ETHREAD.ThreadName` (`+0x6a0` on 26100) is a `PUNICODE_STRING`;
+`NtQueryInformationThread(ThreadNameInformation)` copies `Length` bytes from `ThreadName->Buffer` to a
+user buffer. Point that pointer at a fake `UNICODE_STRING{Length=8, Buffer=target}` — parked in a
+page-aligned big-pool `FSCTL_PIPE_LISTEN` buffer whose address `SystemBigPoolInformation` reports — and
+the query returns `[target]`. Placing the ThreadName pointer with KD (standing in for the unlink) and
+aiming the fake at `FILE_OBJECT+0x08`, the query returned the `MessageDevice` DEVICE_OBJECT, confirmed
+against `!devobj`. One write of a known value to a known address becomes an arbitrary kernel read.
+
+### The chain reaches SYSTEM
+
+Composed end to end, with KD placing only the two unlink-shaped pointer writes: a process reads the
+System token through the gadget (`[PsInitialSystemProcess+0x248]`) and installs it into its own
+`EPROCESS.Token` — a pointer install, exactly the shape the unlink provides.
+
+```text
+before: WIN-...\Admin
+gadget read System token = 0xffffd58699226309
+after:  NT AUTHORITY\SYSTEM
+```
+
+KD independently confirmed the process's `Token` became `ffffd58699226300`, the System token. The read
+and write halves compose; the only thing KD stands in for is *landing* the writes — the ordering.
+
+![MessageManager pool UAF composed to SYSTEM](../examples/messagemanager/system-proof.gif)
+
+*(Reconstructed terminal session — source:
+[`system-proof.cast`](../examples/messagemanager/system-proof.cast), `asciinema play`.)*
+
+### The honest boundary: two things are still owed
+
+- **The address leak is not medium-integrity.** Run as a real non-administrative `lowuser`,
+  `SystemModuleInformation`, `SystemExtendedHandleInformation` and `SystemBigPoolInformation` return
+  their kernel pointers **zeroed** (the big-pool *count* still comes back, the addresses do not) — a
+  24H2/2025 hardening. At admin they are all real. So this chain is **admin → SYSTEM**; a genuine
+  medium-IL escalation needs a separate information-leak primitive. The `FSCTL_PIPE_LISTEN` *reclaim*
+  is medium-IL; the address *disclosure* is not.
+- **The ordering is still KD's.** Every debugger-free step — the read gadget's write, the forged-driver
+  RIP, the token install — needs Flush to unlink a *cleanly reclaimed* fake, and a throttled race still
+  crashes on a dirty stale node before reaching a clean one. That single unproven step is what the
+  whole debugger-free claim now rests on.
+
+## 11. Streamlining the next kernel CTF
 
 This run exposed several improvements that would remove orchestration risk without hiding the
 debugger mechanics.
