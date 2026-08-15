@@ -255,8 +255,10 @@ chain no longer needs the debugger. The caveat is offset control. `FSCTL_PIPE_WA
 validated length, not a pointer), `+0x10..` the pipe name. So it controls `+0x00` and `+0x10`
 onward — reaching **Buffer `+0x18`, the arbitrary-free primitive** — but **not** Flink `+0x08` as a
 kernel pointer, which the §9 *unlink* RIP specifically writes. Removing the assist from the unlink
-variant still needs an offset-`0` primitive that also frees `+0x08`; the data-only **arbitrary-free**
-route (`ExFreePoolWithTag(msg+0x18)`, §3/§6) is now reachable with a fully natural reclaim, and a
+variant needs an offset-`0` primitive that also leaves `+0x08` free — and, as §9 works out, that is
+necessary but not sufficient: the unlink's reciprocal store then demands a `Flink` whose `+0x08` is
+*writable*, which a code pointer never is. The data-only **arbitrary-free** route
+(`ExFreePoolWithTag(msg+0x18)`, §3/§6) is now reachable with a fully natural reclaim, and a
 double-free → type-confusion would sidestep `+0x08` entirely.
 
 The [SSTIC 2020 pool-overflow work](https://www.sstic.org/2020/presentation/pool_overflow_exploitation_since_windows_10_19h1/)
@@ -414,7 +416,10 @@ fake.Blink = &DriverObject->MajorFunction[IRP_MJ_CREATE]
 ```
 
 The first unlink store therefore installs a kCFG-valid kernel export in the dispatch slot. The
-reciprocal store would try to write into read-only kernel code, so KD temporarily changes `+0x16f2`
+second store is not a driver quirk: the pair is a textbook `RemoveEntryList` — `Blink->Flink = Flink`
+then `Flink->Blink = Blink` — and the driver has no idea either pointer is forged. It targets
+read-only kernel code only because *this attack* chose a code address for `Flink`, which makes the
+store `[nt!DbgBreakPointWithStatus+8] = Blink`. So KD temporarily changes `+0x16f2`
 to `jmp $`. A second harness thread, pinned to CPU 3, continuously opens `\\.\MessageDevice`; the
 stale SetData caller remains on CPU 0. Once the dispatch pointer changes, the trigger thread reaches
 the selected target through the normal I/O manager indirect call.
@@ -458,12 +463,69 @@ debugger-assisted, but the pieces it depended on have fallen away one at a time:
 **reclaim** natural (a pending `FSCTL_PIPE_WAIT`/`IoSB` spray reclaims freed `Tgsm` slots 8/16,
 attacker-controlled from `+0x00`, no debugger), and §8 makes the **trigger** natural (the high-volume
 `drift` race fires `ExFreePoolWithTag` on a use-after-free MESSAGE from user mode, three dumps, no
-debugger and no Verifier). What the *unlink* variant in this section still specifically needs is
-`+0x08` as a kernel pointer, which the `IoSB` buffer pins to `NameLength`; that store, and the
-precise free-vs-reclaim *ordering* a clean chosen-target arbitrary free needs (§8), are what KD still
-buys. This makes no claim of privilege escalation; it moves the boundary from "reclaim needs KD"
-through "trigger needs KD" to **"the primitives fire debugger-free; only the `+0x08` unlink store and
-the clean chosen-target ordering remain KD-assisted."**
+debugger and no Verifier). What this section still owes the debugger is **three** things, not two:
+
+1. **The write-what.** `Flink` at `+0x08` has to be a kernel pointer, and the `IoSB` buffer pins that
+   qword to `NameLength` (a validated length) followed by `TimeoutSpecified` and the first name
+   `WCHAR`.
+2. **The reciprocal store.** `Flink->Blink = Blink` is unconditional, so `Flink+0x08` has to be
+   writable. KD's `jmp $` is what makes that true here.
+3. **The ordering** a clean chosen-target arbitrary free needs (§8).
+
+The second is the one that decides whether this route can *ever* be debugger-free, because **as
+written above** it stands in direct opposition to RIP itself. A value the dispatch slot will accept
+has to be a kCFG-valid function entry; function entries live in read-only `.text`; so `Flink+0x08` is
+unwritable **precisely because** `Flink` is executable. Put the code pointer in `Flink` and the unlink
+can hand over RIP or survive its own second store, not both.
+
+That opposition is an artifact of *where the code pointer sits*, though, and it dissolves one
+indirection later. `IopfCallDriver` reloads the driver object from the device object on every
+dispatch, and validates nothing in between:
+
+```text
+nt!IopfCallDriver+0x4a:
+  mov  rcx,qword ptr [rcx+8]         ; rcx = DeviceObject->DriverObject
+  mov  rax,qword ptr [rcx+r9*8+70h]  ; rax = DriverObject->MajorFunction[major]
+  call nt!KscpCfgDispatchUserCallTargetEsSmep
+```
+
+No type tag, no size field, no signature — and the kCFG guard checks the *call target*, not the object
+it was loaded out of. So aim `Blink` at `DeviceObject->DriverObject` (`_DEVICE_OBJECT+0x08`) and
+`Flink` at a **forged `_DRIVER_OBJECT`**, and the first store redirects every later dispatch through
+attacker data. The reciprocal store then writes `Blink` into the forged object's own `+0x08` —
+`_DRIVER_OBJECT.DeviceObject`, which this path never reads — so it is not *survived*, it is
+**harmless**, and it drops the target's address into a buffer we own as a bonus leak. The code pointer
+moves out of `Flink` and into the forged `MajorFunction[IRP_MJ_CREATE]` at `+0xE0`, where it is
+ordinary sprayed data that still satisfies kCFG because it is still a real export. The forged object
+therefore has to run to at least `0xE8` bytes, which rules out the reclaimed `0x68` chunk: it is a
+separate allocation whose address is leaked (`SystemBigPoolInformation`, §5), and only the *pointer*
+to it has to fit through `+0x08`.
+
+Which is where (1) still bites — and it is now the only thing in the way. `Flink` has to be that
+address, and the `IoSB` buffer spells that qword `NameLength | TimeoutSpecified | pad | Name[0]`. The
+top 16 bits are `Name[0]`, and `0xFFFF` is an acceptable `WCHAR`; the two bytes below it are copied
+verbatim and pick any of 65536 4 GiB-aligned boundaries. But the low 32 bits are `NameLength`, and
+with LFH in play the binding constraint is the *block*, not an exact size: the reclaiming buffer only
+has to round into the same block as the freed `MESSAGE`. That block is `0x80` — a `0x10` pool header
+over `0x70` of usable bytes — and the buffer is `0x0e + NameLength`, so the real cap is
+`NameLength <= 0x62`; the live spray in §6 used `0x58` and left headroom. Sizing the *hole* up is what
+would actually widen this, and it is not available here: the hole is a `MESSAGE`, whose `0x68` the
+driver fixes. The one attacker-sized allocation this driver makes is the `Tfub` data buffer (up to
+`0x2FF4`), and nothing unlinks a freed `Tfub`, so it cannot carry the fake `LIST_ENTRY`. **The forged
+object is therefore addressable only if attacker bytes exist within `0x62` of a 4 GiB boundary.** That is a
+placement problem rather than an arithmetic one, and it is the open question: a pipe write controls
+its allocation size (less the NPFS header), so a buffer large enough to *straddle* a boundary puts an
+encodable address inside its own controlled data — no need for the allocator to place a chunk at the
+boundary, only to cross one. Expected cost scales as 4 GiB over the buffer size, and misses can be
+freed and retried, but none of that has been measured on this build.
+
+Removing KD from this section therefore means one of: making that placement land, winning the race
+between the first store and the second store's fault, or finding a single-store write primitive.
+
+This makes no claim of privilege escalation; it moves the boundary from "reclaim needs KD" through
+"trigger needs KD" to **"the primitives fire debugger-free; the unlink's `+0x08` write-what, its
+reciprocal store, and the clean chosen-target ordering are what this proof still owes the
+debugger."**
 
 ## 10. Streamlining the next kernel CTF
 
