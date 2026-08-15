@@ -503,11 +503,12 @@ it was loaded out of. So aim `Blink` at `DeviceObject->DriverObject` (`_DEVICE_O
 attacker data. The reciprocal store then writes `Blink` into the forged object's own `+0x08` —
 `_DRIVER_OBJECT.DeviceObject`, which this path never reads — so it is not *survived*, it is
 **harmless**, and it drops the target's address into a buffer we own as a bonus leak. The code pointer
-moves out of `Flink` and into the forged `MajorFunction[IRP_MJ_CREATE]` at `+0xE0`, where it is
-ordinary sprayed data that still satisfies kCFG because it is still a real export. The forged object
-therefore has to run to at least `0xE8` bytes, which rules out the reclaimed `0x68` chunk: it is a
-separate allocation whose address is leaked (`SystemBigPoolInformation`, §5), and only the *pointer*
-to it has to fit through `+0x08`.
+moves out of `Flink` and into the forged `MajorFunction[IRP_MJ_CREATE]` — index 0, so at
+`DRIVER_OBJECT+0x70` (`MajorFunction` base; a `CreateFile` on the device dispatches `IRP_MJ_CREATE`) —
+where it is ordinary sprayed data that still satisfies kCFG because it is still a real export. The
+forged object therefore has to run to at least `0x78` bytes, which rules out the reclaimed `0x68`
+chunk: it is a separate allocation whose address is leaked (`SystemBigPoolInformation`, §5), and only
+the *pointer* to it has to fit through `+0x08`.
 
 Which is where (1) still bites — and it is now the only thing in the way. `Flink` has to be that
 address, and the `IoSB` buffer spells that qword `NameLength | TimeoutSpecified | pad | Name[0]`. The
