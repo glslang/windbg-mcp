@@ -576,19 +576,33 @@ same I/O-manager `SystemBuffer` path `FSCTL_PIPE_WAIT` reclaims freed `Tgsm` slo
 never touches a byte of it, so the pipe-name encoding rules (`towupper`-invariant, no `NUL`, no `\`)
 that constrained `Blink` and `Buffer` in §6 are gone too.
 
+And it reclaims. 64 messages were created bare (no `SetData`, so the refcount reaches zero on a
+single `Delete` — §6), their chunks recorded under KD, then all 64 deleted and 4000 `FSCTL_PIPE_LISTEN`
+buffers sprayed. Of the 31 addresses the walk had resolved, **15 came back as the fake `MESSAGE`** —
+about 48%, against `FSCTL_PIPE_WAIT`'s 8/16:
+
+```text
+ffff8786`d4c17590  01 00 00 00 00 00 00 00  de c0 ad de 07 f8 ff ff
+ffff8786`d4c175a0  02 ee ff c0 04 9a ff ff  52 52 52 52 52 52 52 52
+  pool_chunk: tag IoSB, size 112, non_paged_nx, lfh; neighbours both `Even`
+```
+
+The formerly-`Tgsm` address now carries tag `IoSB` and all four fields verbatim — `RefCount` 1,
+`Flink` the free kernel pointer, `Blink`, `Buffer`. (`pool_chunk` calls the state `reusable_free`;
+that is the 26100 segment-heap LFH misread §6 already documents, and the live content is the truth.)
+The unreclaimed slots still show the free-chunk pattern `00000070'00000000`, so the two outcomes are
+distinguishable rather than assumed.
+
 So the `+0x08` blocker is retired, and with the reciprocal store already harmless by construction,
-the **ordering** is the only KD dependency this section still has. Two caveats keep that from being a
-finished claim: whether these buffers actually land in a *freed* `Tgsm` slot is argued rather than
-measured — `FSCTL_PIPE_WAIT` managed 8/16 through the same path — and the double-free →
-type-confusion route remains the alternative that sidesteps `+0x08` entirely. Racing the first store
-against the second store's fault is retired by the forged object rather than solved, and matters
-again only if the reclaim does not reproduce.
+the **ordering** is the only KD dependency this section still has. Racing the first store against the
+second store's fault is retired by the forged object rather than solved; the double-free →
+type-confusion route remains as the alternative that sidesteps `+0x08` entirely.
 
 This makes no claim of privilege escalation; it moves the boundary from "reclaim needs KD" through
 "trigger needs KD" to **"the primitives fire debugger-free; of the three things the captured proof
-owed the debugger, the `+0x08` write-what is retired by `FSCTL_PIPE_LISTEN` and the reciprocal store
-by the forged `_DRIVER_OBJECT`, leaving the clean chosen-target ordering — and a reclaim that is
-argued rather than measured."**
+owed the debugger, the `+0x08` write-what is retired by `FSCTL_PIPE_LISTEN` — measured, reclaiming
+freed `Tgsm` slots at 15/31 — and the reciprocal store by the forged `_DRIVER_OBJECT`, leaving the
+clean chosen-target ordering as the last one."**
 
 ## 10. Streamlining the next kernel CTF
 
