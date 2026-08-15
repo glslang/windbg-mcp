@@ -512,15 +512,43 @@ over `0x70` of usable bytes — and the buffer is `0x0e + NameLength`, so the re
 would actually widen this, and it is not available here: the hole is a `MESSAGE`, whose `0x68` the
 driver fixes. The one attacker-sized allocation this driver makes is the `Tfub` data buffer (up to
 `0x2FF4`), and nothing unlinks a freed `Tfub`, so it cannot carry the fake `LIST_ENTRY`. **The forged
-object is therefore addressable only if attacker bytes exist within `0x62` of a 4 GiB boundary.** That is a
-placement problem rather than an arithmetic one, and it is the open question: a pipe write controls
-its allocation size (less the NPFS header), so a buffer large enough to *straddle* a boundary puts an
-encodable address inside its own controlled data — no need for the allocator to place a chunk at the
-boundary, only to cross one. Expected cost scales as 4 GiB over the buffer size, and misses can be
-freed and retried, but none of that has been measured on this build.
+object is therefore addressable only if attacker bytes exist within `0x62` of a 4 GiB boundary.** That
+reads like a placement problem: a pipe write controls its allocation size (less the NPFS header), so a
+buffer large enough to *straddle* a boundary would put an encodable address inside its own controlled
+data, and the allocator would never have to place a chunk at the boundary — only to cross one.
 
-Removing KD from this section therefore means one of: making that placement land, winning the race
-between the first store and the second store's fault, or finding a single-store write primitive.
+Measured on 26100.32995, it does not cross one. A NonPaged pipe-write spray was walked deliberately
+into a boundary while `SystemBigPoolInformation` was polled each round:
+
+```text
+after ~760 MiB held (1042 nonpaged big-pool entries)
+  not page-aligned            : 0             every big-pool address is page-granular
+  smallest low-32 ever seen   : 0x00010000    (needs <= 0x62)
+  straddling a 4 GiB boundary : 0
+  window ffff8786  first=0xd0655000  lastEnd=0xffc31000   stops 3.8 MiB short
+  window ffff8787  first=0x00010000                       new region opens past the boundary
+```
+
+The frontier does march — 64 MiB of pipe data advances it by roughly 84 MiB — and it walked from
+679 MiB out to 8 MiB out in eight rounds. Then the region stopped short and a **new** region opened at
+`boundary + 0x10000`; a further 1.5 GiB of spray never moved it again. The allocator does not cross a
+4 GiB boundary, it starts over on the far side.
+
+That turns the keyhole from a lottery into a residue class. An encodable `Flink` needs its low 32 bits
+in `[0x58, 0x62]`; every address a medium-IL caller can *learn* comes from `SystemBigPoolInformation`
+and is page-aligned, so those bits are a multiple of `0x1000`; and that interval contains no such
+multiple. Rebooting for a luckier region base does not change it, nor does adding RAM, and straddling —
+the one construction that would let an interior offset like `boundary+0x58` be chosen — is precisely
+what the measurement rules out. (The spray ran elevated over WinRM; VA layout and straddling are
+allocator properties rather than token properties, though a medium-IL *quota* ceiling was not measured.)
+
+The forged-object mechanism survives this. Only its delivery through the `IoSB` keyhole dies, so
+removing KD from this section means one of: a reclaim primitive whose `+0x08` is attacker data rather
+than a validated length — for which a page-aligned big-pool address is perfectly good, and which is now
+a single criterion with a complete payoff, since the reciprocal store is already harmless; the
+double-free → type-confusion route that sidesteps `+0x08` altogether; or a single-store write
+primitive. Racing the first store against the second store's fault is retired by the forged object
+rather than solved, and only matters again if no free `+0x08` can be found.
 
 This makes no claim of privilege escalation; it moves the boundary from "reclaim needs KD" through
 "trigger needs KD" to **"the primitives fire debugger-free; the unlink's `+0x08` write-what, its
