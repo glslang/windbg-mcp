@@ -421,11 +421,6 @@ the selected target through the normal I/O manager indirect call.
 
 The captured proof was:
 
-The [curated MCP proof record](../examples/messagemanager/rip-proof-transcript.txt) identifies the
-live binary and distinguishes transcribed output from canonicalized commands and post-run annotations.
-A reconstructed [asciicast v2 recording](../examples/messagemanager/rip-proof.cast) animates the same
-captured events; its timing is illustrative because live recording was not enabled for the original run.
-
 ```text
 rip=fffff803`aa6fa240  nt!DbgBreakPointWithStatus
 THREAD ffff9a04`93426080  Cid 0da0.0a2c  RUNNING on processor 3
@@ -440,6 +435,16 @@ nt!NtCreateFile+0x79
 MM_PROOF_PROCESS_OK
 MM_PROOF_CONCURRENT_THREAD_OK
 ```
+
+The [curated MCP proof record](../examples/messagemanager/rip-proof-transcript.txt) identifies the
+live binary and distinguishes transcribed output from canonicalized commands and post-run annotations.
+A reconstructed [asciicast v2 recording](../examples/messagemanager/rip-proof.cast) replays the same
+captured events; its timing is illustrative because live recording was not enabled for the original run.
+
+![KD-assisted RIP proof against MessageManager](../examples/messagemanager/rip-proof.gif)
+
+*(Reconstructed terminal session — source:
+[`rip-proof.cast`](../examples/messagemanager/rip-proof.cast), `asciinema play`.)*
 
 The stale caller was a different thread (`ffff9a04'94017080`) in the same process, stopped at
 `MessageManager+0x1560` on CPU 0. After capture, KD restored the CREATE slot to
