@@ -465,9 +465,9 @@ attacker-controlled from `+0x00`, no debugger), and §8 makes the **trigger** na
 `drift` race fires `ExFreePoolWithTag` on a use-after-free MESSAGE from user mode, three dumps, no
 debugger and no Verifier). What this section still owes the debugger is **three** things, not two:
 
-1. **The write-what.** `Flink` at `+0x08` has to be a kernel pointer, and the `IoSB` buffer pins that
-   qword to `NameLength` (a validated length) followed by `TimeoutSpecified` and the first name
-   `WCHAR`.
+1. **The write-what.** `Flink` at `+0x08` has to be a kernel pointer, and §6's `FSCTL_PIPE_WAIT`
+   reclaim pins that qword to `NameLength` (a validated length) followed by `TimeoutSpecified` and
+   the first name `WCHAR`. *(Retired below by a different reclaim primitive.)*
 2. **The reciprocal store.** `Flink->Blink = Blink` is unconditional, so `Flink+0x08` has to be
    writable. KD's `jmp $` is what makes that true here.
 3. **The ordering** a clean chosen-target arbitrary free needs (§8).
@@ -542,18 +542,53 @@ the one construction that would let an interior offset like `boundary+0x58` be c
 what the measurement rules out. (The spray ran elevated over WinRM; VA layout and straddling are
 allocator properties rather than token properties, though a medium-IL *quota* ceiling was not measured.)
 
-The forged-object mechanism survives this. Only its delivery through the `IoSB` keyhole dies, so
-removing KD from this section means one of: a reclaim primitive whose `+0x08` is attacker data rather
-than a validated length — for which a page-aligned big-pool address is perfectly good, and which is now
-a single criterion with a complete payoff, since the reciprocal store is already harmless; the
-double-free → type-confusion route that sidesteps `+0x08` altogether; or a single-store write
-primitive. Racing the first store against the second store's fault is retired by the forged object
-rather than solved, and only matters again if no free `+0x08` can be found.
+The forged-object mechanism survives this. Only its *delivery* dies — and the delivery was never
+`FSCTL_PIPE_WAIT`'s to own. What the route needs is a reclaim primitive whose `+0x08` is attacker
+data rather than a validated length, and for which a page-aligned big-pool address is perfectly good.
+
+### The primitive: `FSCTL_PIPE_LISTEN`
+
+Eighteen candidate FSCTLs were swept for the gating property — does the request **park pending** with
+an oversized `METHOD_BUFFERED` input buffer, so the I/O manager's `SystemBuffer` stays resident? Ten
+do. The interesting ones are those documented as taking *no input buffer at all*, because a driver
+that never reads the buffer also never validates it. `FSCTL_PIPE_LISTEN` is the best of them:
+
+```text
+input length sweep 0x58 / 0x62 / 0x68 / 0x70 / 0x71   ->  8/8 parked at every size
+spray scale                                           ->  4000/4000 parked
+durability                                            ->  none completed; parks until a client connects
+caller                                                ->  WIN-...\lowuser, isAdmin=False, S-1-16-8192
+```
+
+Read back under KD from two different address clusters, byte-identical, with the spray running as a
+non-administrative medium-integrity account:
+
+```text
+ffff8786d3090990  01 00 00 00 00 00 00 00  55 da ba 00 07 f8 ff ff
+ffff8786d30909a0  ce fa ed fe 04 9a ff ff  43 43 43 43 43 43 43 43
+ffff8786d30909b0  4d 4d 4d 4d 4d 4d 4d 4d  4d 4d 4d 4d 4d 4d 4d 4d
+```
+
+That is `RefCount = 1` at `+0x00`, `Flink = 0xFFFFF80700BADA55` at **`+0x08`**, `Blink =
+0xFFFF9A04FEEDFACE` at `+0x10`, `Buffer = 0x4343…` at `+0x18` — every field of the fake `MESSAGE`,
+verbatim, in a `0x70`-usable chunk of the `0x80` block, `non_paged_nx`, LFH backend, tag `IoSB`: the
+same I/O-manager `SystemBuffer` path `FSCTL_PIPE_WAIT` reclaims freed `Tgsm` slots through. NPFS
+never touches a byte of it, so the pipe-name encoding rules (`towupper`-invariant, no `NUL`, no `\`)
+that constrained `Blink` and `Buffer` in §6 are gone too.
+
+So the `+0x08` blocker is retired, and with the reciprocal store already harmless by construction,
+the **ordering** is the only KD dependency this section still has. Two caveats keep that from being a
+finished claim: whether these buffers actually land in a *freed* `Tgsm` slot is argued rather than
+measured — `FSCTL_PIPE_WAIT` managed 8/16 through the same path — and the double-free →
+type-confusion route remains the alternative that sidesteps `+0x08` entirely. Racing the first store
+against the second store's fault is retired by the forged object rather than solved, and matters
+again only if the reclaim does not reproduce.
 
 This makes no claim of privilege escalation; it moves the boundary from "reclaim needs KD" through
-"trigger needs KD" to **"the primitives fire debugger-free; the unlink's `+0x08` write-what, its
-reciprocal store, and the clean chosen-target ordering are what this proof still owes the
-debugger."**
+"trigger needs KD" to **"the primitives fire debugger-free; of the three things the captured proof
+owed the debugger, the `+0x08` write-what is retired by `FSCTL_PIPE_LISTEN` and the reciprocal store
+by the forged `_DRIVER_OBJECT`, leaving the clean chosen-target ordering — and a reclaim that is
+argued rather than measured."**
 
 ## 10. Streamlining the next kernel CTF
 
