@@ -159,7 +159,12 @@ searched before `System32`, so the copied engine wins. One-time, from the instal
 package:
 
 ```pwsh
-$wd  = (Get-AppxPackage Microsoft.WinDbg).InstallLocation + "\amd64"
+# Match $arch to windbg-mcp.exe, not to the machine: a process loads DLLs of its
+# own architecture, and the published release zip is x64 even on an ARM64 host.
+# See the table under "ARM64 hosts" — "amd64" is right for every x64 binary,
+# including one running under emulation.
+$arch = "amd64"
+$wd  = (Get-AppxPackage Microsoft.WinDbg).InstallLocation + "\$arch"
 # Set $dst to the folder that actually holds windbg-mcp.exe — pick the one for
 # your install (do not leave it as the placeholder):
 #   plugin / build-from-source layout      -> <plugin dir>\target\release
@@ -220,9 +225,12 @@ $w = "$env:TEMP\wdbg"; New-Item $w -ItemType Directory -Force | Out-Null
 $uri = ([xml](Invoke-WebRequest 'https://aka.ms/windbg/download' -UseBasicParsing).Content).AppInstaller.MainBundle.Uri
 Invoke-WebRequest $uri -OutFile "$w\b.zip" -UseBasicParsing      # ~1.1 GB
 Expand-Archive "$w\b.zip" "$w\b" -Force
-Copy-Item "$w\b\windbg_win-x64.msix" "$w\p.zip" -Force           # or windbg_win-arm64.msix
+# Same $arch as the copy block above. Note the two spellings: the .msix is named
+# x64/arm64, while the payload directory inside it is amd64/arm64.
+$msix = if ($arch -eq "arm64") { "windbg_win-arm64.msix" } else { "windbg_win-x64.msix" }
+Copy-Item "$w\b\$msix" "$w\p.zip" -Force
 Expand-Archive "$w\p.zip" "$w\p" -Force
-Copy-Item "$w\p\amd64\ttd" "$dst\ttd" -Recurse -Force            # amd64 or arm64 — see below
+Copy-Item "$w\p\$arch\ttd" "$dst\ttd" -Recurse -Force
 ```
 
 **Pick the architecture by `windbg-mcp.exe`, exactly as above** — not by the host, and not by which
