@@ -228,6 +228,11 @@ processes, so they need real ones:
 - *A call that names no session records the one it reached.* Two sessions open and a `modules` call
   with no `session_id`, which routes to the newest. With one session open this proves nothing —
   any answer would be right — which is why there are two.
+- *A session reclaimed at the limit records what became of it.* The third way a target is let go,
+  after `end_session` and a disconnect: opening past `MAX_SESSIONS` reclaims the oldest idle
+  session in a background task, with no caller to answer and nothing in the tool result to say it
+  happened. The test opens one past the limit and waits for the record rather than assuming it has
+  landed, so a reclamation that never reports is this assertion failing and not a puzzle later.
 - *A walk marks what it cannot read and keeps going.* The claim
   [#103](https://github.com/glslang/windbg-mcp/issues/103) is about, and the one that needs a real
   engine: `src/walk.rs` proves the traversal against a fake address space, and this proves the

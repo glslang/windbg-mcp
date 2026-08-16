@@ -164,6 +164,19 @@ fn ms(d: Duration) -> u64 {
     d.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+/// The session an open ended up with, for the outcomes that have one.
+///
+/// A `match` rather than a chain of `if let`s, so a new [`OpenError`] variant is a compile error
+/// here rather than an outcome that quietly stops being recorded against its session.
+fn opened_session(outcome: &Result<OpenReport, OpenError>) -> Option<&str> {
+    match outcome {
+        Ok(report) => Some(&report.id),
+        Err(OpenError::PostCommit { id, .. }) | Err(OpenError::Timeout { id, .. }) => Some(id),
+        // Nothing was created, so there is no session to name.
+        Err(OpenError::Unavailable(_) | OpenError::NoRoom(_) | OpenError::Clean(_)) => None,
+    }
+}
+
 /// A failed open, with the two things a caller has to act on as fields.
 ///
 /// `session_id` because an open that failed *after* creating its target hands back the only
@@ -2162,26 +2175,6 @@ pub(crate) fn changes_debug_target(command: &str) -> bool {
     })
 }
 
-tokio::task_local! {
-    /// Where the tool call running on this task was routed, for the transcript.
-    ///
-    /// A task-local rather than a return value because the answer is discovered deep inside the
-    /// call — `resolve` picks the current session for anyone who named none — and is wanted by
-    /// [`WindbgServer::call_tool`], forty-odd tool bodies further out. Threading it back would
-    /// mean changing the signature of every one of them to carry a fact none of them uses.
-    ///
-    /// Scoped per call, so nothing leaks between them, and read after the tool returns.
-    static ROUTED: std::sync::Mutex<Option<String>>;
-}
-
-/// Records which session the call on this task reached. Silent outside a scope — the tool tests
-/// call these functions directly, and a missing transcript is not a reason to fail a debug call.
-fn note_routed(session: &str) {
-    let _ = ROUTED.try_with(|routed| {
-        *routed.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.to_string());
-    });
-}
-
 impl WindbgServer {
     /// Routes a call to the session the caller named — or to the current one — and runs it.
     ///
@@ -2192,7 +2185,6 @@ impl WindbgServer {
     /// of it, and that is `engine::Gate`'s job.
     async fn run_call(&self, session_id: Option<&str>, call: Call) -> Result<Output, EngineError> {
         let session = self.sessions.resolve(session_id)?;
-        note_routed(&session.id);
         self.sessions
             .call(&session, call.named(session_id.is_some()))
             .await
@@ -2218,31 +2210,38 @@ impl WindbgServer {
         // Kept for the typed answer, which describes what was asked for rather than re-deriving
         // it from the report the debugger printed.
         let target = what.clone();
-        match self.sessions.open(kind, what, op).await {
+        let outcome = self.sessions.open(kind, what, op).await;
+        // An opener does not route to a session, it *mints* one — and the transcript wants the
+        // same field filled in either way, so the call that created a target can be joined to the
+        // events about it.
+        //
+        // From **every** outcome that carries an id, not only the successful one. The two that
+        // fail with a handle are the ones a reader most needs joined up: `PostCommit` left a
+        // target open, and `Timeout` left an open that may still land — both are recovery cases
+        // where the next question is "what happened to that session?", and the answer is in the
+        // events this field is what links to.
+        if let Some(id) = opened_session(&outcome) {
+            crate::record::routed_to(id);
+        }
+        match outcome {
             Ok(OpenReport {
                 id,
                 report,
                 summary,
-            }) => {
-                // An opener does not route to a session, it *mints* one — and the transcript
-                // wants the same field filled in either way, so the call that created a target
-                // is joinable to the events about it.
-                note_routed(&id);
-                outcome_result(
-                    format!(
-                        "{report}\n\nsession_id: {id}\nPass this as `session_id` on later calls \
+            }) => outcome_result(
+                format!(
+                    "{report}\n\nsession_id: {id}\nPass this as `session_id` on later calls \
                          to route them to this session and to fail loudly rather than act on a \
                          different target."
-                    ),
-                    structured::OpenOutcome::Ok(structured::OpenedSession {
-                        session_id: id,
-                        kind: kind.into(),
-                        target,
-                        report,
-                        summary,
-                    }),
-                )
-            }
+                ),
+                structured::OpenOutcome::Ok(structured::OpenedSession {
+                    session_id: id,
+                    kind: kind.into(),
+                    target,
+                    report,
+                    summary,
+                }),
+            ),
             // No worker, so no session — and no argument the model can change fixes that.
             Err(OpenError::Unavailable(m)) => Err(ErrorData::internal_error(m, None)),
             Err(OpenError::NoRoom(m)) => {
@@ -4131,12 +4130,7 @@ impl rmcp::ServerHandler for WindbgServer {
         }
         let args = tcc.arguments.clone().map(serde_json::Value::Object);
         let mut call = self.rec.tool_request(tcc.name(), args.as_ref());
-        let routed = ROUTED.scope(std::sync::Mutex::new(None), async move {
-            let outcome = Self::tool_router().call(tcc).await;
-            let routed = ROUTED.with(|r| r.lock().unwrap_or_else(|e| e.into_inner()).clone());
-            (outcome, routed)
-        });
-        let (outcome, routed) = routed.await;
+        let (outcome, routed) = crate::record::tracking_route(Self::tool_router().call(tcc)).await;
         // Where it actually went, which for a call that named no session is the only record of
         // which target it read or changed.
         call.routed_to(routed);

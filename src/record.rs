@@ -55,6 +55,7 @@
 //!   no buffering in this process, so an abrupt exit leaves whole records behind it.
 
 use std::fs::OpenOptions;
+use std::future::Future;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -400,6 +401,41 @@ impl InFlight {
             self.session = Some(session);
         }
     }
+}
+
+// ---- which session a call reached ------------------------------------------
+
+tokio::task_local! {
+    /// Where the tool call running on this task was routed.
+    ///
+    /// A task-local rather than a return value because the answer is discovered deep inside the
+    /// call — [`crate::engine::Sessions::resolve`] picks the current session for anyone who named
+    /// none — and is wanted by the recorder, forty-odd tool bodies further out. Threading it back
+    /// would mean changing the signature of every one of them to carry a fact none of them uses.
+    static ROUTED: Mutex<Option<String>>;
+}
+
+/// Runs `work` with somewhere to note the session it reaches, and hands back both.
+pub async fn tracking_route<F: Future>(work: F) -> (F::Output, Option<String>) {
+    ROUTED
+        .scope(Mutex::new(None), async move {
+            let outcome = work.await;
+            let routed = ROUTED.with(|r| r.lock().unwrap_or_else(|e| e.into_inner()).clone());
+            (outcome, routed)
+        })
+        .await
+}
+
+/// Notes that the work on this task reached `session`.
+///
+/// Called from **resolution** rather than from each tool, which is what makes it hard to forget:
+/// a tool that resolves a session by any route is recorded, including the two that do it by hand
+/// instead of going through `run_call`. Silent outside a scope, because the in-process tests call
+/// tool bodies directly and a missing transcript is not a reason to fail a debug call.
+pub fn routed_to(session: &str) {
+    let _ = ROUTED.try_with(|routed| {
+        *routed.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.to_string());
+    });
 }
 
 // ---- the records ----------------------------------------------------------
