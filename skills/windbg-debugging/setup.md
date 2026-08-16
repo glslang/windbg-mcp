@@ -14,9 +14,18 @@ section for the workflow you're about to run before blaming the target.
 ### ARM64 hosts
 
 Crash-dump analysis works on Windows on ARM, and the dump does **not** have to be ARM64: an ARM64
-engine read an x64 kernel minidump here in full — `!analyze -v`, symbols, failure bucket and pool
-tag. Live user-mode and live kernel are untested on ARM64, and the bitness rule above still applies
-to those.
+engine read an x64 kernel minidump here — `!analyze -v`, symbols, failure bucket and pool tag.
+
+**But not everything in it.** CI's ARM64 debugger tier found that the same combination cannot read
+the target's **virtual memory**: `walk_memory` and `disassemble` fail with `0x8007001E` /
+`0x80040205`, and `crash_triage` loses `process_name` because the `EPROCESS` behind it is a virtual
+read ([#142](https://github.com/glslang/windbg-mcp/issues/142)). The dump's *structure* — bug check,
+module list, stack attribution — reads fine; following a pointer into the captured address space
+does not. Whether that is the inbox engine specifically, or cross-architecture dumps generally, is
+still open.
+
+Live user-mode and live kernel are untested on ARM64, and the bitness rule above still applies to
+those.
 
 Two things change when you bundle the engine.
 

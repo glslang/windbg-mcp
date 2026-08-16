@@ -2310,6 +2310,10 @@ const UNMAPPED: &str = "0x1000";
 ///
 /// Everything here is read-only against the checked-in dump, and the one address it assumes
 /// anything about is [`UNMAPPED`], which is unmapped on every Windows target there is.
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    ignore = "the checked-in dump is x64 and this reads its virtual memory, which an engine of another architecture cannot — see docs/smoke-test.md and issue #142"
+)]
 #[test]
 fn a_walk_marks_what_it_cannot_read_and_keeps_going() {
     let Some(dump) = target_tier() else { return };
@@ -2461,6 +2465,10 @@ fn a_walk_marks_what_it_cannot_read_and_keeps_going() {
 /// parameters and its `nt`-topped stack are facts about the file, while what `!analyze` concludes
 /// depends on whether this host has `winext\ext.dll` beside the engine — so the analysis is
 /// checked for being coherent, not for having run.
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    ignore = "the checked-in dump is x64 and this reads its virtual memory, which an engine of another architecture cannot — see docs/smoke-test.md and issue #142"
+)]
 #[test]
 fn a_bug_check_is_triaged_into_its_fields() {
     let Some(dump) = target_tier() else { return };
@@ -2709,6 +2717,10 @@ fn a_bug_check_is_triaged_into_its_fields() {
 /// fixed offset into a fixed image, so it is reproducible across every reboot and load base — five
 /// dumps from the same loop reported it at five different addresses — and a change in it means the
 /// attribution arithmetic moved.
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    ignore = "the checked-in dump is x64 and this reads its virtual memory, which an engine of another architecture cannot — see docs/smoke-test.md and issue #142"
+)]
 #[test]
 fn a_driver_crash_names_the_driver_frame_that_analyze_cannot() {
     if target_tier().is_none() {
@@ -2849,6 +2861,10 @@ fn a_driver_crash_names_the_driver_frame_that_analyze_cannot() {
 ///
 /// Read-only against the checked-in kernel dump: the mutation the rollback would undo is left to
 /// the live-kernel tier, because a dump has nothing worth restoring.
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    ignore = "the checked-in dump is x64 and this reads its virtual memory, which an engine of another architecture cannot — see docs/smoke-test.md and issue #142"
+)]
 #[test]
 fn a_batch_commits_or_fails_and_its_rollback_runs_either_way() {
     let Some(dump) = target_tier() else { return };
