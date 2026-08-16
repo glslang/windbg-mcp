@@ -1074,8 +1074,11 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
             "error",
         ),
         ("attach_kernel", json!({}), "error"),
-        // Answered from this server's own bookkeeping, so it succeeds with nothing open.
+        // Both are answered from this server's own bookkeeping, so they succeed with nothing
+        // open — and `server_log` has records to answer with whatever else has happened, this
+        // server having logged its own startup.
         ("session_status", json!({}), "ok"),
+        ("server_log", json!({}), "ok"),
         // Everything else needs a session, and there is none.
         ("end_session", json!({}), "error"),
         ("registers", json!({}), "error"),
