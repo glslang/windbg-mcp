@@ -4747,7 +4747,17 @@ fn a_live_kernel_session_attaches_coexists_and_detaches_cleanly() {
     let Some(connection) = kernel_tier() else {
         return;
     };
-    let mut server = Server::started();
+    // Recorded, because this is the only place the transcript's redaction claim can be made
+    // against an attach that **landed**. The protocol tier passes a raw connection too, but its
+    // attach is refused for its shape before anything dials — so it proves the argument is
+    // scrubbed and nothing about a session that then exists, gets a label, opens a target and
+    // reports on it. Checked at the end of this test, after the detach.
+    let transcript = marker_path("live-attach");
+    let _ = std::fs::remove_file(&transcript);
+    let mut server = Server::started_with(&[(
+        "WINDBG_MCP_TRANSCRIPT",
+        transcript.to_str().expect("a UTF-8 temp path"),
+    )]);
 
     let attached = server.call_tool(
         "attach_kernel",
@@ -4892,6 +4902,40 @@ fn a_live_kernel_session_attaches_coexists_and_detaches_cleanly() {
         ended_text.contains("closed"),
         "end_session should report the session closed:\n{ended_text}"
     );
+
+    // The redaction claim, against a real attach. Last, so a failure here can never be the reason
+    // a machine is left halted — the detach above has already run.
+    let key = connection
+        .split("key=")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .unwrap_or_default();
+    assert!(
+        key.len() >= 4,
+        "this connection has no `key=` to look for, so the assertion below would pass on nothing"
+    );
+    let raw = std::fs::read_to_string(&transcript)
+        .unwrap_or_else(|e| panic!("no transcript at {}: {e}", transcript.display()));
+    // Deliberately *not* printing the file on failure: it would put the key in the test output,
+    // which is the thing being checked. The path is enough to go and look.
+    assert!(
+        !raw.contains(key),
+        "the supplied KD key reached the transcript of a landed attach ({})",
+        transcript.display()
+    );
+    assert!(
+        raw.contains("<redacted>"),
+        "nothing in the transcript was masked, so the check above proves nothing ({})",
+        transcript.display()
+    );
+    // And the session really is in there — otherwise a transcript that recorded nothing would
+    // satisfy both assertions above.
+    assert!(
+        raw.contains("\"event\":\"session_open\"") && raw.contains("\"kind\":\"kernel target\""),
+        "the transcript has no record of the kernel session it was recording ({})",
+        transcript.display()
+    );
+    let _ = std::fs::remove_file(&transcript);
     println!("live kernel session detached cleanly:\n{ended_text}");
 }
 

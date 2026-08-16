@@ -488,6 +488,14 @@ about. This is the other half — an attach that lands:
   containing one cannot be turned back into the bytes it came from. That is a fact about rendering
   and says nothing about the walk, so it skips the comparison with a note rather than failing.
 
+The attach test also records a **transcript** and checks the supplied KD key is nowhere in it. The
+protocol tier passes a raw connection too, but its attach is refused for its shape before anything
+dials — so it proves the *argument* is scrubbed and nothing about a session that then exists, takes
+a label, opens a target and reports on it. Only here is that an attach that landed. Three guards
+keep it from passing on nothing: the connection must actually contain a `key=`, the transcript must
+contain a mask, and it must contain the kernel `session_open`. The failure message names the file
+rather than printing it, since printing it would put the key in the test output.
+
 The first run of this tier found a real bug — shutdown killed workers outright, so a disconnect
 froze the target — which no dump-based tier could have found, because killing a worker that holds
 a *dump* costs nothing. Both tests therefore collect their evidence and assert only after the
