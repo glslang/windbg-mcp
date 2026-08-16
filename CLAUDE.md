@@ -151,16 +151,23 @@ alone will happily validate the wrong guest, which is what the `hostip` comparis
 
 ## Live kernel + driver IOCTL gotchas (learned driving HEVD over KDNET)
 
-**Attach by `profile`, not by connection string.** `attach_kernel { "profile": "<name>" }` resolves
-the connection inside the server (`src/kdconn.rs`), so the target's debug key never lands in a tool
-argument — and therefore never in the session transcript, where one key previously ended up
-replicated across hundreds of records. `attach_kernel {}` lists the profiles this host has.
-Configure one with `WINDBG_MCP_PROFILE_<NAME>` or `%USERPROFILE%\.windbg-mcp\profiles.json`; raw
-`connection` still works for a target nothing is configured for. Note the live smoke tier below is
-one of those: `WINDBG_MCP_SMOKE_KERNEL` is a raw connection string, passed straight to
-`attach_kernel { "connection": … }`, and is deliberately *not* a profile — the tier has to exercise
-the explicit path, and it is a variable in a developer's own shell rather than something a client
-ever sees.
+**Attach by `profile`, not by connection string — always, for any live target.** `attach_kernel
+{ "profile": "<name>" }` resolves the connection inside the server (`src/kdconn.rs`), so the
+target's debug key never lands in a tool argument — and therefore never in the *client's*
+transcript, where one key previously ended up replicated across hundreds of records.
+`attach_kernel {}` lists the profiles this host has. Configure one with
+`WINDBG_MCP_PROFILE_<NAME>` or `%USERPROFILE%\.windbg-mcp\profiles.json`; raw `connection` still
+works for a target nothing is configured for, and is the last resort rather than the quick option.
+
+A raw `connection` now also reaches a second place: with recording on (below) it is written to the
+server's own transcript file, scrubbed to `key=<redacted>`. That backstop is not a reason to pass
+one. A profile keeps the key out of the request, so there is nothing for either transcript to
+redact, and redaction is a thing that has to keep working while a key never sent cannot leak.
+
+The live smoke tier below is the one sanctioned exception: `WINDBG_MCP_SMOKE_KERNEL` is a raw
+connection string, passed straight to `attach_kernel { "connection": … }`, and is deliberately
+*not* a profile — the tier has to exercise the explicit path, and it is a variable in a developer's
+own shell rather than something a client ever sees.
 
 A worker process does **not** inherit `WINDBG_MCP_PROFILE_*` (`engine::spawn_worker` strips them):
 it is told the one connection it is opening over its private pipe, and a `launch`ed debuggee would
@@ -224,6 +231,12 @@ Two things worth knowing when using it here:
 - **`windbg-mcp --render-cast <transcript.jsonl>`** turns one into an asciicast. That is the
   supported way to produce the recordings under `examples/` and `docs/` — the older ones are
   hand-reconstructed and say so, and a new walkthrough should not add another.
+
+Recording a **live kernel** session is where this needs care, because a transcript of one is as
+sensitive as the target: not the connection (attach by `profile` and there is no key in it), but
+everything the debugger printed — stack frames, strings, whatever the guest holds. Nothing but
+secrets is masked, so treat the file like a crash dump: keep it out of the repo, and delete it when
+the investigation is done. It is **appended** to, so a path reused across runs accumulates.
 
 ## Plugin vs. dev build
 
