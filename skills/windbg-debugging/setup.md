@@ -5,10 +5,34 @@ section for the workflow you're about to run before blaming the target.
 
 ## Platform
 
-- **Windows x64 only.** Host bitness must match the target.
+- **Windows x64 is the supported and tested configuration.** Host bitness must match the target
+  for *live* debugging.
 - `dbgeng.dll` / `dbghelp.dll` ship in `System32` on modern Windows 11 (verified on
   `10.0.26100`). That is enough for live user-mode/kernel debugging and crash-dump
   analysis — **but not for TTD `.run` replay** (see below).
+
+### ARM64 hosts
+
+Crash-dump analysis works on Windows on ARM, and the dump does **not** have to be ARM64: an ARM64
+engine read an x64 kernel minidump here in full — `!analyze -v`, symbols, failure bucket and pool
+tag. Live user-mode and live kernel are untested on ARM64, and the bitness rule above still applies
+to those.
+
+Two things change when you bundle the engine:
+
+- The store package's payload directory is **`\arm64`**, not `\amd64`.
+- If the store package will not install, the **Windows SDK Debugging Tools** are an alternative
+  source — `winsdksetup.exe /features OptionId.WindowsDesktopDebuggers /quiet /norestart`, landing
+  in `C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64`. It supplies every file in the copy
+  below **except `msdia140.dll` and `ttd\`**, so `!analyze`, the driver tools and symbol resolution
+  all work and **TTD replay does not**
+  ([#132](https://github.com/glslang/windbg-mcp/issues/132)).
+
+That fallback matters because MSIX registration fails from a **non-interactive** session —
+`Add-AppxPackage` returns `0x80070005` even when the session is elevated, leaving the payload
+staged but unrunnable, since `WindowsApps` denies execute to an unregistered package. Install
+WinDbg from the machine's own console session rather than over SSH or a remote shell; that is also
+what makes `Get-AppxPackage Microsoft.WinDbg` resolve, which the copy below depends on.
 
 ## Get the server binary
 
@@ -124,6 +148,7 @@ Copy-Item "$wd\dbgeng.dll","$wd\dbghelp.dll","$wd\dbgcore.dll","$wd\dbgmodel.dll
           "$wd\symsrv.dll","$wd\msdia140.dll" $dst -Force
 Copy-Item "$wd\ttd"    "$dst\ttd"    -Recurse -Force   # TTDReplay*.dll, TtdExt.dll, TTDAnalyze.dll, ...
 Copy-Item "$wd\winext" "$dst\winext" -Recurse -Force   # ext.dll (!analyze), kext.dll, … — for crash dumps
+Copy-Item "$wd\triage" "$dst\triage" -Recurse -Force   # triage.ini, pooltag.txt — !analyze's module attribution
 New-Item   "$dst\winxp" -ItemType Directory -Force | Out-Null
 Copy-Item "$wd\winxp\kdexts.dll" "$dst\winxp" -Force   # !drvobj/!devobj/!irp — for the driver-IOCTL tools (kernel)
 ```
@@ -132,6 +157,13 @@ Copy-Item "$wd\winxp\kdexts.dll" "$dst\winxp" -Force   # !drvobj/!devobj/!irp �
   `!tt` time-travel commands.
 - The `winext\` subdir provides `ext.dll` (which exports `!analyze`) and the other `!`-extensions.
   Required for crash-dump triage — without it `!analyze` returns *"No export analyze found"*.
+- The `triage\` subdir provides `triage.ini` and `pooltag.txt`, which `!analyze` reads to attribute
+  a crash to a module and to name pool tags. **Its absence does not produce an error**, which is
+  what makes it worth listing: `!analyze` runs, and reports `ANALYSIS_INCONCLUSIVE` /
+  `Unknown_Module` / `Unknown_Image` with the bucket id built from those. Measured on the same dump
+  with and without it, the failure bucket goes from `0x13a_8_TNf__MessageManager!unknown_function`
+  to `0x13a_8_TNf__ANALYSIS_INCONCLUSIVE!unknown_function` — a missing file that reads as an
+  inconclusive crash.
 - `winxp\kdexts.dll` provides the kernel-object extensions `!drvobj`/`!devobj`/`!irp` used by the
   `driver_object`/`device_object`/`irp_stack` tools. `attach_kernel` / `attach_kernel_local`
   `.load kdexts` automatically; without the file those tools return *"No export drvobj found"*.
