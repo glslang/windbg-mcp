@@ -53,6 +53,7 @@ use hyper::header::AUTHORIZATION;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use rmcp::transport::streamable_http_server::SessionManager;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
 use tokio::net::TcpListener;
@@ -133,6 +134,18 @@ struct Tenancy {
     deadline: Option<Instant>,
 }
 
+/// What a swept lease left behind.
+#[derive(Debug, PartialEq, Eq)]
+struct Expired {
+    /// The MCP session still open at the moment the lease ran out — a client that vanished rather
+    /// than saying goodbye. `None` when it sent a DELETE, which already closed it.
+    ///
+    /// Reported so the sweeper can close it in the service too. Releasing the debug sessions alone
+    /// would leave that MCP session resident and its id still accepted, and every reconnect cycle
+    /// would add another.
+    holder: Option<String>,
+}
+
 /// What the tenancy gate decided about one request.
 #[derive(Debug, PartialEq, Eq)]
 enum Admission {
@@ -190,9 +203,15 @@ impl Lease {
             // persist rather than pass: serving it leaves both clients working.
             (Some(_), Some(_)) => Admission::Occupied,
             // A session id with nobody holding the server — a client resuming what it left inside
-            // the grace. Served, but the holder is not taken until the service says the session was
-            // real, or a stale id would lock the server out for a whole grace period.
-            (Some(_), None) if !state.claiming => Admission::Serve,
+            // the grace. Reserved like an `initialize`, because it is the same contest: a lease
+            // expiry leaves the old session id valid in the service, so a resume can race a fresh
+            // client and both would pass a gate that only served them. The holder is still not
+            // taken until `settle` hears the session was real, or a stale id would lock the server
+            // out for a whole grace period.
+            (Some(_), None) if !state.claiming => {
+                state.claiming = true;
+                Admission::Serve
+            }
             // A new client, and nobody attached or attaching: it reserves the server here, and
             // inherits whatever the last one left open.
             (None, None) if !state.claiming => {
@@ -214,11 +233,14 @@ impl Lease {
     /// are its own sessions) is wrong in a way that matters when it ends one.
     fn settle(&self, requested: Option<&str>, minted: Option<&str>, ok: bool) -> bool {
         let mut state = self.state();
+        // Unconditionally, before anything else: a reservation outliving the request that took it
+        // is a server nobody can claim. Every route out of here has resolved it — the arms below
+        // decide who holds the server, not whether the claim is over.
+        state.claiming = false;
         let adopted = state.holder.is_none() && state.deadline.is_some();
         match (minted, requested) {
             // An `initialize` that produced a session: the claim becomes a holder.
             (Some(id), _) => {
-                state.claiming = false;
                 state.holder = Some(id.to_string());
                 state.deadline = Some(Instant::now() + self.grace);
                 adopted
@@ -229,11 +251,9 @@ impl Lease {
                 state.deadline = Some(Instant::now() + self.grace);
                 adopted
             }
-            // Anything else, including an `initialize` that failed: give the reservation back.
-            _ => {
-                state.claiming = false;
-                false
-            }
+            // Anything else, including an `initialize` that failed: the reservation is already
+            // given back above, and nobody took the server.
+            _ => false,
         }
     }
 
@@ -252,16 +272,16 @@ impl Lease {
     /// way until [`Self::released_leases`] says the teardown is done. That is what closes the
     /// window [`Sessions::release_leased`] warns it does not close itself: between deciding to
     /// release and having released, no client can be admitted to the sessions being released.
-    fn expired(&self) -> bool {
+    fn expired(&self) -> Option<Expired> {
         let mut state = self.state();
         match state.deadline {
             Some(at) if Instant::now() >= at => {
-                state.holder = None;
+                let holder = state.holder.take();
                 state.deadline = None;
                 state.releasing = true;
-                true
+                Some(Expired { holder })
             }
-            _ => false,
+            _ => None,
         }
     }
 
@@ -300,11 +320,12 @@ pub async fn serve(sessions: Sessions, addr: SocketAddr, call_timeout: Duration)
         );
     }
 
+    let manager = Arc::new(LocalSessionManager::default());
     let mcp = {
         let sessions = sessions.clone();
         Arc::new(StreamableHttpService::new(
             move || Ok(WindbgServer::new(sessions.clone())),
-            Arc::new(LocalSessionManager::default()),
+            manager.clone(),
             // A tool call can be quiet for minutes; without a keep-alive the stream looks idle to
             // anything between the two machines and gets collected.
             StreamableHttpServerConfig::default().with_sse_keep_alive(Some(SSE_KEEP_ALIVE)),
@@ -318,7 +339,7 @@ pub async fn serve(sessions: Sessions, addr: SocketAddr, call_timeout: Duration)
         "windbg-mcp listening on http://{addr} (lease grace {grace:?}, one client at a time)"
     );
 
-    tokio::spawn(sweep(sessions.clone(), lease.clone()));
+    tokio::spawn(sweep(sessions.clone(), lease.clone(), manager));
 
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -417,16 +438,26 @@ fn refuse(status: StatusCode, why: &str) -> Response<BoxBody<Bytes, Infallible>>
 }
 
 /// Releases what an absent client left behind, once its lease runs out.
-async fn sweep(sessions: Sessions, lease: Arc<Lease>) {
+async fn sweep(sessions: Sessions, lease: Arc<Lease>, manager: Arc<LocalSessionManager>) {
     loop {
         tokio::time::sleep(SWEEP).await;
-        if lease.expired() {
-            tracing::info!("a client's lease ran out; releasing the sessions it left open");
-            sessions.release_leased().await;
-            // Only now may the server be taken again: until this, an arriving client would be
-            // admitted to sessions this release is closing.
-            lease.released_leases();
+        let Some(expired) = lease.expired() else {
+            continue;
+        };
+        tracing::info!("a client's lease ran out; releasing the sessions it left open");
+        sessions.release_leased().await;
+        // The debug sessions are the expensive half, but not the whole of it. A client that
+        // vanished never sent the DELETE that closes its MCP session, so without this the service
+        // keeps that session resident and its id accepted — and every disconnect-and-reconnect
+        // cycle would add another one that no lease will ever sweep again.
+        if let Some(id) = expired.holder
+            && let Err(e) = manager.close_session(&id.into()).await
+        {
+            tracing::warn!("could not close the MCP session of the client that went away: {e}");
         }
+        // Only now may the server be taken again: until this, an arriving client would be admitted
+        // to sessions this release is closing.
+        lease.released_leases();
     }
 }
 
@@ -565,7 +596,7 @@ mod tests {
         lease.released("session-a");
 
         assert!(
-            !lease.expired(),
+            lease.expired().is_none(),
             "a client that said goodbye has its whole grace to change its mind"
         );
         assert!(lease.state().deadline.is_some(), "and the clock is running");
@@ -585,6 +616,75 @@ mod tests {
         );
     }
 
+    /// A resume is a contested claim too, not a free pass.
+    ///
+    /// After a lease expiry the old session id is still valid in the service, so a resume can race
+    /// a fresh client. Both would pass a gate that only served them, and the stale one could run a
+    /// tool against the global registry while the new client became the holder.
+    #[test]
+    fn a_resume_reserves_the_server_like_an_initialize_does() {
+        let lease = lease();
+        lease.admit(None);
+        lease.settle(None, Some("session-a"), true);
+        lease.released("session-a");
+
+        assert_eq!(lease.admit(Some("session-a")), Admission::Serve);
+        assert_eq!(
+            lease.admit(None),
+            Admission::Occupied,
+            "a fresh client cannot slip in while a resume is being confirmed"
+        );
+    }
+
+    /// Whatever a request turns out to be, it hands the reservation back.
+    ///
+    /// The leak this pins is the one the resume path introduced: taking the holder without
+    /// resolving the claim leaves `claiming` set, and the next goodbye then makes the server
+    /// permanently unclaimable — a server nobody can use and nothing will fix.
+    #[test]
+    fn every_settled_request_resolves_its_reservation() {
+        let lease = lease();
+        lease.admit(None);
+        lease.settle(None, Some("session-a"), true);
+        lease.released("session-a");
+
+        lease.admit(Some("session-a"));
+        lease.settle(Some("session-a"), None, true);
+        assert!(!lease.state().claiming, "a resume that succeeded");
+
+        lease.released("session-a");
+        assert_eq!(
+            lease.admit(None),
+            Admission::Serve,
+            "so the next client is not refused by a reservation nobody holds"
+        );
+    }
+
+    /// A swept lease says what it left in the service, so the sweeper can close that too.
+    #[test]
+    fn a_swept_lease_reports_the_session_that_never_said_goodbye() {
+        let lease = Lease::new(Duration::from_millis(1), Duration::from_micros(1))
+            .expect("a grace longer than the budget");
+        lease.admit(None);
+        lease.settle(None, Some("session-a"), true);
+        std::thread::sleep(Duration::from_millis(5));
+
+        assert_eq!(
+            lease.expired().map(|e| e.holder),
+            Some(Some("session-a".to_string())),
+            "a client that vanished leaves an MCP session nothing else will ever close"
+        );
+
+        // Whereas one that said goodbye had its session closed by the DELETE.
+        let lease = Lease::new(Duration::from_millis(1), Duration::from_micros(1))
+            .expect("a grace longer than the budget");
+        lease.admit(None);
+        lease.settle(None, Some("session-b"), true);
+        lease.released("session-b");
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(lease.expired().map(|e| e.holder), Some(None));
+    }
+
     /// Nothing is admitted between deciding to release and having released.
     ///
     /// The window this closes is narrow and expensive: a client admitted there starts using a
@@ -597,7 +697,7 @@ mod tests {
         lease.settle(None, Some("session-a"), true);
         std::thread::sleep(Duration::from_millis(5));
 
-        assert!(lease.expired(), "the grace is spent");
+        assert!(lease.expired().is_some(), "the grace is spent");
         assert_eq!(
             lease.admit(None),
             Admission::Occupied,
@@ -621,9 +721,9 @@ mod tests {
         lease.settle(None, Some("session-a"), true);
         std::thread::sleep(Duration::from_millis(5));
 
-        assert!(lease.expired(), "the grace is spent");
+        assert!(lease.expired().is_some(), "the grace is spent");
         assert!(
-            !lease.expired(),
+            lease.expired().is_none(),
             "and expiry is reported once, not on every sweep — the sweeper runs every few \
              seconds, and a second `true` would release an already-released set of sessions on \
              each pass"
