@@ -586,6 +586,13 @@ rollback completed — reported *beside* the original failure, never instead of 
 session is left stopped, running, detached, or uncertain. A batch that did not commit comes back as a
 tool error carrying that whole report.
 
+It carries the same report as values (see [Structured results](#structured-results)), and the
+pairing is worth reading once: a batch that **ran** answers `status: "ok"` — the report is the
+answer — on a result flagged `isError` when the transaction did not commit or its rollback did not
+finish. `status: "error"` is the batch that never ran at all: refused for a malformed step, a stale
+handle, too little budget left to start. Reading only `isError` cannot tell those apart, and it is
+the difference between "resubmit" and "check what the target is left holding".
+
 Four honest limits, none of them hidden in the report:
 
 - A raw command that prints an error and returns success is a step that *succeeded* with that text
@@ -627,6 +634,7 @@ matching `outputSchema` in `tools/list`, so a program can read a field instead o
 | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` | PEB heap roots and Segment Heap allocations/totals/diagnostics, each carrying exact `ntdll` layout provenance, skipped-heap scope, and walk coverage |
 | `walk_memory` | `nodes[]` with each field's `value` — `null` where the debugger could not read it — plus `walked`/`unreadable` counts and a `stopped` reason (`complete`, `cap`, `null_link`, `loop`, `unreadable_link`, `deadline`, `interrupted`), each carrying the address it is about |
 | `crash_triage` | `bug_check` (`code`, `name`, four `parameters`), `process_name`, `frames[]` as `{module, rva, symbol}`, the `faulting_frame` picked out of them — and `!analyze`'s own conclusions kept apart under `analysis` |
+| `debug_batch` | `outcome` (`committed`/`failed`/`timed_out`/`abandoned`/`interrupted`), the position it stopped `at`, `committed`, `rollback_complete`, what the session holds `after`, and every step of both blocks with what it `changed` and whether an assertion was `unmet` |
 
 Two conventions hold across all of them:
 
@@ -667,6 +675,60 @@ and `ttd_memory` query `@$cursession.TTD.{Calls,Memory}` (every call to a functi
 an address range), and `ttd_events` queries `@$curprocess.TTD.Events` (the module/thread/exception
 timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressions, e.g.
 `@$cursession.TTD.Calls("ntdll!NtCreateFile").Where(c => c.ReturnValue != 0)`.
+
+### Session transcripts (`WINDBG_MCP_TRANSCRIPT`)
+
+Point `WINDBG_MCP_TRANSCRIPT` at a path and the server records what it was asked and what it did,
+one JSON object per line. Unset — the default — nothing is written and nothing is spent.
+
+```pwsh
+$env:WINDBG_MCP_TRANSCRIPT = "$env:USERPROFILE\.windbg-mcp\session.jsonl"
+```
+
+```jsonc
+{"v":1,"seq":1,"at":"2026-08-16T07:13:01.508Z","mono_ms":1,"event":"tool_request","request":1,"tool":"open_dump","args":{"path":"C:\\dumps\\a.dmp"}}
+{"v":1,"seq":2,"at":"2026-08-16T07:13:01.643Z","mono_ms":135,"event":"session_open","session":"sess-…","kind":"crash dump","target":"C:\\dumps\\a.dmp","engine_pid":1656}
+{"v":1,"seq":11,"at":"2026-08-16T07:13:04.272Z","mono_ms":2765,"event":"batch","request":3,"session":"sess-…","outcome":"failed","at_step":2,"committed":false,"rollback_complete":true,"after":"stopped","elapsed_ms":603}
+```
+
+Every record carries the format version, a sequence number, a wall clock and a monotonic offset.
+The events are the tool call and its result; a session opening, changing state and being released;
+a wait abandoned, an `interrupt`, a worker process dying; and — derived from each result's *typed*
+half, never scraped from the text beside it — where execution stopped, what a `run_to_address`
+concluded, every breakpoint or memory mutation, each assertion that did not hold, and how a
+`debug_batch` ended with whether its rollback completed. See [`src/record.rs`](./src/record.rs).
+
+**It is not the log.** `RUST_LOG` output is prose about the server, on stderr; this is values about
+the *session*, in a file of its own. Standard output stays JSON-RPC and nothing else.
+
+Render one as a terminal recording with the same executable:
+
+```pwsh
+windbg-mcp --render-cast session.jsonl -o session.cast   # asciicast v2
+asciinema play session.cast
+```
+
+The rendering is derived, so a cast can be made from a transcript recorded weeks ago and the
+timings are the recorded ones. `--idle-limit <s>` tells a player how long to sit in a pause (`0`
+plays at the speed it happened), `--max-lines <n>` caps how much of a long result is shown, and
+`--title`/`--width`/`--height` shape the recording.
+
+**Redaction.** Every string recorded is scrubbed for `key=`/`password=` values, and an argument
+member *named* like a secret is masked whole — so a raw `connection` passed to `attach_kernel` is
+recorded as `net:port=50000,key=<redacted>`. Prefer a [profile](#kernel-connection-profiles-keeping-the-kdnet-key-out-of-the-transcript)
+anyway: it keeps the key out of the request in the first place, and this is the backstop.
+
+**Retention.** Nothing else is masked, and that is the point to plan around: debugger output is the
+contents of somebody's memory — stack frames, strings, registry paths, whatever the target holds —
+so a transcript of a live session is as sensitive as the machine it was taken from. Treat one like
+a crash dump. Keep it out of version control unless you have read it, put it somewhere with the
+same access as the target, and delete it when the investigation is done. The file is **appended**
+to, never truncated, so a path reused across runs accumulates until something removes it; each run
+starts with a `start` record naming its pid, which is what separates them.
+
+**Size.** Fields are capped at 16 KiB, and a record says how much it dropped rather than being
+quietly short. `WINDBG_MCP_TRANSCRIPT_MAX_FIELD` moves the cap; `0` removes it, at the cost of a
+file that grows with every module listing and pool census.
 
 ## Limitations & notes
 

@@ -1637,6 +1637,185 @@ pub enum WalkStop {
     Interrupted,
 }
 
+// ---- transactional batches ------------------------------------------------
+
+/// What a `debug_batch` did, as values.
+///
+/// The last tool whose whole answer was a rendering. It is also the one with the most at stake in
+/// being readable by a program: a batch is run precisely when something *mutates* the target, and
+/// the two questions a caller has to act on afterwards — did this commit, and did the rollback put
+/// everything back — were answerable only by matching on `BATCH: FAILED` and `rollback: INCOMPLETE`
+/// in prose. A transcript recording that prose records the wording, not the verdict
+/// ([#87](https://github.com/glslang/windbg-mcp/issues/87)).
+///
+/// One thing is deliberately **not** here: each step's debugger output. It is in the text half,
+/// which is where a rendering belongs, and carrying a copy of every step's captured output would
+/// make the typed answer the larger of the two channels while adding no fact this does not already
+/// name. What each step *changed* is a fact, and that is [`BatchStepInfo::changes`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BatchReportInfo {
+    /// How the batch as a whole ended.
+    pub outcome: BatchOutcomeName,
+    /// The 1-based position the outcome is about: the step that failed, or the first one not
+    /// attempted. Absent only for [`BatchOutcomeName::Committed`], where every step ran.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub at: Option<u32>,
+    /// Every step ran and every assertion held. The same fact as `outcome == committed`, named
+    /// because it is the one a caller branches on.
+    pub committed: bool,
+    /// Whether every `always` step completed. **Read this even when `committed` is true**: a
+    /// rollback that did not finish is a target left patched, and it is independent of how the
+    /// steps themselves went.
+    pub rollback_complete: bool,
+    /// What the session holds now — the question the step list cannot answer.
+    pub after: SessionAfterInfo,
+    /// The budget the batch was given.
+    pub budget_ms: u64,
+    /// What it actually took.
+    pub elapsed_ms: u64,
+    /// The `steps` block, in order.
+    pub steps: Vec<BatchStepInfo>,
+    /// The `always` block, in order. Present whatever the outcome: it runs on every path, which
+    /// is what a batch is for.
+    pub always: Vec<BatchStepInfo>,
+}
+
+/// How a batch ended. Mirrors [`crate::batch::BatchOutcome`] without its position, which is
+/// [`BatchReportInfo::at`] — one field for one fact, rather than a payload on four of five
+/// variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchOutcomeName {
+    /// Every step ran and every assertion held.
+    Committed,
+    /// A step failed, or an assertion did not hold.
+    Failed,
+    /// The deadline expired.
+    TimedOut,
+    /// The session was torn down under it — a disconnect, or `end_session`. Nothing was wrong
+    /// with the steps, so resubmitting the whole batch is the right next move.
+    Abandoned,
+    /// `interrupt` was called on this batch's session. The session still holds its target, so
+    /// this batch can be resubmitted as it stands.
+    Interrupted,
+}
+
+/// One step, as the report tells it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BatchStepInfo {
+    /// 1-based position within its own block.
+    pub position: u32,
+    /// The step's label, or the action if it was not given one.
+    pub label: String,
+    /// What actually ran, after interpolation — not what was written.
+    pub action: String,
+    pub result: StepResultName,
+    /// Why, for every result but [`StepResultName::Ok`]: the debugger's refusal, the assertion
+    /// that did not hold, or why the step was never attempted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// What this step changed, where the executor recognised a mutation. Recorded whether or not
+    /// the step then succeeded — a command that errors may already have written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changes: Option<String>,
+    /// A break landed while this step was running, so its output is what it had reached rather
+    /// than what it would have produced.
+    pub cut_short: bool,
+}
+
+/// How one step ended. [`crate::batch::StepResult`] without its message, which is
+/// [`BatchStepInfo::detail`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StepResultName {
+    Ok,
+    /// The debugger refused the operation.
+    Failed,
+    /// The action succeeded and an assertion on it did not hold.
+    Unmet,
+    /// Never attempted.
+    Skipped,
+}
+
+/// What the session holds once the batch is done.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SessionAfterInfo {
+    /// The engine answered with a current instruction pointer.
+    Stopped { ip: String },
+    /// The target was told to run and never reported a stop.
+    Running { why: String },
+    /// A step released or replaced the target.
+    Detached { by: String },
+    /// The probe failed and nothing in the batch explains it. Reported as not knowing, never
+    /// guessed at.
+    Uncertain { why: String },
+}
+
+impl From<&crate::batch::BatchReport> for BatchReportInfo {
+    fn from(report: &crate::batch::BatchReport) -> Self {
+        use crate::batch::BatchOutcome;
+        let (outcome, at) = match report.outcome {
+            BatchOutcome::Committed => (BatchOutcomeName::Committed, None),
+            BatchOutcome::Failed { at } => (BatchOutcomeName::Failed, Some(at as u32)),
+            BatchOutcome::TimedOut { at } => (BatchOutcomeName::TimedOut, Some(at as u32)),
+            BatchOutcome::Abandoned { at } => (BatchOutcomeName::Abandoned, Some(at as u32)),
+            BatchOutcome::Interrupted { at } => (BatchOutcomeName::Interrupted, Some(at as u32)),
+        };
+        Self {
+            outcome,
+            at,
+            // From the report's own predicates, not from `outcome` re-tested here: they are what
+            // the text is rendered from, so this cannot disagree with what a reader is told.
+            committed: report.committed(),
+            rollback_complete: report.rollback_complete(),
+            after: (&report.after).into(),
+            budget_ms: ms(report.budget),
+            elapsed_ms: ms(report.elapsed),
+            steps: report.steps.iter().map(BatchStepInfo::from).collect(),
+            always: report.always.iter().map(BatchStepInfo::from).collect(),
+        }
+    }
+}
+
+impl From<&crate::batch::StepOutcome> for BatchStepInfo {
+    fn from(step: &crate::batch::StepOutcome) -> Self {
+        use crate::batch::StepResult;
+        let (result, detail) = match &step.result {
+            StepResult::Ok => (StepResultName::Ok, None),
+            StepResult::Failed(why) => (StepResultName::Failed, Some(why.clone())),
+            StepResult::Unmet(why) => (StepResultName::Unmet, Some(why.clone())),
+            StepResult::Skipped(why) => (StepResultName::Skipped, Some(why.clone())),
+        };
+        Self {
+            position: step.position as u32,
+            label: step.label.clone(),
+            action: step.rendered.clone(),
+            result,
+            detail,
+            changes: step.changes.clone(),
+            cut_short: step.cut_short,
+        }
+    }
+}
+
+impl From<&crate::batch::SessionAfter> for SessionAfterInfo {
+    fn from(after: &crate::batch::SessionAfter) -> Self {
+        use crate::batch::SessionAfter;
+        match after {
+            SessionAfter::Stopped { ip } => Self::Stopped { ip: ip.clone() },
+            SessionAfter::Running { why } => Self::Running { why: why.clone() },
+            SessionAfter::Detached { by } => Self::Detached { by: by.clone() },
+            SessionAfter::Uncertain { why } => Self::Uncertain { why: why.clone() },
+        }
+    }
+}
+
+/// A duration in whole milliseconds, saturating rather than wrapping.
+fn ms(d: std::time::Duration) -> u64 {
+    d.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

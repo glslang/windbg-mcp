@@ -206,6 +206,25 @@ Issue `.sympath` alone, or use the **`set_symbol_path`** tool (goes through the 
 `AppendSymbolPath`/`SetSymbolPath` API, immune to the quirk; appends + reloads). When a driver's
 `module!Symbol` names don't resolve, **ask the user for the PDB folder** and apply it with that tool.
 
+## Recording a session while debugging this server
+
+`WINDBG_MCP_TRANSCRIPT=<path>` makes the supervisor write a JSONL record of every tool call, every
+session transition, every timeout and every worker death (`src/record.rs`; the README has the
+format). It is off unless the variable is set, and it is often the fastest way to answer "what
+actually happened in that session" — the `tracing` stream on stderr is prose about the *server* and
+interleaves both roles, while this is values about the *session*, keyed by session and request.
+
+Two things worth knowing when using it here:
+
+- **It records the supervisor's view.** A worker inherits the variable and ignores it (the role
+  check in `main` runs first), so there is exactly one writer and no interleaving. A fact that
+  exists only inside a worker reaches the transcript only if it crosses the pipe as a value — which
+  is the same rule as everything else in `src/structured.rs`, and the reason `debug_batch` grew a
+  typed report.
+- **`windbg-mcp --render-cast <transcript.jsonl>`** turns one into an asciicast. That is the
+  supported way to produce the recordings under `examples/` and `docs/` — the older ones are
+  hand-reconstructed and say so, and a new walkthrough should not add another.
+
 ## Plugin vs. dev build
 
 This project is also installed as a user-scope Claude Code plugin (`windbg-mcp@windbg-mcp`), which is

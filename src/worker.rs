@@ -1224,9 +1224,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         }
         // `id` is passed because a batch is the one op that can stop *itself*: it checks between
         // steps whether an interrupt has been raised for the job it is running as.
-        EngineOp::Batch(op) => run_batch(e, id, op, queued)
-            .map(Output::text)
-            .map_err(Failed::from),
+        EngineOp::Batch(op) => run_batch(e, id, op, queued).map_err(Failed::from),
         // Answered by the request reader, which is the only way it could reach a busy engine at
         // all, so it is never queued and never arrives here. See [`EngineOp::Interrupt`].
         EngineOp::Interrupt => Err(Failed::from(
@@ -2425,12 +2423,20 @@ impl Debuggee for BatchEngine<'_> {
     }
 }
 
-/// Runs a batch and renders its report.
+/// Runs a batch and reports what happened, as the rendered report and as values.
 ///
 /// The report is the result either way — a failed transaction that did not say which step failed
-/// and whether the rollback ran would be worse than no report at all. `Err` only chooses how
-/// [`crate::server`] renders it: a tool-execution error the model can read and act on.
-fn run_batch(e: &DebugEngine, job: u64, op: BatchOp, queued: Duration) -> Result<String, String> {
+/// and whether the rollback ran would be worse than no report at all. So a batch that **ran**
+/// answers `Ok` whatever it concluded, and its verdict is a field inside
+/// [`crate::structured::BatchReportInfo`] rather than the choice of `Ok`/`Err`;
+/// [`crate::server::batch_result`] is what turns that verdict into a tool-execution error, and the
+/// two `Err`s here are the batch that never started at all.
+///
+/// It is built here rather than parsed from the rendering on the other side of the pipe for the
+/// reason [#77](https://github.com/glslang/windbg-mcp/issues/77) gives, and it exists at all so a
+/// transcript can record a transaction's outcome and rollback state as facts
+/// ([#87](https://github.com/glslang/windbg-mcp/issues/87)).
+fn run_batch(e: &DebugEngine, job: u64, op: BatchOp, queued: Duration) -> Result<Output, String> {
     let Some(budget) = batch_budget(
         op.budget_ms,
         Duration::from_millis(u64::from(op.patience_ms)),
@@ -2497,11 +2503,10 @@ fn run_batch(e: &DebugEngine, job: u64, op: BatchOp, queued: Duration) -> Result
             }
         );
     }
-    if report.committed() && report.rollback_complete() {
-        Ok(rendered)
-    } else {
-        Err(rendered)
-    }
+    Ok(Output::typed(
+        rendered,
+        crate::structured::BatchReportInfo::from(&report),
+    ))
 }
 
 /// Column header for the chunk tables below. Kept next to [`pool_row`] so the two cannot

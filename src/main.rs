@@ -6,11 +6,18 @@
 //! [`worker::WORKER_FLAG`] it is an **engine worker**, owning exactly one debug session — which
 //! is what dbgeng.dll's one-session-per-process rule makes the natural unit, and what lets a
 //! session that cannot be unwound be killed without taking the server with it.
+//!
+//! There is also a third, which is not a server at all: [`cast::RENDER_FLAG`] turns a recorded
+//! transcript into a terminal recording and exits. It touches neither DbgEng nor MCP, and it is
+//! here rather than in a second binary because it reads a format this crate defines — a renderer
+//! that could drift out of step with the writer is a renderer that will.
 
 mod batch;
+mod cast;
 mod engine;
 mod kdconn;
 mod proto;
+mod record;
 mod server;
 mod structured;
 mod triage;
@@ -61,11 +68,46 @@ fn main() -> Result<()> {
         // inherited pipe handles, which is why a worker started by hand cannot get anywhere.
         worker::run(&args);
     }
+    if let Some(at) = args.iter().position(|arg| arg == cast::RENDER_FLAG) {
+        // Before the runtime: this reads a file and writes a file, and neither wants one.
+        return render_cast(&args[at + 1..]);
+    }
 
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
         .block_on(serve())
+}
+
+/// The renderer role: a transcript in, an asciicast out.
+///
+/// The one place in this binary that prints to standard output, and it is safe to: this role
+/// never speaks MCP, so there is no JSON-RPC transport to corrupt. It exits before `serve` is ever
+/// reached.
+fn render_cast(args: &[String]) -> Result<()> {
+    let options = match cast::Options::parse(args) {
+        Ok(options) => options,
+        Err(why) => anyhow::bail!("{why}\n\n{}", cast::USAGE),
+    };
+    let summary = cast::render(&options).map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!(
+        "wrote {} — {} frame(s) from {} record(s), {:.1}s of session",
+        options.output.display(),
+        summary.frames,
+        summary.records,
+        summary.duration_ms as f64 / 1000.0
+    );
+    // Loud, because it means part of the session is missing from the recording, and a renderer
+    // that mentioned it only in a return value nobody reads would be hiding that.
+    if summary.unreadable > 0 {
+        println!(
+            "note: {} line(s) of `{}` could not be read and were skipped — the usual cause is a \
+             transcript whose last record was cut short by the server exiting mid-write",
+            summary.unreadable,
+            options.input.display()
+        );
+    }
+    Ok(())
 }
 
 /// stdout is the JSON-RPC transport, so all logging must go to stderr. A worker's stderr is
@@ -86,7 +128,9 @@ fn init_logging() {
 }
 
 async fn serve() -> Result<()> {
-    let sessions = Sessions::new(call_timeout());
+    // Opened before anything is served, so the transcript's first record is this run starting
+    // rather than whatever the first tool call happened to be.
+    let sessions = Sessions::new(call_timeout()).recording(record::Recorder::from_env());
     let server = WindbgServer::new(sessions.clone());
 
     tracing::info!("windbg-mcp starting on stdio");
