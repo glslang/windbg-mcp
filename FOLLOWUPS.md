@@ -18,7 +18,10 @@ landed** (process-per-session, 2026-08-02); it is kept here rather than deleted 
 **Items 16, 17 and 18 have landed** (2026-08-10) and are kept for the opposite reason: each turned
 out to need something its entry did not anticipate — item 18 needed much less of item 7 than it
 claimed to, item 17 needed a walk deadline nothing had asked for, and item 16 needed a probe before
-it could measure anything at all. **Item 7 has landed** too (2026-08-10, the `interrupt` tool), and
+it could measure anything at all. **Item 20 has landed** (2026-08-16, #131) and is kept because the fix needed something the entry
+did not see: the two installers spell x64 differently, so the reordering it proposed would have
+picked the wrong architecture by another route. **Item 7 has landed** too (2026-08-10, the
+`interrupt` tool), and
 is kept because item 8 rests on it: what it built is the job binding, and what it deliberately did
 not build is the queued-job half that only `tasks/cancel` can ask for. **Item 12 has landed**
 (2026-08-02) and is kept because what validating it *disproved* outlives what it confirmed: a kernel
@@ -539,26 +542,34 @@ against. The one design question is the budget: a walk step is up to 1024 reads 
 transaction whose whole point is that its rollback still fits, so the step's share has to come out
 of the batch's deadline the way `pool`'s does rather than out of the call's.
 
-## 20. [windbg-mcp] Pick the TTD recorder by architecture, not by a fixed list
+## 20. [windbg-mcp] Pick the TTD recorder by architecture, not by a fixed list — **done** (2026-08-16, #131)
 
-`find_ttd` probes x64 before arm64 in both layouts it knows — `["x64", "arm64"]` for the classic
-SDK, and a list headed by `amd64\TTD\TTD.exe` for the MSIX package. On an ARM64 host that is always
-the wrong answer, because the ARM64 WinDbg package ships **all three** recorders (`amd64`, `arm64`,
-`x86`) and the first probe therefore always hits. `record_trace` picks the x64 recorder on exactly
-the hosts where the choice is not free, and a native ARM64 target cannot be recorded with it.
+`find_ttd` probed x64 before arm64 in both layouts it knows — `["x64", "arm64"]` for the classic
+SDK, and a list headed by `amd64\TTD\TTD.exe` for the MSIX package. On an ARM64 host that was
+always the wrong answer, because the ARM64 WinDbg package ships **all three** recorders (`amd64`,
+`arm64`, `x86`) and the first probe therefore always hit. `record_trace` picked the x64 recorder on
+exactly the hosts where the choice is not free, and a native ARM64 target cannot be recorded with
+it.
 
-Deferred rather than fixed on the spot because the honest selector is not the one the bug suggests.
-Host architecture is the obvious improvement, but x64-on-ARM64 emulation is a real workflow — an
-emulated x64 debuggee genuinely needs the `amd64` recorder — so the choice properly belongs to the
-*target*, which `record_trace` knows only after it has decided what to launch. Host-first is a
-strict improvement and a fine first cut; target-first is the design question worth thinking about
-before writing either.
+Found while setting up a Parallels ARM64 guest for [`docs/remote-phase0.md`](./docs/remote-phase0.md).
 
-Found while setting up a Parallels ARM64 guest for [`docs/remote-phase0.md`](./docs/remote-phase0.md),
-and tracked as [#131](https://github.com/glslang/windbg-mcp/issues/131). Note the workaround is
-already load-bearing on that host: `search_path` runs before both layout probes, so a recorder on
-`PATH` masks the ordering entirely — which also means a host configured that way will not reproduce
-the bug.
+**Resolved as the first cut this entry described**, and the deferral reasoning stands: the probe
+order now leads with *this build's* architecture and keeps the others behind it, because it is an
+ordering and not a filter — an emulated x64 debuggee on an ARM64 host genuinely wants the `amd64`
+recorder. The target's architecture is still the correct selector and still unavailable here:
+`record_trace` receives a command line, and resolving that to a file to read a PE header from is a
+separate problem with its own failure modes. `PATH` is searched first and overrides all of it, which
+is now documented at the point of the guess rather than only in the issue.
 
-Picks up at `ttd::find_ttd` and `ttd::find_in_windowsapps`, both of which are pure path probes with
-no engine dependency, so the fix is testable without a debugger.
+**What the entry did not anticipate** is the reason it is kept rather than deleted. The two
+installers disagree about one spelling — the SDK ships `Debuggers\x64` where the store package's
+payload directory is `amd64` — so reordering the string lists, which is what this entry describes,
+would have selected the wrong architecture by a different route. That is the same class of mistake
+as the ordering itself, and it is why the fix introduced an `Arch` type with the two names as
+separate accessors instead of reordering literals.
+
+Two smaller things it also turned out to need: the bare `TTD\TTD.exe` layout moved from second to
+last, since a package has either an architecture-specific tree or that one; and the ordering is
+covered by unit tests rather than a live probe, because the ARM64 host it was found on no longer has
+a TTD in either layout — its recorder is the `PATH` copy, which is the workaround this removes the
+need for.
