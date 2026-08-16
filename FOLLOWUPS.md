@@ -7,8 +7,8 @@ MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (#46, 2026-08-02), item 15 from the private worker channel (#65 / #72, 2026-08-04), items 16–18
 from transactional batches (#82, 2026-08-09/10 — item 17 is what validating the tool against the CTF
 session's own transcript turned up, and item 18 what reviewing it did), and item 19 from
-`walk_memory` (#103, 2026-08-13), and item 20 from standing the server up on an ARM64 guest
-(#131, 2026-08-16). Each item notes its repo,
+`walk_memory` (#103, 2026-08-13), and items 20–22 from standing the server up on an ARM64 guest
+(#131, #132, #134, 2026-08-16). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -573,3 +573,59 @@ last, since a package has either an architecture-specific tree or that one; and 
 covered by unit tests rather than a live probe, because the ARM64 host it was found on no longer has
 a TTD in either layout — its recorder is the `PATH` copy, which is the workaround this removes the
 need for.
+
+## 21. [windbg-mcp] TTD replay on a host where the store package will not install
+
+`open_trace` needs the replay engine — `TTDReplay*.dll`, `TtdExt.dll`, `TTDAnalyze.dll` — in a
+`ttd\` directory beside `windbg-mcp.exe`. System32's `dbgeng.dll` ships none of it and rejects every
+trace with `0x80070057`, so there is no degraded mode: replay either has the files or does not
+happen.
+
+Two things compound to make that unreachable on some hosts. The **SDK Debugging Tools do not ship
+`ttd\`** (nor `msdia140.dll`), so the one source that installs cleanly from a command line supplies
+everything *except* replay. And **MSIX registration fails from a non-interactive session** —
+`Add-AppxPackage` returns `0x80070005` even when elevated — staging the payload into
+`WindowsApps` without registering it, where the ACLs then deny execute. The result is a host that
+records traces and cannot replay them.
+
+Deferred because the two halves that could be done cheaply already have been, and what is left is a
+judgement call rather than a task. `open_trace` now says *why* a trace will not open instead of
+surfacing `0x80070057`, and `setup.md` carries a recipe for unpacking `ttd\` from the
+`.msixbundle`, which is an ordinary zip. So the failure is legible and there is a way through it.
+
+What is undecided is whether unpacking a Microsoft package by hand should be a **supported** path
+in this project's own documentation — it is currently written down as a fallback, not endorsed — or
+whether the answer is to require an interactive install and say so plainly. That is a maintainer's
+call about what this repo is willing to tell people to do, not an engineering problem.
+
+Picks up at [`setup.md`](./skills/windbg-debugging/setup.md)'s *When the store package will not
+install*, and [#132](https://github.com/glslang/windbg-mcp/issues/132).
+
+## 22. [windbg-mcp] Run the debugger tier on an ARM64 runner
+
+Both CI jobs that touch a debugger are `runs-on: windows-latest`, which is x64. `setup.md` now
+documents ARM64 hosts and states that an ARM64 engine reads an **x64** kernel minidump in full —
+`!analyze -v`, symbols, failure bucket, pool tag — and the only thing behind that claim is one
+manual session. If a future Windows-on-ARM image shipped a `dbgeng.dll` that could not open the
+checked-in sample dump, this repo would hear about it from a user.
+
+Not blocked: `windows-11-arm` runners are available on this account. It is deferred on scope rather
+than feasibility.
+
+The value is concentrated in the **debugger tier** and thin everywhere else. That job's own comment
+already argues the case — *"a runner whose DbgEng cannot open a checked-in dump is something this
+repo wants to hear about: it breaks users the same way"* — and it needs no symbols, no network, and
+opens a dump that is checked in. **Build & test** is a weaker case: the crate is
+architecture-independent Rust, so `cargo fmt`, clippy and the unit tests have no reason to differ,
+and a second entry there mostly buys runtime.
+
+Worth knowing before starting: the `Swatinem/rust-cache` key has to include the architecture, or the
+two matrix entries share one cache and each poisons the other.
+
+Note what an ARM64 runner would *not* have caught, so it does not get oversold. Item 20 (#131) was a
+path-probe ordering bug, caught by unit tests over a fake layout on any runner; and the `triage\`
+and `ttd\` gaps beside it are packaging problems that reproduce on x64 given the same partial
+bundle.
+
+Picks up at `.github/workflows/ci.yml`, the *Smoke test (debugger tier)* job, and
+[#134](https://github.com/glslang/windbg-mcp/issues/134).
