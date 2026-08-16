@@ -1729,8 +1729,12 @@ impl Sessions {
             session: session.id.clone(),
             kind: kind.label().to_string(),
             // Already masked where it is a connection: an attach resolves its label in
-            // `kdconn::select` before a worker is ever spawned.
-            target: crate::kdconn::scrub(&session.what),
+            // `kdconn::select` before a worker is ever spawned. Scrubbed anyway, and capped,
+            // because a `launch` target is a command line somebody wrote.
+            target: crate::record::Capped::of(
+                &crate::kdconn::scrub(&session.what),
+                self.rec.field_limit(),
+            ),
             engine_pid: pid,
         });
 

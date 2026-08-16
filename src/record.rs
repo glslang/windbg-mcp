@@ -19,17 +19,21 @@
 //!
 //! # Where the records come from
 //!
-//! Every one is written by the **supervisor**, which is what makes this a single-writer file with
-//! no locking and no interleaving between processes. That is not a limitation: a worker's facts
-//! reach here as the typed half of its reply ([`crate::proto::Output::data`]), built on the side
-//! of the pipe where the engine's own types are in hand. So a stop position, a batch's verdict and
-//! its rollback state are recorded from [`crate::structured`] values — never re-read out of the
+//! Every one is written by the **supervisor**. That is not a limitation: a worker's facts reach
+//! here as the typed half of its reply ([`crate::proto::Output::data`]), built on the side of the
+//! pipe where the engine's own types are in hand. So a stop position, a batch's verdict and its
+//! rollback state are recorded from [`crate::structured`] values — never re-read out of the
 //! rendering, which would measure the rendering ([#77](https://github.com/glslang/windbg-mcp/issues/77)).
 //!
 //! A worker inherits [`TRANSCRIPT_ENV`] like any other variable and never acts on it: the role
 //! check in [`crate::main`] runs before the server is built, so [`Recorder::from_env`] is only ever
-//! reached by the supervisor. Two processes appending to one file is a thing this design does not
-//! have to cope with because it cannot happen.
+//! reached by the supervisor. One server is therefore one writer, and within it the file lock in
+//! [`Recorder::write`] is what makes the record order and the line order the same order.
+//!
+//! **Two servers can still share a path**, because the file is opened for append and nothing
+//! stops an operator pointing both at it. Their lines then interleave, which is why every record
+//! carries a [`Record::run`] and not just the `start` line: grouping by it is what keeps two
+//! independently numbered sessions from being read as one.
 //!
 //! # Safety properties, and why each one is here
 //!
@@ -107,6 +111,8 @@ struct Sink {
     /// when the server is going down, which is when a transcript earns its keep.
     file: Mutex<std::fs::File>,
     path: PathBuf,
+    /// Which run this is, on every record it writes. See [`Record::run`].
+    run: u64,
     /// Where `mono_ms` is measured from: this server's start, not the wall clock, so a record's
     /// ordering survives a clock that steps.
     started: Instant,
@@ -158,8 +164,10 @@ impl Recorder {
     /// Opens `path` for append and writes the header record.
     ///
     /// Append rather than truncate: two servers pointed at one path, or a second run of the same
-    /// one, must not silently erase what is already there. Each run's records are told apart by
-    /// the `start` record and its pid.
+    /// one, must not silently erase what is already there. Which run wrote which line is then
+    /// [`Record::run`]'s job — on every record, because two servers appending at once interleave
+    /// theirs and a marker at the top of each run would only be able to describe a file whose
+    /// runs do not overlap.
     pub fn to_file(path: &Path, limit: usize) -> std::io::Result<Self> {
         if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
             std::fs::create_dir_all(parent)?;
@@ -168,6 +176,7 @@ impl Recorder {
         let recorder = Self(Some(Arc::new(Sink {
             file: Mutex::new(file),
             path: path.to_path_buf(),
+            run: mint_run_id(),
             started: Instant::now(),
             limit,
             seq: AtomicU64::new(0),
@@ -207,6 +216,7 @@ impl Recorder {
         let mut file = sink.file.lock().unwrap_or_else(|e| e.into_inner());
         let record = Record {
             v: SCHEMA,
+            run: sink.run,
             seq: sink.seq.fetch_add(1, Ordering::Relaxed),
             at: rfc3339(SystemTime::now()),
             mono_ms: ms(sink.started.elapsed()),
@@ -243,10 +253,17 @@ impl Recorder {
         let request = sink.request.fetch_add(1, Ordering::Relaxed) + 1;
         // The session a call names is worth having on the *request*, not only on the result: a
         // call that never comes back is one this is the only record of.
+        //
+        // Scrubbed, like the argument object it is lifted out of. A handle this server issued is
+        // `sess-…` and holds nothing — but this is whatever the *caller* sent, and the case the
+        // backstop exists for is precisely a caller who put a connection string somewhere it does
+        // not belong. `kdconn` already refuses that mistake in `profile` *without echoing it*; a
+        // copy taken before the scrub would write it to a file instead. It survives to the result
+        // too, because a handle that does not resolve is never replaced by a routed one.
         let session = args
             .and_then(|a| a.get("session_id"))
             .and_then(Value::as_str)
-            .map(str::to_string);
+            .map(kdconn::scrub);
         self.write(Event::ToolRequest {
             request,
             tool: tool.to_string(),
@@ -393,6 +410,20 @@ pub struct Record {
     /// The format version, on every line rather than only in the header — a reader that starts
     /// mid-file, or in the middle of a second run appended to the first, still knows what it has.
     pub v: u32,
+    /// Which run of this server wrote the line, unique among the runs that could be sharing the
+    /// file.
+    ///
+    /// On **every** record, not only on `start`, because two supervisors can be pointed at one
+    /// path and this file is opened for append — which is a thing [`Recorder::to_file`] allows on
+    /// purpose. Their records then interleave, and with the run named only once a reader would
+    /// take everything after the later `start` as one run, mixing two sets of `seq`, `request` and
+    /// session identifiers that were each numbered from scratch. Grouping by this field is what
+    /// makes such a file readable rather than merely present.
+    ///
+    /// Defaulted for a transcript written before this field existed; all of its records then share
+    /// run `0` and are segmented by their `start` records instead.
+    #[serde(default)]
+    pub run: u64,
     /// Position in this run, from zero. What orders records that share a millisecond.
     pub seq: u64,
     /// Wall clock, RFC 3339 in UTC. For a person, and for lining a transcript up against other
@@ -487,7 +518,10 @@ pub enum Event {
         kind: String,
         /// What was opened, already redacted where it is a connection — this is the session's own
         /// label, which is built masked (see [`kdconn::select`]).
-        target: String,
+        ///
+        /// Capped like everything else: a `launch` target is a whole command line, and it is the
+        /// caller's.
+        target: Capped,
         engine_pid: u32,
     },
     /// A session moved. Every transition goes through one place in the supervisor, so this covers
@@ -798,6 +832,19 @@ fn ms(d: Duration) -> u64 {
     d.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+/// An identifier for this run: distinct from any other run that could be appending to the same
+/// file at the same time, and from the run before it in a file that reuses a pid.
+///
+/// The wall clock in nanoseconds, mixed with the pid. Neither alone is enough — two processes can
+/// start in the same nanosecond about as easily as a pid is reused, which is to say rarely, and a
+/// transcript is not the place to rely on rarely.
+fn mint_run_id() -> u64 {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    nanos ^ ((std::process::id() as u64) << 48)
+}
+
 /// A wall-clock instant as RFC 3339 in UTC, to the millisecond.
 ///
 /// Written out rather than pulled in: the crate has no date dependency, this is the only place
@@ -992,7 +1039,7 @@ mod tests {
         rec.write(Event::SessionOpen {
             session: "sess-1".to_string(),
             kind: "kernel target".to_string(),
-            target: "net:port=50000,key=<redacted>".to_string(),
+            target: Capped::of("net:port=50000,key=<redacted>", 0),
             engine_pid: 4,
         });
 
@@ -1007,6 +1054,42 @@ mod tests {
         );
         // And it reads back as records, rather than the scrub having broken the JSON.
         assert_eq!(records(&path).len(), 4);
+    }
+
+    /// The `session_id` a record carries is the caller's string until it resolves, so it is
+    /// scrubbed like the argument object it was lifted out of.
+    ///
+    /// A handle this server issued is `sess-…` and holds nothing. But the backstop exists for the
+    /// caller who puts a connection string where it does not belong — `kdconn` already refuses
+    /// exactly that mistake in `profile`, and refuses it *without echoing the value back*. A copy
+    /// taken before the scrub would write to a file what that refusal was careful not to say. It
+    /// reaches the result too: a handle that does not resolve is never replaced by a routed one.
+    #[test]
+    fn a_session_handle_carrying_a_secret_is_scrubbed_like_any_other_argument() {
+        let (rec, path) = recorder("session-handle");
+        let call = rec.tool_request(
+            "registers",
+            Some(&serde_json::json!({ "session_id": "net:port=50000,key=1.2.3.4" })),
+        );
+        // Unresolvable, so nothing overwrites what the caller sent — which is the case that
+        // carries the value all the way through to the result.
+        rec.tool_result(call, true, "unknown session handle", None);
+
+        let raw = std::fs::read_to_string(&path).expect("the transcript exists");
+        assert!(!raw.contains("1.2.3.4"), "the key reached the file:\n{raw}");
+        let sessions: Vec<String> = records(&path)
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::ToolRequest { session, .. } | Event::ToolResult { session, .. } => {
+                    session.clone()
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sessions, ["net:port=50000,key=<redacted>"; 2],
+            "both the request and the result carry the masked form"
+        );
     }
 
     /// A member *named* like a secret is masked whole, whatever it holds. No tool has one today,

@@ -691,7 +691,8 @@ $env:WINDBG_MCP_TRANSCRIPT = "$env:USERPROFILE\.windbg-mcp\session.jsonl"
 {"v":1,"seq":11,"at":"2026-08-16T07:13:04.272Z","mono_ms":2765,"event":"batch","request":3,"session":"sess-…","outcome":"failed","at_step":2,"committed":false,"rollback_complete":true,"after":"stopped","elapsed_ms":603}
 ```
 
-Every record carries the format version, a sequence number, a wall clock and a monotonic offset.
+Every record carries the format version, the run that wrote it, a sequence number, a wall clock
+and a monotonic offset.
 The events are the tool call and its result; a session opening, changing state and being released;
 a wait abandoned, an `interrupt`, a worker process dying; and — derived from each result's *typed*
 half, never scraped from the text beside it — where execution stopped, what a `run_to_address`
@@ -719,7 +720,9 @@ plays at the speed it happened), `--max-lines <n>` caps how much of a long resul
 
 A file holding several runs renders as one recording with the runs laid end to end, separated by
 however long the server was actually down — each run's own clock starts at zero, so playing those
-offsets as they stand would step backwards at the join and no player would accept it.
+offsets as they stand would step backwards at the join and no player would accept it. Two servers
+pointed at the same path interleave their lines; they are grouped back into their own runs by the
+`run` field every record carries, so neither session is read as part of the other.
 
 **Redaction.** Every string recorded is scrubbed for `key=`/`password=` values, and an argument
 member *named* like a secret is masked whole — so a raw `connection` passed to `attach_kernel` is
