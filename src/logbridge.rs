@@ -522,7 +522,7 @@ mod tests {
         assert!(Level::Debug < Level::Trace);
         let wanted = Level::Warn;
         assert!(Level::Error <= wanted, "an error is at least a warning");
-        assert!(!(Level::Info <= wanted), "info is not at least a warning");
+        assert!(Level::Info > wanted, "info is not at least a warning");
     }
 
     /// The ring drops the oldest, and the drop is *visible*: seq numbers do not restart, so a
