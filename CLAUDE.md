@@ -111,22 +111,31 @@ that patches a byte of the running kernel** and has to put it back (through a fa
 clamped call budget, a disconnect and an `end_session`) — the one claim a crash dump cannot test,
 because a byte patched in a dump is patched in a file nobody reads again. It is gated on the
 connection string (which nobody can guess) *and* `#[ignore]`d, so a stale variable can never freeze
-a VM during an ordinary `cargo test`. Run it last, on its own:
+a VM during an ordinary `cargo test`. Run it last, on its own.
+
+**Before deciding a live-kernel claim cannot be checked, read the profiles.** This host normally has
+one configured, and a configured profile *is* a KDNET target — connection, port and key — so the
+tier can be run. The failure this is here to stop is not asking the user for a key; it is concluding
+"no KDNET target on this host" without looking, shipping the live claim as unverified, and saying so
+in a PR. Two lines settle it:
 
 ```pwsh
-$env:WINDBG_MCP_SMOKE_KERNEL = "net:port=50000,key=<w.x.y.z>"
+Get-Content "$env:USERPROFILE\.windbg-mcp\profiles.json" -Raw | ConvertFrom-Json | Get-Member -MemberType NoteProperty | Select-Object Name
+Get-ChildItem Env: | Where-Object Name -like 'WINDBG_MCP_PROFILE_*' | Select-Object Name
+```
+
+Then set the variable **from the profile, in one step**, so the key never lands in a command line, a
+tool argument or this transcript:
+
+```pwsh
+$env:WINDBG_MCP_SMOKE_KERNEL = (Get-Content "$env:USERPROFILE\.windbg-mcp\profiles.json" -Raw | ConvertFrom-Json).'ctf-vm'
 cargo test --test mcp_smoke -- --ignored --nocapture --test-threads=1 live_kernel
 ```
 
-**Do not ask for that string before checking whether a profile already holds it.** The same
-connection is usually configured for `attach_kernel { "profile": … }`, in
-`%USERPROFILE%\.windbg-mcp\profiles.json` or a `WINDBG_MCP_PROFILE_<NAME>` variable, and the tier
-takes the *raw* string only because it has to exercise the explicit path — not because it needs a
-second copy. Read the profile and set the variable from it in one step, so the key never lands in a
-command line, a tool argument or this transcript; print the profile *name* and the port when
-reporting what you are attaching to, never the value. `attach_kernel {}` lists the configured names
-without disclosing any of them. Only ask the user for a raw connection when no profile is
-configured at all.
+The tier takes the *raw* string only because it has to exercise the explicit path — not because it
+needs a second copy of the key. Print the profile **name** and the port when reporting what you are
+attaching to, never the value; `attach_kernel {}` lists the configured names without disclosing any
+of them. Only ask the user for a raw connection when no profile is configured at all.
 
 `--test-threads=1` is not optional: the filter matches **eight** tests, and the KD transport is
 single-owner, so in parallel the second attach fails and can leave the target halted.
