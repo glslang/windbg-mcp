@@ -56,7 +56,7 @@ const CLOSED_HISTORY: usize = 8;
 /// How long to wait for a freshly spawned worker to report [`WorkerMessage::Ready`]. This covers
 /// process creation and `DebugCreate`, nothing else — a worker that is slower than this is not
 /// going to become usable.
-const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How long `end_session` gives the worker to release its target cleanly before the process is
 /// killed instead.
