@@ -159,7 +159,10 @@ Copy-Item "$wd\winxp\kdexts.dll" "$dst\winxp" -Force   # !drvobj/!devobj/!irp �
 - The `ttd\` subdir provides the `@$cursession.TTD` / `@$curprocess.TTD` data model and the
   `!tt` time-travel commands.
 - The `winext\` subdir provides `ext.dll` (which exports `!analyze`) and the other `!`-extensions.
-  Required for crash-dump triage — without it `!analyze` returns *"No export analyze found"*.
+  Required for crash-dump triage — without it `!analyze` returns *"No export analyze found"*. On a
+  minimal engine the **unqualified `!analyze` may not resolve** even with `winext\` present; the
+  module-qualified **`!ext.analyze -v`** does. `crash_triage` tries both and reports which one
+  answered, so its `analysis.command` tells you which case this host is in.
 - The `triage\` subdir provides `triage.ini` and `pooltag.txt`, which `!analyze` reads to attribute
   a crash to a module and to name pool tags. **Its absence does not produce an error**, which is
   what makes it worth listing: `!analyze` runs, and reports `ANALYSIS_INCONCLUSIVE` /
