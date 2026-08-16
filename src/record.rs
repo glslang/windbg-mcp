@@ -43,14 +43,16 @@
 //! * **Never the MCP transport.** The process's standard output is JSON-RPC. This writes to its
 //!   own file, opened here, and to nothing else — a test in this module holds that line by
 //!   reading the source.
-//! * **Redacted.** Every string that goes in is scrubbed for KDNET keys and remote passwords
-//!   ([`kdconn::scrub`]), and an argument member *named* like a secret is masked whole. Profiles
-//!   keep a key out of the request in the first place; this is what covers a caller who passed a
-//!   raw `connection` anyway.
+//! * **Redacted.** Every string that goes in passes [`kdconn::scrub`], which masks a secret this
+//!   server has been handed **by value** — in any syntax, that being the guarantee — and scans for
+//!   `key=`/`password=` as a best-effort net under it. An argument member *named* like a secret is
+//!   masked whole. Profiles keep a key out of the request in the first place; this covers a caller
+//!   who passed a raw `connection` anyway.
 //! * **Bounded, and says so.** A rendering can be megabytes. Fields are capped at
 //!   [`FIELD_LIMIT_ENV`] bytes and the record says how much was dropped, rather than being
 //!   silently short — a transcript that quietly truncates is worse than one that does not exist,
-//!   because it reads as complete.
+//!   because it reads as complete. A whole record is bounded too
+//!   ([`Recorder::over_ceiling`]), which is what holds the promise for a field somebody forgot.
 //! * **Parseable after a crash.** One record is one `write_all` to a file opened for append, with
 //!   no buffering in this process, so an abrupt exit leaves whole records behind it.
 
@@ -87,6 +89,10 @@ const DEFAULT_FIELD_LIMIT: usize = 16 * 1024;
 
 /// The record format's version, carried on every line so a reader never has to guess.
 pub const SCHEMA: u32 = 1;
+
+/// Headroom over the field cap for a whole record: its envelope, and the several capped fields
+/// one can carry. See [`Recorder::over_ceiling`].
+const RECORD_OVERHEAD: usize = 4096;
 
 // ---- the sink -------------------------------------------------------------
 
@@ -215,10 +221,13 @@ impl Recorder {
     pub fn write(&self, event: Event) {
         let Some(sink) = &self.0 else { return };
         let mut file = sink.file.lock().unwrap_or_else(|e| e.into_inner());
+        let record_seq = sink.seq.fetch_add(1, Ordering::Relaxed);
+        // Read before the event moves into the record, for the marker below.
+        let kind = name_of(&event);
         let record = Record {
             v: SCHEMA,
             run: sink.run,
-            seq: sink.seq.fetch_add(1, Ordering::Relaxed),
+            seq: record_seq,
             at: rfc3339(SystemTime::now()),
             mono_ms: ms(sink.started.elapsed()),
             event,
@@ -233,11 +242,55 @@ impl Recorder {
                 return;
             }
         };
+        // The backstop under the per-field caps. Those are applied field by field, by hand, and
+        // three rounds of review each found a field that had been missed — the derived batch
+        // details, a session's target, a caller's handle. Every one of them was a *new* place to
+        // remember, which is a losing shape. This bounds the record itself, so a field nobody
+        // capped — including one added later — cannot put an unbounded line in the file. It
+        // reports what it dropped rather than dropping it silently, and it is deliberately far
+        // above what a well-capped record reaches, so it fires only when something slipped past.
+        if let Some(bytes) = self.over_ceiling(&line) {
+            tracing::warn!(
+                "a transcript record of kind `{kind}` was {bytes} bytes, past the whole-record \
+                 ceiling, and was replaced by a marker: a field of it is not being capped"
+            );
+            let marker = Record {
+                v: SCHEMA,
+                run: sink.run,
+                seq: record_seq,
+                at: record.at,
+                mono_ms: record.mono_ms,
+                event: Event::Oversized { of: kind, bytes },
+            };
+            match serde_json::to_string(&marker) {
+                Ok(replacement) => line = replacement,
+                Err(e) => {
+                    tracing::error!("an oversized-record marker did not serialize: {e}");
+                    return;
+                }
+            }
+        }
         line.push('\n');
         // One `write_all` per record, on a file opened for append and with no buffer in front of
         // it: that is what leaves a parseable prefix behind an abrupt exit.
         if let Err(e) = file.write_all(line.as_bytes()) {
             tracing::error!("could not write a transcript record: {e}");
+        }
+    }
+
+    /// How big a serialized record is, if that is past the whole-record ceiling.
+    ///
+    /// The ceiling is the field cap with room for the several capped fields a record can hold and
+    /// its envelope — generous on purpose. It is not the bound the documentation promises, which
+    /// is per field; it is the thing that makes that promise hold even where a field was missed.
+    /// `None` when the cap is off, which is an operator asking for everything.
+    fn over_ceiling(&self, line: &str) -> Option<usize> {
+        match self.limit() {
+            0 => None,
+            limit => {
+                let ceiling = limit.saturating_mul(8).saturating_add(RECORD_OVERHEAD);
+                (line.len() > ceiling).then_some(line.len())
+            }
         }
     }
 
@@ -264,7 +317,7 @@ impl Recorder {
         let session = args
             .and_then(|a| a.get("session_id"))
             .and_then(Value::as_str)
-            .map(kdconn::scrub);
+            .map(|id| Capped::of(&kdconn::scrub(id), self.limit()).text);
         self.write(Event::ToolRequest {
             request,
             tool: tool.to_string(),
@@ -663,6 +716,12 @@ pub enum Event {
     },
     /// The server is going down and every session is being let go.
     Shutdown { sessions: usize },
+    /// A record that would have been past the whole-record ceiling, replaced by its size.
+    ///
+    /// Present so that a field which is not being capped shows up as a **fact in the transcript**
+    /// rather than as an enormous line. Seeing one means this module has a bug, not that the
+    /// session did something unusual — `of` names the event kind to look at.
+    Oversized { of: String, bytes: usize },
 }
 
 // ---- deriving the typed events --------------------------------------------
@@ -1336,6 +1395,46 @@ mod tests {
                 assert!(field.dropped.is_some(), "and it has to say so: {field:?}");
             }
         }
+    }
+
+    /// The whole-record ceiling: the backstop under the per-field caps.
+    ///
+    /// Three rounds of review each found a *different* field that had been missed — derived batch
+    /// details, a session's target, a caller's handle — because capping was something each new
+    /// field had to remember to do. This bounds the record itself, so the next missed field is a
+    /// marker in the transcript instead of an unbounded line, and says which kind to go and look
+    /// at. `tool` is the field used here because it is genuinely uncapped and genuinely the
+    /// caller's: an MCP client chooses the name it asks for.
+    #[test]
+    fn a_record_no_field_cap_bounded_is_replaced_by_a_marker() {
+        let path = std::env::temp_dir()
+            .join("windbg-mcp-transcript-tests")
+            .join(format!("ceiling-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let rec = Recorder::to_file(&path, 64).expect("open the transcript");
+        let enormous = "t".repeat(64 * 8 + RECORD_OVERHEAD + 1);
+        let call = rec.tool_request(&enormous, None);
+        rec.tool_result(call, false, "", None);
+
+        let records = records(&path);
+        let Event::Oversized { of, bytes } = &records[1].event else {
+            panic!(
+                "expected the request to be replaced: {:?}",
+                records[1].event
+            )
+        };
+        assert_eq!(of, "tool_request");
+        assert!(*bytes > 64 * 8, "the marker says how big it was: {bytes}");
+        // The marker is a record like any other — numbered in sequence, so nothing is lost from
+        // the ordering, and small.
+        assert_eq!(records[1].seq, 1);
+        let longest = std::fs::read_to_string(&path)
+            .expect("the transcript")
+            .lines()
+            .map(str::len)
+            .max()
+            .unwrap_or(0);
+        assert!(longest <= 64 * 8 + RECORD_OVERHEAD, "{longest} bytes");
     }
 
     /// A tool this module knows nothing about contributes its result and no derived events. The

@@ -22,9 +22,10 @@
 //! whose key is not configured anywhere has to be reachable, and an operator driving this server
 //! by hand should not have to write a config file first.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -80,8 +81,17 @@ const NAME_LIMIT: usize = 64;
 pub struct Connection(String);
 
 impl Connection {
+    /// Wraps a raw connection string, and **remembers its secrets** so they can be masked by value
+    /// wherever they later turn up — see [`KNOWN_SECRETS`].
+    ///
+    /// Here because this is the one door: a profile resolved on this host and a raw `connection`
+    /// argument both become a `Connection`, and nothing dials without one. Registering at the
+    /// parse rather than at each caller is the same reasoning as `is_secret_name` having one
+    /// definition — a second place to remember is a place to forget.
     pub fn new(raw: impl Into<String>) -> Self {
-        Self(raw.into())
+        let raw = raw.into();
+        remember_secrets(&raw);
+        Self(raw)
     }
 
     /// The raw string, key and all — for handing to DbgEng and nothing else.
@@ -188,6 +198,13 @@ impl<'a> Param<'a> {
         is_secret_name(self.name)
     }
 
+    /// This parameter's value if it is a secret one, for [`remember_secrets`]. Blank values are
+    /// not secrets — the same rule [`Self::render`] applies when it decides whether to mask.
+    fn secret_value(&self) -> Option<&'a str> {
+        self.value
+            .filter(|v| self.is_secret() && !v.trim().is_empty())
+    }
+
     fn render(&self, secrets: Secrets, out: &mut String) {
         out.push_str(self.name);
         if let Some(value) = self.value {
@@ -269,24 +286,60 @@ fn redact(connection: &str) -> String {
     Parsed::of(connection).render(Secrets::Mask)
 }
 
-/// Masks every secret parameter value in **arbitrary text**, wherever one appears in it.
+/// Every secret this server has been handed, so it can be masked by **value** wherever it turns up.
+///
+/// This is the half of [`scrub`] that is a guarantee rather than a net, and it exists because the
+/// other half kept losing. A scan for `key=…` has to anticipate a syntax; review found it missing
+/// whitespace around the separator, then a line break after it, then an escaped quote inside the
+/// value, then a backslash-escaped member name — four shapes of one string, and no reason to think
+/// the list was finished. Knowing the actual value ends that: a key masked because it *is* the key
+/// does not care how it was written, escaped, quoted or split across a sentence.
+///
+/// Populated by [`Connection::new`], which every connection this server dials goes through, from a
+/// profile or from a raw argument alike. Bounded by the number of distinct targets a host talks to,
+/// which is a handful; nothing is ever removed, because a key stays a secret after its session ends.
+static KNOWN_SECRETS: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Shorter than this and a value is not masked by [`KNOWN_SECRETS`].
+///
+/// A secret short enough to occur by accident would mask the text around it rather than itself: a
+/// key of `1` would blank every digit in a transcript. Real ones are far longer — a KDNET key is
+/// four dotted numbers — so the floor costs nothing and stops the mechanism from being worse than
+/// the leak it prevents.
+const MASKABLE_SECRET: usize = 6;
+
+/// Remembers the secret parameter values of `connection`, so [`scrub`] can mask them by value.
+fn remember_secrets(connection: &str) {
+    let mut known = KNOWN_SECRETS.lock().unwrap_or_else(|e| e.into_inner());
+    for param in &Parsed::of(connection).params {
+        if let Some(value) = param.secret_value().filter(|v| v.len() >= MASKABLE_SECRET) {
+            known.insert(value.to_string());
+        }
+    }
+}
+
+/// Masks every secret in **arbitrary text**, wherever one appears in it.
 ///
 /// [`redact`] is for a string that *is* a connection: it parses one, and hands back [`OPAQUE`] for
 /// anything whose structure it cannot trust — which is the right answer there and the wrong one
 /// here, where the input is a blob of JSON or a page of debugger output that happens to contain a
 /// connection somewhere inside it. Passing that through `redact` would mask the entire blob.
 ///
-/// So this scans instead, and the two share the one thing that must not drift: [`SECRET_PARAMS`]
-/// and [`MASK`]. A secret is a *whole* parameter name (`pubkey=` is not `key=`, matched the same
-/// way [`Param::is_secret`] matches), followed by `=` or a JSON `:`, and its value is masked
-/// whether it is bare (`key=1.2.3.4`, as a connection string writes it) or quoted
-/// (`"key": "1.2.3.4"`, as a tool call does).
+/// Two mechanisms, and the order matters because they are not equally strong:
 ///
-/// Written for [`crate::record`], where the argument object of an `attach_kernel` that supplied a
-/// raw `connection` is the one place a KDNET key can still reach a file this server writes. It
-/// scans rather than reaches into the JSON because the text half of a result is not JSON at all,
-/// and a transcript that protected only the structured half would leak through the other one.
+/// 1. **By value.** Every secret this server has been given is masked wherever it occurs, in any
+///    syntax at all — see [`KNOWN_SECRETS`]. This is the guarantee: a key that reached this process
+///    cannot leave it in a transcript, however the text around it is written.
+/// 2. **By pattern**, as a net under it: a *whole* parameter name (`pubkey=` is not `key=`, matched
+///    the way [`Param::is_secret`] matches), a separator, and a value — bare (`key=1.2.3.4`, as a
+///    connection string writes it) or quoted (`"key": "1.2.3.4"`, as a tool call does, escaped or
+///    not). This catches a secret this server has never seen, such as one a target printed itself.
+///    It is **best-effort**, and deliberately described as such: it has to guess a syntax, and the
+///    guesses that have been wrong so far were all found by someone looking, not by it failing
+///    loudly. Anything relying on redaction relies on (1).
 pub(crate) fn scrub(text: &str) -> String {
+    let masked = mask_known_values(text);
+    let text: &str = &masked;
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut i = 0;
@@ -308,6 +361,27 @@ pub(crate) fn scrub(text: &str) -> String {
         }
     }
     out
+}
+
+/// Replaces every known secret value with [`MASK`], wherever it occurs.
+///
+/// Borrowed back unchanged in the ordinary case, which is every call on a host that has never
+/// dialled a target with a key.
+fn mask_known_values(text: &str) -> std::borrow::Cow<'_, str> {
+    let known = KNOWN_SECRETS.lock().unwrap_or_else(|e| e.into_inner());
+    let present: Vec<&String> = known.iter().filter(|s| text.contains(s.as_str())).collect();
+    if present.is_empty() {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    // Longest first, so a secret that contains another is masked whole rather than being cut into
+    // a mask and a remainder.
+    let mut present = present;
+    present.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    let mut out = text.to_string();
+    for secret in present {
+        out = out.replace(secret.as_str(), MASK);
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 /// A secret parameter starting at `i`, as `(where its value starts, where it ends)`.
@@ -335,8 +409,11 @@ fn secret_at(text: &str, i: usize) -> Option<(usize, usize)> {
         return None;
     }
     let mut at = i + name.len();
-    let quoted_name = text[at..].starts_with('"');
-    at += usize::from(quoted_name);
+    // A quote, optionally backslash-escaped: debugger output and log lines quote JSON inside
+    // strings, so the member name's own delimiter arrives as `\"` rather than `"`.
+    let escaped_name = text[at..].starts_with("\\\"");
+    let quoted_name = escaped_name || text[at..].starts_with('"');
+    at += usize::from(quoted_name) + usize::from(escaped_name);
     // Filler on **both** sides of the separator, because a secret arrives in text somebody typed.
     // `net:port=1, key = 1.2.3.4` is refused by [`is_dialable`] — but only after it has already
     // been recorded as an argument, so a scan that required `key=` exactly would mask the key in
@@ -347,15 +424,16 @@ fn secret_at(text: &str, i: usize) -> Option<(usize, usize)> {
         _ => return None,
     }
     at += inline_gap(text, at);
-    let quoted = text[at..].starts_with('"');
-    let start = at + usize::from(quoted);
+    let escaped_value = text[at..].starts_with("\\\"");
+    let quoted = escaped_value || text[at..].starts_with('"');
+    let start = at + usize::from(quoted) + usize::from(escaped_value);
     let body = &text[start..];
     let len = match quoted {
-        // Up to the closing quote — the first *unescaped* one. Stopping at an escaped quote would
-        // mask the head of the value and leave its tail in the file, which is the one way this
-        // scan can fail that produces a plausible-looking redacted line with the secret still in
-        // it. A `.server` password may contain anything a shell will pass.
-        true => closing_quote(body),
+        // Up to the closing quote, which is `\"` when the opening one was escaped and a plain
+        // unescaped `"` otherwise. Stopping in the wrong place would mask the head of the value
+        // and leave its tail in the file — the one way this scan fails that produces a
+        // plausible-looking redacted line with the secret still in it.
+        true => closing_quote(body, escaped_value),
         false => body
             .find(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '"' | '}' | ']'))
             .unwrap_or(body.len()),
@@ -368,18 +446,25 @@ fn name_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '-'
 }
 
-/// How far a quoted value runs: to the first quote not preceded by an odd number of backslashes,
-/// or to the end of the text if it is unterminated.
+/// How far a quoted value runs, to its closing delimiter or to the end of an unterminated one.
 ///
-/// JSON's own escaping rule, and it has to be honoured rather than approximated: `"hunter\"x"` is
-/// one value of `hunter"x`, and a scan that stopped at the inner quote would mask `hunter\` and
-/// leave `x` behind — a line that *looks* redacted while still carrying part of the secret.
-fn closing_quote(body: &str) -> usize {
-    let mut escaped = false;
+/// Which delimiter depends on how it was opened, and both spellings occur in text this server
+/// records. In JSON, `"hunter\"x"` is one value of `hunter"x`, so the close is the first quote
+/// *not* escaped — a scan stopping at the inner one would mask `hunter\` and leave `x` behind. In
+/// JSON that has itself been quoted into a string, which is how a log line carries a request it is
+/// quoting, every delimiter is written `\"` and the close is that pair.
+///
+/// Getting this wrong is the failure worth naming: a line that *looks* redacted while still
+/// carrying part of the secret is worse than one that plainly does not.
+fn closing_quote(body: &str, escaped: bool) -> usize {
+    if escaped {
+        return body.find("\\\"").unwrap_or(body.len());
+    }
+    let mut after_backslash = false;
     for (at, c) in body.char_indices() {
         match c {
-            _ if escaped => escaped = false,
-            '\\' => escaped = true,
+            _ if after_backslash => after_backslash = false,
+            '\\' => after_backslash = true,
             '"' => return at,
             _ => {}
         }
@@ -1199,6 +1284,52 @@ mod tests {
         );
     }
 
+    /// Masking **by value** is the half of `scrub` that is a guarantee, and this is what it buys:
+    /// the same key written four ways that the pattern scan handles differently, and one it does
+    /// not handle at all, all masked because they *are* the key.
+    ///
+    /// Three rounds of review found three separate syntaxes the scan missed. Chasing a fourth was
+    /// the wrong move; knowing the value ends the category.
+    #[test]
+    fn a_known_secret_is_masked_however_it_is_written() {
+        // Registered the way every real one is: by being dialled.
+        let _ = Connection::new("net:port=50011,key=203.0.113.77");
+        for written in [
+            // The shapes the scan also catches, for the avoidance of doubt.
+            "net:port=50011,key=203.0.113.77",
+            r#"{"connection":"net:port=50011,key=203.0.113.77"}"#,
+            // And the ones it does not: no parameter name in sight.
+            "the key for that box is 203.0.113.77, do not share it",
+            "KDNET_KEY=203.0.113.77",
+            r#"{"note":"reconnect with 203.0.113.77"}"#,
+            "203.0.113.77",
+        ] {
+            let out = scrub(written);
+            assert!(
+                !out.contains("203.0.113.77"),
+                "a key this server was handed survived as `{out}`"
+            );
+            assert!(
+                out.contains(MASK),
+                "and it should say something was masked: {out}"
+            );
+        }
+    }
+
+    /// A value too short to be a real secret is not masked, because masking it would do more
+    /// damage than the leak: a key of `1` would blank every digit in a transcript.
+    #[test]
+    fn a_secret_too_short_to_be_one_is_not_masked_by_value() {
+        let _ = Connection::new("net:port=1,key=1.2");
+        assert_eq!(
+            scrub("the value 1.2 appears often"),
+            "the value 1.2 appears often"
+        );
+        // The pattern scan still covers it where it is written as a parameter, which is the only
+        // place a two-character key means anything.
+        assert_eq!(scrub("key=1.2"), "key=<redacted>");
+    }
+
     /// A quoted value ends at the first *unescaped* quote.
     ///
     /// The failure this prevents is the worst shape a redaction bug takes: a line that reads as
@@ -1219,6 +1350,20 @@ mod tests {
         assert_eq!(scrub(r#"{"key":"1.2.3.4"#), r#"{"key":"<redacted>"#);
     }
 
+    /// JSON quoted inside a string arrives with its own delimiters escaped, which is how a
+    /// debugger's output and a log line carry a request they are quoting.
+    #[test]
+    fn scrubbing_masks_a_secret_whose_json_is_itself_escaped() {
+        assert_eq!(
+            scrub(r#"request was {\"password\":\"hunter2\"}"#),
+            r#"request was {\"password\":\"<redacted>\"}"#
+        );
+        assert_eq!(
+            scrub(r#"{\"key\": \"1.2.3.4\"}"#),
+            r#"{\"key\": \"<redacted>\"}"#
+        );
+    }
+
     /// Filler stops at the end of the line, which is the difference between "no value" and "the
     /// next line".
     ///
@@ -1227,10 +1372,12 @@ mod tests {
     /// there was an empty value and losing a fact from the transcript.
     #[test]
     fn scrubbing_does_not_run_past_the_end_of_a_line() {
+        // Values no other test registers: `KNOWN_SECRETS` is process-wide on purpose, so a test
+        // asserting something is *not* masked cannot reuse a key another test has dialled.
         for across in [
             "key=\nnt!KeBugCheckEx",
-            "net:port=1,key=\n1.2.3.4",
-            "password=\r\nhunter2",
+            "net:port=1,key=\n198.51.100.4",
+            "password=\r\nnotasecrethere",
         ] {
             assert_eq!(scrub(across), across);
         }
