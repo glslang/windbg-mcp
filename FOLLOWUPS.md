@@ -18,8 +18,9 @@ landed** (process-per-session, 2026-08-02); it is kept here rather than deleted 
 **Items 16, 17 and 18 have landed** (2026-08-10) and are kept for the opposite reason: each turned
 out to need something its entry did not anticipate — item 18 needed much less of item 7 than it
 claimed to, item 17 needed a walk deadline nothing had asked for, and item 16 needed a probe before
-it could measure anything at all. **Item 20 has landed** (2026-08-16, #131) and is kept because the fix needed something the entry
-did not see: the two installers spell x64 differently, so the reordering it proposed would have
+it could measure anything at all. **Items 20 and 22 have landed** (2026-08-16, #131 and #134) and are kept because each needed
+something its entry did not see — item 22's job rename silently removed a required status check.
+Item 20's fix needed something the entry did not see: the two installers spell x64 differently, so the reordering it proposed would have
 picked the wrong architecture by another route. **Item 7 has landed** too (2026-08-10, the
 `interrupt` tool), and
 is kept because item 8 rests on it: what it built is the job binding, and what it deliberately did
@@ -601,31 +602,31 @@ call about what this repo is willing to tell people to do, not an engineering pr
 Picks up at [`setup.md`](./skills/windbg-debugging/setup.md)'s *When the store package will not
 install*, and [#132](https://github.com/glslang/windbg-mcp/issues/132).
 
-## 22. [windbg-mcp] Run the debugger tier on an ARM64 runner
+## 22. [windbg-mcp] Run the debugger tier on an ARM64 runner — **done** (2026-08-16, #134)
 
-Both CI jobs that touch a debugger are `runs-on: windows-latest`, which is x64. `setup.md` now
-documents ARM64 hosts and states that an ARM64 engine reads an **x64** kernel minidump in full —
-`!analyze -v`, symbols, failure bucket, pool tag — and the only thing behind that claim is one
-manual session. If a future Windows-on-ARM image shipped a `dbgeng.dll` that could not open the
-checked-in sample dump, this repo would hear about it from a user.
+Both CI jobs that touch a debugger were `runs-on: windows-latest`, which is x64, while `setup.md`
+told readers an ARM64 engine reads an **x64** kernel minidump in full — a claim resting on one
+manual session. The debugger tier now runs on both, and only that tier: the crate is
+architecture-independent Rust, so `fmt`, clippy and the unit tests have no reason to differ, and
+what differs on ARM64 is the engine.
 
-Not blocked: `windows-11-arm` runners are available on this account. It is deferred on scope rather
-than feasibility.
+The `Swatinem/rust-cache` key carries the architecture, as this entry said it would have to.
 
-The value is concentrated in the **debugger tier** and thin everywhere else. That job's own comment
-already argues the case — *"a runner whose DbgEng cannot open a checked-in dump is something this
-repo wants to hear about: it breaks users the same way"* — and it needs no symbols, no network, and
-opens a dump that is checked in. **Build & test** is a weaker case: the crate is
-architecture-independent Rust, so `cargo fmt`, clippy and the unit tests have no reason to differ,
-and a second entry there mostly buys runtime.
+**Two things it did not anticipate, which is why it is kept.**
 
-Worth knowing before starting: the `Swatinem/rust-cache` key has to include the architecture, or the
-two matrix entries share one cache and each poisons the other.
+The first is the reason the entry existed and still cost a correction: the ARM64 run **failed on its
+first attempt**, four assertions of forty-five, and the claim in `setup.md` was wrong. The engine
+parses the dump — bug check, module list, stack attribution — and cannot read *virtual memory* out
+of it, so `walk_memory`, `disassemble` and the `EPROCESS` behind `crash_triage`'s `process_name` all
+fail ([#142](https://github.com/glslang/windbg-mcp/issues/142)). Those four are gated to `x86_64`,
+because the constraint belongs to the **sample**: the checked-in dump is x64, and on another
+architecture they have nothing to assert. Equivalent coverage there needs an ARM64 dump of its own
+([#143](https://github.com/glslang/windbg-mcp/issues/143)).
 
-Note what an ARM64 runner would *not* have caught, so it does not get oversold. Item 20 (#131) was a
-path-probe ordering bug, caught by unit tests over a fake layout on any runner; and the `triage\`
-and `ttd\` gaps beside it are packaging problems that reproduce on x64 given the same partial
-bundle.
-
-Picks up at `.github/workflows/ci.yml`, the *Smoke test (debugger tier)* job, and
-[#134](https://github.com/glslang/windbg-mcp/issues/134).
+The second is a trap with nothing to do with architecture. **Renaming the job removed a required
+status check.** `Smoke test (debugger tier)` is a required context in the repository ruleset,
+matched by name — so adding `, ${{ matrix.arch }}` did not rename the requirement, it deleted the
+only job that could satisfy it, and every PR in the repo would have blocked on a check that can
+never report again. It surfaced as a PR that was `MERGEABLE` but `BLOCKED` with nothing failing that
+was required. The x64 entry now keeps the original name exactly, so adding a matrix is not a rename.
+Worth knowing before touching any job name in this repository, not just this one.
