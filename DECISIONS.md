@@ -5,6 +5,52 @@ status. Keep entries short; link to code with `file:line` where it helps a futur
 
 ---
 
+## Tenancy is held until the engine is idle, not until the request ends (2026-08-16, #135)
+
+**Context.** The stdio role gets one property free: when stdin closes the client is *definitively*
+gone, and `Sessions::shutdown` releases every target — which for a live kernel is the difference
+between a machine that comes back and one left frozen. `--listen` gives that up. Over HTTP a client
+that has stopped talking is indistinguishable from one that is thinking, and a dropped connection
+from a network that will recover.
+
+**Decision.** A client holds a **lease**: any request renews it, and when it runs out the sessions
+that client opened are released exactly as a disconnect released them (`Sessions::release_leased`,
+which is `shutdown` without closing the registry). One client at a time, refused with `409` —
+forced by the registry rather than chosen, since handles are minted globally, `MAX_SESSIONS` is
+shared, and `end_session` ends whatever it is handed.
+
+**The grace floor is enforced, not documented.** A `crash_triage` or a pool walk sends no HTTP
+request for minutes, so a grace shorter than the longest a call can keep a client quiet reads a
+working client as an absent one and releases the session the call is running against. The bound is
+`WORKER_READY_TIMEOUT + call timeout` — an opener spends up to 30 s bringing a worker up *before*
+the budget starts — and the listener refuses to start below it.
+
+**Seven review rounds went on one invariant, and the pattern is the point.** Each fix was correct
+and opened the next seam: a reservation needed a lifetime, the lifetime needed a resolution, the
+resolution needed an undo for what it had already minted, the counter of in-flight work needed an
+epoch so a stale guard could not decrement a later tenancy. Every one of them answered "is it safe
+to hand the server over?" one level *above* the thing being protected — at the claim, at the HTTP
+request, at the guard — and each answer was true of its level and silent about the one below.
+
+It terminated at `Sessions::busy`. An engine job outlives the request that queued it —
+`Sessions::call_as` cancels only the waiter, and says so — so "the HTTP request ended" was never
+"the target is free". Asking the engine's own account of whether a session has work outstanding is
+the last question in the chain, because it *is* the resource. **The lesson for anything that
+extends this: name the resource being protected and find who can answer for it authoritatively,
+before adding a condition at the layer you happen to be standing on.**
+
+**A corollary, from #136.** The one tenancy rule that lived in the HTTP handler rather than in
+`Lease` — whether a `DELETE` counts as the client leaving — was also the one that was wrong, and it
+was wrong for a year of nobody noticing because it had no test. It had no test because it was
+unreachable without an HTTP harness, not because anyone decided to skip it. It is now a named
+predicate (`listen::is_departure`) with the same unit coverage every rule beside it has.
+
+**Status.** Implemented (#135, #137). Still missing from the listener: progress notifications, MCP
+log notifications, service installation, and a smoke tier for the lease itself — which is the
+coverage gap that made seven rounds of review the way these were found rather than the second.
+
+---
+
 ## A walk reports its holes; only a chain is stopped by one (2026-08-13, issue #103)
 
 **Context.** Inspecting a kernel list meant a MASM `.for` loop through `execute`, which is
