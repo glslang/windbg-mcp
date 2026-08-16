@@ -3,7 +3,7 @@
     "(none)",
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 50,
+  "toolCount": 51,
   "tools": [
     {
       "hints": {
@@ -1084,6 +1084,42 @@
         "address"
       ],
       "title": "Run to address"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": false,
+        "readOnly": true
+      },
+      "name": "server_log",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/LogReport",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
+      "params": [
+        "level: enum[\"error\"|\"warn\"|\"info\"|\"debug\"|\"trace\"]|null",
+        "limit: integer|null/uint32",
+        "session_id: string|null",
+        "since: integer|null/uint64"
+      ],
+      "required": [],
+      "title": "Read the server's log"
     },
     {
       "hints": {
