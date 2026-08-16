@@ -351,9 +351,11 @@ fn secret_at(text: &str, i: usize) -> Option<(usize, usize)> {
     let start = at + usize::from(quoted);
     let body = &text[start..];
     let len = match quoted {
-        // Up to the closing quote. None of these values contains an escaped one, and stopping
-        // early would mask a shorter run than the value — never a longer one.
-        true => body.find('"').unwrap_or(body.len()),
+        // Up to the closing quote — the first *unescaped* one. Stopping at an escaped quote would
+        // mask the head of the value and leave its tail in the file, which is the one way this
+        // scan can fail that produces a plausible-looking redacted line with the secret still in
+        // it. A `.server` password may contain anything a shell will pass.
+        true => closing_quote(body),
         false => body
             .find(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '"' | '}' | ']'))
             .unwrap_or(body.len()),
@@ -364,6 +366,25 @@ fn secret_at(text: &str, i: usize) -> Option<(usize, usize)> {
 /// Whether a character can be part of a parameter name, for the whole-name test in [`secret_at`].
 fn name_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '-'
+}
+
+/// How far a quoted value runs: to the first quote not preceded by an odd number of backslashes,
+/// or to the end of the text if it is unterminated.
+///
+/// JSON's own escaping rule, and it has to be honoured rather than approximated: `"hunter\"x"` is
+/// one value of `hunter"x`, and a scan that stopped at the inner quote would mask `hunter\` and
+/// leave `x` behind — a line that *looks* redacted while still carrying part of the secret.
+fn closing_quote(body: &str) -> usize {
+    let mut escaped = false;
+    for (at, c) in body.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '"' => return at,
+            _ => {}
+        }
+    }
+    body.len()
 }
 
 /// How many bytes of filler start at `at`: spaces and tabs, and **never a line break**.
@@ -1176,6 +1197,26 @@ mod tests {
             scrub(r#"{"password" : "hunter2"}"#),
             r#"{"password" : "<redacted>"}"#
         );
+    }
+
+    /// A quoted value ends at the first *unescaped* quote.
+    ///
+    /// The failure this prevents is the worst shape a redaction bug takes: a line that reads as
+    /// redacted while still carrying the tail of the secret. Stopping at the escaped quote would
+    /// mask `hunter\` and leave `suffix` in the transcript.
+    #[test]
+    fn scrubbing_masks_a_quoted_value_that_contains_a_quote() {
+        assert_eq!(
+            scrub(r#"{"password":"hunter\"suffix"}"#),
+            r#"{"password":"<redacted>"}"#
+        );
+        // A trailing backslash is escaped itself, so the quote after it really does close.
+        assert_eq!(
+            scrub(r#"{"password":"hunter\\"}"#),
+            r#"{"password":"<redacted>"}"#
+        );
+        // Unterminated: everything to the end is the value, which errs toward masking.
+        assert_eq!(scrub(r#"{"key":"1.2.3.4"#), r#"{"key":"<redacted>"#);
     }
 
     /// Filler stops at the end of the line, which is the difference between "no value" and "the

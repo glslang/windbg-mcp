@@ -158,8 +158,8 @@ pub fn render(options: &Options) -> Result<Summary, String> {
     let mut out = String::new();
     writeln!(out, "{}", header(options, &records)).map_err(|e| e.to_string())?;
     let mut frames = 0;
-    for (record, at) in records.iter().zip(&timeline) {
-        let Some(text) = frame(record, options.max_lines) else {
+    for (index, at) in &timeline {
+        let Some(text) = frame(&records[*index], options.max_lines) else {
             continue;
         };
         // `[time, "o", data]`, where the time is the recorded one in seconds. Serialized as an
@@ -193,7 +193,7 @@ pub fn render(options: &Options) -> Result<Summary, String> {
         frames,
         unreadable,
         runs,
-        duration_ms: timeline.last().copied().unwrap_or(0),
+        duration_ms: timeline.last().map_or(0, |(_, at)| *at),
     })
 }
 
@@ -212,86 +212,105 @@ pub struct Summary {
     pub duration_ms: u64,
 }
 
-/// One playback time per record, in milliseconds, never decreasing.
+/// The records in playback order, each with the time it plays at — never decreasing.
 ///
-/// `mono_ms` is measured from the start of **its own run**, and a transcript is appended to — so a
-/// file holding two runs has a second one that starts again at zero. Written into a cast as they
-/// stand, those offsets step backwards at the join, and a player refuses the recording. The fix is
-/// not to discard the earlier run (it is the part somebody kept the file for) but to lay the runs
-/// end to end: each `start` after the first continues from where the previous one stopped.
+/// Three things have to be reconciled, and they are all consequences of a transcript being a file
+/// that is *appended* to.
 ///
-/// The gap between runs is the **wall clock's**, when the two stamps allow it — that is how long
-/// the server was actually down, and it is the honest thing to show. When they do not (a clock
-/// that stepped, an unparseable stamp), the runs are simply butted together with [`RUN_GAP`],
-/// which is visibly a join rather than a wait.
+/// **Runs.** `mono_ms` is measured from the start of its own run, so a file holding two of them
+/// has a second that begins again at zero. Written out as they stand those offsets step backwards
+/// at the join and a player refuses the recording. The runs are laid end to end instead — keeping
+/// the earlier one, which is the part somebody kept the file for — separated by the **wall
+/// clock's** gap, since that is how long the server was actually down. When the stamps cannot
+/// answer (a clock that stepped, an unreadable one) the runs are butted together with [`RUN_GAP`],
+/// which reads as a join rather than a wait.
 ///
-/// Within a run the order is `seq`, not file order. They agree for anything this build writes —
-/// `Recorder::write` numbers under the same lock it writes under — but a file from a build before
-/// that fix can have them disagree, and a cast rendered from one must still play.
-fn timeline(records: &[Record]) -> Vec<u64> {
-    let mut times = vec![0u64; records.len()];
+/// **Interleaving.** Two supervisors can share a path, so the runs are grouped by `run` id rather
+/// than by position: their lines alternate in the file, and taking the file in order would tell
+/// one story out of two.
+///
+/// **Order within a run** is `seq`, not file order — and the records are *reordered*, not merely
+/// restamped. Rising timestamps on lines still emitted in file order would show a result before
+/// the request that produced it, which is a recording of something that did not happen. The two
+/// agree for anything this build writes, since `Recorder::write` numbers under the same lock it
+/// writes under; a file from before that fix still has to play, and to play correctly.
+fn timeline(records: &[Record]) -> Vec<(usize, u64)> {
+    let mut playback = Vec::with_capacity(records.len());
     let mut base = 0u64;
+    let mut previous: Option<usize> = None;
     for run in runs(records) {
-        let first = &records[run.start];
+        let Some(&first) = run.first() else { continue };
         // Where this run begins on the playback clock: after everything before it, plus however
-        // long the server was down.
-        let start = match run.start {
-            0 => 0,
-            _ => base + gap(records.get(run.start.wrapping_sub(1)), Some(first)),
+        // long the server was down in between.
+        let start = match previous {
+            None => 0,
+            Some(previous) => base + gap(&records[previous], &records[first]),
         };
-        let mut order: Vec<usize> = run.clone().collect();
-        order.sort_by_key(|i| records[*i].seq);
         let mut last = start;
-        for (position, index) in order.into_iter().enumerate() {
-            // Sorted by `seq`, so the *n*th record of the run takes the *n*th slot of the run's
-            // span whatever order its line was written in.
-            let at = start + records[index].mono_ms;
-            last = last.max(at);
-            times[run.start + position] = last;
+        for index in run {
+            last = last.max(start + records[index].mono_ms);
+            playback.push((index, last));
+            previous = Some(index);
         }
         base = last;
     }
-    times
+    playback
 }
 
 /// How long the server was down between two runs, in milliseconds, from their wall clocks.
 ///
 /// [`RUN_GAP`] when the stamps cannot answer — either is unreadable, or the later one is not later,
 /// which a clock that stepped backwards produces. Never zero, so a join is always visible.
-fn gap(before: Option<&Record>, after: Option<&Record>) -> u64 {
-    let (Some(before), Some(after)) = (before, after) else {
-        return RUN_GAP;
-    };
-    let measured = crate::record::unix_seconds(&after.at)
+fn gap(before: &Record, after: &Record) -> u64 {
+    crate::record::unix_seconds(&after.at)
         .zip(crate::record::unix_seconds(&before.at))
         .and_then(|(after, before)| after.checked_sub(before))
-        .map(|secs| secs.saturating_mul(1000));
-    measured.filter(|gap| *gap > 0).unwrap_or(RUN_GAP)
+        .map(|secs| secs.saturating_mul(1000))
+        .filter(|gap| *gap > 0)
+        .unwrap_or(RUN_GAP)
 }
 
 /// The stand-in gap between two runs whose wall clocks cannot be compared. Long enough to read as
 /// a break, short enough not to be a wait.
 const RUN_GAP: u64 = 1_000;
 
-/// The records of each run, as ranges. A run begins at a `start` record — the first thing every
-/// run writes — and the leading records of a file that has none are treated as one run, so a
-/// transcript whose head was lost still renders.
-fn runs(records: &[Record]) -> Vec<std::ops::Range<usize>> {
-    let mut bounds: Vec<usize> = records
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| matches!(r.event, Event::Start { .. }))
-        .map(|(i, _)| i)
-        .collect();
-    if bounds.first() != Some(&0) {
-        bounds.insert(0, 0);
+/// The record indices of each run, in the order the runs happened, each sorted by `seq`.
+///
+/// Grouped by the `run` field first, which is what separates two servers appending to one file.
+/// Then split again at every `start` record, because a run id is missing from a transcript written
+/// before the field existed (they all read as run `0`) and because a `start` is where a run begins
+/// whatever else is true. Records before the first `start` are a run of their own, so a file whose
+/// head was lost still renders.
+fn runs(records: &[Record]) -> Vec<Vec<usize>> {
+    let mut order: Vec<u64> = Vec::new();
+    let mut grouped: std::collections::HashMap<u64, Vec<Vec<usize>>> =
+        std::collections::HashMap::new();
+    for (index, record) in records.iter().enumerate() {
+        let segments = grouped.entry(record.run).or_insert_with(|| {
+            order.push(record.run);
+            Vec::new()
+        });
+        // A `start` opens a segment; so does the first record of a group that did not begin with
+        // one.
+        if segments.is_empty() || matches!(record.event, Event::Start { .. }) {
+            segments.push(Vec::new());
+        }
+        segments
+            .last_mut()
+            .expect("a segment was just opened")
+            .push(index);
     }
-    bounds
-        .iter()
-        .enumerate()
-        .map(|(n, start)| *start..bounds.get(n + 1).copied().unwrap_or(records.len()))
-        .filter(|run| !run.is_empty())
-        .collect()
+    let mut runs: Vec<Vec<usize>> = order
+        .into_iter()
+        .flat_map(|run| grouped.remove(&run).unwrap_or_default())
+        .collect();
+    // By where each run first appears, so interleaved groups still come out in the order they
+    // started, and by `seq` within one.
+    runs.sort_by_key(|run| run.first().copied().unwrap_or(usize::MAX));
+    for run in &mut runs {
+        run.sort_by_key(|index| records[*index].seq);
+    }
+    runs
 }
 
 /// Reads a transcript, skipping what it cannot parse.
@@ -333,7 +352,7 @@ fn header(options: &Options, records: &[Record]) -> Value {
     let title = options.title.clone().or_else(|| {
         records.iter().find_map(|r| match &r.event {
             Event::SessionOpen { kind, target, .. } => {
-                Some(format!("windbg-mcp — {kind} {target}"))
+                Some(format!("windbg-mcp — {kind} {}", target.text))
             }
             _ => None,
         })
@@ -393,7 +412,10 @@ fn frame(record: &Record, max_lines: usize) -> Option<String> {
         } => note(
             &mut out,
             NOTE,
-            &format!("session {session} — {kind} `{target}` (engine pid {engine_pid})"),
+            &format!(
+                "session {session} — {kind} `{}` (engine pid {engine_pid})",
+                target.text
+            ),
         ),
         Event::SessionState {
             session,
@@ -611,7 +633,7 @@ mod tests {
         rec.write(Event::SessionOpen {
             session: "sess-1".to_string(),
             kind: "crash dump".to_string(),
-            target: r"C:\dumps\a.dmp".to_string(),
+            target: Capped::of(r"C:\dumps\a.dmp", 0),
             engine_pid: 42,
         });
         let call = rec.tool_request("go", Some(&serde_json::json!({ "session_id": "sess-1" })));
@@ -783,22 +805,29 @@ mod tests {
         assert!(second > first, "{first} -> {second}");
     }
 
-    /// Within a run, order comes from `seq` rather than from the order the lines happen to sit in.
+    /// Within a run, order comes from `seq` rather than from the order the lines happen to sit in
+    /// — and the records are **reordered**, not merely restamped.
+    ///
+    /// The distinction is the whole test. Rising timestamps on lines still emitted in file order
+    /// would satisfy a player and show a result *before* the request that produced it: a recording
+    /// of something that did not happen, which is worse than one that will not play. So this
+    /// asserts the content order and treats the times as the secondary claim.
     ///
     /// `Recorder::write` numbers under the same lock it writes under, so the two agree for
-    /// anything this build produces. A file from a build *before* that fix can have them disagree,
-    /// and a cast rendered from one still has to play.
+    /// anything this build produces. A file from a build *before* that fix has to render, and
+    /// render correctly.
     #[test]
-    fn a_file_whose_lines_are_out_of_order_still_renders_forwards() {
+    fn a_file_whose_lines_are_out_of_order_is_reordered_not_just_restamped() {
         let input = scratch("out-of-order");
         let _ = std::fs::remove_file(&input);
         let rec = Recorder::to_file(&input, 0).expect("a transcript");
         let call = rec.tool_request("modules", None);
-        rec.tool_result(call, false, "first", None);
+        rec.tool_result(call, false, "the answer", None);
         rec.write(Event::Shutdown { sessions: 0 });
         drop(rec);
 
-        // Swap two lines, as a race between two writers would have left them.
+        // The request and its result, swapped — as a race between two writers would have left
+        // them before the numbering moved inside the file lock.
         let mut lines: Vec<String> = std::fs::read_to_string(&input)
             .expect("the transcript")
             .lines()
@@ -818,6 +847,76 @@ mod tests {
         };
         render(&options).expect("the render succeeds");
         let (_, events) = read_cast(&options.output);
+        let screen: Vec<String> = events.iter().map(|(_, _, d)| d.clone()).collect();
+        let asked = screen
+            .iter()
+            .position(|d| d.contains("modules"))
+            .unwrap_or_else(|| panic!("the call is not rendered: {screen:#?}"));
+        let answered = screen
+            .iter()
+            .position(|d| d.contains("the answer"))
+            .unwrap_or_else(|| panic!("the result is not rendered: {screen:#?}"));
+        assert!(
+            asked < answered,
+            "the result was played before the call that produced it: {screen:#?}"
+        );
+        assert!(
+            events.windows(2).all(|w| w[0].0 <= w[1].0),
+            "times went backwards: {:?}",
+            events.iter().map(|(t, _, _)| *t).collect::<Vec<_>>()
+        );
+    }
+
+    /// Two servers pointed at one path, which [`Recorder::to_file`] allows: their records
+    /// interleave in the file, and a reader taking it in order tells one story out of two.
+    ///
+    /// Grouped by the run each record names, so each server's session comes out whole. Without the
+    /// `run` field the second `start` would look like the beginning of a single later run, and
+    /// everything after it — two sets of sequence numbers, request ids and sessions, each numbered
+    /// from scratch — would be attributed to it.
+    #[test]
+    fn two_servers_sharing_a_file_render_as_two_runs() {
+        let input = scratch("interleaved");
+        let _ = std::fs::remove_file(&input);
+        // Two recorders on one path, writing alternately — which is what concurrent supervisors
+        // produce, and what append mode is for.
+        let first = Recorder::to_file(&input, 0).expect("a transcript");
+        let second = Recorder::to_file(&input, 0).expect("the same transcript");
+        let a = first.tool_request("registers", None);
+        let b = second.tool_request("modules", None);
+        first.tool_result(a, false, "from the first server", None);
+        second.tool_result(b, false, "from the second server", None);
+        first.write(Event::Shutdown { sessions: 0 });
+        second.write(Event::Shutdown { sessions: 0 });
+
+        let options = Options {
+            output: input.with_extension("cast"),
+            input,
+            width: DEFAULT_WIDTH,
+            height: DEFAULT_HEIGHT,
+            title: None,
+            idle_limit: 0.0,
+            max_lines: 0,
+        };
+        let summary = render(&options).expect("the render succeeds");
+        assert_eq!(summary.runs, 2, "two servers wrote this file");
+
+        let (_, events) = read_cast(&options.output);
+        let screen: Vec<String> = events.iter().map(|(_, _, d)| d.clone()).collect();
+        let at = |needle: &str| {
+            screen
+                .iter()
+                .position(|d| d.contains(needle))
+                .unwrap_or_else(|| panic!("`{needle}` is not rendered: {screen:#?}"))
+        };
+        // Each server's call and its answer are adjacent, rather than one server's result landing
+        // between the other's call and its own.
+        assert!(at("registers") < at("from the first server"), "{screen:#?}");
+        assert!(at("modules") < at("from the second server"), "{screen:#?}");
+        assert!(
+            at("from the first server") < at("modules"),
+            "the two runs are interleaved rather than laid end to end: {screen:#?}"
+        );
         assert!(
             events.windows(2).all(|w| w[0].0 <= w[1].0),
             "times went backwards: {:?}",
