@@ -209,6 +209,27 @@ Point your client at the built binary, e.g. Claude Code:
 }
 ```
 
+### On another machine
+
+The server has to run where DbgEng does, but the client and the model do not. `--listen <addr>`
+serves the same tools over HTTP instead of stdio, so a Mac can drive a Windows VM:
+
+```console
+# Windows, with WINDBG_MCP_LISTEN_TOKEN set
+windbg-mcp.exe --listen 127.0.0.1:8765
+# client machine
+ssh -N -L 8765:127.0.0.1:8765 windbg-vm
+claude mcp add windbg-vm --transport http http://127.0.0.1:8765/ \
+  --header "Authorization: Bearer $WINDBG_MCP_LISTEN_TOKEN"
+```
+
+**Bind loopback and forward over SSH.** This endpoint runs `execute`, `debug_batch` and `launch`
+against a live kernel, and the token is sent in clear — a hypervisor's guest network is not private
+when the machine being debugged shares it. [`docs/remote-listener.md`](./docs/remote-listener.md)
+covers the token, the session lease and its grace, why only one client is served at a time, and
+what a `409` means. For a one-off, [`docs/remote-phase0.md`](./docs/remote-phase0.md) does the same
+job over plain `ssh` with no listener.
+
 ### As a Claude Code plugin
 
 This repo is also a single-plugin [Claude Code marketplace](https://code.claude.com/docs/en/plugin-marketplaces):

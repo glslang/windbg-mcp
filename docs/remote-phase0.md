@@ -237,6 +237,9 @@ Four things push you off phase 0, roughly in the order you will hit them:
 
 All four are the same fix — an HTTP listener running as a service, with leases and progress
 notifications — which is where this stops being a configuration exercise and starts being code.
+The listener exists and covers the first two;
+[`remote-listener.md`](./remote-listener.md) is its setup, and says which of the rest are still
+missing.
 
 Note that **elevation is not on this list**, though an earlier draft of this document had it at the
 top. A Windows service is elevated by construction, which is a real advantage over *some* ways of
