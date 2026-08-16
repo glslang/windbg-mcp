@@ -214,35 +214,12 @@ Copy-Item "$wd\winxp\kdexts.dll" "$dst\winxp" -Force   # !drvobj/!devobj/!irp �
 the TTD engine; PDB symbol *names* need `msdia140.dll` + a symbol path
 (`execute` → `.sympath srv*C:\ProgramData\Dbg\sym*https://msdl.microsoft.com/download/symbols`).
 
-#### When the store package will not install
-
-`Get-AppxPackage Microsoft.WinDbg` returning nothing is not always a matter of installing it: MSIX
-registration fails from a **non-interactive** session — `Add-AppxPackage` returns `0x80070005` even
-when elevated — and leaves the payload staged but unrunnable, because `WindowsApps` denies execute
-to an unregistered package. Installing from the machine's own console session is the fix, and the
-one to reach for first.
-
-Where that is not available, the two sources below cover the same files between them. The
-**Windows SDK Debugging Tools** (`winsdksetup.exe /features OptionId.WindowsDesktopDebuggers`) give
-a plain directory — `C:\Program Files (x86)\Windows Kits\10\Debuggers\<arch>` — holding every file
-above **except `msdia140.dll` and `ttd\`**, so `!analyze`, the driver tools and symbols all work and
-TTD replay does not. For `ttd\` itself, the WinDbg `.msixbundle` is an ordinary zip and can be
-unpacked without being installed:
-
-```pwsh
-$w = "$env:TEMP\wdbg"; New-Item $w -ItemType Directory -Force | Out-Null
-$uri = ([xml](Invoke-WebRequest 'https://aka.ms/windbg/download' -UseBasicParsing).Content).AppInstaller.MainBundle.Uri
-Invoke-WebRequest $uri -OutFile "$w\b.zip" -UseBasicParsing      # ~1.1 GB
-Expand-Archive "$w\b.zip" "$w\b" -Force
-Copy-Item "$w\b\windbg_win-x64.msix" "$w\p.zip" -Force           # or windbg_win-arm64.msix
-Expand-Archive "$w\p.zip" "$w\p" -Force
-Copy-Item "$w\p\amd64\ttd" "$dst\ttd" -Recurse -Force            # or arm64\ttd, matching the .msix
-```
-
-Pick the architecture deliberately: the bundle carries `amd64\`, `arm64\` and `x86\` payloads, and
-an ARM64 package ships all three ([#131](https://github.com/glslang/windbg-mcp/issues/131)). See
-[#132](https://github.com/glslang/windbg-mcp/issues/132) for why this is written down rather than
-assumed away.
+The script above starts from `Get-AppxPackage Microsoft.WinDbg`, which does not always resolve —
+and not always because the package merely needs installing. The skill's
+[`setup.md`](./skills/windbg-debugging/setup.md#when-the-store-package-will-not-install) covers that
+case: why MSIX can stage a payload it then refuses to run, and which two sources supply these files
+between them when it does. It is also the place to look for anything else environment-shaped —
+symbols, elevation, kernel connection profiles, and the differences an ARM64 host brings.
 
 ## Use with an MCP client
 

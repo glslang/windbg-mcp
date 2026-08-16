@@ -34,11 +34,8 @@ staged but unrunnable, since `WindowsApps` denies execute to an unregistered pac
 WinDbg from the machine's own console session rather than over SSH or a remote shell; that is also
 what makes `Get-AppxPackage Microsoft.WinDbg` resolve, which the copy below depends on.
 
-For `ttd\` specifically there is a way out that needs no install at all: the WinDbg `.msixbundle`
-is an ordinary zip and can be unpacked. The README's
-[*When the store package will not install*](../../README.md#when-the-store-package-will-not-install)
-carries the recipe, and the architecture warning that goes with it — the bundle holds `amd64\`,
-`arm64\` and `x86\` payloads, so which one you copy is a choice rather than a default.
+For `ttd\` specifically there is a way out that needs no install at all — see
+[*When the store package will not install*](#when-the-store-package-will-not-install) below.
 
 ## Get the server binary
 
@@ -175,6 +172,41 @@ Copy-Item "$wd\winxp\kdexts.dll" "$dst\winxp" -Force   # !drvobj/!devobj/!irp �
   `.load kdexts` automatically; without the file those tools return *"No export drvobj found"*.
   (Note it lives in `winxp\`, not `winext\`, and the engine already searches a `WINXP` subdir.)
 - `cargo clean` (when building from source) wipes `target\`, so re-copy after one.
+
+### When the store package will not install
+
+`Get-AppxPackage Microsoft.WinDbg` returning nothing is not always a matter of installing it. MSIX
+registration fails from a **non-interactive** session — `Add-AppxPackage` returns `0x80070005` even
+when elevated — and leaves the payload staged but unrunnable, because `WindowsApps` denies execute
+to an unregistered package. So the files can be on disk and every one of them refuse to run.
+Installing from the machine's own console session is the fix and the first thing to reach for.
+
+Where that is not available, two sources cover the same files between them.
+
+**The Windows SDK Debugging Tools** — `winsdksetup.exe /features OptionId.WindowsDesktopDebuggers
+/quiet /norestart` — give a plain directory, `C:\Program Files (x86)\Windows Kits\10\Debuggers\<arch>`,
+holding every file in the copy above **except `msdia140.dll` and `ttd\`**. So `!analyze`, the driver
+tools and symbol resolution all work from it, and TTD replay does not.
+
+**The WinDbg `.msixbundle`**, for `ttd\` itself, is an ordinary zip and can be unpacked without
+being installed:
+
+```pwsh
+$w = "$env:TEMP\wdbg"; New-Item $w -ItemType Directory -Force | Out-Null
+$uri = ([xml](Invoke-WebRequest 'https://aka.ms/windbg/download' -UseBasicParsing).Content).AppInstaller.MainBundle.Uri
+Invoke-WebRequest $uri -OutFile "$w\b.zip" -UseBasicParsing      # ~1.1 GB
+Expand-Archive "$w\b.zip" "$w\b" -Force
+Copy-Item "$w\b\windbg_win-x64.msix" "$w\p.zip" -Force           # or windbg_win-arm64.msix
+Expand-Archive "$w\p.zip" "$w\p" -Force
+Copy-Item "$w\p\amd64\ttd" "$dst\ttd" -Recurse -Force            # or arm64\ttd, matching the .msix
+```
+
+**Pick the architecture deliberately.** Each package carries `amd64\`, `arm64\` and `x86\` payloads
+— an ARM64 package ships all three — so a copy that takes the first match takes the emulation build.
+That is the same ordering trap as [#131](https://github.com/glslang/windbg-mcp/issues/131), and it
+is easy to walk into twice. [#132](https://github.com/glslang/windbg-mcp/issues/132) is why this is
+written down rather than assumed away; without `ttd\`, `open_trace` says so explicitly rather than
+leaving you with `0x80070057`.
 
 ## Symbols — required for `module!func` name resolution
 
