@@ -4437,7 +4437,7 @@ mod tests {
 
     /// Only a tool that structurally cannot reach the network may say so. Everything that
     /// touches a target can trigger a PDB download, and over KDNET the target itself is
-    /// remote — leaving the two that never reach the engine at all.
+    /// remote — leaving the three that never reach the engine at all.
     #[test]
     fn only_the_tools_that_cannot_reach_the_network_are_closed_world() {
         let closed: Vec<String> = WindbgServer::tool_router()
@@ -4451,7 +4451,7 @@ mod tests {
             .map(|t| t.name.to_string())
             .collect();
 
-        assert_eq!(closed, ["decode_ioctl", "session_status"]);
+        assert_eq!(closed, ["decode_ioctl", "server_log", "session_status"]);
     }
 
     /// Session-scoped tools take a handle; the two that are genuinely session-independent
@@ -4474,8 +4474,9 @@ mod tests {
             "end_session",
             "modules",
             "debug_batch",
-            // Takes one to ask *about*, not to be checked against.
+            // These two take one to ask *about*, not to be checked against.
             "session_status",
+            "server_log",
         ] {
             assert!(takes_session(name), "`{name}` should accept session_id");
         }
