@@ -65,7 +65,7 @@ pub const LISTEN_FLAG: &str = "--listen";
 
 /// Where the bearer token is read from. An environment variable rather than an argument, because a
 /// command line is readable by every process on the machine — including a `launch`ed debuggee.
-const TOKEN_ENV: &str = "WINDBG_MCP_LISTEN_TOKEN";
+pub const TOKEN_ENV: &str = "WINDBG_MCP_LISTEN_TOKEN";
 
 /// Overrides how long a client may be silent before its sessions are released, in whole seconds.
 const GRACE_ENV: &str = "WINDBG_MCP_LEASE_GRACE_SECS";
@@ -115,6 +115,19 @@ struct Tenancy {
     /// The MCP session that owns this server. `None` while nobody is attached — which is *not* the
     /// same as nothing being open, since a departed client's sessions live on until `deadline`.
     holder: Option<String>,
+    /// A client is opening a session and has not been given an id yet.
+    ///
+    /// Without this the gate only *observes* tenancy, and two `initialize` requests arriving
+    /// together both see a vacant server, both get sessions, and the second silently replaces the
+    /// first as holder while the first stays serviceable — two clients on a registry whose handles,
+    /// capacity and `end_session` are all global. Admission has to **reserve**.
+    claiming: bool,
+    /// A lease has run out and its sessions are being released.
+    ///
+    /// Held across the release, because the teardown is not instant: clearing the holder and then
+    /// releasing would leave a window where the server looks vacant and a new client can start
+    /// using a session the sweeper is about to close underneath it.
+    releasing: bool,
     /// When the sessions are released if nothing renews first. `None` means there is nothing to
     /// release and nothing to wait for.
     deadline: Option<Instant>,
@@ -125,7 +138,7 @@ struct Tenancy {
 enum Admission {
     /// Hand it to the MCP service.
     Serve,
-    /// Someone else holds the server.
+    /// Someone else holds the server, is taking it, or is being cleaned up after.
     Occupied,
 }
 
@@ -155,40 +168,73 @@ impl Lease {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Decides whether a request may be served, and renews the lease if so.
+    /// Decides whether a request may be served, **reserving** the server when one is taking it.
     ///
     /// `session` is the request's `Mcp-Session-Id`; its absence means a client opening a new
-    /// session, which is the only moment tenancy is actually contested.
+    /// session, which is the only moment tenancy is contested. Every decision is made under one
+    /// lock, so the answer a request gets is the state it will be served against.
     fn admit(&self, session: Option<&str>) -> Admission {
         let mut state = self.state();
+        // Nothing is served while a teardown is in flight. Briefly refusing a client that could
+        // have been served costs a reconnect; serving one costs it the session mid-call.
+        if state.releasing {
+            return Admission::Occupied;
+        }
         match (session, state.holder.as_deref()) {
             // The holder, still talking.
             (Some(id), Some(held)) if id == held => {
                 state.deadline = Some(Instant::now() + self.grace);
                 Admission::Serve
             }
-            // A session id nobody holds. Let the service answer — it knows whether that session
-            // exists, and a 404 from it is a better answer than a guess from here.
-            (Some(_), _) => Admission::Serve,
-            // A new client, and nobody is attached: it may take the server, and inherits whatever
-            // the last one left open.
-            (None, None) => Admission::Serve,
-            // A new client while someone holds it.
-            (None, Some(_)) => Admission::Occupied,
+            // A session id belonging to someone else. This is the arm that made the race above
+            // persist rather than pass: serving it leaves both clients working.
+            (Some(_), Some(_)) => Admission::Occupied,
+            // A session id with nobody holding the server — a client resuming what it left inside
+            // the grace. Served, but the holder is not taken until the service says the session was
+            // real, or a stale id would lock the server out for a whole grace period.
+            (Some(_), None) if !state.claiming => Admission::Serve,
+            // A new client, and nobody attached or attaching: it reserves the server here, and
+            // inherits whatever the last one left open.
+            (None, None) if !state.claiming => {
+                state.claiming = true;
+                Admission::Serve
+            }
+            // Someone is mid-`initialize`, or holds it already.
+            _ => Admission::Occupied,
         }
     }
 
-    /// Records that a client took the server, once the service has minted its session id.
+    /// Records what the service made of a request the gate admitted.
     ///
-    /// Returns whether this was an **adoption** — a new client picking up sessions a previous one
-    /// left inside the grace — which is worth a log line because the alternative reading, that
-    /// these are its own sessions, is wrong in a way that matters when it ends one.
-    fn take(&self, id: &str) -> bool {
+    /// Called for **every** admitted request, because a claim that is never resolved is a server
+    /// nobody can take: an `initialize` that fails has to give the reservation back.
+    ///
+    /// Returns whether this was an **adoption** — a client picking up sessions a previous one left
+    /// inside the grace — which is worth saying out loud, since the alternative reading (that these
+    /// are its own sessions) is wrong in a way that matters when it ends one.
+    fn settle(&self, requested: Option<&str>, minted: Option<&str>, ok: bool) -> bool {
         let mut state = self.state();
         let adopted = state.holder.is_none() && state.deadline.is_some();
-        state.holder = Some(id.to_string());
-        state.deadline = Some(Instant::now() + self.grace);
-        adopted
+        match (minted, requested) {
+            // An `initialize` that produced a session: the claim becomes a holder.
+            (Some(id), _) => {
+                state.claiming = false;
+                state.holder = Some(id.to_string());
+                state.deadline = Some(Instant::now() + self.grace);
+                adopted
+            }
+            // A resumed session the service accepted: the returning client is the holder again.
+            (None, Some(id)) if ok && state.holder.is_none() => {
+                state.holder = Some(id.to_string());
+                state.deadline = Some(Instant::now() + self.grace);
+                adopted
+            }
+            // Anything else, including an `initialize` that failed: give the reservation back.
+            _ => {
+                state.claiming = false;
+                false
+            }
+        }
     }
 
     /// The holder said goodbye. The sessions stay; the clock starts.
@@ -200,22 +246,28 @@ impl Lease {
         }
     }
 
-    /// Whether the lease has run out, clearing it if so.
+    /// Whether the lease has run out, **claiming the teardown** if so.
     ///
-    /// Clears under the same lock that reads it, so a client connecting exactly now is either
-    /// admitted before this and renews the deadline, or arrives after and finds a vacant server —
-    /// never admitted against a lease this is about to act on. That is the race
-    /// [`Sessions::release_leased`] warns it does not handle itself.
+    /// The server is marked `releasing` under the same lock that reads the deadline, and stays that
+    /// way until [`Self::released_leases`] says the teardown is done. That is what closes the
+    /// window [`Sessions::release_leased`] warns it does not close itself: between deciding to
+    /// release and having released, no client can be admitted to the sessions being released.
     fn expired(&self) -> bool {
         let mut state = self.state();
         match state.deadline {
             Some(at) if Instant::now() >= at => {
                 state.holder = None;
                 state.deadline = None;
+                state.releasing = true;
                 true
             }
             _ => false,
         }
+    }
+
+    /// The teardown is done; the server may be taken again.
+    fn released_leases(&self) {
+        self.state().releasing = false;
     }
 }
 
@@ -327,12 +379,18 @@ async fn gate(
 
     let response = mcp.handle(req).await;
 
-    if let Some(id) = response
+    let minted = response
         .headers()
         .get(SESSION_HEADER)
         .and_then(|v| v.to_str().ok())
-        && lease.take(id)
-    {
+        .map(str::to_owned);
+    // Every admitted request settles, so a reservation is never left standing by a request that
+    // did not become a session.
+    if lease.settle(
+        session.as_deref(),
+        minted.as_deref(),
+        response.status().is_success(),
+    ) {
         tracing::info!("a client attached and adopted the sessions the previous one left open");
     }
     if goodbye && let Some(id) = session {
@@ -365,6 +423,9 @@ async fn sweep(sessions: Sessions, lease: Arc<Lease>) {
         if lease.expired() {
             tracing::info!("a client's lease ran out; releasing the sessions it left open");
             sessions.release_leased().await;
+            // Only now may the server be taken again: until this, an arriving client would be
+            // admitted to sessions this release is closing.
+            lease.released_leases();
         }
     }
 }
@@ -392,12 +453,12 @@ mod tests {
         assert!(Lease::new(call + Duration::from_secs(1), call).is_ok());
     }
 
-    /// One client at a time, and the contest is only ever over a *new* session.
+    /// One client at a time — and admission has to *reserve*, not merely observe.
     #[test]
     fn a_second_client_is_refused_while_the_first_holds_the_server() {
         let lease = lease();
         assert_eq!(lease.admit(None), Admission::Serve, "nobody holds it yet");
-        lease.take("session-a");
+        lease.settle(None, Some("session-a"), true);
 
         assert_eq!(
             lease.admit(None),
@@ -411,8 +472,43 @@ mod tests {
         );
         assert_eq!(
             lease.admit(Some("session-b")),
+            Admission::Occupied,
+            "and another client's session id is refused too — serving it is what would let a \
+             racing second client keep working"
+        );
+    }
+
+    /// The race the reservation exists for: two `initialize`s arriving together.
+    ///
+    /// Without it both see a vacant server, both get sessions, and the second replaces the first as
+    /// holder while the first stays serviceable — two clients on a registry whose handles, capacity
+    /// and `end_session` are all global.
+    #[test]
+    fn a_claim_in_flight_blocks_a_second_initialize() {
+        let lease = lease();
+        assert_eq!(lease.admit(None), Admission::Serve);
+        assert_eq!(
+            lease.admit(None),
+            Admission::Occupied,
+            "the first claim is not resolved yet, so the server is not free"
+        );
+
+        lease.settle(None, Some("session-a"), true);
+        assert_eq!(lease.state().holder.as_deref(), Some("session-a"));
+    }
+
+    /// A claim that comes to nothing must give the server back.
+    #[test]
+    fn an_initialize_that_fails_does_not_hold_the_server_for_ever() {
+        let lease = lease();
+        assert_eq!(lease.admit(None), Admission::Serve);
+        lease.settle(None, None, false);
+
+        assert!(!lease.state().claiming, "the reservation was returned");
+        assert_eq!(
+            lease.admit(None),
             Admission::Serve,
-            "an unknown session id is the service's to reject, not the gate's"
+            "so the next client can take the server"
         );
     }
 
@@ -422,7 +518,7 @@ mod tests {
         let lease = lease();
         lease.admit(None);
         assert!(
-            !lease.take("session-a"),
+            !lease.settle(None, Some("session-a"), true),
             "the first client adopts nothing — there was nothing open"
         );
 
@@ -433,9 +529,31 @@ mod tests {
             "the server is free again the moment the holder lets go"
         );
         assert!(
-            lease.take("session-b"),
+            lease.settle(None, Some("session-b"), true),
             "and the next client is told it inherited the sessions still open"
         );
+    }
+
+    /// A client resuming the session id it already had becomes the holder again — but only once the
+    /// service has confirmed that session is real.
+    #[test]
+    fn a_resumed_session_takes_the_server_back_only_if_it_existed() {
+        let lease = lease();
+        lease.admit(None);
+        lease.settle(None, Some("session-a"), true);
+        lease.released("session-a");
+
+        assert_eq!(lease.admit(Some("session-a")), Admission::Serve);
+        lease.settle(Some("session-a"), None, false);
+        assert_eq!(
+            lease.state().holder,
+            None,
+            "a session id the service rejected must not lock the server out for a whole grace"
+        );
+
+        assert_eq!(lease.admit(Some("session-a")), Admission::Serve);
+        lease.settle(Some("session-a"), None, true);
+        assert_eq!(lease.state().holder.as_deref(), Some("session-a"));
     }
 
     /// Letting go is not the same as expiring: the sessions are still there to come back to.
@@ -443,7 +561,7 @@ mod tests {
     fn letting_go_starts_the_clock_rather_than_releasing_anything() {
         let lease = lease();
         lease.admit(None);
-        lease.take("session-a");
+        lease.settle(None, Some("session-a"), true);
         lease.released("session-a");
 
         assert!(
@@ -458,7 +576,7 @@ mod tests {
     fn only_the_holder_can_let_go() {
         let lease = lease();
         lease.admit(None);
-        lease.take("session-a");
+        lease.settle(None, Some("session-a"), true);
         lease.released("session-b");
         assert_eq!(
             lease.state().holder.as_deref(),
@@ -467,22 +585,49 @@ mod tests {
         );
     }
 
-    /// Expiry clears the holder as well as the deadline, so the next client is not refused by a
-    /// tenancy nobody is in.
+    /// Nothing is admitted between deciding to release and having released.
+    ///
+    /// The window this closes is narrow and expensive: a client admitted there starts using a
+    /// session the sweeper is in the middle of closing, and the call dies underneath it.
     #[test]
-    fn an_expired_lease_leaves_the_server_vacant() {
+    fn nothing_is_admitted_while_the_teardown_runs() {
         let lease = Lease::new(Duration::from_millis(1), Duration::from_micros(1))
             .expect("a grace longer than the budget");
         lease.admit(None);
-        lease.take("session-a");
+        lease.settle(None, Some("session-a"), true);
+        std::thread::sleep(Duration::from_millis(5));
+
+        assert!(lease.expired(), "the grace is spent");
+        assert_eq!(
+            lease.admit(None),
+            Admission::Occupied,
+            "and the server is not vacant yet — the sessions are still being let go"
+        );
+
+        lease.released_leases();
+        assert_eq!(
+            lease.admit(None),
+            Admission::Serve,
+            "only once the teardown is done"
+        );
+    }
+
+    /// Expiry is a one-shot: the deadline is consumed by the sweep that acts on it.
+    #[test]
+    fn expiry_is_reported_once_rather_than_on_every_sweep() {
+        let lease = Lease::new(Duration::from_millis(1), Duration::from_micros(1))
+            .expect("a grace longer than the budget");
+        lease.admit(None);
+        lease.settle(None, Some("session-a"), true);
         std::thread::sleep(Duration::from_millis(5));
 
         assert!(lease.expired(), "the grace is spent");
         assert!(
             !lease.expired(),
-            "and expiry is reported once, not on every sweep"
+            "and expiry is reported once, not on every sweep — the sweeper runs every few \
+             seconds, and a second `true` would release an already-released set of sessions on \
+             each pass"
         );
         assert_eq!(lease.state().holder, None);
-        assert_eq!(lease.admit(None), Admission::Serve);
     }
 }
