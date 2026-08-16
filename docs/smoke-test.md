@@ -29,7 +29,20 @@ connected MCP client holds a lock on (see [`CLAUDE.md`](../CLAUDE.md)). Whole su
 The protocol tier rides `cargo test`, so CI already runs it. The debugger tier is opt-in
 *locally* but runs on every push and PR in CI, as the **Smoke test (debugger tier)** job — it is
 the only automated check of the properties process-per-session exists for, and it needs no symbols
-and no network. The bounded-command and live-kernel tiers are `#[ignore]`d — one is measured in
+and no network. It runs **twice, on x64 and on ARM64** (`windows-11-arm`), because the thing it
+exercises that nothing else does is a real `dbgeng.dll`, and there is a different one on each
+([#134](https://github.com/glslang/windbg-mcp/issues/134)). The two entries do not share a cargo
+cache, and an ARM64 failure does not cancel the x64 run.
+
+**Four of its assertions are gated to x86_64**, and the reason is a property of the sample rather
+than of the tests: the checked-in dump is x64, and an engine of another architecture parses its
+structure — bug check, module list, stack attribution — but cannot follow a pointer into the
+captured address space ([#142](https://github.com/glslang/windbg-mcp/issues/142)). So
+`walk_memory`, `disassemble` and the `EPROCESS` read behind `crash_triage`'s `process_name` have
+nothing to assert there. They report as `ignored` with that reason rather than failing, which keeps
+the distinction visible: on ARM64 the tier says what it did not check, instead of passing quietly or
+failing misleadingly. Equivalent coverage on ARM64 needs an **ARM64 dump** of its own — a sample to
+capture, not a test to write. The bounded-command and live-kernel tiers are `#[ignore]`d — one is measured in
 minutes, the other touches another machine; see below. Neither is automated, and the rest of the
 live checklist is not either: no runner has a kernel target, a TTD engine, or elevation.
 

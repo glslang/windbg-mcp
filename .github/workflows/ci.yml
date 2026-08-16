@@ -69,7 +69,7 @@ jobs:
           }
 
   smoke-debugger:
-    name: Smoke test (debugger tier)
+    name: Smoke test (debugger tier${{ matrix.suffix }})
     # Runs on every push and PR, not on demand.
     #
     # It was on-demand while the risk (a Windows-image change breaking it for reasons unrelated
@@ -82,7 +82,40 @@ jobs:
     # The risk it was hedging against is still real, and the answer to it is that a runner whose
     # DbgEng cannot open a checked-in dump is something this repo wants to hear about: it breaks
     # users the same way. If that happens, pin the failure here rather than in a bug report.
-    runs-on: windows-latest
+    #
+    # Both architectures, because that argument applies to each of them separately and the ARM64
+    # one had nothing behind it: it was a claim about a `dbgeng.dll` this project does not ship and
+    # cannot test any other way, resting on one manual session (issue #134).
+    #
+    # The four assertions that read the checked-in dump's *virtual memory* are gated to x86_64,
+    # because the dump is x64 and an engine of another architecture cannot follow a pointer into it
+    # (issue #142). They report as `ignored` with that reason on ARM64 rather than failing, and the
+    # equivalent coverage there needs an ARM64 dump of its own — which is a sample to capture, not
+    # a test to write.
+    #
+    # Only this tier is matrixed. The crate is architecture-independent Rust, so `fmt`, clippy and
+    # the unit tests in `build` have no reason to differ and a second entry there would buy runtime
+    # rather than coverage. What differs on ARM64 is the *engine*, and this is the job that loads
+    # one.
+    strategy:
+      # An ARM64 failure must not cancel the x64 run: x64 is the result this repo has trusted for
+      # every release, and a new runner label is exactly the thing most likely to be flaky first.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+            # Empty, so this entry's check keeps the exact name `Smoke test (debugger tier)`.
+            # That string is a *required status check* in the repository ruleset, and a required
+            # context is matched by name: renaming the job does not rename the requirement, it
+            # removes the only job that could ever satisfy it — and every PR in the repo blocks on
+            # a check that will never report again. Adding a matrix is not a rename as long as one
+            # entry keeps the original name.
+            suffix: ""
+          - arch: arm64
+            runner: windows-11-arm
+            suffix: ", arm64"
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -97,6 +130,10 @@ jobs:
 
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # Keyed by architecture, or the two entries share one cache and each restores the
+          # other's target directory — objects for the wrong triple, rebuilt every run at best.
+          key: ${{ matrix.arch }}
 
       - name: Smoke test against the sample dump
         env:
