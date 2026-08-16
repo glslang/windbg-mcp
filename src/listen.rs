@@ -183,6 +183,20 @@ impl Tenancy {
     }
 }
 
+/// What became of a request's reservation.
+#[derive(Debug, PartialEq, Eq)]
+enum Settled {
+    /// Tenancy is as this request left it, and the response stands.
+    Kept {
+        /// Whether this client picked up sessions a previous one left open.
+        adopted: bool,
+    },
+    /// This request no longer owns the server: its claim was swept while it was being handled, or
+    /// a teardown started under it. Anything it produced has to be undone — the service may have
+    /// minted a session for a client that is not the holder, and nothing else will ever close it.
+    Stale,
+}
+
 /// What the tenancy gate decided about one request.
 #[derive(Debug, PartialEq, Eq)]
 enum Admission {
@@ -276,22 +290,22 @@ impl Lease {
         requested: Option<&str>,
         minted: Option<&str>,
         ok: bool,
-    ) -> bool {
+    ) -> Settled {
         let mut state = self.state();
         match claim {
             // This request reserved the server. It may only resolve *its own* reservation: one
             // that outlived the grace has already been cleared and possibly re-issued to somebody
             // else, and clearing that would hand two clients the registry at once.
             Some(mine) if state.claim == Some(mine) => state.claim = None,
-            Some(_) => return false,
+            Some(_) => return Settled::Stale,
             // A request from the established holder reserved nothing and settles nothing.
-            None => return false,
+            None => return Settled::Kept { adopted: false },
         }
         // A teardown that started while this request was being handled has already decided the
         // sessions are going. Installing a holder now would hand a client something being released
         // out from under it, and the client is better served by being told to come back.
         if state.releasing {
-            return false;
+            return Settled::Stale;
         }
         let adopted = state.left_open;
         match (minted, requested) {
@@ -300,18 +314,18 @@ impl Lease {
                 state.holder = Some(id.to_string());
                 state.deadline = Some(Instant::now() + self.grace);
                 state.left_open = false;
-                adopted
+                Settled::Kept { adopted }
             }
             // A resumed session the service accepted: the returning client is the holder again.
             (None, Some(id)) if ok && state.holder.is_none() => {
                 state.holder = Some(id.to_string());
                 state.deadline = Some(Instant::now() + self.grace);
                 state.left_open = false;
-                adopted
+                Settled::Kept { adopted }
             }
             // Anything else, including an `initialize` that failed: the reservation is already
             // given back above, and nobody took the server.
-            _ => false,
+            _ => Settled::Kept { adopted: false },
         }
     }
 
@@ -404,7 +418,7 @@ pub async fn serve(sessions: Sessions, addr: SocketAddr, call_timeout: Duration)
         "windbg-mcp listening on http://{addr} (lease grace {grace:?}, one client at a time)"
     );
 
-    tokio::spawn(sweep(sessions.clone(), lease.clone(), manager));
+    tokio::spawn(sweep(sessions.clone(), lease.clone(), manager.clone()));
 
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -415,11 +429,20 @@ pub async fn serve(sessions: Sessions, addr: SocketAddr, call_timeout: Duration)
             }
         };
         let mcp = mcp.clone();
+        let manager = manager.clone();
         let lease = lease.clone();
         let token = token.clone();
         tokio::spawn(async move {
-            let serve =
-                service_fn(move |req| gate(req, mcp.clone(), lease.clone(), token.clone(), peer));
+            let serve = service_fn(move |req| {
+                gate(
+                    req,
+                    mcp.clone(),
+                    manager.clone(),
+                    lease.clone(),
+                    token.clone(),
+                    peer,
+                )
+            });
             if let Err(e) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(TokioIo::new(stream), serve)
                 .await
@@ -434,6 +457,7 @@ pub async fn serve(sessions: Sessions, addr: SocketAddr, call_timeout: Duration)
 async fn gate(
     req: Request<Incoming>,
     mcp: Arc<StreamableHttpService<WindbgServer, LocalSessionManager>>,
+    manager: Arc<LocalSessionManager>,
     lease: Arc<Lease>,
     token: String,
     peer: SocketAddr,
@@ -475,13 +499,34 @@ async fn gate(
         .map(str::to_owned);
     // Every admitted request settles, so a reservation is never left standing by a request that
     // did not become a session.
-    if lease.settle(
+    match lease.settle(
         claim,
         session.as_deref(),
         minted.as_deref(),
         response.status().is_success(),
     ) {
-        tracing::info!("a client attached and adopted the sessions the previous one left open");
+        Settled::Kept { adopted: true } => {
+            tracing::info!("a client attached and adopted the sessions the previous one left open");
+        }
+        Settled::Kept { adopted: false } => {}
+        // This request lost the server while it was being handled. If the service minted a session
+        // for it, that session belongs to nobody: the holder is someone else, so every request
+        // carrying it would be refused, and no lease will ever sweep it. Close it here and tell the
+        // client what actually happened, rather than handing it an id that cannot be used.
+        Settled::Stale => {
+            if let Some(id) = minted
+                && let Err(e) = manager.close_session(&id.into()).await
+            {
+                tracing::warn!("could not close a session minted by a claim that had expired: {e}");
+            }
+            tracing::warn!(
+                "a request from {peer} outlived its claim on this server; its session was closed"
+            );
+            return Ok(refuse(
+                StatusCode::CONFLICT,
+                "this request outlived its claim on the server; open a new session",
+            ));
+        }
     }
     if goodbye && let Some(id) = session {
         lease.released(&id);
@@ -551,6 +596,14 @@ mod tests {
 
     /// The claim an admitted request reserved. Panics if the gate refused, since every caller here
     /// is testing what happens *after* admission.
+    /// Whether a settlement adopted sessions, asserting it was not rejected.
+    fn adopted(settled: Settled) -> bool {
+        match settled {
+            Settled::Kept { adopted } => adopted,
+            Settled::Stale => panic!("the settlement was rejected as stale"),
+        }
+    }
+
     fn claim_of(admission: Admission) -> Option<u64> {
         match admission {
             Admission::Serve(claim) => claim,
@@ -648,12 +701,36 @@ mod tests {
         lease.settle(fresh, None, Some("session-new"), true);
 
         // Now the request nobody is waiting for finally returns.
-        assert!(!lease.settle(stale, None, Some("session-stale"), true));
+        assert_eq!(
+            lease.settle(stale, None, Some("session-stale"), true),
+            Settled::Stale,
+            "and is told so, because the session it minted has to be closed and its client told to \
+             start again — an id whose every request is refused is worse than an error"
+        );
         assert_eq!(
             lease.state().holder.as_deref(),
             Some("session-new"),
             "the holder is whoever legitimately took the server, not whoever answered last"
         );
+    }
+
+    /// A request from the established holder settles nothing and is never stale.
+    ///
+    /// It reserved no claim, so there is nothing to resolve — and treating it as stale would close
+    /// the holder's own session out from under it.
+    #[test]
+    fn an_ordinary_request_from_the_holder_is_not_a_settlement() {
+        let lease = lease();
+        let claim = claim_of(lease.admit(None));
+        lease.settle(claim, None, Some("session-a"), true);
+
+        let none = claim_of(lease.admit(Some("session-a")));
+        assert_eq!(none, None, "the holder reserves nothing");
+        assert_eq!(
+            lease.settle(none, Some("session-a"), None, true),
+            Settled::Kept { adopted: false }
+        );
+        assert_eq!(lease.state().holder.as_deref(), Some("session-a"));
     }
 
     /// A returning client finds what it left, and is told that is what happened.
@@ -662,14 +739,14 @@ mod tests {
         let lease = lease();
         let first = claim_of(lease.admit(None));
         assert!(
-            !lease.settle(first, None, Some("session-a"), true),
+            !adopted(lease.settle(first, None, Some("session-a"), true)),
             "the first client adopts nothing — there was nothing open"
         );
 
         lease.released("session-a");
         let next = claim_of(lease.admit(None));
         assert!(
-            lease.settle(next, None, Some("session-b"), true),
+            adopted(lease.settle(next, None, Some("session-b"), true)),
             "the next client is told it inherited the sessions still open"
         );
     }
@@ -810,11 +887,18 @@ mod tests {
         let lease = brief();
         let claim = claim_of(lease.admit(None));
         lease.settle(claim, None, Some("session-a"), true);
+        // The holder lets go, so the next request is a genuine resume and reserves a claim of its
+        // own — a request from the sitting holder reserves nothing and settles nothing.
+        lease.released("session-a");
         let resumed = claim_of(lease.admit(Some("session-a")));
+        assert!(resumed.is_some(), "a resume reserves the server");
         std::thread::sleep(Duration::from_millis(5));
         assert!(lease.expired().is_some());
 
-        assert!(!lease.settle(resumed, None, Some("session-b"), true));
+        assert_eq!(
+            lease.settle(resumed, None, Some("session-b"), true),
+            Settled::Stale
+        );
         assert_eq!(
             lease.state().holder,
             None,
