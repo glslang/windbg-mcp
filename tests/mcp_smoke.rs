@@ -1956,35 +1956,13 @@ fn a_dump_session_opens_reads_and_closes() {
     );
 }
 
-/// A record made in the **engine worker** reaches the client, tagged with the session that made
-/// it.
+/// Waits for a record from `session_id`'s **engine worker** whose message contains `needle`, and
+/// hands it back.
 ///
-/// The one claim about the log bridge that only two real processes can settle. A worker's
-/// `tracing` output has always gone to its inherited stderr, which is the supervisor's — and on
-/// stdio that is the client's log, so nothing had to carry it. Under `--listen` the client is on
-/// another machine and that inheritance reaches nobody, so the record has to cross the pipe as a
-/// value (`WorkerMessage::Log`) and be filed against a session id only the supervisor knows. In
-/// process there is no second process, and no session for a record to be tagged with; here there
-/// are both.
-///
-/// Hung off the teardown because that is the path a healthy session is *guaranteed* to log on:
-/// the worker reads EOF, says it is releasing the target before exit, and flushes on its way out
-/// — which is also the record most worth having, being the account of a teardown nobody asked
-/// for.
-#[test]
-fn a_workers_log_records_reach_the_client_tagged_with_their_session() {
-    let Some(dump) = target_tier() else { return };
-    let mut server = Server::started();
-    let session_id = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
-    server.tool_data(
-        "end_session",
-        json!({ "session_id": session_id }),
-        TARGET_STEP,
-    );
-
-    // Polled rather than read once: `end_session` answers when the target is released, and the
-    // worker's exit records are written after that, by a different process. The order of those
-    // two is not something this test gets to assume.
+/// Polled rather than read once, and deliberately not on a fixed sleep: the record is made in
+/// another process, queued there, mirrored up the protocol channel and filed by the supervisor,
+/// none of which is ordered against the tool call that provoked it.
+fn wait_for_log_record(server: &mut Server, session_id: &str, needle: &str) -> Value {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let page = server.tool_data(
@@ -1992,31 +1970,19 @@ fn a_workers_log_records_reach_the_client_tagged_with_their_session() {
             json!({ "session_id": session_id, "limit": 200 }),
             STEP,
         );
-        let records = page["records"].as_array().cloned().unwrap_or_default();
-        if !records.is_empty() {
-            for record in &records {
-                assert_eq!(
-                    record["session_id"], session_id,
-                    "a session filter must not hand back another session's records: {record}"
-                );
-            }
-            assert!(
-                records.iter().any(|r| r["target"] == "windbg_mcp::worker"),
-                "these have to be the worker's own records, not the supervisor's about it: \
-                 {records:?}"
-            );
-            assert!(
-                records
-                    .iter()
-                    .any(|r| r["message"].as_str().is_some_and(|m| m.contains("worker:"))),
-                "and to carry what the worker actually said: {records:?}"
-            );
-            return;
+        let found = page["records"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|r| r["message"].as_str().is_some_and(|m| m.contains(needle)))
+            .cloned();
+        if let Some(found) = found {
+            return found;
         }
         assert!(
             Instant::now() < deadline,
-            "no record from session {session_id}'s engine worker reached the client within 15s \
-             of its teardown — the bridge is not carrying them: {page}"
+            "no record containing `{needle}` from session {session_id}'s engine worker reached \
+             the client within 15s — the log bridge is not carrying them: {page}"
         );
         std::thread::sleep(Duration::from_millis(250));
     }
@@ -3343,6 +3309,29 @@ fn interrupting_a_running_batch_stops_it_and_rolls_it_back() {
         "interrupting a batch must not cost the session:\n{}",
         text_of(&after["result"])
     );
+
+    // The **worker's** account of the same interrupt, read back through `server_log` — the one
+    // claim about the log bridge that needs two real processes.
+    //
+    // A worker's `tracing` output has always gone to its inherited stderr, which is the
+    // supervisor's, which under stdio is the client's log; nothing had to carry it. Under
+    // `--listen` the client is on another machine and that inheritance reaches nobody, so the
+    // record has to cross the pipe as a value and be filed against a session id only the
+    // supervisor knows. In process there is neither a second process nor a session to tag.
+    //
+    // Hung off the interrupt because that is a path a worker is *certain* to log on — a healthy
+    // session is quiet by design, which is the point of the level rather than a gap — and because
+    // the session survives it, so this is not racing a teardown.
+    let worker_said = wait_for_log_record(&mut server, &session_id, "interrupt raised for job");
+    assert_eq!(
+        worker_said["target"], "windbg_mcp::worker",
+        "it has to be the worker's own record, not the supervisor's about it: {worker_said}"
+    );
+    assert_eq!(
+        worker_said["session_id"], session_id,
+        "and filed against the session whose worker made it: {worker_said}"
+    );
+
     server.tool_text(
         "end_session",
         json!({ "session_id": session_id }),
