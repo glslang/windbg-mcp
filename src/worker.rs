@@ -509,6 +509,7 @@ pub fn run(args: &[String]) -> ! {
     }
     // Installed before the engine thread exists, so nothing can reach `emit` without a channel.
     let _ = MESSAGES.set(Mutex::new(messages));
+    start_log_writer();
 
     // Each request is stamped when it is *read*, so the engine thread can tell how long it then
     // waited its turn — the half of the watchdog budget only this process can measure.
@@ -523,6 +524,7 @@ pub fn run(args: &[String]) -> ! {
         emit(&WorkerMessage::Fatal {
             message: format!("could not start the engine thread: {e}"),
         });
+        crate::logbridge::flush(LOG_FLUSH);
         std::process::exit(1);
     }
 
@@ -631,7 +633,49 @@ pub fn run(args: &[String]) -> ! {
             }
         }
     }
+    // Everything above is the account of a teardown nobody asked for, and it is the account most
+    // worth reading — so it goes up the channel before this process stops existing. Bounded, and
+    // last: a flush that held the exit open would be a worse bug than a lost log line.
+    crate::logbridge::flush(LOG_FLUSH);
     std::process::exit(0);
+}
+
+/// How long a worker will wait, on its way out, for its log records to reach the supervisor.
+///
+/// Small on purpose. The records are already on this process's stderr; what this buys is the
+/// copy a client on another machine can read ([`crate::logbridge`]), and no diagnostic is worth
+/// delaying the release of a debug target for.
+const LOG_FLUSH: Duration = Duration::from_millis(250);
+
+/// Starts the thread that mirrors this worker's `tracing` records up the protocol channel.
+///
+/// A thread of its own because the alternative is writing them from wherever they are logged —
+/// which is mostly the engine thread, inside DbgEng, where a pipe that has filled would block the
+/// debugger on a log line. Queued and dropped when full instead; the drops are counted and
+/// reported rather than swallowed.
+fn start_log_writer() {
+    let started = thread::Builder::new().name("logs".into()).spawn(|| {
+        crate::logbridge::run_worker_writer(|entry, dropped| {
+            !matches!(
+                emit(&WorkerMessage::Log {
+                    at_ms: entry.at_ms,
+                    level: entry.level,
+                    target: entry.target,
+                    message: entry.message,
+                    dropped,
+                }),
+                Emit::Unwritable
+            )
+        });
+    });
+    if let Err(e) = started {
+        // Not fatal, and not silent: the session works, and its records still reach this
+        // process's stderr — they just stop reaching a client that is not on this machine.
+        tracing::warn!(
+            "worker: could not start the log writer ({e}); this session's log records will not \
+             reach the client, only the server's own stderr"
+        );
+    }
 }
 
 /// Owns the [`DebugEngine`] for the life of the process and runs one op at a time.
@@ -648,6 +692,7 @@ fn engine_thread(rx: mpsc::Receiver<Job>) {
                 message: "failed to initialize DbgEng (is dbgeng.dll on the search path?)"
                     .to_string(),
             });
+            crate::logbridge::flush(LOG_FLUSH);
             std::process::exit(1);
         }
     };

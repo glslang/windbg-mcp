@@ -164,6 +164,114 @@ fn ms(d: Duration) -> u64 {
     d.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+/// How many records `server_log` returns when the caller does not say.
+const DEFAULT_LOG_RECORDS: u32 = 50;
+
+/// The most it will return in one call.
+///
+/// A page rather than the buffer. The buffer is a thousand records by design — enough to hold the
+/// run-up to a failure — and the reader on the other end of a tool result has a context window.
+const MAX_LOG_RECORDS: u32 = 500;
+
+/// [`crate::logbridge::Tail`] as the typed half of a `server_log` result.
+fn log_report(tail: &crate::logbridge::Tail) -> structured::LogReport {
+    structured::LogReport {
+        records: tail
+            .entries
+            .iter()
+            .map(|e| structured::LogRecord {
+                seq: e.seq,
+                at: crate::record::rfc3339(std::time::UNIX_EPOCH + Duration::from_millis(e.at_ms)),
+                level: e.level,
+                session_id: e.session.clone(),
+                target: e.target.clone(),
+                message: e.message.clone(),
+            })
+            .collect(),
+        matched: tail.matched.min(u32::MAX as usize) as u32,
+        next_since: tail.next_since,
+        held: tail.held.min(u32::MAX as usize) as u32,
+        capacity: tail.capacity.min(u32::MAX as usize) as u32,
+        oldest_seq: tail.oldest_seq,
+    }
+}
+
+/// The module part of a `tracing` target, which is what a reader is actually distinguishing:
+/// `windbg_mcp::worker` against `windbg_mcp::engine`. The full target is kept in the typed half.
+fn short_target(target: &str) -> &str {
+    target.rsplit("::").next().unwrap_or(target)
+}
+
+/// One record as a line: when, how bad, who said it, and what it said.
+fn describe_record(e: &crate::logbridge::Entry) -> String {
+    let at = crate::record::rfc3339(std::time::UNIX_EPOCH + Duration::from_millis(e.at_ms));
+    let source = match &e.session {
+        Some(id) => format!("{}/{id}", short_target(&e.target)),
+        None => short_target(&e.target).to_string(),
+    };
+    format!("{at} {} {source}: {}", e.level.label(), e.message)
+}
+
+/// A page of the log, with the facts about the *buffer* a reader cannot get from the records —
+/// which is what separates "nothing happened" from "it scrolled past".
+///
+/// Free function so the wording tests without a debugger, like [`describe_session`].
+fn describe_log(tail: &crate::logbridge::Tail, query: &crate::logbridge::Query) -> String {
+    let level = query.level.label().trim().to_lowercase();
+    let scope = match &query.session {
+        Some(id) => format!(" about session {id}"),
+        None => String::new(),
+    };
+    let mut out = String::new();
+    if tail.entries.is_empty() {
+        out.push_str(&format!("No log records{scope} at {level} or above.\n"));
+        if query.session.is_some() {
+            out.push_str(
+                "Only what a session's own engine worker logged carries its session id — records \
+                 the supervisor made *about* that session (spawning its worker, timing a call \
+                 out, the worker dying) do not. Ask again without `session_id` to see those; that \
+                 is also the only way to see an open that failed before there was a session.\n",
+            );
+        }
+        if tail.held > 0 {
+            out.push_str(&format!(
+                "The buffer holds {} record(s) that this filter excluded.\n",
+                tail.held
+            ));
+        }
+    } else {
+        out.push_str(&format!(
+            "{} of {} record(s){scope} at {level} or above, oldest first:\n\n",
+            tail.entries.len(),
+            tail.matched
+        ));
+        for e in &tail.entries {
+            out.push_str(&describe_record(e));
+            out.push('\n');
+        }
+    }
+    out.push_str(&format!(
+        "\nBuffer: {} of {} record(s) held. Pass `since: {}` next time for only what is new.\n\
+         This is the same stream as the server's stderr, so it holds nothing below the level the \
+         server was started with — widen it with `RUST_LOG` (and restart) rather than with \
+         `level` here.",
+        tail.held, tail.capacity, tail.next_since
+    ));
+    // The one thing a caller paging through *must* be told, because their next page would
+    // otherwise silently skip a stretch and read as a quiet one.
+    if let (Some(since), Some(oldest)) = (query.since, tail.oldest_seq)
+        && oldest > since
+    {
+        out.push_str(&format!(
+            "\n[!] Records before seq {oldest} were evicted since your last call, so this page \
+             starts later than the `since` you asked for. The buffer holds the most recent \
+             {} records; ask sooner, or raise it with WINDBG_MCP_LOG_BUFFER.",
+            tail.capacity
+        ));
+    }
+    out
+}
+
 /// The session an open ended up with, for the outcomes that have one.
 ///
 /// A `match` rather than a chain of `if let`s, so a new [`OpenError`] variant is a compile error
@@ -1368,6 +1476,29 @@ pub struct SessionArgs {
     pub session_id: Option<String>,
 }
 
+/// Parameters for `server_log`.
+#[derive(Deserialize, JsonSchema)]
+pub struct LogArgs {
+    /// Only records about this session — what its engine worker logged. The supervisor's own
+    /// records about that session (spawning its worker, timing a call out) carry no session id
+    /// and are excluded, so omit this when tracing a session that failed to *open*.
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// The least severe level to include; more severe records are always included. Defaults to
+    /// `info`, which is what the server logs unless `RUST_LOG` says otherwise — asking for
+    /// `debug` or `trace` on a server started without them returns nothing, because records
+    /// below the filter are never made in the first place.
+    #[serde(default)]
+    pub level: Option<crate::logbridge::Level>,
+    /// How many records to return, most recent last. Defaults to 50, capped at 500.
+    #[serde(default)]
+    pub limit: Option<u32>,
+    /// Return only records filed after this point — pass back the `next_since` from the previous
+    /// call to see what has happened since, without re-reading what you already have.
+    #[serde(default)]
+    pub since: Option<u64>,
+}
+
 /// Parameters for `modules`.
 #[derive(Deserialize, JsonSchema)]
 pub struct ModulesArgs {
@@ -2297,15 +2428,15 @@ impl WindbgServer {
 // ---- Tools ---------------------------------------------------------------
 //
 // On `open_world_hint`: everything that touches a debug target is open-world, and only
-// `decode_ioctl` (pure arithmetic on a control code) and `session_status` (a read of this
-// server's own state) are not. Two independent reasons put the rest over the line. A symbol server on the symbol
+// `decode_ioctl` (pure arithmetic on a control code), `session_status` and `server_log` (reads of
+// this server's own state) are not. Two independent reasons put the rest over the line. A symbol server on the symbol
 // path (the documented, recommended setup) means almost any command can make DbgEng
 // download a PDB, and not only the obvious symbol-pattern queries: `r` symbolizes the
 // current instruction, `k` symbolizes every frame, `bp module!Symbol` resolves a name.
 // And a session opened over KDNET puts the *target itself* on the far side of a network
 // link, so even `read_memory` fetching raw bytes, or `end_session` releasing the target,
-// is remote traffic. That leaves `decode_ioctl` and `session_status`, the two that never
-// reach the engine at all. Claiming otherwise would tell a client the tool cannot touch
+// is remote traffic. That leaves `decode_ioctl`, `session_status` and `server_log`, the three
+// that never reach the engine at all. Claiming otherwise would tell a client the tool cannot touch
 // the network and let it skip whatever consent that decision gates.
 
 #[rmcp::tool_router]
@@ -2966,6 +3097,49 @@ impl WindbgServer {
             describe_session(session),
             sessions_report(&[session], Some(asked), false),
         )
+    }
+
+    /// Read this server's own log — the supervisor's records and every engine worker's, tagged
+    /// with the session each one belongs to. This is the *server's* diagnostics, not the target's.
+    ///
+    /// Ask when something happened that a tool result cannot explain: a call that timed out, a
+    /// session that failed to open, a worker that died, a target released by a path nobody asked
+    /// for. The records name which of the two processes spoke and when.
+    ///
+    /// Answers even while a session is parked or wedged: it reads a buffer this server keeps and
+    /// never queues on any session's engine. Only the most recent records are held (1000 by
+    /// default) — `next_since` pages forward, and a `since` older than `oldest_seq` means records
+    /// were evicted in between.
+    ///
+    /// The level filter cannot reach below what the server was started to log, which is `info`
+    /// unless `RUST_LOG` says otherwise: records below that are never made, so asking for them
+    /// returns nothing rather than more.
+    #[rmcp::tool(
+        annotations(
+            title = "Read the server's log",
+            read_only_hint = true,
+            open_world_hint = false
+        ),
+        output_schema = schema_for_output::<Outcome<structured::LogReport>>()
+    )]
+    async fn server_log(
+        &self,
+        Parameters(args): Parameters<LogArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // Never routed to a worker, for the same reason `session_status` is not: the case this
+        // exists for is a session nothing can be asked of, and a tool that queued behind it would
+        // be unavailable exactly when it is wanted.
+        let query = crate::logbridge::Query {
+            session: args.session_id.clone(),
+            level: args.level.unwrap_or(crate::logbridge::Level::Info),
+            since: args.since,
+            limit: args
+                .limit
+                .unwrap_or(DEFAULT_LOG_RECORDS)
+                .min(MAX_LOG_RECORDS) as usize,
+        };
+        let tail = crate::logbridge::tail(&query);
+        structured_result(describe_log(&tail, &query), log_report(&tail))
     }
 
     /// Stop the operation a session is currently running, **keeping the session and its target**.

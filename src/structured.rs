@@ -285,6 +285,48 @@ pub struct SessionsReport {
     pub unknown_handle: bool,
 }
 
+/// What `server_log` reports: a page of the server's own log, and enough about the ring behind it
+/// to tell "nothing happened" from "it scrolled past".
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LogReport {
+    /// Oldest first, which is reading order.
+    pub records: Vec<LogRecord>,
+    /// How many matched the filter before `limit` clipped it. Greater than `records.len()` means
+    /// the oldest matches were left behind, not that they do not exist.
+    pub matched: u32,
+    /// Pass as `since` next time to get only what is new. It advances even when this page is
+    /// empty, so polling a quiet server does not re-read the same tail.
+    pub next_since: u64,
+    /// How many records the buffer holds, and how many it can. Set the capacity with
+    /// `WINDBG_MCP_LOG_BUFFER`.
+    pub held: u32,
+    pub capacity: u32,
+    /// The oldest `seq` still buffered. A `since` older than this is the only way to find out
+    /// that records were evicted between two calls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub oldest_seq: Option<u64>,
+}
+
+/// One log record.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LogRecord {
+    /// Filing order within this server run, gapless unless records were evicted.
+    pub seq: u64,
+    /// When it was logged, in the process that logged it — RFC 3339, UTC, to the millisecond.
+    /// A worker's record is stamped in the worker, so `at` and `seq` can disagree by the width of
+    /// a pipe write: `at` says when, `seq` says in what order it was filed.
+    pub at: String,
+    pub level: crate::logbridge::Level,
+    /// The session a worker's record is about. Absent for the supervisor's own records — the
+    /// session registry, the listener, the tool surface — which are *about* sessions without
+    /// belonging to one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    /// The `tracing` target, which says which part of the server spoke.
+    pub target: String,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionInfo {
     pub session_id: String,

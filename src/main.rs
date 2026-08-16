@@ -17,6 +17,7 @@ mod cast;
 mod engine;
 mod kdconn;
 mod listen;
+mod logbridge;
 mod proto;
 mod record;
 mod server;
@@ -63,7 +64,7 @@ fn main() -> Result<()> {
     // engine thread must be free to block in DbgEng indefinitely.
     let args: Vec<String> = std::env::args().collect();
     let is_worker = args.iter().any(|arg| arg == worker::WORKER_FLAG);
-    init_logging();
+    init_logging(is_worker);
     if is_worker {
         // The rest of the command line is the worker's half of the protocol channel — two
         // inherited pipe handles, which is why a worker started by hand cannot get anywhere.
@@ -143,18 +144,31 @@ fn render_cast(args: &[String]) -> Result<()> {
 
 /// stdout is the JSON-RPC transport, so all logging must go to stderr. A worker's stderr is
 /// inherited from the supervisor, so both roles' logs land in the same place an MCP client
-/// already reads.
+/// already reads — when the client is on this machine.
 ///
 /// Targets stay on for both, which is what tells them apart: a worker's records carry
 /// `windbg_mcp::worker`, the supervisor's `windbg_mcp::engine` and friends. Suppressing them for
 /// workers — the first cut here — identified a worker only by the *absence* of a field, which is
 /// no help at all when two processes are interleaving lines in one stream.
-fn init_logging() {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+///
+/// Two layers, not one, and under a **single** filter. Stderr is unchanged and stays the local
+/// operator's view; [`logbridge`] is the copy a client reads with `server_log`, which is what
+/// makes the records reachable when the client is on another machine (`--listen`). Sharing the
+/// filter is deliberate: the tool then shows exactly what the log shows, and `RUST_LOG` widens
+/// both together rather than one of them silently.
+fn init_logging(is_worker: bool) {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let role = if is_worker {
+        logbridge::Role::Worker
+    } else {
+        logbridge::Role::Supervisor
+    };
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(logbridge::layer(role))
         .init();
 }
 

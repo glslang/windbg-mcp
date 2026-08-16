@@ -1229,6 +1229,72 @@ fn a_tool_call_round_trips_over_the_wire() {
     }
 }
 
+/// The server's own log, read back through a tool.
+///
+/// In the base tier because the thing being checked is not the debugger: it is that a record this
+/// process wrote to stderr is *also* reachable over the transport. That property is what
+/// `--listen` needs and stdio got for free — the server's stderr is the client's log only while
+/// the two are on one machine — so it has to be asserted somewhere that a client can see, which
+/// means over the wire.
+#[test]
+fn the_servers_own_log_is_readable_over_the_transport() {
+    let mut server = Server::started();
+    let page = server.tool_data("server_log", json!({}), STEP);
+    let records = page["records"]
+        .as_array()
+        .unwrap_or_else(|| panic!("server_log returns records: {page}"))
+        .clone();
+    assert!(
+        !records.is_empty(),
+        "the server logs its own startup, so a bare `server_log` cannot be empty: {page}"
+    );
+    assert!(
+        records.iter().any(|r| r["target"]
+            .as_str()
+            .is_some_and(|t| t.starts_with("windbg_mcp"))),
+        "the records must be this server's own, keyed by tracing target: {records:?}"
+    );
+    assert!(
+        page["capacity"].as_u64().unwrap_or(0) > 0,
+        "a report has to say how much the buffer holds: {page}"
+    );
+
+    // `since` is the paging contract, and it is the half a poller depends on: a second call with
+    // the returned cursor must not re-serve what the first one already handed over.
+    let cursor = page["next_since"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("server_log returns a cursor: {page}"));
+    let next = server.tool_data("server_log", json!({ "since": cursor }), STEP);
+    for record in next["records"].as_array().into_iter().flatten() {
+        assert!(
+            record["seq"].as_u64().unwrap_or(0) >= cursor,
+            "a `since` page must contain nothing older than its cursor: {record}"
+        );
+    }
+
+    // A filter that matches nothing answers with an empty page rather than an error — asking
+    // after a session that is gone is a fair question with a definite answer.
+    let none = server.tool_data(
+        "server_log",
+        json!({ "session_id": "sess-not-a-real-handle" }),
+        STEP,
+    );
+    assert!(
+        none["records"].as_array().is_some_and(Vec::is_empty),
+        "no session, no records: {none}"
+    );
+
+    // The level filter is a floor on severity, so asking for errors must not hand back the info
+    // records above.
+    let errors = server.tool_data("server_log", json!({ "level": "error" }), STEP);
+    for record in errors["records"].as_array().into_iter().flatten() {
+        assert_eq!(
+            record["level"], "error",
+            "`level: error` returned something less severe: {record}"
+        );
+    }
+}
+
 /// The session transcript, end to end through the shipped binary: recorded by a real server
 /// process over a real stdio connection, read back as JSONL, and rendered as an asciicast.
 ///
@@ -1885,6 +1951,72 @@ fn a_dump_session_opens_reads_and_closes() {
         is_tool_error(&after) || !after["error"].is_null(),
         "a handle from an ended session must be refused, got {after}"
     );
+}
+
+/// A record made in the **engine worker** reaches the client, tagged with the session that made
+/// it.
+///
+/// The one claim about the log bridge that only two real processes can settle. A worker's
+/// `tracing` output has always gone to its inherited stderr, which is the supervisor's — and on
+/// stdio that is the client's log, so nothing had to carry it. Under `--listen` the client is on
+/// another machine and that inheritance reaches nobody, so the record has to cross the pipe as a
+/// value (`WorkerMessage::Log`) and be filed against a session id only the supervisor knows. In
+/// process there is no second process, and no session for a record to be tagged with; here there
+/// are both.
+///
+/// Hung off the teardown because that is the path a healthy session is *guaranteed* to log on:
+/// the worker reads EOF, says it is releasing the target before exit, and flushes on its way out
+/// — which is also the record most worth having, being the account of a teardown nobody asked
+/// for.
+#[test]
+fn a_workers_log_records_reach_the_client_tagged_with_their_session() {
+    let Some(dump) = target_tier() else { return };
+    let mut server = Server::started();
+    let session_id = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+    server.tool_data(
+        "end_session",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
+
+    // Polled rather than read once: `end_session` answers when the target is released, and the
+    // worker's exit records are written after that, by a different process. The order of those
+    // two is not something this test gets to assume.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let page = server.tool_data(
+            "server_log",
+            json!({ "session_id": session_id, "limit": 200 }),
+            STEP,
+        );
+        let records = page["records"].as_array().cloned().unwrap_or_default();
+        if !records.is_empty() {
+            for record in &records {
+                assert_eq!(
+                    record["session_id"], session_id,
+                    "a session filter must not hand back another session's records: {record}"
+                );
+            }
+            assert!(
+                records.iter().any(|r| r["target"] == "windbg_mcp::worker"),
+                "these have to be the worker's own records, not the supervisor's about it: \
+                 {records:?}"
+            );
+            assert!(
+                records
+                    .iter()
+                    .any(|r| r["message"].as_str().is_some_and(|m| m.contains("worker:"))),
+                "and to carry what the worker actually said: {records:?}"
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no record from session {session_id}'s engine worker reached the client within 15s \
+             of its teardown — the bridge is not carrying them: {page}"
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 /// An open answers the three questions it is asked every time — which build, where the target's

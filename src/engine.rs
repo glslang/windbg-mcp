@@ -2198,6 +2198,21 @@ fn read_messages(
                     continue;
                 }
                 match serde_json::from_str::<WorkerMessage>(&line) {
+                    // Not protocol, and belonging to no request: one of that worker's own log
+                    // records, mirrored so the supervisor holds every record either process made
+                    // (`crate::logbridge`). Filed here rather than forwarded, because everything
+                    // past this point is routed by request id and this has none — and because
+                    // *here* is where the session id is known, which is the one thing the worker
+                    // could not stamp it with.
+                    Ok(WorkerMessage::Log {
+                        at_ms,
+                        level,
+                        target,
+                        message,
+                        dropped,
+                    }) => {
+                        crate::logbridge::from_worker(&id, at_ms, level, &target, message, dropped);
+                    }
                     Ok(message) => {
                         // Recorded here, before the message is handed on, because a teardown reads
                         // it against a deadline — see [`Session::unwinding`]. Everything this
@@ -2466,8 +2481,10 @@ async fn reader(
                     sessions.reconcile_capacity(&session);
                 }
             }
-            // Both belong to the spawn handshake, which has already happened.
-            WorkerMessage::Ready | WorkerMessage::Fatal { .. } => {}
+            // `Ready` and `Fatal` belong to the spawn handshake, which has already happened.
+            // `Log` never gets this far: it is filed by the reader thread that parsed it, which
+            // is also where the session id it is tagged with lives.
+            WorkerMessage::Ready | WorkerMessage::Fatal { .. } | WorkerMessage::Log { .. } => {}
         }
     }
     // The channel closed: the worker exited, for whatever reason. Nothing else can close it —

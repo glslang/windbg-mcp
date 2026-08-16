@@ -952,7 +952,7 @@ fn mint_run_id() -> u64 {
 /// Written out rather than pulled in: the crate has no date dependency, this is the only place
 /// that needs one, and the arithmetic below is the whole of it. Days are converted with the
 /// civil-from-days algorithm, which is exact for every date a file's timestamp can hold.
-fn rfc3339(at: SystemTime) -> String {
+pub fn rfc3339(at: SystemTime) -> String {
     let since = at.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
     let secs = since.as_secs();
     let (days, rem) = ((secs / 86_400) as i64, secs % 86_400);
