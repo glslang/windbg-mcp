@@ -612,9 +612,9 @@ async fn gate(
         epoch: admitted.epoch,
     };
 
-    // A DELETE is the client saying it is done. Noted before the service handles it, because
-    // afterwards the session is gone and there is nothing left to match the holder against.
-    let goodbye = req.method() == hyper::Method::DELETE;
+    // A DELETE is the client saying it is done. Read before the service handles it, because
+    // afterwards the request is gone; whether it *was* a departure also depends on the answer.
+    let method = req.method().clone();
 
     let response = mcp.handle(req).await;
 
@@ -654,11 +654,28 @@ async fn gate(
             ));
         }
     }
-    if goodbye && let Some(id) = session {
+    if is_departure(&method, response.status())
+        && let Some(id) = session
+    {
         lease.released(&id);
         tracing::info!("the client let go; its sessions are held for the grace period");
     }
     Ok(response)
+}
+
+/// Whether this request was the holder actually leaving.
+///
+/// A `DELETE` is the client saying it is done — **if the service agreed**. rmcp refuses one that
+/// carries an invalid protocol version, and a refused `DELETE` leaves the MCP session open. Taking
+/// it as a departure anyway clears the holder, and the sweep that would have closed that session
+/// then finds `holder: None` and nothing to close: the session survives with no lease owning it and
+/// no sweep that will ever collect it, one per failed attempt
+/// ([#136](https://github.com/glslang/windbg-mcp/issues/136)).
+///
+/// A predicate rather than a condition inline, because it is the one tenancy rule that lives in the
+/// HTTP handler rather than in [`Lease`] — and so the one that had no test until it had a name.
+fn is_departure(method: &hyper::Method, status: StatusCode) -> bool {
+    method == hyper::Method::DELETE && status.is_success()
 }
 
 fn authorised(req: &Request<Incoming>, token: &str) -> bool {
@@ -1092,6 +1109,32 @@ mod tests {
         );
         lease.released_leases();
         assert!(matches!(lease.admit(None), Admission::Serve(_)));
+    }
+
+    /// Only a `DELETE` the service accepted is a departure.
+    ///
+    /// A refused one leaves the MCP session open. Recording the client as gone then clears the
+    /// holder, so the sweep that would have closed that session finds nothing to close — and it
+    /// survives with no lease owning it and nothing that will ever collect it (#136).
+    #[test]
+    fn only_an_accepted_delete_is_a_departure() {
+        use hyper::Method;
+
+        assert!(is_departure(&Method::DELETE, StatusCode::OK));
+        assert!(
+            is_departure(&Method::DELETE, StatusCode::ACCEPTED),
+            "202 is what the service actually answers a DELETE with"
+        );
+
+        assert!(
+            !is_departure(&Method::DELETE, StatusCode::BAD_REQUEST),
+            "a DELETE the service refused left the session open, so the client has not left"
+        );
+        assert!(!is_departure(&Method::DELETE, StatusCode::NOT_FOUND));
+        assert!(
+            !is_departure(&Method::POST, StatusCode::OK),
+            "and no other method is a goodbye, however well it went"
+        );
     }
 
     /// A goodbye from something that is not the holder changes nothing.
