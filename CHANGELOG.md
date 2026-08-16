@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Opt-in session transcripts, and an asciicast renderer for them**
+  ([#87](https://github.com/glslang/windbg-mcp/issues/87)). Point `WINDBG_MCP_TRANSCRIPT` at a path
+  and the supervisor records what it was asked and what it did, one JSON object per line: the tool
+  call and its result; a session opening, changing state and being released; a wait abandoned, an
+  `interrupt`, a worker process dying; and — derived from each result's *typed* half — where
+  execution stopped, what a `run_to_address` concluded, every breakpoint or memory mutation, each
+  assertion that did not hold, and how a `debug_batch` ended with whether its rollback completed.
+  Unset, which is the default, nothing is written.
+
+  What existed before had opposite problems. A client's own log is tens of megabytes of prompts
+  with the debugger operations buried inside shell-command source; the curated proof records under
+  `examples/` are readable and are written afterwards from memory — one of them says so on its
+  face, captioning its own timing as *"illustrative because live recording was not enabled for the
+  original run"*. The server is the only party that sees the whole of a session, and it was
+  recording none of it.
+
+  - **Written by the supervisor, from values.** One writer, so no locking and no interleaving
+    between processes — and a worker's facts still arrive as facts, because they cross the pipe as
+    the typed half of its reply and are read back through [`structured`](./src/structured.rs)
+    types. Nothing in a transcript is scraped out of a rendering, which is the rule
+    [#77](https://github.com/glslang/windbg-mcp/issues/77) was fixed by. A tool this server cannot
+    type — an arbitrary `execute` — contributes its call and its result and no derived event, which
+    is the honest answer rather than a guess about what the command did.
+  - **Redacted, and by the same rule as everywhere else.** `kdconn` grew a scan for arbitrary text
+    beside its connection parser, sharing the one list of secret parameter names, so a raw
+    `connection` passed to `attach_kernel` is recorded as `key=<redacted>`; an argument member
+    *named* like a secret is masked whole, before any tool has one. Profiles still keep the key out
+    of the request in the first place — this is the backstop for the caller who passed a raw string
+    anyway.
+  - **Bounded, and it says so.** Fields are capped (`WINDBG_MCP_TRANSCRIPT_MAX_FIELD`, 16 KiB by
+    default) and a record reports how much it dropped. A transcript that quietly truncated would
+    read as complete, which is worse than not having one.
+  - **Never the transport.** Standard output stays JSON-RPC: the transcript is a file this module
+    opens, and a test reads the source to keep it that way.
+  - **`windbg-mcp --render-cast <transcript.jsonl>`** renders one as an [asciicast v2] recording —
+    each call as a prompt line, its output beneath, and the derived facts marked between them. It
+    is derived offline from the same JSONL, so a cast can be made from a transcript recorded weeks
+    ago and its timings are the recorded ones, measured on a monotonic clock. `--idle-limit`,
+    `--max-lines`, `--title`, `--width`/`--height` shape it.
+
+  Retention is the operator's: nothing but secrets is masked, and debugger output is the contents of
+  somebody's memory. The README says what to do with one.
+
+  [asciicast v2]: https://docs.asciinema.org/manual/asciicast/v2/
+
+- **`debug_batch` answers with its report as values**, not only as prose — the last tool whose
+  whole answer was a rendering, and the one with the most at stake in being readable by a program.
+  `outcome`, the position it stopped `at`, `committed`, `rollback_complete`, what the session holds
+  `after`, and every step of both blocks with what it changed and whether an assertion was `unmet`.
+  It is built in the worker from the executor's own `BatchReport`, which is what lets a transcript
+  record a transaction's verdict as a fact.
+
+  **Visible change for existing clients**: `debug_batch` now declares an `outputSchema` and returns
+  `structuredContent`. The text is unchanged and so is `isError` — a batch that did not commit is
+  still a tool error carrying the whole report. Note the pairing this tool alone has: a batch that
+  *ran* answers `status: "ok"` (the report is the answer) on a result flagged `isError`, while
+  `status: "error"` means the batch never ran. Reading only `isError` cannot tell those apart.
+
 ## [0.9.0] - 2026-08-14
 
 ### Changed

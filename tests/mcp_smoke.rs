@@ -1122,6 +1122,15 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
             json!({ "addresses": ["0xffff800000000000"] }),
             "error",
         ),
+        // Well-formed for the same reason: a batch that fails `validate` never reaches a session,
+        // and it is the session refusal this row is here for. `status: "error"` is the batch that
+        // did not run — a batch that *runs* and fails answers `status: "ok"` on an `isError`
+        // result, which the dump tier checks because it needs a target to run against.
+        (
+            "debug_batch",
+            json!({ "steps": [{ "op": "command", "command": "version" }] }),
+            "error",
+        ),
     ];
 
     let mut server = Server::started();
@@ -1218,6 +1227,167 @@ fn a_tool_call_round_trips_over_the_wire() {
             "decoded output should mention `{expected}`, got:\n{text}"
         );
     }
+}
+
+/// The session transcript, end to end through the shipped binary: recorded by a real server
+/// process over a real stdio connection, read back as JSONL, and rendered as an asciicast.
+///
+/// In the base tier deliberately. Every acceptance criterion in
+/// [#87](https://github.com/glslang/windbg-mcp/issues/87) except the ones needing a target is
+/// about *this* — the environment variable being read, the file being written beside a live
+/// JSON-RPC transport rather than into it, and the renderer being reachable from the same
+/// executable — and none of that is provable in-process. `src/record.rs` covers the shapes.
+#[test]
+fn a_recorded_session_reads_back_as_jsonl_and_renders_as_a_cast() {
+    let transcript = marker_path("transcript");
+    let _ = std::fs::remove_file(&transcript);
+    let mut server = Server::started_with(&[(
+        "WINDBG_MCP_TRANSCRIPT",
+        transcript.to_str().expect("a UTF-8 temp path"),
+    )]);
+
+    server.tool_text("decode_ioctl", json!({ "code": "0x70000" }), STEP);
+    // A raw connection carrying a key. Refused here for its shape — so nothing dials and this
+    // test never waits on a network — but the key still crossed the wire as a tool argument,
+    // which is the only thing this row is about.
+    let key = "9.8.7.6";
+    server.call_tool(
+        "attach_kernel",
+        json!({ "connection": format!("net:port=50000, key={key}") }),
+        STEP,
+    );
+    // A failure with a category, so the transcript has one of each verdict.
+    server.call_tool("registers", json!({}), STEP);
+    // Read before the shutdown consumes the server; asserted after the file is, so a failure
+    // reports the transcript's problem rather than this.
+    let stdout = server.stdout_lines();
+    assert_eq!(server.shutdown(), Some(0), "the server exits cleanly");
+
+    let raw = std::fs::read_to_string(&transcript)
+        .unwrap_or_else(|e| panic!("no transcript at {}: {e}", transcript.display()));
+    // JSONL: every line is one complete object. Parsed as `Value` rather than as this crate's
+    // own type, because a consumer of the file has neither.
+    let records: Vec<Value> = raw
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSONL ({e}): {l}")))
+        .collect();
+    let kinds: Vec<&str> = records.iter().filter_map(|r| r["event"].as_str()).collect();
+    assert_eq!(kinds.first(), Some(&"start"), "a run starts with a header");
+    assert_eq!(
+        kinds.last(),
+        Some(&"shutdown"),
+        "and ends where the server did, so a truncated file is visibly truncated"
+    );
+    // Request order, which is the criterion: the calls, in the order they were made, each with
+    // its result.
+    let calls: Vec<(&str, &str)> = records
+        .iter()
+        .filter(|r| matches!(r["event"].as_str(), Some("tool_request" | "tool_result")))
+        .map(|r| {
+            (
+                r["event"].as_str().unwrap_or_default(),
+                r["tool"].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            ("tool_request", "decode_ioctl"),
+            ("tool_result", "decode_ioctl"),
+            ("tool_request", "attach_kernel"),
+            ("tool_result", "attach_kernel"),
+            ("tool_request", "registers"),
+            ("tool_result", "registers"),
+        ]
+    );
+    assert!(
+        records
+            .windows(2)
+            .all(|w| w[0]["seq"].as_u64() < w[1]["seq"].as_u64()),
+        "records are numbered in the order they were written"
+    );
+
+    // The security criterion, checked against the bytes of the file rather than a parsed field:
+    // a key that leaked into some corner of a record nobody thought to look at is still a leak.
+    assert!(
+        !raw.contains(key),
+        "the supplied KD key reached the transcript:\n{raw}"
+    );
+    assert!(
+        raw.contains("<redacted>"),
+        "and it should be visible that something was masked:\n{raw}"
+    );
+
+    // The transport criterion: stdout carried JSON-RPC and nothing else, so a transcript being
+    // written cannot corrupt a client's connection.
+    for line in stdout {
+        let message: Value = serde_json::from_str(&line)
+            .unwrap_or_else(|e| panic!("a non-JSON-RPC line reached stdout ({e}): {line}"));
+        assert_eq!(message["jsonrpc"], "2.0", "not a JSON-RPC message: {line}");
+    }
+
+    // And the same executable renders it. Anything else would be a second tool to keep in step
+    // with a format this one defines.
+    let cast = transcript.with_extension("cast");
+    let rendered = Command::new(EXE)
+        .arg("--render-cast")
+        .arg(&transcript)
+        .arg("--out")
+        .arg(&cast)
+        .output()
+        .expect("run the renderer");
+    assert!(
+        rendered.status.success(),
+        "the renderer failed: {}",
+        String::from_utf8_lossy(&rendered.stderr)
+    );
+
+    let cast_text = std::fs::read_to_string(&cast).expect("the cast exists");
+    let mut lines = cast_text.lines();
+    let header: Value =
+        serde_json::from_str(lines.next().expect("a header line")).expect("the header is JSON");
+    assert_eq!(header["version"], 2, "asciicast v2: {header}");
+    assert!(header["width"].as_u64().unwrap_or(0) > 0, "{header}");
+    assert!(header["height"].as_u64().unwrap_or(0) > 0, "{header}");
+    let mut previous = -1.0;
+    let mut frames = 0;
+    for line in lines.filter(|l| !l.trim().is_empty()) {
+        let event: Vec<Value> = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("an event line is not an array ({e}): {line}"));
+        assert_eq!(event.len(), 3, "an asciicast event is `[time, code, data]`");
+        let at = event[0].as_f64().expect("the time is a number");
+        assert_eq!(event[1], "o", "this renderer only writes output events");
+        assert!(event[2].is_string(), "the data is a string");
+        assert!(at >= previous, "an asciicast's times must not go backwards");
+        previous = at;
+        frames += 1;
+    }
+    assert!(frames > 0, "the recording has frames");
+    assert!(
+        !cast_text.contains(key),
+        "the key must not survive into the rendering either"
+    );
+
+    let _ = std::fs::remove_file(&transcript);
+    let _ = std::fs::remove_file(&cast);
+}
+
+/// Recording is opt-in, and its absence has to cost nothing at all: no file, no directory, and
+/// no change to what a client sees.
+#[test]
+fn nothing_is_recorded_unless_a_transcript_is_asked_for() {
+    let would_be = marker_path("unrecorded");
+    let _ = std::fs::remove_file(&would_be);
+    let mut server = Server::started();
+    server.tool_text("decode_ioctl", json!({ "code": "0x70000" }), STEP);
+    assert_eq!(server.shutdown(), Some(0));
+    assert!(
+        !would_be.exists(),
+        "a server nobody asked to record wrote {}",
+        would_be.display()
+    );
 }
 
 /// Bad calls have to fail as *protocol* errors, and — the part that matters — the connection
@@ -1442,6 +1612,51 @@ fn an_unknown_profile_is_refused_with_the_names_that_exist_but_no_values() {
         "a key reached the JSON-RPC transport"
     );
     assert!(!server.stderr().contains(key), "a key reached the log");
+}
+
+/// The same claim about the **third** place this server writes: a session transcript.
+///
+/// Its own test rather than an extra assertion on the one above, because it needs a server started
+/// with recording on, and because it is the other half of a pair — the transcript tier covers a raw
+/// `connection`, and this covers `profile`, which is the selector that is *supposed* to make the
+/// question moot. "Supposed to" is what a test is for: a profile's key lives in this server's own
+/// memory for the life of the process, and a recorder is a new thing that writes memory to a file.
+#[test]
+fn a_profiles_key_never_reaches_a_session_transcript() {
+    let (connection, key) = FAKE_PROFILE;
+    let transcript = marker_path("profile-transcript");
+    let _ = std::fs::remove_file(&transcript);
+    let mut env = profile_env().to_vec();
+    env.push((
+        "WINDBG_MCP_TRANSCRIPT",
+        transcript.to_str().expect("a UTF-8 temp path"),
+    ));
+    let mut server = Server::started_with(&env);
+
+    // Every route by which a profile's key could plausibly be written: naming a profile that does
+    // not exist (the reply lists the ones that do), asking for the list, and the mistake of typing
+    // the connection string into `profile`. None of these dials, so none of them waits.
+    server.call_tool("attach_kernel", json!({ "profile": "no-such-vm" }), STEP);
+    server.call_tool("attach_kernel", json!({}), STEP);
+    server.call_tool("attach_kernel", json!({ "profile": connection }), STEP);
+    assert_eq!(server.shutdown(), Some(0));
+
+    let raw = std::fs::read_to_string(&transcript)
+        .unwrap_or_else(|e| panic!("no transcript at {}: {e}", transcript.display()));
+    assert!(!raw.contains(key), "a profile's key reached the transcript");
+    // And the recording really did happen — otherwise the assertion above passes on an empty file,
+    // which is the way a test like this stops testing anything.
+    assert!(
+        raw.matches("\"tool\":\"attach_kernel\"").count() >= 3,
+        "the three calls should all be recorded:\n{raw}"
+    );
+    // The profile *name* is not a secret and is the whole point of the feature: a transcript has
+    // to say which target a session was pointed at.
+    assert!(
+        raw.contains("smoke_kdnet"),
+        "the profile's name should still be readable:\n{raw}"
+    );
+    let _ = std::fs::remove_file(&transcript);
 }
 
 /// The harness's own guard, pinned because losing it is silent and expensive.
@@ -2628,7 +2843,7 @@ fn a_batch_commits_or_fails_and_its_rollback_runs_either_way() {
 
     // A batch that should commit: a capture bound from one step and interpolated into the next,
     // which is the whole of the "named values" contract in three steps.
-    let committed = server.tool_text(
+    let committed_response = server.call_tool(
         "debug_batch",
         json!({
             "session_id": session_id,
@@ -2642,6 +2857,8 @@ fn a_batch_commits_or_fails_and_its_rollback_runs_either_way() {
         }),
         TARGET_STEP,
     );
+    assert_no_error(&committed_response, "debug_batch");
+    let committed = text_of(&committed_response["result"]);
     assert!(
         committed.contains("BATCH: COMMITTED"),
         "the batch should have committed:
@@ -2663,6 +2880,40 @@ fn a_batch_commits_or_fails_and_its_rollback_runs_either_way() {
         !committed.contains("u {{ip}}"),
         "the capture was not interpolated:
 {committed}"
+    );
+    // The same verdict as values. Read from the typed half rather than from the sentences above,
+    // because that half is what a transcript records and what a client branches on — and the two
+    // agreeing is the property that keeps the report honest.
+    let data = &committed_response["result"]["structuredContent"];
+    assert_eq!(
+        data["status"], "ok",
+        "a batch that ran answers `ok`: {data}"
+    );
+    assert_eq!(data["outcome"], "committed", "{data}");
+    assert_eq!(data["committed"], true, "{data}");
+    assert_eq!(data["rollback_complete"], true, "{data}");
+    assert_eq!(
+        data["after"]["state"], "stopped",
+        "a dump is stopped: {data}"
+    );
+    assert!(
+        data["at"].is_null(),
+        "a committed batch stopped at no step: {data}"
+    );
+    assert_eq!(
+        data["steps"].as_array().map(Vec::len),
+        Some(3),
+        "every step belongs in the typed report: {data}"
+    );
+    assert_eq!(data["always"].as_array().map(Vec::len), Some(1), "{data}");
+    // The interpolation again, from the values: `action` is what ran, not what was written.
+    let disassembly = data["steps"][2]["action"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        disassembly.starts_with("u 0x") && !disassembly.contains("{{ip}}"),
+        "the typed step should carry the substituted action, not the template: {disassembly}"
     );
 
     // The same shape with an assertion that cannot hold. The batch must stop at that step, name
@@ -2701,6 +2952,31 @@ fn a_batch_commits_or_fails_and_its_rollback_runs_either_way() {
         text.contains("rollback: COMPLETE"),
         "the `always` block must run on the failing path — that is the whole point:
 {text}"
+    );
+    // The pairing this tool is the only one with: the *call* produced its answer (`status: "ok"`,
+    // the report), and the *transaction* did not commit (`isError`, asserted above). A caller that
+    // read only `status` would think this worked; one that read only `isError` could not tell a
+    // batch that failed from one that never ran.
+    let failed = &failing["result"]["structuredContent"];
+    assert_eq!(failed["status"], "ok", "the batch ran: {failed}");
+    assert_eq!(failed["outcome"], "failed", "{failed}");
+    assert_eq!(failed["committed"], false, "{failed}");
+    assert_eq!(
+        failed["at"], 2,
+        "the typed report must name the failing position: {failed}"
+    );
+    assert_eq!(
+        failed["steps"][1]["result"], "unmet",
+        "an assertion that did not hold is `unmet`, not `failed`: {failed}"
+    );
+    assert!(
+        failed["steps"][1]["detail"].is_string(),
+        "the assertion that did not hold must say so: {failed}"
+    );
+    assert_eq!(failed["steps"][2]["result"], "skipped", "{failed}");
+    assert_eq!(
+        failed["rollback_complete"], true,
+        "the `always` block ran, and the values must say so too: {failed}"
     );
 
     server.tool_text(
@@ -2808,7 +3084,15 @@ fn interrupting_a_running_batch_stops_it_and_rolls_it_back() {
     let _ = std::fs::remove_file(&running);
     let _ = std::fs::remove_file(&reached_later);
 
-    let mut server = Server::started();
+    // Recorded, because this is the only place the interrupted-transaction half of the transcript
+    // contract ([#87](https://github.com/glslang/windbg-mcp/issues/87)) is real: an `interrupt`
+    // that actually reached a running batch, and a report that came back saying so.
+    let transcript = marker_path("interrupt-batch-transcript");
+    let _ = std::fs::remove_file(&transcript);
+    let mut server = Server::started_with(&[(
+        "WINDBG_MCP_TRANSCRIPT",
+        transcript.to_str().expect("a UTF-8 temp path"),
+    )]);
     let response = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
     assert_no_error(&response, "open_dump");
     let session_id = session_id_of(&response["result"]);
@@ -2896,9 +3180,47 @@ fn interrupting_a_running_batch_stops_it_and_rolls_it_back() {
         json!({ "session_id": session_id }),
         TARGET_STEP,
     );
+    assert_eq!(server.shutdown(), Some(0));
+
+    // The transcript's account of the same thing, and the reason it is worth asserting: the report
+    // above is a paragraph, and this is what a reader after the fact — or an unattended run — has
+    // to be able to act on. The `interrupt` is recorded as its own cause, and the transaction's
+    // verdict says it was interrupted and that the rollback finished, as fields.
+    let events: Vec<Value> = std::fs::read_to_string(&transcript)
+        .unwrap_or_else(|e| panic!("no transcript at {}: {e}", transcript.display()))
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSONL ({e}): {l}")))
+        .collect();
+    let interrupt = events
+        .iter()
+        .find(|r| r["event"] == "interrupt")
+        .unwrap_or_else(|| panic!("the interrupt is not in the transcript: {events:#?}"));
+    assert_eq!(
+        interrupt["delivered"], true,
+        "the interrupt reached the worker, and the record has to say so: {interrupt}"
+    );
+    let batch = events
+        .iter()
+        .find(|r| r["event"] == "batch")
+        .unwrap_or_else(|| panic!("the batch verdict is not in the transcript: {events:#?}"));
+    assert_eq!(batch["outcome"], "interrupted", "{batch}");
+    assert_eq!(batch["committed"], false, "{batch}");
+    assert_eq!(
+        batch["rollback_complete"], true,
+        "the rollback ran, and a transcript that did not say so would be the one fact an \
+         unattended run is read for: {batch}"
+    );
+    // Ordered as cause and effect, which is what makes the pair readable.
+    let position = |event: &str| events.iter().position(|r| r["event"] == event);
+    assert!(
+        position("interrupt") < position("batch"),
+        "the interrupt is recorded before the verdict it produced"
+    );
 
     let _ = std::fs::remove_file(&running);
     let _ = std::fs::remove_file(&reached_later);
+    let _ = std::fs::remove_file(&transcript);
 }
 
 /// An `interrupt` that arrives while a batch is running its **rollback** is refused, and the

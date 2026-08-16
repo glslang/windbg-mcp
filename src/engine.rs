@@ -362,6 +362,26 @@ impl SessionState {
     pub fn is_live(&self) -> bool {
         !matches!(self, Self::Failed(_) | Self::Closed(_))
     }
+
+    /// The state's name on its own, for a transcript that records a transition as a value.
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Opening => "opening",
+            Self::Attaching => "attaching",
+            Self::Open => "open",
+            Self::Failed(_) => "failed",
+            Self::Retired(_) => "retired",
+            Self::Closed(_) => "closed",
+        }
+    }
+
+    /// Why it is in this state, for the three that carry a reason.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Self::Opening | Self::Attaching | Self::Open => None,
+            Self::Failed(why) | Self::Retired(why) | Self::Closed(why) => Some(why),
+        }
+    }
 }
 
 /// One session: a worker process, its queue, and the outstanding calls against it.
@@ -411,6 +431,11 @@ pub struct Session {
     /// had already been spent. A worker that finishes early retracts it by naming zero.
     unwinding: Arc<Mutex<Option<Instant>>>,
     child: Mutex<Option<Child>>,
+    /// Where this session's life is recorded, when anything is. Held here rather than reached for
+    /// through [`Sessions`] because the transitions worth recording happen in [`Self::update_state`],
+    /// which the registry does not call and cannot see — a worker dying moves a session from a
+    /// task that holds nothing but the session itself.
+    rec: crate::record::Recorder,
 }
 
 type Waiters = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Output, EngineError>>>>>;
@@ -444,14 +469,39 @@ impl Session {
         &self,
         next: impl FnOnce(&SessionState) -> Option<SessionState>,
     ) -> SessionState {
-        let mut slot = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if !slot.0.is_live() {
-            return slot.0.clone();
+        // Whether this *changed* anything, which is a different question from whether a transition
+        // was taken: a transition to the state the session is already in restamps it — that is
+        // what `in_state_for` measures and nothing here may quietly stop doing — while there is
+        // nothing about it worth a line in a transcript. Every conditional transition comes
+        // through here and most of them decline, so recording each call would fill a file with a
+        // session repeatedly not moving.
+        let (settled, moved) = {
+            let mut slot = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if !slot.0.is_live() {
+                return slot.0.clone();
+            }
+            let moved = match next(&slot.0) {
+                Some(next) => {
+                    let moved = next != slot.0;
+                    *slot = (next, Instant::now());
+                    moved
+                }
+                None => false,
+            };
+            (slot.0.clone(), moved)
+        };
+        if moved {
+            // Outside the lock: writing a record touches a disk, and nothing that does belongs
+            // inside the mutex every state read in this process contends on.
+            self.rec.write(crate::record::Event::SessionState {
+                session: self.id.clone(),
+                state: settled.name().to_string(),
+                detail: settled
+                    .detail()
+                    .map(|d| crate::record::Capped::of(&crate::kdconn::scrub(d), 0)),
+            });
         }
-        if let Some(next) = next(&slot.0) {
-            *slot = (next, Instant::now());
-        }
-        slot.0.clone()
+        settled
     }
 
     /// How far the opener got. See [`OpenPhase`] for why this is not read off the state.
@@ -816,16 +866,33 @@ impl Registry {
 pub struct Sessions {
     inner: Arc<Mutex<Registry>>,
     call_timeout: Duration,
+    rec: crate::record::Recorder,
 }
 
 impl Sessions {
     /// Creates an empty registry. No process is started until something is opened, so a server
     /// that is only ever asked for `tools/list` never loads DbgEng at all.
+    ///
+    /// Recording is off unless [`Self::recording`] turns it on, which is what every test here
+    /// relies on: a registry is built in a dozen of them and none of them is about transcripts.
     pub fn new(call_timeout: Duration) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Registry::default())),
             call_timeout,
+            rec: crate::record::Recorder::disabled(),
         }
+    }
+
+    /// Records this registry's sessions into `rec`. Called once, by `main`, with whatever the
+    /// environment asked for.
+    pub fn recording(mut self, rec: crate::record::Recorder) -> Self {
+        self.rec = rec;
+        self
+    }
+
+    /// The transcript this server is writing, so the tool surface can record against the same one.
+    pub fn recorder(&self) -> crate::record::Recorder {
+        self.rec.clone()
     }
 
     fn registry(&self) -> std::sync::MutexGuard<'_, Registry> {
@@ -979,6 +1046,14 @@ impl Sessions {
         }
         // A timeout is an operational outcome, not broken plumbing: the target may simply still be
         // running. Note the job itself is *not* cancelled — only this wait for it.
+        //
+        // Its own record, and not merely a failed `tool_result`: the two say different things. The
+        // result says this caller gave up; this says the *job* is still out there, which is the
+        // fact that makes a later reply, or a session that will not go idle, make sense.
+        self.rec.write(crate::record::Event::CallTimeout {
+            session: session.id.clone(),
+            budget_ms: budget.as_millis().min(u128::from(u64::MAX)) as u64,
+        });
         Err(EngineError::Timeout(format!(
             "engine call timed out (the target may still be running). The session `{}` is still \
              holding this call; `session_status` reports it, and `end_session` ends it outright — \
@@ -1123,7 +1198,19 @@ impl Sessions {
         named: bool,
     ) -> Result<Output, EngineError> {
         let call = Call::new(EngineOp::Interrupt).named(named);
-        self.call_within(session, call, INTERRUPT_TIMEOUT).await
+        let outcome = self.call_within(session, call, INTERRUPT_TIMEOUT).await;
+        // Recorded from this side because an interrupt is a *cause*: whatever the interrupted call
+        // reports next — a short result, a batch that says `INTERRUPTED`, a walk that stopped —
+        // reads as an unexplained truncation without the record that somebody asked for it.
+        self.rec.write(crate::record::Event::Interrupt {
+            session: session.id.clone(),
+            delivered: outcome.is_ok(),
+            detail: match &outcome {
+                Ok(out) => Some(crate::record::Capped::of(&out.text, 0)),
+                Err(e) => Some(crate::record::Capped::of(&e.to_string(), 0)),
+            },
+        });
+        outcome
     }
 
     /// Ends a session: asks the worker to release its target, then terminates it.
@@ -1150,6 +1237,20 @@ impl Sessions {
                 _ => None,
             },
         };
+        // From the same value the caller is answered with, not from the paragraph below it. The
+        // one fact an unattended run is read for is `released`: false means the worker was killed
+        // still holding its target, and for a live kernel that is a machine left halted.
+        //
+        // Not for a stale handle, which tore nothing down: recording an end for a session that was
+        // never ended would put a teardown in the transcript that did not happen.
+        if !matches!(outcome, Release::Stale(_)) {
+            self.rec.write(crate::record::Event::SessionEnd {
+                session: ended.session_id.clone(),
+                released: ended.released,
+                worker_terminated: ended.worker_terminated,
+                waited_ms: ended.waited_ms,
+            });
+        }
         let (reason, message) = match outcome {
             // A refused handle is the mechanism working, not a session to tear down.
             Release::Stale(why) => return Err(EngineError::Stale(why)),
@@ -1281,6 +1382,12 @@ impl Sessions {
             registry.closing = true;
             registry.owning_workers()
         };
+        // Recorded before the releases rather than after them, and even when there are none: this
+        // is the record that says the transcript ends here on purpose. Without it a file that
+        // stops mid-session is indistinguishable from one whose server was killed.
+        self.rec.write(crate::record::Event::Shutdown {
+            sessions: owners.len(),
+        });
         if owners.is_empty() {
             return;
         }
@@ -1584,6 +1691,19 @@ impl Sessions {
             released: AtomicBool::new(false),
             unwinding,
             child: Mutex::new(Some(child)),
+            rec: self.rec.clone(),
+        });
+        // Recorded here, where the worker exists and the session has its identity, rather than
+        // where `open` returns: an open that then fails still started a process against a target,
+        // and a transcript that only knew about the ones that worked would be missing exactly the
+        // sessions somebody is reading it to understand.
+        self.rec.write(crate::record::Event::SessionOpen {
+            session: session.id.clone(),
+            kind: kind.label().to_string(),
+            // Already masked where it is a connection: an attach resolves its label in
+            // `kdconn::select` before a worker is ever spawned.
+            target: crate::kdconn::scrub(&session.what),
+            engine_pid: pid,
         });
 
         // Both halves hold a `Weak`, so a session dropped from the registry takes its worker's
@@ -2239,6 +2359,13 @@ async fn reader(
             "the engine worker process exited".to_string(),
         ));
     }
+    // Beside the state transition rather than instead of it: the transition says the session is
+    // closed, and this says the calls it owed replies to are being answered with a failure nobody
+    // asked for. A reader looking at a result that never arrived needs the second one.
+    session.rec.write(crate::record::Event::WorkerLost {
+        session: session.id.clone(),
+        detail: crate::record::Capped::of(&worker_gone(&session.id), 0),
+    });
     session.fail_outstanding(&worker_gone(&session.id));
 }
 
@@ -2544,6 +2671,15 @@ mod tests {
     /// A `Session` with no worker behind it, for the routing tests. Its queue has no consumer,
     /// which is all these need: they never submit a call.
     fn dormant(id: &str, state: SessionState) -> Arc<Session> {
+        dormant_recording(id, state, crate::record::Recorder::disabled())
+    }
+
+    /// [`dormant`] with a transcript, for the one test that is about what gets recorded.
+    fn dormant_recording(
+        id: &str,
+        state: SessionState,
+        rec: crate::record::Recorder,
+    ) -> Arc<Session> {
         let (tx, _rx) = mpsc::unbounded_channel();
         // The phase a session in this state would really have reached. They are separate fields
         // for good reason, but a double whose phase contradicts its state would prove nothing.
@@ -2568,7 +2704,61 @@ mod tests {
             released: AtomicBool::new(false),
             unwinding: Arc::new(Mutex::new(None)),
             child: Mutex::new(None),
+            rec,
         })
+    }
+
+    /// A transition that changes nothing still restamps the session — that is what `session_status`
+    /// measures — but it must not put a line in the transcript.
+    ///
+    /// Both halves matter and they pull in opposite directions. Skipping the restamp would quietly
+    /// change what `in_state_for` means, and with it the "this attach is overdue" advice built on
+    /// it; recording every call would fill a file with a session repeatedly not moving, because
+    /// most conditional transitions decline. `update_state` is the single funnel for all of them,
+    /// so this is the one place either could go wrong.
+    #[test]
+    fn a_transition_that_changes_nothing_restamps_without_recording_it() {
+        let path = std::env::temp_dir().join(format!(
+            "windbg-mcp-engine-transitions-{}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let rec = crate::record::Recorder::to_file(&path, 0).expect("open a transcript");
+        let session = dormant_recording("sess-1", SessionState::Opening, rec);
+
+        session.set_state(SessionState::Attaching);
+        // Let it age first. A reset is invisible from a stamp taken an instant ago — the two
+        // readings would differ by the time the assertion itself took, and the test would pass
+        // whether or not anything restamped.
+        std::thread::sleep(Duration::from_millis(20));
+        let aged = session.in_state_for();
+        assert!(
+            aged >= Duration::from_millis(20),
+            "the baseline has to be a session that has visibly been sitting in this state"
+        );
+        // The same state again, which is what a milestone arriving twice would do.
+        session.set_state(SessionState::Attaching);
+        assert!(
+            session.in_state_for() < aged,
+            "a repeated transition has to restamp: `in_state_for` should have gone back down"
+        );
+        // And a transition that declines outright.
+        session.update_state(|_| None);
+        session.set_state(SessionState::Open);
+
+        let states: Vec<String> = std::fs::read_to_string(&path)
+            .expect("the transcript")
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|r| r["event"] == "session_state")
+            .filter_map(|r| r["state"].as_str().map(str::to_string))
+            .collect();
+        assert_eq!(
+            states,
+            ["attaching", "open"],
+            "only the transitions that moved the session belong in the transcript"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A long-lived child to stand in for a worker, where what is under test is which sessions own

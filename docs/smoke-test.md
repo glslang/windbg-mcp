@@ -93,6 +93,30 @@ appears on neither the JSON-RPC transport nor the log, checked against every lin
 wrote rather than against one result. `WINDBG_MCP_PROFILES` is pointed at a path that does not
 exist, so a developer's real profiles can never be read into a failure message.
 
+**Session transcripts.** A server is started with `WINDBG_MCP_TRANSCRIPT` pointed at a temporary
+file, driven through a few calls, and shut down; the file is then read back as JSONL and asserted
+on — every line a complete object, the calls in the order they were made, a `start` first and a
+`shutdown` last, and sequence numbers that only increase. One of those calls passes a raw KDNET
+connection (refused for its shape, so nothing dials and no test waits on a network), and the key
+must appear nowhere in the file's **bytes** — checked against the whole file rather than a parsed
+field, because a key that leaked into a corner nobody thought to look at is still a leak. Every
+line the server wrote to stdout is then re-parsed as JSON-RPC, which is the claim that a transcript
+being written cannot corrupt a client's connection.
+
+A second test covers the other selector: a server recording, three `attach_kernel` calls that route
+through a configured **profile** (an unknown name, the empty listing, and the connection string
+typed into `profile`), and the profile's key absent from the file — while its *name* is still
+readable, because a transcript has to say which target a session was pointed at. It also counts the
+calls it recorded, so the absence assertion cannot pass on an empty file.
+
+The same executable is then run as `--render-cast` over that transcript, and the result is
+validated as asciicast v2: a version-2 header with a shape, then events that are `[time, "o", data]`
+triples whose times never go backwards. In the **protocol** tier deliberately — every property here
+is about the shipped binary reading an environment variable, opening a file beside a live transport,
+and reaching its own renderer, and none of that is provable in-process. `src/record.rs` and
+`src/cast.rs` cover the shapes. A companion test asserts the opposite case: a server nobody asked to
+record writes no file at all.
+
 **Debugger tier.** Opens the checked-in kernel crash dump, confirms it mints a `session_id` that
 `session_status` reports, reads it through `modules` / `registers` / `backtrace`, then checks the
 session-handle contract on the wire (a stale handle is refused; the handle stops working once
@@ -183,7 +207,12 @@ processes, so they need real ones:
   engine seam, the report coming back — by running one batch to `COMMITTED` (with a capture bound
   from one step and interpolated into the next) and one to `FAILED at step 2 of 3`, with the same
   `always` block on both. The claim only a real engine can settle is the second one: the rollback
-  ran **inside the worker process**, on the failing path, before the tool call returned.
+  ran **inside the worker process**, on the failing path, before the tool call returned. Both
+  outcomes are read from the **typed** half as well as the prose — `outcome`, `at`, `committed`,
+  `rollback_complete`, each step's `result`, the interpolated `action` — because that half is what
+  a transcript records and what a client branches on, and the two agreeing is what keeps the report
+  honest. It also pins the pairing only this tool has: a batch that ran answers `status: "ok"` on a
+  result flagged `isError`.
 - *A walk marks what it cannot read and keeps going.* The claim
   [#103](https://github.com/glslang/windbg-mcp/issues/103) is about, and the one that needs a real
   engine: `src/walk.rs` proves the traversal against a fake address space, and this proves the
@@ -236,6 +265,11 @@ processes, so they need real ones:
   break provoked, so the interrupted step comes back `Ok` with its assertions intact and the executor
   saw a step that simply ran. `src/batch.rs` pins the executor's half against a scripted debuggee,
   which answers `Ok` to the interrupted step for exactly this reason.
+  It records a transcript too, because this is the only place the *interrupted*-transaction half of
+  the [#87](https://github.com/glslang/windbg-mcp/issues/87) contract is real: an `interrupt` that
+  genuinely reached a running batch, recorded as its own cause, followed by a verdict whose
+  `outcome` is `interrupted` and whose `rollback_complete` is true — as fields, which is what an
+  unattended run has to be able to act on rather than a paragraph it would have to match on.
 - *Interrupting a batch during its **rollback** is refused.* The severe half of the same problem,
   and it needs no earlier interrupt to set up: cleanup is reached on every path, so a *first* break
   landing there hits a restore command — recorded as a step that worked, reported as `rollback:

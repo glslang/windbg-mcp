@@ -47,7 +47,19 @@ const SECRET_PARAMS: &[&str] = &["key", "password"];
 
 /// What a redacted secret is replaced with. Deliberately not the same length as any real value —
 /// a mask that preserved length would leak the key's shape.
-const MASK: &str = "<redacted>";
+pub(crate) const MASK: &str = "<redacted>";
+
+/// Whether `name` names a value that must never be rendered.
+///
+/// The one test, shared by everything that hides a secret: the connection parser
+/// ([`Param::is_secret`]), the text scan ([`secret_at`]), and the transcript's walk over a tool's
+/// argument object ([`crate::record`]). A fourth place with its own list is a fourth place to
+/// forget an entry.
+pub(crate) fn is_secret_name(name: &str) -> bool {
+    SECRET_PARAMS
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case(name.trim()))
+}
 
 /// What a connection whose structure cannot be trusted is reported as, in full. See [`redact`].
 const OPAQUE: &str = "<connection redacted>";
@@ -173,9 +185,7 @@ impl<'a> Param<'a> {
     }
 
     fn is_secret(&self) -> bool {
-        SECRET_PARAMS
-            .iter()
-            .any(|p| p.eq_ignore_ascii_case(self.name.trim()))
+        is_secret_name(self.name)
     }
 
     fn render(&self, secrets: Secrets, out: &mut String) {
@@ -257,6 +267,101 @@ fn redact(connection: &str) -> String {
         return OPAQUE.to_string();
     }
     Parsed::of(connection).render(Secrets::Mask)
+}
+
+/// Masks every secret parameter value in **arbitrary text**, wherever one appears in it.
+///
+/// [`redact`] is for a string that *is* a connection: it parses one, and hands back [`OPAQUE`] for
+/// anything whose structure it cannot trust — which is the right answer there and the wrong one
+/// here, where the input is a blob of JSON or a page of debugger output that happens to contain a
+/// connection somewhere inside it. Passing that through `redact` would mask the entire blob.
+///
+/// So this scans instead, and the two share the one thing that must not drift: [`SECRET_PARAMS`]
+/// and [`MASK`]. A secret is a *whole* parameter name (`pubkey=` is not `key=`, matched the same
+/// way [`Param::is_secret`] matches), followed by `=` or a JSON `:`, and its value is masked
+/// whether it is bare (`key=1.2.3.4`, as a connection string writes it) or quoted
+/// (`"key": "1.2.3.4"`, as a tool call does).
+///
+/// Written for [`crate::record`], where the argument object of an `attach_kernel` that supplied a
+/// raw `connection` is the one place a KDNET key can still reach a file this server writes. It
+/// scans rather than reaches into the JSON because the text half of a result is not JSON at all,
+/// and a transcript that protected only the structured half would leak through the other one.
+pub(crate) fn scrub(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match secret_at(text, i) {
+            Some((value, end)) => {
+                out.push_str(&text[i..value]);
+                out.push_str(MASK);
+                i = end;
+            }
+            None => {
+                // Advance one *character*, not one byte: the index has to stay on a boundary for
+                // the slicing above, and this text is arbitrary — a debugger's output carries
+                // whatever the target is named.
+                let step = text[i..].chars().next().map_or(1, char::len_utf8);
+                out.push_str(&text[i..i + step]);
+                i += step;
+            }
+        }
+    }
+    out
+}
+
+/// A secret parameter starting at `i`, as `(where its value starts, where it ends)`.
+///
+/// Two syntaxes and no others: `key=…`, how a connection string writes it, and `"key":…`, how JSON
+/// does. Requiring the quote before a `:` is what keeps this off ordinary prose — a debugger
+/// printing `Key: \REGISTRY\MACHINE\…` is not a parameter, and a transcript that masked it would
+/// lose a fact to a rule about a different syntax. The bare `key:` form is not a connection string
+/// either, so nothing that can carry a real key is given up for that.
+///
+/// `None` also when the value is empty, which neither this nor [`Parsed::render`] masks: there is
+/// nothing there to hide, and a `key=<redacted>` grown out of `key=` would report a secret that
+/// was never supplied.
+fn secret_at(text: &str, i: usize) -> Option<(usize, usize)> {
+    let rest = &text[i..];
+    // `get`, not a slice: `i` is a character boundary but `i + name.len()` need not be, and this
+    // text is whatever a target chose to call itself.
+    let name = SECRET_PARAMS.iter().find(|p| {
+        rest.get(..p.len())
+            .is_some_and(|s| s.eq_ignore_ascii_case(p))
+    })?;
+    // Whole-name matching at the front: `pubkey=` is not `key=`. The back is settled by what may
+    // follow — a quote or the separator — so `keyring=` cannot match either.
+    if text[..i].chars().next_back().is_some_and(name_char) {
+        return None;
+    }
+    let mut at = i + name.len();
+    let quoted_name = text[at..].starts_with('"');
+    at += usize::from(quoted_name);
+    match (quoted_name, text[at..].chars().next()?) {
+        (false, '=') | (true, ':') => at += 1,
+        _ => return None,
+    }
+    // Filler after the separator is ordinary in JSON and refused in a connection string
+    // ([`is_ambiguous`]), and skipping it here can only ever mask a value already committed to
+    // being a secret's.
+    at = text.len() - text[at..].trim_start().len();
+    let quoted = text[at..].starts_with('"');
+    let start = at + usize::from(quoted);
+    let body = &text[start..];
+    let len = match quoted {
+        // Up to the closing quote. None of these values contains an escaped one, and stopping
+        // early would mask a shorter run than the value — never a longer one.
+        true => body.find('"').unwrap_or(body.len()),
+        false => body
+            .find(|c: char| c.is_whitespace() || matches!(c, ',' | ';' | '"' | '}' | ']'))
+            .unwrap_or(body.len()),
+    };
+    (len > 0).then_some((start, start + len))
+}
+
+/// Whether a character can be part of a parameter name, for the whole-name test in [`secret_at`].
+fn name_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '-'
 }
 
 /// A character with no unambiguous place *between* the parameters of a connection string.
@@ -954,6 +1059,106 @@ mod tests {
         }
         // Nothing to mask is not the same as something to hide.
         assert_eq!(redact("net:port=1,key="), "net:port=1,key=");
+    }
+
+    // ---- scrubbing arbitrary text --------------------------------------
+    //
+    // The transcript's half of redaction. `redact` answers "render this connection safely";
+    // `scrub` answers "there may be one somewhere in this blob", which is a different question
+    // with a different failure mode — masking the blob.
+
+    /// The case the whole function exists for: a tool call carrying a raw connection, exactly as
+    /// it crosses the wire, recorded into a file.
+    #[test]
+    fn scrubbing_masks_a_key_inside_a_tool_call() {
+        let call = format!(r#"{{"connection":"{FAKE}","session_id":null}}"#);
+        let out = scrub(&call);
+        assert!(!out.contains(FAKE_KEY), "the key survived scrubbing: {out}");
+        assert_eq!(
+            out,
+            r#"{"connection":"net:port=50000,key=<redacted>","session_id":null}"#
+        );
+    }
+
+    /// The other shape a secret arrives in: a JSON member of its own, quoted both sides.
+    #[test]
+    fn scrubbing_masks_a_quoted_json_member() {
+        assert_eq!(
+            scrub(r#"{"key":"1.2.3.4","port":50000}"#),
+            r#"{"key":"<redacted>","port":50000}"#
+        );
+        // Pretty-printed, where a space follows the colon.
+        assert_eq!(
+            scrub("{\n  \"password\": \"hunter2\"\n}"),
+            "{\n  \"password\": \"<redacted>\"\n}"
+        );
+    }
+
+    /// A blob is not a connection string, so nothing but the parameter may be touched. This is
+    /// what `redact` cannot do: given any of these it answers `OPAQUE` for the whole thing.
+    #[test]
+    fn scrubbing_leaves_the_text_around_a_secret_alone() {
+        let text = "attaching to net:port=50000,key=1.2.3.4 (profile CTF)\nlink up in 25s";
+        assert_eq!(
+            scrub(text),
+            "attaching to net:port=50000,key=<redacted> (profile CTF)\nlink up in 25s"
+        );
+        assert_eq!(scrub(""), "");
+        for clean in ["no secret here", "net:port=50000", "{\"tag\":\"Tgsm\"}"] {
+            assert_eq!(scrub(clean), clean);
+        }
+    }
+
+    /// Whole names only, at both ends, and the same rule the parser uses.
+    #[test]
+    fn scrubbing_matches_whole_parameter_names_only() {
+        for untouched in ["pubkey=abc", "keyring=abc", "monkey=abc", "my-key=abc"] {
+            assert_eq!(scrub(untouched), untouched);
+        }
+        // Case-insensitive, like `is_secret`.
+        assert_eq!(scrub("KEY=1.2.3.4"), "KEY=<redacted>");
+        assert_eq!(scrub("Password=hunter2"), "Password=<redacted>");
+    }
+
+    /// The reason a bare `key:` is not a separator. A debugger printing a registry path is prose,
+    /// and a transcript that masked it would lose a fact to a rule about connection strings —
+    /// while giving up nothing, because no connection string is written that way.
+    #[test]
+    fn scrubbing_does_not_mask_prose_that_merely_says_key() {
+        for prose in [
+            r"Key: \REGISTRY\MACHINE\SYSTEM",
+            "the key is in the profile",
+            "password rotation is monthly",
+        ] {
+            assert_eq!(scrub(prose), prose);
+        }
+    }
+
+    /// An empty value is not a secret. `redact` takes the same view, and the two must agree:
+    /// reporting `<redacted>` where nothing was supplied describes a target that does not exist.
+    #[test]
+    fn scrubbing_leaves_an_empty_value_alone() {
+        for empty in ["net:port=1,key=", r#"{"key":""}"#, "key= "] {
+            assert_eq!(scrub(empty), empty);
+        }
+    }
+
+    /// Several in one blob, which is what a batch of tool calls looks like.
+    #[test]
+    fn scrubbing_masks_every_secret_in_the_text() {
+        let out = scrub("key=1.2.3.4 then password=hunter2 then key=5.6.7.8");
+        assert_eq!(
+            out,
+            "key=<redacted> then password=<redacted> then key=<redacted>"
+        );
+    }
+
+    /// Arbitrary text really is arbitrary: a target names its own modules, and a scan that
+    /// advanced by bytes would panic on the first one that is not ASCII.
+    #[test]
+    fn scrubbing_survives_text_that_is_not_ascii() {
+        let text = "модуль ключ ✓ key=1.2.3.4 ✓";
+        assert_eq!(scrub(text), "модуль ключ ✓ key=<redacted> ✓");
     }
 
     #[test]

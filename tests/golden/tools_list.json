@@ -163,7 +163,25 @@
         "readOnly": false
       },
       "name": "debug_batch",
-      "output": null,
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/BatchReportInfo",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "always: array<ref(#/$defs/BatchStep)>",
         "session_id: string|null",
