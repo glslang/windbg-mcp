@@ -403,14 +403,20 @@ fn frame(record: &Record, max_lines: usize) -> Option<String> {
         Event::Start { version, .. } => {
             line(
                 &mut out,
-                &format!("{DIM}windbg-mcp {version} — session transcript{RESET}"),
+                &format!(
+                    "{DIM}windbg-mcp {} — session transcript{RESET}",
+                    visible(version)
+                ),
             );
         }
         Event::ToolRequest { tool, args, .. } => {
             let args = args.as_ref().map_or_else(String::new, render_args);
             line(
                 &mut out,
-                &format!("{PROMPT}${RESET} {TOOL}{tool}{RESET} {args}"),
+                &format!(
+                    "{PROMPT}${RESET} {TOOL}{}{RESET} {DIM}{args}{RESET}",
+                    visible(tool)
+                ),
             );
         }
         Event::ToolResult {
@@ -565,6 +571,13 @@ fn frame(record: &Record, max_lines: usize) -> Option<String> {
             DIM,
             &format!("server shutting down, releasing {sessions} session(s)"),
         ),
+        // Shown rather than skipped: a viewer has to know a record was here and what it was, or
+        // the recording quietly misses a step of the session it claims to be.
+        Event::Oversized { of, bytes } => note(
+            &mut out,
+            FAIL,
+            &format!("a `{of}` record was {bytes} bytes and was not stored"),
+        ),
     }
     (!out.is_empty()).then_some(out)
 }
@@ -574,10 +587,12 @@ fn frame(record: &Record, max_lines: usize) -> Option<String> {
 fn render_args(args: &Value) -> String {
     let rendered = serde_json::to_string(args).unwrap_or_default();
     let clipped: String = rendered.chars().take(160).collect();
-    match clipped.chars().count() < rendered.chars().count() {
-        true => format!("{DIM}{clipped}…{RESET}"),
-        false => format!("{DIM}{clipped}{RESET}"),
-    }
+    let ellipsis = if clipped.chars().count() < rendered.chars().count() {
+        "…"
+    } else {
+        ""
+    };
+    format!("{}{ellipsis}", visible(&clipped))
 }
 
 /// A result's text, clipped to what is watchable and saying how much was left out.
@@ -591,7 +606,7 @@ fn body(out: &mut String, text: &Capped, max_lines: usize) {
         n => lines.len().min(n),
     };
     for l in &lines[..shown] {
-        line(out, l);
+        line(out, &visible(l));
     }
     // Two different elisions, and they are not the same fact: this one is the *rendering* holding
     // back, and `dropped` is the *transcript* having done so. A viewer who cannot tell them apart
@@ -611,8 +626,11 @@ fn body(out: &mut String, text: &Capped, max_lines: usize) {
     }
 }
 
+/// A marked line between the frames. `text` is built from transcript values, so it is made
+/// visible here — one of the two doors everything from the transcript comes through, the other
+/// being [`body`].
 fn note(out: &mut String, colour: &str, text: &str) {
-    line(out, &format!("{colour}  · {text}{RESET}"));
+    line(out, &format!("{colour}  · {}{RESET}", visible(text)));
 }
 
 fn suffix(detail: &Option<Capped>) -> String {
@@ -626,6 +644,56 @@ fn suffix(detail: &Option<Capped>) -> String {
 fn line(out: &mut String, text: &str) {
     out.push_str(text);
     out.push_str("\r\n");
+}
+
+/// Text from the transcript, made safe to put in a frame a terminal will interpret.
+///
+/// **This is a security boundary, not tidying.** A cast frame is a stream of bytes a player writes
+/// straight to a terminal, and the text in a transcript is whatever the *target* produced —
+/// symbol names, strings out of a dump, a driver's own `DbgPrint`. A target chosen for analysis is
+/// frequently the least trustworthy program anyone has, and it can put an escape sequence in a
+/// string: OSC 52 writes the viewer's clipboard, others retitle the window, redraw what is already
+/// on screen, or query the terminal and have it type the answer back. None of that is content;
+/// all of it executes when someone plays the recording, on the machine of whoever was sent it.
+///
+/// So every control character from the transcript is rendered as a *visible* escape and never
+/// passed through. The renderer's own styling is added outside this, from constants in this file,
+/// which is the whole reason the two can be told apart at all: what this server writes is
+/// interpreted, what the target wrote is shown.
+fn visible(text: &str) -> String {
+    if !text
+        .chars()
+        .any(|c| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}'))
+    {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            // Kept, because the renderer builds lines out of them: a result is many lines and is
+            // meant to be read as many lines. `\r` is not — a lone carriage return moves the
+            // cursor back over what was already drawn.
+            '\n' => out.push('\n'),
+            '\t' => out.push('\t'),
+            // `^[`, the caret notation a terminal cannot act on. `U+2028`/`U+2029` are not
+            // control characters by `is_control` but do break a line in a renderer that knows
+            // Unicode, so they are named too.
+            c if c.is_control() => out.push_str(&format!("^{}", caret(c))),
+            '\u{2028}' => out.push_str("<U+2028>"),
+            '\u{2029}' => out.push_str("<U+2029>"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// A control character in caret notation: `ESC` is `^[`, `NUL` is `^@`.
+fn caret(c: char) -> char {
+    match u32::from(c) {
+        code @ 0..=0x1f => char::from_u32(code + 0x40).unwrap_or('?'),
+        0x7f => '?',
+        _ => '?',
+    }
 }
 
 // SGR sequences, spelled out rather than pulled from a crate: there are six of them and they are
@@ -968,6 +1036,75 @@ mod tests {
         );
         assert!(summary.frames > 0, "everything before it is still there");
         read_cast(&options.output);
+    }
+
+    /// A cast frame is bytes a player writes straight to a terminal, and the text in a transcript
+    /// is whatever the **target** produced. So a target can put an escape sequence in a string and
+    /// have it *execute* on the machine of whoever plays the recording.
+    ///
+    /// That is not hypothetical for this server: the targets are dumps and drivers chosen for
+    /// analysis, frequently the least trustworthy program anyone has, and a recording is made
+    /// precisely to be sent to somebody else. OSC 52 writes the viewer's clipboard; other
+    /// sequences retitle the window, redraw the screen above, or query the terminal and have it
+    /// type the answer back as input.
+    ///
+    /// Everything from the transcript is rendered visible; the renderer's own styling, added from
+    /// constants outside that, still works. Both halves are asserted here, because a fix that
+    /// escaped the styling too would leave a cast of unreadable noise.
+    #[test]
+    fn a_target_cannot_smuggle_terminal_control_sequences_into_a_cast() {
+        let input = scratch("hostile-output");
+        let _ = std::fs::remove_file(&input);
+        let rec = Recorder::to_file(&input, 0).expect("a transcript");
+        let call = rec.tool_request("execute", None);
+        // OSC 52 (clipboard write), a window retitle, and a bare carriage return that would
+        // overdraw the line above it.
+        rec.tool_result(
+            call,
+            false,
+            "\u{1b}]52;c;aGVsbG8=\u{7}pwned\u{1b}]0;gotcha\u{7}\roverdrawn",
+            None,
+        );
+        let options = Options {
+            output: input.with_extension("cast"),
+            input,
+            width: DEFAULT_WIDTH,
+            height: DEFAULT_HEIGHT,
+            title: None,
+            idle_limit: 0.0,
+            max_lines: 0,
+        };
+        render(&options).expect("the render succeeds");
+
+        let (_, events) = read_cast(&options.output);
+        let screen: String = events.iter().map(|(_, _, d)| d.clone()).collect();
+        // The renderer's own styling is intact...
+        assert!(
+            screen.contains(RESET),
+            "the styling should survive: {screen:?}"
+        );
+        // ...and every escape the target wrote is shown rather than performed.
+        assert!(
+            !screen.contains("\u{1b}]"),
+            "an OSC sequence from the target reached the frame: {screen:?}"
+        );
+        assert!(
+            !screen.contains('\u{7}'),
+            "a BEL from the target reached the frame: {screen:?}"
+        );
+        assert!(screen.contains("^["), "shown in caret notation: {screen:?}");
+        // The text itself is still readable, which is the point of showing rather than dropping.
+        assert!(
+            screen.contains("pwned") && screen.contains("overdrawn"),
+            "{screen:?}"
+        );
+        // A lone carriage return is not passed through — only the line endings this renderer
+        // writes, which always follow a newline.
+        assert_eq!(
+            screen.matches('\r').count(),
+            screen.matches("\r\n").count(),
+            "a bare carriage return would overdraw the line above: {screen:?}"
+        );
     }
 
     /// The rendering must never be written over the transcript it came from.

@@ -686,9 +686,9 @@ $env:WINDBG_MCP_TRANSCRIPT = "$env:USERPROFILE\.windbg-mcp\session.jsonl"
 ```
 
 ```jsonc
-{"v":1,"seq":1,"at":"2026-08-16T07:13:01.508Z","mono_ms":1,"event":"tool_request","request":1,"tool":"open_dump","args":{"path":"C:\\dumps\\a.dmp"}}
-{"v":1,"seq":2,"at":"2026-08-16T07:13:01.643Z","mono_ms":135,"event":"session_open","session":"sess-…","kind":"crash dump","target":"C:\\dumps\\a.dmp","engine_pid":1656}
-{"v":1,"seq":11,"at":"2026-08-16T07:13:04.272Z","mono_ms":2765,"event":"batch","request":3,"session":"sess-…","outcome":"failed","at_step":2,"committed":false,"rollback_complete":true,"after":"stopped","elapsed_ms":603}
+{"v":1,"run":4158027124358305144,"seq":1,"at":"2026-08-16T12:05:20.549Z","mono_ms":1,"event":"tool_request","request":1,"tool":"open_dump","args":{"path":"C:\\dumps\\a.dmp"}}
+{"v":1,"run":4158027124358305144,"seq":2,"at":"2026-08-16T12:05:20.672Z","mono_ms":125,"event":"session_open","session":"sess-18cc47a3b2779cc8-1","kind":"crash dump","target":{"text":"C:\\dumps\\a.dmp"},"engine_pid":832}
+{"v":1,"run":4158027124358305144,"seq":11,"at":"2026-08-16T12:05:23.129Z","mono_ms":2582,"event":"batch","request":3,"session":"sess-18cc47a3b2779cc8-1","outcome":"failed","at_step":2,"committed":false,"rollback_complete":true,"after":"stopped","elapsed_ms":402}
 ```
 
 Every record carries the format version, the run that wrote it, a sequence number, a wall clock
@@ -724,10 +724,14 @@ offsets as they stand would step backwards at the join and no player would accep
 pointed at the same path interleave their lines; they are grouped back into their own runs by the
 `run` field every record carries, so neither session is read as part of the other.
 
-**Redaction.** Every string recorded is scrubbed for `key=`/`password=` values, and an argument
-member *named* like a secret is masked whole — so a raw `connection` passed to `attach_kernel` is
-recorded as `net:port=50000,key=<redacted>`. Prefer a [profile](#kernel-connection-profiles-keeping-the-kdnet-key-out-of-the-transcript)
-anyway: it keeps the key out of the request in the first place, and this is the backstop.
+**Redaction**, by two mechanisms that are not equally strong. Every secret this server has been
+handed — from a profile or from a raw `connection` — is masked **by value**, wherever it appears
+and in whatever syntax, so a key that reached this process cannot leave it in a transcript. Under
+that sits a scan for `key=`/`password=` in text, which also catches a secret the server has never
+seen (one a target printed itself); it has to guess a syntax and is best-effort by nature. An
+argument member *named* like a secret is masked whole. Prefer a
+[profile](#kernel-connection-profiles-keeping-the-kdnet-key-out-of-the-transcript) regardless: it
+keeps the key out of the request in the first place, and all of this is the backstop.
 
 **Retention.** Nothing else is masked, and that is the point to plan around: debugger output is the
 contents of somebody's memory — stack frames, strings, registry paths, whatever the target holds —
@@ -739,7 +743,9 @@ starts with a `start` record naming its pid, which is what separates them.
 
 **Size.** Fields are capped at 16 KiB, and a record says how much it dropped rather than being
 quietly short. `WINDBG_MCP_TRANSCRIPT_MAX_FIELD` moves the cap; `0` removes it, at the cost of a
-file that grows with every module listing and pool census.
+file that grows with every module listing and pool census. A whole record is bounded too, well
+above what a capped one reaches: a record past that ceiling is replaced by an `oversized` marker
+naming its kind and size, which is a bug in the recorder rather than something a session did.
 
 ## Limitations & notes
 

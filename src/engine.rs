@@ -1098,9 +1098,31 @@ impl Sessions {
             // Refused *before* the opener was written, so this worker is `Ready` and holds
             // nothing at all — no dump, no trace, no attach. There is no target to release and so
             // nothing for its channel closing to accomplish; killing it is the whole teardown.
+            //
+            // And nothing is recorded, because nothing happened to a target: no session was
+            // registered, so there is none to end either. The caller is told why in the result.
+            // Recording an open here — as this did, from inside `spawn` — would put a session in
+            // the transcript that never existed, with no end to match it, and a disconnect racing
+            // a handshake is enough to produce one *after* the shutdown record.
             session.kill();
             return Err(OpenError::NoRoom(why));
         }
+        // Admitted, so this session exists and is routable. Recorded now rather than when the
+        // *opener* returns: a target that then fails to open still had a process started against
+        // it, and a transcript that only knew about the ones that worked would be missing exactly
+        // the sessions somebody is reading it to understand.
+        self.rec.write(crate::record::Event::SessionOpen {
+            session: session.id.clone(),
+            kind: kind.label().to_string(),
+            // Already masked where it is a connection: an attach resolves its label in
+            // `kdconn::select` before a worker is ever spawned. Scrubbed anyway, and capped,
+            // because a `launch` target is a command line somebody wrote.
+            target: crate::record::Capped::of(
+                &crate::kdconn::scrub(&session.what),
+                self.rec.field_limit(),
+            ),
+            engine_pid: session.pid,
+        });
         // Released only now: from here the session is counted in `all` instead, and holding both
         // would count this open twice.
         drop(slot);
@@ -1723,23 +1745,6 @@ impl Sessions {
             child: Mutex::new(Some(child)),
             rec: self.rec.clone(),
         });
-        // Recorded here, where the worker exists and the session has its identity, rather than
-        // where `open` returns: an open that then fails still started a process against a target,
-        // and a transcript that only knew about the ones that worked would be missing exactly the
-        // sessions somebody is reading it to understand.
-        self.rec.write(crate::record::Event::SessionOpen {
-            session: session.id.clone(),
-            kind: kind.label().to_string(),
-            // Already masked where it is a connection: an attach resolves its label in
-            // `kdconn::select` before a worker is ever spawned. Scrubbed anyway, and capped,
-            // because a `launch` target is a command line somebody wrote.
-            target: crate::record::Capped::of(
-                &crate::kdconn::scrub(&session.what),
-                self.rec.field_limit(),
-            ),
-            engine_pid: pid,
-        });
-
         // Both halves hold a `Weak`, so a session dropped from the registry takes its worker's
         // plumbing with it rather than keeping the Arc alive forever.
         let pumping = std::thread::Builder::new()
