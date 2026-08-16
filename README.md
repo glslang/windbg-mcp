@@ -185,6 +185,7 @@ Copy-Item "$wd\dbgeng.dll","$wd\dbghelp.dll","$wd\dbgcore.dll","$wd\dbgmodel.dll
           "$wd\symsrv.dll","$wd\msdia140.dll" $dst -Force
 Copy-Item "$wd\ttd"    "$dst\ttd"    -Recurse -Force   # TTDReplay*.dll, TtdExt.dll, TTDAnalyze.dll, ...
 Copy-Item "$wd\winext" "$dst\winext" -Recurse -Force   # ext.dll (!analyze), kext.dll, … — crash-dump triage
+Copy-Item "$wd\triage" "$dst\triage" -Recurse -Force   # triage.ini, pooltag.txt — !analyze's module attribution
 New-Item   "$dst\winxp" -ItemType Directory -Force | Out-Null
 Copy-Item "$wd\winxp\kdexts.dll" "$dst\winxp" -Force   # !drvobj/!devobj/!irp — the kernel driver tools
 ```
@@ -200,6 +201,10 @@ Copy-Item "$wd\winxp\kdexts.dll" "$dst\winxp" -Force   # !drvobj/!devobj/!irp �
   `.load kdexts` for you and nothing complains at attach time, so a missing file first surfaces as
   *"No export drvobj found"* from those three tools. It lives in `winxp\`, not `winext\` — the
   engine searches that subdir by name.
+- The `triage\` subdir provides `triage.ini` and `pooltag.txt`, which `!analyze` reads to attribute
+  a crash to a module and to name pool tags. **Its absence raises no error**, which is what makes it
+  worth copying deliberately: `!analyze` runs and reports `ANALYSIS_INCONCLUSIVE` / `Unknown_Module`
+  instead, so a missing file reads as an inconclusive crash.
 - **`msdia140.dll` is required for PDB symbols.** Without it, `dbghelp` can't parse any PDB
   (`dia error 0x8007007e`) and silently falls back to *export* symbols — which makes `module!name`
   lookups (and so `ttd_calls("ucrtbase!__stdio_common_vfprintf")`) fail even with the right PDB in
@@ -208,6 +213,36 @@ Copy-Item "$wd\winxp\kdexts.dll" "$dst\winxp" -Force   # !drvobj/!devobj/!irp �
 (`cargo clean` wipes `target\`, so re-copy after one.) Live and dump debugging work with or without
 the TTD engine; PDB symbol *names* need `msdia140.dll` + a symbol path
 (`execute` → `.sympath srv*C:\ProgramData\Dbg\sym*https://msdl.microsoft.com/download/symbols`).
+
+#### When the store package will not install
+
+`Get-AppxPackage Microsoft.WinDbg` returning nothing is not always a matter of installing it: MSIX
+registration fails from a **non-interactive** session — `Add-AppxPackage` returns `0x80070005` even
+when elevated — and leaves the payload staged but unrunnable, because `WindowsApps` denies execute
+to an unregistered package. Installing from the machine's own console session is the fix, and the
+one to reach for first.
+
+Where that is not available, the two sources below cover the same files between them. The
+**Windows SDK Debugging Tools** (`winsdksetup.exe /features OptionId.WindowsDesktopDebuggers`) give
+a plain directory — `C:\Program Files (x86)\Windows Kits\10\Debuggers\<arch>` — holding every file
+above **except `msdia140.dll` and `ttd\`**, so `!analyze`, the driver tools and symbols all work and
+TTD replay does not. For `ttd\` itself, the WinDbg `.msixbundle` is an ordinary zip and can be
+unpacked without being installed:
+
+```pwsh
+$w = "$env:TEMP\wdbg"; New-Item $w -ItemType Directory -Force | Out-Null
+$uri = ([xml](Invoke-WebRequest 'https://aka.ms/windbg/download' -UseBasicParsing).Content).AppInstaller.MainBundle.Uri
+Invoke-WebRequest $uri -OutFile "$w\b.zip" -UseBasicParsing      # ~1.1 GB
+Expand-Archive "$w\b.zip" "$w\b" -Force
+Copy-Item "$w\b\windbg_win-x64.msix" "$w\p.zip" -Force           # or windbg_win-arm64.msix
+Expand-Archive "$w\p.zip" "$w\p" -Force
+Copy-Item "$w\p\amd64\ttd" "$dst\ttd" -Recurse -Force            # or arm64\ttd, matching the .msix
+```
+
+Pick the architecture deliberately: the bundle carries `amd64\`, `arm64\` and `x86\` payloads, and
+an ARM64 package ships all three ([#131](https://github.com/glslang/windbg-mcp/issues/131)). See
+[#132](https://github.com/glslang/windbg-mcp/issues/132) for why this is written down rather than
+assumed away.
 
 ## Use with an MCP client
 

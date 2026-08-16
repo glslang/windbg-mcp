@@ -34,6 +34,12 @@ staged but unrunnable, since `WindowsApps` denies execute to an unregistered pac
 WinDbg from the machine's own console session rather than over SSH or a remote shell; that is also
 what makes `Get-AppxPackage Microsoft.WinDbg` resolve, which the copy below depends on.
 
+For `ttd\` specifically there is a way out that needs no install at all: the WinDbg `.msixbundle`
+is an ordinary zip and can be unpacked. The README's
+[*When the store package will not install*](../../README.md#when-the-store-package-will-not-install)
+carries the recipe, and the architecture warning that goes with it — the bundle holds `amd64\`,
+`arm64\` and `x86\` payloads, so which one you copy is a choice rather than a default.
+
 ## Get the server binary
 
 The plugin ships the source, not a binary. Put `windbg-mcp.exe` in place so the path in
