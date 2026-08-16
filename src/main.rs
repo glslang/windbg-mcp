@@ -91,11 +91,17 @@ fn render_cast(args: &[String]) -> Result<()> {
     };
     let summary = cast::render(&options).map_err(|e| anyhow::anyhow!("{e}"))?;
     println!(
-        "wrote {} — {} frame(s) from {} record(s), {:.1}s of session",
+        "wrote {} — {} frame(s) from {} record(s), {:.1}s of session{}",
         options.output.display(),
         summary.frames,
         summary.records,
-        summary.duration_ms as f64 / 1000.0
+        summary.duration_ms as f64 / 1000.0,
+        // Worth saying, because it explains a recording longer than any one session was: a
+        // transcript is appended to, and the runs are laid end to end.
+        match summary.runs {
+            0 | 1 => String::new(),
+            runs => format!(" across {runs} server runs"),
+        }
     );
     // Loud, because it means part of the session is missing from the recording, and a renderer
     // that mentioned it only in a return value nobody reads would be hiding that.

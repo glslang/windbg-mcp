@@ -493,12 +493,13 @@ impl Session {
         if moved {
             // Outside the lock: writing a record touches a disk, and nothing that does belongs
             // inside the mutex every state read in this process contends on.
+            let limit = self.rec.field_limit();
             self.rec.write(crate::record::Event::SessionState {
                 session: self.id.clone(),
                 state: settled.name().to_string(),
                 detail: settled
                     .detail()
-                    .map(|d| crate::record::Capped::of(&crate::kdconn::scrub(d), 0)),
+                    .map(|d| crate::record::Capped::of(&crate::kdconn::scrub(d), limit)),
             });
         }
         settled
@@ -1205,10 +1206,16 @@ impl Sessions {
         self.rec.write(crate::record::Event::Interrupt {
             session: session.id.clone(),
             delivered: outcome.is_ok(),
-            detail: match &outcome {
-                Ok(out) => Some(crate::record::Capped::of(&out.text, 0)),
-                Err(e) => Some(crate::record::Capped::of(&e.to_string(), 0)),
-            },
+            // Scrubbed and capped like every other debugger-supplied string that reaches the
+            // transcript — this one is the engine's own words about what it stopped, and it is
+            // the one path that was not going through the rule the module documents.
+            detail: Some(crate::record::Capped::of(
+                &crate::kdconn::scrub(&match &outcome {
+                    Ok(out) => out.text.clone(),
+                    Err(e) => e.to_string(),
+                }),
+                self.rec.field_limit(),
+            )),
         });
         outcome
     }
@@ -1409,10 +1416,31 @@ impl Sessions {
                         SHUTDOWN_RELEASE_TIMEOUT,
                     )
                     .await;
+                let note = shutdown_note(&outcome, session.released.load(Ordering::SeqCst));
+                // The same record `end_session` writes, and this is the path that needs it more:
+                // a disconnect has no caller to answer, so without it the transcript of an
+                // unattended run ends with "shutting down" and never says what became of each
+                // target. `released` is read from the note rather than from this attempt's own
+                // outcome, because two teardowns can race for one session and the loser's failure
+                // is not news about the target — see [`ShutdownNote`].
+                session.rec.write(crate::record::Event::SessionEnd {
+                    session: session.id.clone(),
+                    released: matches!(
+                        note,
+                        ShutdownNote::Released | ShutdownNote::ReleasedElsewhere
+                    ),
+                    worker_terminated: !matches!(outcome, Release::AlreadyGone | Release::Stale(_)),
+                    waited_ms: match &outcome {
+                        Release::Parked { waited } => {
+                            Some(waited.as_millis().min(u128::from(u64::MAX)) as u64)
+                        }
+                        _ => None,
+                    },
+                });
                 // `end_session` renders this for its caller. Shutdown has no caller — the client
                 // has already gone — so the log is the only place it can land, and it is exactly
                 // where an operator looks after finding a guest that did not come back.
-                match shutdown_note(&outcome, session.released.load(Ordering::SeqCst)) {
+                match note {
                     ShutdownNote::Released => {
                         tracing::info!("shutting down: session {} released its target", session.id)
                     }
@@ -2354,18 +2382,23 @@ async fn reader(
     let Some(session) = session.upgrade() else {
         return;
     };
-    if session.state().is_live() {
+    // Whether this death is *news*. A session already settled is one somebody ended — `release`
+    // terminates the worker on purpose, so its pipe reaching EOF here is the last step of an
+    // orderly teardown, not a loss. Recording it either way would put a red "lost its engine"
+    // line after every successful `end_session`, describing a failure that did not happen.
+    let unexpected = session.state().is_live();
+    if unexpected {
         session.set_state(SessionState::Closed(
             "the engine worker process exited".to_string(),
         ));
+        // Beside the state transition rather than instead of it: the transition says the session
+        // is closed, and this says the calls it owed replies to are being answered with a failure
+        // nobody asked for. A reader looking at a result that never arrived needs the second one.
+        session.rec.write(crate::record::Event::WorkerLost {
+            session: session.id.clone(),
+            detail: crate::record::Capped::of(&worker_gone(&session.id), session.rec.field_limit()),
+        });
     }
-    // Beside the state transition rather than instead of it: the transition says the session is
-    // closed, and this says the calls it owed replies to are being answered with a failure nobody
-    // asked for. A reader looking at a result that never arrived needs the second one.
-    session.rec.write(crate::record::Event::WorkerLost {
-        session: session.id.clone(),
-        detail: crate::record::Capped::of(&worker_gone(&session.id), 0),
-    });
     session.fail_outstanding(&worker_gone(&session.id));
 }
 

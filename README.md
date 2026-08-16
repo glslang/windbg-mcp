@@ -698,6 +698,10 @@ half, never scraped from the text beside it — where execution stopped, what a 
 concluded, every breakpoint or memory mutation, each assertion that did not hold, and how a
 `debug_batch` ended with whether its rollback completed. See [`src/record.rs`](./src/record.rs).
 
+A record's `session` is the one the call was **routed** to, not the one it named: omitting
+`session_id` accepts the current session rather than none, so the field answers "which target was
+this?" even for the calls that did not say.
+
 **It is not the log.** `RUST_LOG` output is prose about the server, on stderr; this is values about
 the *session*, in a file of its own. Standard output stays JSON-RPC and nothing else.
 
@@ -712,6 +716,10 @@ The rendering is derived, so a cast can be made from a transcript recorded weeks
 timings are the recorded ones. `--idle-limit <s>` tells a player how long to sit in a pause (`0`
 plays at the speed it happened), `--max-lines <n>` caps how much of a long result is shown, and
 `--title`/`--width`/`--height` shape the recording.
+
+A file holding several runs renders as one recording with the runs laid end to end, separated by
+however long the server was actually down — each run's own clock starts at zero, so playing those
+offsets as they stand would step backwards at the join and no player would accept it.
 
 **Redaction.** Every string recorded is scrubbed for `key=`/`password=` values, and an argument
 member *named* like a secret is masked whole — so a raw `connection` passed to `attach_kernel` is

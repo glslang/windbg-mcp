@@ -337,14 +337,16 @@ fn secret_at(text: &str, i: usize) -> Option<(usize, usize)> {
     let mut at = i + name.len();
     let quoted_name = text[at..].starts_with('"');
     at += usize::from(quoted_name);
+    // Filler on **both** sides of the separator, because a secret arrives in text somebody typed.
+    // `net:port=1, key = 1.2.3.4` is refused by [`is_dialable`] — but only after it has already
+    // been recorded as an argument, so a scan that required `key=` exactly would mask the key in
+    // the connections this server accepts and miss it in the one it turns away.
+    at += inline_gap(text, at);
     match (quoted_name, text[at..].chars().next()?) {
         (false, '=') | (true, ':') => at += 1,
         _ => return None,
     }
-    // Filler after the separator is ordinary in JSON and refused in a connection string
-    // ([`is_ambiguous`]), and skipping it here can only ever mask a value already committed to
-    // being a secret's.
-    at = text.len() - text[at..].trim_start().len();
+    at += inline_gap(text, at);
     let quoted = text[at..].starts_with('"');
     let start = at + usize::from(quoted);
     let body = &text[start..];
@@ -362,6 +364,19 @@ fn secret_at(text: &str, i: usize) -> Option<(usize, usize)> {
 /// Whether a character can be part of a parameter name, for the whole-name test in [`secret_at`].
 fn name_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_' || c == '-'
+}
+
+/// How many bytes of filler start at `at`: spaces and tabs, and **never a line break**.
+///
+/// The distinction is what keeps [`secret_at`] from running off the end of a line. `key=` with
+/// nothing after it is an empty value — which is not a secret and is left alone — while a scan
+/// that treated the newline as filler would decide the first token of the *next* line was the
+/// key's value and mask that instead. Debugger output is full of lines that end in `=`.
+fn inline_gap(text: &str, at: usize) -> usize {
+    text[at..]
+        .bytes()
+        .take_while(|b| *b == b' ' || *b == b'\t')
+        .count()
 }
 
 /// A character with no unambiguous place *between* the parameters of a connection string.
@@ -1140,6 +1155,43 @@ mod tests {
     fn scrubbing_leaves_an_empty_value_alone() {
         for empty in ["net:port=1,key=", r#"{"key":""}"#, "key= "] {
             assert_eq!(scrub(empty), empty);
+        }
+    }
+
+    /// Filler around the separator, which is how a *person* writes a connection string.
+    ///
+    /// This is the shape [`is_dialable`] refuses — and it is refused only after the argument has
+    /// already been recorded, so a scan that insisted on `key=` exactly would mask the key in the
+    /// connections this server accepts and miss it in the one it turns away.
+    #[test]
+    fn scrubbing_masks_a_secret_with_filler_around_the_separator() {
+        assert_eq!(
+            scrub("net:port=50000, key = 1.2.3.4"),
+            "net:port=50000, key = <redacted>"
+        );
+        assert_eq!(scrub("key\t=\t1.2.3.4"), "key\t=\t<redacted>");
+        // The JSON spelling of the same thing. `serde_json` does not emit it, but `scrub` also
+        // runs over result text, which is whatever the target printed.
+        assert_eq!(
+            scrub(r#"{"password" : "hunter2"}"#),
+            r#"{"password" : "<redacted>"}"#
+        );
+    }
+
+    /// Filler stops at the end of the line, which is the difference between "no value" and "the
+    /// next line".
+    ///
+    /// A trim that skipped every whitespace character masked the first token *after* the line
+    /// break — so `key=` at the end of a line ate the symbol below it, reporting a secret where
+    /// there was an empty value and losing a fact from the transcript.
+    #[test]
+    fn scrubbing_does_not_run_past_the_end_of_a_line() {
+        for across in [
+            "key=\nnt!KeBugCheckEx",
+            "net:port=1,key=\n1.2.3.4",
+            "password=\r\nhunter2",
+        ] {
+            assert_eq!(scrub(across), across);
         }
     }
 

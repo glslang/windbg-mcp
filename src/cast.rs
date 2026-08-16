@@ -153,10 +153,12 @@ pub fn render(options: &Options) -> Result<Summary, String> {
             options.input.display()
         ));
     }
+    let runs = runs(&records).len();
+    let timeline = timeline(&records);
     let mut out = String::new();
     writeln!(out, "{}", header(options, &records)).map_err(|e| e.to_string())?;
     let mut frames = 0;
-    for record in &records {
+    for (record, at) in records.iter().zip(&timeline) {
         let Some(text) = frame(record, options.max_lines) else {
             continue;
         };
@@ -165,7 +167,7 @@ pub fn render(options: &Options) -> Result<Summary, String> {
         // characters, quotes and half-finished escape sequences, and a hand-built line would be
         // the one thing that could make a cast unplayable.
         let event = Value::Array(vec![
-            Value::from(record.mono_ms as f64 / 1000.0),
+            Value::from(*at as f64 / 1000.0),
             Value::from("o"),
             Value::from(text),
         ]);
@@ -190,7 +192,8 @@ pub fn render(options: &Options) -> Result<Summary, String> {
         records: records.len(),
         frames,
         unreadable,
-        duration_ms: records.last().map_or(0, |r| r.mono_ms),
+        runs,
+        duration_ms: timeline.last().copied().unwrap_or(0),
     })
 }
 
@@ -202,7 +205,93 @@ pub struct Summary {
     pub records: usize,
     pub frames: usize,
     pub unreadable: usize,
+    /// How many server runs the transcript holds. More than one is ordinary — the file is
+    /// appended to — and worth reporting, because it is why a cast can be longer than any single
+    /// session was.
+    pub runs: usize,
     pub duration_ms: u64,
+}
+
+/// One playback time per record, in milliseconds, never decreasing.
+///
+/// `mono_ms` is measured from the start of **its own run**, and a transcript is appended to — so a
+/// file holding two runs has a second one that starts again at zero. Written into a cast as they
+/// stand, those offsets step backwards at the join, and a player refuses the recording. The fix is
+/// not to discard the earlier run (it is the part somebody kept the file for) but to lay the runs
+/// end to end: each `start` after the first continues from where the previous one stopped.
+///
+/// The gap between runs is the **wall clock's**, when the two stamps allow it — that is how long
+/// the server was actually down, and it is the honest thing to show. When they do not (a clock
+/// that stepped, an unparseable stamp), the runs are simply butted together with [`RUN_GAP`],
+/// which is visibly a join rather than a wait.
+///
+/// Within a run the order is `seq`, not file order. They agree for anything this build writes —
+/// `Recorder::write` numbers under the same lock it writes under — but a file from a build before
+/// that fix can have them disagree, and a cast rendered from one must still play.
+fn timeline(records: &[Record]) -> Vec<u64> {
+    let mut times = vec![0u64; records.len()];
+    let mut base = 0u64;
+    for run in runs(records) {
+        let first = &records[run.start];
+        // Where this run begins on the playback clock: after everything before it, plus however
+        // long the server was down.
+        let start = match run.start {
+            0 => 0,
+            _ => base + gap(records.get(run.start.wrapping_sub(1)), Some(first)),
+        };
+        let mut order: Vec<usize> = run.clone().collect();
+        order.sort_by_key(|i| records[*i].seq);
+        let mut last = start;
+        for (position, index) in order.into_iter().enumerate() {
+            // Sorted by `seq`, so the *n*th record of the run takes the *n*th slot of the run's
+            // span whatever order its line was written in.
+            let at = start + records[index].mono_ms;
+            last = last.max(at);
+            times[run.start + position] = last;
+        }
+        base = last;
+    }
+    times
+}
+
+/// How long the server was down between two runs, in milliseconds, from their wall clocks.
+///
+/// [`RUN_GAP`] when the stamps cannot answer — either is unreadable, or the later one is not later,
+/// which a clock that stepped backwards produces. Never zero, so a join is always visible.
+fn gap(before: Option<&Record>, after: Option<&Record>) -> u64 {
+    let (Some(before), Some(after)) = (before, after) else {
+        return RUN_GAP;
+    };
+    let measured = crate::record::unix_seconds(&after.at)
+        .zip(crate::record::unix_seconds(&before.at))
+        .and_then(|(after, before)| after.checked_sub(before))
+        .map(|secs| secs.saturating_mul(1000));
+    measured.filter(|gap| *gap > 0).unwrap_or(RUN_GAP)
+}
+
+/// The stand-in gap between two runs whose wall clocks cannot be compared. Long enough to read as
+/// a break, short enough not to be a wait.
+const RUN_GAP: u64 = 1_000;
+
+/// The records of each run, as ranges. A run begins at a `start` record — the first thing every
+/// run writes — and the leading records of a file that has none are treated as one run, so a
+/// transcript whose head was lost still renders.
+fn runs(records: &[Record]) -> Vec<std::ops::Range<usize>> {
+    let mut bounds: Vec<usize> = records
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| matches!(r.event, Event::Start { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    if bounds.first() != Some(&0) {
+        bounds.insert(0, 0);
+    }
+    bounds
+        .iter()
+        .enumerate()
+        .map(|(n, start)| *start..bounds.get(n + 1).copied().unwrap_or(records.len()))
+        .filter(|run| !run.is_empty())
+        .collect()
 }
 
 /// Reads a transcript, skipping what it cannot parse.
@@ -385,15 +474,15 @@ fn frame(record: &Record, max_lines: usize) -> Option<String> {
             &format!(
                 "changed: {}{}",
                 detail.text,
-                step.as_deref()
-                    .map(|s| format!(" [{s}]"))
+                step.as_ref()
+                    .map(|s| format!(" [{}]", s.text))
                     .unwrap_or_default()
             ),
         ),
         Event::Assertion { step, detail, .. } => note(
             &mut out,
             FAIL,
-            &format!("assertion did not hold at {step}: {}", detail.text),
+            &format!("assertion did not hold at {}: {}", step.text, detail.text),
         ),
         Event::Batch {
             outcome,
@@ -644,6 +733,95 @@ mod tests {
         assert!(
             !screen.contains('\n')
                 || screen.matches('\n').count() == screen.matches("\r\n").count()
+        );
+    }
+
+    /// A transcript is **appended** to, so one file can hold several runs — and each run's
+    /// `mono_ms` starts again at zero.
+    ///
+    /// Written into a cast as they stand, those offsets step backwards at the join and a player
+    /// refuses the whole recording. The runs are laid end to end instead, which keeps the earlier
+    /// one — it is the part somebody kept the file for.
+    #[test]
+    fn several_runs_in_one_file_render_as_one_rising_timeline() {
+        let input = scratch("two-runs");
+        let _ = std::fs::remove_file(&input);
+        for run in 0..2 {
+            let rec = Recorder::to_file(&input, 0).expect("a transcript");
+            let call = rec.tool_request("modules", None);
+            // Long enough that the second run's own offsets are unambiguously small numbers,
+            // which is what would step backwards without the fix.
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            rec.tool_result(call, false, &format!("run {run}"), None);
+            rec.write(Event::Shutdown { sessions: 0 });
+        }
+        let options = Options {
+            output: input.with_extension("cast"),
+            input,
+            width: DEFAULT_WIDTH,
+            height: DEFAULT_HEIGHT,
+            title: None,
+            idle_limit: DEFAULT_IDLE_LIMIT,
+            max_lines: 0,
+        };
+        let summary = render(&options).expect("the render succeeds");
+        assert_eq!(summary.runs, 2, "the file holds two runs");
+
+        let (_, events) = read_cast(&options.output);
+        assert!(
+            events.windows(2).all(|w| w[0].0 <= w[1].0),
+            "the join went backwards: {:?}",
+            events.iter().map(|(t, _, _)| *t).collect::<Vec<_>>()
+        );
+        // Both runs are in it, in the order they happened.
+        let screen: Vec<String> = events.iter().map(|(_, _, d)| d.clone()).collect();
+        let of = |needle: &str| screen.iter().position(|d| d.contains(needle));
+        assert!(of("run 0") < of("run 1"), "{screen:#?}");
+        // And the second run really is offset past the first, rather than restarting.
+        let second = events[of("run 1").expect("the second run is rendered")].0;
+        let first = events[of("run 0").expect("the first run is rendered")].0;
+        assert!(second > first, "{first} -> {second}");
+    }
+
+    /// Within a run, order comes from `seq` rather than from the order the lines happen to sit in.
+    ///
+    /// `Recorder::write` numbers under the same lock it writes under, so the two agree for
+    /// anything this build produces. A file from a build *before* that fix can have them disagree,
+    /// and a cast rendered from one still has to play.
+    #[test]
+    fn a_file_whose_lines_are_out_of_order_still_renders_forwards() {
+        let input = scratch("out-of-order");
+        let _ = std::fs::remove_file(&input);
+        let rec = Recorder::to_file(&input, 0).expect("a transcript");
+        let call = rec.tool_request("modules", None);
+        rec.tool_result(call, false, "first", None);
+        rec.write(Event::Shutdown { sessions: 0 });
+        drop(rec);
+
+        // Swap two lines, as a race between two writers would have left them.
+        let mut lines: Vec<String> = std::fs::read_to_string(&input)
+            .expect("the transcript")
+            .lines()
+            .map(str::to_string)
+            .collect();
+        lines.swap(1, 2);
+        std::fs::write(&input, lines.join("\n")).expect("rewrite");
+
+        let options = Options {
+            output: input.with_extension("cast"),
+            input,
+            width: DEFAULT_WIDTH,
+            height: DEFAULT_HEIGHT,
+            title: None,
+            idle_limit: 0.0,
+            max_lines: 0,
+        };
+        render(&options).expect("the render succeeds");
+        let (_, events) = read_cast(&options.output);
+        assert!(
+            events.windows(2).all(|w| w[0].0 <= w[1].0),
+            "times went backwards: {:?}",
+            events.iter().map(|(t, _, _)| *t).collect::<Vec<_>>()
         );
     }
 
