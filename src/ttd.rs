@@ -125,6 +125,12 @@ pub fn record_launch(
     for name in crate::kdconn::env_names() {
         cmd.env_remove(name);
     }
+    // And the listener's bearer token, which is the same hazard one step further on: the recorded
+    // target is chosen by the caller and inherits this environment, so a token left here is a
+    // credential handed to an arbitrary binary. With it, that binary could dial the listener on
+    // loopback and claim the server once the current holder goes quiet. Stripped in both places
+    // this server creates a process, because either one is enough to leak it.
+    cmd.env_remove(crate::listen::TOKEN_ENV);
     // Pass through the validated environment (e.g. an anti-analysis env guard) and cwd to the
     // recorded target. TTD.exe launches `target` with this environment inherited. Applied after
     // the scrub above, so an entry the caller passed deliberately still wins.
