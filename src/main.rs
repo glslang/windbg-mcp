@@ -16,6 +16,7 @@ mod batch;
 mod cast;
 mod engine;
 mod kdconn;
+mod listen;
 mod proto;
 mod record;
 mod server;
@@ -73,10 +74,34 @@ fn main() -> Result<()> {
         return render_cast(&args[at + 1..]);
     }
 
+    // Decided before the runtime so a bad address fails as a usage error rather than from inside a
+    // task, but acted on inside it: both roles need the runtime, and only one of them needs stdio.
+    let listen = match listen::requested(&args) {
+        Some(addr) => Some(addr?),
+        None => None,
+    };
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
-        .block_on(serve())
+        .block_on(async {
+            match listen {
+                Some(addr) => serve_http(addr).await,
+                None => serve().await,
+            }
+        })
+}
+
+/// The listener role. See [`listen`] for what HTTP takes away and what is put back.
+///
+/// The teardown differs from [`serve`]'s in the one way that matters: there is no disconnect to
+/// hang it on, so the shutdown here belongs to the *process* ending rather than to any client, and
+/// a client going away is handled by its lease instead.
+async fn serve_http(addr: std::net::SocketAddr) -> Result<()> {
+    let sessions = Sessions::new(call_timeout()).recording(record::Recorder::from_env());
+    let outcome = listen::serve(sessions.clone(), addr, call_timeout()).await;
+    sessions.shutdown().await;
+    outcome
 }
 
 /// The renderer role: a transcript in, an asciicast out.

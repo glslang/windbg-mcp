@@ -1415,12 +1415,35 @@ impl Sessions {
     /// kernel outright costs. Sessions are released concurrently because they are independent
     /// processes and the client is waiting.
     pub async fn shutdown(&self) {
+        self.release_every_worker(Teardown::Shutdown).await
+    }
+
+    /// Releases every session the way [`Self::shutdown`] does, but **leaves the registry open**.
+    ///
+    /// For the listener ([`crate::listen`]), where a client going away is not the server going
+    /// away: the lease on the sessions it opened expires, those targets are let go, and the next
+    /// client opens its own. Closing the gate here would turn one client's disconnect into a
+    /// server that can never debug anything again.
+    ///
+    /// The caller owns the race this leaves open. Nothing stops a session registering behind the
+    /// snapshot, so this must only be called once the tenancy gate says no client holds the
+    /// server — otherwise a client connecting exactly as the grace expires could have the session
+    /// it just opened released underneath it.
+    pub async fn release_leased(&self) {
+        self.release_every_worker(Teardown::Lease).await
+    }
+
+    async fn release_every_worker(&self, teardown: Teardown) {
         // Closing the gate and taking the snapshot under **one** lock acquisition is what makes
         // one pass enough. [`Self::admit`] re-checks `closing` under this same lock after its
         // worker's handshake, so every open is on one side or the other of this moment: either it
         // registered first and is in `owners`, or it registers never and is refused. The set
         // cannot grow behind this snapshot, which is what earlier versions used a timed drain to
         // approximate.
+        //
+        // That guarantee is bought by `closing` and so belongs to shutdown alone; a lease release
+        // does not get it, which is why the tenancy gate has to stand in for it (see
+        // [`Self::release_leased`]).
         //
         // Every session that still *owns a worker*, not every live one. A session claimed for
         // reclamation is already `Closed` while its release runs in the background, and a
@@ -1430,19 +1453,18 @@ impl Sessions {
         // not.
         let owners = {
             let mut registry = self.registry();
-            registry.closing = true;
+            registry.closing |= teardown.closes_registry();
             registry.owning_workers()
         };
         // Recorded before the releases rather than after them, and even when there are none: this
         // is the record that says the transcript ends here on purpose. Without it a file that
         // stops mid-session is indistinguishable from one whose server was killed.
-        self.rec.write(crate::record::Event::Shutdown {
-            sessions: owners.len(),
-        });
+        self.rec.write(teardown.record(owners.len()));
         if owners.is_empty() {
             return;
         }
-        tracing::info!("shutting down: releasing {} session(s)", owners.len());
+        let label = teardown.label();
+        tracing::info!("{label}: releasing {} session(s)", owners.len());
         let mut releasing = Vec::with_capacity(owners.len());
         for session in owners {
             let sessions = self.clone();
@@ -1450,9 +1472,7 @@ impl Sessions {
                 // Marked first so nothing new is routed to a session on its way out; the release
                 // runs as the supervisor's own teardown and so passes the gate that closes. A
                 // session already closed keeps the reason it closed for.
-                session.set_state(SessionState::Closed(
-                    "the server is shutting down".to_string(),
-                ));
+                session.set_state(SessionState::Closed(teardown.state_reason().to_string()));
                 let outcome = sessions
                     .release(
                         &session,
@@ -1466,15 +1486,14 @@ impl Sessions {
                 // where an operator looks after finding a guest that did not come back.
                 match note {
                     ShutdownNote::Released => {
-                        tracing::info!("shutting down: session {} released its target", session.id)
+                        tracing::info!("{label}: session {} released its target", session.id)
                     }
                     ShutdownNote::ReleasedElsewhere => tracing::info!(
-                        "shutting down: session {}'s target was released by a teardown already in \
-                         flight",
+                        "{label}: session {}'s target was released by a teardown already in flight",
                         session.id
                     ),
                     ShutdownNote::Refused(why) => tracing::warn!(
-                        "shutting down: session {} reported an error releasing its target ({why}); \
+                        "{label}: session {} reported an error releasing its target ({why}); \
                          its worker (pid {}) was terminated anyway — and terminating a debugger \
                          does not resume and detach for it, so a live kernel target may be left \
                          halted",
@@ -1482,13 +1501,13 @@ impl Sessions {
                         session.pid
                     ),
                     ShutdownNote::Unreleased(what) => tracing::warn!(
-                        "shutting down: session {} (pid {}) {what}, and no teardown reported \
+                        "{label}: session {} (pid {}) {what}, and no teardown reported \
                          releasing its target — so a live kernel target may be left halted",
                         session.id,
                         session.pid
                     ),
                     ShutdownNote::Settled(why) => tracing::info!(
-                        "shutting down: session {} was already settled ({why})",
+                        "{label}: session {} was already settled ({why})",
                         session.id
                     ),
                 }
@@ -1500,7 +1519,7 @@ impl Sessions {
             // released by the five-second best effort, and an operator should not have to infer
             // that from a frozen guest.
             if let Err(e) = task.await {
-                tracing::error!("shutting down: a session's release task failed: {e}");
+                tracing::error!("{label}: a session's release task failed: {e}");
             }
         }
     }
@@ -1870,6 +1889,54 @@ fn settle_open(session: &Session, result: &Result<Output, EngineError>) -> bool 
             .then_some(SessionState::Open)
     });
     settled.is_live()
+}
+
+/// Why every session is being released at once.
+///
+/// The two occasions differ in one structural way and several cosmetic ones. The structural one:
+/// **shutdown closes the registry and a lease expiry does not**, because the server is still
+/// serving and the next client will want to open sessions of its own. The rest is saying which
+/// happened — an operator reading a log after finding a guest that did not come back is owed the
+/// difference between "the server stopped" and "your client went away and stayed away", since only
+/// one of those is about them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Teardown {
+    /// The server itself is going away.
+    Shutdown,
+    /// A client's lease on the sessions it opened ran out. See [`crate::listen`].
+    Lease,
+}
+
+impl Teardown {
+    /// Whether the registry is finished with, or merely between clients.
+    fn closes_registry(self) -> bool {
+        matches!(self, Self::Shutdown)
+    }
+
+    /// The log prefix every line of this teardown carries.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Shutdown => "shutting down",
+            Self::Lease => "lease expired",
+        }
+    }
+
+    /// What a session released this way says when something asks why it closed.
+    fn state_reason(self) -> &'static str {
+        match self {
+            Self::Shutdown => "the server is shutting down",
+            Self::Lease => "the client's lease on this session expired",
+        }
+    }
+
+    /// The transcript record. Two variants rather than one with a reason, so a reader filtering a
+    /// transcript for "the server stopped" does not have to also parse why.
+    fn record(self, sessions: usize) -> crate::record::Event {
+        match self {
+            Self::Shutdown => crate::record::Event::Shutdown { sessions },
+            Self::Lease => crate::record::Event::LeaseExpired { sessions },
+        }
+    }
 }
 
 /// What a session's teardown should be reported as at shutdown.

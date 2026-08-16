@@ -716,6 +716,13 @@ pub enum Event {
     },
     /// The server is going down and every session is being let go.
     Shutdown { sessions: usize },
+    /// A client stayed away past its grace, and the sessions it opened were let go — but the
+    /// server is still running and will serve the next client.
+    ///
+    /// Distinct from [`Self::Shutdown`] rather than a reason on it, because the two answer
+    /// different questions about a transcript that stops: one says the recording ended, the other
+    /// says this client's work did while the file goes on.
+    LeaseExpired { sessions: usize },
     /// A record that would have been past the whole-record ceiling, replaced by its size.
     ///
     /// Present so that a field which is not being capped shows up as a **fact in the transcript**

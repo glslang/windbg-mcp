@@ -571,6 +571,11 @@ fn frame(record: &Record, max_lines: usize) -> Option<String> {
             DIM,
             &format!("server shutting down, releasing {sessions} session(s)"),
         ),
+        Event::LeaseExpired { sessions } => note(
+            &mut out,
+            DIM,
+            &format!("client lease expired, releasing {sessions} session(s)"),
+        ),
         // Shown rather than skipped: a viewer has to know a record was here and what it was, or
         // the recording quietly misses a step of the session it claims to be.
         Event::Oversized { of, bytes } => note(
