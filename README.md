@@ -170,56 +170,29 @@ promise on this project's behalf.
 
 ### Bundling the WinDbg engine
 
-Needed for three things: TTD `.run` replay (System32's engine rejects traces with `0x80070057`),
-crash-dump `!analyze` (which lives in the `winext\` extensions that System32 doesn't ship), and the
-kernel driver tools `driver_object`/`device_object`/`irp_stack` (which need `winxp\kdexts.dll`).
-So a live-kernel-only user needs this section too, even though the attach itself works on the
-System32 engine. `DebugCreate` binds to whichever `dbgeng.dll` the loader finds first, and the app
-directory is searched before `System32`, so the copied **WinDbg** engine (which replays TTD traces
-and ships the extensions) wins. One-time, from the installed WinDbg store package:
+Basic live and crash-dump debugging works on the `dbgeng.dll` already in `System32`. These do not,
+and each needs files that engine does not ship:
 
-```pwsh
-$wd  = (Get-AppxPackage Microsoft.WinDbg).InstallLocation + "\amd64"
-$dst = "C:\workspace\windbg-mcp\target\release"
-Copy-Item "$wd\dbgeng.dll","$wd\dbghelp.dll","$wd\dbgcore.dll","$wd\dbgmodel.dll",`
-          "$wd\symsrv.dll","$wd\msdia140.dll" $dst -Force
-Copy-Item "$wd\ttd"    "$dst\ttd"    -Recurse -Force   # TTDReplay*.dll, TtdExt.dll, TTDAnalyze.dll, ...
-Copy-Item "$wd\winext" "$dst\winext" -Recurse -Force   # ext.dll (!analyze), kext.dll, … — crash-dump triage
-Copy-Item "$wd\triage" "$dst\triage" -Recurse -Force   # triage.ini, pooltag.txt — !analyze's module attribution
-New-Item   "$dst\winxp" -ItemType Directory -Force | Out-Null
-Copy-Item "$wd\winxp\kdexts.dll" "$dst\winxp" -Force   # !drvobj/!devobj/!irp — the kernel driver tools
-```
+| Wanted | Needs |
+| --- | --- |
+| TTD `.run` replay | `ttd\` — System32's engine rejects traces with `0x80070057` |
+| Crash-dump `!analyze` | `winext\` for the extension, `triage\` for its module attribution |
+| `driver_object` / `device_object` / `irp_stack` | `winxp\kdexts.dll` |
+| `module!name` symbols anywhere | `msdia140.dll` + `symsrv.dll`, plus a symbol path |
 
-- The `ttd\` subdir provides the `@$cursession.TTD` / `@$curprocess.TTD` data model and the `!tt`
-  time-travel commands.
-- The `winext\` subdir provides `ext.dll` (which exports `!analyze`) and the other `!`-extensions.
-  `open_dump` runs `.load ext` for you, but note the **unqualified `!analyze` does not resolve** on
-  this minimal engine — use the module-qualified **`!ext.analyze -v`** for crash-dump triage. Without
-  `winext\`, `!analyze` returns *"No export analyze found"*.
-- `winxp\kdexts.dll` provides `!drvobj`/`!devobj`/`!irp`, behind the
-  `driver_object`/`device_object`/`irp_stack` tools. `attach_kernel` / `attach_kernel_local`
-  `.load kdexts` for you and nothing complains at attach time, so a missing file first surfaces as
-  *"No export drvobj found"* from those three tools. It lives in `winxp\`, not `winext\` — the
-  engine searches that subdir by name.
-- The `triage\` subdir provides `triage.ini` and `pooltag.txt`, which `!analyze` reads to attribute
-  a crash to a module and to name pool tags. **Its absence raises no error**, which is what makes it
-  worth copying deliberately: `!analyze` runs and reports `ANALYSIS_INCONCLUSIVE` / `Unknown_Module`
-  instead, so a missing file reads as an inconclusive crash.
-- **`msdia140.dll` is required for PDB symbols.** Without it, `dbghelp` can't parse any PDB
-  (`dia error 0x8007007e`) and silently falls back to *export* symbols — which makes `module!name`
-  lookups (and so `ttd_calls("ucrtbase!__stdio_common_vfprintf")`) fail even with the right PDB in
-  the cache. `symsrv.dll` is needed to read a symbol-store cache.
+The fix is a one-time file copy: `DebugCreate` binds to whichever `dbgeng.dll` the loader finds
+first and the app directory is searched before `System32`, so a WinDbg engine copied next to
+`windbg-mcp.exe` wins. Note the kernel row — a live-kernel-only user needs this too, even though
+the attach itself works on the System32 engine.
 
-(`cargo clean` wipes `target\`, so re-copy after one.) Live and dump debugging work with or without
-the TTD engine; PDB symbol *names* need `msdia140.dll` + a symbol path
-(`execute` → `.sympath srv*C:\ProgramData\Dbg\sym*https://msdl.microsoft.com/download/symbols`).
+**The copy list, what each file buys, and what to do when the store package will not install are in
+the skill's [`setup.md`](./skills/windbg-debugging/setup.md).**
+It is one document rather than two so the list cannot drift; it is also where symbols, elevation,
+kernel connection profiles and the differences an ARM64 host brings are written down.
 
-The script above starts from `Get-AppxPackage Microsoft.WinDbg`, which does not always resolve —
-and not always because the package merely needs installing. The skill's
-[`setup.md`](./skills/windbg-debugging/setup.md#when-the-store-package-will-not-install) covers that
-case: why MSIX can stage a payload it then refuses to run, and which two sources supply these files
-between them when it does. It is also the place to look for anything else environment-shaped —
-symbols, elevation, kernel connection profiles, and the differences an ARM64 host brings.
+Most of these fail *quietly* rather than loudly — a missing `triage\` turns `!analyze` into
+`ANALYSIS_INCONCLUSIVE`, a missing `msdia140.dll` silently downgrades symbols to exports — so it is
+worth doing deliberately rather than discovering later.
 
 ## Use with an MCP client
 
