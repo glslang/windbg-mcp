@@ -160,6 +160,14 @@ struct Tenancy {
     ///
     /// Tenancy is given up when that work drains, not when the `DELETE` arrives.
     farewell: bool,
+    /// Which tenancy the counters above belong to.
+    ///
+    /// Bumped whenever a teardown discards them. An in-flight guard carries the epoch it was
+    /// admitted under and subtracts nothing from a later one — without that, a request that
+    /// outlived its grace decrements the *next* holder's count when it finally returns, which can
+    /// drive that count to zero while a tool call is still running and let a concurrent goodbye
+    /// hand the registry to somebody else mid-call.
+    epoch: u64,
     /// A previous client's sessions are still open, waiting to be adopted or swept.
     ///
     /// Tracked rather than inferred from `deadline`. It was inferred, until reserving a claim
@@ -210,11 +218,14 @@ impl Tenancy {
 /// all: a connection dropped inside `mcp.handle` cancels the future, and an explicit decrement
 /// would simply not run — leaving the holder's count permanently above zero and its goodbye
 /// deferred for ever.
-struct InFlight(Arc<Lease>);
+struct InFlight {
+    lease: Arc<Lease>,
+    epoch: u64,
+}
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        self.0.leave();
+        self.lease.leave(self.epoch);
     }
 }
 
@@ -232,12 +243,21 @@ enum Settled {
     Stale,
 }
 
+/// A request the gate let through, and what it was let through *as*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Admitted {
+    /// The claim this request reserved, if it reserved one — which [`Lease::settle`] must present
+    /// to change tenancy.
+    claim: Option<u64>,
+    /// The tenancy it was admitted under, which [`Lease::leave`] must present to count it out.
+    epoch: u64,
+}
+
 /// What the tenancy gate decided about one request.
 #[derive(Debug, PartialEq, Eq)]
 enum Admission {
-    /// Hand it to the MCP service. Carries the claim this request reserved, if it reserved one —
-    /// which [`Lease::settle`] must present to change tenancy.
-    Serve(Option<u64>),
+    /// Hand it to the MCP service.
+    Serve(Admitted),
     /// Someone else holds the server, is taking it, or is being cleaned up after.
     Occupied,
 }
@@ -288,7 +308,10 @@ impl Lease {
             (Some(id), Some(held)) if id == held => {
                 state.deadline = Some(Instant::now() + self.grace);
                 state.in_flight += 1;
-                Admission::Serve(None)
+                Admission::Serve(Admitted {
+                    claim: None,
+                    epoch: state.epoch,
+                })
             }
             // A session id belonging to someone else. This is the arm that made the race above
             // persist rather than pass: serving it leaves both clients working.
@@ -301,13 +324,21 @@ impl Lease {
             // out for a whole grace period.
             (Some(_), None) if state.claim.is_none() => {
                 state.in_flight += 1;
-                Admission::Serve(Some(state.claim(self.grace)))
+                let epoch = state.epoch;
+                Admission::Serve(Admitted {
+                    claim: Some(state.claim(self.grace)),
+                    epoch,
+                })
             }
             // A new client, and nobody attached or attaching: it reserves the server here, and
             // inherits whatever the last one left open.
             (None, None) if state.claim.is_none() => {
                 state.in_flight += 1;
-                Admission::Serve(Some(state.claim(self.grace)))
+                let epoch = state.epoch;
+                Admission::Serve(Admitted {
+                    claim: Some(state.claim(self.grace)),
+                    epoch,
+                })
             }
             // Someone is mid-`initialize`, or holds it already.
             _ => Admission::Occupied,
@@ -382,8 +413,16 @@ impl Lease {
     }
 
     /// One admitted request finished, however it finished.
-    fn leave(&self) {
+    ///
+    /// `epoch` is the tenancy it was admitted under. A request that outlived a teardown belongs to
+    /// a tenancy that no longer exists, and counting it out of the current one would subtract work
+    /// it never did — enough for a concurrent goodbye to see zero while a tool call is still
+    /// running.
+    fn leave(&self, epoch: u64) {
         let mut state = self.state();
+        if state.epoch != epoch {
+            return;
+        }
         state.in_flight = state.in_flight.saturating_sub(1);
         state.give_up_if_drained(self.grace);
     }
@@ -410,6 +449,9 @@ impl Lease {
                 // past this point would defer a goodbye that has already been overtaken.
                 state.in_flight = 0;
                 state.farewell = false;
+                // Anything still out there was admitted under the tenancy being discarded, and may
+                // not count itself out of the next one.
+                state.epoch += 1;
                 state.releasing = true;
                 Some(Expired { holder })
             }
@@ -528,8 +570,8 @@ async fn gate(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
-    let claim = match lease.admit(session.as_deref()) {
-        Admission::Serve(claim) => claim,
+    let admitted = match lease.admit(session.as_deref()) {
+        Admission::Serve(admitted) => admitted,
         Admission::Occupied => {
             tracing::warn!("refused a second client from {peer}: this server is already held");
             return Ok(refuse(
@@ -540,7 +582,10 @@ async fn gate(
     };
     // From here every exit — a reply, a refusal, or this future being cancelled — counts the
     // request out, and a goodbye waiting on it completes when the last one does.
-    let _in_flight = InFlight(lease.clone());
+    let _in_flight = InFlight {
+        lease: lease.clone(),
+        epoch: admitted.epoch,
+    };
 
     // A DELETE is the client saying it is done. Noted before the service handles it, because
     // afterwards the session is gone and there is nothing left to match the holder against.
@@ -556,7 +601,7 @@ async fn gate(
     // Every admitted request settles, so a reservation is never left standing by a request that
     // did not become a session.
     match lease.settle(
-        claim,
+        admitted.claim,
         session.as_deref(),
         minted.as_deref(),
         response.status().is_success(),
@@ -660,9 +705,9 @@ mod tests {
         }
     }
 
-    fn claim_of(admission: Admission) -> Option<u64> {
+    fn admitted(admission: Admission) -> Admitted {
         match admission {
-            Admission::Serve(claim) => claim,
+            Admission::Serve(admitted) => admitted,
             Admission::Occupied => panic!("the gate refused a request this test needed served"),
         }
     }
@@ -671,17 +716,17 @@ mod tests {
     /// again in `gate` by a guard, so a test that settles without finishing is modelling a request
     /// that never came back.
     fn request(lease: &Lease, session: Option<&str>, minted: Option<&str>, ok: bool) -> Settled {
-        let claim = claim_of(lease.admit(session));
-        let settled = lease.settle(claim, session, minted, ok);
-        lease.leave();
+        let it = admitted(lease.admit(session));
+        let settled = lease.settle(it.claim, session, minted, ok);
+        lease.leave(it.epoch);
         settled
     }
 
     /// A client's `DELETE`, which is itself an admitted request.
     fn goodbye(lease: &Lease, id: &str) {
-        claim_of(lease.admit(Some(id)));
+        let it = admitted(lease.admit(Some(id)));
         lease.released(id);
-        lease.leave();
+        lease.leave(it.epoch);
     }
 
     /// The check that stops a long call from looking like an absent client.
@@ -715,7 +760,10 @@ mod tests {
 
         assert!(matches!(lease.admit(None), Admission::Occupied));
         assert!(
-            matches!(lease.admit(Some("session-a")), Admission::Serve(None)),
+            matches!(
+                lease.admit(Some("session-a")),
+                Admission::Serve(Admitted { claim: None, .. })
+            ),
             "the holder is served, and reserves nothing — it already holds the server"
         );
         assert!(
@@ -729,10 +777,10 @@ mod tests {
     #[test]
     fn a_claim_in_flight_blocks_a_second_initialize() {
         let lease = lease();
-        let claim = claim_of(lease.admit(None));
+        let first = admitted(lease.admit(None));
         assert!(matches!(lease.admit(None), Admission::Occupied));
 
-        lease.settle(claim, None, Some("session-a"), true);
+        lease.settle(first.claim, None, Some("session-a"), true);
         assert_eq!(lease.state().holder.as_deref(), Some("session-a"));
     }
 
@@ -740,8 +788,8 @@ mod tests {
     #[test]
     fn an_initialize_that_fails_does_not_hold_the_server_for_ever() {
         let lease = lease();
-        let claim = claim_of(lease.admit(None));
-        lease.settle(claim, None, None, false);
+        let claim = admitted(lease.admit(None));
+        lease.settle(claim.claim, None, None, false);
 
         assert!(
             lease.state().claim.is_none(),
@@ -760,7 +808,7 @@ mod tests {
     #[test]
     fn a_claim_that_outlived_its_grace_cannot_settle_over_a_newer_one() {
         let lease = brief();
-        let stale = claim_of(lease.admit(None));
+        let stale = admitted(lease.admit(None)).claim;
         std::thread::sleep(Duration::from_millis(5));
         assert!(
             lease.expired().is_some(),
@@ -768,7 +816,7 @@ mod tests {
         );
         lease.released_leases();
 
-        let fresh = claim_of(lease.admit(None));
+        let fresh = admitted(lease.admit(None)).claim;
         assert_ne!(stale, fresh, "a cleared claim is never re-issued");
         lease.settle(fresh, None, Some("session-new"), true);
 
@@ -793,10 +841,10 @@ mod tests {
     #[test]
     fn an_ordinary_request_from_the_holder_is_not_a_settlement() {
         let lease = lease();
-        let claim = claim_of(lease.admit(None));
-        lease.settle(claim, None, Some("session-a"), true);
+        let claim = admitted(lease.admit(None));
+        lease.settle(claim.claim, None, Some("session-a"), true);
 
-        let none = claim_of(lease.admit(Some("session-a")));
+        let none = admitted(lease.admit(Some("session-a"))).claim;
         assert_eq!(none, None, "the holder reserves nothing");
         assert_eq!(
             lease.settle(none, Some("session-a"), None, true),
@@ -848,7 +896,7 @@ mod tests {
 
         assert!(matches!(
             lease.admit(Some("session-a")),
-            Admission::Serve(Some(_))
+            Admission::Serve(Admitted { claim: Some(_), .. })
         ));
         assert!(
             matches!(lease.admit(None), Admission::Occupied),
@@ -899,9 +947,9 @@ mod tests {
         request(&lease, None, Some("session-a"), true);
 
         // A tool call is admitted and is still running.
-        claim_of(lease.admit(Some("session-a")));
+        let call = admitted(lease.admit(Some("session-a")));
         // The DELETE arrives on another connection, and is itself in flight.
-        claim_of(lease.admit(Some("session-a")));
+        let delete = admitted(lease.admit(Some("session-a")));
         lease.released("session-a");
 
         assert_eq!(
@@ -911,14 +959,14 @@ mod tests {
         );
         assert!(matches!(lease.admit(None), Admission::Occupied));
 
-        lease.leave(); // the DELETE's own request ends
+        lease.leave(delete.epoch); // the DELETE's own request ends
         assert_eq!(
             lease.state().holder.as_deref(),
             Some("session-a"),
             "still held: the tool call has not come back"
         );
 
-        lease.leave(); // and now the tool call does
+        lease.leave(call.epoch); // and now the tool call does
         assert_eq!(
             lease.state().holder,
             None,
@@ -927,13 +975,49 @@ mod tests {
         assert!(matches!(lease.admit(None), Admission::Serve(_)));
     }
 
+    /// A guard from a torn-down tenancy subtracts nothing from the next one.
+    ///
+    /// Without the epoch, a request that outlived its grace decrements the *new* holder's count
+    /// when it finally returns — which can reach zero while that holder's tool call is still
+    /// running, and let a concurrent goodbye hand the registry to somebody else mid-call.
+    #[test]
+    fn a_stale_guard_cannot_count_out_a_later_holders_work() {
+        let lease = brief();
+        let stranded = admitted(lease.admit(None)); // never comes back before the sweep
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(lease.expired().is_some());
+        lease.released_leases();
+
+        // A new client takes the server and starts a call.
+        request(&lease, None, Some("session-new"), true);
+        let call = admitted(lease.admit(Some("session-new")));
+        let delete = admitted(lease.admit(Some("session-new")));
+        lease.released("session-new");
+        lease.leave(delete.epoch);
+
+        // The request from the previous tenancy finally returns.
+        lease.leave(stranded.epoch);
+        assert_eq!(
+            lease.state().holder.as_deref(),
+            Some("session-new"),
+            "a guard from a dead tenancy must not drain the live one's count"
+        );
+
+        lease.leave(call.epoch);
+        assert_eq!(
+            lease.state().holder,
+            None,
+            "only the real work ending gives it up"
+        );
+    }
+
     /// A request that never came back cannot defer a goodbye for ever.
     #[test]
     fn a_swept_lease_forgets_work_it_was_waiting_on() {
         let lease = brief();
-        let claim = claim_of(lease.admit(None));
-        lease.settle(claim, None, Some("session-a"), true);
-        claim_of(lease.admit(Some("session-a"))); // a call that never returns
+        let claim = admitted(lease.admit(None));
+        lease.settle(claim.claim, None, Some("session-a"), true);
+        admitted(lease.admit(Some("session-a"))); // a call that never returns
         lease.released("session-a");
         std::thread::sleep(Duration::from_millis(5));
 
@@ -987,7 +1071,7 @@ mod tests {
     #[test]
     fn a_claim_whose_request_died_is_cleared_by_the_grace() {
         let lease = brief();
-        claim_of(lease.admit(None));
+        admitted(lease.admit(None));
         std::thread::sleep(Duration::from_millis(5));
 
         assert!(
@@ -1010,7 +1094,7 @@ mod tests {
         // The holder lets go, so the next request is a genuine resume and reserves a claim of its
         // own — a request from the sitting holder reserves nothing and settles nothing.
         goodbye(&lease, "session-a");
-        let resumed = claim_of(lease.admit(Some("session-a")));
+        let resumed = admitted(lease.admit(Some("session-a"))).claim;
         assert!(resumed.is_some(), "a resume reserves the server");
         std::thread::sleep(Duration::from_millis(5));
         assert!(lease.expired().is_some());
@@ -1030,8 +1114,8 @@ mod tests {
     #[test]
     fn nothing_is_admitted_while_the_teardown_runs() {
         let lease = brief();
-        let claim = claim_of(lease.admit(None));
-        lease.settle(claim, None, Some("session-a"), true);
+        let claim = admitted(lease.admit(None));
+        lease.settle(claim.claim, None, Some("session-a"), true);
         std::thread::sleep(Duration::from_millis(5));
 
         assert!(lease.expired().is_some(), "the grace is spent");
@@ -1048,8 +1132,8 @@ mod tests {
     #[test]
     fn expiry_is_reported_once_rather_than_on_every_sweep() {
         let lease = brief();
-        let claim = claim_of(lease.admit(None));
-        lease.settle(claim, None, Some("session-a"), true);
+        let claim = admitted(lease.admit(None));
+        lease.settle(claim.claim, None, Some("session-a"), true);
         std::thread::sleep(Duration::from_millis(5));
 
         assert!(lease.expired().is_some(), "the grace is spent");
@@ -1065,8 +1149,8 @@ mod tests {
     #[test]
     fn a_swept_lease_reports_the_session_that_never_said_goodbye() {
         let lease = brief();
-        let claim = claim_of(lease.admit(None));
-        lease.settle(claim, None, Some("session-a"), true);
+        let claim = admitted(lease.admit(None));
+        lease.settle(claim.claim, None, Some("session-a"), true);
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(
             lease.expired().map(|e| e.holder),
