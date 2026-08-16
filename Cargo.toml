@@ -8,8 +8,27 @@ win-kexp = { git = "https://github.com/glslang/win-kexp", rev = "40f79cd4c8f3941
 # 3.1.1 is a floor, not a preference: every 3.x before it generates a `tools/list` that omits
 # SEP-2549's required `ttlMs`/`cacheScope`, which a spec-strict `2026-07-28` client rejects
 # outright — the server connects and appears to expose no tools at all (upstream issue #1114).
-rmcp = { version = "3.1.1", features = ["server", "transport-io", "macros", "schemars"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "process", "sync", "time"] }
+rmcp = { version = "3.1.1", features = [
+    "server",
+    "transport-io",
+    "macros",
+    "schemars",
+    # The listener (`--listen`, see `src/listen.rs`). `-session` is what makes a client's MCP
+    # session an addressable thing with a close of its own, which is what a lease is hung off.
+    "transport-streamable-http-server",
+    "transport-streamable-http-server-session",
+] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "net", "process", "sync", "time"] }
+# The listener's HTTP plumbing, and nothing more: rmcp's `StreamableHttpService` is a plain
+# request-to-response handler, so what is missing is a server to call it. hyper rather than a
+# framework because one route with one middleware (the bearer check) is not a router's worth of
+# work — see `src/listen.rs`.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server"] }
+# Bodies for the listener's own responses (401/409): rmcp hands back a boxed body, so refusing a
+# request needs one of the same shape.
+http-body-util = "0.1"
+bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 schemars = "1"
