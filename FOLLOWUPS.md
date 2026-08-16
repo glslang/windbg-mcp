@@ -7,7 +7,8 @@ MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (#46, 2026-08-02), item 15 from the private worker channel (#65 / #72, 2026-08-04), items 16–18
 from transactional batches (#82, 2026-08-09/10 — item 17 is what validating the tool against the CTF
 session's own transcript turned up, and item 18 what reviewing it did), and item 19 from
-`walk_memory` (#103, 2026-08-13). Each item notes its repo,
+`walk_memory` (#103, 2026-08-13), and item 20 from standing the server up on an ARM64 guest
+(#131, 2026-08-16). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -537,3 +538,27 @@ alongside `pool`, and `worker::walk_memory`, which already returns the text a ch
 against. The one design question is the budget: a walk step is up to 1024 reads inside a
 transaction whose whole point is that its rollback still fits, so the step's share has to come out
 of the batch's deadline the way `pool`'s does rather than out of the call's.
+
+## 20. [windbg-mcp] Pick the TTD recorder by architecture, not by a fixed list
+
+`find_ttd` probes x64 before arm64 in both layouts it knows — `["x64", "arm64"]` for the classic
+SDK, and a list headed by `amd64\TTD\TTD.exe` for the MSIX package. On an ARM64 host that is always
+the wrong answer, because the ARM64 WinDbg package ships **all three** recorders (`amd64`, `arm64`,
+`x86`) and the first probe therefore always hits. `record_trace` picks the x64 recorder on exactly
+the hosts where the choice is not free, and a native ARM64 target cannot be recorded with it.
+
+Deferred rather than fixed on the spot because the honest selector is not the one the bug suggests.
+Host architecture is the obvious improvement, but x64-on-ARM64 emulation is a real workflow — an
+emulated x64 debuggee genuinely needs the `amd64` recorder — so the choice properly belongs to the
+*target*, which `record_trace` knows only after it has decided what to launch. Host-first is a
+strict improvement and a fine first cut; target-first is the design question worth thinking about
+before writing either.
+
+Found while setting up a Parallels ARM64 guest for [`docs/remote-phase0.md`](./docs/remote-phase0.md),
+and tracked as [#131](https://github.com/glslang/windbg-mcp/issues/131). Note the workaround is
+already load-bearing on that host: `search_path` runs before both layout probes, so a recorder on
+`PATH` masks the ordering entirely — which also means a host configured that way will not reproduce
+the bug.
+
+Picks up at `ttd::find_ttd` and `ttd::find_in_windowsapps`, both of which are pure path probes with
+no engine dependency, so the fix is testable without a debugger.
