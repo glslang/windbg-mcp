@@ -132,6 +132,12 @@ struct Tenancy {
     /// When the sessions are released if nothing renews first. `None` means there is nothing to
     /// release and nothing to wait for.
     deadline: Option<Instant>,
+    /// A previous client's sessions are still open, waiting to be adopted or swept.
+    ///
+    /// Tracked rather than inferred from `deadline`. It was inferred, until reserving a claim
+    /// started arming that deadline too — at which point every first client looked like it was
+    /// inheriting sessions that did not exist.
+    left_open: bool,
 }
 
 /// What a swept lease left behind.
@@ -144,6 +150,18 @@ struct Expired {
     /// would leave that MCP session resident and its id still accepted, and every reconnect cycle
     /// would add another.
     holder: Option<String>,
+}
+
+impl Tenancy {
+    /// Reserves the server for a request that is on its way to becoming the holder.
+    ///
+    /// Renewing the deadline is the load-bearing half. A claim admitted near the end of a grace
+    /// would otherwise be adopting sessions the sweeper is entitled to release while
+    /// `mcp.handle` is still running — the client would be handed a target that is being let go.
+    fn claim(&mut self, grace: Duration) {
+        self.claiming = true;
+        self.deadline = Some(Instant::now() + grace);
+    }
 }
 
 /// What the tenancy gate decided about one request.
@@ -209,13 +227,13 @@ impl Lease {
             // taken until `settle` hears the session was real, or a stale id would lock the server
             // out for a whole grace period.
             (Some(_), None) if !state.claiming => {
-                state.claiming = true;
+                state.claim(self.grace);
                 Admission::Serve
             }
             // A new client, and nobody attached or attaching: it reserves the server here, and
             // inherits whatever the last one left open.
             (None, None) if !state.claiming => {
-                state.claiming = true;
+                state.claim(self.grace);
                 Admission::Serve
             }
             // Someone is mid-`initialize`, or holds it already.
@@ -237,18 +255,26 @@ impl Lease {
         // is a server nobody can claim. Every route out of here has resolved it — the arms below
         // decide who holds the server, not whether the claim is over.
         state.claiming = false;
-        let adopted = state.holder.is_none() && state.deadline.is_some();
+        // A teardown that started while this request was being handled has already decided the
+        // sessions are going. Installing a holder now would hand a client something being released
+        // out from under it, and the client is better served by being told to come back.
+        if state.releasing {
+            return false;
+        }
+        let adopted = state.left_open;
         match (minted, requested) {
             // An `initialize` that produced a session: the claim becomes a holder.
             (Some(id), _) => {
                 state.holder = Some(id.to_string());
                 state.deadline = Some(Instant::now() + self.grace);
+                state.left_open = false;
                 adopted
             }
             // A resumed session the service accepted: the returning client is the holder again.
             (None, Some(id)) if ok && state.holder.is_none() => {
                 state.holder = Some(id.to_string());
                 state.deadline = Some(Instant::now() + self.grace);
+                state.left_open = false;
                 adopted
             }
             // Anything else, including an `initialize` that failed: the reservation is already
@@ -263,6 +289,7 @@ impl Lease {
         if state.holder.as_deref() == Some(id) {
             state.holder = None;
             state.deadline = Some(Instant::now() + self.grace);
+            state.left_open = true;
         }
     }
 
@@ -278,6 +305,12 @@ impl Lease {
             Some(at) if Instant::now() >= at => {
                 let holder = state.holder.take();
                 state.deadline = None;
+                // Including a claim. A request whose connection died before `settle` would
+                // otherwise leave this set for ever — no client could take the server, and no
+                // expiry would ever clear it either, because a claim renews the deadline it would
+                // have to outlive. Bounded by one grace, and this is the bound.
+                state.claiming = false;
+                state.left_open = false;
                 state.releasing = true;
                 Some(Expired { holder })
             }
@@ -683,6 +716,73 @@ mod tests {
         lease.released("session-b");
         std::thread::sleep(Duration::from_millis(5));
         assert_eq!(lease.expired().map(|e| e.holder), Some(None));
+    }
+
+    /// A claim keeps alive the sessions it is adopting.
+    ///
+    /// Admission near the end of a grace would otherwise reserve the server and leave the previous
+    /// client's deadline armed, so the sweeper could release the very sessions the request is being
+    /// admitted to adopt — while `mcp.handle` is still running.
+    #[test]
+    fn reserving_the_server_renews_what_the_claim_is_adopting() {
+        let lease = Lease::new(Duration::from_millis(60), Duration::from_micros(1))
+            .expect("a grace longer than the budget");
+        lease.admit(None);
+        lease.settle(None, Some("session-a"), true);
+        lease.released("session-a");
+        std::thread::sleep(Duration::from_millis(40));
+
+        assert_eq!(
+            lease.admit(None),
+            Admission::Serve,
+            "still inside the grace"
+        );
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            lease.expired().is_none(),
+            "the claim pushed the deadline out; without that the sweep would have released the \
+             sessions this request is in the middle of adopting"
+        );
+    }
+
+    /// A request that never settles cannot wedge the server for ever.
+    ///
+    /// The reservation introduced this: a connection dropped inside `mcp.handle` never reaches
+    /// `settle`, so without expiry clearing the claim, no client could take the server and no sweep
+    /// would ever clear it — a claim renews the deadline an expiry would have to outlive.
+    #[test]
+    fn a_claim_whose_request_died_is_cleared_by_the_grace() {
+        let lease = Lease::new(Duration::from_millis(1), Duration::from_micros(1))
+            .expect("a grace longer than the budget");
+        assert_eq!(lease.admit(None), Admission::Serve);
+        std::thread::sleep(Duration::from_millis(5));
+
+        assert!(
+            lease.expired().is_some(),
+            "the claim's own deadline ran out"
+        );
+        assert!(!lease.state().claiming, "and took the reservation with it");
+        lease.released_leases();
+        assert_eq!(lease.admit(None), Admission::Serve);
+    }
+
+    /// A teardown already under way wins over a claim settling into it.
+    #[test]
+    fn a_claim_that_settles_during_a_teardown_does_not_take_the_server() {
+        let lease = Lease::new(Duration::from_millis(1), Duration::from_micros(1))
+            .expect("a grace longer than the budget");
+        lease.admit(None);
+        lease.settle(None, Some("session-a"), true);
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(lease.expired().is_some());
+
+        // The request that was in flight when the sweep started now comes back.
+        assert!(!lease.settle(None, Some("session-b"), true));
+        assert_eq!(
+            lease.state().holder,
+            None,
+            "a client must not be handed sessions that are being released out from under it"
+        );
     }
 
     /// Nothing is admitted between deciding to release and having released.
