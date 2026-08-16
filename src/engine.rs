@@ -940,6 +940,17 @@ impl Sessions {
     }
 
     /// Every session, newest first, as `session_status` reports them.
+    /// Whether any live session still has work the engine has not finished.
+    ///
+    /// **Not the same question as "is anyone waiting for it".** A job outlives the wait for it —
+    /// [`Self::call_as`] cancels only the waiter, and says so — so a dropped request, a timeout, or
+    /// a client that vanished all leave a job running against a target. Anything deciding it is
+    /// safe to hand that target to somebody else has to ask this, not whether the caller is still
+    /// there. See [`crate::listen`], which is the caller that has to.
+    pub fn busy(&self) -> bool {
+        self.registry().live().iter().any(|session| session.busy())
+    }
+
     pub fn snapshot(&self) -> Vec<SessionSnapshot> {
         let registry = self.registry();
         let current = registry.current().map(|s| s.id.clone());
