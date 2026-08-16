@@ -8,16 +8,85 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+/// A recorder's architecture, and the two different names the installers give it.
+///
+/// Worth a type rather than a string because the two layouts disagree about the spelling: the SDK
+/// ships `Debuggers\x64`, while the store package's payload directory for the same thing is
+/// `amd64`. Getting that crossed silently selects a recorder for the wrong architecture.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Arch {
+    Arm64,
+    X64,
+    X86,
+}
+
+impl Arch {
+    /// The one this build of `windbg-mcp` is, which is the best guess available here about what it
+    /// will be asked to record.
+    ///
+    /// Deliberately the *binary's* architecture and not the machine's, for the same reason
+    /// `setup.md` matches the engine DLLs to the executable: an x64 build running under emulation
+    /// on an ARM64 host is being used for x64 work, and its debuggee is far more likely to be x64
+    /// than native.
+    fn of_this_build() -> Self {
+        match std::env::consts::ARCH {
+            "aarch64" => Self::Arm64,
+            "x86" => Self::X86,
+            // x86_64, and anything unforeseen: x64 is the overwhelmingly common case and the only
+            // one every installer ships.
+            _ => Self::X64,
+        }
+    }
+
+    /// The SDK's directory under `Windows Kits\10\Debuggers`.
+    fn sdk_dir(self) -> &'static str {
+        match self {
+            Self::Arm64 => "arm64",
+            Self::X64 => "x64",
+            Self::X86 => "x86",
+        }
+    }
+
+    /// The store package's payload directory, which spells x64 differently.
+    fn payload_dir(self) -> &'static str {
+        match self {
+            Self::Arm64 => "arm64",
+            Self::X64 => "amd64",
+            Self::X86 => "x86",
+        }
+    }
+}
+
+/// Every architecture, this build's first.
+///
+/// An **ordering, not a filter**. Recording an emulated x64 process on an ARM64 host genuinely
+/// wants the `amd64` recorder, so no architecture is excluded — but the native one is tried first
+/// because it is right whenever the debuggee is what this build is for, which is the ordinary case.
+///
+/// The honest selector is the *target's* architecture, and nothing here knows it: `record_trace`
+/// receives a command line, and resolving that to a file to read a PE header from is a different
+/// problem with its own failure modes. When this guess is wrong, put the right recorder on `PATH`
+/// — [`find_ttd`] looks there first, and that is the documented escape hatch
+/// ([#131](https://github.com/glslang/windbg-mcp/issues/131)).
+fn probe_order() -> [Arch; 3] {
+    match Arch::of_this_build() {
+        Arch::Arm64 => [Arch::Arm64, Arch::X64, Arch::X86],
+        Arch::X64 => [Arch::X64, Arch::Arm64, Arch::X86],
+        Arch::X86 => [Arch::X86, Arch::X64, Arch::Arm64],
+    }
+}
+
 /// Best-effort search for `TTD.exe` from an installed Windows debugging toolset.
 pub fn find_ttd() -> Option<PathBuf> {
-    // 1. Anything already on PATH.
+    // 1. Anything already on PATH. First, and so the way to override everything below.
     if let Some(p) = search_path("TTD.exe") {
         return Some(p);
     }
     // 2. Classic SDK "Debugging Tools for Windows".
-    for arch in ["x64", "arm64"] {
+    for arch in probe_order() {
         let p = PathBuf::from(format!(
-            r"C:\Program Files (x86)\Windows Kits\10\Debuggers\{arch}\TTD\TTD.exe"
+            r"C:\Program Files (x86)\Windows Kits\10\Debuggers\{}\TTD\TTD.exe",
+            arch.sdk_dir()
         ));
         if p.is_file() {
             return Some(p);
@@ -45,16 +114,19 @@ fn find_in_windowsapps() -> Option<PathBuf> {
             continue;
         }
         let base = entry.path();
-        for rel in [
-            r"amd64\TTD\TTD.exe",
-            r"TTD\TTD.exe",
-            r"arm64\TTD\TTD.exe",
-            r"x64\TTD\TTD.exe",
-        ] {
-            let candidate = base.join(rel);
+        // Architecture-specific first, in the order above: an ARM64 package carries *all three*
+        // payloads, so whichever is probed first is what a package like that always returns.
+        for arch in probe_order() {
+            let candidate = base.join(format!(r"{}\TTD\TTD.exe", arch.payload_dir()));
             if candidate.is_file() {
                 return Some(candidate);
             }
+        }
+        // A layout with no architecture directory at all, last: there is only ever one of these, so
+        // reaching it means none of the above matched and it is the whole of what the package has.
+        let candidate = base.join(r"TTD\TTD.exe");
+        if candidate.is_file() {
+            return Some(candidate);
         }
     }
     None
@@ -214,7 +286,7 @@ fn first_meaningful_line(log: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_meaningful_line, split_env_entry};
+    use super::{Arch, first_meaningful_line, probe_order, split_env_entry};
 
     #[test]
     fn split_env_entry_parses_key_value() {
@@ -274,5 +346,74 @@ mod tests {
     fn skips_leading_blank_lines() {
         let log = "\n\n   \nactual message\n";
         assert_eq!(first_meaningful_line(log), Some("actual message"));
+    }
+
+    /// The native recorder is tried first, and nothing is excluded.
+    ///
+    /// The bug this fixes was an ordering, not a missing candidate: an ARM64 WinDbg package ships
+    /// `amd64`, `arm64` and `x86` payloads, so a fixed list headed by `amd64` returned the
+    /// emulation recorder on every ARM64 host — a native ARM64 target cannot be recorded with it.
+    #[test]
+    fn the_native_recorder_is_probed_first_and_the_others_still_follow() {
+        let order = probe_order();
+        assert_eq!(
+            order[0],
+            Arch::of_this_build(),
+            "the build's own architecture leads"
+        );
+
+        let mut seen = order.to_vec();
+        seen.sort_by_key(|a| format!("{a:?}"));
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            3,
+            "and every architecture is still reachable — recording an emulated target wants one of \
+             the others, so this is an ordering and not a filter"
+        );
+    }
+
+    /// Each host leads with itself, so the rule is not "arm64 first" hard-coded.
+    #[test]
+    fn every_architecture_leads_its_own_order() {
+        for arch in [Arch::Arm64, Arch::X64, Arch::X86] {
+            let order = match arch {
+                Arch::Arm64 => [Arch::Arm64, Arch::X64, Arch::X86],
+                Arch::X64 => [Arch::X64, Arch::Arm64, Arch::X86],
+                Arch::X86 => [Arch::X86, Arch::X64, Arch::Arm64],
+            };
+            assert_eq!(order[0], arch);
+        }
+    }
+
+    /// The two installers spell x64 differently, and crossing them selects the wrong recorder.
+    #[test]
+    fn the_sdk_and_the_store_package_disagree_about_x64() {
+        assert_eq!(Arch::X64.sdk_dir(), "x64");
+        assert_eq!(
+            Arch::X64.payload_dir(),
+            "amd64",
+            "the store payload directory is `amd64` where the SDK's is `x64` — the one difference \
+             between the two layouts that is not a path prefix"
+        );
+
+        // And the two agree everywhere else, which is why only x64 is a trap.
+        assert_eq!(Arch::Arm64.sdk_dir(), Arch::Arm64.payload_dir());
+        assert_eq!(Arch::X86.sdk_dir(), Arch::X86.payload_dir());
+    }
+
+    /// Whatever this build is, it maps onto an architecture the installers actually ship.
+    #[test]
+    fn this_build_resolves_to_a_shipped_recorder() {
+        let own = Arch::of_this_build();
+        assert!(!own.sdk_dir().is_empty() && !own.payload_dir().is_empty());
+        assert_eq!(
+            own,
+            match std::env::consts::ARCH {
+                "aarch64" => Arch::Arm64,
+                "x86" => Arch::X86,
+                _ => Arch::X64,
+            }
+        );
     }
 }
