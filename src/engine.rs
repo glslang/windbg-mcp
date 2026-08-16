@@ -905,19 +905,31 @@ impl Sessions {
     /// This is where a stale handle is refused. It is *not* the whole check — the session can
     /// still be retired between here and the worker — which is why [`Gate`] repeats it at the
     /// front of the queue.
+    ///
+    /// It is also where the transcript learns **which** session a call reached
+    /// ([`crate::record::routed_to`]), and it is here rather than at the call sites because the
+    /// caller's argument is not the answer: a call naming no session still acts on the current
+    /// one. Two tools resolve by hand instead of going through `run_call` — `interrupt` and
+    /// `end_session` — and recording at the funnel is what stops them, and the next one like
+    /// them, from being missed.
     pub fn resolve(&self, supplied: Option<&str>) -> Result<Arc<Session>, EngineError> {
         let registry = self.registry();
         let Some(want) = supplied else {
-            return registry.current().ok_or_else(|| {
+            let current = registry.current().ok_or_else(|| {
                 EngineError::Stale(
                     "no debug session is open. Start one with open_dump / open_trace / \
                      attach_process / attach_kernel / attach_kernel_local / launch."
                         .to_string(),
                 )
-            });
+            })?;
+            crate::record::routed_to(&current.id);
+            return Ok(current);
         };
         match registry.find(want) {
-            Some(session) if session.state().accepts_handle() => Ok(session),
+            Some(session) if session.state().accepts_handle() => {
+                crate::record::routed_to(&session.id);
+                Ok(session)
+            }
             Some(session) => Err(EngineError::Stale(stale_handle(want, &session.state()))),
             None => Err(EngineError::Stale(format!(
                 "unknown session handle `{want}`: this server is not holding it. Either it was \
@@ -1244,20 +1256,6 @@ impl Sessions {
                 _ => None,
             },
         };
-        // From the same value the caller is answered with, not from the paragraph below it. The
-        // one fact an unattended run is read for is `released`: false means the worker was killed
-        // still holding its target, and for a live kernel that is a machine left halted.
-        //
-        // Not for a stale handle, which tore nothing down: recording an end for a session that was
-        // never ended would put a teardown in the transcript that did not happen.
-        if !matches!(outcome, Release::Stale(_)) {
-            self.rec.write(crate::record::Event::SessionEnd {
-                session: ended.session_id.clone(),
-                released: ended.released,
-                worker_terminated: ended.worker_terminated,
-                waited_ms: ended.waited_ms,
-            });
-        }
         let (reason, message) = match outcome {
             // A refused handle is the mechanism working, not a session to tear down.
             Release::Stale(why) => return Err(EngineError::Stale(why)),
@@ -1352,7 +1350,7 @@ impl Sessions {
         }
         session.fail_outstanding(&format!("session `{}` was ended", session.id));
         session.kill();
-        match out {
+        let outcome = match out {
             Ok(out) => Release::Released(out.text),
             // Carries what it actually waited, because that is no longer one constant: a session
             // unwinding a transaction is given the extra time it asked for, and a report naming
@@ -1360,7 +1358,31 @@ impl Sessions {
             Err(EngineError::Timeout(_)) => Release::Parked { waited },
             Err(EngineError::Lost(_)) => Release::AlreadyGone,
             Err(e) => Release::Refused(e.to_string()),
-        }
+        };
+        // Recorded **here**, at the one place every teardown passes, rather than by each caller.
+        // There are three — `end_session`, the shutdown sweep, and the reclamation that pays for
+        // a new session at the limit — and the first two rounds of review each found one that had
+        // been forgotten. A caller cannot forget this one.
+        //
+        // `released` is the session's flag, not this attempt's outcome, and the difference shows
+        // when two teardowns race for one session: only the winner is told it worked, and the
+        // loser's failure is not news about the *target*. The question a transcript is read for is
+        // "was it let go?", which the flag answers and this attempt's result does not.
+        //
+        // A stale handle never reaches here — it returns above — so no teardown that tore nothing
+        // down is recorded as one.
+        session.rec.write(crate::record::Event::SessionEnd {
+            session: session.id.clone(),
+            released: session.released.load(Ordering::SeqCst),
+            worker_terminated: !matches!(outcome, Release::AlreadyGone),
+            waited_ms: match &outcome {
+                Release::Parked { waited } => {
+                    Some(waited.as_millis().min(u128::from(u64::MAX)) as u64)
+                }
+                _ => None,
+            },
+        });
+        outcome
     }
 
     /// Ends every session, then terminates any worker that did not let go. Called when the client
@@ -1417,26 +1439,6 @@ impl Sessions {
                     )
                     .await;
                 let note = shutdown_note(&outcome, session.released.load(Ordering::SeqCst));
-                // The same record `end_session` writes, and this is the path that needs it more:
-                // a disconnect has no caller to answer, so without it the transcript of an
-                // unattended run ends with "shutting down" and never says what became of each
-                // target. `released` is read from the note rather than from this attempt's own
-                // outcome, because two teardowns can race for one session and the loser's failure
-                // is not news about the target — see [`ShutdownNote`].
-                session.rec.write(crate::record::Event::SessionEnd {
-                    session: session.id.clone(),
-                    released: matches!(
-                        note,
-                        ShutdownNote::Released | ShutdownNote::ReleasedElsewhere
-                    ),
-                    worker_terminated: !matches!(outcome, Release::AlreadyGone | Release::Stale(_)),
-                    waited_ms: match &outcome {
-                        Release::Parked { waited } => {
-                            Some(waited.as_millis().min(u128::from(u64::MAX)) as u64)
-                        }
-                        _ => None,
-                    },
-                });
                 // `end_session` renders this for its caller. Shutdown has no caller — the client
                 // has already gone — so the log is the only place it can land, and it is exactly
                 // where an operator looks after finding a guest that did not come back.

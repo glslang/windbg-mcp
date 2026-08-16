@@ -143,6 +143,20 @@ Renders a session transcript (WINDBG_MCP_TRANSCRIPT) as an asciicast v2 recordin
 
 /// Renders `options.input` into `options.output`, and reports what it wrote.
 pub fn render(options: &Options) -> Result<Summary, String> {
+    // Before anything is read, because what follows would destroy the evidence. Writing the cast
+    // truncates its output, and two ways of asking lead here: `--out` naming the input, and a
+    // transcript that already ends in `.cast`, whose default output is itself. The render would
+    // then *succeed* — the records are in memory by then — and replace the only JSONL copy of the
+    // session with a rendering of it. That is the one failure this whole feature exists to
+    // prevent, arriving through the tool meant to make the session shareable.
+    if same_file(&options.input, &options.output) {
+        return Err(format!(
+            "the rendering would be written over the transcript it is made from (`{}`). Name a \
+             different `--out`: the transcript is the record, and a cast is a rendering of it that \
+             can be made again.",
+            options.input.display()
+        ));
+    }
     let transcript = std::fs::read_to_string(&options.input)
         .map_err(|e| format!("could not read `{}`: {e}", options.input.display()))?;
     let (records, unreadable) = parse(&transcript);
@@ -210,6 +224,20 @@ pub struct Summary {
     /// session was.
     pub runs: usize,
     pub duration_ms: u64,
+}
+
+/// Whether two paths name the same file.
+///
+/// By identity where the filesystem can say so — `canonicalize` resolves `.`, `..`, a symlink and
+/// (on Windows) the case of a path that exists, which a string comparison of
+/// `run.jsonl` against `./RUN.jsonl` would not. It only answers for paths that exist, and the
+/// output usually does not yet, so the comparison falls back to the paths as given: enough for
+/// the two ways this is actually reached, both of which produce literally equal paths.
+fn same_file(a: &std::path::Path, b: &std::path::Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 /// The records in playback order, each with the time it plays at — never decreasing.
@@ -940,6 +968,47 @@ mod tests {
         );
         assert!(summary.frames > 0, "everything before it is still there");
         read_cast(&options.output);
+    }
+
+    /// The rendering must never be written over the transcript it came from.
+    ///
+    /// The render would *succeed* — the records are in memory by the time the output is truncated
+    /// — and the only JSONL copy of the session would be replaced by a rendering of it. Two ways
+    /// in: `--out` naming the input, and a transcript already called `.cast`, whose default output
+    /// is itself. Both are checked, and both before a single byte is read.
+    #[test]
+    fn a_rendering_never_overwrites_the_transcript_it_came_from() {
+        let input = scratch("self-overwrite");
+        let _ = std::fs::remove_file(&input);
+        let rec = Recorder::to_file(&input, 0).expect("a transcript");
+        rec.write(Event::Shutdown { sessions: 0 });
+        drop(rec);
+        let before = std::fs::read_to_string(&input).expect("the transcript");
+
+        // Explicitly, with `--out`.
+        let options = Options::parse(&[
+            input.display().to_string(),
+            "--out".to_string(),
+            input.display().to_string(),
+        ])
+        .expect("parse");
+        let error = render(&options).expect_err("this would destroy the transcript");
+        assert!(error.contains("written over the transcript"), "{error}");
+
+        // And by default, for a transcript that happens to be named `.cast`.
+        let named_cast = input.with_extension("cast");
+        std::fs::copy(&input, &named_cast).expect("copy");
+        let options = Options::parse(&[named_cast.display().to_string()]).expect("parse");
+        assert_eq!(options.output, options.input, "the default collides here");
+        let error = render(&options).expect_err("this would destroy the transcript");
+        assert!(error.contains("written over the transcript"), "{error}");
+
+        assert_eq!(
+            std::fs::read_to_string(&input).expect("the transcript"),
+            before,
+            "the transcript was modified by a render that should have refused"
+        );
+        let _ = std::fs::remove_file(&named_cast);
     }
 
     /// An empty or non-transcript file is refused with an explanation rather than producing a cast

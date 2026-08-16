@@ -3961,6 +3961,67 @@ fn a_transcript_records_both_teardowns_and_invents_neither() {
     let _ = std::fs::remove_file(&transcript);
 }
 
+/// A session reclaimed to pay for a new one is a teardown nobody asked for, and the transcript is
+/// the only place it is reported.
+///
+/// The third way a target is let go, after `end_session` and a disconnect: opening at the session
+/// limit reclaims the oldest idle one, in a background task, with no caller to answer and nothing
+/// in the tool result to say it happened. Whether that target was released cleanly or its worker
+/// was killed still holding it is exactly the question a transcript exists for — and for a live
+/// kernel it is the difference between a machine that came back and one that is sitting halted.
+#[test]
+fn a_session_reclaimed_at_the_limit_records_what_became_of_it() {
+    let Some(dump) = target_tier() else { return };
+    let transcript = marker_path("reclaimed");
+    let _ = std::fs::remove_file(&transcript);
+    let mut server = Server::started_with(&[(
+        "WINDBG_MCP_TRANSCRIPT",
+        transcript.to_str().expect("a UTF-8 temp path"),
+    )]);
+
+    // One past the limit the server documents, so the oldest idle session pays for the last open.
+    const MAX_SESSIONS: usize = 4;
+    let opened: Vec<String> = (0..=MAX_SESSIONS)
+        .map(|_| server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP))
+        .collect();
+    let reclaimed = &opened[0];
+
+    // The reclamation releases in a task of its own, so its record can land after the open that
+    // provoked it returned. Waited for rather than assumed — and the failure if it never comes is
+    // this assertion, not a confusing one later.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let ended = loop {
+        let found = std::fs::read_to_string(&transcript)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .find(|r| r["event"] == "session_end" && r["session"] == *reclaimed);
+        match found {
+            Some(record) => break record,
+            None if Instant::now() >= deadline => panic!(
+                "session {reclaimed} was reclaimed to make room and the transcript never said \
+                 what became of it:\n{}",
+                std::fs::read_to_string(&transcript).unwrap_or_default()
+            ),
+            None => std::thread::sleep(Duration::from_millis(100)),
+        }
+    };
+    assert_eq!(
+        ended["released"], true,
+        "a dump session lets go cleanly even when it is reclaimed rather than ended: {ended}"
+    );
+    // And the handle now says it is gone, which is the caller-visible half of the same fact.
+    let status = server.tool_data(
+        "session_status",
+        json!({ "session_id": reclaimed }),
+        TARGET_STEP,
+    );
+    assert_eq!(status["sessions"][0]["live"], false, "{status}");
+
+    assert_eq!(server.shutdown(), Some(0));
+    let _ = std::fs::remove_file(&transcript);
+}
+
 /// A worker whose supervisor died without saying goodbye still lets go and exits.
 ///
 /// This is the mechanism the whole teardown story now rests on. The supervisor does not terminate
