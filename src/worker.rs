@@ -944,7 +944,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             |commit| {
                 // As in `OpenDump`: commit before the load wait, because a wait that times out
                 // still leaves DbgEng holding the trace.
-                e.open_trace(&path).map_err(es)?;
+                e.open_trace(&path).map_err(trace_open_failure)?;
                 commit();
                 e.wait_for_event(LOAD_WAIT_MS).map_err(es)
             },
@@ -1247,6 +1247,49 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
 /// Maps any error to a `String` for the wire.
 fn es<E: ToString>(e: E) -> String {
     e.to_string()
+}
+
+/// Whether a TTD replay engine is bundled beside this executable.
+///
+/// DbgEng loads the replay engine — `TTDReplay*.dll`, `TtdExt.dll`, `TTDAnalyze.dll` — out of a
+/// `ttd\` directory next to itself, and System32's `dbgeng.dll` ships none of them. So a host that
+/// never bundled the WinDbg package cannot replay *any* trace, and the only way it says so is
+/// `0x80070057` from `open_trace` — "the parameter is incorrect", which names neither the missing
+/// directory nor the fix, and reads as a complaint about the path the caller passed.
+///
+/// Probed against **this executable's** directory rather than the loaded engine's, because that is
+/// the layout `setup.md` prescribes and the only one this server can reason about without asking
+/// the loader where `dbgeng.dll` came from: the bundle is copied next to `windbg-mcp.exe`, so the
+/// engine and its `ttd\` are both there. It answers correctly for the case that actually happens
+/// too — an engine taken from System32, where there is no `ttd\` anywhere on the host.
+fn replay_engine_bundled() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("ttd").is_dir()))
+        // Say nothing rather than something wrong: an executable that cannot locate itself is no
+        // evidence that the engine is unbundled.
+        .unwrap_or(true)
+}
+
+/// `open_trace`'s failure, told against what this host can actually do.
+fn trace_open_failure<E: ToString>(error: E) -> String {
+    explain_trace_failure(error.to_string(), replay_engine_bundled())
+}
+
+/// The message half of [`trace_open_failure`], split from the probe so it can be tested without
+/// standing up a directory layout around the test binary.
+fn explain_trace_failure(message: String, bundled: bool) -> String {
+    if bundled {
+        return message;
+    }
+    format!(
+        "{message}\n\nAlso worth knowing, whatever this error turns out to be: there is no `ttd\\` \
+         directory beside this server's executable, so this host cannot replay *any* trace — \
+         System32's `dbgeng.dll` ships no replay engine and rejects every `.run` with \
+         `0x80070057`. If the path is right, that is the reason, and no change to it will help. \
+         Copy `ttd\\` from the WinDbg package next to `windbg-mcp.exe`; the skill's `setup.md` \
+         lists the whole engine bundle."
+    )
 }
 
 /// Maps any error onto the wire as the ordinary case: the debugger ran it and it failed.
@@ -5646,5 +5689,62 @@ mod tests {
         assert!(HeapOp::chunk("0x1000".into(), Some(true)).refreshes());
         assert!(!HeapOp::census(None, None, None).refreshes());
         assert!(!HeapOp::diagnostics(None, None, Some(false), None).refreshes());
+    }
+
+    /// A host that *can* replay says only what the debugger said.
+    ///
+    /// The point of the split is that the note is evidence-bearing: appending it to every failed
+    /// `open_trace` would make it noise, and would misdirect the one caller whose path really is
+    /// wrong on a properly bundled host.
+    #[test]
+    fn a_bundled_host_reports_the_engines_own_failure_and_nothing_else() {
+        let engine = "trace load failed: 0x80070057".to_string();
+        assert_eq!(explain_trace_failure(engine.clone(), true), engine);
+    }
+
+    /// A host that cannot replay at all says so, and names the directory to copy.
+    ///
+    /// `0x80070057` is "the parameter is incorrect", which on this path is a lie of omission: the
+    /// parameter is fine and the engine simply has no replay DLLs. A reader who takes the error at
+    /// face value edits the one thing that was never wrong ([#132]).
+    ///
+    /// [#132]: https://github.com/glslang/windbg-mcp/issues/132
+    #[test]
+    fn a_host_with_no_replay_engine_says_so_rather_than_leaving_the_error_bare() {
+        let explained = explain_trace_failure("trace load failed: 0x80070057".to_string(), false);
+
+        assert!(
+            explained.starts_with("trace load failed: 0x80070057"),
+            "the engine's own words stay first; the note is added to them, not substituted for \
+             them: {explained}"
+        );
+        assert!(
+            explained.contains("ttd\\"),
+            "it names the directory to copy: {explained}"
+        );
+    }
+
+    /// And it claims only what it can know.
+    ///
+    /// The probe answers "can this host replay at all", which is a fact about the *host* — it is
+    /// no evidence about why this particular open failed. On a host with no `ttd\`, a genuinely
+    /// mistyped path fails for its own reason and gets this note too, so a note that asserted the
+    /// path was fine would be confidently wrong exactly when the caller most needs it right.
+    #[test]
+    fn the_note_does_not_pronounce_on_a_failure_it_cannot_see() {
+        let explained = explain_trace_failure("trace load failed: file not found".to_string(), false);
+
+        assert!(
+            explained.contains("whatever this error turns out to be"),
+            "it is explicit that it has not diagnosed this failure: {explained}"
+        );
+        assert!(
+            explained.contains("If the path is right"),
+            "and conditions the conclusion on the one thing it cannot check: {explained}"
+        );
+        assert!(
+            !explained.contains("Nothing about the trace or the path needs changing"),
+            "never the unconditional claim, which a mistyped path would falsify: {explained}"
+        );
     }
 }
