@@ -114,9 +114,14 @@ pub fn requested(args: &[String]) -> Option<Result<SocketAddr>> {
 ///
 /// One lock over both, because they are one decision. "Is there a holder" and "has it expired" read
 /// together or a request can be admitted against a holder the sweeper is releasing.
-#[derive(Debug)]
 struct Lease {
     grace: Duration,
+    /// Consulted before tenancy changes hands, never for anything else.
+    ///
+    /// The listener otherwise knows nothing about debug sessions — but "may this client have the
+    /// server" cannot be answered from HTTP alone, because an engine job outlives the request that
+    /// asked for it.
+    sessions: Sessions,
     state: Mutex<Tenancy>,
 }
 
@@ -194,16 +199,6 @@ impl Tenancy {
     /// Renewing the deadline is the load-bearing half. A claim admitted near the end of a grace
     /// would otherwise be adopting sessions the sweeper is entitled to release while
     /// `mcp.handle` is still running — the client would be handed a target that is being let go.
-    /// Completes a deferred goodbye once nothing admitted under the holder is still running.
-    fn give_up_if_drained(&mut self, grace: Duration) {
-        if self.farewell && self.in_flight == 0 {
-            self.farewell = false;
-            self.holder = None;
-            self.deadline = Some(Instant::now() + grace);
-            self.left_open = true;
-        }
-    }
-
     fn claim(&mut self, grace: Duration) -> u64 {
         self.claims_issued += 1;
         self.claim = Some(self.claims_issued);
@@ -269,7 +264,7 @@ impl Lease {
     /// sends nothing for minutes, so a grace shorter than the call budget reads it as an absent
     /// client and releases the very session the call is running against. Refusing at startup makes
     /// that a message an operator sees once, instead of a target that goes away mid-analysis.
-    fn new(grace: Duration, call_timeout: Duration) -> Result<Self> {
+    fn new(grace: Duration, call_timeout: Duration, sessions: Sessions) -> Result<Self> {
         let quiet = longest_quiet_call(call_timeout);
         if grace <= quiet {
             bail!(
@@ -283,6 +278,7 @@ impl Lease {
         }
         Ok(Self {
             grace,
+            sessions,
             state: Mutex::new(Tenancy::default()),
         })
     }
@@ -409,7 +405,8 @@ impl Lease {
         // that is the point: tenancy is given up when the work admitted under it drains, which is
         // at worst this request and at best a tool call still running on another connection.
         state.farewell = true;
-        state.give_up_if_drained(self.grace);
+        drop(state);
+        self.try_give_up();
     }
 
     /// One admitted request finished, however it finished.
@@ -424,7 +421,8 @@ impl Lease {
             return;
         }
         state.in_flight = state.in_flight.saturating_sub(1);
-        state.give_up_if_drained(self.grace);
+        drop(state);
+        self.try_give_up();
     }
 
     /// Whether the lease has run out, **claiming the teardown** if so.
@@ -459,6 +457,33 @@ impl Lease {
         }
     }
 
+    /// Hands the server over, if a goodbye is outstanding and nothing is still using it.
+    ///
+    /// Two conditions, and they are not the same one. `in_flight` is HTTP: the requests this holder
+    /// was admitted for. `Sessions::busy` is the engine: a job survives the request that queued it,
+    /// so a dropped future or a timed-out call leaves work running against a target the next client
+    /// would otherwise be handed. Attempted on every sweep as well as on the two events, because
+    /// the engine going idle is not an event this side can see.
+    fn try_give_up(&self) {
+        let mut state = self.state();
+        if !state.farewell || state.in_flight != 0 {
+            return;
+        }
+        drop(state);
+        if self.sessions.busy() {
+            return;
+        }
+        state = self.state();
+        // Re-checked: the two locks were not held together, so a request could have arrived.
+        if !state.farewell || state.in_flight != 0 {
+            return;
+        }
+        state.farewell = false;
+        state.holder = None;
+        state.deadline = Some(Instant::now() + self.grace);
+        state.left_open = true;
+    }
+
     /// The teardown is done; the server may be taken again.
     fn released_leases(&self) {
         self.state().releasing = false;
@@ -481,7 +506,7 @@ pub async fn serve(sessions: Sessions, addr: SocketAddr, call_timeout: Duration)
         Some(secs) if secs > 0 => Duration::from_secs(secs),
         _ => longest_quiet_call(call_timeout) + GRACE_HEADROOM,
     };
-    let lease = Arc::new(Lease::new(grace, call_timeout)?);
+    let lease = Arc::new(Lease::new(grace, call_timeout, sessions.clone())?);
 
     if !addr.ip().is_loopback() {
         // Not refused: a host-only adapter is a legitimate choice and this server does not know
@@ -656,6 +681,9 @@ fn refuse(status: StatusCode, why: &str) -> Response<BoxBody<Bytes, Infallible>>
 async fn sweep(sessions: Sessions, lease: Arc<Lease>, manager: Arc<LocalSessionManager>) {
     loop {
         tokio::time::sleep(SWEEP).await;
+        // The engine may have gone idle since the last tick, which is not something the HTTP side
+        // is told about.
+        lease.try_give_up();
         let Some(expired) = lease.expired() else {
             continue;
         };
@@ -684,13 +712,19 @@ mod tests {
 
     /// A grace comfortably past the opener's end-to-end bound.
     fn lease() -> Lease {
-        Lease::new(longest_quiet_call(CALL) + Duration::from_secs(60), CALL).expect("workable")
+        Lease::new(
+            longest_quiet_call(CALL) + Duration::from_secs(60),
+            CALL,
+            Sessions::new(CALL),
+        )
+        .expect("workable")
     }
 
     /// A lease whose grace expires almost immediately, for the sweep paths.
     fn brief() -> Lease {
         Lease {
             grace: Duration::from_millis(1),
+            sessions: Sessions::new(CALL),
             state: Mutex::new(Tenancy::default()),
         }
     }
@@ -737,19 +771,26 @@ mod tests {
     #[test]
     fn a_grace_that_could_expire_inside_a_call_is_refused_at_startup() {
         assert!(
-            Lease::new(Duration::from_secs(120), CALL).is_err(),
+            Lease::new(Duration::from_secs(120), CALL, Sessions::new(CALL)).is_err(),
             "well under the budget"
         );
         assert!(
-            Lease::new(CALL + Duration::from_secs(1), CALL).is_err(),
+            Lease::new(CALL + Duration::from_secs(1), CALL, Sessions::new(CALL)).is_err(),
             "past the call budget but not past the worker handshake in front of it — the case that \
              looks safe and is not"
         );
         assert!(
-            Lease::new(longest_quiet_call(CALL), CALL).is_err(),
+            Lease::new(longest_quiet_call(CALL), CALL, Sessions::new(CALL)).is_err(),
             "equal is not enough: the call may finish at its deadline, not before it"
         );
-        assert!(Lease::new(longest_quiet_call(CALL) + Duration::from_secs(1), CALL).is_ok());
+        assert!(
+            Lease::new(
+                longest_quiet_call(CALL) + Duration::from_secs(1),
+                CALL,
+                Sessions::new(CALL)
+            )
+            .is_ok()
+        );
     }
 
     /// One client at a time — and admission has to *reserve*, not merely observe.
@@ -1011,6 +1052,28 @@ mod tests {
         );
     }
 
+    /// Tenancy waits on the *engine*, not only on the HTTP request that asked.
+    ///
+    /// A job outlives the wait for it — `Sessions::call_as` cancels only the waiter and says so —
+    /// so a dropped future or a timed-out call leaves work running against a target. Handing that
+    /// target to the next client because the HTTP side went quiet is the same overlap the in-flight
+    /// count exists to prevent, one layer down.
+    #[test]
+    fn a_goodbye_waits_for_the_engine_and_not_just_the_request() {
+        let lease = lease();
+        request(&lease, None, Some("session-a"), true);
+        goodbye(&lease, "session-a");
+        assert_eq!(
+            lease.state().holder,
+            None,
+            "with an idle engine the handover is immediate"
+        );
+
+        // `Sessions::busy` is what the lease consults, and an idle registry is not busy — so this
+        // test pins the wiring rather than the debugger, which needs a worker to be busy at all.
+        assert!(!lease.sessions.busy());
+    }
+
     /// A request that never came back cannot defer a goodbye for ever.
     #[test]
     fn a_swept_lease_forgets_work_it_was_waiting_on() {
@@ -1049,6 +1112,7 @@ mod tests {
     fn reserving_the_server_renews_what_the_claim_is_adopting() {
         let lease = Lease {
             grace: Duration::from_millis(60),
+            sessions: Sessions::new(CALL),
             state: Mutex::new(Tenancy::default()),
         };
         request(&lease, None, Some("session-a"), true);
