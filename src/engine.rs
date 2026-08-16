@@ -2106,6 +2106,11 @@ fn spawn_worker(exe: &Path) -> std::io::Result<(Child, Channel)> {
     for name in kdconn::env_names() {
         command.env_remove(name);
     }
+    // The listener's bearer token, for exactly the same reason and with a sharper edge. A worker
+    // never authenticates anything, so it has no use for the token — but a `launch`ed debuggee
+    // inheriting it could dial the listener on loopback, wait for the holder to go quiet, and take
+    // over the very sessions being used to debug it. The credential does not cross this boundary.
+    command.env_remove(crate::listen::TOKEN_ENV);
     let child = command
         .arg(WORKER_FLAG)
         .arg(format!(
