@@ -5732,7 +5732,8 @@ mod tests {
     /// path was fine would be confidently wrong exactly when the caller most needs it right.
     #[test]
     fn the_note_does_not_pronounce_on_a_failure_it_cannot_see() {
-        let explained = explain_trace_failure("trace load failed: file not found".to_string(), false);
+        let explained =
+            explain_trace_failure("trace load failed: file not found".to_string(), false);
 
         assert!(
             explained.contains("whatever this error turns out to be"),
