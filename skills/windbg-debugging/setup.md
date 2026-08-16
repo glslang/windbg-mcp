@@ -18,15 +18,34 @@ engine read an x64 kernel minidump here in full — `!analyze -v`, symbols, fail
 tag. Live user-mode and live kernel are untested on ARM64, and the bitness rule above still applies
 to those.
 
-Two things change when you bundle the engine:
+Two things change when you bundle the engine.
 
-- The store package's payload directory is **`\arm64`**, not `\amd64`.
-- If the store package will not install, the **Windows SDK Debugging Tools** are an alternative
-  source — `winsdksetup.exe /features OptionId.WindowsDesktopDebuggers /quiet /norestart`, landing
-  in `C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64`. It supplies every file in the copy
-  below **except `msdia140.dll` and `ttd\`**, so `!analyze`, the driver tools and symbol resolution
-  all work and **TTD replay does not**
-  ([#132](https://github.com/glslang/windbg-mcp/issues/132)).
+**Match the payload to `windbg-mcp.exe`'s architecture, not to the host's.** A process loads DLLs
+of its own architecture, so an x64 binary running under emulation on an ARM64 host needs the
+**`amd64`** engine and cannot load the `arm64` one — it will fail to initialise the debugger rather
+than fall back. Which you need therefore depends on where the binary came from:
+
+| `windbg-mcp.exe` | Store payload | SDK directory |
+| --- | --- | --- |
+| Prebuilt release zip (Option A) — **always x64** | `\amd64` | `Debuggers\x64` |
+| Built from source on an ARM64 host (Option B) | `\arm64` | `Debuggers\arm64` |
+
+The releases this repo publishes are x64 only, so downloading one onto an ARM64 host and reaching
+for `arm64` DLLs — the intuitive move — is the wrong pairing. `cargo build --release` on the host
+is what gets you a native binary worth pairing with `arm64`.
+
+**The store package is not the only source.** If it will not install, the **Windows SDK Debugging
+Tools** — `winsdksetup.exe /features OptionId.WindowsDesktopDebuggers /quiet /norestart` — land in
+`C:\Program Files (x86)\Windows Kits\10\Debuggers\<arch>` and supply every file in the copy below
+**except `msdia140.dll` and `ttd\`**. So `!analyze` and the driver tools work from it and **TTD
+replay does not** ([#132](https://github.com/glslang/windbg-mcp/issues/132)).
+
+Symbols are the interesting omission. `msdia140.dll` is documented below as required for PDB
+parsing, but on the host tested here full private symbols resolved (`nt!RtlpHpVsSlotFreeList`, not
+an export) with **no `msdia140.dll` anywhere on the machine and none registered** — the SDK's own
+`dbghelp.dll` read the PDBs unaided. Treat that requirement as a property of the `dbghelp.dll` you
+bundle rather than a universal one, and check with `lm m <mod>` (`(pdb symbols)` versus
+`(export symbols)`) rather than assuming either way.
 
 That fallback matters because MSIX registration fails from a **non-interactive** session —
 `Add-AppxPackage` returns `0x80070005` even when the session is elevated, leaving the payload
@@ -203,15 +222,19 @@ Invoke-WebRequest $uri -OutFile "$w\b.zip" -UseBasicParsing      # ~1.1 GB
 Expand-Archive "$w\b.zip" "$w\b" -Force
 Copy-Item "$w\b\windbg_win-x64.msix" "$w\p.zip" -Force           # or windbg_win-arm64.msix
 Expand-Archive "$w\p.zip" "$w\p" -Force
-Copy-Item "$w\p\amd64\ttd" "$dst\ttd" -Recurse -Force            # or arm64\ttd, matching the .msix
+Copy-Item "$w\p\amd64\ttd" "$dst\ttd" -Recurse -Force            # amd64 or arm64 — see below
 ```
 
-**Pick the architecture deliberately.** Each package carries `amd64\`, `arm64\` and `x86\` payloads
-— an ARM64 package ships all three — so a copy that takes the first match takes the emulation build.
-That is the same ordering trap as [#131](https://github.com/glslang/windbg-mcp/issues/131), and it
-is easy to walk into twice. [#132](https://github.com/glslang/windbg-mcp/issues/132) is why this is
-written down rather than assumed away; without `ttd\`, `open_trace` says so explicitly rather than
-leaving you with `0x80070057`.
+**Pick the architecture by `windbg-mcp.exe`, exactly as above** — not by the host, and not by which
+`.msix` you happened to unpack. Each package carries `amd64\`, `arm64\` and `x86\` payloads (an
+ARM64 package ships all three), so there is no default to fall back on and a copy that takes the
+first match takes the emulation build. That is the same ordering trap as
+[#131](https://github.com/glslang/windbg-mcp/issues/131), which is easy to walk into twice.
+
+[#132](https://github.com/glslang/windbg-mcp/issues/132) is why this is written down rather than
+assumed away. Note that `open_trace` reports a missing `ttd\` explicitly instead of leaving you with
+`0x80070057` — but it checks that the directory is *there*, not that what is in it matches your
+binary, so a wrong-architecture copy still surfaces as the bare engine error.
 
 ## Symbols — required for `module!func` name resolution
 

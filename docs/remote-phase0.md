@@ -121,17 +121,25 @@ DHCP, which is not routable off the host machine. That address moves — but Par
 the guest as `<vm-name>.shared`, so prefer that as the `HostName` and the drift stops mattering.
 
 When a connection fails, the useful first question is whether the guest is reachable at layer 2 at
-all, which separates a stale address from a filtered one:
+all, which separates a stale address from a filtered one. **Force a fresh resolution before reading
+the neighbour table**, because the table on its own answers neither question: an entry can outlive
+the guest that owned the address, and no entry may mean only that nothing has tried recently.
 
 ```console
-arp -a | grep <guest-subnet>
+nc -z -G 2 <guest-address> 22 ; arp -a | grep <guest-address>
 ```
 
-An entry resolving to the guest's MAC means the address is current and the guest answered — so
-anything above that is being dropped, and the firewall is where to look. No entry means the address
-itself is wrong. `prlctl list -f` reports what the hypervisor believes, and
-`prlctl exec <vm> <command>` runs inside the guest through the Tools channel rather than the
-network, which is how you ask a machine why it is not answering.
+The probe supplies the traffic; the lookup reports what came back. A **complete** entry — a real MAC
+address — means something is answering at that address right now, so anything failing above layer 2
+is being filtered, and the firewall is where to look. An **incomplete** entry means nothing
+answered, which points at the address rather than at a rule. The probe does not need to succeed: a
+refused or filtered port still resolves the address, which is what makes it usable when every port
+is closed.
+
+Two hypervisor tools sit outside all of this: `prlctl list -f` reports what the hypervisor believes
+the address is — worth comparing against what you are dialling — and `prlctl exec <vm> <command>`
+runs inside the guest over the Tools channel rather than the network, which is how you ask a machine
+why it is not answering.
 
 ### 5. Configure kernel profiles in the file, not the environment
 
