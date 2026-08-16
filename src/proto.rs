@@ -673,6 +673,31 @@ pub enum WorkerMessage {
         id: u64,
         result: Result<Output, Failed>,
     },
+    /// One of this worker's own `tracing` records, mirrored so the supervisor owns every record
+    /// either process made — see [`crate::logbridge`] for why that is worth a message.
+    ///
+    /// The only variant that belongs to **no request**, which is what it is: a worker logs from
+    /// its engine thread, from its request reader, and from paths that run after every request is
+    /// answered. It is intercepted where the channel is read and never reaches the routing that
+    /// the rest of these go through, because there is no `id` to route it by.
+    ///
+    /// The worker still writes the same record to its inherited stderr. This copy is not that one
+    /// arriving by another road: it is the one that can be read from the *client's* machine.
+    Log {
+        /// Milliseconds since the Unix epoch, stamped in the worker — where it happened, which is
+        /// not where it is filed.
+        at_ms: u64,
+        level: crate::logbridge::Level,
+        /// The `tracing` target, kept rather than assumed: a worker's records are not all
+        /// `windbg_mcp::worker`, and the one from a dependency is the one worth seeing whole.
+        target: String,
+        message: String,
+        /// Records this worker had to drop before this one, its queue having filled. Zero on
+        /// every ordinary message — a gap in a log has to be reported, or a reader takes it for a
+        /// stretch where nothing happened.
+        #[serde(default)]
+        dropped: u32,
+    },
 }
 
 /// A failed op, as it crosses the pipe.
