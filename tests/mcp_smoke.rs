@@ -1374,19 +1374,36 @@ fn a_recorded_session_reads_back_as_jsonl_and_renders_as_a_cast() {
     let _ = std::fs::remove_file(&cast);
 }
 
-/// Recording is opt-in, and its absence has to cost nothing at all: no file, no directory, and
-/// no change to what a client sees.
+/// Recording is opt-in, and its absence has to cost nothing at all.
+///
+/// **The same path, twice**, which is the only way this can mean anything: a path the server was
+/// never told about could not be written whatever the default was, so asserting it stays absent
+/// asserts nothing. Here the first run proves the server *does* write that exact file when asked,
+/// and the second — same path, no variable — proves it does not when it is not.
 #[test]
 fn nothing_is_recorded_unless_a_transcript_is_asked_for() {
-    let would_be = marker_path("unrecorded");
-    let _ = std::fs::remove_file(&would_be);
-    let mut server = Server::started();
-    server.tool_text("decode_ioctl", json!({ "code": "0x70000" }), STEP);
-    assert_eq!(server.shutdown(), Some(0));
+    let path = marker_path("opt-in");
+    let _ = std::fs::remove_file(&path);
+    let named = path.to_str().expect("a UTF-8 temp path");
+
+    let mut asked = Server::started_with(&[("WINDBG_MCP_TRANSCRIPT", named)]);
+    asked.tool_text("decode_ioctl", json!({ "code": "0x70000" }), STEP);
+    assert_eq!(asked.shutdown(), Some(0));
     assert!(
-        !would_be.exists(),
+        path.exists(),
+        "the control half of this test is broken: a server that was asked to record wrote nothing \
+         to {}, so the assertion below cannot mean anything",
+        path.display()
+    );
+
+    std::fs::remove_file(&path).expect("clear the transcript between the two halves");
+    let mut unasked = Server::started();
+    unasked.tool_text("decode_ioctl", json!({ "code": "0x70000" }), STEP);
+    assert_eq!(unasked.shutdown(), Some(0));
+    assert!(
+        !path.exists(),
         "a server nobody asked to record wrote {}",
-        would_be.display()
+        path.display()
     );
 }
 
@@ -3821,6 +3838,127 @@ fn engine_workers_do_not_outlive_the_connection() {
         !process_alive(worker),
         "engine worker pid {worker} outlived the connection — every disconnect would leak one"
     );
+}
+
+/// A call that names no session is still routed to one, and the transcript has to say which.
+///
+/// Omitting `session_id` is not "no session" — it accepts whatever the current one is — and it is
+/// the ordinary way this server is driven. Recording only the argument would put `null` on every
+/// such call *and on every event derived from it*, so with two targets open a transcript could not
+/// answer the question it exists for: which one was read, and which one was changed.
+///
+/// Two sessions, deliberately, because with one open the bug is invisible — any answer at all
+/// would be the right one.
+#[test]
+fn a_call_that_names_no_session_records_the_one_it_reached() {
+    let Some(dump) = target_tier() else { return };
+    let transcript = marker_path("routing");
+    let _ = std::fs::remove_file(&transcript);
+    let mut server = Server::started_with(&[(
+        "WINDBG_MCP_TRANSCRIPT",
+        transcript.to_str().expect("a UTF-8 temp path"),
+    )]);
+
+    let first = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+    let second = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+    assert_ne!(first, second, "two sessions, or this proves nothing");
+    // No `session_id`: this goes to the newest usable session, which is the second one.
+    server.tool_text("modules", json!({ "filter": "nt" }), TARGET_STEP);
+    assert_eq!(server.shutdown(), Some(0));
+
+    let events: Vec<Value> = std::fs::read_to_string(&transcript)
+        .unwrap_or_else(|e| panic!("no transcript at {}: {e}", transcript.display()))
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSONL ({e}): {l}")))
+        .collect();
+    let result = events
+        .iter()
+        .find(|r| r["event"] == "tool_result" && r["tool"] == "modules")
+        .unwrap_or_else(|| panic!("the unnamed call is not in the transcript: {events:#?}"));
+    assert_eq!(
+        result["session"], second,
+        "the result must name the session the call was routed to, not `null` because the caller \
+         named none: {result}"
+    );
+    // The openers too: an opener mints a session rather than routing to one, and the record has
+    // to carry it either way or the call that created a target cannot be joined to it.
+    let opened: Vec<&Value> = events
+        .iter()
+        .filter(|r| r["event"] == "tool_result" && r["tool"] == "open_dump")
+        .collect();
+    assert_eq!(opened.len(), 2, "{events:#?}");
+    assert_eq!(opened[0]["session"], first, "{}", opened[0]);
+    assert_eq!(opened[1]["session"], second, "{}", opened[1]);
+    let _ = std::fs::remove_file(&transcript);
+}
+
+/// What a transcript says about the two teardowns, which is the pair that matters most in a file
+/// nobody was watching being written.
+///
+/// A **disconnect** has no caller to answer, so the transcript is the only account of what became
+/// of each target — `released` false means a worker was killed still holding one, which for a live
+/// kernel is a machine left halted. That record has to be there, per session, and not only the
+/// `shutdown` line saying a teardown began.
+///
+/// An **`end_session`** must not then be followed by a "lost its engine" record. Its worker is
+/// terminated on purpose, so the pipe reaching EOF is the last step of an orderly teardown rather
+/// than a loss, and a red line after every successful release would describe a failure that did
+/// not happen. Both halves in one test because they are the same claim from opposite ends: the
+/// transcript reports the teardown that happened and no teardown that did not.
+#[test]
+fn a_transcript_records_both_teardowns_and_invents_neither() {
+    let Some(dump) = target_tier() else { return };
+
+    // Ended by hand, then disconnected. Two sessions so the disconnect has one of its own.
+    let transcript = marker_path("teardowns");
+    let _ = std::fs::remove_file(&transcript);
+    let mut server = Server::started_with(&[(
+        "WINDBG_MCP_TRANSCRIPT",
+        transcript.to_str().expect("a UTF-8 temp path"),
+    )]);
+    let ended = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+    let abandoned = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+    server.tool_text("end_session", json!({ "session_id": ended }), TARGET_STEP);
+    assert_eq!(server.shutdown(), Some(0));
+
+    let events: Vec<Value> = std::fs::read_to_string(&transcript)
+        .unwrap_or_else(|e| panic!("no transcript at {}: {e}", transcript.display()))
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSONL ({e}): {l}")))
+        .collect();
+    let for_session = |session: &str, event: &str| -> Vec<Value> {
+        events
+            .iter()
+            .filter(|r| r["event"] == event && r["session"] == session)
+            .cloned()
+            .collect()
+    };
+
+    // The session the client ended, and the one it walked away from, both accounted for.
+    for (session, how) in [(&ended, "end_session"), (&abandoned, "the disconnect")] {
+        let ends = for_session(session, "session_end");
+        assert_eq!(
+            ends.len(),
+            1,
+            "{how} should have recorded exactly one end for {session}: {events:#?}"
+        );
+        assert_eq!(
+            ends[0]["released"], true,
+            "a dump session lets go cleanly, and the record is what says so: {}",
+            ends[0]
+        );
+    }
+
+    // And no invented loss. The worker of an ended session is terminated deliberately, so its
+    // pipe closing is the teardown finishing rather than an engine that died.
+    let lost = for_session(&ended, "worker_lost");
+    assert!(
+        lost.is_empty(),
+        "an orderly end_session reported a lost engine: {lost:#?}"
+    );
+    let _ = std::fs::remove_file(&transcript);
 }
 
 /// A worker whose supervisor died without saying goodbye still lets go and exits.

@@ -109,6 +109,12 @@ typed into `profile`), and the profile's key absent from the file — while its 
 readable, because a transcript has to say which target a session was pointed at. It also counts the
 calls it recorded, so the absence assertion cannot pass on an empty file.
 
+A third pins that recording is opt-in, and it uses **the same path twice** — which is the only way
+that claim can be tested. A path the server was never told about could not be written whatever the
+default was, so asserting it stays absent asserts nothing; here the first run proves the server
+does write that exact file when asked, and the second, with the variable unset, proves it does not
+when it is not.
+
 The same executable is then run as `--render-cast` over that transcript, and the result is
 validated as asciicast v2: a version-2 header with a shape, then events that are `[time, "o", data]`
 triples whose times never go backwards. In the **protocol** tier deliberately — every property here
@@ -213,6 +219,15 @@ processes, so they need real ones:
   a transcript records and what a client branches on, and the two agreeing is what keeps the report
   honest. It also pins the pairing only this tool has: a batch that ran answers `status: "ok"` on a
   result flagged `isError`.
+- *A transcript records both teardowns and invents neither.* Two sessions, one ended by hand and
+  one left to the disconnect, and the file has to account for both — a disconnect has no caller to
+  answer, so the transcript is the only record of whether each target was released or a worker was
+  killed still holding one. The other half is the absence: an `end_session` terminates its worker
+  on purpose, so the pipe reaching EOF is the teardown finishing, and a "lost its engine" record
+  after it would report a failure that did not happen.
+- *A call that names no session records the one it reached.* Two sessions open and a `modules` call
+  with no `session_id`, which routes to the newest. With one session open this proves nothing —
+  any answer would be right — which is why there are two.
 - *A walk marks what it cannot read and keeps going.* The claim
   [#103](https://github.com/glslang/windbg-mcp/issues/103) is about, and the one that needs a real
   engine: `src/walk.rs` proves the traversal against a fake address space, and this proves the

@@ -2162,6 +2162,26 @@ pub(crate) fn changes_debug_target(command: &str) -> bool {
     })
 }
 
+tokio::task_local! {
+    /// Where the tool call running on this task was routed, for the transcript.
+    ///
+    /// A task-local rather than a return value because the answer is discovered deep inside the
+    /// call — `resolve` picks the current session for anyone who named none — and is wanted by
+    /// [`WindbgServer::call_tool`], forty-odd tool bodies further out. Threading it back would
+    /// mean changing the signature of every one of them to carry a fact none of them uses.
+    ///
+    /// Scoped per call, so nothing leaks between them, and read after the tool returns.
+    static ROUTED: std::sync::Mutex<Option<String>>;
+}
+
+/// Records which session the call on this task reached. Silent outside a scope — the tool tests
+/// call these functions directly, and a missing transcript is not a reason to fail a debug call.
+fn note_routed(session: &str) {
+    let _ = ROUTED.try_with(|routed| {
+        *routed.lock().unwrap_or_else(|e| e.into_inner()) = Some(session.to_string());
+    });
+}
+
 impl WindbgServer {
     /// Routes a call to the session the caller named — or to the current one — and runs it.
     ///
@@ -2172,6 +2192,7 @@ impl WindbgServer {
     /// of it, and that is `engine::Gate`'s job.
     async fn run_call(&self, session_id: Option<&str>, call: Call) -> Result<Output, EngineError> {
         let session = self.sessions.resolve(session_id)?;
+        note_routed(&session.id);
         self.sessions
             .call(&session, call.named(session_id.is_some()))
             .await
@@ -2202,20 +2223,26 @@ impl WindbgServer {
                 id,
                 report,
                 summary,
-            }) => outcome_result(
-                format!(
-                    "{report}\n\nsession_id: {id}\nPass this as `session_id` on later calls to \
-                     route them to this session and to fail loudly rather than act on a different \
-                     target."
-                ),
-                structured::OpenOutcome::Ok(structured::OpenedSession {
-                    session_id: id,
-                    kind: kind.into(),
-                    target,
-                    report,
-                    summary,
-                }),
-            ),
+            }) => {
+                // An opener does not route to a session, it *mints* one — and the transcript
+                // wants the same field filled in either way, so the call that created a target
+                // is joinable to the events about it.
+                note_routed(&id);
+                outcome_result(
+                    format!(
+                        "{report}\n\nsession_id: {id}\nPass this as `session_id` on later calls \
+                         to route them to this session and to fail loudly rather than act on a \
+                         different target."
+                    ),
+                    structured::OpenOutcome::Ok(structured::OpenedSession {
+                        session_id: id,
+                        kind: kind.into(),
+                        target,
+                        report,
+                        summary,
+                    }),
+                )
+            }
             // No worker, so no session — and no argument the model can change fixes that.
             Err(OpenError::Unavailable(m)) => Err(ErrorData::internal_error(m, None)),
             Err(OpenError::NoRoom(m)) => {
@@ -3105,12 +3132,19 @@ impl WindbgServer {
         // The alternative is a batch that applies three mutations and then trips over a typo in
         // the fourth — survivable, because that is what `always` is for, but not something a
         // caller should have to survive.
+        //
+        // Typed, like every other refusal from a tool that declares an output schema: these are
+        // precisely the documented "the batch never ran" cases, so they are the `status: "error"`
+        // branch. Answering them with text alone would break the contract the schema states, and
+        // break it on the two failures a caller is most likely to hit.
+        let refused =
+            |why: String| typed_error(ErrorCategory::InvalidArgument, why, args.session_id.clone());
         if let Err(why) = batch::validate(&args.steps, &args.always) {
-            return tool_error(why);
+            return refused(why);
         }
         let budget_ms = match batch::budget_ms(args.timeout_ms) {
             Ok(budget_ms) => budget_ms,
-            Err(why) => return tool_error(why),
+            Err(why) => return refused(why),
         };
         // Read before the steps move into the op, and before any of them runs: a `.detach` that
         // reports an error may still have detached, so the handle has to be retired ahead of the
@@ -4086,18 +4120,26 @@ impl rmcp::ServerHandler for WindbgServer {
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
-        let args = request
-            .arguments
-            .clone()
-            .map(serde_json::Value::Object)
-            .filter(|_| self.rec.enabled());
-        let call = self.rec.tool_request(&request.name, args.as_ref());
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        let outcome = Self::tool_router().call(tcc).await;
-        // A protocol error is recorded too, as a failure with its message. It is the rarest
-        // outcome here — this server answers almost everything as a tool result on purpose — and
-        // so the one a transcript most needs to name rather than leave as a request with nothing
-        // after it.
+        // Nothing at all when there is no transcript, which is the default: not the argument
+        // clone, not the routing scope, and — the one that would actually cost something — not
+        // `text_of`, which joins and copies every content block a tool produced. A module listing
+        // or a pool census is megabytes, and paying for it on every call of a server that is not
+        // recording is the kind of overhead nobody would ever see and everybody would pay.
+        if !self.rec.enabled() {
+            return Self::tool_router().call(tcc).await;
+        }
+        let args = tcc.arguments.clone().map(serde_json::Value::Object);
+        let mut call = self.rec.tool_request(tcc.name(), args.as_ref());
+        let routed = ROUTED.scope(std::sync::Mutex::new(None), async move {
+            let outcome = Self::tool_router().call(tcc).await;
+            let routed = ROUTED.with(|r| r.lock().unwrap_or_else(|e| e.into_inner()).clone());
+            (outcome, routed)
+        });
+        let (outcome, routed) = routed.await;
+        // Where it actually went, which for a call that named no session is the only record of
+        // which target it read or changed.
+        call.routed_to(routed);
         match &outcome {
             Ok(rmcp::model::CallToolResponse::Complete(result)) => self.rec.tool_result(
                 call,
@@ -4105,10 +4147,15 @@ impl rmcp::ServerHandler for WindbgServer {
                 &text_of(result),
                 result.structured_content.as_ref(),
             ),
-            // The MRTR shapes: the call has not produced a result yet, so there is nothing to
-            // record about one. Named rather than folded into the error arm, which would report a
-            // failure that did not happen.
-            Ok(_) => self.rec.tool_result(call, false, "", None),
+            // An MRTR round trip: the server is asking the *client* for something, and this call
+            // has not produced a result. Deliberately recorded as nothing rather than as an empty
+            // success — a `tool_result` says the call finished, and it has not. The request record
+            // stands on its own, which is exactly what happened. (This server elicits nothing
+            // today, so the arm is here to be correct rather than because it is reached.)
+            Ok(_) => {}
+            // A protocol error is a result: the rarest outcome here, since almost everything is
+            // answered as a tool result on purpose, and so the one most worth naming rather than
+            // leaving as a request with nothing after it.
             Err(e) => self.rec.tool_result(call, true, &e.message, None),
         }
         outcome
@@ -4865,6 +4912,22 @@ mod tests {
         assert!(
             !text.contains("session"),
             "validation must not have reached a session: {text}"
+        );
+        // Typed, because this tool declares an output schema and a refusal is a result like any
+        // other. It is also the documented "the batch never ran" case, which is the *only* thing
+        // `status: "error"` means here — a batch that ran answers `ok` and reports its verdict in
+        // the payload — so a caller that cannot see this branch cannot tell "resubmit after fixing
+        // the argument" from "go and look at what the target is holding".
+        let data = result
+            .structured_content
+            .as_ref()
+            .expect("a schema-bearing tool must answer with structured content");
+        assert_eq!(data["status"], "error", "{data}");
+        assert_eq!(data["error"]["category"], "invalid_argument", "{data}");
+        assert_eq!(
+            data["error"]["message"].as_str().unwrap_or_default(),
+            text,
+            "the typed message and the text are one failure, not two accounts of it"
         );
     }
 

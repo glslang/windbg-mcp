@@ -131,7 +131,7 @@ impl Recorder {
         let Some(path) = std::env::var_os(TRANSCRIPT_ENV).filter(|p| !p.is_empty()) else {
             return Self::disabled();
         };
-        let limit = field_limit();
+        let limit = configured_field_limit();
         match Self::to_file(Path::new(&path), limit) {
             Ok(recorder) => {
                 tracing::info!(
@@ -192,8 +192,19 @@ impl Recorder {
     }
 
     /// Records `event`, stamped and numbered. Does nothing when disabled.
+    ///
+    /// **The lock is taken before the record is built, not after.** Numbering and stamping outside
+    /// it would make `seq` and `mono_ms` an order of their own, different from the order the lines
+    /// land in: two threads recording at once can be numbered one way and preempted into writing
+    /// the other. A reader then has a file whose lines disagree with their own sequence numbers,
+    /// and a cast rendered from it has times that go backwards — which a player refuses. Inside
+    /// the lock, the two orders are the same order by construction.
+    ///
+    /// It costs serializing a small record while holding the lock. That is the right side to pay
+    /// on: this contends only with other records, never with a debugger operation.
     pub fn write(&self, event: Event) {
         let Some(sink) = &self.0 else { return };
+        let mut file = sink.file.lock().unwrap_or_else(|e| e.into_inner());
         let record = Record {
             v: SCHEMA,
             seq: sink.seq.fetch_add(1, Ordering::Relaxed),
@@ -212,7 +223,6 @@ impl Recorder {
             }
         };
         line.push('\n');
-        let mut file = sink.file.lock().unwrap_or_else(|e| e.into_inner());
         // One `write_all` per record, on a file opened for append and with no buffer in front of
         // it: that is what leaves a parseable prefix behind an abrupt exit.
         if let Err(e) = file.write_all(line.as_bytes()) {
@@ -282,7 +292,7 @@ impl Recorder {
             data: scrubbed_data.as_ref().map(|d| self.payload_of(d)),
         });
         if let Some(data) = &scrubbed_data {
-            for event in derived(&call, data) {
+            for event in derived(&call, data, self.limit()) {
                 self.write(event);
             }
         }
@@ -290,8 +300,18 @@ impl Recorder {
 
     // ---- fields -----------------------------------------------------------
 
-    fn limit(&self) -> usize {
+    /// How many bytes of one field this transcript keeps. `0` is no cap.
+    ///
+    /// Public because the supervisor writes events of its own ([`crate::engine`]) and has to cap
+    /// them to the same figure. A caller that picked its own would be a second answer to "how big
+    /// may a record be", which is the sort of thing that stays right until someone reads the
+    /// documentation and believes it.
+    pub fn field_limit(&self) -> usize {
         self.0.as_ref().map_or(DEFAULT_FIELD_LIMIT, |s| s.limit)
+    }
+
+    fn limit(&self) -> usize {
+        self.field_limit()
     }
 
     /// A JSON value as a capped field: itself, or a marker naming what was dropped.
@@ -316,12 +336,16 @@ impl Recorder {
 
     /// How big `value` is, if that is over the cap. `None` means it fits.
     fn dropped_bytes(&self, value: &Value) -> Option<usize> {
-        let limit = self.limit();
-        if limit == 0 {
-            return None;
+        // A value that will not serialize is dropped rather than kept. Kept, it takes the whole
+        // record down with it in [`Self::write`] — the same serialization fails there — and a
+        // missing line is worse than a marker saying a payload could not be measured.
+        let Ok(rendered) = serde_json::to_string(value) else {
+            return Some(0);
+        };
+        match self.limit() {
+            0 => None,
+            limit => (rendered.len() > limit).then_some(rendered.len()),
         }
-        let size = serde_json::to_string(value).map_or(0, |s| s.len());
-        (size > limit).then_some(size)
     }
 }
 
@@ -342,6 +366,21 @@ impl InFlight {
             tool: String::new(),
             session: None,
             at: Instant::now(),
+        }
+    }
+
+    /// Names the session this call was actually **routed** to, which is not always the one it
+    /// named.
+    ///
+    /// A caller that omits `session_id` is not saying "no session" — it is accepting whatever the
+    /// current one is ([`crate::engine::Sessions::resolve`]), which is the ordinary way this
+    /// server is driven. Recording the argument alone would put `null` on every such call and on
+    /// every event derived from it, so with more than one target open a transcript could not say
+    /// which one was read or changed. The request record is already written by then, deliberately:
+    /// it is stamped when the call *arrived*, and routing had not happened yet.
+    pub fn routed_to(&mut self, session: Option<String>) {
+        if let Some(session) = session {
+            self.session = Some(session);
         }
     }
 }
@@ -518,9 +557,10 @@ pub enum Event {
         /// What kind of change — `breakpoint`, or a batch step's own description.
         kind: String,
         detail: Capped,
-        /// For a batch step: which block it was in and where.
+        /// For a batch step: which block it was in and where. Capped like the rest, because the
+        /// label inside it is the caller's own string.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        step: Option<String>,
+        step: Option<Capped>,
     },
     /// An assertion inside a transactional batch did not hold. Its own record because it is the
     /// fact that decided the transaction, and a reader should not have to walk the step list to
@@ -529,7 +569,7 @@ pub enum Event {
         request: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session: Option<String>,
-        step: String,
+        step: Capped,
         detail: Capped,
     },
     /// How a transactional batch ended, and whether it put everything back.
@@ -564,7 +604,7 @@ pub enum Event {
 /// `tool_result` and nothing more, which is the honest answer: this server cannot know what an
 /// arbitrary `execute` command did to the target, and inventing a `mutation` event by matching on
 /// command text would be a guess wearing a value's clothes.
-fn derived(call: &InFlight, data: &Value) -> Vec<Event> {
+fn derived(call: &InFlight, data: &Value, limit: usize) -> Vec<Event> {
     let request = call.request;
     let session = call.session.clone();
     match call.tool.as_str() {
@@ -605,25 +645,30 @@ fn derived(call: &InFlight, data: &Value) -> Vec<Event> {
                     request,
                     session: session.clone(),
                     kind: "breakpoint".to_string(),
-                    detail: Capped::of(&breakpoint_detail(&set, *id), 0),
+                    detail: Capped::of(&breakpoint_detail(&set, *id), limit),
                     step: None,
                 })
                 .collect()
         }
-        "debug_batch" => batch_events(request, session, data),
+        "debug_batch" => batch_events(request, session, data, limit),
         _ => Vec::new(),
     }
 }
 
 /// A batch's verdict, the assertion that decided it, and everything it changed.
-fn batch_events(request: u64, session: Option<String>, data: &Value) -> Vec<Event> {
+///
+/// Every field here is capped like any other, and the step label is the reason it has to be: it is
+/// the *caller's* string, of whatever length they sent, and a batch of a thousand labelled steps
+/// would otherwise produce a thousand unbounded lines beside a payload the cap had already
+/// replaced with a marker.
+fn batch_events(request: u64, session: Option<String>, data: &Value, limit: usize) -> Vec<Event> {
     let Some(report) = typed::<BatchReportInfo>(data) else {
         return Vec::new();
     };
     let mut events = Vec::new();
     for (block, steps) in [("steps", &report.steps), ("always", &report.always)] {
         for step in steps {
-            let at = format!("{block}[{}] {}", step.position, step.label);
+            let at = Capped::of(&format!("{block}[{}] {}", step.position, step.label), limit);
             // Recorded whether or not the step then succeeded: a command that errors may already
             // have written, which is exactly when a record of it matters.
             if let Some(changes) = &step.changes {
@@ -631,7 +676,7 @@ fn batch_events(request: u64, session: Option<String>, data: &Value) -> Vec<Even
                     request,
                     session: session.clone(),
                     kind: "batch_step".to_string(),
-                    detail: Capped::of(changes, 0),
+                    detail: Capped::of(changes, limit),
                     step: Some(at.clone()),
                 });
             }
@@ -640,7 +685,7 @@ fn batch_events(request: u64, session: Option<String>, data: &Value) -> Vec<Even
                     request,
                     session: session.clone(),
                     step: at,
-                    detail: Capped::of(step.detail.as_deref().unwrap_or_default(), 0),
+                    detail: Capped::of(step.detail.as_deref().unwrap_or_default(), limit),
                 });
             }
         }
@@ -741,7 +786,8 @@ fn scrubbed(value: &Value) -> Value {
 
 // ---- odds and ends --------------------------------------------------------
 
-fn field_limit() -> usize {
+/// The cap this host's environment asks for, or [`DEFAULT_FIELD_LIMIT`].
+fn configured_field_limit() -> usize {
     std::env::var(FIELD_LIMIT_ENV)
         .ok()
         .and_then(|v| v.trim().parse().ok())
@@ -1087,12 +1133,15 @@ mod tests {
         let Event::Assertion { step, detail, .. } = &records[4].event else {
             panic!("expected an assertion: {:?}", records[4].event)
         };
-        assert_eq!(step, "steps[2] check");
+        assert_eq!(step.text, "steps[2] check");
         assert_eq!(detail.text, "expected `91`");
         let Event::Mutation { step, detail, .. } = &records[5].event else {
             panic!("expected the rollback's mutation")
         };
-        assert_eq!(step.as_deref(), Some("always[1] restore"));
+        assert_eq!(
+            step.as_ref().map(|s| s.text.as_str()),
+            Some("always[1] restore")
+        );
         assert_eq!(detail.text, "wrote 1 byte at fffff803");
         let Event::Batch {
             outcome,
@@ -1109,6 +1158,65 @@ mod tests {
         assert!(!committed);
         assert!(rollback_complete, "the `always` block ran");
         assert_eq!(after, "stopped");
+    }
+
+    /// The cap covers the **derived** records too, and the step label is why it has to: that
+    /// string is the caller's, of whatever length they sent, so a batch of long labels could
+    /// otherwise produce unbounded lines beside a payload the cap had already replaced.
+    #[test]
+    fn a_derived_records_fields_are_capped_like_any_other() {
+        let path = std::env::temp_dir()
+            .join("windbg-mcp-transcript-tests")
+            .join(format!("derived-cap-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let rec = Recorder::to_file(&path, 32).expect("open the transcript");
+        let call = rec.tool_request("debug_batch", None);
+        rec.tool_result(
+            call,
+            true,
+            "BATCH: FAILED",
+            Some(&serde_json::json!({
+                "status": "ok",
+                "outcome": "failed",
+                "at": 1,
+                "committed": false,
+                "rollback_complete": true,
+                "after": { "state": "stopped", "ip": "0x0" },
+                "budget_ms": 1,
+                "elapsed_ms": 1,
+                "steps": [{
+                    "position": 1,
+                    "label": "L".repeat(400),
+                    "action": "eb 0 90",
+                    "result": "unmet",
+                    "detail": "D".repeat(400),
+                    "changes": "C".repeat(400),
+                    "cut_short": false,
+                }],
+                "always": []
+            })),
+        );
+
+        let records = records(&path);
+        let capped: Vec<(&Capped, &Capped)> = records
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::Mutation { detail, step, .. } => Some((step.as_ref()?, detail)),
+                Event::Assertion { step, detail, .. } => Some((step, detail)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            capped.len(),
+            2,
+            "a mutation and the assertion: {records:#?}"
+        );
+        for (step, detail) in capped {
+            for field in [step, detail] {
+                assert!(field.text.len() <= 32, "over the cap: {field:?}");
+                assert!(field.dropped.is_some(), "and it has to say so: {field:?}");
+            }
+        }
     }
 
     /// A tool this module knows nothing about contributes its result and no derived events. The
