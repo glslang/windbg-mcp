@@ -1263,12 +1263,26 @@ fn es<E: ToString>(e: E) -> String {
 /// engine and its `ttd\` are both there. It answers correctly for the case that actually happens
 /// too — an engine taken from System32, where there is no `ttd\` anywhere on the host.
 fn replay_engine_bundled() -> bool {
-    std::env::current_exe()
+    // Say nothing rather than something wrong: an executable that cannot locate itself is no
+    // evidence that the engine is unbundled.
+    let Some(dir) = std::env::current_exe()
         .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join("ttd").is_dir()))
-        // Say nothing rather than something wrong: an executable that cannot locate itself is no
-        // evidence that the engine is unbundled.
-        .unwrap_or(true)
+        .and_then(|exe| exe.parent().map(|dir| dir.to_path_buf()))
+    else {
+        return true;
+    };
+    // Non-empty, not merely present. A `New-Item ttd` whose copy then failed leaves a directory
+    // that satisfies `is_dir` and replays nothing, which is a plausible end state for a manual
+    // bundling step.
+    //
+    // What this deliberately does *not* check is that the DLLs match this binary's architecture —
+    // that needs a PE read per file, and the layout it would be reading is WinDbg's to change. A
+    // wrong-architecture `ttd\` therefore still fails with the engine's own error, which is the
+    // behaviour without this diagnostic at all rather than a regression from it; `setup.md` states
+    // the rule where the copy is made, which is the only place it can be acted on.
+    std::fs::read_dir(dir.join("ttd"))
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false)
 }
 
 /// `open_trace`'s failure, told against what this host can actually do.
