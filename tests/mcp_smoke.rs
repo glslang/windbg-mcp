@@ -5485,6 +5485,40 @@ fn has_thread_context(registers: &str) -> bool {
     registers.contains("rip=") || registers.contains("pc=")
 }
 
+/// Whether the attached target is the **x64** kernel the pool tools require.
+///
+/// Read from the opener's own `vertarget` report rather than from `cfg!(target_arch)`, because the
+/// architecture that decides this is the *target's* and not the debugger host's — those are
+/// routinely different, and on this project's own bench they are. `vertarget` names it:
+/// `Free x64` against `Free ARM 64-bit (AArch64)`.
+///
+/// The pool tools say "Needs a broken-in x64 kernel target" in their own descriptions
+/// (`src/server.rs`), and the walker decodes x64 pool descriptors. Against anything else the two
+/// tests below have no premise, so they say so instead of failing.
+fn target_is_x64(report: &str) -> bool {
+    !report.contains("AArch64") && !report.contains("ARM 64") && report.contains("x64")
+}
+
+/// Why the two pool tests stand down. Shared, so the pair cannot drift into disagreeing about
+/// what they need.
+const NOT_X64_SKIP: &str = "the pool tools need a broken-in x64 kernel target; this one is not, so \
+                            there is nothing here for them to be right or wrong about";
+
+/// Pinned in the default tier, like the two predicates above, because the tier that would catch a
+/// regression needs a kernel on the other end of a wire.
+#[test]
+fn a_targets_architecture_is_read_from_its_own_report() {
+    assert!(target_is_x64(
+        "Windows 10 Kernel Version 26100 MP (4 procs) Free x64"
+    ));
+    assert!(!target_is_x64(
+        "Windows 10 Kernel Version 26100 MP (4 procs) Free ARM 64-bit (AArch64)"
+    ));
+    // Nothing to go on is not x64: this gates work that would otherwise fail confusingly, so the
+    // safe answer to "cannot tell" is to skip it.
+    assert!(!target_is_x64("Windows 10 Kernel Version 26100 MP"));
+}
+
 /// Pinned in the default tier for the same reason as the port parser above: the assertion it feeds
 /// lives in a tier that needs a kernel on the other end of a wire, so a spelling quietly dropped
 /// here would not be noticed until someone had one.
@@ -6336,6 +6370,15 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         assert_no_error(&attached, "attach_kernel");
 
+        // The pool walker decodes x64 pool descriptors, which the tools' own descriptions say. On
+        // any other target this test has no premise, so it says so — before paying for symbols,
+        // and while still falling through to the detach below, since the target is broken in from
+        // the attach onward whatever we decide here.
+        if !target_is_x64(&report) {
+            skip(NOT_X64_SKIP);
+            return;
+        }
+
         // The documented precondition, satisfied rather than assumed — and then *checked*.
         // Asking for symbols and carrying on regardless is what made the previous run report a
         // pool failure with no way to tell whether the path, the reload, or the walker was at
@@ -6836,6 +6879,31 @@ fn with_live_kernel_session<R>(
         (Ok(_), Some(why)) => panic!("{why}"),
         (Ok(value), None) => value,
     }
+}
+
+/// [`with_live_kernel_session`], for a body that only means anything against an **x64** target.
+///
+/// The architecture is read from the target's own `vertarget` rather than from `cfg!`, for the
+/// reason [`target_is_x64`] gives: what decides this is the target, not the debugger host. That
+/// costs one engine-local call, and it is asked *after* attaching because there is nowhere earlier
+/// to ask — which is fine, since the detach the wrapped helper performs runs either way.
+fn with_live_x64_kernel_session(
+    server: &mut Server,
+    connection: &str,
+    body: impl FnOnce(&mut Server, &str),
+) {
+    with_live_kernel_session(server, connection, |server, session| {
+        let report = server.tool_text(
+            "execute",
+            json!({ "command": "vertarget", "session_id": session }),
+            TARGET_STEP,
+        );
+        if !target_is_x64(&report) {
+            skip(NOT_X64_SKIP);
+            return;
+        }
+        body(server, session);
+    });
 }
 
 /// The steps that save a byte, patch it, and prove the patch landed — the opening of every
@@ -7372,7 +7440,7 @@ fn a_live_kernel_batch_step_can_ask_the_pool_about_a_captured_pointer() {
         &SERVER_CALL_TIMEOUT.as_secs().to_string(),
     )]);
 
-    with_live_kernel_session(&mut server, &connection, |server, session| {
+    with_live_x64_kernel_session(&mut server, &connection, |server, session| {
         let symbols = load_kernel_symbols(server, session);
         assert!(
             symbols.loaded.contains("pdb symbols") && !symbols.probe.is_empty(),
