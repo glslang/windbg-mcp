@@ -381,6 +381,15 @@ restore cut short would come back `Ok` with partial output and be reported as a 
 completed while the target was still changed — so an `interrupt` aimed at a batch that is unwinding
 says so and sends nothing, as does one repeated while a batch is still stopping.
 
+**Watching a call that is taking a while.** Put a `progressToken` in a call's `_meta` and it reports
+on itself with MCP progress notifications while it runs: the engine worker coming up, the target
+being claimed, the target being open, a teardown unwinding a transaction — and, when there is
+nothing new to say, that it is still running, every ten seconds. `progress` is seconds elapsed and
+there is no `total`, since the budget differs per tool and an opener spends up to 30s bringing a
+worker up before its own budget starts. Nothing is sent to a call that did not ask. This matters
+most over `--listen`, where `session_status` and `server_log` are on the other machine and both are
+pull — see [`docs/remote-listener.md`](./docs/remote-listener.md).
+
 **Recovering a session that is stuck.** A per-call timeout abandons the *wait*, not the job, so a
 call that reports a timeout may still be running. The case that matters is `attach_kernel`: it waits
 for the target to dial in with no timeout, and DbgEng cannot interrupt a wait that has not yet

@@ -38,3 +38,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Only for the handle plumbing behind the supervisor↔worker channel (see `engine::spawn_worker`):
 # marking a pipe end inheritable is the one thing std cannot express.
 windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+
+[dev-dependencies]
+# `test-util` only, and only for the tests: `src/progress.rs` asserts on a heartbeat measured in
+# tens of seconds, and the alternative — real sleeps shrunk to milliseconds — is a test that fails
+# on a loaded runner for reasons that have nothing to do with the code. A paused clock makes the
+# timing exact. Kept out of the shipped binary by the edition-2024 resolver, which does not unify
+# dev-dependency features into a normal build.
+tokio = { version = "1", features = ["test-util"] }

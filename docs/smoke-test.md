@@ -14,7 +14,8 @@ $env:WINDBG_MCP_SMOKE_DUMP = "1"; cargo test --test mcp_smoke   # + the debugger
 
 It builds and runs against `target/debug`, so it never touches the `target/release` exe a
 connected MCP client holds a lock on (see [`CLAUDE.md`](../CLAUDE.md)). The protocol tier is ~2s;
-adding the debugger tier takes it to ~40s, almost all of it one test waiting out a lease grace.
+adding the debugger tier takes it to ~50s, almost all of it two tests waiting out real timers — a
+lease grace, and a call staying silent long enough to have to report that it is still running.
 
 ### Tiers
 
@@ -346,6 +347,36 @@ come up, so the budget is shrunk to a second) and watches **stderr**, not HTTP �
 request renews the lease, so a test that polled would hold open the very thing it is waiting to
 expire. It asserts the worker process is gone, the swept session id is no longer served, and the
 next client gets a server with nothing left over. Budget ~40s.
+
+**Progress notifications.** The policy — what is reported, when a silence becomes a heartbeat, that
+a send never delays the call — has unit tests in [`progress.rs`](../src/progress.rs) against a
+collector. What those cannot reach is whether any of it leaves the process, so three assertions do:
+
+- *A call that asked for no progress is sent none*, checked against **stdout as a whole**, since
+  that is the transport a stray notification would corrupt. The call is an open that fails, so it
+  exercises the path that would report rather than a tool with nothing to say. Protocol tier.
+- *An open reports its milestones before it answers.* The debugger tier, because the sequence is the
+  point: worker up, target claimed, target open, in that order, one notification each, on the token
+  the call supplied, with `progress` increasing and no `total`. They are read out of the queue of
+  messages that arrived *while the call was outstanding*, which is what makes "before" an assertion.
+- *A remote client is told how a call is going.* The same thing over HTTP, where it is the only
+  channel that exists while a call runs: rmcp routes the notification onto the SSE stream the call
+  is answered on, keyed by the token, so the milestone and the result come back together. A failing
+  open on purpose — one milestone proves the route, and it costs a worker coming up rather than a
+  dump load that may go to a symbol server.
+- *A call with nothing to report still reports that it is running.* The half of this that is not a
+  mapping, and the one that covers a call with **no milestones at all** — a pool walk, a
+  `crash_triage`, a batch. A twelve-second batch of `.sleep`s, asserted to produce a beat and
+  nothing else. The beat is ten seconds and deliberately not tunable, so this costs wall clock;
+  it runs beside the lease grace rather than after it. A parked kernel attach is the other silence
+  and would prove the same thing, at the price of a worker holding a UDP port through a
+  twenty-second teardown.
+
+The third milestone rides an existing test rather than one of its own: *ending a session stops a
+running batch and rolls it back* now watches its own `end_session`, and asserts the teardown said
+it had found a transaction to unwind. That is the only milestone with a *number* a caller can act
+on, and it is only produced when a teardown really does land mid-transaction — which that test is
+already at pains to arrange.
 
 This tier is also the only end-to-end check of the **protocol channel** — the inherited pipe pair a
 worker speaks on ([`proto.rs`](../src/proto.rs)). Handles are passed on the worker's command line

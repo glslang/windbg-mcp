@@ -5,6 +5,59 @@ status. Keep entries short; link to code with `file:line` where it helps a futur
 
 ---
 
+## Progress *is* a protocol notification, and it counts seconds (2026-08-17)
+
+**Context.** A tool call here can take minutes — a kernel attach waits for its target to dial in, a
+pool walk reads every page, `!analyze -v` goes to a symbol server — and every one of them was
+silent from the request until the result. Under stdio an operator could watch stderr scroll; over
+`--listen` those records are on the other machine, and both ways of asking for them
+(`session_status`, `server_log`) are **pull**, so a client has to guess when to ask about a call it
+cannot see.
+
+**Why this one is a notification when the log is a tool.** The entry below took the opposite
+decision for `server_log`, and the reasons do not transfer. MCP's *logging* capability is
+deprecated for removal (SEP-2577) and would have meant unadvertising nothing and depending on a
+dying API; **progress** is not deprecated, is not a capability at all — a client opts in per call,
+by putting a `progressToken` in that call's `_meta` — and is the only mechanism that can say
+anything *while a request is outstanding*, which is precisely what pull cannot do. A log is a
+stream about the server; this is one call reporting on itself.
+
+**Decision.** `call_tool` reads the token off the request and runs the whole tool call inside a
+relay (`src/progress.rs`); the milestones the supervisor and its worker already produce —
+`Committed`/`Opened` from an opener, `RollingBack` from a teardown that found a transaction, plus
+the engine worker coming up — become `notifications/progress`. No new facts crossed the pipe: the
+protocol messages were already there, and what was missing was somewhere to send them.
+
+**The sink travels with the waiter.** A milestone is learned on the task that reads a worker's
+channel, which belongs to the *session*; the peer and the token belong to the *call*, forty-odd
+tool bodies away. So the sink is read from a task-local on the caller's own task — the last place
+the request is still reachable — and left beside that call's waiter in `engine::Waiting`, for the
+reader to find by job id. Removing the waiter, which is how a call stops counting as outstanding,
+is the same act that stops it being reported against.
+
+**`progress` counts seconds and there is no `total`.** Elapsed time increases strictly (which is
+what MCP asks of the field) and is the number a reader of a debugger actually wants. A denominator
+would have to be the call's budget, and that is a different constant per tool — none of which
+covers the up-to-30s worker handshake an opener spends before its budget starts. An absent `total`
+says "unknown", which is true.
+
+**A silence is reported too, and that is the part that is not just plumbing.** Milestones alone
+leave the two longest waits exactly as quiet as before: a parked kernel attach reports `Committed`
+in the first second and may never report again, and a pool walk or a `crash_triage` has no
+milestones at all. So ten seconds without a word is itself a notification. It also makes progress a
+liveness signal a client can extend its own request timeout on, which is what stops a 60s client
+timeout abandoning a five-minute call that is working perfectly.
+
+**What it costs.** Nothing for a client that did not ask: no token, no channel, no timer, no
+notification. For one that did, a send is raced against the call rather than awaited before it, so
+a client that has stopped reading its stream cannot stall a debugger command.
+
+**Status:** landed. Both transports; over HTTP rmcp routes the notification onto the SSE stream the
+call is answered on, keyed by the token. Covered by unit tests on the relay's policy and by smoke
+tiers for the opener sequence over stdio and for a remote client over HTTP.
+
+---
+
 ## The server's log is a tool, not a protocol notification (2026-08-17)
 
 **Context.** Under stdio the log needs no plumbing: a worker's stderr is inherited by the
@@ -86,9 +139,12 @@ was wrong for a year of nobody noticing because it had no test. It had no test b
 unreachable without an HTTP harness, not because anyone decided to skip it. It is now a named
 predicate (`listen::is_departure`) with the same unit coverage every rule beside it has.
 
-**Status.** Implemented (#135, #137). Still missing from the listener: progress notifications, MCP
-log notifications, service installation, and a smoke tier for the lease itself — which is the
-coverage gap that made seven rounds of review the way these were found rather than the second.
+**Status.** Implemented (#135, #137). Three of the four things this listed as missing have since
+landed, each with an entry of its own above: the log reaches a remote client (as a tool, not a
+notification), the lease has the smoke tier whose absence made seven rounds of review the way these
+were found rather than the second, and a long call now reports its progress. What is still missing
+is **service installation** — the listener runs in whatever shell starts it — tracked as
+`FOLLOWUPS.md` item 23.
 
 ---
 
