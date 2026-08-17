@@ -1198,15 +1198,23 @@ fn field_bytes(tool: &Value, field: &str) -> usize {
     }
 }
 
-/// The per-tool size table.
+/// The per-tool size table, plus the totals.
 ///
-/// Ordered **by name**, which is worth stating because the obvious choice is worse: sorting by
-/// cost makes the golden read as a ranking, and then a tool that grows moves up it and shifts
-/// every row below, so the diff cascades through a dozen untouched tools instead of naming the one
-/// that changed. A stable key is what makes the failure legible. The ranking is not lost — the
-/// totals carry the worst tool by name.
-fn budget_report(tools: &[Value], instructions: &str) -> Value {
-    let mut rows: Vec<Value> = tools
+/// Takes the whole **`tools/list` result** rather than its `tools` array, so the payload figure is
+/// the payload rather than a reconstruction of it. Summing the tools misses the array's own commas
+/// and every result-level field — and on `2026-07-28` those are `resultType`, `ttlMs` and
+/// `cacheScope`, which is not a hypothetical omission in this repo: the `rmcp = "3.1.1"` floor
+/// exists *because* of `ttlMs`/`cacheScope`, and a revision that adds another such field is
+/// precisely the change a wire budget should notice. 118 bytes today; the number matters less than
+/// which side of the boundary it is measured on.
+///
+/// Rows are ordered **by name**, which is worth stating because the obvious choice is worse:
+/// sorting by cost makes the golden read as a ranking, and then a tool that grows moves up it and
+/// shifts every row below. The ranking is not lost — the totals carry the worst tool by name.
+fn budget_report(result: &Value, instructions: &str) -> Value {
+    let mut rows: Vec<Value> = result["tools"]
+        .as_array()
+        .expect("tools/list returns an array")
         .iter()
         .map(|tool| {
             json!({
@@ -1231,7 +1239,12 @@ fn budget_report(tools: &[Value], instructions: &str) -> Value {
         "totals": {
             "tools": rows.len(),
             "modelVisible": sum("modelVisible"),
+            // `wire` is the sum of the rows, and exists for attribution: it is what the per-tool
+            // figures add up to, so a total that moves can be traced to a tool. `payload` is the
+            // serialized result — the actual answer — and is what the ceiling guards. Keeping both
+            // means the gap between them is visible, and that gap is the result-level fields.
             "wire": sum("wire"),
+            "payload": json_bytes(result),
             "description": sum("description"),
             "inputSchema": sum("inputSchema"),
             "outputSchema": sum("outputSchema"),
@@ -1249,11 +1262,14 @@ fn budget_report(tools: &[Value], instructions: &str) -> Value {
 /// a new tool arriving with a `debug_batch`-scale schema does not.
 const MODEL_VISIBLE_CEILING: usize = 76_000;
 
-/// Ceiling on the whole `tools/list` payload. 358,533 bytes today, ~80% of it `outputSchema` that
-/// no model reads — which is why this is a separate, much looser number rather than a scaled
-/// version of the one above. It is a client-side parse and memory cost, and it is the one that
-/// grows silently: `schemars` inlines `$defs` per tool, so adding one shared type to one more
-/// output shape can add tens of kilobytes here while [`MODEL_VISIBLE_CEILING`] does not move.
+/// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
+/// the array's own punctuation and every result-level field are inside it. 358,651 bytes today,
+/// ~80% of that `outputSchema` no model reads, which is why this is a separate and much looser
+/// number rather than a scaled version of the one above.
+///
+/// It is a client-side parse and memory cost, and it is the one that grows silently: `schemars`
+/// inlines `$defs` per tool, so adding one shared type to one more output shape can add tens of
+/// kilobytes here while [`MODEL_VISIBLE_CEILING`] does not move.
 const WIRE_CEILING: usize = 412_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 9,757
@@ -1282,22 +1298,20 @@ fn tool_surface_stays_within_its_token_budget() {
 
     let response = server.request("tools/list", json!({}), STEP);
     assert_no_error(&response, "tools/list");
-    let tools = response["result"]["tools"]
-        .as_array()
-        .expect("tools/list returns an array")
-        .clone();
 
-    let report = budget_report(&tools, instructions);
+    // The whole result, not its `tools` array: what the payload figure has to measure is the
+    // answer this server actually sent, result-level fields and all.
+    let report = budget_report(&response["result"], instructions);
     let totals = &report["totals"];
     let model_visible = totals["modelVisible"].as_u64().unwrap() as usize;
-    let wire = totals["wire"].as_u64().unwrap() as usize;
+    let payload = totals["payload"].as_u64().unwrap() as usize;
 
     // Where you are, next to the ceiling you are under — for a run made by hand, which needs
     // `--nocapture` to see it: libtest prints a passing test's output nowhere. That is why the
     // golden rather than this line is what CI leaves behind.
     eprintln!(
         "tool surface: {} tools, {model_visible} B to the model (ceiling {MODEL_VISIBLE_CEILING}), \
-         {wire} B on the wire (ceiling {WIRE_CEILING}), instructions {} B",
+         {payload} B on the wire (ceiling {WIRE_CEILING}), instructions {} B",
         totals["tools"], totals["instructions"],
     );
 
@@ -1313,10 +1327,12 @@ fn tool_surface_stays_within_its_token_budget() {
          in docs/token-budget.md."
     );
     assert!(
-        wire <= WIRE_CEILING,
-        "tools/list is now {wire} B, over its {WIRE_CEILING} B ceiling. This is mostly \
+        payload <= WIRE_CEILING,
+        "the tools/list payload is now {payload} B, over its {WIRE_CEILING} B ceiling ({} B of \
+         that is the tools themselves, the rest result-level fields). This is mostly \
          outputSchema, which no model reads — check whether a shared type just got inlined into \
-         another tool's $defs before raising the ceiling."
+         another tool's $defs before raising the ceiling.",
+        totals["wire"],
     );
     assert!(
         worst_bytes <= WORST_TOOL_CEILING,
