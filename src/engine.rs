@@ -2519,14 +2519,28 @@ async fn reader(
             // whole reason the store is not here.
             WorkerMessage::RollingBack { id, within_ms } => {
                 let within = Duration::from_millis(u64::from(within_ms));
-                tracing::info!(
-                    "session {}: job {id} found a transaction in flight and told it to roll back; \
-                     it needs up to {within:?}",
-                    session.id
-                );
-                // The one milestone whose *number* the caller can act on: a teardown that looks
-                // stuck is a teardown waiting out a rollback, and this says how long that is.
-                tell(&waiters, id, crate::progress::Step::Unwinding { within });
+                // **Zero is a retraction, not a shorter promise.** The worker sends this message
+                // twice for one transaction: once when a teardown finds a batch to stop, naming
+                // how long that leaves, and once from the batch's own guard naming zero to say the
+                // transaction is over (`worker::RETRACTED`). Reading the second as another unwind
+                // reports a transaction still in flight at the moment it stopped being one — and
+                // says "up to 0.0s" doing it.
+                if within.is_zero() {
+                    tracing::info!(
+                        "session {}: job {id}'s transaction is unwound; only the release is left",
+                        session.id
+                    );
+                    tell(&waiters, id, crate::progress::Step::Unwound);
+                } else {
+                    tracing::info!(
+                        "session {}: job {id} found a transaction in flight and told it to roll \
+                         back; it needs up to {within:?}",
+                        session.id
+                    );
+                    // The one milestone whose *number* the caller can act on: a teardown that
+                    // looks stuck is a teardown waiting out a rollback, and this says how long.
+                    tell(&waiters, id, crate::progress::Step::Unwinding { within });
+                }
             }
             WorkerMessage::Committed { id } | WorkerMessage::Opened { id } => {
                 tracing::warn!(
