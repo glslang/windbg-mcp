@@ -1170,8 +1170,9 @@ fn tool_surface_stays_within_its_token_budget() {
     let model_visible = totals["modelVisible"].as_u64().unwrap() as usize;
     let wire = totals["wire"].as_u64().unwrap() as usize;
 
-    // Print unconditionally: on a green run this is the only place the numbers are visible, and a
-    // budget nobody ever sees is a budget nobody maintains.
+    // Where you are, next to the ceiling you are under — for a run made by hand, which needs
+    // `--nocapture` to see it: libtest prints a passing test's output nowhere. That is why the
+    // golden rather than this line is what CI leaves behind.
     eprintln!(
         "tool surface: {} tools, {model_visible} B to the model (ceiling {MODEL_VISIBLE_CEILING}), \
          {wire} B on the wire (ceiling {WIRE_CEILING}), instructions {} B",
@@ -3120,8 +3121,9 @@ fn tool_results_stay_within_their_budget() {
         );
     }
 
-    // The table is the deliverable on a green run — the assertions only fire when something has
-    // already gone wrong, and a budget nobody ever sees is a budget nobody maintains.
+    // The table is the deliverable when this passes — the assertions only speak up once something
+    // has already gone wrong. Unlike the surface budget, this one *is* visible in CI, because the
+    // debugger tier's job passes `--nocapture`; without it libtest would swallow the table.
     eprintln!("\n  model     text  struct  ratio  ceiling  tool");
     for (tool, model, text, structured, ceiling) in &rows {
         let (shown, ratio) = match structured {

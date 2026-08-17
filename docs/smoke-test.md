@@ -392,10 +392,12 @@ dependency bump or a widened schema can move what this server spends of the *mod
 without breaking a single assertion — `schemars` inlining one more shared type across 31 output
 schemas is tens of kilobytes and no test failure.
 
-Both print their numbers on a green run, and the surface one is pinned in
-`tests/golden/tool_budget.json`, re-recorded by the same `UPDATE_GOLDEN=1` as the shape golden
-beside it. Read the diff; it is the only place the price of a reworded description shows up. See
-[`token-budget.md`](./token-budget.md) for the baseline, the ceilings and how to raise one.
+Both print their numbers **under `--nocapture`** — libtest shows a passing test's output nowhere,
+so without the flag they pass in silence. The debugger tier's CI job passes it and the result table
+is in its log; the `build` job does not, so the surface figures live in
+`tests/golden/tool_budget.json` instead, re-recorded by the same `UPDATE_GOLDEN=1` as the shape
+golden beside it. Read that diff — it is the only place the price of a reworded description shows
+up. See [`token-budget.md`](./token-budget.md) for the baseline, the ceilings and how to raise one.
 
 ## When to run it
 
