@@ -19,8 +19,15 @@ worker supervision, routing), `src/worker.rs` (the child process and the engine 
 `src/main.rs` (role selection).
 
 Practical consequences when debugging this server: a stack trace or log line can come from either
-role (worker logs are untagged by target and inherit the supervisor's stderr), and killing the
-supervisor leaves no workers behind — they exit when their request channel closes. That channel is
+role (both write to the supervisor's stderr, told apart by `tracing` target — `windbg_mcp::worker`
+against `windbg_mcp::engine` and friends), and killing the supervisor leaves no workers behind —
+they exit when their request channel closes.
+
+The same records are also readable **through the tool surface**: `server_log` serves a bounded ring
+of them (`src/logbridge.rs`), with a worker's tagged by session, which is the only way to see them
+when the client is not on this machine (`--listen`). It is a copy of the stderr stream, not a
+replacement — worker stderr is untouched — so it holds nothing below the level the server was
+started with; `RUST_LOG` widens both together. That channel is
 a pair of inherited anonymous pipes, *not* the worker's stdio: anything a worker prints to stdout
 is drained into the log and cannot reach the protocol.
 

@@ -93,13 +93,39 @@ knowing about, because an engine job outlives the request that asked for it — 
 gave up is still running against the target, and the server will not hand that target on until it
 finishes.
 
+## Reading the server's log from the client machine
+
+The listener's `tracing` output still goes to its own stderr, which is now on the *other* machine.
+`server_log` is how it reaches you anyway: the supervisor keeps the last thousand records — its own
+and every engine worker's — and serves them as a tool, so this works the same over stdio and HTTP.
+
+```jsonc
+server_log {}                                   // the last 50, info and above
+server_log { "session_id": "sess-…-1" }         // what that session's engine worker said
+server_log { "level": "warn", "limit": 200 }
+server_log { "since": 412 }                     // only what is new, from the last `next_since`
+```
+
+A worker's records carry the session they belong to; the supervisor's — spawning a worker, timing
+a call out, a worker dying — carry none, so **omit `session_id` when tracing an open that failed**,
+since there was no session for those records to be tagged with.
+
+Two things worth knowing. A healthy session is *quiet*: a worker logs when something goes wrong, not
+as it works, so an empty page usually means nothing went wrong rather than that the bridge is
+broken. And the buffer is the same stream as stderr, so it holds nothing below the level the server
+was started with — widen with `RUST_LOG=windbg_mcp=debug` on the listener (and restart), not with
+`level` on the call. `WINDBG_MCP_LOG_BUFFER` sets how many records are kept.
+
+This is diagnostics about the *server*, not the target, and it is as sensitive as the server's
+stderr — which for a live kernel session can name what the guest was doing. Under stdio those
+records reached a log file; here they reach the client, and therefore the model. Treat a live-kernel
+session accordingly.
+
 ## Not there yet
 
 - **No progress notifications.** A long call is quiet; the SSE keep-alive holds the stream open but
-  nothing reports what the call is doing. `session_status` still answers.
-- **No MCP log notifications.** Worker `tracing` output goes to the listener's own stderr on the
-  server machine, not to the client — so the diagnostics [`CLAUDE.md`](../CLAUDE.md) describes are
-  read there for now.
+  nothing reports what the call is doing. `session_status` still answers, and `server_log` says what
+  the server has been doing — but neither is the call reporting on itself.
 - **No service installation.** The listener runs in whatever shell you start it in. A Windows
   service would give it a defined `PATH` and working directory, boot start, and a life independent
   of a login session.

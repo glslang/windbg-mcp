@@ -326,6 +326,7 @@ gh attestation verify <zip> --repo glslang/windbg-mcp `
 | Group | Tools |
 |-------|-------|
 | Session | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `interrupt`, `end_session`, `session_status` |
+| Server   | `server_log` — the server's own log, the supervisor's and every engine worker's, tagged with the session each record belongs to |
 | State   | `registers`, `read_memory`, `walk_memory`, `backtrace`, `modules`, `threads`, `disassemble`, `dx` |
 | Crash   | `crash_triage` — a bug check as fields: code and parameters, crashing process, the stack as `module+RVA`, and the faulting driver frame |
 | Control | `go`, `step_over`, `step_into`, `set_breakpoint`, `run_to_address` |
@@ -630,6 +631,7 @@ matching `outputSchema` in `tools/list`, so a program can read a field instead o
 |------|--------------|
 | `open_dump`, `open_trace`, `attach_kernel`, `attach_kernel_local`, `attach_process`, `launch` | `session_id`, `kind`, `target`, `report`, and a `summary` of the target — `kernel_mode`, `modules_loaded`, the `primary_module` (the kernel, or the process's own image) and, for a crash dump, the `bug_check`. On failure, whether a target was created (`target: no \| yes \| pending`), which is what decides whether opening again is a recovery or a second attach |
 | `session_status` | each session's `state` (`opening`/`attaching`/`open`/`failed`/`retired`/`closed`), `engine_pid`, `in_state_for_ms`, and — for an attach — `waits_indefinitely` and `overdue` |
+| `server_log` | `records[]` as `{seq, at, level, session_id, target, message}` — `session_id` absent for the supervisor's own — plus `matched`, the buffer's `held`/`capacity`/`oldest_seq`, and a `next_since` cursor that advances even on an empty page |
 | `end_session` | `released`, `worker_terminated`, `waited_ms` |
 | `registers` | `registers[]` as `{name, kind, …}` plus `instruction_pointer` — `kind: int` and `kind: float` carry `value`, `kind: bytes` carries `bytes` (an x87 or vector register, which no number holds), `kind: non_finite` names a NaN or infinity that JSON has no literal for and carries its bits, `kind: unavailable` carries neither; pass `all: true` for the x87/vector registers and subregister views |
 | `modules` | `modules[]` with `start`/`end`, `size` and a typed `symbols` state (`deferred` is *not* `none`); `unloaded[]` for the images that have since unloaded (listed by image name, since an unloaded module has none of its own); `loaded` (how many the target has in total) and the `filter` a narrowed listing was matched by. The listing text is rendered from these same records rather than pasted from `lm`, so the two halves cannot describe different sets of modules; the filter's grammar is this server's own — a name plus `*` (any run) and `?` (exactly one), **every other character literal** — and `execute { "command": "lm m <pattern>" }` is where WinDbg's fuller wildcard syntax lives |
