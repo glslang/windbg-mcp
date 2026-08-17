@@ -9,6 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`server_log` — the server's own log, readable from wherever the client is.** The supervisor
+  keeps a bounded ring of the most recent records, its own and every engine worker's, and serves
+  them as a tool: filterable by session and level, paged with a `since` cursor, answered without
+  ever touching a session's engine — so it still answers while the session it is about is wedged,
+  like `session_status`.
+
+  This closes a regression the listener introduced. Under stdio the log needs no plumbing: a
+  worker's stderr is inherited by the supervisor, the supervisor's is captured by the MCP client,
+  and the whole stream lands in a file the operator already has. `--listen` moves the server to
+  another machine and the stream stops there.
+
+  - **Records cross the pipe as values.** A worker's `tracing` output is mirrored up the existing
+    protocol channel (`WorkerMessage::Log`) and filed by the supervisor **tagged with the session
+    id** — the one thing the worker itself cannot stamp them with, and the thing that makes two
+    processes' interleaved records readable.
+  - **Worker stderr is untouched.** The bridge is a second copy, not a redirection, so the stdio
+    behaviour it exists to restore is preserved by not touching it — and the local operator's view
+    on the server machine is unchanged.
+  - **It cannot block the debugger.** The worker's queue is bounded and dropped when full, never
+    blocked on: it is fed from the engine thread, inside DbgEng, where a log line must never wait
+    on a pipe. Drops are counted and filed as a record of their own, because a gap in a log that
+    reads as a quiet stretch is worse than no log at all.
+  - **Not built on MCP's logging capability.** rmcp marks `notifications/message` and its whole
+    API `#[deprecated]` for removal (SEP-2577), and this repo asserts that capability is not
+    advertised. See [`DECISIONS.md`](./DECISIONS.md) for the trade — pull rather than push — and
+    for what a tool reaches that stderr never did: the model holding the session.
+
+  `WINDBG_MCP_LOG_BUFFER` sets how many records are kept (1000 by default). The ring is the same
+  stream as stderr, so `RUST_LOG` widens both together.
+
 - **Opt-in session transcripts, and an asciicast renderer for them**
   ([#87](https://github.com/glslang/windbg-mcp/issues/87)). Point `WINDBG_MCP_TRANSCRIPT` at a path
   and the supervisor records what it was asked and what it did, one JSON object per line: the tool

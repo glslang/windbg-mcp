@@ -5,6 +5,47 @@ status. Keep entries short; link to code with `file:line` where it helps a futur
 
 ---
 
+## The server's log is a tool, not a protocol notification (2026-08-17)
+
+**Context.** Under stdio the log needs no plumbing: a worker's stderr is inherited by the
+supervisor, the supervisor's is captured by the MCP client, and the whole stream lands in a file
+the operator already has. `--listen` moves the server to another machine and the stream stops
+there — a regression against stdio rather than anything HTTP requires.
+
+**The obvious fix is the wrong one.** MCP has a logging capability (`notifications/message`,
+`logging/setLevel`), and it is a few lines. It is also deprecated: rmcp marks every type in it
+`#[deprecated]` for removal under SEP-2577. And this repo already asserts, in
+`capabilities_advertise_only_what_is_implemented`, that the `logging` capability is *not*
+advertised — advertising what you do not implement routes real calls into `method_not_found`. So
+taking it would mean unpicking a standing test in order to depend on an API the SDK has announced
+it is deleting.
+
+**Decision.** The supervisor keeps a bounded ring of the most recent records — its own and, over
+the pipe as typed values, every worker's — and `server_log` serves it. A worker's records are
+tagged with the session id on arrival, which is the one thing the worker cannot stamp them with.
+
+**Why this shape.** It is transport-agnostic, so stdio and HTTP report the same thing through one
+code path. It is answered by the supervisor and never routed to a worker, like `session_status`, so
+it still answers while the session it is about is wedged — which is the case it exists for. And it
+reaches a reader stderr never did: the model holding the session, which under stdio could not see
+these records at all.
+
+**What it costs.** Pull, not push: nothing arrives unasked, so a client that never calls it learns
+nothing. That is the trade for not building on an API with a removal notice on it, and the ring is
+the same stream either way.
+
+**Two things fell out of building it.** A worker's queue is bounded and **dropped when full**,
+never blocked on — it is fed from the engine thread, inside DbgEng, where a log line must never
+block — and the drops are counted and filed as a record of their own, because a gap that reads as
+quiet is worse than no log. And worker stderr is left exactly as it was: the bridge is a second
+copy, not a redirection, so the stdio behaviour this exists to restore is preserved by not
+touching it.
+
+**Status:** landed. Worker stderr unchanged; `server_log` on both transports; verified over HTTP
+against the listener.
+
+---
+
 ## Tenancy is held until the engine is idle, not until the request ends (2026-08-16, #135)
 
 **Context.** The stdio role gets one property free: when stdin closes the client is *definitively*

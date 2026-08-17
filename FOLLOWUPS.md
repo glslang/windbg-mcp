@@ -1,14 +1,15 @@
 # Follow-ups
 
-Deferred work, in six clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in nine clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/win-kexp#71, 2026-08-01), items 13–14 from the bounded-command coverage review
 (#46, 2026-08-02), item 15 from the private worker channel (#65 / #72, 2026-08-04), items 16–18
 from transactional batches (#82, 2026-08-09/10 — item 17 is what validating the tool against the CTF
-session's own transcript turned up, and item 18 what reviewing it did), and item 19 from
-`walk_memory` (#103, 2026-08-13), and items 20–22 from standing the server up on an ARM64 guest
-(#131, #132, #134, 2026-08-16). Each item notes its repo,
+session's own transcript turned up, and item 18 what reviewing it did), item 19 from
+`walk_memory` (#103, 2026-08-13), items 20–22 from standing the server up on an ARM64 guest
+(#131, #132, #134, 2026-08-16), and item 23 from making the listener usable rather than merely
+working (2026-08-17). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -630,3 +631,29 @@ only job that could satisfy it, and every PR in the repo would have blocked on a
 never report again. It surfaced as a PR that was `MERGEABLE` but `BLOCKED` with nothing failing that
 was required. The x64 entry now keeps the original name exactly, so adding a matrix is not a rename.
 Worth knowing before touching any job name in this repository, not just this one.
+
+## 23. [windbg-mcp] The listener is transport-complete, not usable-complete
+
+The log half of this is **done** (2026-08-17): `server_log` carries every record either process
+made to a client on any machine, and [`DECISIONS.md`](./DECISIONS.md) records why it is a tool
+rather than MCP's deprecated logging capability. What is left of the same gap is the other two
+items [`docs/remote-listener.md`](./docs/remote-listener.md) lists under *Not there yet*, plus one
+this work added.
+
+**No progress notifications.** A long call is silent. The worker already emits the milestones — a
+`Committed`/`Opened` opener pair, `RollingBack` — as protocol messages, so what is missing is the
+mapping onto MCP progress and a `progressToken` to hang it on, not the facts. Under stdio a caller
+watched stderr for this; a remote one has `session_status` and `server_log`, and both are pull.
+
+**No service installation.** The listener runs in whatever shell starts it, so it dies with the
+login session and inherits that shell's `PATH` — which for this server decides whether the engine
+DLLs beside the exe are the ones that load.
+
+**No smoke tier for the lease.** Every rule of it has unit tests
+(`src/listen.rs`), and the ones that matter most — drop and return inside the grace, release past
+it, a second client refused with `409` — have only ever been exercised by hand against the guest.
+That is the shape of gap the lease's seven review rounds kept finding bugs in. This work drove the
+listener over HTTP again to check `server_log` reaches a client that is not on the machine, which
+is a third hand-run of the same setup and an argument for scripting it.
+
+Picks up at `src/listen.rs` and the tiers in `tests/mcp_smoke.rs`.
