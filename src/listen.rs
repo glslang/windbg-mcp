@@ -41,6 +41,7 @@
 //! reconnect needs nothing further to prove.
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -67,6 +68,18 @@ pub const LISTEN_FLAG: &str = "--listen";
 /// Where the bearer token is read from. An environment variable rather than an argument, because a
 /// command line is readable by every process on the machine — including a `launch`ed debuggee.
 pub const TOKEN_ENV: &str = "WINDBG_MCP_LISTEN_TOKEN";
+
+/// A file to read the bearer token from instead, for when an environment variable is not private
+/// enough.
+///
+/// It is not, for a **service**: a service reads the *machine* environment, and that is readable by
+/// every local process including unprivileged ones. Since this endpoint's token is the only thing
+/// between a caller and `launch`, and a service runs as `LocalSystem`, a machine-scope token is a
+/// local privilege escalation rather than an inconvenience — see [`crate::service`], which writes
+/// this file with an ACL that excludes ordinary users and points the service at it.
+///
+/// Read *before* [`TOKEN_ENV`], so a host that has both is using the private one.
+pub const TOKEN_FILE_ENV: &str = "WINDBG_MCP_LISTEN_TOKEN_FILE";
 
 /// Overrides how long a client may be silent before its sessions are released, in whole seconds.
 const GRACE_ENV: &str = "WINDBG_MCP_LEASE_GRACE_SECS";
@@ -491,16 +504,83 @@ impl Lease {
 }
 
 /// Serves MCP over HTTP until the process is asked to stop.
-pub async fn serve(sessions: Sessions, addr: SocketAddr, call_timeout: Duration) -> Result<()> {
+/// How long to keep retrying a bind that fails because the address is not there yet.
+///
+/// Only reached by a **non-loopback** bind at boot: an auto-start service can be launched before
+/// the adapter it names has been given its address, and a single attempt then fails the service
+/// permanently — which quietly undoes the "starts at boot" that is half the reason to be a service.
+/// Loopback is up before anything starts, so the ordinary configuration never waits here at all.
+pub(crate) const BIND_PATIENCE: Duration = Duration::from_secs(90);
+const BIND_RETRY_EVERY: Duration = Duration::from_secs(2);
+
+/// Binds `addr`, waiting for the address to exist if it does not yet.
+///
+/// Retries only what is worth retrying. A port already in use, or one this process may not have, is
+/// a configuration error that will not fix itself, and failing immediately says so while an
+/// operator is still watching; an address that has not been assigned yet is the one condition that
+/// resolves on its own.
+async fn bind_when_ready(addr: SocketAddr) -> Result<TcpListener> {
+    let deadline = Instant::now() + BIND_PATIENCE;
+    let mut said_so = false;
+    loop {
+        match TcpListener::bind(addr).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+                if Instant::now() >= deadline {
+                    return Err(anyhow::Error::new(e)).with_context(|| {
+                        format!("{addr} never appeared on this host within {BIND_PATIENCE:?}")
+                    });
+                }
+                if !said_so {
+                    tracing::info!("{addr} is not on this host yet; waiting for it to appear");
+                    said_so = true;
+                }
+                tokio::time::sleep(BIND_RETRY_EVERY).await;
+            }
+            Err(e) => return Err(anyhow::Error::new(e).context(format!("cannot bind {addr}"))),
+        }
+    }
+}
+
+/// The bearer token, from a file if one is named and from the environment otherwise.
+///
+/// Trimmed, because a token in a file arrives with whatever line ending wrote it, and a token that
+/// works from an editor but not from `Set-Content` would be an unpleasant afternoon.
+fn bearer_token() -> Result<String> {
+    if let Some(path) = std::env::var_os(TOKEN_FILE_ENV) {
+        let path = std::path::PathBuf::from(path);
+        let token = std::fs::read_to_string(&path).with_context(|| {
+            format!(
+                "{TOKEN_FILE_ENV} names {}, which cannot be read",
+                path.display()
+            )
+        })?;
+        if token.trim().is_empty() {
+            bail!("{} is empty; that is not a token.", path.display());
+        }
+        return Ok(token.trim().to_string());
+    }
     let token = std::env::var(TOKEN_ENV).map_err(|_| {
         anyhow::anyhow!(
-            "{TOKEN_ENV} is not set. The listener will not start without a bearer token: it \
-             exposes every tool this server has, including the ones that write to a live kernel."
+            "neither {TOKEN_FILE_ENV} nor {TOKEN_ENV} is set. The listener will not start without \
+             a bearer token: it exposes every tool this server has, including the ones that write \
+             to a live kernel."
         )
     })?;
     if token.trim().is_empty() {
         bail!("{TOKEN_ENV} is set but empty; that is not a token.");
     }
+    Ok(token.trim().to_string())
+}
+
+pub async fn serve(
+    sessions: Sessions,
+    addr: SocketAddr,
+    call_timeout: Duration,
+    shutdown: impl Future<Output = ()>,
+    ready: impl FnOnce(),
+) -> Result<()> {
+    let token = bearer_token()?;
 
     let grace = match std::env::var(GRACE_ENV).ok().and_then(|v| v.parse().ok()) {
         Some(secs) if secs > 0 => Duration::from_secs(secs),
@@ -531,9 +611,21 @@ pub async fn serve(sessions: Sessions, addr: SocketAddr, call_timeout: Duration)
         ))
     };
 
-    let listener = TcpListener::bind(addr)
-        .await
-        .with_context(|| format!("cannot bind {addr}"))?;
+    // Pinned here rather than at the accept loop, because the bind is raced against it: a stop
+    // arriving while a not-yet-assigned address is being waited for must be answered now, not in
+    // ninety seconds' time. Without this the service would sit `Running` with no endpoint and no
+    // way to be stopped, which is worse than the boot-time failure the retry exists to survive.
+    let mut shutdown = std::pin::pin!(shutdown);
+    let listener = tokio::select! {
+        () = &mut shutdown => {
+            tracing::info!("asked to stop before {addr} could be bound");
+            return Ok(());
+        }
+        bound = bind_when_ready(addr) => bound?,
+    };
+    // There is an endpoint from here, and not before: a caller that reports itself started does it
+    // *now*. See [`crate::service`], where "started" is a thing the SCM and its dependants act on.
+    ready();
     tracing::info!(
         "windbg-mcp listening on http://{addr} (lease grace {grace:?}, one client at a time)"
     );
@@ -541,12 +633,22 @@ pub async fn serve(sessions: Sessions, addr: SocketAddr, call_timeout: Duration)
     tokio::spawn(sweep(sessions.clone(), lease.clone(), manager.clone()));
 
     loop {
-        let (stream, peer) = match listener.accept().await {
-            Ok(accepted) => accepted,
-            Err(e) => {
-                tracing::warn!("accept failed: {e}");
-                continue;
+        let (stream, peer) = tokio::select! {
+            // Asked to stop. Returning here is the whole mechanism: the caller's `shutdown` on
+            // `Sessions` runs next, and that is what releases a live kernel rather than leaving it
+            // frozen. Connections already in flight are dropped — a client mid-call loses that
+            // call, which is the lesser of the two, and its session is being released anyway.
+            () = &mut shutdown => {
+                tracing::info!("no longer accepting connections on {addr}");
+                return Ok(());
             }
+            accepted = listener.accept() => match accepted {
+                Ok(accepted) => accepted,
+                Err(e) => {
+                    tracing::warn!("accept failed: {e}");
+                    continue;
+                }
+            },
         };
         let mcp = mcp.clone();
         let manager = manager.clone();

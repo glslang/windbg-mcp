@@ -633,15 +633,14 @@ never report again. It surfaced as a PR that was `MERGEABLE` but `BLOCKED` with 
 was required. The x64 entry now keeps the original name exactly, so adding a matrix is not a rename.
 Worth knowing before touching any job name in this repository, not just this one.
 
-## 23. [windbg-mcp] The listener is transport-complete, not usable-complete
+## 23. [windbg-mcp] The listener is transport-complete, not usable-complete — **done** (2026-08-17)
 
-Three quarters of this are **done** (2026-08-17): `server_log` reaches a client on any machine with
+All of it is **done** (2026-08-17): `server_log` reaches a client on any machine with
 the records *both* processes made — bounded, and saying so when a record was dropped or evicted
 rather than leaving a gap to be read as quiet ([`DECISIONS.md`](./DECISIONS.md) records why it is a
 tool rather than MCP's deprecated logging capability); the lease has a **smoke tier** — four
-assertions in the protocol tier and one, against a parked kernel attach, in the debugger tier; and a
-long call now reports **progress**. What is left is the one item
-[`docs/remote-listener.md`](./docs/remote-listener.md) still lists under *Not there yet*.
+assertions in the protocol tier and one, against a parked kernel attach, in the debugger tier; a
+long call reports **progress**; and the listener installs as a **Windows service**.
 
 **Progress notifications — done** (`src/progress.rs`). The milestones were already protocol
 messages, so what was added is the route out: a `progressToken` read off the call's `_meta` in
@@ -656,9 +655,28 @@ again, and a pool walk or a `crash_triage` has no milestones at all — so **ten
 word is itself reported**, which incidentally makes progress a liveness signal a client can extend
 its own request timeout on.
 
-**No service installation.** The listener runs in whatever shell starts it, so it dies with the
-login session and inherits that shell's `PATH` — which for this server decides whether the engine
-DLLs beside the exe are the ones that load.
+**Service installation — done** (`src/service.rs`). `--install-service --listen <addr>` registers
+the listener with the SCM as `windbg-mcp`, auto-start, `LocalSystem`; `--uninstall-service` stops it
+and removes it. Three things it turned up that the entry did not anticipate.
+
+The **stop** is the whole of the difficulty, and it is why `listen::serve` grew a shutdown future:
+nothing else in this server needs one — under stdio the disconnect *is* the signal, and a foreground
+listener has nobody to ask it — but a service that is killed rather than asked leaves a
+detached-but-halted kernel frozen. The SCM is told `StopPending` with a wait hint sized from what
+releasing every worker can actually take, rather than being left on the default.
+
+`LocalSystem` **does not read your `profiles.json`** — its `%USERPROFILE%` is
+`C:\Windows\system32\config\systemprofile` — so kernel profiles have to be configured machine-wide
+or the service sees none. Verified, not assumed, and `install` says so where an operator will read
+it. The token is the same problem one scope out, and machine-scope is a real widening.
+
+And a service has **no console**, so the role writes to `%ProgramData%\windbg-mcp\service.log`: the
+`server_log` ring is the better channel, but it is only reachable once the listener is up, which is
+exactly the case not worth diagnosing that way.
+
+Verified end to end on the ARM64 bench: installed, started, served an authorised MCP call and
+refused an unauthenticated one, **attached a live kernel and was then stopped** — the guest kept
+running rather than freezing, and no worker outlived the service.
 
 **What the smoke tier does not reach**, now that there is one: the grace is waited out at 32
 seconds because the listener's own floor is the call budget plus `WORKER_READY_TIMEOUT`, and that

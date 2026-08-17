@@ -143,10 +143,10 @@ connection string (which nobody can guess) *and* `#[ignore]`d, so a stale variab
 a VM during an ordinary `cargo test`. Run it last, on its own.
 
 **Before deciding a live-kernel claim cannot be checked, read the profiles.** This host normally has
-one configured, and a configured profile *is* a KDNET target — connection, port and key — so the
-tier can be run. The failure this is here to stop is not asking the user for a key; it is concluding
-"no KDNET target on this host" without looking, shipping the live claim as unverified, and saying so
-in a PR. Two lines settle it:
+one configured, and a configured profile *is* a live kernel target, so the tier can be run. The
+failure this is here to stop is not asking the user for a key; it is concluding "no kernel target on
+this host" without looking, shipping the live claim as unverified, and saying so in a PR. Two lines
+settle it:
 
 ```pwsh
 Get-Content "$env:USERPROFILE\.windbg-mcp\profiles.json" -Raw | ConvertFrom-Json | Get-Member -MemberType NoteProperty | Select-Object Name
@@ -169,23 +169,59 @@ of them. Only ask the user for a raw connection when no profile is configured at
 `--test-threads=1` is not optional: the filter matches **eight** tests, and the KD transport is
 single-owner, so in parallel the second attach fails and can leave the target halted.
 
-**Check the target is reachable before starting the tier, not by starting it.** A KDNET attach that
-finds nothing parks its worker in `WaitForEvent(INFINITE)` for the whole run and reports a timeout
-that measures the environment rather than the code.
+**The transport does not have to be KDNET, and the target does not have to be x64.** The variable is
+a DbgEng connection string, passed through untouched, so `com:port=COM1,baud=115200` is as valid as
+a `net:` one. Three assertions gate themselves on what the target actually is rather than on the
+tier: the KD endpoint being owned by the worker is a UDP claim, the key-redaction claim needs a key
+to look for, and the two **pool** tests need an x64 target because the walker decodes x64 pool
+descriptors. Each says so when it stands down; none of them passes quietly.
 
-What settles it is not "can I reach the guest" but **does the guest's `bcdedit /dbgsettings hostip`
-equal this debugger host's current IP**, on the port the profile names — that is what makes the
-target dial in, and the host IP moves between sessions. Read it on the guest and compare the key by
-*hash* rather than printing it. That check is the same everywhere; how you reach the guest to run it
-is not.
+### Two ways a target is reached, and neither is "the" procedure
 
-*Finding* the guest is topology-specific, so what follows is one instance and not the procedure. On
-the machine this was written for, the debugger host is itself a Hyper-V guest — `Get-VM` does not
-exist and there is no local VM to start — so the target is a *sibling*: it appears in the neighbour
-table (`Get-NetNeighbor | ? LinkLayerAddress -like '00-15-5D*'`) and answers **TCP 5985** and
-nothing else, ICMP and 445 being closed, so a failed ping proves nothing there. Elsewhere it may be
-a local VM, another hypervisor, or one of several neighbours — and with several, the neighbour table
-alone will happily validate the wrong guest, which is what the `hostip` comparison above is for.
+**KDNET.** Check the target is reachable *before* starting the tier, not by starting it — an attach
+that finds nothing parks its worker in `WaitForEvent(INFINITE)` for the whole run and reports a
+timeout that measures the environment rather than the code. What settles it is not "can I reach the
+guest" but **does the guest's `bcdedit /dbgsettings hostip` equal this debugger host's current IP**,
+on the port the profile names; the host IP moves between sessions. Compare the key by *hash* rather
+than printing it.
+
+*Finding* the guest is topology-specific. On the machine that paragraph was written for, the
+debugger host is itself a Hyper-V guest — `Get-VM` does not exist and there is no local VM to start
+— so the target is a *sibling*: it appears in the neighbour table (`Get-NetNeighbor | ?
+LinkLayerAddress -like '00-15-5D*'`) and answers **TCP 5985** and nothing else, ICMP and 445 being
+closed, so a failed ping proves nothing there. With several neighbours the table will happily
+validate the wrong guest, which is what the `hostip` comparison is for.
+
+**Serial, which is what the Parallels bench uses** — and there KDNET is not merely unconfigured but
+*impossible*: guests get a `Parallels VirtIO Ethernet Adapter` (`PCI\VEN_1AF4`), and `1AF4` is not
+in the Debugging Tools' `VerifiedNICList.xml`. `prlctl set <vm> --device-set net0 --adapter-type
+e1000` is accepted and silently ignored on ARM, leaving the guest with no network at all. Do not
+spend an afternoon on it. The wiring that works is a TCP socket between two guests:
+
+- target `serial0` → `tcp://localhost:2020`, **client**; `bcdedit /dbgsettings serial debugport:1
+  baudrate:115200`
+- debugger `serial0` → `tcp://:2020`, **server** — then `prlctl set <vm> --device-connect serial0`,
+  or it stays `state=disconnected` and nothing binds the port, and a **VM restart**, or the guest
+  never sees a COM port
+- `netstat -an | grep 2020` on the Mac: a LISTEN *and* an ESTABLISHED pair means the wire is up
+- on the target, `ARM PL011 Serial Port Device (COM1)` in **`Error`** state with no name from
+  `GetPortNames()` is correct — that is the kernel debugger owning the port
+
+Three traps on that bench, each of which cost real time:
+
+- **`kd -b` is no longer supported** — the docs say so in those words, and it is silently a no-op,
+  so a `kd -k … -b` probe sits at `no_debuggee` against a *running* target and looks like a dead
+  link. Use **`-bonc`**. windbg-mcp itself is unaffected; DbgEng issues a proper break-in.
+- **Parallels `Pause idle` is on by default**, and a target broken into the debugger burns no CPU,
+  so the hypervisor suspends the whole VM mid-run and every later call times out with nothing to
+  explain it. `prlctl list` then shows it `paused`, which is *not* a kernel halt.
+  `prlctl set "<vm>" --pause-idle off`.
+- **A worker killed while holding a broken-in kernel leaves the guest frozen** — `prlctl exec` hangs
+  on it. Attaching and detaching properly is the fix:
+  `kd -k com:port=COM1,baud=115200 -c ".time;qd"`.
+
+**A pool walk will not finish over 115200 baud.** It reads every committed pool page and times out
+at 240s, so on a serial bench "x64-only" and "too slow over this wire" cannot be told apart.
 
 ## Live kernel + driver IOCTL gotchas (learned driving HEVD over KDNET)
 
@@ -250,6 +286,15 @@ line* — they ignore `;`, so anything chained after them (`; .reload ...`) is p
 Issue `.sympath` alone, or use the **`set_symbol_path`** tool (goes through the DbgEng
 `AppendSymbolPath`/`SetSymbolPath` API, immune to the quirk; appends + reloads). When a driver's
 `module!Symbol` names don't resolve, **ask the user for the PDB folder** and apply it with that tool.
+
+**Nothing resolves at all without `msdia140.dll` beside the engine** — `symsrv.dll` finds a PDB and
+that one *parses* it, so without it every module reports `Symbol Type: EXPORT - PDB not found` even
+when the identity was known and the file was downloaded. It is **not** store-package-only, which
+this repo believed for a while: Visual Studio Build Tools ships it, including an ARM64 build, at
+`…\BuildTools\DIA SDK\bin\arm64\msdia140.dll`. Copy it next to the exe (`target\release`, and
+`target\debug` for the smoke tiers). **Warm the cache once** afterwards — attach and `.reload /f nt`
+— because the first fetch takes minutes and everything around it times out, which reads convincingly
+as the parser having made things worse.
 
 ## Recording a session while debugging this server
 

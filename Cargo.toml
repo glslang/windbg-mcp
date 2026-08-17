@@ -38,6 +38,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Only for the handle plumbing behind the supervisor↔worker channel (see `engine::spawn_worker`):
 # marking a pipe end inheritable is the one thing std cannot express.
 windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+# The Windows service role (`src/service.rs`). A wrapper rather than hand-rolled SCM FFI because
+# that lifecycle is the one part of this which must not be subtly wrong: a service that mishandles
+# its stop is a service that cannot be stopped, and for this server that means a live kernel target
+# left frozen. Small and focused — it pulls in no framework behind it.
+windows-service = "0.8"
 
 [dev-dependencies]
 # `test-util` only, and only for the tests: `src/progress.rs` asserts on a heartbeat measured in
