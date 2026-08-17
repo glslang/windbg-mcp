@@ -143,6 +143,17 @@ impl Reporter {
     }
 }
 
+#[cfg(test)]
+impl Reporter {
+    /// A reporter and the receiving end, for tests in *other* modules that need to see what a call
+    /// reported. The field is private on purpose — nothing outside this module should be able to
+    /// invent a sink — so the test seam is explicit rather than a widened visibility.
+    pub fn for_test() -> (Self, mpsc::UnboundedReceiver<Step>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        (Self(tx), rx)
+    }
+}
+
 tokio::task_local! {
     /// Where the call running on this task reports what it is doing.
     ///
@@ -211,6 +222,23 @@ impl Watch {
     }
 }
 
+/// The next value for `progress`: seconds elapsed, but never a repeat of the last one.
+///
+/// [`Instant`] is only *non-decreasing*, so two notifications sampled in the same tick of the
+/// platform clock can read the same — which the final flush makes likely, since it drains whatever
+/// is queued back to back. MCP asks this field to increase every time progress is made, and a
+/// client that enforces it may discard the later milestone, so the one case where the reading is
+/// not enough is nudged to the smallest value above the last. The number stays honest: it is still
+/// the elapsed seconds to any precision a reader could act on.
+fn strictly_after(reported: f64, elapsed: Duration) -> f64 {
+    let seconds = elapsed.as_secs_f64();
+    if seconds > reported {
+        seconds
+    } else {
+        reported.next_up()
+    }
+}
+
 /// Drives `work`, turning the steps it reports — and the silences between them — into `notify`
 /// calls carrying seconds elapsed and a message.
 ///
@@ -224,6 +252,9 @@ where
     F: Future<Output = ()>,
 {
     let started = Instant::now();
+    // The last value handed to `notify`, so the sequence can be kept strictly increasing even when
+    // two notifications sample the clock in the same tick. See `strictly_after`.
+    let mut reported = 0.0f64;
     let (tx, mut rx) = mpsc::unbounded_channel();
     // Held here *as well as* inside the scope, so the channel cannot close while this loop is still
     // selecting on it. A `recv()` on a closed channel is instantly ready, and an arm that is
@@ -247,7 +278,8 @@ where
         // Restarted after anything said, so the heartbeat is "nothing for `beat`" rather than a
         // metronome running beside the milestones.
         ticker.reset();
-        let mut sending = std::pin::pin!(notify(started.elapsed().as_secs_f64(), message));
+        reported = strictly_after(reported, started.elapsed());
+        let mut sending = std::pin::pin!(notify(reported, message));
         tokio::select! {
             // Biased again, one level down: a send that is ready now completes rather than being
             // dropped on a coin toss. Only a send that actually *stalls* loses to the answer —
@@ -270,7 +302,8 @@ where
     // a courtesy and the result is the contract. A client that has stopped reading its stream
     // loses the courtesy.
     while let Ok(step) = rx.try_recv() {
-        let sent = notify(started.elapsed().as_secs_f64(), step.message());
+        reported = strictly_after(reported, started.elapsed());
+        let sent = notify(reported, step.message());
         if tokio::time::timeout(FINAL_FLUSH, sent).await.is_err() {
             break;
         }
@@ -467,6 +500,25 @@ mod tests {
             "a finished call reports nothing: {:?}",
             messages(&sent)
         );
+    }
+
+    /// `progress` never repeats, even when two notifications read the same clock.
+    ///
+    /// `Instant` is only non-decreasing, and the final flush drains whatever is queued back to
+    /// back, so identical readings are reachable — and MCP asks this field to increase every time,
+    /// with clients entitled to discard a milestone that does not.
+    #[test]
+    fn progress_never_repeats_a_value() {
+        let same = Duration::from_millis(1500);
+        let first = strictly_after(0.0, same);
+        let second = strictly_after(first, same);
+        let third = strictly_after(second, same);
+        assert_eq!(first, 1.5);
+        assert!(second > first && third > second, "{first} {second} {third}");
+        // Nudged by the smallest step there is, so the number a reader acts on is unchanged.
+        assert_eq!(format!("{third:.3}"), "1.500");
+        // A real advance is taken as it comes, rather than accumulating the nudges.
+        assert_eq!(strictly_after(third, Duration::from_secs(9)), 9.0);
     }
 
     /// The two readings of the worker's one rollback message do not sound alike.

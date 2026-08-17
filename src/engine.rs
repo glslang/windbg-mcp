@@ -457,6 +457,15 @@ struct Waiting {
     /// the only place both facts are in hand. The milestones themselves arrive in [`reader`], which
     /// belongs to the session rather than to any one call and can only find this by job id.
     progress: Option<crate::progress::Reporter>,
+    /// Whether this job's transaction has already been reported as unwound.
+    ///
+    /// The worker's two `RollingBack` messages are emitted by *different threads* — the promise by
+    /// its request reader, the retraction by its engine thread — so a teardown landing exactly as a
+    /// batch exits can put them on the wire in either order. [`read_messages`] already defends the
+    /// session's deadline against that by keeping the earlier instant; this is the same defence for
+    /// the words a client reads, which would otherwise go "has been rolled back" and then back to
+    /// "rolling it back".
+    unwound: bool,
 }
 
 type Waiters = Arc<Mutex<HashMap<u64, Waiting>>>;
@@ -1041,6 +1050,7 @@ impl Sessions {
                     Waiting {
                         done: tx,
                         progress: crate::progress::current(),
+                        unwound: false,
                     },
                 );
         }
@@ -2480,6 +2490,39 @@ fn tell(waiters: &Waiters, id: u64, step: crate::progress::Step) {
     }
 }
 
+/// Reports a rollback milestone to the caller waiting for `id`, and refuses to walk one backwards.
+///
+/// Its own function rather than a [`tell`] call because it is the one milestone with *state*: the
+/// worker sends `RollingBack` twice for a single transaction, and the second reading is terminal.
+/// Both the flag and the reporter are read under one lock so the decision cannot straddle another
+/// message; the send happens outside it, as everywhere else here.
+///
+/// See [`Waiting::unwound`] for why arrival order cannot be trusted.
+fn tell_rollback(waiters: &Waiters, id: u64, within: Duration) {
+    let telling = {
+        let mut waiters = waiters.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(waiting) = waiters.get_mut(&id) else {
+            return;
+        };
+        if within.is_zero() {
+            // Terminal for this job: nothing arriving later can put the transaction back in
+            // flight, because there is no longer one to be in flight.
+            waiting.unwound = true;
+        } else if waiting.unwound {
+            return;
+        }
+        let step = if within.is_zero() {
+            crate::progress::Step::Unwound
+        } else {
+            crate::progress::Step::Unwinding { within }
+        };
+        waiting.progress.clone().map(|reporter| (reporter, step))
+    };
+    if let Some((reporter, step)) = telling {
+        reporter.step(step);
+    }
+}
+
 /// Consumes one worker's messages: milestones move the session's state, results answer callers.
 ///
 /// Fed by [`read_messages`]'s thread, so this side stays on the runtime — settling a session
@@ -2530,17 +2573,19 @@ async fn reader(
                         "session {}: job {id}'s transaction is unwound; only the release is left",
                         session.id
                     );
-                    tell(&waiters, id, crate::progress::Step::Unwound);
                 } else {
+                    // The one milestone whose *number* the caller can act on: a teardown that
+                    // looks stuck is a teardown waiting out a rollback, and this says how long.
                     tracing::info!(
                         "session {}: job {id} found a transaction in flight and told it to roll \
                          back; it needs up to {within:?}",
                         session.id
                     );
-                    // The one milestone whose *number* the caller can act on: a teardown that
-                    // looks stuck is a teardown waiting out a rollback, and this says how long.
-                    tell(&waiters, id, crate::progress::Step::Unwinding { within });
                 }
+                // Logged either way and *reported* conditionally, which is the right split: the log
+                // is a faithful record of what arrived on the wire, and progress is a narration of
+                // the call for a client — and a narration may not contradict itself.
+                tell_rollback(&waiters, id, within);
             }
             WorkerMessage::Committed { id } | WorkerMessage::Opened { id } => {
                 tracing::warn!(
@@ -3132,6 +3177,69 @@ mod tests {
         assert_eq!(sessions.registry().live().len(), MAX_SESSIONS);
     }
 
+    /// A rollback promise that arrives *after* its own retraction is not reported.
+    ///
+    /// The two `RollingBack` messages come from different threads in the worker, so a teardown
+    /// landing exactly as a batch exits can put them on the wire in either order — `read_messages`
+    /// says so where it keeps the earlier deadline. Without the same defence here, the client is
+    /// told the transaction is done and then told it is still unwinding, which is the one thing a
+    /// narration of a call must never do.
+    #[test]
+    fn a_rollback_promise_that_arrives_after_its_retraction_is_not_reported() {
+        let (reporter, mut reported) = crate::progress::Reporter::for_test();
+        let waiters: Waiters = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _caller) = oneshot::channel();
+        waiters.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            7,
+            Waiting {
+                done: tx,
+                progress: Some(reporter),
+                unwound: false,
+            },
+        );
+
+        // Out of order on purpose: the retraction first, then the promise it retracts.
+        tell_rollback(&waiters, 7, Duration::ZERO);
+        tell_rollback(&waiters, 7, Duration::from_secs(12));
+
+        assert_eq!(
+            reported.try_recv(),
+            Ok(crate::progress::Step::Unwound),
+            "the retraction is the milestone worth having"
+        );
+        assert!(
+            reported.try_recv().is_err(),
+            "a stale promise must not put the transaction back in flight"
+        );
+    }
+
+    /// And in the ordinary order both are reported, because both are true in turn.
+    #[test]
+    fn a_rollback_reports_its_promise_and_then_its_retraction() {
+        let (reporter, mut reported) = crate::progress::Reporter::for_test();
+        let waiters: Waiters = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _caller) = oneshot::channel();
+        waiters.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            7,
+            Waiting {
+                done: tx,
+                progress: Some(reporter),
+                unwound: false,
+            },
+        );
+
+        tell_rollback(&waiters, 7, Duration::from_secs(12));
+        tell_rollback(&waiters, 7, Duration::ZERO);
+
+        assert_eq!(
+            reported.try_recv(),
+            Ok(crate::progress::Step::Unwinding {
+                within: Duration::from_secs(12)
+            })
+        );
+        assert_eq!(reported.try_recv(), Ok(crate::progress::Step::Unwound));
+    }
+
     /// A parked attach is *busy*, so it is never the session reclaimed to make room — and a
     /// caller who gave up waiting does not make it idle either, because the worker still owes a
     /// reply.
@@ -3153,6 +3261,7 @@ mod tests {
                 Waiting {
                     done: tx,
                     progress: None,
+                    unwound: false,
                 },
             );
         assert!(idle.busy(), "an abandoned call still owes a reply");
