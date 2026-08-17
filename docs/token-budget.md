@@ -181,3 +181,20 @@ One rule is asserted rather than a number: a tool's `structuredContent` may not 
 rendering by more than 20x. A typed answer is meant to be the facts behind a rendering, so a large
 multiple means it is carrying scaffolding instead. `registers` is at 15.9x and is finding 7 above,
 not a failure — the rule is there to catch the next one.
+
+### What the result budget does not cover
+
+It asserts on **one channel per call** — `structuredContent` when a tool has one, its text
+otherwise — because that is what the measured client forwards. That is a forwarding policy rather
+than protocol: MCP does not require a client to drop the text block, and this server is advertised
+for several. So for the 31 typed tools, the text half is measured and printed but never asserted,
+and it could grow unwatched.
+
+Worse, growing it would look like an improvement. Text is the *denominator* of the ratio rule
+above, so doubling a rendering lowers the ratio and leaves `model` untouched — the one assertion
+that mentions text is the one that would wave it through. Nothing is oversized today (the text
+halves are the small halves), but the harness would not be the thing that noticed.
+[#150](https://github.com/glslang/windbg-mcp/issues/150) tracks it. The cheap half of the fix —
+budgeting `text + structured`, the wire total, which no client policy affects — needs nothing this
+document does not already have; the rest wants measurements from a second client rather than a
+guess about one.
