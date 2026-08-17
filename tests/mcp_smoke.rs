@@ -3068,34 +3068,63 @@ fn an_open_summarises_the_target_instead_of_listing_its_modules() {
 /// that matters (a tool that starts returning an order of magnitude more) without pinning a number
 /// the environment owns.
 ///
-/// Sizes are counted as **model-visible** bytes, which is `structuredContent` when a tool has one
-/// and the text otherwise — a client that understands structured results forwards that and drops
-/// the rendering. That is why `registers` is measured at ~9.8 KB and not at the 600 bytes of `r`
-/// output it also sends: the compact half is the one nobody reads.
+/// **Two ceilings per call, because one number cannot answer both questions.**
+///
+/// `model` is what a model is charged: `structuredContent` when a tool has one and the text
+/// otherwise, since a client that understands structured results forwards that and drops the
+/// rendering. It is why `registers` is measured at ~9.8 KB rather than at the 600 bytes of `r`
+/// output it also sends — the compact half is the one nobody reads.
+///
+/// But that is a *forwarding policy*, not protocol. MCP does not oblige a client to discard the
+/// text block, and this server is advertised for several clients, so budgeting only the forwarded
+/// half leaves the other one unwatched — for the tools with an output schema, that is 31 of them.
+/// `wire` closes it: the whole result as it crosses the pipe, which no client's policy affects.
+///
+/// The gap that needed closing was not merely an absent assertion, it was a self-concealing one.
+/// Text is the *denominator* of the ratio rule at the end of this test, so a rendering that doubles
+/// **lowers** the ratio while `model` does not move at all — the single check that mentioned text
+/// was the one that would have waved it through. Take `registers` from 618 B of text to 6,180 B and
+/// 15.9x becomes 1.59x, and every assertion here passed greener than before.
+///
+/// Per-*channel* ceilings would say which half moved, and are not here: that needs a decision about
+/// which forwarding policies this server intends to be good under, which wants measurements from a
+/// second client rather than a guess about one
+/// ([#150](https://github.com/glslang/windbg-mcp/issues/150)).
 #[test]
 fn tool_results_stay_within_their_budget() {
     let Some(dump) = target_tier() else { return };
     let mut server = Server::started();
 
-    // Ceilings are ~35% over what this dump produces today — looser than the surface budget above,
-    // because these numbers depend on the target and on what symbols resolve, where that one
-    // depends only on this crate's own source.
+    // Ceilings are ~35-45% over what this dump produces today — looser than the surface budget
+    // above, because these numbers depend on the target and on what symbols resolve, where that
+    // one depends only on this crate's own source.
+    //
+    // `crash_triage` and `backtrace` are looser still, and not by oversight: `!analyze -v` and `k`
+    // are the two answers here that change *shape* when symbols resolve rather than merely growing,
+    // and a runner that reaches a symbol server produces several times what an offline one does. A
+    // ceiling tight enough to be interesting on this host would fail on that one, which would make
+    // the tier flaky about the environment instead of watchful about the code.
+    //
+    // `wire` is not `model` plus the text: it is the whole `result` object, so it also carries the
+    // content-block scaffolding and JSON escaping — a rendered table's newlines cost two bytes each
+    // there and one in `text`. It is measured rather than derived for exactly that reason.
     //
     // Only calls that succeed on a *kernel* dump are listed. `threads` is deliberately absent: `~`
     // is a user-mode question and answers with a tool error here, which would measure the size of
     // a failure.
-    let budgets: &[(&str, Value, usize)] = &[
-        ("open_dump", json!({ "path": dump }), 2_000),
-        ("session_status", json!({}), 600),
-        ("crash_triage", json!({}), 6_000),
-        ("registers", json!({}), 13_500),
-        ("backtrace", json!({}), 4_000),
-        ("modules", json!({}), 73_000),
-        ("execute", json!({ "command": "lm" }), 27_000),
+    let budgets: &[(&str, Value, usize, usize)] = &[
+        // tool, args, model ceiling, wire ceiling
+        ("open_dump", json!({ "path": dump }), 2_000, 3_200),
+        ("session_status", json!({}), 600, 1_200),
+        ("crash_triage", json!({}), 6_000, 9_000),
+        ("registers", json!({}), 13_500, 14_500),
+        ("backtrace", json!({}), 4_000, 5_000),
+        ("modules", json!({}), 73_000, 100_000),
+        ("execute", json!({ "command": "lm" }), 27_000, 28_500),
     ];
 
     let mut rows = Vec::new();
-    for (tool, args, ceiling) in budgets {
+    for (tool, args, model_ceiling, wire_ceiling) in budgets {
         let response = server.call_tool(tool, args.clone(), TARGET_STEP);
         assert_no_error(&response, &format!("tools/call {tool}"));
         let result = &response["result"];
@@ -3105,27 +3134,35 @@ fn tool_results_stay_within_their_budget() {
             text_of(result)
         );
 
+        let wire = json_bytes(result);
         let text = text_of(result).len();
         let structured = match &result["structuredContent"] {
             Value::Null => None,
             value => Some(json_bytes(value)),
         };
         let model = structured.unwrap_or(text);
-        rows.push((*tool, model, text, structured, *ceiling));
+        rows.push((*tool, model, wire, text, structured, *model_ceiling));
 
         assert!(
-            model <= *ceiling,
-            "`{tool}` answered with {model} B of model context, over its {ceiling} B budget. \
-             Either it started returning more than it used to, or the budget needs raising with \
-             a reason recorded in docs/token-budget.md."
+            model <= *model_ceiling,
+            "`{tool}` answered with {model} B of model context, over its {model_ceiling} B \
+             budget. Either it started returning more than it used to, or the budget needs \
+             raising with a reason recorded in docs/token-budget.md."
+        );
+        assert!(
+            wire <= *wire_ceiling,
+            "`{tool}` put {wire} B on the wire, over its {wire_ceiling} B budget, while its \
+             model-visible half ({model} B) is inside its own. So the half this client drops \
+             grew — which costs every client that does *not* drop it, and is the case the \
+             model-visible budget alone cannot see. See docs/token-budget.md."
         );
     }
 
     // The table is the deliverable when this passes — the assertions only speak up once something
     // has already gone wrong. Unlike the surface budget, this one *is* visible in CI, because the
     // debugger tier's job passes `--nocapture`; without it libtest would swallow the table.
-    eprintln!("\n  model     text  struct  ratio  ceiling  tool");
-    for (tool, model, text, structured, ceiling) in &rows {
+    eprintln!("\n  model     wire     text  struct  ratio  ceiling  tool");
+    for (tool, model, wire, text, structured, ceiling) in &rows {
         let (shown, ratio) = match structured {
             Some(bytes) if *text > 0 => (
                 bytes.to_string(),
@@ -3134,7 +3171,7 @@ fn tool_results_stay_within_their_budget() {
             Some(bytes) => (bytes.to_string(), "-".to_string()),
             None => ("-".to_string(), "-".to_string()),
         };
-        eprintln!("{model:7} {text:8} {shown:>7} {ratio:>6} {ceiling:8}  {tool}");
+        eprintln!("{model:7} {wire:8} {text:8} {shown:>7} {ratio:>6} {ceiling:8}  {tool}");
     }
 
     // A rule rather than a number, and the one regression class the byte budgets cannot state: a
@@ -3142,8 +3179,11 @@ fn tool_results_stay_within_their_budget() {
     // size of that rendering means it is carrying scaffolding instead — `"kind":"int"` and
     // `"subregister":false` on every row. `registers` is ~16x today and is named in
     // docs/token-budget.md rather than fixed here; this catches the *next* one, not that one.
+    //
+    // It is a ratio, so it is only safe to read alongside the `wire` ceiling above: on its own, a
+    // rendering that grows satisfies it *more*. That is why the wire budget is not optional.
     const WORST_STRUCTURED_RATIO: f64 = 20.0;
-    for (tool, _, text, structured, _) in &rows {
+    for (tool, _, _, text, structured, _) in &rows {
         let (Some(bytes), true) = (structured, *text > 0) else {
             continue;
         };
