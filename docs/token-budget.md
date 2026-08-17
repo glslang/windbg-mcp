@@ -132,18 +132,24 @@ it, which may well be an improvement, but it is a size decision and should be ta
 The surface budget needs no debugger and rides the ordinary test run:
 
 ```pwsh
-cargo test --test mcp_smoke tool_surface_stays_within_its_token_budget
+cargo test --test mcp_smoke -- --nocapture tool_surface_stays_within_its_token_budget
 ```
 
-The result budget needs the debugger tier, and prints its table under `--nocapture`:
+The result budget needs the debugger tier:
 
 ```pwsh
 $env:WINDBG_MCP_SMOKE_DUMP = "1"
 cargo test --test mcp_smoke -- --nocapture tool_results_stay_within_their_budget
 ```
 
-Both print their numbers on a green run. That is deliberate: a budget nobody ever sees is a budget
-nobody maintains.
+**`--nocapture` is not optional if you want to read the numbers.** libtest captures a passing
+test's output and prints it only on failure, so without the flag both tests pass in silence — which
+is the opposite of the point. It is in both commands above for that reason, and it is why the
+debugger tier's CI job passes it (`ci.yml`) while the `build` job, which runs the whole suite, does
+not: the surface figures are not in CI's log, they are in `tests/golden/tool_budget.json`.
+
+Which is the more useful record anyway. The printed line tells you where you are; the golden tells
+you what changed, and it is the one a reviewer sees.
 
 ## Changing the numbers
 
