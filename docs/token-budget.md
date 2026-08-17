@@ -163,8 +163,23 @@ golden beside it — with:
 $env:UPDATE_GOLDEN = "1"; cargo test --test mcp_smoke
 ```
 
-Then read the diff before committing it. Rows are keyed by tool name rather than sorted by size, so
-a tool that grows shows up as three changed lines rather than shifting every row beneath it.
+Then read the diff before committing it. It is compared **as values, matched by tool name**, not as
+lines, so it reports what actually moved:
+
+```text
+  + server_log is new: 2599 B to the model, 8858 B on the wire
+  ~ modules: modelVisible 2112 -> 4200 (+2088), description 681 -> 2769 (+2088)
+
+totals:
+  modelVisible 66078 -> 68166 (+2088)
+```
+
+A line diff was tried first and is wrong for this file. Each tool is seven lines, so adding or
+removing one shifts every line below it, and a positional differ blames the first tool whose *line
+numbers* moved rather than the one that changed — dropping one tool from a 51-tool report made the
+failure open with `crash_triage`, which had not changed at all, then truncate before reaching
+anything that had. Keying the JSON by name would not have helped: the rows would still be lines,
+and an insertion would still shift them.
 
 The **ceilings** (`MODEL_VISIBLE_CEILING`, `WIRE_CEILING`, `WORST_TOOL_CEILING` in
 `tests/mcp_smoke.rs`) stop what the golden cannot: a golden re-recorded on every diff is a rubber
