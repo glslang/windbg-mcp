@@ -86,7 +86,7 @@ const INTERRUPT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Shorter than [`END_SESSION_TIMEOUT`] because a session that cannot let go within a few seconds
 /// is one that never will, and sessions are released concurrently, so this is the whole cost
 /// rather than the cost per session.
-const SHUTDOWN_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const SHUTDOWN_RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a teardown commits to before looking at the worker's promise again.
 ///

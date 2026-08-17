@@ -2594,6 +2594,53 @@ fn the_listener_will_not_start_without_a_token() {
     );
 }
 
+/// Installing the service without an address is refused **before the SCM is touched**.
+///
+/// Two things at once, and the ordering is the interesting one. The SCM stores the command line
+/// once, at install time, and nothing re-derives it — so a service registered without an address is
+/// one that installs cleanly and then fails at every start, which is the worst shape this can take.
+/// And because the refusal happens before any SCM call, it needs no elevation, which is what lets
+/// it live in the tier that runs everywhere rather than in one nobody runs.
+#[test]
+fn installing_the_service_without_an_address_is_refused_before_anything_is_registered() {
+    let registered = service_is_registered();
+    let out = Command::new(EXE)
+        .arg("--install-service")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {EXE}: {e}"));
+    assert!(
+        !out.status.success(),
+        "an install with no address should have been refused"
+    );
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("--listen"),
+        "the refusal has to name what is missing, or nobody can act on it: {said}"
+    );
+    let after = service_is_registered();
+    // Nothing was *changed* — asserted through the tool an operator would use, so this also fails
+    // if the refusal happened after a partial install rather than before one.
+    //
+    // "Unchanged" rather than "absent", and deliberately: a developer running the ordinary suite on
+    // a host where they have the service installed — which is to say, someone using the feature
+    // under test — must not be failed by it. So the state is captured either side and compared.
+    assert_eq!(
+        registered, after,
+        "the refused install changed whether `windbg-mcp` is registered with the SCM"
+    );
+}
+
+/// Whether the SCM has a service by this name, for the assertion above to compare against itself.
+fn service_is_registered() -> bool {
+    Command::new("sc.exe")
+        .args(["query", "windbg-mcp"])
+        .output()
+        .expect("sc.exe is present on every Windows host")
+        .status
+        .success()
+}
+
 /// An unauthenticated caller is refused, told nothing about what is here — and costs the server
 /// nothing.
 ///

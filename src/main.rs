@@ -22,6 +22,7 @@ mod progress;
 mod proto;
 mod record;
 mod server;
+mod service;
 mod structured;
 mod triage;
 mod ttd;
@@ -50,7 +51,7 @@ const ENGINE_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 /// wants to hear about a stuck call sooner).
 const CALL_TIMEOUT_ENV: &str = "WINDBG_MCP_CALL_TIMEOUT_SECS";
 
-fn call_timeout() -> Duration {
+pub(crate) fn call_timeout() -> Duration {
     match std::env::var(CALL_TIMEOUT_ENV)
         .ok()
         .and_then(|v| v.parse().ok())
@@ -65,7 +66,12 @@ fn main() -> Result<()> {
     // engine thread must be free to block in DbgEng indefinitely.
     let args: Vec<String> = std::env::args().collect();
     let is_worker = args.iter().any(|arg| arg == worker::WORKER_FLAG);
-    init_logging(is_worker);
+    // A service has no console, so its stderr goes nowhere at all — and the failure most worth
+    // seeing is a listener that refuses to start, which happens before `server_log` can be asked
+    // anything. Decided here because logging is initialised before the role is acted on.
+    let to_file =
+        matches!(service::requested(&args), Some(service::Role::Run)).then(service::log_path);
+    init_logging(is_worker, to_file);
     if is_worker {
         // The rest of the command line is the worker's half of the protocol channel — two
         // inherited pipe handles, which is why a worker started by hand cannot get anywhere.
@@ -74,6 +80,20 @@ fn main() -> Result<()> {
     if let Some(at) = args.iter().position(|arg| arg == cast::RENDER_FLAG) {
         // Before the runtime: this reads a file and writes a file, and neither wants one.
         return render_cast(&args[at + 1..]);
+    }
+
+    // Also before the runtime, and for a sharper reason than the renderer's. Installing touches the
+    // SCM and nothing else. Running *as* a service has to build its runtime inside the SCM's own
+    // dispatcher thread rather than around it, so the one thing this must not do is start one here.
+    if let Some(role) = service::requested(&args) {
+        return match role {
+            service::Role::Install => service::install(
+                listen_address(&args)?,
+                args.iter().any(|a| a == service::ALLOW_UNPROTECTED_FLAG),
+            ),
+            service::Role::Uninstall => service::uninstall(),
+            service::Role::Run => service::run(),
+        };
     }
 
     // Decided before the runtime so a bad address fails as a usage error rather than from inside a
@@ -88,7 +108,10 @@ fn main() -> Result<()> {
         .build()?
         .block_on(async {
             match listen {
-                Some(addr) => serve_http(addr).await,
+                // A foreground listener has nobody to ask it to stop — Ctrl+C ends the process and
+                // each worker releases its target when its pipe closes — so the shutdown it hands
+                // over is one that never fires. Only the service role has a stop to deliver.
+                Some(addr) => serve_http(addr, std::future::pending(), || {}).await,
                 None => serve().await,
             }
         })
@@ -99,11 +122,35 @@ fn main() -> Result<()> {
 /// The teardown differs from [`serve`]'s in the one way that matters: there is no disconnect to
 /// hang it on, so the shutdown here belongs to the *process* ending rather than to any client, and
 /// a client going away is handled by its lease instead.
-async fn serve_http(addr: std::net::SocketAddr) -> Result<()> {
+pub(crate) async fn serve_http(
+    addr: std::net::SocketAddr,
+    shutdown: impl std::future::Future<Output = ()>,
+    ready: impl FnOnce(),
+) -> Result<()> {
     let sessions = Sessions::new(call_timeout()).recording(record::Recorder::from_env());
-    let outcome = listen::serve(sessions.clone(), addr, call_timeout()).await;
+    let outcome = listen::serve(sessions.clone(), addr, call_timeout(), shutdown, ready).await;
+    // Runs on every route out of `serve`, which is why the shutdown future ends the accept loop
+    // rather than the process: a service asked to stop has to reach this line, or it leaves a live
+    // kernel frozen — see [`service`].
     sessions.shutdown().await;
     outcome
+}
+
+/// The address an install was told to bind, with the same parsing the listener itself uses.
+///
+/// Its own function because installing and serving must never disagree about what is a valid
+/// address: a service registered with something the listener will later refuse is a service that
+/// installs cleanly and fails at every start.
+fn listen_address(args: &[String]) -> Result<std::net::SocketAddr> {
+    match listen::requested(args) {
+        Some(addr) => addr,
+        None => anyhow::bail!(
+            "`{}` needs the address the service will bind, e.g. `{} {} 127.0.0.1:8765`",
+            service::INSTALL_FLAG,
+            service::INSTALL_FLAG,
+            listen::LISTEN_FLAG
+        ),
+    }
 }
 
 /// The renderer role: a transcript in, an asciicast out.
@@ -157,7 +204,7 @@ fn render_cast(args: &[String]) -> Result<()> {
 /// makes the records reachable when the client is on another machine (`--listen`). Sharing the
 /// filter is deliberate: the tool then shows exactly what the log shows, and `RUST_LOG` widens
 /// both together rather than one of them silently.
-fn init_logging(is_worker: bool) {
+fn init_logging(is_worker: bool, to_file: Option<std::path::PathBuf>) {
     use tracing_subscriber::layer::SubscriberExt;
     use tracing_subscriber::util::SubscriberInitExt;
 
@@ -166,11 +213,38 @@ fn init_logging(is_worker: bool) {
     } else {
         logbridge::Role::Supervisor
     };
-    tracing_subscriber::registry()
+    // Best-effort, and deliberately so: a service that cannot open its log file should still serve.
+    // If this yields `None` the records still reach the ring behind `server_log`, which is the
+    // channel a remote operator actually reads.
+    let file = to_file.and_then(|path| {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok()
+            .map(std::sync::Arc::new)
+    });
+    let base = tracing_subscriber::registry()
         .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-        .with(logbridge::layer(role))
-        .init();
+        .with(logbridge::layer(role));
+    // Two arms rather than a boxed writer: each is a different subscriber type, and the whole
+    // difference between them is where the bytes go.
+    match file {
+        // No ANSI: nothing renders colour in a log file, and the escapes make it unreadable.
+        Some(file) => base
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(file),
+            )
+            .init(),
+        None => base
+            .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+            .init(),
+    }
 }
 
 async fn serve() -> Result<()> {

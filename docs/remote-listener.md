@@ -157,8 +157,57 @@ nothing at all is sent to a call that did not ask.
 This is the same on stdio, where it is a convenience; here it is the only thing that arrives while a
 call is outstanding.
 
+## Run it as a Windows service
+
+A foreground listener dies with the login session, inherits whatever `PATH` and working directory
+that shell had — which is what decides whether the engine DLLs beside the exe are the ones that load
+— and cannot start at boot. Installing it as a service fixes all three. From an **elevated** shell:
+
+```pwsh
+$env:WINDBG_MCP_LISTEN_TOKEN = "<a long random string>"   # this shell only
+windbg-mcp.exe --install-service --listen 127.0.0.1:8765
+Start-Service windbg-mcp        # or reboot; it is configured to start automatically
+```
+
+**Install from a protected directory.** The SCM stores an exact path for a `LocalSystem` auto-start
+service, so whoever can write that directory — or drop an engine DLL beside the exe — gets their
+code run as SYSTEM at the next start. `--install-service` refuses unless the exe is under
+`%ProgramFiles%`, `%ProgramFiles(x86)%` or `%SystemRoot%`; for a development install on a machine
+that is entirely yours, `--allow-unprotected-path` says so out loud.
+
+The install copies that token into `%ProgramData%\windbg-mcp\token`, strips inheritance and grants
+read to `SYSTEM` and `Administrators` only, and points the service at it. **Do not put the token in
+the machine environment instead.** That would work, and it is a local privilege escalation: the
+machine environment is readable by every local process, the listener is reachable on loopback by the
+same, and `launch` takes an arbitrary command line and runs it from a worker this service spawned —
+as `LocalSystem`. The token is the only thing in the way, so it has to stay unreadable by an
+unprivileged process, which is the one property the foreground listener gets for free.
+
+`windbg-mcp.exe --uninstall-service` removes it, stopping it first and waiting for it — a delete
+issued against a running service only marks it, and this one has debug targets to let go of.
+
+**Stopping is graceful, and that is the point.** `Stop-Service` takes the same path a client
+disconnect takes: every session is asked to release its target before the process exits, and the SCM
+is given a wait hint that covers it rather than being left to assume the default and kill us
+partway. DbgEng leaves a detached-but-halted kernel *frozen*, so a service that were merely killed
+would hold someone's machine stopped until they noticed.
+
+Three things that surprise people, all of them consequences of running as `LocalSystem`:
+
+- **There is no console, so stderr goes nowhere.** The service writes to
+  `%ProgramData%\windbg-mcp\service.log` (override with `WINDBG_MCP_SERVICE_LOG`). `server_log` is
+  still the better channel once the listener is up; the file is for the case that matters most, a
+  listener that refuses to start.
+- **Kernel connection profiles are not read from your home directory.** `LocalSystem`'s
+  `%USERPROFILE%` is `C:\Windows\system32\config\systemprofile`, so `attach_kernel {}` under the
+  service lists nothing from *your* `profiles.json`. Configure them machine-wide instead:
+  `WINDBG_MCP_PROFILE_<NAME>` in the machine environment, or `WINDBG_MCP_PROFILES` pointing at a
+  file the service account can read.
+- **It runs with more privilege than you did.** `--uninstall-service` deletes the token file with
+  the service. If you want less privilege, `sc.exe config windbg-mcp obj= "NT AUTHORITY\LocalService"`
+  and re-ACL the token file to match — at the cost of local kernel and process attach, which need
+  privileges that account does not have.
+
 ## Not there yet
 
-- **No service installation.** The listener runs in whatever shell you start it in. A Windows
-  service would give it a defined `PATH` and working directory, boot start, and a life independent
-  of a login session.
+Nothing on this page is known-missing. `FOLLOWUPS.md` is where anything new lands.

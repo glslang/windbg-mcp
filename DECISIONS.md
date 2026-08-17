@@ -5,6 +5,54 @@ status. Keep entries short; link to code with `file:line` where it helps a futur
 
 ---
 
+## A service's stop is the only part of it that can break something (2026-08-17)
+
+**Context.** `--listen` as a foreground process dies with the login session, inherits whatever
+`PATH` and working directory that shell had — which for this server decides whether the engine DLLs
+beside the exe are the ones that load — and cannot start at boot. The last item of `FOLLOWUPS.md`
+23, and on its face a small one: register the same server with the SCM.
+
+**What made it not small.** For most services a stop is a formality. Here it is the one operation
+that can damage something *outside* the process: DbgEng leaves a detached-but-halted kernel
+**frozen**, so a service killed rather than asked holds someone's machine stopped until they notice.
+That is the whole reason `listen::serve` grew a shutdown future — nothing else in this server needs
+one, because under stdio the client's disconnect *is* the signal and a foreground listener has
+nobody to ask it. The SCM is told `StopPending` with a wait hint sized from what releasing every
+worker can actually take, rather than being left on the default, and `PRESHUTDOWN` is accepted as
+well as `STOP` because the ordinary shutdown notification does not honour a wait hint.
+
+**Decision.** `--install-service --listen <addr>` / `--uninstall-service` / `--service`
+(`src/service.rs`), running as `LocalSystem`, auto-start. A wrapper crate rather than hand-rolled
+SCM FFI, on the same reasoning: the lifecycle is the part that must not be subtly wrong, and a
+service that mishandles its stop is a service that cannot be stopped.
+
+**The token could not follow it into the machine environment.** That was the first shape of this,
+and it is a local privilege escalation rather than an inconvenience: the machine environment is
+readable by every local process, the listener is reachable on loopback by the same, and `launch`
+takes an arbitrary command line and runs it from a worker this service spawned — as `LocalSystem`.
+So `install` copies the token out of the *installing shell's* user environment into
+`%ProgramData%\windbg-mcp\token`, strips inheritance and grants read to `SYSTEM` and
+`Administrators` only, and points the service at it. The property being preserved is the one the
+foreground listener has for free: the token is not readable by an unprivileged process. It is the
+only thing between a local user and SYSTEM, so it is the one thing that had to survive the move.
+
+**Two more `LocalSystem` consequences, both verified rather than assumed.** It has a profile
+directory of its own, so `%USERPROFILE%\.windbg-mcp\profiles.json` is invisible and
+`attach_kernel {}` under the service lists no profiles — they have to be machine-wide. And it has no
+console, so the role writes to `%ProgramData%\windbg-mcp\service.log` — `server_log` is the better
+channel, but only once the listener is up, which is exactly the failure not worth diagnosing that
+way.
+
+**What it does not change.** The lease, the single-tenancy rule and the bearer check are all
+untouched; a service is a way to *run* the listener, not a second one. The foreground path hands
+over a shutdown future that never fires, so its behaviour is byte for byte what it was.
+
+**Status:** landed. Verified end to end on the ARM64 bench — installed, started, served an
+authorised call and refused an unauthenticated one, then **stopped while holding a live kernel
+session**: the guest kept running rather than freezing, and no worker outlived the service.
+
+---
+
 ## Progress *is* a protocol notification, and it counts seconds (2026-08-17)
 
 **Context.** A tool call here can take minutes — a kernel attach waits for its target to dial in, a
@@ -142,9 +190,8 @@ predicate (`listen::is_departure`) with the same unit coverage every rule beside
 **Status.** Implemented (#135, #137). Three of the four things this listed as missing have since
 landed, each with an entry of its own above: the log reaches a remote client (as a tool, not a
 notification), the lease has the smoke tier whose absence made seven rounds of review the way these
-were found rather than the second, and a long call now reports its progress. What is still missing
-is **service installation** — the listener runs in whatever shell starts it — tracked as
-`FOLLOWUPS.md` item 23.
+were found rather than the second, and a long call now reports its progress. **Service installation**, the fourth,
+has since landed too (entry above), which closes `FOLLOWUPS.md` item 23 entirely.
 
 ---
 
