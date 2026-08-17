@@ -394,10 +394,18 @@ schemas is tens of kilobytes and no test failure.
 
 Both print their numbers **under `--nocapture`** — libtest shows a passing test's output nowhere,
 so without the flag they pass in silence. The debugger tier's CI job passes it and the result table
-is in its log; the `build` job does not, so the surface figures live in
-`tests/golden/tool_budget.json` instead, re-recorded by the same `UPDATE_GOLDEN=1` as the shape
-golden beside it. Read that diff — it is the only place the price of a reworded description shows
-up. See [`token-budget.md`](./token-budget.md) for the baseline, the ceilings and how to raise one.
+is in its log; the `build` job does not.
+
+Only the **surface** is goldened, in `tests/golden/tool_budget.json`, re-recorded by the same
+`UPDATE_GOLDEN=1` as the shape golden beside it and diffed per tool rather than per line
+(`modules: modelVisible 2112 -> 4200`), so a tool added or removed does not blame the tools after
+it. Read that diff — it is the only place the price of a reworded description shows up.
+
+**Result budgets are not goldened**, because their sizes move with what symbols a runner resolves.
+They are per-tool ceilings in the `budgets` slice of `tool_results_stay_within_their_budget`, so a
+result that grows within its ceiling leaves no diff anywhere and is only visible in the printed
+table. Adjusting one is an edit to that slice, not a re-record. See
+[`token-budget.md`](./token-budget.md) for the baseline, the ceilings and how to raise one.
 
 ## When to run it
 

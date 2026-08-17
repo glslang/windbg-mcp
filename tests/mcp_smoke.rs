@@ -977,29 +977,38 @@ fn tools_list_matches_the_recorded_wire_surface() {
     assert_golden(GOLDEN, &actual, "the tools/list wire surface");
 }
 
-/// Compare a rendered snapshot against its golden file, or re-record it when `UPDATE_GOLDEN` is
-/// set, failing with a line diff that names what moved.
+/// The half every golden shares: re-record when `UPDATE_GOLDEN` is set, otherwise hand back what
+/// was recorded. `None` means it re-recorded, so this run has nothing to compare against.
 ///
-/// Shared by the two goldens in this file so one command records both and one differ explains
-/// both. Splitting the renderer out matters more than it looks: the budget golden below is a wall
-/// of numbers, and a failure that dumped two of those blobs side by side would be unreadable in a
-/// CI log — the line diff is what makes it say "this tool, this many bytes more".
-fn assert_golden(path: &str, actual: &Value, what: &str) {
-    let rendered = format!("{}\n", serde_json::to_string_pretty(actual).unwrap());
-
+/// One env var and one command records every golden in this file, which is the point of it being
+/// shared. How each one *reports* a difference is not shared — see below.
+fn golden_baseline(path: &str, rendered: &str) -> Option<String> {
     if std::env::var_os("UPDATE_GOLDEN").is_some() {
         std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap())
             .expect("create golden dir");
-        std::fs::write(path, &rendered).expect("write golden");
+        std::fs::write(path, rendered).expect("write golden");
         eprintln!("re-recorded {path}");
-        return;
+        return None;
     }
-
-    let expected = std::fs::read_to_string(path).unwrap_or_else(|e| {
+    Some(std::fs::read_to_string(path).unwrap_or_else(|e| {
         panic!(
             "cannot read {path}: {e}\nrecord it with `UPDATE_GOLDEN=1 cargo test --test mcp_smoke`"
         )
-    });
+    }))
+}
+
+/// Compare a rendered snapshot against its golden file, failing with a **line** diff.
+///
+/// Right for the shape golden, whose entries are mostly names and type strings: a changed line is
+/// legible on its own, and the structure only moves when a tool does.
+///
+/// Wrong for a report of numbers keyed by tool — see [`assert_budget_golden`], which does not use
+/// this.
+fn assert_golden(path: &str, actual: &Value, what: &str) {
+    let rendered = format!("{}\n", serde_json::to_string_pretty(actual).unwrap());
+    let Some(expected) = golden_baseline(path, &rendered) else {
+        return;
+    };
     if rendered.replace("\r\n", "\n") == expected.replace("\r\n", "\n") {
         return;
     }
@@ -1027,6 +1036,119 @@ fn assert_golden(path: &str, actual: &Value, what: &str) {
         "{what} changed:\n{diff}\n\
          If this is intended, re-record with `UPDATE_GOLDEN=1 cargo test --test mcp_smoke` \
          and review the diff."
+    );
+}
+
+/// Compare a budget report against its golden **by tool name**, reporting byte deltas.
+///
+/// Deliberately not [`assert_golden`]'s line diff, and the reason is a failure that was measured
+/// rather than imagined. Each tool occupies seven lines of the report, so adding or removing one
+/// shifts every line after it, and a positional differ then blames the first tool whose *line
+/// numbers* moved rather than the one that changed. Dropping `backtrace` from a 51-tool report
+/// made the failure open with `crash_triage` — which had not changed at all — and truncate at its
+/// 60-line cap before reaching anything that had. A report that names the wrong tool is worse than
+/// no report: it sends the reader to audit something that is fine.
+///
+/// Keying the JSON by name instead would not have fixed it. The rows would still be lines, and an
+/// insertion would still shift the ones below. What fixes it is comparing the two documents as
+/// *values* — matching tools by name, so an insertion is an insertion and every other tool is
+/// untouched — which is also how the failure gets to say `modules: modelVisible 2112 -> 4200`
+/// instead of a line number.
+fn assert_budget_golden(path: &str, actual: &Value, what: &str) {
+    let rendered = format!("{}\n", serde_json::to_string_pretty(actual).unwrap());
+    let Some(expected_text) = golden_baseline(path, &rendered) else {
+        return;
+    };
+    if rendered.replace("\r\n", "\n") == expected_text.replace("\r\n", "\n") {
+        return;
+    }
+    let expected: Value = serde_json::from_str(&expected_text).unwrap_or_else(|e| {
+        panic!("{path} is not readable as JSON ({e}); re-record it with `UPDATE_GOLDEN=1`")
+    });
+
+    let by_name = |report: &Value| -> std::collections::BTreeMap<String, Value> {
+        report["tools"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|row| Some((row["name"].as_str()?.to_string(), row.clone())))
+            .collect()
+    };
+    let (was, now) = (by_name(&expected), by_name(actual));
+
+    // Per-tool figures, most consequential first, so a truncated report keeps what matters.
+    const FIELDS: &[&str] = &[
+        "modelVisible",
+        "wire",
+        "description",
+        "inputSchema",
+        "outputSchema",
+        "annotations",
+    ];
+    let mut lines: Vec<String> = Vec::new();
+    for (name, row) in &now {
+        if !was.contains_key(name) {
+            lines.push(format!(
+                "  + {name} is new: {} B to the model, {} B on the wire",
+                row["modelVisible"], row["wire"]
+            ));
+        }
+    }
+    for (name, row) in &was {
+        if !now.contains_key(name) {
+            lines.push(format!(
+                "  - {name} is gone: was {} B to the model",
+                row["modelVisible"]
+            ));
+        }
+    }
+    for (name, new_row) in &now {
+        let Some(old_row) = was.get(name) else {
+            continue;
+        };
+        let deltas: Vec<String> = FIELDS
+            .iter()
+            .filter_map(|field| {
+                let (a, b) = (old_row[*field].as_i64()?, new_row[*field].as_i64()?);
+                (a != b).then(|| format!("{field} {a} -> {b} ({:+})", b - a))
+            })
+            .collect();
+        if !deltas.is_empty() {
+            lines.push(format!("  ~ {name}: {}", deltas.join(", ")));
+        }
+    }
+
+    let mut totals: Vec<String> = Vec::new();
+    if let Some(recorded) = expected["totals"].as_object() {
+        for (key, old) in recorded {
+            let new = &actual["totals"][key];
+            if old == new {
+                continue;
+            }
+            totals.push(match (old.as_i64(), new.as_i64()) {
+                (Some(a), Some(b)) => format!("  {key} {a} -> {b} ({:+})", b - a),
+                _ => format!("  {key} {old} -> {new}"),
+            });
+        }
+    }
+
+    const MAX_LINES: usize = 25;
+    let hidden = lines.len().saturating_sub(MAX_LINES);
+    lines.truncate(MAX_LINES);
+    if hidden > 0 {
+        lines.push(format!("  ... and {hidden} more tool(s)"));
+    }
+
+    panic!(
+        "{what} changed:\n{}\n\ntotals:\n{}\n\n\
+         If this is intended, re-record with `UPDATE_GOLDEN=1 cargo test --test mcp_smoke` \
+         and review the diff.",
+        lines.join("\n"),
+        if totals.is_empty() {
+            "  (unchanged)".to_string()
+        } else {
+            totals.join("\n")
+        },
     );
 }
 
@@ -1202,7 +1324,7 @@ fn tool_surface_stays_within_its_token_budget() {
          per-tool ceiling."
     );
 
-    assert_golden(BUDGET_GOLDEN, &report, "the tools/list token budget");
+    assert_budget_golden(BUDGET_GOLDEN, &report, "the tools/list token budget");
 }
 
 /// Clients validate arguments against these schemas before ever calling. A `$ref` that points

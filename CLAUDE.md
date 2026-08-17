@@ -98,11 +98,21 @@ build differs only in optimization and is exercised by CI on a fresh runner.
 After a dependency bump (`rmcp`, `schemars`, `tokio`, `cargo update -p win-kexp`) or an MCP spec
 revision, run it and follow [`docs/smoke-test.md`](./docs/smoke-test.md).
 
-Two of its tests budget **what this server costs the model driving it** — the tool surface, which is
-paid once per conversation, and each result, which is paid every call. Both are recorded in
-`tests/golden/tool_budget.json` and re-recorded with the same `UPDATE_GOLDEN=1 cargo test --test
-mcp_smoke` as the shape golden beside it; read the diff rather than rubber-stamping it, because it
-is the only place the price of a reworded description or a widened schema is visible.
+Two of its tests budget **what this server costs the model driving it** — the tool surface, paid
+once per conversation, and each result, paid every call. They are guarded differently, and the
+difference matters when you change one:
+
+- **The surface** is goldened, in `tests/golden/tool_budget.json`, re-recorded by the same
+  `UPDATE_GOLDEN=1 cargo test --test mcp_smoke` as the shape golden beside it. Read that diff
+  rather than rubber-stamping it: it is the only place the price of a reworded description or a
+  widened schema shows up, and it reports per tool (`modules: modelVisible 2112 -> 4200`).
+- **Results are not goldened** — their sizes move with what symbols a runner resolves, so exact
+  bytes would be flaky. They are per-tool ceilings in the `budgets` slice of
+  `tool_results_stay_within_their_budget`, with a table printed under `--nocapture`. So a result
+  that grows *within* its ceiling produces no diff anywhere; if you need to see the movement, run
+  the tier and read the table. Changing a ceiling is an edit to that slice, not a re-record.
+
+`--nocapture` is what makes either print anything: libtest shows a passing test's output nowhere.
 [`docs/token-budget.md`](./docs/token-budget.md) has the baseline and what it exposed — including
 the two client behaviours it settled by measurement: `outputSchema` never reaches the model, and
 `structuredContent` *replaces* the text block rather than accompanying it. To include the tier that
