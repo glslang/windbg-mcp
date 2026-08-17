@@ -91,6 +91,14 @@ pub enum Step {
     /// A teardown found a transaction in flight and told it to stop and roll back, which it has
     /// this long to finish ([`crate::proto::WorkerMessage::RollingBack`]).
     Unwinding { within: Duration },
+    /// That transaction is over — stopped, rolled back and reported — and only the release is left.
+    ///
+    /// The same protocol message as [`Self::Unwinding`], carrying zero: the worker names zero to
+    /// say *now* ([`crate::worker`]'s `RETRACTED`), which is a retraction rather than a shorter
+    /// promise. Reporting it as another unwind would tell a client a transaction was still in
+    /// flight at the exact moment it stopped being one — and phrase it "up to 0.0s", which reads
+    /// as a bug in the server rather than as the good news it is.
+    Unwound,
 }
 
 impl Step {
@@ -109,6 +117,9 @@ impl Step {
                 "a transaction is in flight; rolling it back (up to {})",
                 fmt_duration(within)
             ),
+            Self::Unwound => {
+                "the transaction has been rolled back; releasing the target".to_string()
+            }
         }
     }
 }
@@ -456,6 +467,28 @@ mod tests {
             "a finished call reports nothing: {:?}",
             messages(&sent)
         );
+    }
+
+    /// The two readings of the worker's one rollback message do not sound alike.
+    ///
+    /// `RollingBack` is sent twice for a single transaction — a promise with an interval, then a
+    /// retraction naming zero — and rendering both the same way told a client "rolling it back (up
+    /// to 0.0s)" at the moment the rollback had *finished*. `engine::reader` splits them on the
+    /// zero; this pins that the words on the far side are worth splitting them for.
+    #[test]
+    fn a_finished_rollback_does_not_read_as_one_still_running() {
+        let promised = Step::Unwinding {
+            within: Duration::from_secs(12),
+        }
+        .message();
+        let retracted = Step::Unwound.message();
+        assert!(promised.contains("in flight"), "{promised}");
+        assert!(promised.contains("12.0s"), "{promised}");
+        assert!(
+            !retracted.contains("in flight") && !retracted.contains("0.0s"),
+            "a finished rollback must not read as one still running: {retracted}"
+        );
+        assert!(retracted.contains("has been rolled back"), "{retracted}");
     }
 
     /// Outside a watched call there is nowhere to report to, and that is the common case — a

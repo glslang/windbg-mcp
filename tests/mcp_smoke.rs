@@ -3983,6 +3983,18 @@ fn ending_a_session_stops_a_running_batch_and_rolls_it_back() {
         said.iter().any(|m| m.contains("rolling it back")),
         "the teardown found a transaction and never said so: {said:?}"
     );
+    // And the *end* of it, which is the same protocol message carrying zero. This is the only
+    // place both readings occur for real, so it is the only place that can catch them being
+    // rendered alike — which they were: the retraction used to report a transaction still in
+    // flight, "up to 0.0s", at the moment the rollback had finished.
+    assert!(
+        said.iter().any(|m| m.contains("has been rolled back")),
+        "the rollback finished and the client was never told: {said:?}"
+    );
+    assert!(
+        !said.iter().any(|m| m.contains("up to 0.0s")),
+        "a finished rollback is being reported as one still running: {said:?}"
+    );
     assert!(
         took < Duration::from_secs(15),
         "end_session took {took:?}: it waited out the batch instead of cutting it short"
