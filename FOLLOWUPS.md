@@ -634,11 +634,12 @@ Worth knowing before touching any job name in this repository, not just this one
 
 ## 23. [windbg-mcp] The listener is transport-complete, not usable-complete
 
-The log half of this is **done** (2026-08-17): `server_log` carries every record either process
-made to a client on any machine, and [`DECISIONS.md`](./DECISIONS.md) records why it is a tool
-rather than MCP's deprecated logging capability. What is left of the same gap is the other two
-items [`docs/remote-listener.md`](./docs/remote-listener.md) lists under *Not there yet*, plus one
-this work added.
+Two halves of this are **done** (2026-08-17): `server_log` carries every record either process made
+to a client on any machine ([`DECISIONS.md`](./DECISIONS.md) records why it is a tool rather than
+MCP's deprecated logging capability), and the lease now has a **smoke tier** — four assertions in
+the protocol tier and one, against a parked kernel attach, in the debugger tier. What is left is
+the other two items [`docs/remote-listener.md`](./docs/remote-listener.md) lists under *Not there
+yet*.
 
 **No progress notifications.** A long call is silent. The worker already emits the milestones — a
 `Committed`/`Opened` opener pair, `RollingBack` — as protocol messages, so what is missing is the
@@ -649,11 +650,10 @@ watched stderr for this; a remote one has `session_status` and `server_log`, and
 login session and inherits that shell's `PATH` — which for this server decides whether the engine
 DLLs beside the exe are the ones that load.
 
-**No smoke tier for the lease.** Every rule of it has unit tests
-(`src/listen.rs`), and the ones that matter most — drop and return inside the grace, release past
-it, a second client refused with `409` — have only ever been exercised by hand against the guest.
-That is the shape of gap the lease's seven review rounds kept finding bugs in. This work drove the
-listener over HTTP again to check `server_log` reaches a client that is not on the machine, which
-is a third hand-run of the same setup and an argument for scripting it.
+**What the smoke tier does not reach**, now that there is one: the grace is waited out at 32
+seconds because the listener's own floor is the call budget plus `WORKER_READY_TIMEOUT`, and that
+30s constant is not configurable — so the test costs 40s of wall clock to assert a timer. Lowering
+it would mean making a production constant test-tunable, which is a worse trade than the 40s. Worth
+revisiting only if that tier's runtime starts to matter.
 
 Picks up at `src/listen.rs` and the tiers in `tests/mcp_smoke.rs`.

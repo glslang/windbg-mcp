@@ -39,6 +39,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `WINDBG_MCP_LOG_BUFFER` sets how many records are kept (1000 by default). The ring is the same
   stream as stderr, so `RUST_LOG` widens both together.
 
+- **A smoke tier for the listener's lease.** The lease is the only part of this server whose
+  failures cost a *target* rather than a call, and it was the only part checked by hand. It is now
+  driven over real HTTP against a listener on a loopback port, with a hand-written client — a
+  library that normalised a `409` into an exception, or hid the `Mcp-Session-Id` header, would be
+  asserting on the server's behalf.
+
+  Four assertions need no debugger, because tenancy is decided before any session is opened: the
+  listener refuses to start without a token and says which variable is missing; an unauthenticated
+  request is refused, told nothing about what is here, and **costs the server nothing** (the bearer
+  check runs before the tenancy gate, so a wrong token must not consume a claim); a second client
+  is refused with `409` whether it arrives with a fresh `initialize` or somebody else's session id;
+  and going quiet is not leaving while a `DELETE` is. The fifth is in the debugger tier and waits
+  out a real grace against a **parked kernel attach** — a session that exists, holds a worker, and
+  cannot be interrupted, so releasing it means terminating a process. See
+  [`docs/smoke-test.md`](./docs/smoke-test.md).
+
+### Changed
+
+- The listener no longer claims a reconnecting client **adopted sessions** when there were none to
+  adopt. The flag behind that line says a previous tenancy ended inside the grace, which is true
+  whether or not that client had opened anything — so an ordinary reconnect logged an adoption that
+  had not happened. It now says how many sessions were inherited, or that nothing was open.
+
 - **Opt-in session transcripts, and an asciicast renderer for them**
   ([#87](https://github.com/glslang/windbg-mcp/issues/87)). Point `WINDBG_MCP_TRANSCRIPT` at a path
   and the supervisor records what it was asked and what it did, one JSON object per line: the tool
