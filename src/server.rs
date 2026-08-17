@@ -196,10 +196,16 @@ fn log_report(tail: &crate::logbridge::Tail) -> structured::LogReport {
     }
 }
 
-/// The module part of a `tracing` target, which is what a reader is actually distinguishing:
-/// `windbg_mcp::worker` against `windbg_mcp::engine`. The full target is kept in the typed half.
+/// A `tracing` target as a line prefix: this crate's own shortened to the module, everything
+/// else left whole.
+///
+/// Only the leading `windbg_mcp::` comes off, and the asymmetry is the point. Taking the *last*
+/// segment of every target reads well until a dependency logs — `rmcp::handler::server` and this
+/// crate's `server` then both render as `server`, which is worse than long, because the reader
+/// cannot tell whose record they are looking at. The full target is kept in the typed half either
+/// way.
 fn short_target(target: &str) -> &str {
-    target.rsplit("::").next().unwrap_or(target)
+    target.strip_prefix("windbg_mcp::").unwrap_or(target)
 }
 
 /// One record as a line: when, how bad, who said it, and what it said.
@@ -4725,6 +4731,135 @@ mod tests {
         ));
         assert!(out.contains("0x80070002"), "{out}");
         assert!(out.contains("Nothing was created"), "{out}");
+    }
+
+    // ---- the server's own log ------------------------------------------
+
+    fn log_entry(
+        level: crate::logbridge::Level,
+        session: Option<&str>,
+        target: &str,
+    ) -> crate::logbridge::Entry {
+        crate::logbridge::Entry {
+            seq: 7,
+            at_ms: 1_770_000_000_000,
+            level,
+            target: target.to_string(),
+            session: session.map(str::to_string),
+            message: "a thing happened".to_string(),
+        }
+    }
+
+    /// Only this crate's own targets are shortened. Taking the last segment of every target — the
+    /// first cut here — rendered `rmcp::handler::server` and this crate's `server` identically,
+    /// which loses the one thing the prefix is there to say.
+    #[test]
+    fn a_foreign_target_is_not_shortened_into_one_of_ours() {
+        assert_eq!(short_target("windbg_mcp::worker"), "worker");
+        assert_eq!(short_target("windbg_mcp::server"), "server");
+        assert_eq!(
+            short_target("rmcp::handler::server"),
+            "rmcp::handler::server"
+        );
+        assert_ne!(
+            short_target("rmcp::handler::server"),
+            short_target("windbg_mcp::server"),
+            "two different sources must not render as the same prefix"
+        );
+    }
+
+    /// A record says which session it belongs to in the line itself, not only in the typed half —
+    /// the text is what a person reads, and a worker's record is meaningless without it.
+    #[test]
+    fn a_workers_record_carries_its_session_in_the_line() {
+        let line = describe_record(&log_entry(
+            crate::logbridge::Level::Warn,
+            Some("sess-abc-1"),
+            "windbg_mcp::worker",
+        ));
+        assert!(line.contains("worker/sess-abc-1"), "{line}");
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains("a thing happened"), "{line}");
+        // The supervisor's own records have no session, and must not invent one.
+        let supervisor = describe_record(&log_entry(
+            crate::logbridge::Level::Info,
+            None,
+            "windbg_mcp::engine",
+        ));
+        assert!(
+            supervisor.contains("engine: a thing happened"),
+            "{supervisor}"
+        );
+        assert!(!supervisor.contains('/'), "{supervisor}");
+    }
+
+    /// An empty page is the answer most likely to be misread, so it has to explain itself: why
+    /// there is nothing, and what to ask instead.
+    #[test]
+    fn an_empty_page_says_why_it_is_empty() {
+        let tail = crate::logbridge::Tail {
+            entries: Vec::new(),
+            matched: 0,
+            next_since: 12,
+            held: 12,
+            capacity: 1000,
+            oldest_seq: Some(0),
+        };
+        let query = crate::logbridge::Query {
+            session: Some("sess-abc-1".to_string()),
+            level: crate::logbridge::Level::Info,
+            since: None,
+            limit: 50,
+        };
+        let out = describe_log(&tail, &query);
+        assert!(
+            out.contains("No log records about session sess-abc-1"),
+            "{out}"
+        );
+        assert!(
+            out.contains("without `session_id`"),
+            "an empty session page has to name the filter that would show the supervisor's own \
+             records about that session: {out}"
+        );
+        assert!(
+            out.contains("12 record(s) that this filter excluded"),
+            "{out}"
+        );
+    }
+
+    /// A caller paging with `since` has to be told when the buffer moved past them, or their next
+    /// page silently skips a stretch and reads as a quiet one.
+    #[test]
+    fn a_page_that_missed_records_says_so() {
+        let tail = crate::logbridge::Tail {
+            entries: vec![log_entry(
+                crate::logbridge::Level::Info,
+                None,
+                "windbg_mcp::engine",
+            )],
+            matched: 1,
+            next_since: 400,
+            held: 100,
+            capacity: 100,
+            oldest_seq: Some(300),
+        };
+        let caught_up = crate::logbridge::Query {
+            session: None,
+            level: crate::logbridge::Level::Info,
+            since: Some(350),
+            limit: 50,
+        };
+        assert!(
+            !describe_log(&tail, &caught_up).contains("were evicted"),
+            "a cursor the buffer still covers is not a gap"
+        );
+        let left_behind = crate::logbridge::Query {
+            since: Some(2),
+            ..caught_up
+        };
+        let out = describe_log(&tail, &left_behind);
+        assert!(out.contains("before seq 300 were evicted"), "{out}");
+        assert!(out.contains("WINDBG_MCP_LOG_BUFFER"), "{out}");
     }
 
     #[test]
