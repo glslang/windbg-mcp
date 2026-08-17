@@ -74,17 +74,17 @@ whole `StepAction`/`Check` vocabulary out of `src/batch.rs`.
 
 ### Results, against `docs/samples/052126-34312-01.dmp`
 
-`model` is whichever half the client forwards.
+`model` is whichever half the client forwards; `wire` is the whole result, which every client pays.
 
-| Tool | model | text | structured | ratio |
-|---|---:|---:|---:|---:|
-| `modules` | 53,875 | 19,732 | 53,875 | 2.7x |
-| `execute` (`lm`) | 19,420 | 19,420 | — | — |
-| `registers` | 9,804 | 618 | 9,804 | **15.9x** |
-| `crash_triage` | 1,855 | 1,159 | 1,855 | 1.6x |
-| `open_dump` | 1,347 | 814 | 1,347 | 1.7x |
-| `backtrace` | 572 | 572 | — | — |
-| `session_status` | 297 | 420 | 297 | 0.7x |
+| Tool | model | wire | text | structured | ratio |
+|---|---:|---:|---:|---:|---:|
+| `modules` | 53,875 | 73,994 | 19,732 | 53,875 | 2.7x |
+| `execute` (`lm`) | 19,420 | 19,788 | 19,420 | — | — |
+| `registers` | 9,804 | 10,534 | 618 | 9,804 | **15.9x** |
+| `crash_triage` | 1,855 | 3,133 | 1,159 | 1,855 | 1.6x |
+| `open_dump` | 1,347 | 2,277 | 814 | 1,347 | 1.7x |
+| `backtrace` | 572 | 661 | 572 | — | — |
+| `session_status` | 297 | 823 | 420 | 297 | 0.7x |
 
 `registers` is the shape of the problem in miniature: the model reads 9,804 bytes of JSON carrying
 `"kind":"int"` and `"subregister":false` on every row, and never sees the 618-byte `r` output that
@@ -174,27 +174,37 @@ own commit, with the reason, and update the tables here.
 
 Result budgets are **not** goldened. Their sizes move with what the runner can resolve: a symbol
 server that answers turns `deferred` into paths and grows `lm` a column, and the debugger tier runs
-on two architectures. Per-tool ceilings with ~35% headroom catch a tool that starts returning an
-order of magnitude more, without pinning a number the environment owns.
+on two architectures. Per-tool ceilings with ~35–45% headroom catch a tool that starts returning an
+order of magnitude more, without pinning a number the environment owns. `crash_triage` and
+`backtrace` are looser still, deliberately: `!analyze -v` and `k` change *shape* when symbols
+resolve rather than merely growing, and a ceiling tight enough to be interesting offline would make
+the tier flaky about its environment instead of watchful about the code.
 
 One rule is asserted rather than a number: a tool's `structuredContent` may not exceed its own text
 rendering by more than 20x. A typed answer is meant to be the facts behind a rendering, so a large
 multiple means it is carrying scaffolding instead. `registers` is at 15.9x and is finding 7 above,
-not a failure — the rule is there to catch the next one.
+not a failure — the rule is there to catch the next one. Being a ratio, it is only safe to read
+alongside the `wire` ceiling below: on its own, a rendering that grows satisfies it *more*.
 
-### What the result budget does not cover
+### Why each call has two ceilings
 
-It asserts on **one channel per call** — `structuredContent` when a tool has one, its text
-otherwise — because that is what the measured client forwards. That is a forwarding policy rather
-than protocol: MCP does not require a client to drop the text block, and this server is advertised
-for several. So for the 31 typed tools, the text half is measured and printed but never asserted,
-and it could grow unwatched.
+`model` alone would leave the other channel unwatched. It is `structuredContent` when a tool has
+one, and that is a *forwarding policy* rather than protocol — MCP does not require a client to drop
+the text block, and this server is advertised for several — so budgeting only the forwarded half
+means that for the 31 typed tools the rendering could grow with nothing to notice.
 
-Worse, growing it would look like an improvement. Text is the *denominator* of the ratio rule
-above, so doubling a rendering lowers the ratio and leaves `model` untouched — the one assertion
-that mentions text is the one that would wave it through. Nothing is oversized today (the text
-halves are the small halves), but the harness would not be the thing that noticed.
-[#150](https://github.com/glslang/windbg-mcp/issues/150) tracks it. The cheap half of the fix —
-budgeting `text + structured`, the wire total, which no client policy affects — needs nothing this
-document does not already have; the rest wants measurements from a second client rather than a
-guess about one.
+And it would have looked like an improvement. Text is the **denominator** of the ratio rule above,
+so a rendering that doubles *lowers* the ratio while `model` does not move at all: the one
+assertion that mentioned text was the one that would have waved it through. Measured, not argued —
+adding a line of prose per module to `modules` took its text from 19,732 B to 30,385 B, and the
+ratio *fell* from 2.7x to 1.8x while `model` stayed at 53,875 B.
+
+So each call also has a **`wire`** ceiling: the whole result as it crosses the pipe, which no
+client's policy affects. It is measured rather than derived from `text + structured`, because the
+result object also carries content-block scaffolding and JSON escaping — a rendered table's
+newlines cost two bytes there and one in `text`.
+
+What is still missing is per-*channel* ceilings, which would say which half moved. That needs a
+decision about which forwarding policies this server intends to be good under, and that wants
+measurements from a second client rather than a guess about one —
+[#150](https://github.com/glslang/windbg-mcp/issues/150).
