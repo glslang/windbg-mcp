@@ -60,6 +60,14 @@ use crate::server::fmt_duration;
 /// the overwhelming majority, which answer in milliseconds.
 const HEARTBEAT: Duration = Duration::from_secs(10);
 
+/// How long the flush after a call finishes will wait on the transport before giving up on a
+/// milestone the answer arrived with.
+///
+/// Deliberately short. By that point the result exists, and a progress line is a courtesy while the
+/// result is the contract — so a healthy transport wins this comfortably and a client that has
+/// stopped reading its stream delays nobody's answer.
+const FINAL_FLUSH: Duration = Duration::from_secs(1);
+
 /// Something a call did on its way to an answer.
 ///
 /// Deliberately a closed set of *milestones* rather than a free-text channel. Each one is a
@@ -215,10 +223,14 @@ where
     // The beat measures silence, not wall clock: a runtime that was busy elsewhere must not make up
     // the ticks it missed by sending several notifications at once.
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    loop {
+    let outcome = 'running: loop {
         let message = tokio::select! {
-            outcome = &mut work => return outcome,
+            // Biased so that a step already in the channel is preferred to a result that became
+            // ready beside it, which keeps the order a client sees the natural one. It is not what
+            // makes the last milestone safe — see the flush below, which is.
+            biased;
             Some(step) = rx.recv() => step.message(),
+            outcome = &mut work => break 'running outcome,
             _ = ticker.tick() => format!("still running ({})", fmt_duration(started.elapsed())),
         };
         // Restarted after anything said, so the heartbeat is "nothing for `beat`" rather than a
@@ -226,13 +238,33 @@ where
         ticker.reset();
         let mut sending = std::pin::pin!(notify(started.elapsed().as_secs_f64(), message));
         tokio::select! {
-            // The work is still polled while the notification goes out, and wins if it lands
-            // first: an undelivered progress line costs nothing once the result exists, while a
-            // client that has stopped reading its stream must never be able to stall the debugger.
-            outcome = &mut work => return outcome,
+            // Biased again, one level down: a send that is ready now completes rather than being
+            // dropped on a coin toss. Only a send that actually *stalls* loses to the answer —
+            // which is the property that matters, because a client that has stopped reading its
+            // stream must never be able to hold up the debugger. The work is still polled
+            // throughout, so it never waits on the notification.
+            biased;
             () = &mut sending => {}
+            outcome = &mut work => break 'running outcome,
+        }
+    };
+
+    // **The last milestone is queued by the very poll that produces the answer**, so no polling
+    // order above can catch it: `work` has to run to report `RollingBack`, and the same run
+    // returns `Done`. Selecting more carefully cannot help — only looking again afterwards can.
+    // Without this, an `end_session` that unwinds a transaction tells the client how long that
+    // will take, or does not, depending on scheduling.
+    //
+    // Bounded, because by here the result exists and nothing may hold it back: the notification is
+    // a courtesy and the result is the contract. A client that has stopped reading its stream
+    // loses the courtesy.
+    while let Ok(step) = rx.try_recv() {
+        let sent = notify(started.elapsed().as_secs_f64(), step.message());
+        if tokio::time::timeout(FINAL_FLUSH, sent).await.is_err() {
+            break;
         }
     }
+    outcome
 }
 
 #[cfg(test)]
@@ -263,14 +295,35 @@ mod tests {
             .collect()
     }
 
-    /// Lets the relay drain what has just been reported before the work returns.
+    /// A milestone reported in the same turn as the answer is still delivered.
     ///
-    /// A step reported in the same instant the answer arrives may or may not be delivered — the
-    /// result supersedes it, and `select!` picks between two ready branches at random — so a test
-    /// that asserted on that race would be flaky about behaviour nobody depends on. Every test
-    /// here ends its work with this so what it counts is the steady state.
-    async fn settle() {
-        tokio::time::sleep(Duration::from_millis(1)).await;
+    /// The case the biased `select!` in [`relay`] exists for, and the one that used to need
+    /// scaffolding in every test here to avoid asserting on a coin toss. `end_session` finding a
+    /// transaction to unwind is exactly this shape — the milestone and the reply can land together
+    /// — and the client that asked for progress would have had no way to know it lost one.
+    #[tokio::test(start_paused = true)]
+    async fn a_step_reported_as_the_call_answers_is_not_dropped() {
+        let (sent, notify) = collector();
+        relay(
+            async {
+                report(Step::Unwinding {
+                    within: Duration::from_secs(12),
+                });
+                // and returns immediately: no await between the report and the answer, so both
+                // are ready in the same poll.
+            },
+            HEARTBEAT,
+            notify,
+        )
+        .await;
+
+        let said = messages(&sent);
+        assert_eq!(
+            said.len(),
+            1,
+            "the last milestone must survive the answer arriving with it: {said:?}"
+        );
+        assert!(said[0].contains("rolling it back"), "{said:?}");
     }
 
     /// The opener sequence, end to end: what the supervisor and its worker report becomes three
@@ -290,7 +343,6 @@ mod tests {
                 })
                 .await
                 .expect("the reader task");
-                settle().await;
             },
             HEARTBEAT,
             notify,
@@ -315,7 +367,6 @@ mod tests {
                 report(Step::Committed);
                 tokio::time::sleep(Duration::from_millis(250)).await;
                 report(Step::Opened);
-                settle().await;
             },
             HEARTBEAT,
             notify,
@@ -361,7 +412,6 @@ mod tests {
                     tokio::time::sleep(HEARTBEAT - Duration::from_secs(1)).await;
                     report(Step::Committed);
                 }
-                settle().await;
             },
             HEARTBEAT,
             notify,
