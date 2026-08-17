@@ -61,7 +61,9 @@ authority — the tables below are a reading of it at the time of writing.
 
 | Component | Bytes | Reaches the model |
 |---|---:|---|
-| **Whole `tools/list` payload** | **358,533** | partly |
+| **Whole `tools/list` payload** | **358,651** | partly |
+| — the 51 tools themselves | 358,533 | partly |
+| — result-level fields (`resultType`, `ttlMs`, `cacheScope`) | 118 | no |
 | `outputSchema` (the 31 tools that have one) | 285,745 | no |
 | `inputSchema` (all 51) | 39,964 | yes |
 | `description` (all 51) | 23,457 | yes |
@@ -71,6 +73,19 @@ authority — the tables below are a reading of it at the time of writing.
 
 Worst single tool: `debug_batch` at 9,757 model-visible bytes, because its `inputSchema` pulls the
 whole `StepAction`/`Check` vocabulary out of `src/batch.rs`.
+
+The payload is measured as the **serialized result**, not as the sum of its tools, and the 118-byte
+gap between those two is the reason. Result-level fields live in it, and on `2026-07-28` those are
+SEP-2549's `ttlMs`/`cacheScope` — the fields the `rmcp = "3.1.1"` floor exists for. Asking the same
+server at two revisions shows what a sum would miss:
+
+| Revision | payload | sum of tools | result-level |
+|---|---:|---:|---|
+| `2026-07-28` | 358,651 | 358,533 | `resultType`, `ttlMs`, `cacheScope` |
+| `2025-06-18` | 358,595 | 358,533 | none |
+
+The sum is **identical** across the two; only the payload figure can tell them apart. The golden
+records both, so the gap stays visible.
 
 ### Results, against `docs/samples/052126-34312-01.dmp`
 
