@@ -13,12 +13,18 @@
 //! Five tiers, so the cheap one can ride `cargo test` everywhere:
 //!
 //! * **Protocol** (default) — spawns the server, speaks JSON-RPC. No debugger target, no
-//!   symbols, no network.
+//!   symbols, no network. This tier also drives the **listener** (`--listen`) over real HTTP on a
+//!   loopback port: the bearer check, the `409` that keeps it to one client at a time, and the
+//!   difference between a client going quiet and a client saying goodbye. Those need no debugger,
+//!   because the lease is decided before any session is opened — but the sweep meeting a real
+//!   engine worker does, so that half lives in the tier below.
 //! * **Target** (`WINDBG_MCP_SMOKE_DUMP=1`) — opens the sample crash dump through DbgEng, so
 //!   it needs `dbgeng.dll` and may reach a symbol server. Off by default; this is the tier
 //!   that catches a `win-kexp` regression. It also runs a `debug_batch` to both outcomes, and
 //!   through both teardowns — an `end_session` and a client disconnect landing mid-transaction —
-//!   because "the rollback ran inside the worker" is a claim only a real engine can settle.
+//!   because "the rollback ran inside the worker" is a claim only a real engine can settle. And
+//!   it waits out a **lease expiry** against a parked kernel attach, which is the listener's
+//!   answer to a closed stdin and the one claim there that costs a target when it is wrong.
 //! * **Bounded command** (`#[ignore]`d, run by hand) — deliberately runs away and waits out a
 //!   watchdog, so it is measured in minutes rather than seconds. It lives here rather than
 //!   beside the budget arithmetic in `src/engine.rs` because the two halves it proves are now
@@ -1765,6 +1771,495 @@ fn a_profiles_key_never_reaches_a_session_transcript() {
 fn tool_text_refuses_to_hand_back_a_failed_call() {
     let mut server = Server::started();
     server.tool_text("go", json!({}), STEP);
+}
+
+// ---- tier 1: the listener and its lease ---------------------------------------
+//
+// `--listen` gives up the one property stdio has for free: a closed stdin means the client is
+// *definitively* gone, and every target is released. Over HTTP a silent client is
+// indistinguishable from one that is thinking, so a **lease** stands in for that moment — and the
+// lease is the only part of this server whose failures cost a *target* rather than a call.
+//
+// Every rule of it has unit tests in `src/listen.rs`, against the state machine directly. What
+// those cannot reach is the wiring: the bearer check that runs before the gate, the
+// `Mcp-Session-Id` header tenancy is keyed on, an HTTP status a client actually branches on, and —
+// in the debugger tier — the sweep releasing a real engine worker. That had been checked by hand
+// against the guest three times, which is how this tier came to exist.
+//
+// The client here is hand-written for the same reason the stdio one is: what is being asserted is
+// what goes over the wire, and a library that normalises a `409` into an exception, or hides the
+// session header, is a library asserting on this server's behalf.
+
+/// The protocol revision the lease is exercised against.
+///
+/// Tenancy is keyed on `Mcp-Session-Id`, so this has to be a revision whose handshake mints one.
+const LEASE_REVISION: &str = "2025-06-18";
+
+/// A free loopback port, taken by binding and letting go.
+///
+/// Racy in principle and not in practice: the window is microseconds, tests each take their own,
+/// and a collision fails loudly at bind rather than silently sharing a server.
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("a loopback port")
+        .local_addr()
+        .expect("a bound address")
+        .port()
+}
+
+/// One HTTP reply, parsed far enough to assert on.
+struct Reply {
+    status: u16,
+    /// `Mcp-Session-Id`, which is what the lease reads a client's identity from.
+    session: Option<String>,
+    /// The JSON-RPC payload, whether it arrived as a plain body or inside an SSE frame.
+    payload: Option<Value>,
+    body: String,
+}
+
+impl Reply {
+    fn result(&self, what: &str) -> Value {
+        let payload = self
+            .payload
+            .as_ref()
+            .unwrap_or_else(|| panic!("`{what}` answered with no JSON-RPC payload: {}", self.body));
+        assert!(
+            payload["error"].is_null(),
+            "`{what}` failed: {}",
+            payload["error"]
+        );
+        payload["result"].clone()
+    }
+}
+
+/// A `--listen` server, and just enough HTTP to drive it.
+struct Listener {
+    child: Child,
+    addr: String,
+    token: String,
+    stderr_log: Arc<Mutex<Vec<String>>>,
+    next_id: i64,
+}
+
+impl Listener {
+    fn start(env: &[(&str, &str)]) -> Self {
+        let addr = format!("127.0.0.1:{}", free_port());
+        // Distinct per listener, so a token left in a stray process cannot reach this one.
+        let token = format!("smoke-{}-{addr}", std::process::id());
+        let mut command = Command::new(EXE);
+        command
+            .arg("--listen")
+            .arg(&addr)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .env("RUST_LOG", "info")
+            .env("WINDBG_MCP_LISTEN_TOKEN", &token);
+        for (key, value) in env {
+            command.env(key, value);
+        }
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|e| panic!("failed to spawn {EXE} --listen {addr}: {e}"));
+
+        // Both drained, for the same reason the stdio harness drains stderr: an unread pipe fills
+        // and the server blocks mid-test, which would present as a protocol hang.
+        let stderr_log = Arc::new(Mutex::new(Vec::new()));
+        let err = BufReader::new(child.stderr.take().expect("piped stderr"));
+        let log = Arc::clone(&stderr_log);
+        std::thread::spawn(move || {
+            for line in err.lines().map_while(Result::ok) {
+                log.lock().unwrap().push(line);
+            }
+        });
+        let out = BufReader::new(child.stdout.take().expect("piped stdout"));
+        std::thread::spawn(move || out.lines().map_while(Result::ok).for_each(drop));
+
+        let listener = Self {
+            child,
+            addr,
+            token,
+            stderr_log,
+            next_id: 1,
+        };
+        listener.wait_until_bound();
+        listener
+    }
+
+    fn stderr(&self) -> String {
+        self.stderr_log.lock().unwrap().join("\n")
+    }
+
+    fn wait_for_stderr(&self, needle: &str, budget: Duration) -> bool {
+        let deadline = Instant::now() + budget;
+        loop {
+            if self.stderr().contains(needle) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// Waits for the bind rather than guessing at it — the alternative is a fixed sleep that is
+    /// either too short on a loaded runner or wasted on every run.
+    fn wait_until_bound(&self) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let addr: std::net::SocketAddr = self.addr.parse().expect("a loopback address");
+        loop {
+            if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the listener never bound {}\n--- stderr ---\n{}",
+                self.addr,
+                self.stderr()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// One request, on a connection of its own.
+    ///
+    /// A connection per request is what a client behind a tunnel looks like anyway, and it makes
+    /// "the client went quiet" the default rather than something the test has to arrange: there is
+    /// no connection left open for the server to mistake for a client still there.
+    fn send(
+        &self,
+        method: &str,
+        token: Option<&str>,
+        session: Option<&str>,
+        body: Option<&Value>,
+    ) -> Reply {
+        use std::io::Read;
+
+        let mut stream = std::net::TcpStream::connect(&self.addr)
+            .unwrap_or_else(|e| panic!("cannot reach the listener at {}: {e}", self.addr));
+        // So a server that never answers fails this test rather than hanging the suite.
+        stream
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .expect("set a read timeout");
+
+        let mut request = format!(
+            "{method} / HTTP/1.1\r\nHost: {}\r\nAccept: application/json, text/event-stream\r\n\
+             Connection: close\r\n",
+            self.addr
+        );
+        if let Some(token) = token {
+            request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        }
+        if let Some(session) = session {
+            request.push_str(&format!("Mcp-Session-Id: {session}\r\n"));
+        }
+        match body.map(|b| b.to_string()) {
+            Some(body) => {
+                request.push_str(&format!(
+                    "Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                ));
+            }
+            None => request.push_str("\r\n"),
+        }
+        stream.write_all(request.as_bytes()).expect("write request");
+        stream.flush().expect("flush request");
+
+        let mut raw = Vec::new();
+        // A read error is not a failure here: `Connection: close` means the server ends the
+        // stream, and whatever arrived before that is the reply.
+        let _ = stream.read_to_end(&mut raw);
+        parse_reply(&raw)
+    }
+
+    /// A JSON-RPC request from the authorised client.
+    fn call(&mut self, session: Option<&str>, method: &str, params: Value) -> Reply {
+        let id = self.next_id;
+        self.next_id += 1;
+        let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        self.send("POST", Some(&self.token.clone()), session, Some(&body))
+    }
+
+    fn opening() -> Value {
+        json!({
+            "protocolVersion": LEASE_REVISION,
+            "capabilities": {},
+            "clientInfo": { "name": "windbg-mcp-lease-smoke", "version": "1" },
+        })
+    }
+
+    /// The handshake, answering with the session id the lease keys tenancy on.
+    fn initialize(&mut self) -> String {
+        let reply = self.call(None, "initialize", Self::opening());
+        assert_eq!(
+            reply.status,
+            200,
+            "initialize was refused ({}): {}\n--- stderr ---\n{}",
+            reply.status,
+            reply.body,
+            self.stderr()
+        );
+        let session = reply
+            .session
+            .clone()
+            .unwrap_or_else(|| panic!("initialize minted no Mcp-Session-Id: {}", reply.body));
+        let ack = self.send(
+            "POST",
+            Some(&self.token.clone()),
+            Some(&session),
+            Some(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })),
+        );
+        assert!(
+            (200..300).contains(&ack.status),
+            "the initialized notification was refused ({}): {}",
+            ack.status,
+            ack.body
+        );
+        session
+    }
+
+    /// The typed half of a tool call that worked.
+    fn tool(&mut self, session: &str, name: &str, args: Value) -> Value {
+        let reply = self.call(
+            Some(session),
+            "tools/call",
+            json!({ "name": name, "arguments": args }),
+        );
+        assert_eq!(
+            reply.status, 200,
+            "`{name}` was refused ({}): {}",
+            reply.status, reply.body
+        );
+        reply.result(name)["structuredContent"].clone()
+    }
+
+    /// The client saying it is done, which is the only departure the server is ever told about.
+    fn goodbye(&self, session: &str) -> Reply {
+        self.send("DELETE", Some(&self.token.clone()), Some(session), None)
+    }
+}
+
+impl Drop for Listener {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// Splits an HTTP reply into what a test asserts on.
+///
+/// Hand-rolled, and small enough to stay that way: a status, three headers, and a body that is
+/// either a JSON document or an SSE frame carrying one. The chunked decode is not optional —
+/// rmcp answers a tool call as `text/event-stream`, and scanning the raw stream for `data:` would
+/// read a chunk-size line as content the moment a payload spans two chunks.
+fn parse_reply(raw: &[u8]) -> Reply {
+    let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        panic!(
+            "not an HTTP reply: {:?}",
+            String::from_utf8_lossy(&raw[..raw.len().min(200)])
+        );
+    };
+    let head = String::from_utf8_lossy(&raw[..split]).into_owned();
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no status line in: {head}"));
+    let header = |name: &str| {
+        head.lines().skip(1).find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
+        })
+    };
+    let chunked = header("transfer-encoding").is_some_and(|v| v.contains("chunked"));
+    let raw_body = &raw[split + 4..];
+    let body_bytes = if chunked {
+        dechunk(raw_body)
+    } else {
+        raw_body.to_vec()
+    };
+    let body = String::from_utf8_lossy(&body_bytes).into_owned();
+    // An SSE frame first, then a plain body: a tool call comes back as the former and a refusal
+    // as neither, and `None` is a fine answer for a refusal.
+    let payload = body
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("data: "))
+        .find_map(|data| serde_json::from_str::<Value>(data).ok())
+        .or_else(|| serde_json::from_str::<Value>(&body).ok());
+    Reply {
+        status,
+        session: header("mcp-session-id"),
+        payload,
+        body,
+    }
+}
+
+/// `Transfer-Encoding: chunked`, decoded on bytes — a chunk boundary may split a code point, and
+/// slicing a `&str` there would panic on content this server has no control over.
+fn dechunk(mut rest: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(eol) = rest.windows(2).position(|w| w == b"\r\n") {
+        let header = String::from_utf8_lossy(&rest[..eol]);
+        let size = header.split(';').next().unwrap_or("").trim();
+        let Ok(len) = usize::from_str_radix(size, 16) else {
+            break;
+        };
+        rest = &rest[eol + 2..];
+        if len == 0 {
+            break;
+        }
+        let take = len.min(rest.len());
+        out.extend_from_slice(&rest[..take]);
+        rest = &rest[take..];
+        if rest.starts_with(b"\r\n") {
+            rest = &rest[2..];
+        }
+    }
+    out
+}
+
+/// The listener exposes every tool this server has, including the ones that write to a live
+/// kernel. Starting without a token would put that on a port with no lock at all, so it refuses —
+/// and refuses *loudly*, because the failure mode of a quiet default is a server nobody knows is
+/// open.
+#[test]
+fn the_listener_will_not_start_without_a_token() {
+    let addr = format!("127.0.0.1:{}", free_port());
+    let out = Command::new(EXE)
+        .arg("--listen")
+        .arg(&addr)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env_remove("WINDBG_MCP_LISTEN_TOKEN")
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {EXE}: {e}"));
+    assert!(
+        !out.status.success(),
+        "the listener started with no token set"
+    );
+    let said = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        said.contains("WINDBG_MCP_LISTEN_TOKEN"),
+        "it has to name the variable that is missing, or nobody can act on it: {said}"
+    );
+}
+
+/// An unauthenticated caller is refused, told nothing about what is here — and costs the server
+/// nothing.
+///
+/// The last clause is the one worth a test. The bearer check runs *before* the tenancy gate, so a
+/// wrong token must not reserve, renew or consume a claim; if it did, anything that could reach
+/// the port could keep the real client locked out without ever authenticating.
+#[test]
+fn an_unauthenticated_request_is_refused_and_costs_the_server_nothing() {
+    let mut server = Listener::start(&[]);
+    let probe = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} });
+    for token in [None, Some("not-the-token"), Some("")] {
+        let reply = server.send("POST", token, None, Some(&probe));
+        assert_eq!(
+            reply.status, 401,
+            "a request with token {token:?} was not refused: {}",
+            reply.body
+        );
+        assert!(
+            !reply.body.contains("open_dump") && !reply.body.contains("jsonrpc"),
+            "a refusal must not describe what is here: {}",
+            reply.body
+        );
+    }
+    let session = server.initialize();
+    let status = server.tool(&session, "session_status", json!({}));
+    assert_eq!(
+        status["status"], "ok",
+        "the real client must still be able to take a server that only refused strangers: {status}"
+    );
+}
+
+/// One client at a time, refused with `409` rather than served alongside.
+///
+/// Not a policy choice so much as an admission: `session_id` handles are minted from one registry,
+/// `MAX_SESSIONS` is shared, and `end_session` ends whatever it is handed — so two clients would
+/// silently share, and one could end a target the other was using.
+#[test]
+fn a_second_client_is_refused_while_the_first_holds_the_server() {
+    let mut server = Listener::start(&[]);
+    let holder = server.initialize();
+
+    let intruder = server.call(None, "initialize", Listener::opening());
+    assert_eq!(
+        intruder.status, 409,
+        "a second client was not refused: {}",
+        intruder.body
+    );
+    assert!(
+        intruder.body.contains("one at a time"),
+        "the refusal has to say why, or it reads as a bug: {}",
+        intruder.body
+    );
+
+    // A session id that is not the holder's is refused on the same grounds — this is the arm that
+    // makes the refusal a rule about tenancy rather than about `initialize`.
+    let stranger = server.call(
+        Some("not-a-session-this-server-issued"),
+        "tools/list",
+        json!({}),
+    );
+    assert_eq!(
+        stranger.status, 409,
+        "a stranger's session id was served: {}",
+        stranger.body
+    );
+
+    // And the holder is undisturbed by either.
+    let status = server.tool(&holder, "session_status", json!({}));
+    assert_eq!(status["status"], "ok", "{status}");
+}
+
+/// Going quiet is not leaving; saying goodbye is.
+///
+/// The distinction is the whole reason a lease exists. Every request here is its own connection —
+/// which is what a client behind a tunnel looks like — so "the client is silent" is the resting
+/// state, and a server that treated silence as departure would hand the registry on between two
+/// calls of a working client.
+#[test]
+fn a_silence_is_not_a_departure_and_a_goodbye_is() {
+    let mut server = Listener::start(&[]);
+    let holder = server.initialize();
+
+    // Nothing is connected at this moment, and the holder still holds.
+    let too_early = server.call(None, "initialize", Listener::opening());
+    assert_eq!(
+        too_early.status, 409,
+        "silence was read as departure — a client between two calls would lose its targets: {}",
+        too_early.body
+    );
+
+    // Returning with the same id is served: the property stdio cannot offer, where a client
+    // restart costs a KDNET attach and a KDNET attach costs a reboot of the target.
+    let resumed = server.call(Some(&holder), "tools/list", json!({}));
+    assert_eq!(
+        resumed.status, 200,
+        "a returning client was not let back in: {}",
+        resumed.body
+    );
+
+    let farewell = server.goodbye(&holder);
+    assert!(
+        (200..300).contains(&farewell.status),
+        "the DELETE was refused ({}): {}",
+        farewell.status,
+        farewell.body
+    );
+
+    let next = server.initialize();
+    assert_ne!(next, holder, "the next client gets a session of its own");
+    let status = server.tool(&next, "session_status", json!({}));
+    assert_eq!(status["status"], "ok", "{status}");
 }
 
 // ---- tier 2: a real debugger target -------------------------------------------
@@ -3861,6 +4356,129 @@ fn a_kernel_attach_that_never_connects_costs_one_session_and_can_be_ended() {
         "end_session",
         json!({ "session_id": dump_session }),
         TARGET_STEP,
+    );
+}
+
+/// A lease that runs out releases what the absent client left, and the next client gets a clean
+/// server.
+///
+/// The claim the whole lease exists for, and the only one that costs a *target* when it is wrong.
+/// The unit tests in `src/listen.rs` settle the state machine; the fast listener tier settles the
+/// HTTP wiring. Neither can reach this, because it is the sweep meeting a real engine worker —
+/// which is where the stdio role's teardown lives and where the listener had nothing but a
+/// hand-run check against a guest.
+///
+/// **The target is a kernel attach nothing will answer**, deliberately. A parked attach is the
+/// worst case in one move: the session exists, it holds a worker, and its wait cannot be
+/// interrupted — so releasing it means terminating a process, not asking politely. A dump would
+/// prove the timer and not the teardown.
+///
+/// **The grace is 32 seconds because that is nearly the floor.** The listener refuses to start
+/// with a grace that could expire inside a call, and the bound is the call budget plus the time an
+/// engine worker takes to come up (30s). Shrinking the budget to a second is what makes the floor
+/// small enough to wait out; nothing here needs a longer one, since the attach is meant to park.
+#[test]
+fn a_lease_that_runs_out_releases_what_the_absent_client_left() {
+    if target_tier().is_none() {
+        return;
+    }
+    let mut server = Listener::start(&[
+        ("WINDBG_MCP_CALL_TIMEOUT_SECS", "1"),
+        ("WINDBG_MCP_LEASE_GRACE_SECS", "32"),
+    ]);
+    let client = server.initialize();
+
+    // Its own port, because these tests run in parallel and a KDNET attach takes a UDP port for
+    // the life of its session.
+    server.call(
+        Some(&client),
+        "tools/call",
+        json!({
+            "name": "attach_kernel",
+            "arguments": { "connection": "net:port=50009,key=1.1.1.1" },
+        }),
+    );
+
+    // Wait for the park rather than assuming a timing — and read it as a *state*, since the
+    // sentence describing one is rewritten whenever the advice changes.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let parked = loop {
+        let status = server.tool(&client, "session_status", json!({}));
+        let found = status["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|s| s["kind"] == "kernel" && s["state"]["state"] == "attaching")
+            .and_then(|s| s["session_id"].as_str().map(str::to_string));
+        if found.is_some() {
+            break found;
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    };
+    let Some(parked) = parked else {
+        // The attach failed outright instead of parking — most likely the UDP port was already
+        // taken on this host. Nothing to assert about a park that did not happen.
+        skip("attach_kernel did not reach the parked state (port 50009 busy?)");
+        return;
+    };
+    let worker = server.tool(&client, "session_status", json!({ "session_id": parked }))["sessions"]
+        [0]["engine_pid"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the parked session reports no engine pid"))
+        as u32;
+    assert!(
+        process_alive(worker),
+        "the parked engine worker (pid {worker}) should be running before the lease expires"
+    );
+
+    // And now the client vanishes: no goodbye, no requests. **Nothing below may speak to the
+    // server** — every admitted request renews the lease, so a test that polled over HTTP would
+    // hold the lease open for as long as it watched. The log is the one channel that costs
+    // nothing.
+    assert!(
+        server.wait_for_stderr(
+            "a client's lease ran out; releasing the sessions it left open",
+            Duration::from_secs(120),
+        ),
+        "the lease never expired — a client that vanished would hold this target for ever\n\
+         --- stderr ---\n{}",
+        server.stderr()
+    );
+
+    // The half that matters: the worker is gone. `release_leased` is `shutdown` without closing
+    // the registry, so a parked attach ends the only way it can — its process terminated.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while process_alive(worker) {
+        assert!(
+            Instant::now() < deadline,
+            "the lease expired but the parked engine worker (pid {worker}) is still running\n\
+             --- stderr ---\n{}",
+            server.stderr()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    // The old session id is not honoured after the sweep closed it. Without this the service
+    // would keep it resident and every reconnect cycle would leave another behind.
+    let stale = server.call(Some(&client), "tools/list", json!({}));
+    assert_ne!(
+        stale.status, 200,
+        "a session the sweep closed was still served: {}",
+        stale.body
+    );
+
+    // And the server is takeable again, with nothing left over. Both halves: a lease that
+    // released the sessions but stayed `releasing` would refuse every client for ever, and one
+    // that handed over sessions it had just closed would be worse.
+    let next = server.initialize();
+    assert_ne!(next, client);
+    let status = server.tool(&next, "session_status", json!({}));
+    assert!(
+        status["sessions"].as_array().is_none_or(Vec::is_empty),
+        "the next client inherited a session the sweep should have released: {status}"
     );
 }
 
