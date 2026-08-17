@@ -445,8 +445,20 @@ passed through untouched, so `com:port=COM1,baud=115200` is as valid as a `net:`
 only option on a hypervisor whose guests have no KDNET-capable NIC (Parallels on Apple Silicon
 presents VirtIO, and `1AF4` is not in the Debugging Tools' `VerifiedNICList.xml`). Two assertions
 are **transport-specific and skip themselves** rather than failing: the KD endpoint being owned by
-the worker process is a UDP claim, and the key-redaction claim needs a key to look for. A serial run
-says so in its output; it does not pass quietly.
+the worker process is a UDP claim, and the key-redaction claim needs a key to look for.
+
+**Nor does the target have to be x64** — but two of the eight tests need one. The pool tools
+document it (*"Needs a broken-in x64 kernel target"*) because the walker decodes x64 pool
+descriptors, so `a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable` and
+`a_live_kernel_batch_step_can_ask_the_pool_about_a_captured_pointer` stand down against anything
+else. The architecture is read from the target's own `vertarget`, not from `cfg!(target_arch)`: what
+decides it is the target, and the debugger host is routinely a different machine of a different
+shape. Everything skipped here says so in the output rather than passing quietly.
+
+One caveat that is not a gate, because it is a property of a particular wire rather than of the
+tests: **a pool walk over a 115200-baud serial link will not finish inside any sane budget** — it
+reads every committed pool page. If you point the tier at a serial target, expect those two to time
+out rather than to skip, unless the target is also non-x64 and stands down first.
 
 `--test-threads=1` is required, not tidiness: the filter matches **eight** tests, and the KD
 transport is single-owner. Run them in parallel and the later attaches fail, which can leave the
