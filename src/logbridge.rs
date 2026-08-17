@@ -366,6 +366,17 @@ pub fn run_worker_writer(mut send: impl FnMut(Entry, u32) -> bool) {
     WRITER_GONE.store(true, Ordering::Relaxed);
 }
 
+/// Serializes taking the drop count with the insertion that carries it.
+///
+/// Not for the counter's sake — the atomics are sound on their own — but for *where the gap is
+/// reported*. Take and insert are two steps, so without this one thread can take a run of drops,
+/// be descheduled, and have another thread enqueue the true first-record-after-the-gap carrying
+/// zero; the marker then lands a record or two late. A lock is affordable precisely because
+/// nothing under it can wait: an atomic swap, a **non-blocking** `try_send`, an atomic add. There
+/// is no I/O in the critical section, and the log-writer thread never enters it (it is muted), so
+/// it cannot be held against the thread that drains it.
+static HANDOFF: Mutex<()> = Mutex::new(());
+
 /// Queues one record, carrying however many were dropped since the last one that got through.
 /// `false` when the queue would not take it, which is itself a drop.
 ///
@@ -373,6 +384,7 @@ pub fn run_worker_writer(mut send: impl FnMut(Entry, u32) -> bool) {
 /// subtracted afterwards: two threads reading the same count would each attach it, and the second
 /// subtraction would wrap the counter past zero into a very large number of imaginary drops.
 fn enqueue(queue: Option<&SyncSender<(Entry, u32)>>, entry: Entry) -> bool {
+    let _in_order = HANDOFF.lock().unwrap_or_else(|e| e.into_inner());
     let carried = DROPPED.swap(0, Ordering::Relaxed);
     let queued = match queue {
         Some(queue) => queue.try_send((entry, carried)).is_ok(),
@@ -387,6 +399,16 @@ fn enqueue(queue: Option<&SyncSender<(Entry, u32)>>, entry: Entry) -> bool {
     queued
 }
 
+/// Takes whatever drops are outstanding, so the caller can report them itself.
+///
+/// Under [`HANDOFF`] like every other transfer of this count: without it, a record being enqueued
+/// concurrently could carry a run this has already taken, and the same drops would be reported
+/// twice.
+fn take_unreported_drops() -> u32 {
+    let _in_order = HANDOFF.lock().unwrap_or_else(|e| e.into_inner());
+    DROPPED.swap(0, Ordering::Relaxed)
+}
+
 /// Waits, up to `within`, for the writer to have mirrored everything queued so far.
 ///
 /// Called by a worker on its way out. Without it the records that matter most are the ones most
@@ -396,7 +418,7 @@ pub fn flush(within: std::time::Duration) {
     // A run of drops is carried by the *next* record to get through, and at exit there may not be
     // one — so this is that record. Taken first, so the count is in the text even if the queue will
     // not take this one either: stderr has it regardless, which is the fallback everywhere here.
-    let unreported = DROPPED.swap(0, Ordering::Relaxed);
+    let unreported = take_unreported_drops();
     if unreported > 0 {
         tracing::warn!(
             "worker: {unreported} log record(s) were dropped and this process is exiting, so \
@@ -514,6 +536,10 @@ impl Visit for Rendered {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The drop counter is process-wide, and two tests below drive it. `cargo test` runs them on
+    /// different threads, so they take turns here rather than reading each other's arithmetic.
+    static COUNTER_TESTS: Mutex<()> = Mutex::new(());
 
     /// A ring of its own, so nothing here depends on the process-wide one — these tests run in
     /// one process alongside everything else in this crate that logs. It is the *same* type with
@@ -711,6 +737,7 @@ mod tests {
     /// the arithmetic small enough to state.
     #[test]
     fn a_dropped_run_is_carried_by_the_record_that_follows_it() {
+        let _mine = COUNTER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
         let (tx, rx) = sync_channel::<(Entry, u32)>(2);
         DROPPED.store(0, Ordering::Relaxed);
         let record = |message: &str| Entry {
@@ -753,6 +780,81 @@ mod tests {
         assert_eq!(
             carried, 3,
             "the three that were lost, reported where they were lost"
+        );
+    }
+
+    /// Under concurrency, every record is either delivered or counted — never both, and never
+    /// neither.
+    ///
+    /// This is the invariant the drop count is *for*, and the one a race would break in the way
+    /// that matters: a double-counted run reports a gap that did not happen, and a lost one reports
+    /// silence where records went missing. Placement can only ever be best-effort — the drops are
+    /// discovered by whoever is refused next — but conservation is exact, and it is what makes the
+    /// number in the marker worth printing.
+    ///
+    /// Driven from several threads against a queue too small for them, which is the only state in
+    /// which any of this arithmetic runs at all.
+    #[test]
+    fn no_record_is_lost_or_counted_twice_when_threads_log_at_once() {
+        const THREADS: usize = 8;
+        const EACH: usize = 250;
+        // Small enough that most attempts are refused, which is the arithmetic under test.
+        let _mine = COUNTER_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = sync_channel::<(Entry, u32)>(4);
+        DROPPED.store(0, Ordering::Relaxed);
+
+        // Drains as the writers work, so slots keep freeing and the full/not-full boundary is
+        // crossed constantly rather than once.
+        let drained = std::thread::spawn(move || {
+            let mut received = 0u64;
+            let mut reported = 0u64;
+            while let Ok((_, carried)) = rx.recv() {
+                received += 1;
+                reported += u64::from(carried);
+            }
+            (received, reported)
+        });
+
+        let writers: Vec<_> = (0..THREADS)
+            .map(|thread| {
+                let tx = tx.clone();
+                std::thread::spawn(move || {
+                    for n in 0..EACH {
+                        enqueue(
+                            Some(&tx),
+                            Entry {
+                                seq: 0,
+                                at_ms: 1_700_000_000_000,
+                                level: Level::Info,
+                                target: "windbg_mcp::test".to_string(),
+                                session: None,
+                                message: format!("thread {thread} record {n}"),
+                            },
+                        );
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().expect("a writer finished");
+        }
+        // The last sender, so the drain ends.
+        drop(tx);
+        let (received, reported) = drained.join().expect("the drain finished");
+        let outstanding = u64::from(take_unreported_drops());
+
+        assert_eq!(
+            received + reported + outstanding,
+            (THREADS * EACH) as u64,
+            "every record made must be delivered, reported as dropped, or still awaiting a report \
+             — {received} delivered + {reported} reported + {outstanding} outstanding is not \
+             {} made",
+            THREADS * EACH
+        );
+        assert!(
+            reported + outstanding > 0,
+            "a queue of 4 against {THREADS} threads must have refused something, or this test is \
+             asserting conservation over a path it never took"
         );
     }
 
