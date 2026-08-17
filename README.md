@@ -117,7 +117,9 @@ cargo build --release
 
 `cargo test` covers the unit tests plus an end-to-end smoke test that drives the built binary over
 stdio. Run it after a dependency bump or an MCP spec revision — see
-[`docs/smoke-test.md`](docs/smoke-test.md).
+[`docs/smoke-test.md`](docs/smoke-test.md). It also budgets what the tool surface and each result
+cost the model driving them, which a schema change can move without breaking anything —
+[`docs/token-budget.md`](docs/token-budget.md).
 
 ### Install with Scoop
 
@@ -665,6 +667,12 @@ Two conventions hold across all of them:
   or a traversal cap — more time changes nothing). Counts from anything but `complete` are floors,
   not totals. A walk that failed outright, or was stopped by `interrupt`, is not a coverage state at
   all: it is the error branch below, with category `debugger` or `interrupted`.
+
+One caveat about "also", measured rather than assumed: a client that understands
+`structuredContent` generally forwards **it** to the model and drops the text block, rather than
+sending both. So for the tools above, the typed answer is what a model reads and the rendering is
+what a program-with-a-terminal reads — they are two audiences, not one audience twice.
+[`docs/token-budget.md`](docs/token-budget.md) has the measurements, and what they cost.
 
 ### Error reporting
 

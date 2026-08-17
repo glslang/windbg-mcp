@@ -384,6 +384,19 @@ and inherited across the spawn, so a mistake there is not a compile error: the w
 a usable channel, or comes up and is never heard from, and either way every test here that opens a
 target fails on the open. Run it after touching `engine::spawn_worker` or `worker::run`.
 
+## What it costs the caller
+
+Two tests measure size rather than behaviour: `tool_surface_stays_within_its_token_budget`
+(protocol tier) and `tool_results_stay_within_their_budget` (debugger tier). They exist because a
+dependency bump or a widened schema can move what this server spends of the *model's* context
+without breaking a single assertion — `schemars` inlining one more shared type across 31 output
+schemas is tens of kilobytes and no test failure.
+
+Both print their numbers on a green run, and the surface one is pinned in
+`tests/golden/tool_budget.json`, re-recorded by the same `UPDATE_GOLDEN=1` as the shape golden
+beside it. Read the diff; it is the only place the price of a reworded description shows up. See
+[`token-budget.md`](./token-budget.md) for the baseline, the ceilings and how to raise one.
+
 ## When to run it
 
 ### A dependency moved

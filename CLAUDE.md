@@ -96,7 +96,16 @@ build differs only in optimization and is exercised by CI on a fresh runner.
 `cargo test` includes `tests/mcp_smoke.rs`, which spawns the **dev** binary (via
 `CARGO_BIN_EXE_windbg-mcp`) and drives it over stdio — so it is also clear of the release lock.
 After a dependency bump (`rmcp`, `schemars`, `tokio`, `cargo update -p win-kexp`) or an MCP spec
-revision, run it and follow [`docs/smoke-test.md`](./docs/smoke-test.md). To include the tier that
+revision, run it and follow [`docs/smoke-test.md`](./docs/smoke-test.md).
+
+Two of its tests budget **what this server costs the model driving it** — the tool surface, which is
+paid once per conversation, and each result, which is paid every call. Both are recorded in
+`tests/golden/tool_budget.json` and re-recorded with the same `UPDATE_GOLDEN=1 cargo test --test
+mcp_smoke` as the shape golden beside it; read the diff rather than rubber-stamping it, because it
+is the only place the price of a reworded description or a widened schema is visible.
+[`docs/token-budget.md`](./docs/token-budget.md) has the baseline and what it exposed — including
+the two client behaviours it settled by measurement: `outputSchema` never reaches the model, and
+`structuredContent` *replaces* the text block rather than accompanying it. To include the tier that
 opens the sample dump through DbgEng, set the gate first (PowerShell, not `VAR=1 cmd`):
 
 ```pwsh
