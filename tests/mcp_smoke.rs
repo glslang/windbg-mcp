@@ -5469,6 +5469,40 @@ fn a_kdnet_connection_string_yields_its_port() {
     assert_eq!(kdnet_port("net:key=1.1.1.1"), None);
 }
 
+/// Whether a `registers` dump shows a thread context at all.
+///
+/// The instruction pointer is the marker, and **its name is architectural**: `rip` on x64, `pc` on
+/// ARM64. Matching one spelling made this a test of the debugger *host's* architecture rather than
+/// of the debugger, and that is exactly how it failed — against a live ARM64 kernel it rejected a
+/// perfectly good `x0`–`x30`/`fp`/`lr`/`sp`/`pc` context, stopped at `nt!DbgBreakPointWithStatus`.
+/// Same family as [#142](https://github.com/glslang/windbg-mcp/issues/142), which found the
+/// x64 assumptions in the *dump* tier; this one survived because the live tier had only ever been
+/// pointed at an x64 KDNET target.
+///
+/// Deliberately not a list of every register: what is being asserted is "there is a context here",
+/// and the program counter is the one register every architecture has.
+fn has_thread_context(registers: &str) -> bool {
+    registers.contains("rip=") || registers.contains("pc=")
+}
+
+/// Pinned in the default tier for the same reason as the port parser above: the assertion it feeds
+/// lives in a tier that needs a kernel on the other end of a wire, so a spelling quietly dropped
+/// here would not be noticed until someone had one.
+#[test]
+fn a_thread_context_is_recognised_on_either_architecture() {
+    assert!(has_thread_context(
+        "rax=0000000000000001 rip=fffff80012345678"
+    ));
+    assert!(has_thread_context(
+        " fp=fffff8003d7c2740   lr=fffff8004205cb24   sp=fffff8003d7c2740\n \
+         pc=fffff80042001370  psr=80000344 N--- EL1"
+    ));
+    // A dump with no context at all, and one whose other registers must not stand in for the
+    // program counter — `psr` on ARM64 is the near miss.
+    assert!(!has_thread_context("Unable to get current machine context"));
+    assert!(!has_thread_context("psr=80000344 N--- EL1"));
+}
+
 /// `System Uptime` out of `.time` output, e.g. `0 days 0:05:31.599`.
 ///
 /// A halted kernel's uptime does not advance — no CPU is running to take the clock interrupt — so
@@ -5614,7 +5648,7 @@ fn a_live_kernel_session_attaches_coexists_and_detaches_cleanly() {
         let registers =
             server.tool_text("registers", json!({ "session_id": session }), TARGET_STEP);
         assert!(
-            registers.contains("rip="),
+            has_thread_context(&registers),
             "a broken-in kernel should have a thread context:\n{registers}"
         );
 
@@ -5640,7 +5674,7 @@ fn a_live_kernel_session_attaches_coexists_and_detaches_cleanly() {
         let after_refusal =
             server.tool_text("registers", json!({ "session_id": session }), TARGET_STEP);
         assert!(
-            after_refusal.contains("rip="),
+            has_thread_context(&after_refusal),
             "the session must survive a triage that had nothing to triage:\n{after_refusal}"
         );
 
@@ -5694,36 +5728,45 @@ fn a_live_kernel_session_attaches_coexists_and_detaches_cleanly() {
 
     // The redaction claim, against a real attach. Last, so a failure here can never be the reason
     // a machine is left halted — the detach above has already run.
-    let key = connection
-        .split("key=")
-        .nth(1)
-        .and_then(|rest| rest.split(',').next())
-        .unwrap_or_default();
-    assert!(
-        key.len() >= 4,
-        "this connection has no `key=` to look for, so the assertion below would pass on nothing"
-    );
     let raw = std::fs::read_to_string(&transcript)
         .unwrap_or_else(|e| panic!("no transcript at {}: {e}", transcript.display()));
-    // Deliberately *not* printing the file on failure: it would put the key in the test output,
-    // which is the thing being checked. The path is enough to go and look.
-    assert!(
-        !raw.contains(key),
-        "the supplied KD key reached the transcript of a landed attach ({})",
-        transcript.display()
-    );
-    assert!(
-        raw.contains("<redacted>"),
-        "nothing in the transcript was masked, so the check above proves nothing ({})",
-        transcript.display()
-    );
-    // And the session really is in there — otherwise a transcript that recorded nothing would
-    // satisfy both assertions above.
+    // First, unconditionally: the session really is in there. Otherwise everything below would be
+    // satisfied by a transcript that recorded nothing at all.
     assert!(
         raw.contains("\"event\":\"session_open\"") && raw.contains("\"kind\":\"kernel target\""),
         "the transcript has no record of the kernel session it was recording ({})",
         transcript.display()
     );
+    let key = connection
+        .split("key=")
+        .nth(1)
+        .and_then(|rest| rest.split(',').next())
+        .unwrap_or_default();
+    // Conditional for the same reason the UDP-ownership check above is: the claim belongs to the
+    // *transport*, not to this tier. A KD key is a KDNET thing, and a serial target
+    // (`com:port=COM1,baud=115200`) carries no secret at all — so there is nothing for the
+    // transcript to redact, and demanding a `<redacted>` marker would fail a target that is
+    // behaving perfectly. Keyless is announced rather than skipped silently, so a `net:` run that
+    // somehow lost its key cannot pass by taking this branch.
+    if key.len() < 4 {
+        println!(
+            "NOTE: this connection carries no `key=`, so the redaction claim is not exercised — \
+             that check needs a KDNET target"
+        );
+    } else {
+        // Deliberately *not* printing the file on failure: it would put the key in the test
+        // output, which is the thing being checked. The path is enough to go and look.
+        assert!(
+            !raw.contains(key),
+            "the supplied KD key reached the transcript of a landed attach ({})",
+            transcript.display()
+        );
+        assert!(
+            raw.contains("<redacted>"),
+            "nothing in the transcript was masked, so the check above proves nothing ({})",
+            transcript.display()
+        );
+    }
     let _ = std::fs::remove_file(&transcript);
     println!("live kernel session detached cleanly:\n{ended_text}");
 }

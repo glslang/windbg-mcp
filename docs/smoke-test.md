@@ -23,7 +23,7 @@ adding the debugger tier takes it to ~40s, almost all of it one test waiting out
 | **Protocol** | always | no debugger, no target, and no network off this machine — it does bind a loopback port for the listener | transport, revision negotiation, tool-surface drift, and the listener's lease up to the point a session is opened |
 | **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump | `win-kexp` / DbgEng regressions, and a lease expiry releasing a real engine worker |
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
-| **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a KDNET target you can freeze | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
+| **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a live kernel target you can freeze — KDNET, or serial | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
 | **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
 | **Live (other)** | manual | TTD engine, elevation, a test driver | see [Manual checklist](#manual-checklist) |
 
@@ -431,14 +431,22 @@ the two agree across the pipe, which is the part neither module can prove alone.
 
 ## The live-kernel tier
 
-The only tier that touches another machine, and the last thing to run. It needs a KDNET target you
-are willing to freeze for the duration, booted with debugging enabled and dialling *this* host —
-see the KDNET gotchas in [`CLAUDE.md`](../CLAUDE.md) before diagnosing a failure.
+The only tier that touches another machine, and the last thing to run. It needs a live kernel target
+you are willing to freeze for the duration, booted with debugging enabled — see the KDNET gotchas in
+[`CLAUDE.md`](../CLAUDE.md) before diagnosing a failure.
 
 ```pwsh
 $env:WINDBG_MCP_SMOKE_KERNEL = "net:port=50000,key=<w.x.y.z>"
 cargo test --test mcp_smoke -- --ignored --nocapture --test-threads=1 live_kernel
 ```
+
+**The transport does not have to be KDNET.** The variable is a DbgEng connection string and is
+passed through untouched, so `com:port=COM1,baud=115200` is as valid as a `net:` one — which is the
+only option on a hypervisor whose guests have no KDNET-capable NIC (Parallels on Apple Silicon
+presents VirtIO, and `1AF4` is not in the Debugging Tools' `VerifiedNICList.xml`). Two assertions
+are **transport-specific and skip themselves** rather than failing: the KD endpoint being owned by
+the worker process is a UDP claim, and the key-redaction claim needs a key to look for. A serial run
+says so in its output; it does not pass quietly.
 
 `--test-threads=1` is required, not tidiness: the filter matches **eight** tests, and the KD
 transport is single-owner. Run them in parallel and the later attaches fail, which can leave the
