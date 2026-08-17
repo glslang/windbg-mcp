@@ -79,6 +79,11 @@ const SUPPORTED_REVISIONS: &[&str] = &[
 const FALLBACK_REVISION: &str = "2025-11-25";
 
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/tools_list.json");
+/// Companion to [`GOLDEN`], and deliberately the thing it is blind to. That one digests the tool
+/// surface down to its *shape* — `digest_tool` drops every `description` on purpose — which is
+/// what makes it readable, and what makes it unable to see the bytes. This one records only
+/// sizes. See `docs/token-budget.md`.
+const BUDGET_GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/tool_budget.json");
 const SAMPLE_DUMP: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/docs/samples/052126-34312-01.dmp"
@@ -969,18 +974,31 @@ fn tools_list_matches_the_recorded_wire_surface() {
         .clone();
 
     let actual = digest_tool_list(&tools);
-    let rendered = format!("{}\n", serde_json::to_string_pretty(&actual).unwrap());
+    assert_golden(GOLDEN, &actual, "the tools/list wire surface");
+}
+
+/// Compare a rendered snapshot against its golden file, or re-record it when `UPDATE_GOLDEN` is
+/// set, failing with a line diff that names what moved.
+///
+/// Shared by the two goldens in this file so one command records both and one differ explains
+/// both. Splitting the renderer out matters more than it looks: the budget golden below is a wall
+/// of numbers, and a failure that dumped two of those blobs side by side would be unreadable in a
+/// CI log — the line diff is what makes it say "this tool, this many bytes more".
+fn assert_golden(path: &str, actual: &Value, what: &str) {
+    let rendered = format!("{}\n", serde_json::to_string_pretty(actual).unwrap());
 
     if std::env::var_os("UPDATE_GOLDEN").is_some() {
-        std::fs::create_dir_all(std::path::Path::new(GOLDEN).parent().unwrap())
+        std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap())
             .expect("create golden dir");
-        std::fs::write(GOLDEN, &rendered).expect("write golden");
-        eprintln!("re-recorded {GOLDEN}");
+        std::fs::write(path, &rendered).expect("write golden");
+        eprintln!("re-recorded {path}");
         return;
     }
 
-    let expected = std::fs::read_to_string(GOLDEN).unwrap_or_else(|e| {
-        panic!("cannot read {GOLDEN}: {e}\nrecord it with `UPDATE_GOLDEN=1 cargo test --test mcp_smoke`")
+    let expected = std::fs::read_to_string(path).unwrap_or_else(|e| {
+        panic!(
+            "cannot read {path}: {e}\nrecord it with `UPDATE_GOLDEN=1 cargo test --test mcp_smoke`"
+        )
     });
     if rendered.replace("\r\n", "\n") == expected.replace("\r\n", "\n") {
         return;
@@ -1006,10 +1024,184 @@ fn tools_list_matches_the_recorded_wire_surface() {
         }
     }
     panic!(
-        "the tools/list wire surface changed:\n{diff}\n\
+        "{what} changed:\n{diff}\n\
          If this is intended, re-record with `UPDATE_GOLDEN=1 cargo test --test mcp_smoke` \
          and review the diff."
     );
+}
+
+// ---- what the surface costs its caller ----------------------------------------
+//
+// Every other assertion in this file is about whether the server is *correct*. These are about
+// what it *costs*, which nothing here measured before: a client pays for the whole tool surface
+// at the start of every conversation, and then for each result, out of the same context window
+// the debugging itself has to fit in. `docs/token-budget.md` has the findings; this is the part
+// that keeps them from drifting unnoticed.
+
+/// Bytes a value occupies as minified JSON — the unit every budget here is counted in.
+///
+/// Bytes, not tokens, and deliberately. No tokenizer exists in this crate's dependency tree, a
+/// real one would pull in BPE data to produce a figure that varies by model, and the golden would
+/// then churn on a tokenizer bump rather than on a change to this server. Bytes are
+/// deterministic, diff cleanly, and move with tokens for a fixed content style.
+/// `docs/token-budget.md` records the ≈4 bytes/token convention used when quoting these as tokens.
+fn json_bytes(value: &Value) -> usize {
+    serde_json::to_string(value)
+        .expect("a value read off the wire re-serializes")
+        .len()
+}
+
+/// The part of a tool definition that reaches the **model**.
+///
+/// `outputSchema` and `annotations` are not in it: the Anthropic tool spec carries name,
+/// description and input schema, and the rest of a `tools/list` entry is the client's own
+/// business — validation, display — never spent on a context window. That split is why this
+/// report has two totals instead of one, and it is not a detail: ~80% of what this server puts on
+/// the wire is `outputSchema`, and none of it is read by a model. Optimising the two halves means
+/// optimising for different things, so conflating them would point any future work at the wrong
+/// 280 KB.
+fn model_visible_bytes(tool: &Value) -> usize {
+    json_bytes(&json!({
+        "name": tool["name"],
+        "description": tool["description"],
+        "inputSchema": tool["inputSchema"],
+    }))
+}
+
+/// Bytes of one field of a tool definition, or 0 when the tool does not carry it.
+fn field_bytes(tool: &Value, field: &str) -> usize {
+    match tool.get(field) {
+        None | Some(Value::Null) => 0,
+        Some(value) => json_bytes(value),
+    }
+}
+
+/// The per-tool size table.
+///
+/// Ordered **by name**, which is worth stating because the obvious choice is worse: sorting by
+/// cost makes the golden read as a ranking, and then a tool that grows moves up it and shifts
+/// every row below, so the diff cascades through a dozen untouched tools instead of naming the one
+/// that changed. A stable key is what makes the failure legible. The ranking is not lost — the
+/// totals carry the worst tool by name.
+fn budget_report(tools: &[Value], instructions: &str) -> Value {
+    let mut rows: Vec<Value> = tools
+        .iter()
+        .map(|tool| {
+            json!({
+                "name": tool["name"],
+                "modelVisible": model_visible_bytes(tool),
+                "wire": json_bytes(tool),
+                "description": field_bytes(tool, "description"),
+                "inputSchema": field_bytes(tool, "inputSchema"),
+                "outputSchema": field_bytes(tool, "outputSchema"),
+                "annotations": field_bytes(tool, "annotations"),
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+
+    let sum = |field: &str| -> u64 { rows.iter().filter_map(|r| r[field].as_u64()).sum() };
+    let worst = rows
+        .iter()
+        .max_by_key(|row| row["modelVisible"].as_u64().unwrap_or(0))
+        .expect("tools/list is never empty");
+    json!({
+        "totals": {
+            "tools": rows.len(),
+            "modelVisible": sum("modelVisible"),
+            "wire": sum("wire"),
+            "description": sum("description"),
+            "inputSchema": sum("inputSchema"),
+            "outputSchema": sum("outputSchema"),
+            "annotations": sum("annotations"),
+            "instructions": instructions.len(),
+            "worstTool": worst["name"],
+            "worstToolModelVisible": worst["modelVisible"],
+        },
+        "tools": rows,
+    })
+}
+
+/// Ceiling on the tool surface a model is given before it has asked anything. 66,078 bytes across
+/// 51 tools today (~16k tokens), +15% headroom — sized so that rewording a description passes and
+/// a new tool arriving with a `debug_batch`-scale schema does not.
+const MODEL_VISIBLE_CEILING: usize = 76_000;
+
+/// Ceiling on the whole `tools/list` payload. 358,533 bytes today, ~80% of it `outputSchema` that
+/// no model reads — which is why this is a separate, much looser number rather than a scaled
+/// version of the one above. It is a client-side parse and memory cost, and it is the one that
+/// grows silently: `schemars` inlines `$defs` per tool, so adding one shared type to one more
+/// output shape can add tens of kilobytes here while [`MODEL_VISIBLE_CEILING`] does not move.
+const WIRE_CEILING: usize = 412_000;
+
+/// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 9,757
+/// bytes, because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary from
+/// `src/batch.rs`. A tool costing more than this is not necessarily wrong, but it should be a
+/// decision somebody made rather than a schema that grew.
+const WORST_TOOL_CEILING: usize = 11_200;
+
+/// What the tool surface costs a caller, pinned per tool.
+///
+/// Two mechanisms, because they fail on different things and neither covers the other:
+///
+/// * The **golden** shows *where* the bytes are. Any change to any tool's size lands as a
+///   readable diff, so the price of a reworded description is visible in review rather than
+///   discovered later.
+/// * The **ceilings** stop what the golden cannot: a golden re-recorded on every diff is a rubber
+///   stamp, and thirty accepted +2% changes are a doubling nobody ever voted for.
+///
+/// The numbers themselves are recorded, not argued for — this test exists so that changing them
+/// is a deliberate act, not so that today's figures are correct.
+#[test]
+fn tool_surface_stays_within_its_token_budget() {
+    let mut server = Server::spawn();
+    let initialized = server.initialize(SUPPORTED_REVISIONS[0]);
+    let instructions = initialized["instructions"].as_str().unwrap_or_default();
+
+    let response = server.request("tools/list", json!({}), STEP);
+    assert_no_error(&response, "tools/list");
+    let tools = response["result"]["tools"]
+        .as_array()
+        .expect("tools/list returns an array")
+        .clone();
+
+    let report = budget_report(&tools, instructions);
+    let totals = &report["totals"];
+    let model_visible = totals["modelVisible"].as_u64().unwrap() as usize;
+    let wire = totals["wire"].as_u64().unwrap() as usize;
+
+    // Print unconditionally: on a green run this is the only place the numbers are visible, and a
+    // budget nobody ever sees is a budget nobody maintains.
+    eprintln!(
+        "tool surface: {} tools, {model_visible} B to the model (ceiling {MODEL_VISIBLE_CEILING}), \
+         {wire} B on the wire (ceiling {WIRE_CEILING}), instructions {} B",
+        totals["tools"], totals["instructions"],
+    );
+
+    let worst = totals["worstTool"].as_str().unwrap_or("?").to_string();
+    let worst_bytes = totals["worstToolModelVisible"].as_u64().unwrap() as usize;
+
+    assert!(
+        model_visible <= MODEL_VISIBLE_CEILING,
+        "the tool surface now costs {model_visible} B of model context, over its \
+         {MODEL_VISIBLE_CEILING} B ceiling. That is paid at the start of every conversation, \
+         before anything is debugged. The worst single tool is `{worst}` at {worst_bytes} B. \
+         Trim a description or an input schema, or raise the ceiling deliberately and say why \
+         in docs/token-budget.md."
+    );
+    assert!(
+        wire <= WIRE_CEILING,
+        "tools/list is now {wire} B, over its {WIRE_CEILING} B ceiling. This is mostly \
+         outputSchema, which no model reads — check whether a shared type just got inlined into \
+         another tool's $defs before raising the ceiling."
+    );
+    assert!(
+        worst_bytes <= WORST_TOOL_CEILING,
+        "`{worst}` alone costs {worst_bytes} B of model context, over the {WORST_TOOL_CEILING} B \
+         per-tool ceiling."
+    );
+
+    assert_golden(BUDGET_GOLDEN, &report, "the tools/list token budget");
 }
 
 /// Clients validate arguments against these schemas before ever calling. A `$ref` that points
@@ -2859,6 +3051,109 @@ fn an_open_summarises_the_target_instead_of_listing_its_modules() {
         "the text says it too, and points at the tool that reads the rest:\n{report}"
     );
     assert!(report.contains("crash_triage"), "{report}");
+}
+
+/// What one call costs the caller, per tool, against the checked-in dump.
+///
+/// The tool surface above is paid once a conversation; this is paid every time, and it is the
+/// larger number in practice — a single `modules` on this dump is ~54 KB, roughly a fifth of a
+/// whole tool surface, for one question. The test that precedes this one already defends the
+/// principle for openers (#105: an open summarises rather than lists); this generalises it to a
+/// recorded figure per tool.
+///
+/// **Not a golden.** Result sizes move with what the runner can resolve — a symbol server that
+/// answers turns `deferred` into paths, and `lm` grows a column — so exact bytes would be flaky in
+/// the one tier that runs on two architectures. Ceilings with real headroom catch the regression
+/// that matters (a tool that starts returning an order of magnitude more) without pinning a number
+/// the environment owns.
+///
+/// Sizes are counted as **model-visible** bytes, which is `structuredContent` when a tool has one
+/// and the text otherwise — a client that understands structured results forwards that and drops
+/// the rendering. That is why `registers` is measured at ~9.8 KB and not at the 600 bytes of `r`
+/// output it also sends: the compact half is the one nobody reads.
+#[test]
+fn tool_results_stay_within_their_budget() {
+    let Some(dump) = target_tier() else { return };
+    let mut server = Server::started();
+
+    // Ceilings are ~35% over what this dump produces today — looser than the surface budget above,
+    // because these numbers depend on the target and on what symbols resolve, where that one
+    // depends only on this crate's own source.
+    //
+    // Only calls that succeed on a *kernel* dump are listed. `threads` is deliberately absent: `~`
+    // is a user-mode question and answers with a tool error here, which would measure the size of
+    // a failure.
+    let budgets: &[(&str, Value, usize)] = &[
+        ("open_dump", json!({ "path": dump }), 2_000),
+        ("session_status", json!({}), 600),
+        ("crash_triage", json!({}), 6_000),
+        ("registers", json!({}), 13_500),
+        ("backtrace", json!({}), 4_000),
+        ("modules", json!({}), 73_000),
+        ("execute", json!({ "command": "lm" }), 27_000),
+    ];
+
+    let mut rows = Vec::new();
+    for (tool, args, ceiling) in budgets {
+        let response = server.call_tool(tool, args.clone(), TARGET_STEP);
+        assert_no_error(&response, &format!("tools/call {tool}"));
+        let result = &response["result"];
+        assert!(
+            !is_tool_error(&response),
+            "`{tool}` reported a tool error, so its size would measure a failure:\n{}",
+            text_of(result)
+        );
+
+        let text = text_of(result).len();
+        let structured = match &result["structuredContent"] {
+            Value::Null => None,
+            value => Some(json_bytes(value)),
+        };
+        let model = structured.unwrap_or(text);
+        rows.push((*tool, model, text, structured, *ceiling));
+
+        assert!(
+            model <= *ceiling,
+            "`{tool}` answered with {model} B of model context, over its {ceiling} B budget. \
+             Either it started returning more than it used to, or the budget needs raising with \
+             a reason recorded in docs/token-budget.md."
+        );
+    }
+
+    // The table is the deliverable on a green run — the assertions only fire when something has
+    // already gone wrong, and a budget nobody ever sees is a budget nobody maintains.
+    eprintln!("\n  model     text  struct  ratio  ceiling  tool");
+    for (tool, model, text, structured, ceiling) in &rows {
+        let (shown, ratio) = match structured {
+            Some(bytes) if *text > 0 => (
+                bytes.to_string(),
+                format!("{:.1}x", *bytes as f64 / *text as f64),
+            ),
+            Some(bytes) => (bytes.to_string(), "-".to_string()),
+            None => ("-".to_string(), "-".to_string()),
+        };
+        eprintln!("{model:7} {text:8} {shown:>7} {ratio:>6} {ceiling:8}  {tool}");
+    }
+
+    // A rule rather than a number, and the one regression class the byte budgets cannot state: a
+    // typed answer is supposed to be the *facts* behind a rendering, so it being many times the
+    // size of that rendering means it is carrying scaffolding instead — `"kind":"int"` and
+    // `"subregister":false` on every row. `registers` is ~16x today and is named in
+    // docs/token-budget.md rather than fixed here; this catches the *next* one, not that one.
+    const WORST_STRUCTURED_RATIO: f64 = 20.0;
+    for (tool, _, text, structured, _) in &rows {
+        let (Some(bytes), true) = (structured, *text > 0) else {
+            continue;
+        };
+        let ratio = *bytes as f64 / *text as f64;
+        assert!(
+            ratio <= WORST_STRUCTURED_RATIO,
+            "`{tool}`'s structured answer is {ratio:.1}x its own text rendering ({bytes} B vs \
+             {text} B). A typed result should be the facts behind the rendering, not a larger \
+             restatement of it — see src/structured.rs:1651 for the case where this server \
+             already made the other call."
+        );
+    }
 }
 
 /// Every row a `modules` listing prints, as `(start, end, name)` read back out of its text.

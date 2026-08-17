@@ -55,6 +55,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot be interrupted, so releasing it means terminating a process. See
   [`docs/smoke-test.md`](./docs/smoke-test.md).
 
+- **A token budget for the tool surface and for every result.** Two smoke tests measure what this
+  server costs the model driving it — a cost nothing here had ever measured, and one a dependency
+  bump or a widened schema can move without breaking a single assertion.
+
+  `tool_surface_stays_within_its_token_budget` records a per-tool size table in
+  `tests/golden/tool_budget.json` (re-recorded with the same `UPDATE_GOLDEN=1` as the shape golden
+  beside it) and enforces three ceilings, because a golden re-recorded on every diff is a rubber
+  stamp against slow growth. `tool_results_stay_within_their_budget` runs the debugger tier's dump
+  through a fixed set of calls and budgets each answer, plus one rule: a typed answer may not
+  exceed the rendering it replaces by more than 20x.
+
+  The baseline it recorded is in [`docs/token-budget.md`](./docs/token-budget.md), along with two
+  client behaviours it settled by measurement rather than assumption — `outputSchema` never reaches
+  the model (it is ~80% of the `tools/list` payload), and `structuredContent` *replaces* the text
+  block rather than accompanying it. The second qualifies `DECISIONS.md`'s "a second channel, not a
+  replacement": true for a program reading fields, not for the model. What that costs today is
+  itemised as follow-up 24.
+
 ### Changed
 
 - The listener no longer claims a reconnecting client **adopted sessions** when there were none to

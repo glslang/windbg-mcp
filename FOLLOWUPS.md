@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in nine clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in ten clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/win-kexp#71, 2026-08-01), items 13–14 from the bounded-command coverage review
@@ -8,8 +8,9 @@ MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 from transactional batches (#82, 2026-08-09/10 — item 17 is what validating the tool against the CTF
 session's own transcript turned up, and item 18 what reviewing it did), item 19 from
 `walk_memory` (#103, 2026-08-13), items 20–22 from standing the server up on an ARM64 guest
-(#131, #132, #134, 2026-08-16), and item 23 from making the listener usable rather than merely
-working (2026-08-17). Each item notes its repo,
+(#131, #132, #134, 2026-08-16), item 23 from making the listener usable rather than merely
+working (2026-08-17), and item 24 from first measuring what this server costs the model driving it
+(2026-08-17). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -666,3 +667,48 @@ it would mean making a production constant test-tunable, which is a worse trade 
 revisiting only if that tier's runtime starts to matter.
 
 Picks up at `src/listen.rs` and the tiers in `tests/mcp_smoke.rs`.
+
+## 24. [windbg-mcp] Spend fewer of the caller's tokens
+
+`docs/token-budget.md` and the two budget tests in `tests/mcp_smoke.rs` measured what this server
+costs the model driving it. Nothing had, and the numbers were larger than a careful reading of the
+source predicted — 90–130 KB estimated, 358 KB actual. This item is the list of things the
+measurement found. None of them is a bug; all of them were invisible.
+
+**Why deferred:** the baseline had to be recorded *before* anything was optimised for it, or every
+later fix would be a diff against a number somebody had already tidied. The tests and the golden
+landed on their own so that each of the items below can be argued, and measured, separately.
+
+- **`$defs` are inlined per tool** — `schemars` emits each output schema self-contained, so
+  `ErrorCategory` (2,089 B) ships 31 times and the allocator/pool subtree nine. **200,571 B, 70% of
+  all `outputSchema`.** Wire and client-parse cost only; no model reads it. The lever is
+  `output_schema = schema_for_output::<T>()` on each `#[rmcp::tool]`, or a `list_tools` that emits
+  shared definitions.
+- **Six openers carry a byte-identical 11,093 B output schema**, six step tools a byte-identical
+  4,418 B one. 77,555 B of the above, and the cheapest to collapse.
+- **`session_id` is documented 43 times in three wordings** (222 B ×22, 292 B ×15, 41 B ×5) —
+  9,514 B, and this one *is* model-visible. The repetition is deliberate (`src/server.rs:1356`);
+  the three different wordings are not, and one short shared wording costs nothing to adopt.
+- **The instructions overrun what the client reads** — 3,147 chars sent, truncated at 2,048. The
+  1,099 chars that never arrive are where `debug_batch` and `reachable_from_dispatch` are explained.
+- **`registers` returns 15.9x more JSON than its own text** (9,804 B vs 618 B), because every row
+  carries `"kind":"int"` and `"subregister":false`. `modules` is 2.7x and is the largest single
+  answer this server gives at 53,875 B. The ratio rule in `tool_results_stay_within_their_budget`
+  stops this spreading; it does not fix these two.
+- **`modules` has neither a `limit` nor a cap**, alone among the high-volume tools. Everything else
+  uncapped is raw debugger text — `ttd_calls`, `ttd_memory`, `threads`, `backtrace`, `disassemble`,
+  `execute`, `dx`, `ioctl_trace`, `reachable_from_dispatch` — and `read_memory` returns up to
+  ~4 MiB of hex by design (`src/worker.rs:117`). Every cap that does exist (`MAX_ROWS`,
+  `MAX_NODES`, `MAX_READ_BYTES`) is justified in its own comment as a worker out-of-memory guard.
+  A caller-context guard is a different constraint and does not exist yet.
+
+**Depends on nothing**, but it **collides with item 11**, which proposes adding `structuredContent`
+to `ttd_calls`, `ttd_memory` and `driver_object` — three of the highest-volume text-only tools.
+Under the client rule measured here, structured content *replaces* the text rather than
+supplementing it, so that change is a size decision as much as a typing one, and it also partly
+reverses the reasoning in `DECISIONS.md`'s #84 entry ("a second channel, not a replacement"), which
+was argued against a Python client and never against a model one. Whichever is done first should
+say what it means for the other.
+
+Picks up at [`docs/token-budget.md`](./docs/token-budget.md) and the two budget tests in
+`tests/mcp_smoke.rs`.
