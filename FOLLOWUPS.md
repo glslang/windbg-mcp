@@ -634,18 +634,26 @@ Worth knowing before touching any job name in this repository, not just this one
 
 ## 23. [windbg-mcp] The listener is transport-complete, not usable-complete
 
-Two halves of this are **done** (2026-08-17): `server_log` reaches a client on any machine with the
-records *both* processes made — bounded, and saying so when a record was dropped or evicted rather
-than leaving a gap to be read as quiet ([`DECISIONS.md`](./DECISIONS.md) records why it is a tool
-rather than MCP's deprecated logging capability), and the lease now has a **smoke tier** — four assertions in
-the protocol tier and one, against a parked kernel attach, in the debugger tier. What is left is
-the other two items [`docs/remote-listener.md`](./docs/remote-listener.md) lists under *Not there
-yet*.
+Three quarters of this are **done** (2026-08-17): `server_log` reaches a client on any machine with
+the records *both* processes made — bounded, and saying so when a record was dropped or evicted
+rather than leaving a gap to be read as quiet ([`DECISIONS.md`](./DECISIONS.md) records why it is a
+tool rather than MCP's deprecated logging capability); the lease has a **smoke tier** — four
+assertions in the protocol tier and one, against a parked kernel attach, in the debugger tier; and a
+long call now reports **progress**. What is left is the one item
+[`docs/remote-listener.md`](./docs/remote-listener.md) still lists under *Not there yet*.
 
-**No progress notifications.** A long call is silent. The worker already emits the milestones — a
-`Committed`/`Opened` opener pair, `RollingBack` — as protocol messages, so what is missing is the
-mapping onto MCP progress and a `progressToken` to hang it on, not the facts. Under stdio a caller
-watched stderr for this; a remote one has `session_status` and `server_log`, and both are pull.
+**Progress notifications — done** (`src/progress.rs`). The milestones were already protocol
+messages, so what was added is the route out: a `progressToken` read off the call's `_meta` in
+`call_tool`, a task-local sink read on the caller's task and left beside that call's waiter — the
+milestones arrive on the session's reader task, where the peer and the token are out of reach — and
+a relay that turns each step into `notifications/progress`. Two things it settled that this entry
+did not anticipate. `progress` counts **seconds elapsed with no `total`**, because a denominator
+would have to be a per-tool budget that in an opener's case does not even cover the 30s worker
+handshake before it starts. And the milestones alone would have left the two longest silences
+exactly as they were — a parked attach reports `Committed` in the first second and may never report
+again, and a pool walk or a `crash_triage` has no milestones at all — so **ten seconds without a
+word is itself reported**, which incidentally makes progress a liveness signal a client can extend
+its own request timeout on.
 
 **No service installation.** The listener runs in whatever shell starts it, so it dies with the
 login session and inherits that shell's `PATH` — which for this server decides whether the engine

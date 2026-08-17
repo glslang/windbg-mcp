@@ -122,11 +122,43 @@ stderr — which for a live kernel session can name what the guest was doing. Un
 records reached a log file; here they reach the client, and therefore the model. Treat a live-kernel
 session accordingly.
 
+## Watching a long call
+
+`session_status` and `server_log` are both **pull**: they answer when asked, which means guessing
+when to ask about a call that has not come back. A call can report on *itself* instead, with MCP's
+progress notifications — opt in per call by putting a `progressToken` in its `_meta`:
+
+```jsonc
+{ "method": "tools/call",
+  "params": { "name": "attach_kernel",
+              "arguments": { "profile": "ctf-vm" },
+              "_meta": { "progressToken": "attach-1" } } }
+```
+
+What comes back on that call's own stream, before its result:
+
+```jsonc
+{"method":"notifications/progress","params":{"progressToken":"attach-1","progress":1.4,
+  "message":"engine worker started (pid 8124); opening the target"}}
+{"method":"notifications/progress","params":{"progressToken":"attach-1","progress":2.1,
+  "message":"the target has been created or claimed; waiting for it to break in"}}
+{"method":"notifications/progress","params":{"progressToken":"attach-1","progress":12.1,
+  "message":"still running (12.1s)"}}
+```
+
+Three things worth knowing. `progress` is **seconds elapsed** and there is no `total` — the budget
+is a different constant per tool and an opener spends up to 30s bringing a worker up before its
+budget even starts, so a denominator here would be a number the server cannot stand behind. A call
+that has nothing new to say reports that it is **still running** every ten seconds, which is what
+covers the two longest silences: a kernel attach whose last real milestone lands in the first second
+and may never be followed, and a pool walk or `crash_triage`, which have no milestones at all. And
+nothing at all is sent to a call that did not ask.
+
+This is the same on stdio, where it is a convenience; here it is the only thing that arrives while a
+call is outstanding.
+
 ## Not there yet
 
-- **No progress notifications.** A long call is quiet; the SSE keep-alive holds the stream open but
-  nothing reports what the call is doing. `session_status` still answers, and `server_log` says what
-  the server has been doing — but neither is the call reporting on itself.
 - **No service installation.** The listener runs in whatever shell you start it in. A Windows
   service would give it a defined `PATH` and working directory, boot start, and a life independent
   of a login session.

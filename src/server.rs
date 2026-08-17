@@ -2175,7 +2175,11 @@ fn post_commit_failure(err: &str, session_id: &str) -> String {
 }
 
 /// Renders a duration the way a person reads one: "8.4s", "3m12s", "1h05m".
-fn fmt_duration(d: Duration) -> String {
+///
+/// Shared with [`crate::progress`], which is telling a client about the same waits `session_status`
+/// describes here — a heartbeat that spelled its elapsed time differently would read as a second,
+/// unrelated clock.
+pub(crate) fn fmt_duration(d: Duration) -> String {
     let secs = d.as_secs();
     match secs {
         0..=59 => format!("{:.1}s", d.as_secs_f64()),
@@ -4294,23 +4298,32 @@ impl rmcp::ServerHandler for WindbgServer {
     /// It records the call and its result, and nothing else: the events that say what the *target*
     /// did are derived from the typed half of the result by [`crate::record`], and the ones about
     /// sessions come from the supervisor, which is where sessions live.
+    ///
+    /// It is also where a call's **progress** is hung, for the same reason and with the same shape:
+    /// one place every tool passes, rather than a line in each of forty-odd bodies. See
+    /// [`crate::progress`].
     async fn call_tool(
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        // Read before the router takes the context, and wrapped around the whole call rather than
+        // around the engine work inside it: an opener spends up to `WORKER_READY_TIMEOUT` bringing
+        // a worker up before there is any engine call to report on.
+        let watch = crate::progress::Watch::of(&tcc.request_context);
         // Nothing at all when there is no transcript, which is the default: not the argument
         // clone, not the routing scope, and — the one that would actually cost something — not
         // `text_of`, which joins and copies every content block a tool produced. A module listing
         // or a pool census is megabytes, and paying for it on every call of a server that is not
         // recording is the kind of overhead nobody would ever see and everybody would pay.
         if !self.rec.enabled() {
-            return Self::tool_router().call(tcc).await;
+            return watch.run(Self::tool_router().call(tcc)).await;
         }
         let args = tcc.arguments.clone().map(serde_json::Value::Object);
         let mut call = self.rec.tool_request(tcc.name(), args.as_ref());
-        let (outcome, routed) = crate::record::tracking_route(Self::tool_router().call(tcc)).await;
+        let (outcome, routed) =
+            crate::record::tracking_route(watch.run(Self::tool_router().call(tcc))).await;
         // Where it actually went, which for a call that named no session is the only record of
         // which target it read or changed.
         call.routed_to(routed);

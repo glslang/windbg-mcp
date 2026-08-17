@@ -311,6 +311,42 @@ impl Server {
         )
     }
 
+    /// A tool call that asks to be told how it is going. MCP's opt-in is a `progressToken` in the
+    /// call's own `_meta`, and nothing is sent to a client that did not put one there.
+    fn call_tool_watching(
+        &mut self,
+        name: &str,
+        args: Value,
+        token: &str,
+        budget: Duration,
+    ) -> Value {
+        self.request(
+            "tools/call",
+            json!({
+                "name": name,
+                "arguments": args,
+                "_meta": { "progressToken": token },
+            }),
+            budget,
+        )
+    }
+
+    /// The `notifications/progress` this server sent for `token`, oldest first, taken out of the
+    /// queue of messages read while waiting for something else.
+    ///
+    /// That they are *in* that queue is half the assertion: a progress notification arrives while
+    /// the call is still running, so by the time its result has been matched they are already
+    /// here. One that arrived afterwards would be a notification about a call that was over.
+    fn progress_for(&mut self, token: &str) -> Vec<Value> {
+        let ours = |m: &Value| {
+            m["method"] == json!("notifications/progress")
+                && m["params"]["progressToken"] == json!(token)
+        };
+        let taken: Vec<Value> = self.pending.iter().filter(|m| ours(m)).cloned().collect();
+        self.pending.retain(|m| !ours(m));
+        taken
+    }
+
     /// The text of a tool call that **worked**, for the callers that only proceed if it did.
     ///
     /// Strict about `isError`, not just about protocol errors, and that is the whole point. This
@@ -1773,6 +1809,38 @@ fn tool_text_refuses_to_hand_back_a_failed_call() {
     server.tool_text("go", json!({}), STEP);
 }
 
+/// Progress is opt-in per call, and a client that did not opt in must be sent none.
+///
+/// The rule is MCP's: a `notifications/progress` with no `progressToken` behind it is an
+/// unsolicited message about a request the client never asked to hear about, and a strict client
+/// may treat one as a protocol violation. Asserted on **stdout as a whole** rather than on a
+/// message queue, because that is where a stray notification would actually land — a transport
+/// this server also has to keep free of anything that is not a reply.
+///
+/// The call is an open that fails, deliberately. An opener is the one tool with a milestone to
+/// report before it has done anything (the engine worker coming up), so this exercises the path
+/// that *would* report rather than a tool with nothing to say — on a host with no `dbgeng.dll`
+/// the worker never comes up and the assertion is merely weaker, never wrong.
+#[test]
+fn a_call_that_asked_for_no_progress_is_sent_none() {
+    let mut server = Server::started();
+    let response = server.call_tool("open_dump", json!({ "path": r"Z:\no\such.dmp" }), STEP);
+    assert!(
+        !response["error"].is_null() || is_tool_error(&response),
+        "opening a path that does not exist must fail: {response}"
+    );
+
+    let stray: Vec<String> = server
+        .stdout_lines()
+        .into_iter()
+        .filter(|line| line.contains("notifications/progress"))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "the client asked for no progress and was sent some anyway: {stray:?}"
+    );
+}
+
 // ---- tier 1: the listener and its lease ---------------------------------------
 //
 // `--listen` gives up the one property stdio has for free: a closed stdin means the client is
@@ -1814,10 +1882,24 @@ struct Reply {
     session: Option<String>,
     /// The JSON-RPC payload, whether it arrived as a plain body or inside an SSE frame.
     payload: Option<Value>,
+    /// Every JSON-RPC message on this reply's stream, in order. More than one when the call asked
+    /// for progress: rmcp routes those notifications onto the stream the call is answered on.
+    frames: Vec<Value>,
     body: String,
 }
 
 impl Reply {
+    /// The `notifications/progress` carried on this reply's own stream, oldest first.
+    fn progress(&self, token: &str) -> Vec<&Value> {
+        self.frames
+            .iter()
+            .filter(|frame| {
+                frame["method"] == json!("notifications/progress")
+                    && frame["params"]["progressToken"] == json!(token)
+            })
+            .collect()
+    }
+
     fn result(&self, what: &str) -> Value {
         let payload = self
             .payload
@@ -2083,17 +2165,31 @@ fn parse_reply(raw: &[u8]) -> Reply {
         raw_body.to_vec()
     };
     let body = String::from_utf8_lossy(&body_bytes).into_owned();
-    // An SSE frame first, then a plain body: a tool call comes back as the former and a refusal
-    // as neither, and `None` is a fine answer for a refusal.
-    let payload = body
+    // SSE frames first, then a plain body: a tool call comes back as the former and a refusal as
+    // neither, and no frames at all is a fine answer for a refusal.
+    let mut frames: Vec<Value> = body
         .lines()
         .filter_map(|line| line.trim().strip_prefix("data: "))
-        .find_map(|data| serde_json::from_str::<Value>(data).ok())
-        .or_else(|| serde_json::from_str::<Value>(&body).ok());
+        .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+        .collect();
+    if frames.is_empty()
+        && let Ok(plain) = serde_json::from_str::<Value>(&body)
+    {
+        frames.push(plain);
+    }
+    // The **response**, which is the frame carrying an id — a call that asked for progress is
+    // answered on a stream whose earlier frames are notifications, and those have none. Taking
+    // the first frame regardless would hand `result` a progress line to look for an answer in.
+    let payload = frames
+        .iter()
+        .find(|frame| !frame["id"].is_null())
+        .or_else(|| frames.first())
+        .cloned();
     Reply {
         status,
         session: header("mcp-session-id"),
         payload,
+        frames,
         body,
     }
 }
@@ -2293,6 +2389,181 @@ fn target_tier() -> Option<&'static str> {
         return None;
     }
     Some(SAMPLE_DUMP)
+}
+
+/// An open reports what it is doing while it is doing it, in the order it actually happened.
+///
+/// The milestones are the supervisor's and the worker's — the engine process coming up, the target
+/// being claimed, the target being open — and each already decides something: which of them arrived
+/// is how an open's failure is told apart from the two others that look identical. This asserts the
+/// mapping onto MCP, which is the only part a client can see: one notification per milestone, on
+/// the token the call supplied, all of them **before** the result rather than summarised after it.
+///
+/// Needs a real target because the sequence is the point. A failed open reports the first milestone
+/// and stops, which proves the route and not the order.
+#[test]
+fn an_open_reports_its_milestones_before_it_answers() {
+    let Some(dump) = target_tier() else { return };
+    let mut server = Server::started();
+
+    let response =
+        server.call_tool_watching("open_dump", json!({ "path": dump }), "open-1", TARGET_STEP);
+    assert_no_error(&response, "open_dump");
+    assert!(
+        !is_tool_error(&response),
+        "opening the sample dump failed:\n{}",
+        text_of(&response["result"])
+    );
+
+    // Read after the result, which is what makes "before" an assertion rather than a hope: these
+    // were taken off the wire while the call was still outstanding.
+    let steps = server.progress_for("open-1");
+    let said: Vec<&str> = steps
+        .iter()
+        .filter_map(|s| s["params"]["message"].as_str())
+        .collect();
+    assert_eq!(
+        said.len(),
+        3,
+        "an open has three milestones — worker up, target claimed, target open: {steps:?}"
+    );
+    assert!(said[0].contains("engine worker started"), "{said:?}");
+    assert!(said[1].contains("created or claimed"), "{said:?}");
+    assert!(said[2].contains("target is open"), "{said:?}");
+
+    // Seconds elapsed, strictly increasing, and no `total` — the budget differs per tool and an
+    // opener spends time outside it, so a denominator here would be a number the server cannot
+    // actually stand behind.
+    let progress: Vec<f64> = steps
+        .iter()
+        .map(|s| {
+            s["params"]["progress"]
+                .as_f64()
+                .unwrap_or_else(|| panic!("progress must be a number: {s}"))
+        })
+        .collect();
+    assert!(
+        progress.windows(2).all(|pair| pair[1] > pair[0]),
+        "progress must increase on every notification: {progress:?}"
+    );
+    assert!(
+        steps.iter().all(|s| s["params"]["total"].is_null()),
+        "an unknown total is absent, not guessed: {steps:?}"
+    );
+
+    let session_id = session_id_of(&response["result"]);
+    server.call_tool(
+        "end_session",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
+}
+
+/// And it reaches a client that is not on this machine, which is the whole reason it exists.
+///
+/// Over stdio an operator could watch the server's stderr; over `--listen` those records are on the
+/// far side and everything else this server offers is pull. rmcp routes a progress notification
+/// onto the SSE stream the call itself is being answered on, keyed by the token — so what this
+/// checks is that the milestone and the result come back together, in that order, on one stream.
+///
+/// A **failing** open on purpose: one milestone is enough to prove the route, and it costs a worker
+/// coming up rather than a dump load that may go to a symbol server — which would put this test's
+/// runtime at the mercy of the network for no extra claim.
+#[test]
+fn a_remote_client_is_told_how_a_call_is_going() {
+    if target_tier().is_none() {
+        return;
+    }
+    let mut server = Listener::start(&[]);
+    let client = server.initialize();
+
+    let reply = server.call(
+        Some(&client),
+        "tools/call",
+        json!({
+            "name": "open_dump",
+            "arguments": { "path": r"Z:\no\such.dmp" },
+            "_meta": { "progressToken": "remote-1" },
+        }),
+    );
+    assert_eq!(
+        reply.status,
+        200,
+        "the listener refused the call ({}): {}\n--- stderr ---\n{}",
+        reply.status,
+        reply.body,
+        server.stderr()
+    );
+
+    let steps = reply.progress("remote-1");
+    assert!(
+        steps.iter().any(|s| s["params"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("engine worker started"))),
+        "no milestone reached the remote client on the call's own stream: {}",
+        reply.body
+    );
+    // The result is still the last thing on the stream, and still the thing `result` finds.
+    assert!(
+        !reply.result("open_dump")["content"].is_null(),
+        "the call is answered as well as narrated: {}",
+        reply.body
+    );
+}
+
+/// A call with nothing to say still says it is running — the half of this that is not a mapping.
+///
+/// Milestones alone would leave the two longest silences exactly as they were. One is a kernel
+/// attach nothing answers: it claims its connection in the first second and then has nothing
+/// further to report, ever. The other is every long call that has **no milestones at all** — a pool
+/// walk, a `crash_triage`, a batch — and that is the one used here, because it costs twelve seconds
+/// of a sleeping debuggee rather than a parked worker holding a UDP port that then has to be waited
+/// out of a twenty-second teardown to give it back. The behaviour asserted is the same one.
+///
+/// The beat is ten seconds and deliberately not tunable: making a production constant
+/// test-configurable is a worse trade than the wall clock, and this runs beside the lease tier's
+/// own wait rather than after it.
+#[test]
+fn a_call_with_nothing_to_report_still_reports_that_it_is_running() {
+    let Some(dump) = target_tier() else { return };
+    let mut server = Server::started();
+    let session_id = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+
+    let steps: Vec<Value> =
+        std::iter::repeat_n(json!({ "op": "command", "command": ".sleep 1000" }), 12).collect();
+    let response = server.call_tool_watching(
+        "debug_batch",
+        json!({
+            "session_id": session_id,
+            "steps": steps,
+            "always": [{ "op": "command", "command": "version", "name": "cleanup" }],
+        }),
+        "slow-1",
+        TARGET_STEP,
+    );
+    assert_no_error(&response, "debug_batch");
+
+    let said: Vec<String> = server
+        .progress_for("slow-1")
+        .iter()
+        .filter_map(|step| step["params"]["message"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        said.iter().any(|m| m.starts_with("still running")),
+        "twelve seconds of silence and the call never said it was alive: {said:?}"
+    );
+    // And nothing else, because a batch announces no milestones — which is exactly why the beat
+    // has to exist for this shape of call.
+    assert!(
+        said.iter().all(|m| m.starts_with("still running")),
+        "a batch has no milestones of its own to report: {said:?}"
+    );
+
+    server.call_tool(
+        "end_session",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
 }
 
 /// The end-to-end debugger path, which is what a `win-kexp` or DbgEng change actually moves:
@@ -3686,13 +3957,32 @@ fn ending_a_session_stops_a_running_batch_and_rolls_it_back() {
     }
 
     let asked = Instant::now();
-    let ended = server.tool_text(
+    // Watched, because this is the one call with a milestone of its own to report: a teardown that
+    // finds a transaction says how long unwinding it needs, and a client looking at an
+    // `end_session` that has not come back is exactly who that is for.
+    let response = server.call_tool_watching(
         "end_session",
         json!({ "session_id": session_id }),
+        "unwind-1",
         TARGET_STEP,
     );
     let took = asked.elapsed();
+    assert_no_error(&response, "end_session");
+    let ended = text_of(&response["result"]);
+    assert!(
+        !is_tool_error(&response),
+        "end_session reported a failure: {ended}"
+    );
     assert!(!ended.trim().is_empty(), "end_session said nothing");
+    let said: Vec<String> = server
+        .progress_for("unwind-1")
+        .iter()
+        .filter_map(|step| step["params"]["message"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        said.iter().any(|m| m.contains("rolling it back")),
+        "the teardown found a transaction and never said so: {said:?}"
+    );
     assert!(
         took < Duration::from_secs(15),
         "end_session took {took:?}: it waited out the batch instead of cutting it short"

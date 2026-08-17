@@ -18,6 +18,7 @@ mod engine;
 mod kdconn;
 mod listen;
 mod logbridge;
+mod progress;
 mod proto;
 mod record;
 mod server;

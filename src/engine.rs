@@ -438,7 +438,28 @@ pub struct Session {
     rec: crate::record::Recorder,
 }
 
-type Waiters = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Output, EngineError>>>>>;
+/// A call that has been submitted and not yet answered: where its answer goes, and where the
+/// milestones on the way to it go.
+///
+/// The two travel together because they have the same lifetime and the same lock. A milestone is
+/// only worth reporting while somebody is still waiting for the result, and removing the waiter —
+/// which is how a call stops counting as outstanding — takes the only reporter reachable by that
+/// job id with it. Keeping them in separate maps would be two removals to keep in step, and the one
+/// that got forgotten would report progress against a call already answered.
+#[derive(Debug)]
+struct Waiting {
+    done: oneshot::Sender<Result<Output, EngineError>>,
+    /// Where this call reports what it is doing, when its client asked to be told
+    /// ([`crate::progress`]). `None` for the overwhelming majority: no `progressToken`, or no
+    /// client at all — the shutdown sweep and reclamation call through here too.
+    ///
+    /// Read from the task-local on the **caller's** task, in [`Sessions::call_as`], because that is
+    /// the only place both facts are in hand. The milestones themselves arrive in [`reader`], which
+    /// belongs to the session rather than to any one call and can only find this by job id.
+    progress: Option<crate::progress::Reporter>,
+}
+
+type Waiters = Arc<Mutex<HashMap<u64, Waiting>>>;
 
 impl Session {
     fn state(&self) -> SessionState {
@@ -573,7 +594,7 @@ impl Session {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .drain()
-            .map(|(_, tx)| tx)
+            .map(|(_, waiting)| waiting.done)
             .collect();
         for tx in waiters {
             let _ = tx.send(Err(EngineError::Lost(why.to_string())));
@@ -1005,13 +1026,23 @@ impl Sessions {
         // Without taking it here, a call could become in-flight in the gap between that decision
         // and the close, and reclamation would then end a session the caller had just started
         // using. Held only across the insert; the send below is outside it.
+        //
+        // The reporter is read here for a reason of its own: this is the caller's task, and so the
+        // last point at which the client's request is still reachable. Everything past it —
+        // `pump`'s thread, the worker's reader — belongs to the session rather than to this call.
         {
             let _reclamation = self.registry();
             session
                 .waiters
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .insert(id, tx);
+                .insert(
+                    id,
+                    Waiting {
+                        done: tx,
+                        progress: crate::progress::current(),
+                    },
+                );
         }
         let queued = session.tx.send(Job {
             id,
@@ -1137,6 +1168,16 @@ impl Sessions {
         // Released only now: from here the session is counted in `all` instead, and holding both
         // would count this open twice.
         drop(slot);
+
+        // The supervisor's own milestone, and the only one an opener has before the worker's.
+        // Bringing a worker up takes as long as `WORKER_READY_TIMEOUT` allows, and until this the
+        // client has been told nothing at all — so a client watching progress reads a server that
+        // looks idle for the one part of an open the *supervisor* is responsible for. Reported here
+        // rather than from `spawn`, so it says a worker that was also admitted and registered:
+        // `admit` can still refuse one, and a session that was never routable is not an open that
+        // is under way. See [`crate::progress`] for why this one can be reported directly while the
+        // worker's have to travel with the waiter.
+        crate::progress::report(crate::progress::Step::Spawned { pid: session.pid });
 
         // On the reserved job id, so `reader` can still recognise this open if the caller's
         // timeout means nobody is left to settle it.
@@ -2380,7 +2421,7 @@ fn pump(
                 .unwrap_or_else(|e| e.into_inner())
                 .remove(&job.id);
             if let Some(waiter) = waiter {
-                let _ = waiter.send(result);
+                let _ = waiter.done.send(result);
             }
         };
 
@@ -2423,6 +2464,22 @@ fn pump(
     }
 }
 
+/// Passes a milestone on to the caller waiting for `id`, if that caller asked to be told.
+///
+/// Looked up rather than removed: the call is still running, and this is a thing it is doing on the
+/// way to its answer. Silent when there is no waiter (the caller's budget expired and the job is
+/// still out there) or no reporter (the common case — see [`Waiting::progress`]).
+fn tell(waiters: &Waiters, id: u64, step: crate::progress::Step) {
+    let reporter = waiters
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&id)
+        .and_then(|waiting| waiting.progress.clone());
+    if let Some(reporter) = reporter {
+        reporter.step(step);
+    }
+}
+
 /// Consumes one worker's messages: milestones move the session's state, results answer callers.
 ///
 /// Fed by [`read_messages`]'s thread, so this side stays on the runtime — settling a session
@@ -2450,10 +2507,12 @@ async fn reader(
                 session.update_state(|state| {
                     matches!(state, SessionState::Opening).then_some(SessionState::Attaching)
                 });
+                tell(&waiters, id, crate::progress::Step::Committed);
             }
             WorkerMessage::Opened { id } if id == OPENER_JOB => {
                 session.reach(OpenPhase::Opened);
                 promote_opened(&session);
+                tell(&waiters, id, crate::progress::Step::Opened);
             }
             // Already recorded by the thread that read it — see [`Session::unwinding`] — so this
             // arm only reports it. Nothing here is on the teardown's critical path, which is the
@@ -2465,6 +2524,9 @@ async fn reader(
                      it needs up to {within:?}",
                     session.id
                 );
+                // The one milestone whose *number* the caller can act on: a teardown that looks
+                // stuck is a teardown waiting out a rollback, and this says how long that is.
+                tell(&waiters, id, crate::progress::Step::Unwinding { within });
             }
             WorkerMessage::Committed { id } | WorkerMessage::Opened { id } => {
                 tracing::warn!(
@@ -2477,7 +2539,12 @@ async fn reader(
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .remove(&id);
-                let Some(waiter) = waiter else { continue };
+                // Taken out of the map, so nothing can report a milestone for this job again: the
+                // only reporter reachable by its id went with it. A call that has an answer is
+                // done saying what it is doing.
+                let Some(Waiting { done: waiter, .. }) = waiter else {
+                    continue;
+                };
                 // A failed send means the receiver is gone: the caller's timeout fired and
                 // nobody is left to act on this result. For an ordinary call that is fine —
                 // removing the entry above is what mattered, and it is how the session stops
@@ -3067,7 +3134,13 @@ mod tests {
         idle.waiters
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(1, tx);
+            .insert(
+                1,
+                Waiting {
+                    done: tx,
+                    progress: None,
+                },
+            );
         assert!(idle.busy(), "an abandoned call still owes a reply");
     }
 
