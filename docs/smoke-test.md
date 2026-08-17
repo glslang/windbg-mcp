@@ -13,14 +13,15 @@ $env:WINDBG_MCP_SMOKE_DUMP = "1"; cargo test --test mcp_smoke   # + the debugger
 ```
 
 It builds and runs against `target/debug`, so it never touches the `target/release` exe a
-connected MCP client holds a lock on (see [`CLAUDE.md`](../CLAUDE.md)). Whole suite is ~1s.
+connected MCP client holds a lock on (see [`CLAUDE.md`](../CLAUDE.md)). The protocol tier is ~2s;
+adding the debugger tier takes it to ~40s, almost all of it one test waiting out a lease grace.
 
 ### Tiers
 
 | Tier | Gate | Needs | Catches |
 | --- | --- | --- | --- |
-| **Protocol** | always | nothing — no debugger, no target, no network | transport, revision negotiation, tool-surface drift |
-| **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump | `win-kexp` / DbgEng regressions |
+| **Protocol** | always | nothing — no debugger, no target, no network | transport, revision negotiation, tool-surface drift, and the listener's lease up to the point a session is opened |
+| **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump | `win-kexp` / DbgEng regressions, and a lease expiry releasing a real engine worker |
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a KDNET target you can freeze | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
 | **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
@@ -309,6 +310,42 @@ processes, so they need real ones:
   COMPLETE`, with the target still changed. The batch's `always` block writes a marker when it
   starts and another when it finishes, so the interrupt is staged on the first and the second is the
   proof the rollback ran whole; the refusal has to say it is a rollback, or it reads as a bug.
+
+**The listener's lease.** `--listen` gives up the one property stdio has for free: a closed stdin
+means the client is definitively gone, and every target is released. Over HTTP a silent client is
+indistinguishable from one that is thinking, so a **lease** stands in for that moment — and it is
+the only part of this server whose failures cost a *target* rather than a call. Every rule of it has
+unit tests in [`listen.rs`](../src/listen.rs) against the state machine directly; what those cannot
+reach is the wiring, which is what these assert against a real listener on a loopback port, with a
+hand-written HTTP client (a library that normalised a `409` into an exception, or hid the session
+header, would be asserting on this server's behalf).
+
+Four of them need no debugger, because tenancy is decided before any session is opened:
+
+- *It will not start without a token*, and says which variable is missing. The listener exposes
+  every tool here, including the ones that write to a live kernel; a quiet default would be a
+  server nobody knows is open.
+- *An unauthenticated request is refused, told nothing about what is here, and **costs the server
+  nothing***. The last clause is the one worth a test: the bearer check runs before the tenancy
+  gate, so a wrong token must not reserve or consume a claim — if it did, anything that could
+  reach the port could lock the real client out without ever authenticating.
+- *A second client is refused with `409`*, whether it arrives with a fresh `initialize` or with a
+  session id that is not the holder's, and the holder is undisturbed by either.
+- *Going quiet is not leaving; saying goodbye is.* Every request is its own connection — which is
+  what a client behind a tunnel looks like — so silence is the resting state, and a server that
+  read it as departure would hand the registry on between two calls of a working client. A
+  `DELETE` does hand it on.
+
+The fifth is in the debugger tier, because it is the sweep meeting a real engine worker: *a lease
+that runs out releases what the absent client left*. The target is **a kernel attach nothing will
+answer**, deliberately — a parked attach is the worst case in one move, since the session exists,
+holds a worker, and cannot be interrupted, so releasing it means terminating a process rather than
+asking politely. The test then goes silent for a real grace period (32s, nearly the floor the
+listener enforces: the grace must outlast the call budget plus the 30s an engine worker may take to
+come up, so the budget is shrunk to a second) and watches **stderr**, not HTTP — every admitted
+request renews the lease, so a test that polled would hold open the very thing it is waiting to
+expire. It asserts the worker process is gone, the swept session id is no longer served, and the
+next client gets a server with nothing left over. Budget ~40s.
 
 This tier is also the only end-to-end check of the **protocol channel** — the inherited pipe pair a
 worker speaks on ([`proto.rs`](../src/proto.rs)). Handles are passed on the worker's command line
