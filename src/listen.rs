@@ -631,8 +631,26 @@ async fn gate(
         minted.as_deref(),
         response.status().is_success(),
     ) {
+        // Counted rather than asserted. `left_open` says a previous tenancy ended inside the
+        // grace, which is true whether or not that client had opened anything — so the
+        // unconditional version of this line told an operator a client had adopted sessions that
+        // did not exist, on every ordinary reconnect.
         Settled::Kept { adopted: true } => {
-            tracing::info!("a client attached and adopted the sessions the previous one left open");
+            match lease
+                .sessions
+                .snapshot()
+                .iter()
+                .filter(|s| s.state.is_live())
+                .count()
+            {
+                0 => tracing::info!(
+                    "a client attached to a server the previous one had let go; nothing was open"
+                ),
+                inherited => tracing::info!(
+                    "a client attached and adopted the {inherited} session(s) the previous one \
+                     left open"
+                ),
+            }
         }
         Settled::Kept { adopted: false } => {}
         // This request lost the server while it was being handled. If the service minted a session
