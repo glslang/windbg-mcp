@@ -2235,8 +2235,22 @@ fn read_messages(
                             let mut slot = unwinding.lock().unwrap_or_else(|e| e.into_inner());
                             *slot = Some(slot.map_or(named, |had| had.min(named)));
                         }
+                        // Nobody is left to route it to. Stopping here is what **closes the read
+                        // end** — this thread owns it — and that is load-bearing rather than
+                        // incidental: a worker's next write then fails immediately instead of
+                        // blocking in `write_all` on a pipe nothing is emptying.
+                        //
+                        // The distinction decides whether a teardown can hang. Every message a
+                        // worker sends goes through one lock (`worker::emit`), so a write that
+                        // blocked here would hold that lock against the release its EOF is about
+                        // to ask for — the one bounded by `ABRUPT_EXIT_RELEASE` — and for a live
+                        // kernel that is a target left halted because the supervisor stopped
+                        // listening. It cannot: an absent consumer is a *closed* pipe, not a full
+                        // one. Pinned by `the_channel_fails_a_worker_fast_when_nobody_is_left`,
+                        // because "the reader stops" and "the reader stalls" are one line apart
+                        // here and only one of them is safe.
                         if tx.send(message).is_err() {
-                            break; // nobody is left to route it to
+                            break;
                         }
                     }
                     Err(e) => tracing::error!(
@@ -3443,6 +3457,121 @@ mod tests {
             Some(by),
             "a promise overtaken by its own retraction would have a teardown wait out a batch \
              budget that is already spent"
+        );
+    }
+
+    /// A log record is **filed** against its session rather than dispatched, and a worker whose
+    /// consumer has gone is failed **fast** rather than blocked.
+    ///
+    /// The second is the one with teeth, and it is not about the log. Every message a worker sends
+    /// goes through one lock (`worker::emit`), held across the write. If a departed consumer left a
+    /// pipe that was merely *full*, a background writer could hold that lock indefinitely — and the
+    /// release a worker's EOF asks for, bounded by [`ABRUPT_EXIT_RELEASE`], would never get a
+    /// message out. For a live kernel that is a target left halted because the supervisor stopped
+    /// listening.
+    ///
+    /// It cannot happen, and this is why: the reader thread owns the read end, so the moment it
+    /// stops reading it *closes* it, and the worker's next write errors instead of waiting. That is
+    /// one line of `read_messages` — `break` versus carrying on — and the safe answer is the
+    /// unobvious one, which is what makes it worth pinning. Written as "more than any pipe can
+    /// hold, with the consumer gone": against a reader that stalled instead of stopping, the writes
+    /// would never return.
+    #[test]
+    fn the_channel_fails_a_worker_fast_when_nobody_is_left() {
+        let (arriving, mut worker) = std::io::pipe().expect("a pipe to stand in for a worker's");
+        // A session id nothing else uses: the ring this files into is process-wide, and the whole
+        // test suite logs into it.
+        let session = "sess-drain-to-eof";
+        let messages = read_messages(
+            session.to_string(),
+            arriving,
+            Arc::new(Mutex::new(None::<Instant>)),
+        )
+        .expect("start a reader");
+
+        let log = serde_json::to_string(&WorkerMessage::Log {
+            at_ms: 1_700_000_000_000,
+            level: crate::logbridge::Level::Warn,
+            target: "windbg_mcp::worker".to_string(),
+            message: "worker: something worth reading".to_string(),
+            dropped: 0,
+        })
+        .expect("encode a log record");
+        writeln!(worker, "{log}").expect("write it as a worker would");
+
+        let query = || crate::logbridge::Query {
+            session: Some(session.to_string()),
+            level: crate::logbridge::Level::Trace,
+            since: None,
+            limit: 10,
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let filed = loop {
+            let tail = crate::logbridge::tail(&query());
+            if let Some(entry) = tail.entries.first() {
+                break entry.clone();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "a worker's log record never reached the ring, so `server_log` would show nothing \
+                 of what that worker said"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(filed.message, "worker: something worth reading");
+        assert_eq!(
+            filed.session.as_deref(),
+            Some(session),
+            "filed against the session whose worker sent it — the one thing the worker could not \
+             stamp it with"
+        );
+
+        // Nobody is left to route to.
+        drop(messages);
+
+        // Comfortably more than any pipe buffer, in lines a real worker could send. Written from a
+        // thread of its own so a write that never returns fails this test rather than hanging it.
+        let bulk = serde_json::to_string(&WorkerMessage::Fatal {
+            message: "x".repeat(8192),
+        })
+        .expect("encode a message");
+        let (wrote, written) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut sent = 0usize;
+            let outcome = loop {
+                if sent == 256 {
+                    break Ok(sent);
+                }
+                if let Err(e) = writeln!(worker, "{bulk}") {
+                    break Err((sent, e.kind()));
+                }
+                sent += 1;
+            };
+            let _ = wrote.send(outcome);
+        });
+        let outcome = written.recv_timeout(Duration::from_secs(20)).expect(
+            "a worker writing to a channel nobody is routing blocked inside its write — which in a \
+             real worker is `emit`, holding the lock its teardown needs to report a release",
+        );
+        // And it is an *error*, not 2MB into a void: the read end is gone, which is the property
+        // that makes the block above impossible rather than merely unlikely.
+        let (sent, kind) = match outcome {
+            Err(refused) => refused,
+            Ok(sent) => panic!(
+                "all {sent} line(s) went through, so the reader was still draining a channel it \
+                 had stopped routing — one step from the stall this test exists to rule out"
+            ),
+        };
+        assert!(
+            sent < 256,
+            "the writer should have been refused before it finished, not after"
+        );
+        assert!(
+            matches!(
+                kind,
+                std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionAborted
+            ),
+            "expected the closed read end to refuse the write, got {kind:?} after {sent} line(s)"
         );
     }
 

@@ -634,9 +634,10 @@ Worth knowing before touching any job name in this repository, not just this one
 
 ## 23. [windbg-mcp] The listener is transport-complete, not usable-complete
 
-Two halves of this are **done** (2026-08-17): `server_log` carries every record either process made
-to a client on any machine ([`DECISIONS.md`](./DECISIONS.md) records why it is a tool rather than
-MCP's deprecated logging capability), and the lease now has a **smoke tier** — four assertions in
+Two halves of this are **done** (2026-08-17): `server_log` reaches a client on any machine with the
+records *both* processes made — bounded, and saying so when a record was dropped or evicted rather
+than leaving a gap to be read as quiet ([`DECISIONS.md`](./DECISIONS.md) records why it is a tool
+rather than MCP's deprecated logging capability), and the lease now has a **smoke tier** — four assertions in
 the protocol tier and one, against a parked kernel attach, in the debugger tier. What is left is
 the other two items [`docs/remote-listener.md`](./docs/remote-listener.md) lists under *Not there
 yet*.

@@ -27,9 +27,12 @@ The same records are also readable **through the tool surface**: `server_log` se
 of them (`src/logbridge.rs`), with a worker's tagged by session, which is the only way to see them
 when the client is not on this machine (`--listen`). It is a copy of the stderr stream, not a
 replacement — worker stderr is untouched — so it holds nothing below the level the server was
-started with; `RUST_LOG` widens both together. That channel is
-a pair of inherited anonymous pipes, *not* the worker's stdio: anything a worker prints to stdout
-is drained into the log and cannot reach the protocol.
+started with; `RUST_LOG` widens both together. The ring is bounded, so it holds the run-up to a
+failure rather than a session's history — a transcript (below) is what keeps history.
+
+The **supervisor↔worker protocol channel** is a pair of inherited anonymous pipes, *not* the
+worker's stdio: anything a worker prints to stdout is drained into the log and cannot reach the
+protocol.
 
 ## Updating the running windbg MCP after code changes
 

@@ -20,7 +20,7 @@ adding the debugger tier takes it to ~40s, almost all of it one test waiting out
 
 | Tier | Gate | Needs | Catches |
 | --- | --- | --- | --- |
-| **Protocol** | always | nothing — no debugger, no target, no network | transport, revision negotiation, tool-surface drift, and the listener's lease up to the point a session is opened |
+| **Protocol** | always | no debugger, no target, and no network off this machine — it does bind a loopback port for the listener | transport, revision negotiation, tool-surface drift, and the listener's lease up to the point a session is opened |
 | **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump | `win-kexp` / DbgEng regressions, and a lease expiry releasing a real engine worker |
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a KDNET target you can freeze | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |

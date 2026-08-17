@@ -2129,15 +2129,33 @@ fn dechunk(mut rest: &[u8]) -> Vec<u8> {
 #[test]
 fn the_listener_will_not_start_without_a_token() {
     let addr = format!("127.0.0.1:{}", free_port());
-    let out = Command::new(EXE)
+    let mut child = Command::new(EXE)
         .arg("--listen")
         .arg(&addr)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .env_remove("WINDBG_MCP_LISTEN_TOKEN")
-        .output()
+        .spawn()
         .unwrap_or_else(|e| panic!("failed to spawn {EXE}: {e}"));
+    // Waited for with a deadline rather than `output()`, because the regression under test is a
+    // listener that *serves*: that one never exits, and a bare wait would hang the suite instead
+    // of failing it.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match child.try_wait().expect("poll the listener") {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the listener started with no token set, and stayed up serving on {addr}");
+            }
+            None => std::thread::sleep(Duration::from_millis(50)),
+        }
+    }
+    let out = child
+        .wait_with_output()
+        .expect("collect the listener's output");
     assert!(
         !out.status.success(),
         "the listener started with no token set"
@@ -4390,13 +4408,26 @@ fn a_lease_that_runs_out_releases_what_the_absent_client_left() {
 
     // Its own port, because these tests run in parallel and a KDNET attach takes a UDP port for
     // the life of its session.
-    server.call(
+    let requested = server.call(
         Some(&client),
         "tools/call",
         json!({
             "name": "attach_kernel",
             "arguments": { "connection": "net:port=50009,key=1.1.1.1" },
         }),
+    );
+    // The *tool* is expected to report a failure — the attach parks, and the call budget here is
+    // one second — but the **listener** has to have admitted it. Without this, a `401` or a `409`
+    // from a tenancy regression would fall through to the skip below and be reported as a busy
+    // port on the host, and the one assertion in this file that costs a target would pass in
+    // silence.
+    assert_eq!(
+        requested.status,
+        200,
+        "the listener refused the attach ({}): {}\n--- stderr ---\n{}",
+        requested.status,
+        requested.body,
+        server.stderr()
     );
 
     // Wait for the park rather than assuming a timing — and read it as a *state*, since the
