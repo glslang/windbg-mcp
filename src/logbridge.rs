@@ -48,7 +48,7 @@
 use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -246,10 +246,11 @@ fn file(level: Level, at_ms: u64, target: String, session: Option<String>, messa
 
 /// Files a record a worker produced, against the session that worker holds.
 ///
-/// `dropped` is what that worker's queue had to throw away since its last record, and it is filed
-/// as a record of its own rather than folded into this one's text. A gap in the log is a fact
+/// `dropped` is what that worker's queue threw away **immediately before this record**, and it is
+/// filed as a record of its own rather than folded into this one's text. A gap in the log is a fact
 /// about the log, and a reader who is not told about it reads a quiet stretch as nothing having
-/// happened.
+/// happened — which is also why the count travels with the record that follows the gap rather than
+/// being read as the writer sends: see [`TO_SUPERVISOR`].
 pub fn from_worker(
     session: &str,
     at_ms: u64,
@@ -318,10 +319,17 @@ pub fn tail(query: &Query) -> Tail {
 // ---- the worker's side of the bridge ---------------------------------------
 
 /// The worker's queue. Created by [`layer`] so a record made before the protocol channel exists
-/// is held rather than lost, and drained by [`take_worker_queue`] once there is somewhere to send
+/// is held rather than lost, and drained by [`run_worker_writer`] once there is somewhere to send
 /// it.
-static TO_SUPERVISOR: OnceLock<SyncSender<Entry>> = OnceLock::new();
-static PENDING: Mutex<Option<Receiver<Entry>>> = Mutex::new(None);
+///
+/// Each record travels with **however many were dropped immediately before it**, rather than the
+/// writer reading a counter as it sends. The difference is where the gap is reported: a full queue
+/// holds up to [`WORKER_QUEUE`] records that were made *before* the drops, so a count picked up at
+/// send time lands against the oldest of those — several hundred records early, which tells a
+/// reader the loss happened somewhere it did not.
+static TO_SUPERVISOR: OnceLock<SyncSender<(Entry, u32)>> = OnceLock::new();
+static PENDING: Mutex<Option<Receiver<(Entry, u32)>>> = Mutex::new(None);
+/// Records dropped since the last one that got through, waiting to be carried by the next.
 static DROPPED: AtomicU32 = AtomicU32::new(0);
 /// Queued and written, so [`flush`] can tell whether the writer has caught up. Counters rather
 /// than a channel depth, which `SyncSender` does not expose.
@@ -348,11 +356,7 @@ pub fn run_worker_writer(mut send: impl FnMut(Entry, u32) -> bool) {
     let Some(queue) = PENDING.lock().unwrap_or_else(|e| e.into_inner()).take() else {
         return;
     };
-    for entry in queue {
-        // Read before the send, and reset: these are the records that were dropped to make room
-        // for the ones already queued ahead of this one, so this is the earliest message that can
-        // truthfully carry them.
-        let dropped = DROPPED.swap(0, Ordering::Relaxed);
+    for (entry, dropped) in queue {
         let usable = send(entry, dropped);
         WRITTEN.fetch_add(1, Ordering::Relaxed);
         if !usable {
@@ -362,12 +366,43 @@ pub fn run_worker_writer(mut send: impl FnMut(Entry, u32) -> bool) {
     WRITER_GONE.store(true, Ordering::Relaxed);
 }
 
+/// Queues one record, carrying however many were dropped since the last one that got through.
+/// `false` when the queue would not take it, which is itself a drop.
+///
+/// The count is **taken** before the attempt and put back if it fails, rather than read and
+/// subtracted afterwards: two threads reading the same count would each attach it, and the second
+/// subtraction would wrap the counter past zero into a very large number of imaginary drops.
+fn enqueue(queue: Option<&SyncSender<(Entry, u32)>>, entry: Entry) -> bool {
+    let carried = DROPPED.swap(0, Ordering::Relaxed);
+    let queued = match queue {
+        Some(queue) => queue.try_send((entry, carried)).is_ok(),
+        None => false,
+    };
+    if queued {
+        QUEUED.fetch_add(1, Ordering::Relaxed);
+    } else {
+        // This record, plus whatever it was going to carry for the ones before it.
+        DROPPED.fetch_add(carried.saturating_add(1), Ordering::Relaxed);
+    }
+    queued
+}
+
 /// Waits, up to `within`, for the writer to have mirrored everything queued so far.
 ///
 /// Called by a worker on its way out. Without it the records that matter most are the ones most
 /// likely to be lost: the teardown path logs *why* a target was released, and then exits the
 /// process — which is not something a background thread survives.
 pub fn flush(within: std::time::Duration) {
+    // A run of drops is carried by the *next* record to get through, and at exit there may not be
+    // one — so this is that record. Taken first, so the count is in the text even if the queue will
+    // not take this one either: stderr has it regardless, which is the fallback everywhere here.
+    let unreported = DROPPED.swap(0, Ordering::Relaxed);
+    if unreported > 0 {
+        tracing::warn!(
+            "worker: {unreported} log record(s) were dropped and this process is exiting, so \
+             nothing later can report them; its log queue had filled"
+        );
+    }
     let deadline = std::time::Instant::now() + within;
     while WRITTEN.load(Ordering::Relaxed) < QUEUED.load(Ordering::Relaxed) {
         if WRITER_GONE.load(Ordering::Relaxed) || std::time::Instant::now() >= deadline {
@@ -425,23 +460,17 @@ where
                 rendered.finish(),
             ),
             Role::Worker => {
-                let entry = Entry {
-                    seq: 0, // the supervisor's ring assigns it; this side has no sequence
-                    at_ms: now_ms(),
-                    level,
-                    target: metadata.target().to_string(),
-                    session: None, // likewise: a worker does not know its session id
-                    message: clip(rendered.finish()),
-                };
-                let queued = match TO_SUPERVISOR.get() {
-                    Some(queue) => queue.try_send(entry),
-                    None => Err(TrySendError::Disconnected(entry)),
-                };
-                if queued.is_ok() {
-                    QUEUED.fetch_add(1, Ordering::Relaxed);
-                } else {
-                    DROPPED.fetch_add(1, Ordering::Relaxed);
-                }
+                enqueue(
+                    TO_SUPERVISOR.get(),
+                    Entry {
+                        seq: 0, // the supervisor's ring assigns it; this side has no sequence
+                        at_ms: now_ms(),
+                        level,
+                        target: metadata.target().to_string(),
+                        session: None, // likewise: a worker does not know its session id
+                        message: clip(rendered.finish()),
+                    },
+                );
             }
         }
     }
@@ -670,6 +699,61 @@ mod tests {
     #[test]
     fn an_ordinary_record_is_untouched() {
         assert_eq!(clip("session 3: open".to_string()), "session 3: open");
+    }
+
+    /// A dropped run is carried by the record that **follows** it, not by whichever record the
+    /// writer happens to be sending when it notices.
+    ///
+    /// The distinction is where the gap is reported, and it is only visible when the queue is full:
+    /// a full queue holds hundreds of records made *before* the drops, so a count picked up at send
+    /// time is attached to the oldest of those and tells a reader the loss happened somewhere it did
+    /// not. Driven through the real `enqueue` with a queue of two, which is the same code path with
+    /// the arithmetic small enough to state.
+    #[test]
+    fn a_dropped_run_is_carried_by_the_record_that_follows_it() {
+        let (tx, rx) = sync_channel::<(Entry, u32)>(2);
+        DROPPED.store(0, Ordering::Relaxed);
+        let record = |message: &str| Entry {
+            seq: 0,
+            at_ms: 1_700_000_000_000,
+            level: Level::Info,
+            target: "windbg_mcp::test".to_string(),
+            session: None,
+            message: message.to_string(),
+        };
+
+        // Two fit.
+        assert!(enqueue(Some(&tx), record("first")));
+        assert!(enqueue(Some(&tx), record("second")));
+        // Three do not, and each refusal is a drop.
+        for lost in ["lost a", "lost b", "lost c"] {
+            assert!(!enqueue(Some(&tx), record(lost)), "the queue was full");
+        }
+        assert_eq!(DROPPED.load(Ordering::Relaxed), 3);
+
+        // Draining one makes room, and the next record through carries the run.
+        let (first, before_first) = rx.recv().expect("the first record");
+        assert_eq!(first.message, "first");
+        assert_eq!(
+            before_first, 0,
+            "the record *ahead* of the gap must not be blamed for it — it was made before the \
+             drops, and marking it moves the reported loss hundreds of records early"
+        );
+        assert!(enqueue(Some(&tx), record("after the gap")));
+        assert_eq!(
+            DROPPED.load(Ordering::Relaxed),
+            0,
+            "the run was handed over, not counted twice"
+        );
+
+        let (second, _) = rx.recv().expect("the second record");
+        assert_eq!(second.message, "second");
+        let (after, carried) = rx.recv().expect("the record after the gap");
+        assert_eq!(after.message, "after the gap");
+        assert_eq!(
+            carried, 3,
+            "the three that were lost, reported where they were lost"
+        );
     }
 
     /// A dropped run is filed as a record of its own, so a gap in a worker's log reads as a gap
