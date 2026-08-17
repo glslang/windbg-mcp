@@ -69,7 +69,8 @@ the call timeout.
 **A returning client adopts what it left.** Sessions are not released the moment a client goes
 away, so reconnecting inside the grace finds them still open — which is better than stdio, where a
 client restart costs a KDNET attach, and a KDNET attach costs a reboot of the target. The log says
-`adopted the sessions the previous one left open` when that happens.
+how many sessions were inherited when that happens — or that nothing was open, since a client can
+also arrive to find the previous one had let go of an empty server.
 
 ## One client at a time
 
@@ -100,10 +101,10 @@ The listener's `tracing` output still goes to its own stderr, which is now on th
 and every engine worker's — and serves them as a tool, so this works the same over stdio and HTTP.
 
 ```jsonc
-server_log {}                                   // the last 50, info and above
-server_log { "session_id": "sess-…-1" }         // what that session's engine worker said
-server_log { "level": "warn", "limit": 200 }
-server_log { "since": 412 }                     // only what is new, from the last `next_since`
+server_log {}                                // the last 50, info and above
+server_log { "session_id": "sess-…-1" }      // what that session's engine worker said
+server_log { "level": "warn", "limit": 200 } // 50 records by default, 500 at most
+server_log { "since": 412 }                  // only what is new, from the last `next_since`
 ```
 
 A worker's records carry the session they belong to; the supervisor's — spawning a worker, timing
