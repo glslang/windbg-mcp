@@ -769,6 +769,26 @@ fn discover_opens_a_session_without_initialize() {
         instructions.contains("WinDbg"),
         "instructions should be this server's, got {instructions:?}"
     );
+    // **What the client reads, not what the server sends.** Measured at 2,048 characters; the text
+    // was 3,147 for a long time, so a third of it was paid for on every connection and never
+    // arrived — and what fell off the end was the `debug_batch` paragraph, the one instruction here
+    // that stops a mutation being left half-applied. Asserted on both counts because they are the
+    // same number only while the text stays ASCII, and an em dash is three bytes.
+    const INSTRUCTIONS_BUDGET: usize = 2_048;
+    assert!(
+        instructions.chars().count() <= INSTRUCTIONS_BUDGET
+            && instructions.len() <= INSTRUCTIONS_BUDGET,
+        "the instructions are {} chars / {} bytes, past the {INSTRUCTIONS_BUDGET} a client reads — \
+         the tail is charged for and discarded, so trim it rather than letting it fall off:\n\
+         {instructions}",
+        instructions.chars().count(),
+        instructions.len(),
+    );
+    assert!(
+        instructions.contains("debug_batch"),
+        "the batch guidance is the part that used to be truncated away; it has to survive any \
+         future trim: {instructions:?}"
+    );
 
     // Tools have to be reachable on a session opened this way, not merely listed by discover.
     let tools = server.stateless_request("tools/list", json!({}), STEP);
@@ -1335,13 +1355,13 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
     })
 }
 
-/// Ceiling on the tool surface a model is given before it has asked anything. 67,613 bytes across
+/// Ceiling on the tool surface a model is given before it has asked anything. 67,076 bytes across
 /// 51 tools today (~16k tokens), +12% headroom — sized so that rewording a description passes and
 /// a new tool arriving with a `debug_batch`-scale schema does not.
 const MODEL_VISIBLE_CEILING: usize = 76_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
-/// the array's own punctuation and every result-level field are inside it. 391,709 bytes today,
+/// the array's own punctuation and every result-level field are inside it. 391,172 bytes today,
 /// ~80% of that `outputSchema` no model reads, which is why this is a separate and much looser
 /// number rather than a scaled version of the one above.
 ///

@@ -7,7 +7,7 @@ answer this server returns. That makes payload size a correctness-adjacent prope
 call that spends 13k tokens has not failed, but it has taken the space the investigation needed.
 Nothing measured this until [`tests/mcp_smoke.rs`](../tests/mcp_smoke.rs) grew the two tests below,
 and the numbers turned out to be larger than anyone had guessed — a careful reading of the source
-put the tool surface at 90–130 KB, and the wire is 392 KB.
+put the tool surface at 90–130 KB, and the wire is 391 KB.
 
 ## Two costs, and they are not the same
 
@@ -61,15 +61,15 @@ authority — the tables below are a reading of it at the time of writing.
 
 | Component | Bytes | Reaches the model |
 |---|---:|---|
-| **Whole `tools/list` payload** | **391,709** | partly |
-| — the 51 tools themselves | 391,591 | partly |
+| **Whole `tools/list` payload** | **391,172** | partly |
+| — the 51 tools themselves | 391,054 | partly |
 | — result-level fields (`resultType`, `ttlMs`, `cacheScope`) | 118 | no |
 | `outputSchema` (the 33 tools that have one) | 317,236 | no |
-| `inputSchema` (all 51) | 40,204 | yes |
+| `inputSchema` (all 51) | 39,667 | yes |
 | `description` (all 51) | 24,752 | yes |
 | `annotations` | 5,449 | no |
-| **Model-visible total** | **67,613** (~16k tokens) | — |
-| `initialize` instructions | 3,163 | yes, first 2,048 chars |
+| **Model-visible total** | **67,076** (~16k tokens) | — |
+| `initialize` instructions | 1,996 | yes, **all of it** |
 
 Worst single tool: `debug_batch` at 9,757 model-visible bytes, because its `inputSchema` pulls the
 whole `StepAction`/`Check` vocabulary out of `src/batch.rs`.
@@ -81,8 +81,8 @@ server at two revisions shows what a sum would miss:
 
 | Revision | payload | sum of tools | result-level |
 |---|---:|---:|---|
-| `2026-07-28` | 391,709 | 391,591 | `resultType`, `ttlMs`, `cacheScope` |
-| `2025-06-18` | 391,653 | 391,591 | none |
+| `2026-07-28` | 391,172 | 391,054 | `resultType`, `ttlMs`, `cacheScope` |
+| `2025-06-18` | 391,116 | 391,054 | none |
 
 The sum is **identical** across the two; only the payload figure can tell them apart. The golden
 records both, so the gap stays visible.
@@ -134,13 +134,31 @@ None of these is a bug. They are recorded because they were invisible, and
 
 2. **Whole schemas repeat.** The six openers carry a byte-identical 11,093 B output schema; the six
    step tools a byte-identical 4,418 B one. 77,555 B of the above.
-3. **`session_id` is documented 43 times, in three different wordings** (222 B ×22, 292 B ×15,
-   41 B ×5) — 9,514 B, and unlike the two above this one *is* model-visible. The repetition is
-   deliberate (`src/server.rs:1356`: flattening "renders as a schema composition that clients
-   handle unevenly"); the three wordings are not.
-4. **The instructions overrun what the client reads.** 3,147 chars sent, truncated at 2,048 — the
-   last 1,099 chars, which is where `debug_batch` and `reachable_from_dispatch` are explained, are
-   paid for and never seen.
+3. **`session_id` was documented in three different wordings** — **fixed**, and the original figure
+   here was wrong in an instructive way. It said 9,514 B across 43 sites; the model-visible total was
+   **4,695 B across 32**, because the count had included the copies inside `outputSchema`, which the
+   table two sections up says no model reads. Unifying the wording — and documenting the five heap
+   tools whose `session_id` had *no* description at all — moved the model-visible surface by
+   **−537 B**, not the ~9 KB this bullet implied.
+
+   Most of even that is explained by a second correction, from review. All three original wordings
+   described only the staleness guard ("pass it to refuse the call if the target has been replaced"),
+   which is the *consequence*. The field is a **router**: omitted, the call goes to the current
+   session — the newest still open — and a handle sends it to that one. Unifying on the old phrasing
+   would have propagated a description implying omission is safe when several sessions are open,
+   which is precisely when it is not. A correct description of two behaviours is not shorter than an
+   incomplete description of one, so this half is close to byte-neutral by construction. The
+   repetition itself stays deliberate (`src/server.rs`: flattening "renders as a schema composition
+   that clients handle unevenly").
+
+   The lesson is the one this whole document exists for: a number that has not been measured in the
+   channel it is claimed for is not a finding. The weight is elsewhere — see finding 8.
+4. **The instructions overran what the client reads** — **fixed**. 3,147 chars were sent and 2,048
+   read, so 1,099 were paid for on every connection and discarded, and what fell off the end was the
+   `debug_batch` paragraph: the one instruction there that stops a mutation being left half-applied.
+   Rewritten to 1,996 characters with the batch guidance inside the budget, kept ASCII so the
+   character and byte counts cannot diverge, and pinned by an assertion in the protocol tier so it
+   cannot grow back unnoticed.
 5. **`modules` has neither a `limit` nor a cap**, alone among the high-volume tools. 53,875 B here;
    more on a live kernel.
 6. **Several tools have no bound at all** — `ttd_calls`, `ttd_memory`, `threads`,
@@ -153,6 +171,17 @@ None of these is a bug. They are recorded because they were invisible, and
    own text, because every row carries `"kind":"int"` and `"subregister":false`. This is the one
    finding that is purely model-visible and purely this server's to fix, and it is what the ratio
    rule below exists to stop spreading.
+8. **Five tools are a third of the model-visible surface**, and it is their *input* schemas rather
+   than their prose. `debug_batch` alone is 9,728 B — 15% of everything a model is given before it
+   asks anything — of which 7,962 B is the `StepAction`/`Check` vocabulary its schema pulls out of
+   `src/batch.rs`. Then `walk_memory` 4,058, `crash_triage` 2,894, `reachable_from_dispatch` 2,610,
+   `server_log` 2,599: **21,889 B, 33%**, against a median tool of 882 B.
+
+   This is where the weight is, and it is a different kind of problem from findings 1–4. Those were
+   duplication and waste — the same string paid for repeatedly, or a tail nobody reads. This is one
+   tool honestly describing a rich argument, and the levers are real design choices: a smaller step
+   vocabulary, a `$ref` the client resolves, or a tool surface that does not offer every tool to
+   every caller. Worth measuring before choosing, which is what this table is for.
 
 One interaction worth flagging before acting on any of it: `FOLLOWUPS.md` item 11 proposes *adding*
 `structuredContent` to `ttd_calls`, `ttd_memory` and `driver_object` — three of the highest-volume

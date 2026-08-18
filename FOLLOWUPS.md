@@ -730,15 +730,30 @@ landed on their own so that each of the items below can be argued, and measured,
   costs the same again, and fixing this item is what stops that.
 - **Six openers carry a byte-identical 11,093 B output schema**, six step tools a byte-identical
   4,418 B one. 77,555 B of the above, and the cheapest to collapse.
-- **`session_id` is documented 43 times in three wordings** (222 B ×22, 292 B ×15, 41 B ×5) —
-  9,514 B, and this one *is* model-visible. The repetition is deliberate (`src/server.rs:1356`);
-  the three different wordings are not, and one short shared wording costs nothing to adopt.
-- **The instructions overrun what the client reads** — 3,147 chars sent, truncated at 2,048. The
-  1,099 chars that never arrive are where `debug_batch` and `reachable_from_dispatch` are explained.
+- **`session_id` was documented in three wordings** — **done**, and the figure in this bullet was
+  wrong. It counted the copies inside `outputSchema`, which no model reads; the model-visible total
+  was 4,695 B across 32 fields, not 9,514 across 43. One shared wording — plus documenting the five
+  heap tools whose `session_id` had none at all — moved the surface **−537 B**. Review then found
+  that all three original wordings described only the staleness guard and not the field's actual
+  job, which is routing, so the corrected wording gives most of that back: a right description of
+  two behaviours is not shorter than a wrong description of one. A number not measured in the
+  channel it is claimed for is not a finding, which is worth remembering for the rest of this list.
+- **The instructions overran what the client reads** — **done**. 3,147 chars sent against 2,048
+  read, so the `debug_batch` paragraph — the one instruction that stops a mutation being left
+  half-applied — was charged for on every connection and discarded. Now 1,996 chars with that
+  guidance inside the budget, ASCII so characters and bytes cannot diverge, and asserted in the
+  protocol tier.
 - **`registers` returns 15.9x more JSON than its own text** (9,804 B vs 618 B), because every row
   carries `"kind":"int"` and `"subregister":false`. `modules` is 2.7x and is the largest single
   answer this server gives at 53,875 B. The ratio rule in `tool_results_stay_within_their_budget`
   stops this spreading; it does not fix these two.
+- **Five tools are a third of the model-visible surface**, and it is their input schemas:
+  `debug_batch` 9,728 B (7,962 of it the `StepAction`/`Check` vocabulary), `walk_memory` 4,058,
+  `crash_triage` 2,894, `reachable_from_dispatch` 2,610, `server_log` 2,599 — 21,889 B against a
+  median tool of 882 B. This is where the weight actually is, and unlike the items above it is not
+  waste but one tool honestly describing a rich argument. The levers are design choices: a smaller
+  step vocabulary, a `$ref` the client resolves, or a surface that does not offer every tool to
+  every caller.
 - **`modules` has neither a `limit` nor a cap**, alone among the high-volume tools. Everything else
   uncapped is raw debugger text — `ttd_calls`, `ttd_memory`, `threads`,
   `execute`, `dx`, `ioctl_trace`, `reachable_from_dispatch` — and `read_memory` returns up to
