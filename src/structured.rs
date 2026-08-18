@@ -1480,9 +1480,13 @@ pub struct BugCheckInfo {
 /// One stack frame, named two ways.
 ///
 /// `symbol` is what the debugger resolves; `module` + `rva` is what it can always compute. The
-/// second is the point of this tool: a driver with no PDB has no `symbol` at all, and a bug check
-/// in one is identified by the offset into its image — which is stable across reboots, unlike the
-/// load address it was computed from.
+/// second is the point: a driver with no PDB has no `symbol` at all, and a bug check in one is
+/// identified by the offset into its image — which is stable across reboots, unlike the load
+/// address it was computed from.
+///
+/// One type for both stack tools: [`CrashTriage::frames`] and [`StackTrace::frames`] are the same
+/// records from the same walk, so a frame from either joins the other — and anything else keyed by
+/// `(module, rva)`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct FrameInfo {
     /// Position in the walk; 0 is where the target is stopped.
@@ -1504,6 +1508,34 @@ pub struct FrameInfo {
     /// [`Self::rva`], and for the same reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub displacement: Option<String>,
+}
+
+/// The call stack of the context the session has selected, as values and as the listing rendered
+/// from them.
+///
+/// **The coordinate, not the printout.** `k` renders a frame as `module!Symbol+0x1c`, which is
+/// unusable the moment the symbol does not resolve — and on a driver with no PDB it never does.
+/// Every frame here carries `module` + `rva` as well, computed from the load base the engine
+/// reports, which is the form that survives an unsymbolised driver and stays comparable across
+/// reboots and across machines. That is what lets a frame be joined to a function in a
+/// disassembler without either side knowing the other exists.
+///
+/// **Rendered from these same values**, as [`ModuleList`] is, so the listing and the records
+/// cannot disagree ([#120](https://github.com/glslang/windbg-mcp/issues/120)). The cost is that
+/// this is *not* `k`'s output: the engine's own listing has `Child-SP` and `RetAddr` columns
+/// these records do not carry, and it synthesises `[Inline Frame]` rows that a stack walk does
+/// not return, so a stack with inlined callees has more lines in `k` than it has frames here.
+/// `execute { "command": "k" }` is that listing verbatim for anyone who wants it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct StackTrace {
+    /// The frames, innermost first, capped by the call's `frames` argument.
+    pub frames: Vec<FrameInfo>,
+    /// Whether the stack went on past the cap.
+    ///
+    /// Established by walking one frame further than was asked for and discarding it, exactly as
+    /// [`CrashTriage::frames_truncated`] is — so a stack that happens to be exactly `frames` long
+    /// reports `false`. When `true`, raise `frames` and ask again.
+    pub frames_truncated: bool,
 }
 
 /// What `!analyze -v` concluded, kept separate from the values above because it is a heuristic.

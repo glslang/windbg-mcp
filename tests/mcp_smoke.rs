@@ -1519,6 +1519,7 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
         ("end_session", json!({}), "error"),
         ("registers", json!({}), "error"),
         ("modules", json!({}), "error"),
+        ("backtrace", json!({}), "error"),
         (
             "set_breakpoint",
             json!({ "expression": "nt!KeBugCheckEx" }),
@@ -3201,17 +3202,87 @@ fn a_dump_session_opens_reads_and_closes() {
         "`all` should add the x87/vector registers and the subregister views"
     );
 
-    let response = server.call_tool(
+    // The stack, as records. Shape first, because it holds on a host that resolves nothing: the
+    // walk may come back empty there, and an empty stack is still a well-formed answer.
+    let stack = server.tool_data(
         "backtrace",
         json!({ "session_id": session_id }),
         TARGET_STEP,
     );
-    assert_no_error(&response, "backtrace");
+    let frames = stack["frames"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`backtrace` answered without a `frames` array: {stack}"))
+        .clone();
     assert!(
-        !is_tool_error(&response) && !text_of(&response["result"]).trim().is_empty(),
-        "`backtrace` failed against the sample dump:\n{}",
-        text_of(&response["result"])
+        stack["frames_truncated"].is_boolean(),
+        "`frames_truncated` decides whether a short stack is the stack or the cap: {stack}"
     );
+    for (position, frame) in frames.iter().enumerate() {
+        assert_eq!(
+            frame["index"], position as u64,
+            "frames are the walk's own order, innermost first: {stack}"
+        );
+        assert!(
+            frame["address"]
+                .as_str()
+                .is_some_and(|a| a.starts_with("0x")),
+            "every frame has an address whatever else it has: {frame}"
+        );
+        // The coordinate this tool exists for. Either both halves are there or neither is — an
+        // `rva` with no `module` is an offset from nothing.
+        assert_eq!(
+            frame["module"].is_null(),
+            frame["rva"].is_null(),
+            "`module` and `rva` are one coordinate and travel together: {frame}"
+        );
+        if let Some(rva) = frame["rva"].as_str() {
+            assert!(
+                rva.starts_with("0x") && !rva.starts_with("0x0000"),
+                "an RVA is unpadded — it is pasted after `module+`, not sorted: {frame}"
+            );
+        }
+    }
+
+    // Reading a *target*: walking a stack means reading the stack's pages, so a host that cannot
+    // read `nt`'s base cannot do this and says so rather than asserting on an empty walk.
+    if engine_reads_target_memory(&mut server, &session_id) {
+        assert!(
+            !frames.is_empty(),
+            "a kernel crash dump has a crashing stack: {stack}"
+        );
+        assert!(
+            frames.iter().any(|frame| frame["module"] == "nt"),
+            "a kernel stack passes through `nt` — the bug check is raised there: {stack}"
+        );
+
+        // **The claim the coordinate rests on**: a frame from `crash_triage` and the same frame
+        // from `backtrace` name the same place. They share one walk (`worker::walk_attributed`),
+        // and this is what says so from outside. `analyze: false` because `!analyze -v` ends with
+        // the scope at the target's default — with it off, neither call moves anything, so the two
+        // stacks are the same stack rather than two that ought to match.
+        let triage = server.tool_data(
+            "crash_triage",
+            json!({ "session_id": session_id, "analyze": false }),
+            TARGET_STEP,
+        );
+        let triaged = triage["frames"].as_array().cloned().unwrap_or_default();
+        assert!(
+            !triaged.is_empty(),
+            "the same walk answered `crash_triage` with nothing: {triage}"
+        );
+        for (from_triage, from_backtrace) in triaged.iter().zip(frames.iter()) {
+            for field in ["index", "address", "module", "rva", "symbol"] {
+                assert_eq!(
+                    from_triage[field], from_backtrace[field],
+                    "`crash_triage` and `backtrace` disagree about `{field}` on the same frame, so \
+                     a coordinate carried between them names a different place:\n{from_triage}\n\
+                     {from_backtrace}"
+                );
+            }
+        }
+    } else {
+        skip(NO_TARGET_READS_SKIP);
+    }
 
     // `threads` is `~`, which DbgEng only implements in user mode — against this kernel dump
     // it fails, and that is the point: a real engine failure has to come back as a *tool*
@@ -3423,11 +3494,12 @@ fn tool_results_stay_within_their_budget() {
     // above, because these numbers depend on the target and on what symbols resolve, where that
     // one depends only on this crate's own source.
     //
-    // `crash_triage` and `backtrace` are looser still, and not by oversight: `!analyze -v` and `k`
-    // are the two answers here that change *shape* when symbols resolve rather than merely growing,
-    // and a runner that reaches a symbol server produces several times what an offline one does. A
-    // ceiling tight enough to be interesting on this host would fail on that one, which would make
-    // the tier flaky about the environment instead of watchful about the code.
+    // `crash_triage` and `backtrace` are looser still, and not by oversight: both change *shape*
+    // when symbols resolve rather than merely growing — `!analyze -v` prints a different report,
+    // and a stack whose frames resolve carries a `symbol` on every one of them where an offline
+    // walk carries none. A ceiling tight enough to be interesting on this host would fail on that
+    // one, which would make the tier flaky about the environment instead of watchful about the
+    // code.
     //
     // `wire` is not `model` plus the text: it is the whole `result` object, so it also carries the
     // content-block scaffolding and JSON escaping — a rendered table's newlines cost two bytes each
@@ -3442,7 +3514,7 @@ fn tool_results_stay_within_their_budget() {
         ("session_status", json!({}), 600, 1_200),
         ("crash_triage", json!({}), 6_000, 9_000),
         ("registers", json!({}), 13_500, 14_500),
-        ("backtrace", json!({}), 4_000, 5_000),
+        ("backtrace", json!({}), 3_000, 4_000),
         ("modules", json!({}), 73_000, 100_000),
         ("execute", json!({ "command": "lm" }), 27_000, 28_500),
     ];

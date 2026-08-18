@@ -113,8 +113,27 @@
         "readOnly": true
       },
       "name": "backtrace",
-      "output": null,
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/StackTrace",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
+        "frames: integer|null/uint32",
         "session_id: string|null"
       ],
       "required": [],

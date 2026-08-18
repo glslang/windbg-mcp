@@ -98,8 +98,14 @@ records both, so the gap stays visible.
 | `registers` | 9,804 | 10,534 | 618 | 9,804 | **15.9x** |
 | `crash_triage` | 1,855 | 3,133 | 1,159 | 1,855 | 1.6x |
 | `open_dump` | 1,347 | 2,277 | 814 | 1,347 | 1.7x |
-| `backtrace` | 572 | 661 | 572 | — | — |
+| `backtrace` | 945 | 1,588 | 532 | 945 | 1.8x |
 | `session_status` | 297 | 823 | 420 | 297 | 0.7x |
+
+`backtrace`'s row is the one measured somewhere else: against `docs/samples/121524-4703-01.dmp`,
+on the ARM64 bench, because it became typed after this baseline was recorded and that machine opens
+the sample matching its own architecture. A stack's size is the crash's rather than the tool's, so
+it is not comparable to the digit with the row it replaces (572 B of `k` text, no structured half).
+What is comparable is the shape: the model now reads frames and not a listing.
 
 `registers` is the shape of the problem in miniature: the model reads 9,804 bytes of JSON carrying
 `"kind":"int"` and `"subregister":false` on every row, and never sees the 618-byte `r` output that
@@ -126,7 +132,7 @@ None of these is a bug. They are recorded because they were invisible, and
    paid for and never seen.
 5. **`modules` has neither a `limit` nor a cap**, alone among the high-volume tools. 53,875 B here;
    more on a live kernel.
-6. **Several tools have no bound at all** — `ttd_calls`, `ttd_memory`, `threads`, `backtrace`,
+6. **Several tools have no bound at all** — `ttd_calls`, `ttd_memory`, `threads`,
    `disassemble`, `execute`, `dx`, `ioctl_trace`, `reachable_from_dispatch` — and `read_memory`
    returns up to ~4 MiB of hex by design (`src/worker.rs:117`). Every existing cap in this codebase
    (`MAX_ROWS`, `MAX_NODES`, `MAX_READ_BYTES`) is justified in its own comment as a **worker
@@ -206,9 +212,11 @@ Result budgets are **not** goldened. Their sizes move with what the runner can r
 server that answers turns `deferred` into paths and grows `lm` a column, and the debugger tier runs
 on two architectures. Per-tool ceilings with ~35–45% headroom catch a tool that starts returning an
 order of magnitude more, without pinning a number the environment owns. `crash_triage` and
-`backtrace` are looser still, deliberately: `!analyze -v` and `k` change *shape* when symbols
-resolve rather than merely growing, and a ceiling tight enough to be interesting offline would make
-the tier flaky about its environment instead of watchful about the code.
+`backtrace` are looser still, deliberately: both change *shape* when symbols resolve rather than
+merely growing — `!analyze -v` prints a different report, and a stack whose frames resolve carries a
+`symbol` on every one where an offline walk carries none — and a ceiling tight enough to be
+interesting offline would make the tier flaky about its environment instead of watchful about the
+code.
 
 One rule is asserted rather than a number: a tool's `structuredContent` may not exceed its own text
 rendering by more than 20x. A typed answer is meant to be the facts behind a rendering, so a large

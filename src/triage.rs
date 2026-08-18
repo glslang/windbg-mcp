@@ -281,7 +281,13 @@ pub fn bug_check_info(bug_check: &BugCheck) -> structured::BugCheckInfo {
     }
 }
 
-fn frame_info(attributed: &AttributedFrame) -> structured::FrameInfo {
+/// One attributed frame as the value both stack tools report.
+///
+/// Shared by `crash_triage` and `backtrace` rather than written twice, because the whole claim of
+/// [#155](https://github.com/glslang/windbg-mcp/issues/155) is that a frame from one joins a frame
+/// from the other: two implementations of "the offset into the image" would agree until the day
+/// one of them was fixed.
+pub fn frame_info(attributed: &AttributedFrame) -> structured::FrameInfo {
     let address = attributed.frame.instruction_offset;
     let module = attributed.module.module();
     let symbol = resolved_symbol(&attributed.frame);
@@ -638,7 +644,10 @@ pub fn render(triage: &structured::CrashTriage) -> String {
 /// The symbol carries its displacement, as the debugger's own stack renders it. Printing the bare
 /// name would say the frame is *at* the function's first instruction, which it is for the
 /// innermost frame and for nothing else on the stack.
-fn describe(frame: &structured::FrameInfo) -> String {
+///
+/// Shared with `backtrace` for the same reason [`frame_info`] is: a stack printed two ways by two
+/// renderers is two things to keep in step.
+pub fn describe(frame: &structured::FrameInfo) -> String {
     let symbol = frame
         .symbol
         .as_ref()

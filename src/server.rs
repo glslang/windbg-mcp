@@ -1940,6 +1940,28 @@ const MAX_TRIAGE_FRAMES: u32 = 128;
 const DEFAULT_TRIAGE_FRAMES: u32 = 16;
 
 #[derive(Deserialize, JsonSchema)]
+pub struct BacktraceArgs {
+    /// How many frames to walk (default 32, maximum 256).
+    #[serde(default)]
+    pub frames: Option<u32>,
+    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
+    /// refuse the call if this server's debug target has been replaced since you opened it.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// The most frames `backtrace` will walk, and its default.
+///
+/// Twice `crash_triage`'s, because this is the tool that answers "the whole stack" — a triage is a
+/// summary, and its own cap comment points here for the 200-frame recursion. A cap at all is new:
+/// `k` printed whatever the stack was. It is here because the frames are now *values*, and an
+/// uncapped typed answer is an uncapped bill for whoever is reading it — the same reason every
+/// other high-volume tool has one. `frames_truncated` is what keeps the cap honest, so a caller
+/// who needs more knows to ask rather than reading a truncated stack as a short one.
+const MAX_BACKTRACE_FRAMES: u32 = 256;
+const DEFAULT_BACKTRACE_FRAMES: u32 = 32;
+
+#[derive(Deserialize, JsonSchema)]
 pub struct DriverObjectArgs {
     /// Driver object name, e.g. "mydriver" or "\\Driver\\mydriver".
     pub name: String,
@@ -3470,25 +3492,37 @@ impl WindbgServer {
         engine_result_for(args.session_id.as_deref(), out)
     }
 
-    /// Show the call stack of the current thread (`k`).
-    #[rmcp::tool(annotations(
-        title = "Show call stack",
-        read_only_hint = true,
-        open_world_hint = true
-    ))]
+    /// Show the call stack of the current thread as typed frames. Each carries `module` + `rva` —
+    /// the offset into the image, from its load base — beside the `module!Symbol` the debugger
+    /// resolves: the symbol is missing on a driver with no PDB, the offset never is, and it stays
+    /// comparable across reboots and joins a disassembler's function list. Same records as
+    /// `crash_triage`'s `frames`. `frames_truncated` says when the stack went on past the cap.
+    /// `execute { "command": "k" }` gives the engine's own listing instead, with `Child-SP` /
+    /// `RetAddr` and the inline-frame rows a stack walk does not return.
+    #[rmcp::tool(
+        annotations(
+            title = "Show call stack",
+            read_only_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::StackTrace>>()
+    )]
     async fn backtrace(
         &self,
-        Parameters(args): Parameters<SessionArgs>,
+        Parameters(args): Parameters<BacktraceArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::Command {
-                    command: "k".to_string(),
+                EngineOp::Backtrace {
+                    frames: args
+                        .frames
+                        .unwrap_or(DEFAULT_BACKTRACE_FRAMES)
+                        .clamp(1, MAX_BACKTRACE_FRAMES),
                 },
             )
             .await;
-        engine_result(out)
+        engine_result_for(args.session_id.as_deref(), out)
     }
 
     /// List modules, as typed values and as a listing rendered from those same values: each
