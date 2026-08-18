@@ -5737,8 +5737,10 @@ fn a_lease_that_runs_out_releases_what_the_absent_client_left() {
     // hold the lease open for as long as it watched. The log is the one channel that costs
     // nothing.
     assert!(
+        // The stable half of the line: the message now names *which* client's lease ran out, since
+        // an expiry releases that client's sessions and no others.
         server.wait_for_stderr(
-            "a client's lease ran out; releasing the sessions it left open",
+            "ran out; releasing the sessions it left open",
             Duration::from_secs(120),
         ),
         "the lease never expired — a client that vanished would hold this target for ever\n\

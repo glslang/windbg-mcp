@@ -3181,6 +3181,11 @@ impl WindbgServer {
         // Never routed to a worker, for the same reason `session_status` is not: the case this
         // exists for is a session nothing can be asked of, and a tool that queued behind it would
         // be unavailable exactly when it is wanted.
+        // What this caller may read: the records its own sessions produced, plus the
+        // supervisor's, which carry no session id and are about the process rather than any
+        // target. A handle belonging to another client narrows to a set it is not in, so it comes
+        // back empty — the same answer an id this server never issued gets, and for the same
+        // reason as `resolve`: the reply must not confirm a session the caller may not touch.
         let query = crate::logbridge::Query {
             session: args.session_id.clone(),
             level: args.level.unwrap_or(crate::logbridge::Level::Info),
@@ -3189,6 +3194,7 @@ impl WindbgServer {
                 .limit
                 .unwrap_or(DEFAULT_LOG_RECORDS)
                 .min(MAX_LOG_RECORDS) as usize,
+            visible: Some(self.sessions.visible_session_ids()),
         };
         let tail = crate::logbridge::tail(&query);
         structured_result(describe_log(&tail, &query), log_report(&tail))
@@ -4892,6 +4898,7 @@ mod tests {
             level: crate::logbridge::Level::Info,
             since: None,
             limit: 50,
+            visible: None,
         };
         let out = describe_log(&tail, &query);
         assert!(
@@ -4930,6 +4937,7 @@ mod tests {
             level: crate::logbridge::Level::Info,
             since: Some(350),
             limit: 50,
+            visible: None,
         };
         assert!(
             !describe_log(&tail, &caught_up).contains("were evicted"),
