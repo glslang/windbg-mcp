@@ -60,24 +60,27 @@ it is not one. Measured on one ARM64 host:
 
 Same engine, same dumps: symbols are the variable, and the engine's architecture is not.
 
-So the four **ask the host** instead of guessing from `cfg!(target_arch)`: `nt` has to resolve to
-a PDB, *and* its base has to read — the read issued through `execute` rather than through the tools
-under test, since a regression in `walk_memory` must not be able to silence the test that catches
-it. Where either half comes back empty the test prints `SKIPPED` with the reason and what still
-holds, which is what an `ignore` keyed to an architecture could never say.
+So they **ask the host** instead of guessing from `cfg!(target_arch)`, and each asks for the
+premise it actually has. `walk_memory` and the batch work on numeric addresses, so they need only
+that `nt`'s base reads — asked with a `dq` through `execute` rather than through the tools under
+test, since a regression in `walk_memory` must not be able to silence the test that catches it.
+`crash_triage` and the driver attribution walk `nt`'s *types* — the `_EPROCESS` behind
+`process_name`, and a stack walk that gets past the bug check's own parameters — so those two also
+require `nt` to have resolved to a **PDB**. Either way the test prints `SKIPPED` with the reason
+and what still holds, which is what an `ignore` keyed to an architecture could never say.
 
-**Both halves, because the first attempt asked only for the read and the ARM64 CI entry failed on
-it.** The three tests pointed at the ARM64 sample stood down correctly there — nothing in that dump
-reads on a runner with no `symsrv.dll` — while the driver-crash test, which keeps its x64 dump on
-every architecture, found that dump's module base perfectly readable, walked a stack made of the
-bug check's own parameters, and failed an attribution assertion for a reason that had nothing to do
-with attribution. Reads and symbols fail apart, and the third measurement above is the same
-asymmetry in a controlled form.
+**The two conditions are separate because they fail apart, which the ARM64 CI entry demonstrated
+the hour this was written.** A first version asked only for the read. The three tests on the ARM64
+sample stood down correctly there — nothing in that dump reads on a runner with no `symsrv.dll` —
+while the driver-crash test, which keeps its x64 dump on every architecture, found that dump's
+module base perfectly readable, walked a stack made of the bug check's own parameters, and failed
+an attribution assertion for a reason that had nothing to do with attribution. Asking *both*
+questions of all four would have been the other easy mistake: it stands `walk_memory` and the batch
+down on a host where they are perfectly testable.
 
-The worry that pointed the other way — that asking for symbols stands these four down on a runner
-where they pass today — is settled rather than assumed: the x64 entry reads `mm_exploit_v5.exe` out
-of `SeAuditProcessCreationInfo`, a walk through `nt`'s types that cannot happen without its PDB, so
-that runner answers `pdb` to this question by construction.
+The worry that a symbol condition silences assertions passing today is settled rather than assumed:
+the x64 entry reads `mm_exploit_v5.exe` out of `SeAuditProcessCreationInfo`, a walk through `nt`'s
+types that cannot happen without its PDB, and its run shows all four *running* rather than skipping.
 
 **The sample they open follows the host.** Three dumps are checked in (below), and the two crashes
 a *memory* read is asserted against are paired with the architecture the tests are running on — so

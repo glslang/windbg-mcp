@@ -79,8 +79,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process jumped into memory that is not executable — captured the way the two x64 samples were, a
   real crash on a real machine, and the smallest of the five that machine had at 440 KB.
 
-  The three tier assertions that read a target's memory now open the sample paired with the
-  architecture they are running on, rather than naming one file. What that buys is an ARM64
+  Three of the four tier assertions that read a target now open the sample paired with the
+  architecture they are running on, rather than naming one file; the fourth is the driver crash,
+  which stays with its own x64 dump on every architecture because what it asserts is a property of
+  that crash. What that buys is an ARM64
   `_EPROCESS`, an ARM64 image's headers and an ARM64 stack's frames, read through claims that were
   previously asserted only against x64: the ARM64 CI entry proved the protocol, the session
   machinery and a module list, and nothing at all about reading a target
@@ -102,19 +104,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported failure down to the address and the `0x8007001E`, which is the evidence for what state
   it is in.
 
-  So the four ask the host instead: `nt` has to resolve to a PDB, *and* its base has to read — the
-  read issued through `execute` rather than through the tools under test, so that a regression in
-  `walk_memory` or `crash_triage` cannot silence the test that exists to catch it. Where either
-  half comes back empty the test prints `SKIPPED` with the reason and what still holds.
+  So they ask the host instead, each for the premise it has: `walk_memory` and the batch work on
+  numeric addresses and need only that `nt`'s base reads, asked with a `dq` through `execute`
+  rather than through the tools under test, so that a regression in `walk_memory` cannot silence
+  the test that exists to catch it; `crash_triage` and the driver attribution walk `nt`'s *types*,
+  so those two also require it to have resolved a PDB. Either way the test prints `SKIPPED` with
+  the reason and what still holds.
 
-  Both halves, because a first attempt asked only for the read and the ARM64 CI entry disproved it
-  within the hour: the three tests on the ARM64 sample stood down correctly there, while the
-  driver-crash test — which keeps its x64 dump on every architecture — found that dump's module
-  base readable, walked a stack made of the bug check's own parameters, and failed an attribution
-  assertion for a reason that had nothing to do with attribution. The worry that pointed the other
-  way, that a symbol-shaped gate might silence assertions that pass on x64 today, is settled rather
-  than assumed: that entry reads `mm_exploit_v5.exe` out of `SeAuditProcessCreationInfo`, which is
-  a walk through `nt`'s types and cannot happen without its PDB.
+  The two conditions are separate because they fail apart, which this branch's own CI proved twice
+  over. A version that asked only for the read let the driver-crash test through on a runner that
+  reads a module base and resolves nothing, where it walked a stack made of the bug check's own
+  parameters and failed an attribution assertion for an environmental reason. Asking both of all
+  four would stand `walk_memory` and the batch down where they are perfectly testable. And the
+  worry that a symbol condition silences assertions passing today is settled rather than assumed:
+  the x64 entry reads `mm_exploit_v5.exe` out of `SeAuditProcessCreationInfo`, which is a walk
+  through `nt`'s types, and its run shows all four running rather than skipping.
 
 ### Changed
 
