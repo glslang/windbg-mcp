@@ -1124,6 +1124,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         } => resumed(e, &command, timeout_ms),
         EngineOp::Registers { all } => registers(e, all),
         EngineOp::Modules { filter } => modules(e, filter.as_deref()),
+        EngineOp::Backtrace { frames } => backtrace(e, frames as usize),
         EngineOp::SetBreakpoint { expression } => set_breakpoint(e, &expression),
         EngineOp::ReadMemory { address, size } => read_memory(e, &address, size)
             .map(Output::text)
@@ -1865,44 +1866,14 @@ fn crash_triage(
         return Ok(Output::typed(triage::render(&report), report));
     }
 
-    // Best-effort from here on. A stack walk that fails leaves no frames, which the report renders
+    // Best effort here, unlike `backtrace`: a triage that cannot walk the stack still has the bug
+    // check, the parameters and whatever `!analyze` printed, and the report renders a missing walk
     // as "no faulting frame" with the reason — strictly more than a failed call would say.
-    //
-    // **One frame more than the caller asked for**, so that "the stack went on" and "the stack was
-    // exactly this long" are different observations rather than the same one. `GetStackTrace` says
-    // how much of the buffer it filled, never how much it left, so a walk that came back exactly
-    // full is ambiguous — and the ambiguity is not cosmetic: it decides whether a missing
-    // `faulting_frame` is a fact about the crash or an artefact of the cap. The extra frame is
-    // trimmed before anything sees it; it exists only to be counted.
-    let mut walked = e
-        .stack_frames(frames.saturating_add(1))
-        .unwrap_or_else(|why| {
+    let (attributed, truncated) =
+        walk_attributed(e, frames, "crash triage").unwrap_or_else(|why| {
             tracing::debug!("worker: crash triage could not walk the stack: {why}");
-            Vec::new()
+            (Vec::new(), false)
         });
-    let truncated = walked.len() > frames;
-    walked.truncate(frames);
-    let attributed: Vec<AttributedFrame> = walked
-        .into_iter()
-        .map(|frame| AttributedFrame {
-            // The three answers are kept apart rather than collapsed into "no module". A lookup
-            // that *failed* says nothing about where the address is, and treating it as "in no
-            // module" would let it be blamed as the culprit — pre-empting the real driver frame
-            // below it on the strength of the engine having declined to answer.
-            module: match e.module_at(frame.instruction_offset) {
-                Ok(Some(module)) => Attribution::In(module),
-                Ok(None) => Attribution::NoModule,
-                Err(why) => {
-                    tracing::debug!(
-                        "worker: crash triage could not attribute frame {}: {why}",
-                        frame.index
-                    );
-                    Attribution::Unknown
-                }
-            },
-            frame,
-        })
-        .collect();
     let process_name = e
         .current_process_name()
         .ok()
@@ -1914,6 +1885,111 @@ fn crash_triage(
     };
     let report = triage::report(bug_check, &walk, process_name, analysis);
     Ok(Output::typed(triage::render(&report), report))
+}
+
+/// The current thread's stack, each frame attributed to the module holding it, and whether the
+/// stack went on past `frames`.
+///
+/// **One helper for both stack tools.** `crash_triage` and `backtrace` ask the engine the same two
+/// questions per frame — where the instruction is, and which image holds it — and the answer to
+/// the second is what becomes `module` + `rva`. Written twice they would agree until one of them
+/// was fixed, and the claim this coordinate rests on is that a frame from either tool names the
+/// same place.
+///
+/// **One frame more than the caller asked for**, so that "the stack went on" and "the stack was
+/// exactly this long" are different observations rather than the same one. `GetStackTrace` says
+/// how much of the buffer it filled, never how much it left, so a walk that came back exactly full
+/// is ambiguous — and the ambiguity is not cosmetic: for a triage it decides whether a missing
+/// `faulting_frame` is a fact about the crash or an artefact of the cap. The extra frame is
+/// trimmed before anything sees it; it exists only to be counted.
+///
+/// `what` names the caller in the log lines, because an attribution that failed is a fact about
+/// one frame of one call and the two tools are read in different places.
+fn walk_attributed(
+    e: &DebugEngine,
+    frames: usize,
+    what: &str,
+) -> Result<(Vec<AttributedFrame>, bool), String> {
+    let mut walked = e.stack_frames(frames.saturating_add(1)).map_err(es)?;
+    let truncated = walked.len() > frames;
+    walked.truncate(frames);
+    let attributed = walked
+        .into_iter()
+        .map(|frame| AttributedFrame {
+            // The three answers are kept apart rather than collapsed into "no module". A lookup
+            // that *failed* says nothing about where the address is, and treating it as "in no
+            // module" would let it be blamed as the culprit — pre-empting the real driver frame
+            // below it on the strength of the engine having declined to answer.
+            module: match e.module_at(frame.instruction_offset) {
+                Ok(Some(module)) => Attribution::In(module),
+                Ok(None) => Attribution::NoModule,
+                Err(why) => {
+                    tracing::debug!(
+                        "worker: {what} could not attribute frame {}: {why}",
+                        frame.index
+                    );
+                    Attribution::Unknown
+                }
+            },
+            frame,
+        })
+        .collect();
+    Ok((attributed, truncated))
+}
+
+/// The call stack, as values and as the listing rendered from them.
+///
+/// One op rather than `k` for the reason [`crate::proto::EngineOp::Backtrace`] gives: the answer
+/// is each frame's `module` + `rva`, and nothing but the worker can ask the engine for it.
+///
+/// **The walk failing fails this call**, unlike in a triage. A triage that cannot walk still has a
+/// bug check to report; here the stack *is* the answer, and an empty one would say "this thread has
+/// no frames" — a claim about the target — when what happened was that a read failed.
+fn backtrace(e: &DebugEngine, frames: usize) -> Result<Output, Failed> {
+    let (attributed, frames_truncated) = walk_attributed(e, frames, "backtrace").map_err(failed)?;
+    let trace = structured::StackTrace {
+        frames: attributed.iter().map(triage::frame_info).collect(),
+        frames_truncated,
+    };
+    Ok(Output::typed(render_backtrace(&trace, frames), trace))
+}
+
+/// The stack a person reads, built from the records beside it.
+///
+/// Each frame on one line through [`triage::describe`], so the listing here and the `STACK`
+/// section of a triage are the same rendering rather than two that look alike.
+fn render_backtrace(trace: &structured::StackTrace, asked: usize) -> String {
+    // Not an error, and not necessarily an empty thread either: a target stopped with no thread
+    // context — a module-load break, a bare `goto_position` to the very start of a trace — has a
+    // position but no stack to walk, and `k` prints nothing at all for it. Saying which of the two
+    // this is would be a guess; saying that the walk returned nothing is the fact.
+    if trace.frames.is_empty() {
+        return "No frames: the engine walked no stack from the current context. That is what a \
+                target with no thread context selected looks like (a module-load break, or a \
+                trace positioned before its first thread); `registers` says whether there is a \
+                context at all."
+            .to_string();
+    }
+    let mut listing = String::new();
+    for frame in &trace.frames {
+        listing.push_str(&format!("{:02} {}\n", frame.index, triage::describe(frame)));
+    }
+    let mut out = fenced(&listing);
+    out.push_str(&format!(
+        "\n{} frame{} from the current context. Each frame is `module+RVA` as well as its \
+         symbol — the offset is computed from the load base, so it is the half that survives a \
+         driver with no PDB and stays comparable across reboots.\n",
+        trace.frames.len(),
+        if trace.frames.len() == 1 { "" } else { "s" },
+    ));
+    if trace.frames_truncated {
+        out.push_str(&format!(
+            "The stack goes on past frame {}: this call asked for {asked}. Raise `frames` to see \
+             the rest.\n",
+            asked.saturating_sub(1),
+        ));
+    }
+    out
 }
 
 /// Runs `!analyze -v`, whichever spelling this engine resolves.
@@ -5442,6 +5518,156 @@ mod tests {
         assert!(
             note.contains("3 of 227 loaded") && note.contains("2 that have since **unloaded**"),
             "{note}"
+        );
+    }
+
+    // ---- rendering a stack -------------------------------------------------
+
+    /// A frame as the two stack tools carry it: an address, and the coordinate where the engine
+    /// could place it.
+    fn frame(
+        index: u32,
+        address: &str,
+        placed: Option<(&str, &str)>,
+        symbol: Option<&str>,
+    ) -> structured::FrameInfo {
+        structured::FrameInfo {
+            index,
+            address: address.to_string(),
+            module: placed.map(|(module, _)| module.to_string()),
+            rva: placed.map(|(_, rva)| rva.to_string()),
+            symbol: symbol.map(str::to_string),
+            displacement: symbol.map(|_| "0x1c".to_string()),
+        }
+    }
+
+    /// A walk that returned nothing is not an empty answer, and printing nothing would make it
+    /// one — indistinguishable from a call that quietly failed. Same reasoning as the empty
+    /// module listing above.
+    #[test]
+    fn a_stack_with_no_frames_says_so_rather_than_printing_nothing() {
+        let text = render_backtrace(
+            &structured::StackTrace {
+                frames: Vec::new(),
+                frames_truncated: false,
+            },
+            32,
+        );
+        assert!(
+            text.contains("No frames") && text.contains("context"),
+            "an empty walk has to explain itself: {text}"
+        );
+    }
+
+    /// The case the whole coordinate exists for: a driver with no PDB resolves no symbol at all,
+    /// and the frame is still named — by the offset into its image, which is what an analysis
+    /// server can be asked about.
+    #[test]
+    fn a_frame_with_no_symbol_is_still_named_by_its_image() {
+        let text = render_backtrace(
+            &structured::StackTrace {
+                frames: vec![frame(
+                    0,
+                    "0xfffff8031afe1654",
+                    Some(("MessageManager", "0x1654")),
+                    None,
+                )],
+                frames_truncated: false,
+            },
+            32,
+        );
+        assert!(
+            text.contains("MessageManager+0x1654"),
+            "an unsymbolised frame is `module+RVA` or it is nothing: {text}"
+        );
+    }
+
+    /// An address in no module at all — a freed pool page, an unloaded driver — is a real finding
+    /// rather than a gap, so the line is the address rather than an empty one.
+    #[test]
+    fn a_frame_in_no_module_prints_its_address() {
+        let text = render_backtrace(
+            &structured::StackTrace {
+                frames: vec![frame(0, "0xffffa30712340000", None, None)],
+                frames_truncated: false,
+            },
+            32,
+        );
+        assert!(
+            text.contains("0xffffa30712340000"),
+            "a frame the engine could place in no module still has an address: {text}"
+        );
+    }
+
+    /// A stack cut off by the cap and a stack that is simply this long are different answers, and
+    /// the note is the only place the text says which. Without it a caller reads a truncated walk
+    /// as the whole stack — the same mistake the triage cap is walked one frame past to avoid.
+    #[test]
+    fn a_stack_cut_off_by_the_cap_says_the_cap_is_why() {
+        let one = |truncated| {
+            render_backtrace(
+                &structured::StackTrace {
+                    frames: vec![frame(
+                        0,
+                        "0xfffff80389201234",
+                        Some(("nt", "0x1234")),
+                        Some("nt!KeBugCheckEx"),
+                    )],
+                    frames_truncated: truncated,
+                },
+                1,
+            )
+        };
+        assert!(
+            one(true).contains("goes on past") && one(true).contains("`frames`"),
+            "a truncated stack has to name the argument that lifts the cap: {}",
+            one(true)
+        );
+        assert!(
+            !one(false).contains("goes on past"),
+            "a stack that ended on its own must not be reported as capped: {}",
+            one(false)
+        );
+    }
+
+    /// The listing and the records are one answer, as they are for a module listing: every frame
+    /// in the values appears in the text, in the walk's order.
+    #[test]
+    fn the_listing_prints_the_frames_the_records_carry() {
+        let trace = structured::StackTrace {
+            frames: vec![
+                frame(
+                    0,
+                    "0xfffff80389201234",
+                    Some(("nt", "0x1234")),
+                    Some("nt!KeBugCheckEx"),
+                ),
+                frame(
+                    1,
+                    "0xfffff8031afe1654",
+                    Some(("MessageManager", "0x1654")),
+                    None,
+                ),
+                frame(2, "0xffffa30712340000", None, None),
+            ],
+            frames_truncated: false,
+        };
+        let text = render_backtrace(&trace, 32);
+        let listed: Vec<&str> = text
+            .lines()
+            .filter(|line| line.len() > 3 && line[..2].chars().all(|c| c.is_ascii_digit()))
+            .collect();
+        assert_eq!(
+            listed.len(),
+            trace.frames.len(),
+            "one line per frame: {text}"
+        );
+        assert!(listed[0].contains("nt!KeBugCheckEx"), "{text}");
+        assert!(listed[1].contains("MessageManager+0x1654"), "{text}");
+        assert!(listed[2].contains("0xffffa30712340000"), "{text}");
+        assert!(
+            text.contains("3 frames"),
+            "the count is the reader's check: {text}"
         );
     }
 

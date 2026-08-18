@@ -334,7 +334,7 @@ gh attestation verify <zip> --repo glslang/windbg-mcp `
 |-------|-------|
 | Session | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `interrupt`, `end_session`, `session_status` |
 | Server   | `server_log` — the server's own log, the supervisor's and every engine worker's, tagged with the session each record belongs to |
-| State   | `registers`, `read_memory`, `walk_memory`, `backtrace`, `modules`, `threads`, `disassemble`, `dx` |
+| State   | `registers`, `read_memory`, `walk_memory`, `backtrace` (the stack as typed frames, each carrying `module`+`RVA` as well as its symbol), `modules`, `threads`, `disassemble`, `dx` |
 | Crash   | `crash_triage` — a bug check as fields: code and parameters, crashing process, the stack as `module+RVA`, and the faulting driver frame |
 | Control | `go`, `step_over`, `step_into`, `set_breakpoint`, `run_to_address` |
 | Transaction | `debug_batch` — an ordered sequence with assertions and a rollback the engine process runs on every path |

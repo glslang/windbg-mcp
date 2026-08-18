@@ -29,12 +29,12 @@
     },
     {
       "annotations": 68,
-      "description": 50,
-      "inputSchema": 395,
-      "modelVisible": 495,
+      "description": 610,
+      "inputSchema": 474,
+      "modelVisible": 1134,
       "name": "backtrace",
-      "outputSchema": 0,
-      "wire": 578
+      "outputSchema": 6923,
+      "wire": 8156
     },
     {
       "annotations": 117,
@@ -42,8 +42,8 @@
       "inputSchema": 1319,
       "modelVisible": 2923,
       "name": "crash_triage",
-      "outputSchema": 12651,
-      "wire": 15722
+      "outputSchema": 12853,
+      "wire": 15924
     },
     {
       "annotations": 134,
@@ -462,14 +462,14 @@
   ],
   "totals": {
     "annotations": 5449,
-    "description": 23457,
-    "inputSchema": 39964,
+    "description": 24017,
+    "inputSchema": 40043,
     "instructions": 3163,
-    "modelVisible": 66078,
-    "outputSchema": 285745,
-    "payload": 358651,
+    "modelVisible": 66717,
+    "outputSchema": 292870,
+    "payload": 366431,
     "tools": 51,
-    "wire": 358533,
+    "wire": 366313,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 9757
   }

@@ -122,6 +122,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`backtrace` answers with typed frames carrying `module` + `RVA`, not just `k`'s text.** The
+  tool ran `k` and handed back whatever DbgEng printed, which names a frame as
+  `module!Symbol+0x1c` — a form that is unusable the moment the symbol does not resolve, and on a
+  driver with no PDB it never does. Every frame now carries the offset into its image as well,
+  computed from the load base the engine reports, which is the half that survives an unsymbolised
+  driver and stays comparable across reboots and across machines. That is what lets a frame be
+  joined to a function in a disassembler without either side knowing the other exists.
+
+  - **The same records as `crash_triage`, from the same walk.** Both tools go through one helper
+    (`worker::walk_attributed`) and render through one function (`triage::describe`), so a
+    coordinate carried between them names the same place by construction rather than by
+    inspection. The debugger tier asserts it from outside: the two stacks are compared field by
+    field.
+  - **A cap, which `k` did not have** — 32 frames by default, 256 at most, with `frames_truncated`
+    saying when the stack went on. The frames are values now, and an uncapped typed answer is an
+    uncapped bill for whoever reads it; the flag is what keeps the cap from being read as a short
+    stack. `crash_triage`'s own cap comment points here for the deep stack, which is why this one
+    is twice as deep.
+  - **The listing is rendered from those same values**, as `modules` is
+    ([#120](https://github.com/glslang/windbg-mcp/issues/120)), so the text and the records cannot
+    disagree. The cost is stated rather than hidden: this is not `k`'s output — it has no
+    `Child-SP`/`RetAddr` columns and no `[Inline Frame]` rows, since a stack walk does not return
+    them — and `execute { "command": "k" }` is that listing verbatim for anyone who wants it.
+  - Under the client behaviour measured in [`docs/token-budget.md`](./docs/token-budget.md),
+    `structuredContent` **replaces** the text block rather than accompanying it, so a model driving
+    this tool now reads the frames and not the listing. That is the point — the coordinate is in
+    the frames — but it is the same trade `FOLLOWUPS.md` item 24 records for every other typed
+    tool, and the result budget moved with it.
+
 - The listener no longer claims a reconnecting client **adopted sessions** when there were none to
   adopt. The flag behind that line says a previous tenancy ended inside the grace, which is true
   whether or not that client had opened anything — so an ordinary reconnect logged an adoption that

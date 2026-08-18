@@ -107,6 +107,22 @@ pub enum EngineOp {
         #[serde(default)]
         filter: Option<String>,
     },
+    /// The current thread's call stack, as values and as the listing rendered from them.
+    ///
+    /// One op rather than `k` as a [`Self::Command`] because the answer this tool exists to give
+    /// is each frame's `module` + `rva`, and that is two engine questions per frame — where the
+    /// instruction is, and which image holds it — that only the worker can ask. It is the same
+    /// walk [`Self::CrashTriage`] does, through the same helper, so the frames of the two tools
+    /// are the same records rather than two renderings that agree by inspection.
+    ///
+    /// **Unbounded, as the `k` it replaces was.** These are direct engine calls rather than a
+    /// command, so no watchdog can cut them short and resolving a frame's symbol can block on a
+    /// symbol server — which is exactly what `EngineOp::Command { command: "k" }` did before.
+    /// Carrying a `patience_ms` would imply a bound that does not exist.
+    Backtrace {
+        /// How many frames to walk. Bounded by the supervisor before it gets here.
+        frames: u32,
+    },
     /// Set a breakpoint (`bp <expression>`) and report what the session now holds.
     ///
     /// A command rather than a typed `AddBreakpoint` because `bp`'s syntax is the point: a
