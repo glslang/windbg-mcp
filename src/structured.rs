@@ -1508,6 +1508,19 @@ pub struct FrameInfo {
     /// [`Self::rva`], and for the same reason.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub displacement: Option<String>,
+    /// True when the engine's "which module holds this address" lookup **failed**, rather than
+    /// answering that no module does.
+    ///
+    /// Both leave [`Self::module`] and [`Self::rva`] absent, and they are opposite facts. "No
+    /// loaded module holds this address" is a *positive finding*, and one a driver bug produces
+    /// constantly — a freed pool page, an unloaded driver, a corrupted return address. "The lookup
+    /// failed" is an absence of information, and reading it as the first would let one failed call
+    /// be reported as evidence about the target. The distinction has always existed inside the
+    /// walk, because picking a faulting frame needs it; without this field it stopped at the wire.
+    ///
+    /// Absent from the JSON when false, which is every frame of an ordinary walk.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attribution_failed: bool,
 }
 
 /// The call stack of the context the session has selected, as values and as the listing rendered
