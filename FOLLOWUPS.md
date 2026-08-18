@@ -633,7 +633,8 @@ reads the dump's headers and nothing behind them. On an ARM64 host with the SDK'
 including the `EPROCESS` and the driver frame at its literal RVA; strip the symbol path from that
 same engine and it reads neither. System32 ships `dbghelp.dll` and no `symsrv.dll`, which is why a
 runner with nothing beside the binary downloads no PDB and fails these four. The tests now ask the
-host — `nt` resolving to a PDB, and its base reading — instead of asking `cfg!(target_arch)`, and
+host — `nt`'s base reading, and a resolved PDB for the two that walk its types — rather than
+asking `cfg!(target_arch)`, and
 the ARM64 dump is checked in for the coverage it genuinely adds: an ARM64 *target*, which nothing
 else here reads. **Both halves of that question, because they fail apart**, which the ARM64 CI
 entry demonstrated on the first attempt: a gate that asked only for the read let the driver-crash

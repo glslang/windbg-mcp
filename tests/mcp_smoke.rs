@@ -102,72 +102,53 @@ const DRIVER_CRASH_DUMP: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/docs/samples/081226-2187-01.dmp"
 );
-/// A third crash dump, and the only **ARM64** target in this suite: a
-/// `0xFC ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY` off this project's own ARM64 debuggee, where a
-/// user-mode process jumped into memory that is not executable and the kernel bug-checked out of
-/// `nt!MiCheckSystemNxFault`.
-///
-/// Captured the same way as the two above — a real crash on a real machine, out of
-/// `C:\Windows\Minidump` — and the smallest of the five that machine had, because every clone
-/// carries it for ever (issue #143).
-///
-/// What it adds is a *target*, not a second copy of the protocol: everything else the ARM64 CI
-/// entry runs reads either the protocol or the dump's **structure** — bug check, module list,
-/// stack attribution — and that much is architecture-independent and already passes against the
-/// x64 samples. Reading an ARM64 `_EPROCESS`, an ARM64 image's headers and an ARM64 stack's
-/// frames happens here and nowhere else that CI can reach.
+/// An **ARM64** kernel dump — `0xFC ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY`, a user-mode process
+/// jumping into memory that is not executable — so that an ARM64 run reads an ARM64 `_EPROCESS`,
+/// an ARM64 image's headers and an ARM64 stack's frames. Nothing else in this suite does
+/// ([#143](https://github.com/glslang/windbg-mcp/issues/143)); its provenance is in
+/// `docs/smoke-test.md`.
 const ARM64_SAMPLE_DUMP: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/docs/samples/121524-4703-01.dmp"
 );
 
-/// A checked-in kernel dump together with the facts about *that crash* a test asserts.
-///
-/// The claims below — a walk marks what it cannot read, a batch's rollback runs either way, a bug
-/// check is triaged into its fields — are properties of this server, not of a file, so they are
-/// written once and pointed at whichever real crash this host can read. What differs between two
-/// real crashes is only what is in this record.
+/// A checked-in kernel dump and the facts about *that crash* a test asserts, so one test body can
+/// be pointed at either real crash rather than naming one file.
 struct KernelSample {
-    /// Where the file is.
     path: &'static str,
-    /// `bug_check.code`, spelled as the field spells it: lowercase, unpadded.
+    /// `bug_check.code`: lowercase, unpadded.
     bug_check: &'static str,
     /// The name out of this build's own table, which is why it needs no `!analyze`.
     bug_check_name: &'static str,
-    /// `Arg1`, rendered as the field renders it — zero-padded to sixteen digits.
+    /// `Arg1`, zero-padded to sixteen digits as the field renders it.
     first_parameter: &'static str,
     /// The crashing process, read out of the current `_EPROCESS`.
     process_name: &'static str,
 }
 
 impl KernelSample {
-    /// How `!analyze` heads this bug check's `FAILURE_BUCKET_ID`: `0x9F`, `0xFC` — the digits
-    /// upper-cased and the `0x` left alone, which is neither spelling of [`Self::bug_check`].
+    /// How `!analyze` heads `FAILURE_BUCKET_ID`: `0x9F`, `0xFC` — digits upper-cased and the `0x`
+    /// left alone, which is neither spelling of [`Self::bug_check`].
     fn bucket_prefix(&self) -> String {
         format!("0x{}", self.bug_check[2..].to_ascii_uppercase())
     }
 }
 
-/// The sample whose architecture is **this host's**, which is the one every test that reads a
-/// target's memory opens.
+/// The sample matching this host's architecture, which every test that reads a target opens.
 ///
-/// A dump is read by the engine on the machine running these tests, so pairing the two is what
-/// gives an ARM64 run a target it is certain to be able to read. It is deliberately not a claim
-/// that the other pairing fails: measured on an ARM64 host with symbols, the x64 samples read
-/// fine, and the driver-crash test below opens one on every architecture for exactly that reason.
-/// What decides whether any of this works is [`engine_can_read_this_target`], not the architecture.
+/// The pairing is a choice about coverage, not a workaround: an engine with symbols reads either
+/// dump either way round, which is why [`DRIVER_CRASH_DUMP`] stays x64 everywhere. See
+/// `docs/smoke-test.md`.
 #[cfg(target_arch = "aarch64")]
 const NATIVE_SAMPLE: KernelSample = KernelSample {
     path: ARM64_SAMPLE_DUMP,
     bug_check: "0xfc",
     bug_check_name: "ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY",
-    // The address that was executed. The x64 sample's `Arg1` is a subtype code instead — both are
-    // facts about their own file, which is what makes either of them assertable.
+    // The address that was executed, where the x64 sample's `Arg1` is a subtype code.
     first_parameter: "0x0000019e7b820000",
-    // Fifteen bytes, and cut off at them. This dump does not capture the pool page that
+    // Truncated at fifteen bytes: this dump does not capture the page
     // `SeAuditProcessCreationInfo` points at, so the engine falls back to
-    // `_EPROCESS::ImageFileName` — which is the fallback nothing else in this suite exercises,
-    // where [`DRIVER_CRASH_DUMP`] pins the audit name the fallback exists to avoid.
+    // `_EPROCESS::ImageFileName` — the fallback [`DRIVER_CRASH_DUMP`]'s audit name avoids.
     process_name: "stack_buffer_o",
 };
 
@@ -179,10 +160,9 @@ const NATIVE_SAMPLE: KernelSample = KernelSample {
     bug_check_name: "DRIVER_POWER_STATE_FAILURE",
     // The `0x9F` subtype: 3, "a device object has been blocking an IRP for too long".
     first_parameter: "0x0000000000000003",
-    // The watchdog fires on an idle CPU, so the answer is `System` — and the check that matters is
-    // that it is not the kernel image, which is what the engine's own
-    // `GetCurrentProcessExecutableName` answers on a kernel target for every process there has
-    // ever been.
+    // The watchdog fires on an idle CPU. What matters is that it is not the kernel image, which is
+    // what `GetCurrentProcessExecutableName` answers on a kernel target for every process there
+    // has ever been.
     process_name: "System",
 };
 
@@ -2866,54 +2846,23 @@ fn native_sample_tier() -> Option<&'static KernelSample> {
     Some(&NATIVE_SAMPLE)
 }
 
-/// Whether this host can read the *target* behind `session_id`, rather than only the dump around
-/// it — the premise of the four tests below.
+/// Whether the engine can read the target's memory at all — `nt`'s own base, asked through
+/// `execute` rather than through the tools under test, so a regression in `walk_memory` cannot
+/// silence the test that catches it.
 ///
-/// **It is a question about symbols, not about architecture**, which is what it was gated on until
-/// [#142](https://github.com/glslang/windbg-mcp/issues/142) was run down. A kernel dump carries its
-/// bug check, its module list and its stack in its own headers, and everything behind a *pointer*
-/// needs `nt`'s symbols: without them the engine answers `0x8007001E` to a read of a module base
-/// and walks a stack into nonsense. Measured on one ARM64 host, four ways — with the SDK's
-/// `dbghelp.dll` and `symsrv.dll` beside the binary it reads the x64 samples and an ARM64 one
-/// completely; with nothing beside the binary (System32 ships `dbghelp.dll` and **no**
-/// `symsrv.dll`, so a `srv*` path downloads nothing) it reproduces that CI failure exactly, same
-/// address and same code; and with the full bundle but `_NT_SYMBOL_PATH` pointed at an empty
-/// directory it fails again, differently per dump. Symbols are the variable in all four.
-///
-/// **Both halves are asked, because a read alone is not the premise.** `nt` has to resolve to a
-/// PDB *and* its base has to read, and the ARM64 CI entry is what settled that a single `dq` is
-/// too weak: the ARM64 sample refuses every read there, so its three tests stand down correctly,
-/// while the x64 driver dump on that same runner *does* give up a module base — and then walks a
-/// stack made of the bug check's own parameters, failing an attribution assertion for an
-/// environmental reason. Reads and symbols fail apart, so a gate over one of them is a gate over
-/// half the premise.
-///
-/// The obvious worry about asking for symbols — that it stands these four down on a runner where
-/// they pass today — is settled rather than assumed. The x64 entry reads `mm_exploit_v5.exe` out
-/// of `SeAuditProcessCreationInfo`, which is a walk through `nt`'s types and cannot happen without
-/// its PDB, so that runner answers `pdb` here by construction.
-///
-/// The read goes through `execute` rather than through the tools under test — otherwise a
-/// regression in `walk_memory` or `crash_triage` would silence the test that exists to catch it.
-fn engine_can_read_this_target(server: &mut Server, session_id: &str) -> bool {
-    let modules = server.tool_data("modules", json!({ "session_id": session_id }), TARGET_STEP);
-    let Some(nt) = modules["modules"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .find(|m| m["name"] == "nt")
-    else {
+/// Non-obvious, and what [#142](https://github.com/glslang/windbg-mcp/issues/142) turned out to
+/// be: a kernel dump's *structure* — bug check, module list, stack — comes out of its own headers
+/// and reads anywhere, while following a **pointer** needs `nt`'s symbols to translate the
+/// address, so an engine that resolved none answers `0x8007001E` here.
+fn engine_reads_target_memory(server: &mut Server, session_id: &str) -> bool {
+    let Some(nt) = nt_module(server, session_id) else {
         return false;
     };
-    // The kernel's own PDB, which is what a pointer is followed through.
-    if nt["symbols"] != "pdb" {
-        return false;
-    }
     let Some(base) = nt["start"].as_str() else {
         return false;
     };
-    // A numeric address, so the read does not itself depend on a symbol resolving; `nt` is a PE
-    // image, so a real read of its first qword carries `MZ`.
+    // A numeric address, so the read does not itself need a symbol; `nt` is a PE image, so a real
+    // read of its first qword carries `MZ`.
     let read = server.call_tool(
         "execute",
         json!({ "session_id": session_id, "command": format!("dq {base} L1") }),
@@ -2922,15 +2871,42 @@ fn engine_can_read_this_target(server: &mut Server, session_id: &str) -> bool {
     !is_tool_error(&read) && text_of(&read["result"]).contains("905a4d")
 }
 
-/// Why a target-reading test stands down. Shared, so the four cannot drift into disagreeing about
-/// what they need.
-const NO_TARGET_READS_SKIP: &str = "this host cannot read the target behind the dump: `nt` \
-                                    resolved no PDB, or its own base would not read, and a kernel \
-                                    dump's pointers are followed through structures the engine \
-                                    locates with those symbols (issue #142) — usually for want of \
-                                    a `symsrv.dll` beside the engine, which System32 does not \
-                                    ship. The dump's own structure still reads, which is what the \
-                                    rest of this tier asserts.";
+/// Whether `nt` resolved to a **PDB**, which is what a walk through its *types* needs: the
+/// `_EPROCESS` behind `process_name`, and a stack walk that gets past the bug check's own
+/// parameters to name a driver.
+///
+/// Separate from [`engine_reads_target_memory`] because the two fail apart. A host can read a
+/// module base and resolve nothing — the ARM64 CI entry is one — and there a stack walk returns
+/// frames made of the bug check parameters, which fails an attribution assertion for a reason
+/// that has nothing to do with attribution.
+fn engine_resolves_kernel_symbols(server: &mut Server, session_id: &str) -> bool {
+    nt_module(server, session_id).is_some_and(|nt| nt["symbols"] == "pdb")
+}
+
+/// The `nt` record out of `modules`, which both probes above start from.
+fn nt_module(server: &mut Server, session_id: &str) -> Option<Value> {
+    let modules = server.tool_data("modules", json!({ "session_id": session_id }), TARGET_STEP);
+    modules["modules"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|m| m["name"] == "nt")
+        .cloned()
+}
+
+/// Why a test that reads a target stands down. Shared, so the tests cannot drift into disagreeing
+/// about what they need.
+const NO_TARGET_READS_SKIP: &str = "this engine could not read `nt`'s own base, so nothing behind \
+                                    a pointer in this dump can be asserted; the usual cause is \
+                                    symbols it could not resolve (issue #142), for want of a \
+                                    `symsrv.dll` beside the engine. The dump's own structure \
+                                    still reads, which is what the rest of this tier asserts.";
+
+/// Why a test that walks `nt`'s types stands down, which is a weaker condition than reading.
+const NO_KERNEL_SYMBOLS_SKIP: &str = "`nt` resolved no PDB on this host, so the `_EPROCESS` and \
+                                      the stack walk behind these fields have nothing to read \
+                                      types out of (issue #142). Reads that need no types are \
+                                      unaffected and are asserted elsewhere in this tier.";
 
 /// An open reports what it is doing while it is doing it, in the order it actually happened.
 ///
@@ -3887,7 +3863,7 @@ fn a_walk_marks_what_it_cannot_read_and_keeps_going() {
     };
     let mut server = Server::started();
     let session_id = server.open_session("open_dump", json!({ "path": sample.path }), TARGET_STEP);
-    if !engine_can_read_this_target(&mut server, &session_id) {
+    if !engine_reads_target_memory(&mut server, &session_id) {
         skip(NO_TARGET_READS_SKIP);
         return;
     }
@@ -4052,8 +4028,12 @@ fn a_bug_check_is_triaged_into_its_fields() {
     let response = server.call_tool("open_dump", json!({ "path": sample.path }), TARGET_STEP);
     assert_no_error(&response, "open_dump");
     let session_id = session_id_of(&response["result"]);
-    if !engine_can_read_this_target(&mut server, &session_id) {
+    if !engine_reads_target_memory(&mut server, &session_id) {
         skip(NO_TARGET_READS_SKIP);
+        return;
+    }
+    if !engine_resolves_kernel_symbols(&mut server, &session_id) {
+        skip(NO_KERNEL_SYMBOLS_SKIP);
         return;
     }
 
@@ -4333,8 +4313,12 @@ fn a_driver_crash_names_the_driver_frame_that_analyze_cannot() {
         text_of(&opened["result"])
     );
     let session_id = session_id_of(&opened["result"]);
-    if !engine_can_read_this_target(&mut server, &session_id) {
+    if !engine_reads_target_memory(&mut server, &session_id) {
         skip(NO_TARGET_READS_SKIP);
+        return;
+    }
+    if !engine_resolves_kernel_symbols(&mut server, &session_id) {
+        skip(NO_KERNEL_SYMBOLS_SKIP);
         return;
     }
 
@@ -4468,8 +4452,9 @@ fn a_batch_commits_or_fails_and_its_rollback_runs_either_way() {
     let response = server.call_tool("open_dump", json!({ "path": sample.path }), TARGET_STEP);
     assert_no_error(&response, "open_dump");
     let session_id = session_id_of(&response["result"]);
-    // The batch disassembles at the captured `@$ip`, which is a read of the target like any other.
-    if !engine_can_read_this_target(&mut server, &session_id) {
+    // The batch disassembles at the captured `@$ip`, which is a read like any other — and needs
+    // no symbol, which is why this asks only for the read.
+    if !engine_reads_target_memory(&mut server, &session_id) {
         skip(NO_TARGET_READS_SKIP);
         return;
     }
