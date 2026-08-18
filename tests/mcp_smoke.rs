@@ -2902,8 +2902,14 @@ fn engine_reads_target_memory(server: &mut Server, session_id: &str) -> bool {
 /// module base and resolve nothing — the ARM64 CI entry is one — and there a stack walk returns
 /// frames made of the bug check parameters, which fails an attribution assertion for a reason
 /// that has nothing to do with attribution.
+///
+/// **Both PDB-backed states count.** `dia` is the same PDB read through the Debug Interface Access
+/// API, so it answers types and carries an identity exactly as `pdb` does — and the server treats
+/// them alike (`worker::with_pdb_identity`). Accepting only `pdb` would stand these tests down on a
+/// host that has everything they need, which is the failure this whole gate exists to avoid,
+/// pointed the other way.
 fn engine_resolves_kernel_symbols(server: &mut Server, session_id: &str) -> bool {
-    nt_module(server, session_id).is_some_and(|nt| nt["symbols"] == "pdb")
+    nt_module(server, session_id).is_some_and(|nt| nt["symbols"] == "pdb" || nt["symbols"] == "dia")
 }
 
 /// The `nt` record out of `modules`, which both probes above start from.
@@ -3294,6 +3300,44 @@ fn a_dump_session_opens_reads_and_closes() {
         }
     }
 
+    // The *other* half of the coordinate: which build, and which symbols for it. **Outside the
+    // target-read gate**, because it needs no target read — `modules` and the engine's own symbol
+    // bookkeeping answer this — and the two premises fail apart, so a host that resolves symbols
+    // but cannot read a page would otherwise skip a check it can run. `pdb` is documented as
+    // absent for a deferred module, which is what the remaining gate is for.
+    if engine_resolves_kernel_symbols(&mut server, &session_id) {
+        let nt = nt_module(&mut server, &session_id).expect("nt is in the module list");
+        let pdb = &nt["pdb"];
+        assert!(
+            !pdb.is_null(),
+            "a module whose symbols resolved has a PDB identity to report: {nt}"
+        );
+        let guid = pdb["guid"]
+            .as_str()
+            .unwrap_or_else(|| panic!("`guid` is a string: {pdb}"));
+        assert!(
+            guid.len() == 32
+                && guid
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() && !c.is_lowercase()),
+            "a PDB GUID is spelled as a symbol server path spells it — 32 uppercase hex \
+             digits, no braces, no dashes: {pdb}"
+        );
+        // The key is what a caller pastes into `<pdb>/<key>/<pdb>`, and the age goes in
+        // **hex**. Read strictly rather than defaulted: a missing `age` defaulted to zero
+        // would agree with a key built from zero, and the schema regression would pass.
+        let age = pdb["age"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("`age` is a number: {pdb}"));
+        assert_eq!(
+            pdb["key"].as_str().unwrap_or_default(),
+            format!("{guid}{age:X}"),
+            "the key is the guid and the age in hex: {pdb}"
+        );
+    } else {
+        skip(NO_KERNEL_SYMBOLS_SKIP);
+    }
+
     // Reading a *target*: walking a stack means reading the stack's pages, so a host that cannot
     // read `nt`'s base cannot do this and says so rather than asserting on an empty walk.
     if engine_reads_target_memory(&mut server, &session_id) {
@@ -3330,43 +3374,6 @@ fn a_dump_session_opens_reads_and_closes() {
                      {from_backtrace}"
                 );
             }
-        }
-
-        // The *other* half of the coordinate: which build, and which symbols for it. Its own
-        // premise — reading a target and *resolving* its symbols fail apart, and `pdb` is
-        // documented as absent for a module whose symbols are still deferred, so asserting it on
-        // a host that reads memory and resolves nothing would report a contract as a regression.
-        if engine_resolves_kernel_symbols(&mut server, &session_id) {
-            let nt = nt_module(&mut server, &session_id).expect("nt is in the module list");
-            let pdb = &nt["pdb"];
-            assert!(
-                !pdb.is_null(),
-                "a module whose symbols resolved has a PDB identity to report: {nt}"
-            );
-            let guid = pdb["guid"]
-                .as_str()
-                .unwrap_or_else(|| panic!("`guid` is a string: {pdb}"));
-            assert!(
-                guid.len() == 32
-                    && guid
-                        .chars()
-                        .all(|c| c.is_ascii_hexdigit() && !c.is_lowercase()),
-                "a PDB GUID is spelled as a symbol server path spells it — 32 uppercase hex \
-                 digits, no braces, no dashes: {pdb}"
-            );
-            // The key is what a caller pastes into `<pdb>/<key>/<pdb>`, and the age goes in
-            // **hex**. Read strictly rather than defaulted: a missing `age` defaulted to zero
-            // would agree with a key built from zero, and the schema regression would pass.
-            let age = pdb["age"]
-                .as_u64()
-                .unwrap_or_else(|| panic!("`age` is a number: {pdb}"));
-            assert_eq!(
-                pdb["key"].as_str().unwrap_or_default(),
-                format!("{guid}{age:X}"),
-                "the key is the guid and the age in hex: {pdb}"
-            );
-        } else {
-            skip(NO_KERNEL_SYMBOLS_SKIP);
         }
 
         // The same coordinate, from the third tool that computes one. `disassemble` with no
