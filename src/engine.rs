@@ -404,6 +404,18 @@ pub struct Session {
     /// Whether `open` has finished with this session and told its caller about it. Until then it
     /// is not reclaimable however idle it looks — see [`Session::busy`].
     delivered: AtomicBool,
+    /// Which client opened this session.
+    ///
+    /// The registry is one map for the whole server — handles are minted from it, the cap is
+    /// shared, and `end_session` ends what it is handed — so two clients on one listener could see
+    /// and end each other's targets. The tenancy gate stood in for a boundary by serving one client
+    /// at a time, and `2026-07-28` removed the identifier that gate was keyed on
+    /// ([#162](https://github.com/glslang/windbg-mcp/issues/162)). Recording the owner makes the
+    /// separation a property of the registry rather than of how many clients are let in.
+    ///
+    /// Always [`crate::client::Client::LOCAL`] under stdio, so the rules below are uniform rather
+    /// than conditional.
+    pub owner: crate::client::Client,
     /// When a call was last submitted against this session.
     ///
     /// The transport's disconnect is what normally releases a target, and under the revision of
@@ -807,12 +819,19 @@ pub enum OpenError {
 /// holding it for the life of the process.
 struct Slot {
     registry: Arc<Mutex<Registry>>,
+    /// Whose open this is, so releasing the slot decrements the right client's count.
+    owner: crate::client::Client,
 }
 
 impl Drop for Slot {
     fn drop(&mut self) {
         let mut registry = self.registry.lock().unwrap_or_else(|e| e.into_inner());
-        registry.opening = registry.opening.saturating_sub(1);
+        if let Some(count) = registry.opening.get_mut(&self.owner) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                registry.opening.remove(&self.owner);
+            }
+        }
     }
 }
 
@@ -845,7 +864,7 @@ struct Registry {
     /// Without this the capacity check is blind to opens already in flight, and two of them can
     /// each look at the same four live sessions, each conclude there is room, and each spawn —
     /// so the bound is only enforced against sessions that finished opening.
-    opening: usize,
+    opening: HashMap<crate::client::Client, usize>,
     /// Set once the client has disconnected. Refuses new opens, so the set of workers to release
     /// stops growing while shutdown is walking it.
     closing: bool,
@@ -856,11 +875,11 @@ impl Registry {
     ///
     /// Computed rather than stored, so ending the newest session falls back to the one before it
     /// instead of leaving the server with no default while a perfectly good target is loaded.
-    fn current(&self) -> Option<Arc<Session>> {
+    fn current(&self, owner: &crate::client::Client) -> Option<Arc<Session>> {
         self.all
             .iter()
             .rev()
-            .find(|s| s.state().accepts_default())
+            .find(|s| s.state().accepts_default() && &s.owner == owner)
             .cloned()
     }
 
@@ -872,6 +891,20 @@ impl Registry {
         self.all
             .iter()
             .filter(|s| s.state().is_live())
+            .cloned()
+            .collect()
+    }
+
+    /// The live sessions belonging to one client.
+    ///
+    /// Every question a *caller* asks is this one rather than [`Self::live`]: which session is
+    /// current, whether there is room to open another, what `session_status` lists. `live` stays
+    /// the server's own view, for the sweeps and the shutdown that are about workers rather than
+    /// about who owns them.
+    fn live_for(&self, owner: &crate::client::Client) -> Vec<Arc<Session>> {
+        self.all
+            .iter()
+            .filter(|s| s.state().is_live() && &s.owner == owner)
             .cloned()
             .collect()
     }
@@ -968,8 +1001,9 @@ impl Sessions {
     /// them, from being missed.
     pub fn resolve(&self, supplied: Option<&str>) -> Result<Arc<Session>, EngineError> {
         let registry = self.registry();
+        let caller = crate::client::current();
         let Some(want) = supplied else {
-            let current = registry.current().ok_or_else(|| {
+            let current = registry.current(&caller).ok_or_else(|| {
                 EngineError::Stale(
                     "no debug session is open. Start one with open_dump / open_trace / \
                      attach_process / attach_kernel / attach_kernel_local / launch."
@@ -980,16 +1014,20 @@ impl Sessions {
             return Ok(current);
         };
         match registry.find(want) {
+            // **Another client's handle is not "refused", it is unknown.** Saying "that session
+            // belongs to someone else" would confirm the handle exists and leak that a second
+            // client is here, and there is nothing this caller could do with the answer. The
+            // message below is the one a handle this server never issued gets, which is exactly
+            // what this handle is from where the caller stands.
+            Some(session) if session.owner != caller => {
+                Err(EngineError::Stale(unknown_handle(want)))
+            }
             Some(session) if session.state().accepts_handle() => {
                 crate::record::routed_to(&session.id);
                 Ok(session)
             }
             Some(session) => Err(EngineError::Stale(stale_handle(want, &session.state()))),
-            None => Err(EngineError::Stale(format!(
-                "unknown session handle `{want}`: this server is not holding it. Either it was \
-                 never issued here, or it closed a while ago and has aged out of the session \
-                 history. A session still in flight is never forgotten, so opening again is safe."
-            ))),
+            None => Err(EngineError::Stale(unknown_handle(want))),
         }
     }
 
@@ -1007,10 +1045,15 @@ impl Sessions {
 
     pub fn snapshot(&self) -> Vec<SessionSnapshot> {
         let registry = self.registry();
-        let current = registry.current().map(|s| s.id.clone());
+        // A caller is shown its own sessions and told which of *those* is current. Another client's
+        // are not listed: the handles would be unusable, and reporting them would say how many
+        // clients this server has and what they are debugging.
+        let caller = crate::client::current();
+        let current = registry.current(&caller).map(|s| s.id.clone());
         registry
             .all
             .iter()
+            .filter(|s| s.owner == caller)
             .rev()
             .map(|s| SessionSnapshot {
                 id: s.id.clone(),
@@ -1685,12 +1728,17 @@ impl Sessions {
         if registry.closing {
             return Err(shutting_down());
         }
-        let live = registry.live();
+        // **This client's sessions, not the server's.** The cap is what stops one caller filling
+        // the machine with engine processes; applying it across clients would let a busy one deny
+        // a quiet one, which is the shared-registry harm this separation exists to end.
+        let caller = crate::client::current();
+        let live = registry.live_for(&caller);
+        let in_flight_for_caller = registry.opening.get(&caller).copied().unwrap_or(0);
         // How many sessions would have to be reclaimed to be back at the limit once this open,
         // and every open already in flight, has landed — against how many *can* be. Counting the
         // opens in flight is what stops two of them spending the same idle session: the first
         // needs one reclaimable, the second needs two.
-        let needed = (live.len() + registry.opening + 1).saturating_sub(MAX_SESSIONS);
+        let needed = (live.len() + in_flight_for_caller + 1).saturating_sub(MAX_SESSIONS);
         let reclaimable = live.iter().filter(|s| !s.busy()).count();
         if needed > reclaimable {
             let listed: Vec<String> = live
@@ -1700,7 +1748,7 @@ impl Sessions {
                     format!("  {} — {} ({}){busy}", s.id, s.kind.label(), s.what)
                 })
                 .collect();
-            let in_flight = match registry.opening {
+            let in_flight = match in_flight_for_caller {
                 0 => String::new(),
                 n => format!(
                     " ({n} more open{} already in flight)",
@@ -1718,9 +1766,10 @@ impl Sessions {
                 listed.join("\n")
             ));
         }
-        registry.opening += 1;
+        *registry.opening.entry(caller.clone()).or_default() += 1;
         Ok(Slot {
             registry: Arc::clone(&self.inner),
+            owner: caller,
         })
     }
 
@@ -1756,7 +1805,7 @@ impl Sessions {
             );
             victims.push(victim);
         }
-        let over = self.registry().live().len();
+        let over = self.registry().live_for(&keeping.owner).len();
         if over > MAX_SESSIONS {
             // The honest outcome when nothing is reclaimable: the alternatives are ending
             // someone's live target or discarding one that already opened. It does not compound —
@@ -1795,7 +1844,10 @@ impl Sessions {
     /// one cannot see the same session as live-and-idle, pick it too, and free nothing.
     fn claim_overage_victim(&self, keeping: &Arc<Session>) -> Option<Arc<Session>> {
         let registry = self.registry();
-        let live = registry.live();
+        // **The owner's own sessions.** Reclaiming another client's idle target to make room for
+        // this one is precisely the harm a shared registry did: it ends a session its owner still
+        // holds a handle to, for a reason that has nothing to do with them.
+        let live = registry.live_for(&keeping.owner);
         if live.len() <= MAX_SESSIONS {
             return None;
         }
@@ -1896,6 +1948,7 @@ impl Sessions {
             what,
             pid,
             created: Instant::now(),
+            owner: crate::client::current(),
             last_used: Mutex::new(Instant::now()),
             state: Mutex::new((SessionState::Opening, Instant::now())),
             tx,
@@ -1987,6 +2040,19 @@ fn promote_opened(session: &Session) {
         matches!(state, SessionState::Opening | SessionState::Attaching)
             .then_some(SessionState::Open)
     });
+}
+
+/// What a caller is told about a handle this server will not route.
+///
+/// One message for two cases — a handle that was never issued, and one belonging to another client
+/// — because from where the caller stands they are the same fact, and distinguishing them would
+/// confirm the existence of a session it may not touch.
+fn unknown_handle(want: &str) -> String {
+    format!(
+        "unknown session handle `{want}`: this server is not holding it. Either it was never \
+         issued here, or it closed a while ago and has aged out of the session history. A session \
+         still in flight is never forgotten, so opening again is safe."
+    )
 }
 
 /// Settles a session whose opener failed **without creating anything**, and ends its worker
@@ -3033,6 +3099,114 @@ mod tests {
         assert!(closed.contains("open_dump"), "{closed}");
     }
 
+    // ---- one registry, several clients ---------------------------------------------
+
+    /// The property the whole owner field exists for: a handle is only usable by the client that
+    /// opened it, and to anyone else it is not "refused" but *unknown* — saying otherwise would
+    /// confirm a session exists that the caller may not touch.
+    #[tokio::test]
+    async fn a_handle_is_not_usable_by_another_client() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let opener = crate::client::Client::new("laptop");
+        let session = crate::client::as_client(opener.clone(), async {
+            let session = dormant("sess-laptop", SessionState::Open);
+            sessions.registry().all.push_back(Arc::clone(&session));
+            session
+        })
+        .await;
+        assert_eq!(session.owner, opener);
+
+        // Its own client routes to it, by handle and by default.
+        crate::client::as_client(opener, async {
+            assert!(sessions.resolve(Some("sess-laptop")).is_ok());
+            assert_eq!(sessions.resolve(None).expect("current").id, "sess-laptop");
+        })
+        .await;
+
+        crate::client::as_client(crate::client::Client::new("ci"), async {
+            let by_handle = sessions
+                .resolve(Some("sess-laptop"))
+                .expect_err("another client's handle must not route");
+            assert!(
+                by_handle.to_string().contains("unknown session handle"),
+                "the refusal must not confirm the session exists: {by_handle}"
+            );
+            let by_default = sessions
+                .resolve(None)
+                .expect_err("another client's session is not this one's current");
+            assert!(
+                by_default.to_string().contains("no debug session is open"),
+                "{by_default}"
+            );
+        })
+        .await;
+    }
+
+    /// And it is not listed either. Reporting another client's sessions would hand over handles it
+    /// cannot use, and say how many clients this server has and what they are debugging.
+    #[tokio::test]
+    async fn session_status_shows_only_the_callers_own() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        for (client, id) in [("laptop", "sess-laptop"), ("ci", "sess-ci")] {
+            crate::client::as_client(crate::client::Client::new(client), async {
+                sessions
+                    .registry()
+                    .all
+                    .push_back(dormant(id, SessionState::Open));
+            })
+            .await;
+        }
+
+        let listed = crate::client::as_client(crate::client::Client::new("laptop"), async {
+            sessions
+                .snapshot()
+                .into_iter()
+                .map(|s| s.id)
+                .collect::<Vec<_>>()
+        })
+        .await;
+        assert_eq!(listed, vec!["sess-laptop".to_string()]);
+    }
+
+    /// The cap is per client, so a caller that fills its own quota cannot deny another one — the
+    /// shared-limit version of the same harm.
+    #[tokio::test]
+    async fn one_clients_sessions_do_not_fill_anothers_quota() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        crate::client::as_client(crate::client::Client::new("hog"), async {
+            for n in 0..MAX_SESSIONS {
+                sessions
+                    .registry()
+                    .all
+                    .push_back(dormant(&format!("sess-hog-{n}"), SessionState::Attaching));
+            }
+            assert!(
+                sessions.take_slot().is_err(),
+                "the client at its own limit is refused"
+            );
+        })
+        .await;
+
+        crate::client::as_client(crate::client::Client::new("quiet"), async {
+            assert!(
+                sessions.take_slot().is_ok(),
+                "a client with no sessions has room, whatever another client is holding"
+            );
+        })
+        .await;
+    }
+
+    /// Opens in flight for the client these tests run as, which is the local one: the counter is
+    /// per client now, so a bare total would answer a question the registry no longer asks.
+    fn in_flight_opens(sessions: &Sessions) -> usize {
+        sessions
+            .registry()
+            .opening
+            .get(&crate::client::current())
+            .copied()
+            .unwrap_or(0)
+    }
+
     // ---- releasing what nobody is using -------------------------------------------
 
     /// The clock alone is not the question. A session with a call outstanding is in use however
@@ -3107,6 +3281,7 @@ mod tests {
             what: "test".to_string(),
             pid: 0,
             created: Instant::now(),
+            owner: crate::client::current(),
             last_used: Mutex::new(Instant::now()),
             state: Mutex::new((state, Instant::now())),
             tx,
@@ -3455,7 +3630,7 @@ mod tests {
         );
         // The open failed on the way, so the slot goes back.
         drop(slot);
-        assert_eq!(sessions.registry().opening, 0);
+        assert_eq!(in_flight_opens(&sessions), 0);
         assert_eq!(sessions.registry().live().len(), MAX_SESSIONS);
     }
 
@@ -3472,7 +3647,7 @@ mod tests {
         let _first = sessions
             .take_slot()
             .expect("the idle session pays for this one");
-        assert_eq!(sessions.registry().opening, 1);
+        assert_eq!(in_flight_opens(&sessions), 1);
         // Hmm — the same idle session cannot pay twice, but it is still idle, so the check has to
         // reason about the open already in flight rather than about the sessions alone.
         let second = sessions.take_slot();
