@@ -60,16 +60,24 @@ it is not one. Measured on one ARM64 host:
 
 Same engine, same dumps: symbols are the variable, and the engine's architecture is not.
 
-So the four **ask the host** instead of guessing from `cfg!(target_arch)`: one `dq` at `nt`'s base,
-issued through `execute` rather than through the tools under test, since a regression in
-`walk_memory` must not be able to silence the test that catches it. The question is deliberately
-the *read* rather than the symbols behind it: the third measurement above is a host that reads a
-module base while resolving nothing, so a symbol-shaped gate could stand these four down on a
-runner where they pass today — and a skip that quiet is the failure this gate exists to avoid. A
-host that reads but cannot resolve fails the assertions instead, loudly, as it did before the gate
-existed; the driver-crash assertion says so in its message. Where the read comes back empty the
-test prints `SKIPPED` with the reason and what still holds — which is what an `ignore` keyed to an
-architecture could never say.
+So the four **ask the host** instead of guessing from `cfg!(target_arch)`: `nt` has to resolve to
+a PDB, *and* its base has to read — the read issued through `execute` rather than through the tools
+under test, since a regression in `walk_memory` must not be able to silence the test that catches
+it. Where either half comes back empty the test prints `SKIPPED` with the reason and what still
+holds, which is what an `ignore` keyed to an architecture could never say.
+
+**Both halves, because the first attempt asked only for the read and the ARM64 CI entry failed on
+it.** The three tests pointed at the ARM64 sample stood down correctly there — nothing in that dump
+reads on a runner with no `symsrv.dll` — while the driver-crash test, which keeps its x64 dump on
+every architecture, found that dump's module base perfectly readable, walked a stack made of the
+bug check's own parameters, and failed an attribution assertion for a reason that had nothing to do
+with attribution. Reads and symbols fail apart, and the third measurement above is the same
+asymmetry in a controlled form.
+
+The worry that pointed the other way — that asking for symbols stands these four down on a runner
+where they pass today — is settled rather than assumed: the x64 entry reads `mm_exploit_v5.exe` out
+of `SeAuditProcessCreationInfo`, a walk through `nt`'s types that cannot happen without its PDB, so
+that runner answers `pdb` to this question by construction.
 
 **The sample they open follows the host.** Three dumps are checked in (below), and the two crashes
 a *memory* read is asserted against are paired with the architecture the tests are running on — so

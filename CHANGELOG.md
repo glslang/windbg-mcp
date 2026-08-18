@@ -102,15 +102,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reported failure down to the address and the `0x8007001E`, which is the evidence for what state
   it is in.
 
-  So the four ask the host instead: one `dq` at `nt`'s base, issued through `execute` rather than
-  through the tools under test, so that a regression in `walk_memory` or `crash_triage` cannot
-  silence the test that exists to catch it. The question is the *read* and not the symbols behind
-  it on purpose — a symbol-shaped gate would be closer to the cause and worse in practice, because
-  the x64 samples still give up a module base on a host that resolves nothing, and standing four
-  assertions down on a runner where they pass today is precisely the quiet failure this replaces.
-  Where the read comes back empty the test prints `SKIPPED` with the reason and what still holds;
-  a host that reads without resolving fails the assertions loudly instead, and the driver-crash
-  one now says in its own message which of the two that is.
+  So the four ask the host instead: `nt` has to resolve to a PDB, *and* its base has to read — the
+  read issued through `execute` rather than through the tools under test, so that a regression in
+  `walk_memory` or `crash_triage` cannot silence the test that exists to catch it. Where either
+  half comes back empty the test prints `SKIPPED` with the reason and what still holds.
+
+  Both halves, because a first attempt asked only for the read and the ARM64 CI entry disproved it
+  within the hour: the three tests on the ARM64 sample stood down correctly there, while the
+  driver-crash test — which keeps its x64 dump on every architecture — found that dump's module
+  base readable, walked a stack made of the bug check's own parameters, and failed an attribution
+  assertion for a reason that had nothing to do with attribution. The worry that pointed the other
+  way, that a symbol-shaped gate might silence assertions that pass on x64 today, is settled rather
+  than assumed: that entry reads `mm_exploit_v5.exe` out of `SeAuditProcessCreationInfo`, which is
+  a walk through `nt`'s types and cannot happen without its PDB.
 
 ### Changed
 

@@ -2880,25 +2880,36 @@ fn native_sample_tier() -> Option<&'static KernelSample> {
 /// address and same code; and with the full bundle but `_NT_SYMBOL_PATH` pointed at an empty
 /// directory it fails again, differently per dump. Symbols are the variable in all four.
 ///
-/// What it asks is nevertheless the **read**, not the symbols behind it: one `dq` at `nt`'s base,
-/// which is the thing every one of the four needs first. Asking `nt` for a PDB instead would be
-/// closer to the cause and strictly worse as a gate — the x64 samples give up a module base on a
-/// host with no symbols at all, so a symbol-shaped question could stand these four down on a
-/// runner where they pass today, and a skip that quiet is the failure mode this whole gate exists
-/// to avoid. A host that reads but does not resolve fails the assertions instead, which is what it
-/// did before this gate existed and is loud in the right way.
+/// **Both halves are asked, because a read alone is not the premise.** `nt` has to resolve to a
+/// PDB *and* its base has to read, and the ARM64 CI entry is what settled that a single `dq` is
+/// too weak: the ARM64 sample refuses every read there, so its three tests stand down correctly,
+/// while the x64 driver dump on that same runner *does* give up a module base — and then walks a
+/// stack made of the bug check's own parameters, failing an attribution assertion for an
+/// environmental reason. Reads and symbols fail apart, so a gate over one of them is a gate over
+/// half the premise.
+///
+/// The obvious worry about asking for symbols — that it stands these four down on a runner where
+/// they pass today — is settled rather than assumed. The x64 entry reads `mm_exploit_v5.exe` out
+/// of `SeAuditProcessCreationInfo`, which is a walk through `nt`'s types and cannot happen without
+/// its PDB, so that runner answers `pdb` here by construction.
 ///
 /// The read goes through `execute` rather than through the tools under test — otherwise a
 /// regression in `walk_memory` or `crash_triage` would silence the test that exists to catch it.
 fn engine_can_read_this_target(server: &mut Server, session_id: &str) -> bool {
     let modules = server.tool_data("modules", json!({ "session_id": session_id }), TARGET_STEP);
-    let Some(base) = modules["modules"]
+    let Some(nt) = modules["modules"]
         .as_array()
         .into_iter()
         .flatten()
         .find(|m| m["name"] == "nt")
-        .and_then(|m| m["start"].as_str())
     else {
+        return false;
+    };
+    // The kernel's own PDB, which is what a pointer is followed through.
+    if nt["symbols"] != "pdb" {
+        return false;
+    }
+    let Some(base) = nt["start"].as_str() else {
         return false;
     };
     // A numeric address, so the read does not itself depend on a symbol resolving; `nt` is a PE
@@ -2913,12 +2924,13 @@ fn engine_can_read_this_target(server: &mut Server, session_id: &str) -> bool {
 
 /// Why a target-reading test stands down. Shared, so the four cannot drift into disagreeing about
 /// what they need.
-const NO_TARGET_READS_SKIP: &str = "this engine cannot read the target: `nt`'s own base did not \
-                                    read, which on a kernel dump means it resolved none of `nt`'s \
-                                    symbols to follow a pointer with (issue #142), usually for \
-                                    want of a `symsrv.dll` beside the engine. The dump's own \
-                                    structure still reads, which is what the rest of this tier \
-                                    asserts.";
+const NO_TARGET_READS_SKIP: &str = "this host cannot read the target behind the dump: `nt` \
+                                    resolved no PDB, or its own base would not read, and a kernel \
+                                    dump's pointers are followed through structures the engine \
+                                    locates with those symbols (issue #142) — usually for want of \
+                                    a `symsrv.dll` beside the engine, which System32 does not \
+                                    ship. The dump's own structure still reads, which is what the \
+                                    rest of this tier asserts.";
 
 /// An open reports what it is doing while it is doing it, in the order it actually happened.
 ///

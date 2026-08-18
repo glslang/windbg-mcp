@@ -89,10 +89,12 @@ jobs:
     #
     # The four assertions that read a *target* rather than the dump around it open the sample
     # matching the runner's architecture — an ARM64 dump is checked in for this entry (issue #143)
-    # — and check first that this runner can read one at all, with a single `dq` at `nt`'s base. A
-    # kernel dump's pointers are followed through structures the engine locates with `nt`'s
-    # symbols, and a runner that resolves none reads the dump's own structure and nothing behind
-    # it. That, and not the architecture pairing it was first read as, is issue #142:
+    # — and check first that this runner can read one at all: `nt` resolving to a PDB, and its own
+    # base reading. A kernel dump's pointers are followed through structures the engine locates
+    # with those symbols, and a runner that resolves none reads the dump's own structure and
+    # nothing behind it. Both halves are asked because they fail apart — this entry is where that
+    # was learned, by passing the read and failing the walk. That, and not the architecture
+    # pairing it was first read as, is issue #142:
     # Windows ships `dbghelp.dll` in System32 and no `symsrv.dll` anywhere outside the Debugging
     # Tools, so a runner without them resolves nothing over a `srv*` path — and running that
     # configuration by hand reproduces the reported failure address for address. Those
