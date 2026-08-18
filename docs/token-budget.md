@@ -156,7 +156,7 @@ None of these is a bug. They are recorded because they were invisible, and
 4. **The instructions overran what the client reads** — **fixed**. 3,147 chars were sent and 2,048
    read, so 1,099 were paid for on every connection and discarded, and what fell off the end was the
    `debug_batch` paragraph: the one instruction there that stops a mutation being left half-applied.
-   Rewritten to 1,996 characters with the batch guidance inside the budget, kept ASCII so the
+   Rewritten to 1,990 characters with the batch guidance inside the budget, kept ASCII so the
    character and byte counts cannot diverge, and pinned by an assertion in the protocol tier so it
    cannot grow back unnoticed.
 5. **`modules` has neither a `limit` nor a cap**, alone among the high-volume tools. 53,875 B here;
@@ -172,10 +172,10 @@ None of these is a bug. They are recorded because they were invisible, and
    finding that is purely model-visible and purely this server's to fix, and it is what the ratio
    rule below exists to stop spreading.
 8. **Five tools are a third of the model-visible surface**, and it is their *input* schemas rather
-   than their prose. `debug_batch` alone is 9,728 B — 15% of everything a model is given before it
-   asks anything — of which 7,962 B is the `StepAction`/`Check` vocabulary its schema pulls out of
-   `src/batch.rs`. Then `walk_memory` 4,058, `crash_triage` 2,894, `reachable_from_dispatch` 2,610,
-   `server_log` 2,599: **21,889 B, 33%**, against a median tool of 882 B.
+   than their prose. `debug_batch` alone is 9,746 B — 15% of everything a model is given before it
+   asks anything — of which 7,980 B is the `StepAction`/`Check` vocabulary its schema pulls out of
+   `src/batch.rs`. Then `walk_memory` 4,076, `crash_triage` 2,912, `reachable_from_dispatch` 2,628,
+   `server_log` 2,599: **21,961 B, 33%**, against a median tool of 900 B.
 
    This is where the weight is, and it is a different kind of problem from findings 1–4. Those were
    duplication and waste — the same string paid for repeatedly, or a tail nobody reads. This is one

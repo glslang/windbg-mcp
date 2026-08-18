@@ -125,7 +125,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The server instructions now fit what the client reads.** They were 3,147 characters against a
   measured 2,048-character limit, so 1,099 were paid for on every connection and discarded — and
   what fell off the end was the `debug_batch` paragraph, the one instruction there that stops a
-  mutation being left half-applied. Rewritten to 1,996 characters with that guidance inside the
+  mutation being left half-applied. Rewritten to 1,990 characters with that guidance inside the
   budget, kept ASCII so the character and byte counts cannot diverge, and asserted in the protocol
   tier so it cannot grow back unnoticed.
 
@@ -146,7 +146,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which the same document establishes no model reads. The real model-visible figure was 4,695 B.
   Both the item and [`docs/token-budget.md`](./docs/token-budget.md) are corrected, and the doc
   gains the finding that measurement actually supports — five tools carry a third of the surface,
-  in their *input* schemas, `debug_batch` alone being 15% of it.
+  in their *input* schemas, `debug_batch` alone being 15% of it. The `session_id` wording also gained
+  back what an earlier draft of it dropped: a handle is refused when the target was **replaced** by a
+  raw command, not only when the session closed, and the README explains the asymmetry that makes
+  that guarantee worth having — a retired session refuses its handle while still answering a call
+  that names none.
 
 - **`modules` reports which PDB the engine has for a module** — `guid`, `age`, and the `key` those
   two make, which is the middle element of a symbol server's `<pdb>/<key>/<pdb>` path. It completes

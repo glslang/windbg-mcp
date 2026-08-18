@@ -740,7 +740,7 @@ landed on their own so that each of the items below can be argued, and measured,
   channel it is claimed for is not a finding, which is worth remembering for the rest of this list.
 - **The instructions overran what the client reads** — **done**. 3,147 chars sent against 2,048
   read, so the `debug_batch` paragraph — the one instruction that stops a mutation being left
-  half-applied — was charged for on every connection and discarded. Now 1,996 chars with that
+  half-applied — was charged for on every connection and discarded. Now 1,990 chars with that
   guidance inside the budget, ASCII so characters and bytes cannot diverge, and asserted in the
   protocol tier.
 - **`registers` returns 15.9x more JSON than its own text** (9,804 B vs 618 B), because every row
@@ -748,9 +748,9 @@ landed on their own so that each of the items below can be argued, and measured,
   answer this server gives at 53,875 B. The ratio rule in `tool_results_stay_within_their_budget`
   stops this spreading; it does not fix these two.
 - **Five tools are a third of the model-visible surface**, and it is their input schemas:
-  `debug_batch` 9,728 B (7,962 of it the `StepAction`/`Check` vocabulary), `walk_memory` 4,058,
-  `crash_triage` 2,894, `reachable_from_dispatch` 2,610, `server_log` 2,599 — 21,889 B against a
-  median tool of 882 B. This is where the weight actually is, and unlike the items above it is not
+  `debug_batch` 9,746 B (7,980 of it the `StepAction`/`Check` vocabulary), `walk_memory` 4,076,
+  `crash_triage` 2,912, `reachable_from_dispatch` 2,628, `server_log` 2,599 — 21,961 B against a
+  median tool of 900 B. This is where the weight actually is, and unlike the items above it is not
   waste but one tool honestly describing a rich argument. The levers are design choices: a smaller
   step vocabulary, a `$ref` the client resolves, or a surface that does not offer every tool to
   every caller.
