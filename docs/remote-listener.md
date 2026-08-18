@@ -184,27 +184,61 @@ time, because a live kernel that is merely killed is left halted.
 
 [SEP-2567]: https://modelcontextprotocol.io/seps/2567-sessionless-mcp
 
-## One client at a time
+## A client per token, and sessions that belong to it
 
-A second client is refused with `409`. This is forced by the registry rather than chosen: session
-handles are minted globally, the four-session cap is shared, and `end_session` ends whatever it is
-handed — so two clients would silently share, and one could end a target the other was using.
+A listener may hold several tokens, each naming a client, and **a session belongs to the client that
+opened it**:
 
-The token is the identity. There is one authorised client, so presenting the token *is* the proof,
-and a reconnect needs nothing further.
+```console
+setx WINDBG_MCP_LISTEN_TOKEN        "<a long random string>"   # the client named `local`
+setx WINDBG_MCP_LISTEN_TOKEN_CI     "<another>"                # the client named `ci`
+setx WINDBG_MCP_LISTEN_TOKEN_LAPTOP "<another>"                # `laptop`
+```
 
-A `409` therefore means one of:
+The suffix is the name, lowercased — the same rule a kernel profile's variable follows. The unnamed
+variable still works and names the client `local`, which is also who every stdio call runs as, so
+one set of rules covers both transports. Configuring one token for two names is refused at startup:
+the winner would be a hash-map ordering detail, and a boundary that moves between runs is not one.
 
-- another client holds the server, and has not gone away or timed out yet;
-- a client is mid-`initialize` and has not been given a session id yet;
-- sessions are being released after a lease expired, which finishes within a sweep (5 s);
-- your own request outlived its claim — open a new session.
+What ownership buys, and it is the whole of it:
 
-Tenancy changes hands only when nothing is still using the server: no HTTP request admitted under
-the holder is outstanding, **and** no debug session has work in flight. The second is the one worth
-knowing about, because an engine job outlives the request that asked for it — a call whose client
-gave up is still running against the target, and the server will not hand that target on until it
-finishes.
+| | |
+| --- | --- |
+| Routing | a handle only routes for the client that opened it; omitting one finds *that* client's newest session |
+| Refusal | another client's handle is reported **unknown**, not "someone else's" — the answer must not confirm a session the caller may not touch |
+| Listing | `session_status` shows the caller's sessions and no others |
+| Capacity | the four-session cap is per client, so a busy one cannot deny a quiet one |
+| Reclamation | a session is only ever reclaimed to make room for **its own** client |
+| The log | `server_log` shows the caller's sessions' records, plus the supervisor's own, which name no session |
+| Lease expiry | releases the sessions of the client whose lease ran out, and no others |
+| Contention | **within** a client only — one client's long call does not make another wait |
+
+**Why authentication is the identity.** `2026-07-28` removed the protocol-level MCP session
+([SEP-2567]), so there is no session id to key on; requests arrive on whatever socket a client's
+pool hands them, so there is no connection either; and `clientInfo` is not retained between
+requests. The credential is what is left, and it is what every other stateless HTTP API uses. A name
+a client presents for itself would be a label; a name only the holder of a token can present is a
+boundary.
+
+**Two clients do not queue behind each other.** The lease still arbitrates *within* a client — two
+connections presenting the same token contend, and the second gets a `409` — because that is one
+client racing itself. Across clients there is nothing to arbitrate: a pool walk that keeps one
+client busy for four minutes used to make every other client wait, for a boundary the registry now
+provides properly.
+
+**This does not authorise anything beyond separation.** Every client that can authenticate has the
+whole tool surface, including `execute` and `launch`. Tokens separate clients from each other; they
+do not rank them.
+
+**A token file is the only credential when one is configured.** `WINDBG_MCP_LISTEN_TOKEN_FILE` shuts
+the environment out entirely — named tokens included — rather than merely outranking the unnamed
+variable. That precedence is load-bearing: the service installer ACLs that file to SYSTEM and
+Administrators *because* the machine environment is readable by unprivileged processes, so a
+variable standing beside it would reintroduce exactly what the file was written to avoid.
+
+**Every credential variable is stripped from the processes this server creates** — engine workers
+and the TTD recorder — by prefix rather than by name, so a token added later cannot quietly reach a
+debuggee. See the warning above about what that does and does not protect.
 
 ## Reading the server's log from the client machine
 

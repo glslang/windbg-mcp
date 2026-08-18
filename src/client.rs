@@ -116,6 +116,7 @@ impl Credentials {
         file_token: Option<String>,
     ) -> Result<Self> {
         let mut by_token: HashMap<String, Client> = HashMap::new();
+        let mut named: HashMap<String, String> = HashMap::new();
         let mut insert = |token: String, name: &str| -> Result<()> {
             if let Some(existing) = by_token.get(&token) {
                 bail!(
@@ -124,22 +125,44 @@ impl Credentials {
                      name happened to win."
                 );
             }
+            // **And the other way round.** Two *different* tokens landing on one name is the more
+            // insidious half: nothing looks wrong, both callers authenticate, and they silently
+            // share a namespace — routing, listing, capacity, teardown rights, the lot. Names are
+            // folded before comparison, so `WINDBG_MCP_LISTEN_TOKEN` and `…_TOKEN_LOCAL` collide
+            // (both `local`), as do `…_CI` and `…__CI`. A boundary two credentials can stand on is
+            // not a boundary, so this is a configuration error rather than a merge.
+            if let Some(other) = named.get(name) {
+                bail!(
+                    "two different tokens are configured for the client `{name}` (`{other}` and \
+                     this one). Each client is one credential: two would share every session, \
+                     which is the isolation this is for, silently absent."
+                );
+            }
+            named.insert(name.to_string(), token.clone());
             by_token.insert(token, Client::new(name));
             Ok(())
         };
 
+        // **A configured file is the *only* credential.** That precedence predates named tokens
+        // and is load-bearing: the service installer writes the token to `%ProgramData%` with an
+        // ACL of SYSTEM and Administrators precisely because the machine environment is readable by
+        // unprivileged processes. Letting an environment token stand beside it would mean a stale
+        // or planted variable authenticating to a LocalSystem listener — which has `launch` on it.
+        // So a file shuts the environment out entirely rather than merely outranking the unnamed
+        // variable.
         if let Some(token) = file_token {
             insert(token, Client::LOCAL)?;
+            return Ok(Self { by_token });
         }
         for (key, value) in vars {
             let token = value.trim().to_string();
             if token.is_empty() {
                 continue;
             }
-            if key == TOKEN_FILE_ENV {
+            if is_token_file(&key) {
                 continue;
             }
-            match key.strip_prefix(TOKEN_ENV) {
+            match credential_suffix(&key) {
                 // The unnamed variable, which is what every existing setup uses.
                 Some("") => insert(token, Client::LOCAL)?,
                 // `WINDBG_MCP_LISTEN_TOKEN_CI` names the client `ci`, the same lowercasing a
@@ -155,6 +178,62 @@ impl Credentials {
             }
         }
         Ok(Self { by_token })
+    }
+}
+
+/// The part of a credential variable's name after the prefix, if it is one.
+///
+/// **Compared case-insensitively, because Windows environment names are.** `std::env::var` finds
+/// `Windbg_Mcp_Listen_Token` for a lookup of `WINDBG_MCP_LISTEN_TOKEN`, and a host configured that
+/// way worked until this scan replaced that lookup. Getting it wrong is two failures at once: a
+/// listener that refuses to start because it can no longer see its own token, and — worse — a
+/// mixed-case variable that [`token_file`]'s `var_os` still resolves while the strip below walks
+/// past it, handing a debuggee the credential.
+///
+/// Length-preserving on ASCII, which every variable here is, so the suffix is taken from the
+/// original name rather than the folded copy.
+fn credential_suffix(name: &str) -> Option<&str> {
+    name.to_ascii_uppercase()
+        .starts_with(TOKEN_ENV)
+        .then(|| &name[TOKEN_ENV.len()..])
+}
+
+/// Whether this variable names the token *file* rather than carrying a token.
+fn is_token_file(name: &str) -> bool {
+    name.eq_ignore_ascii_case(TOKEN_FILE_ENV)
+}
+
+/// Every environment variable that configures a credential, for a process that must not inherit
+/// one.
+///
+/// **Prefix, not a list.** `Credentials::from_entries` accepts anything starting with
+/// `WINDBG_MCP_LISTEN_TOKEN`, so a strip that named the variables it knew about would let the next
+/// named token through — and the failure would be silent, a debuggee holding a credential nobody
+/// meant to hand it. The path in `…_TOKEN_FILE` is stripped for the same reason: a target that
+/// knows where the token lives can read it if the file is reachable at all.
+pub fn strip_credentials(command: &mut impl EnvRemove) {
+    for (name, _) in std::env::vars() {
+        if credential_suffix(&name).is_some() {
+            command.remove(&name);
+        }
+    }
+}
+
+/// The one thing [`strip_credentials`] needs of a command, so it can serve both the worker spawn
+/// (which uses tokio's) and the TTD recorder (which uses the standard library's).
+pub trait EnvRemove {
+    fn remove(&mut self, name: &str);
+}
+
+impl EnvRemove for std::process::Command {
+    fn remove(&mut self, name: &str) {
+        self.env_remove(name);
+    }
+}
+
+impl EnvRemove for tokio::process::Command {
+    fn remove(&mut self, name: &str) {
+        self.env_remove(name);
     }
 }
 
@@ -236,6 +315,76 @@ mod tests {
         );
         let why = clash.expect_err("a duplicate token is a configuration error");
         assert!(why.to_string().contains("cannot name two clients"), "{why}");
+    }
+
+    /// Windows environment names are case-insensitive, and `std::env::var` honours that — so a host
+    /// configured as `Windbg_Mcp_Listen_Token` worked before this scan existed and has to keep
+    /// working. The same fold is what makes the child-process strip see a mixed-case variable that
+    /// `var_os` can still resolve.
+    #[test]
+    fn credential_variables_are_matched_however_they_are_cased() {
+        let creds = Credentials::from_entries(
+            vars(&[
+                ("Windbg_Mcp_Listen_Token", "unnamed"),
+                ("windbg_mcp_listen_token_ci", "for-ci"),
+            ]),
+            None,
+        )
+        .expect("valid");
+        assert_eq!(creds.client_for("unnamed").map(Client::name), Some("local"));
+        assert_eq!(creds.client_for("for-ci").map(Client::name), Some("ci"));
+        // And the file variable is still not a token, whatever its casing.
+        assert!(is_token_file("Windbg_Mcp_Listen_Token_File"));
+        assert!(credential_suffix("Windbg_Mcp_Listen_Token_File").is_some());
+    }
+
+    /// A token file shuts the environment out completely, named tokens included.
+    ///
+    /// The file exists because the environment is not trusted on that host — the service installer
+    /// ACLs it to SYSTEM and Administrators for exactly that reason — so a variable standing beside
+    /// it would reintroduce what it was written to avoid.
+    #[test]
+    fn a_token_file_is_the_only_credential() {
+        let creds = Credentials::from_entries(
+            vars(&[
+                (TOKEN_ENV, "from-the-environment"),
+                ("WINDBG_MCP_LISTEN_TOKEN_CI", "also-from-the-environment"),
+            ]),
+            Some("from-the-file".to_string()),
+        )
+        .expect("valid");
+        assert_eq!(
+            creds.client_for("from-the-file").map(Client::name),
+            Some("local")
+        );
+        assert_eq!(creds.len(), 1, "the environment must not add credentials");
+        assert_eq!(creds.client_for("from-the-environment"), None);
+        assert_eq!(creds.client_for("also-from-the-environment"), None);
+    }
+
+    /// Two credentials normalising to one name is refused, and it is the quieter half of the same
+    /// mistake: nothing looks wrong, both tokens authenticate, and their holders silently share a
+    /// namespace. `WINDBG_MCP_LISTEN_TOKEN` and `…_TOKEN_LOCAL` are both `local`; `…_CI` and
+    /// `…__CI` are both `ci`.
+    #[test]
+    fn two_tokens_may_not_name_one_client() {
+        for pairs in [
+            vec![
+                (TOKEN_ENV, "unnamed"),
+                ("WINDBG_MCP_LISTEN_TOKEN_LOCAL", "named"),
+            ],
+            vec![
+                ("WINDBG_MCP_LISTEN_TOKEN_CI", "one"),
+                ("WINDBG_MCP_LISTEN_TOKEN__CI", "two"),
+            ],
+        ] {
+            let why = Credentials::from_entries(vars(&pairs), None)
+                .expect_err("a shared namespace is a configuration error");
+            assert!(
+                why.to_string().contains("two different tokens"),
+                "{why} (from {pairs:?})"
+            );
+        }
     }
 
     /// An empty value is not a token — it is a variable somebody exported and never set.

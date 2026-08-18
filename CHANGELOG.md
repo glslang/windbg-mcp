@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Per-client session namespaces, so two clients on one listener cannot reach each other's
+  targets** ([#162](https://github.com/glslang/windbg-mcp/issues/162), slices 2 and 3). A listener
+  may now hold several bearer tokens — `WINDBG_MCP_LISTEN_TOKEN_<NAME>` names a client, the unnamed
+  variable names `local` — and a session belongs to whichever client opened it.
+
+  - **Routing** is per client: a handle only routes for its owner, and omitting one finds that
+    client's newest session.
+  - **Another client's handle is reported unknown**, not "someone else's". The answer must not
+    confirm a session the caller may not touch, and there is nothing they could do with the
+    distinction.
+  - **`session_status` lists only the caller's**, and the four-session **cap is per client**, so a
+    busy client cannot deny a quiet one. A session is only ever reclaimed to make room for its own
+    client — reclaiming another's is the precise harm a shared registry did.
+  - **`server_log`** shows the caller's sessions' records and the supervisor's own — one ring serves
+    the whole server, so without this a client could read what another's worker printed.
+  - **A lease expiry releases the sessions of the client whose lease ran out**, not every session.
+    Before ownership those were the same set, because the gate served one client at a time.
+  - **The tenancy itself is per client**, so two clients no longer queue behind each other. The gate
+    serialised the server when the registry was global and one client could end another's targets;
+    keeping it shared would have meant one client's four-minute pool walk making every other client
+    wait for a boundary the registry now provides properly — namespaces that cannot be used
+    concurrently. Two connections presenting the *same* token still contend, which is one client
+    racing itself.
+  - Under **stdio** everything runs as `local`, so one set of registry rules serves both transports
+    rather than one rule and an exception.
+  - **Every credential variable is stripped from the processes this server creates** — by prefix,
+    so a token added later cannot quietly reach a debuggee — and a configured token *file* shuts the
+    environment out entirely, which is the precedence a LocalSystem service depends on.
+
+  **Why authentication is the identity.** `2026-07-28` removed the protocol-level MCP session, so
+  there is no session id to key on; requests arrive on whatever socket a client's pool hands them,
+  so there is no connection either; `clientInfo` is not retained. The credential is what is left,
+  and a name only the holder of a token can present is a boundary — where a name a client picks for
+  itself would be a label. Configuring one token for two names is refused at startup rather than
+  resolved, because the winner would be a hash-map ordering detail.
+
+  This separates clients; it does not rank them. Everyone who can authenticate still has the whole
+  tool surface.
+
 - **`server_log` — the server's own log, readable from wherever the client is.** The supervisor
   keeps a bounded ring of the most recent records, its own and every engine worker's, and serves
   them as a tool: filterable by session and level, paged with a `since` cursor, answered without

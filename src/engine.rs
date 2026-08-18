@@ -1043,6 +1043,22 @@ impl Sessions {
         self.registry().live().iter().any(|session| session.busy())
     }
 
+    /// Every session id the calling client owns, live or settled.
+    ///
+    /// For `server_log`, which reads one ring for the whole server: a record naming a session is
+    /// only this caller's to read if the session is. Settled ones are included deliberately —
+    /// the run-up to a session's *failure* is exactly what a caller asks the log for, and it is
+    /// their own failure to read.
+    pub fn visible_session_ids(&self) -> Vec<String> {
+        let caller = crate::client::current();
+        self.registry()
+            .all
+            .iter()
+            .filter(|s| s.owner == caller)
+            .map(|s| s.id.clone())
+            .collect()
+    }
+
     pub fn snapshot(&self) -> Vec<SessionSnapshot> {
         let registry = self.registry();
         // A caller is shown its own sessions and told which of *those* is current. Another client's
@@ -1562,8 +1578,8 @@ impl Sessions {
     /// snapshot, so this must only be called once the tenancy gate says no client holds the
     /// server — otherwise a client connecting exactly as the grace expires could have the session
     /// it just opened released underneath it.
-    pub async fn release_leased(&self) {
-        self.release_every_worker(Teardown::Lease).await
+    pub async fn release_leased(&self, owner: &crate::client::Client) {
+        self.release_workers_of(Teardown::Lease, Some(owner)).await
     }
 
     /// Releases every session nobody has used for `after`, and says how many.
@@ -1621,6 +1637,18 @@ impl Sessions {
     }
 
     async fn release_every_worker(&self, teardown: Teardown) {
+        self.release_workers_of(teardown, None).await
+    }
+
+    /// Releases every worker, or only those belonging to one client.
+    ///
+    /// `None` is the whole server going away, which is shutdown's question. `Some` is one client's
+    /// lease running out, which since [#162] is emphatically not the same set: another client's
+    /// sessions sit in the same registry and must survive a teardown that has nothing to do with
+    /// them.
+    ///
+    /// [#162]: https://github.com/glslang/windbg-mcp/issues/162
+    async fn release_workers_of(&self, teardown: Teardown, owner: Option<&crate::client::Client>) {
         // Closing the gate and taking the snapshot under **one** lock acquisition is what makes
         // one pass enough. [`Self::admit`] re-checks `closing` under this same lock after its
         // worker's handshake, so every open is on one side or the other of this moment: either it
@@ -1641,7 +1669,11 @@ impl Sessions {
         let owners = {
             let mut registry = self.registry();
             registry.closing |= teardown.closes_registry();
-            registry.owning_workers()
+            let owning = registry.owning_workers();
+            match owner {
+                Some(owner) => owning.into_iter().filter(|s| &s.owner == owner).collect(),
+                None => owning,
+            }
         };
         // Recorded before the releases rather than after them, and even when there are none: this
         // is the record that says the transcript ends here on purpose. Without it a file that
@@ -2321,7 +2353,7 @@ fn spawn_worker(exe: &Path) -> std::io::Result<(Child, Channel)> {
     // never authenticates anything, so it has no use for the token — but a `launch`ed debuggee
     // inheriting it could dial the listener on loopback, wait for the holder to go quiet, and take
     // over the very sessions being used to debug it. The credential does not cross this boundary.
-    command.env_remove(crate::listen::TOKEN_ENV);
+    crate::client::strip_credentials(&mut command);
     let child = command
         .arg(WORKER_FLAG)
         .arg(format!(
@@ -4001,6 +4033,9 @@ mod tests {
         writeln!(worker, "{log}").expect("write it as a worker would");
 
         let query = || crate::logbridge::Query {
+            // The test reads the ring directly, as the supervisor does: no client, nothing to
+            // narrow to.
+            visible: None,
             session: Some(session.to_string()),
             level: crate::logbridge::Level::Trace,
             since: None,

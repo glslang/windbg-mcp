@@ -40,6 +40,7 @@
 //! identity: there is one authorised client, so anyone presenting the token *is* that client, and a
 //! reconnect needs nothing further to prove.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -195,7 +196,15 @@ struct Lease {
     /// server" cannot be answered from HTTP alone, because an engine job outlives the request that
     /// asked for it.
     sessions: Sessions,
-    state: Mutex<Tenancy>,
+    /// One tenancy per client, rather than one for the server.
+    ///
+    /// The gate was written when the registry was global: a second client could see and end the
+    /// first's targets, so serving one at a time *was* the boundary. Sessions are owned now
+    /// ([#162](https://github.com/glslang/windbg-mcp/issues/162)), and a shared gate would only
+    /// mean that one client's long call — a pool walk, an `!analyze` — makes every other client
+    /// wait for a boundary it no longer provides. Contention within a client is still real and
+    /// still arbitrated; contention *between* them was never about safety.
+    state: Mutex<HashMap<crate::client::Client, Tenancy>>,
 }
 
 #[derive(Debug, Default)]
@@ -288,12 +297,14 @@ impl Tenancy {
 /// deferred for ever.
 struct InFlight {
     lease: Arc<Lease>,
+    /// Whose tenancy this request was admitted under — the count it has to be taken out of.
+    owner: crate::client::Client,
     epoch: u64,
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        self.lease.leave(self.epoch);
+        self.lease.leave(&self.owner, self.epoch);
     }
 }
 
@@ -330,6 +341,31 @@ enum Admission {
     Occupied,
 }
 
+/// A borrow of one client's tenancy, so the rules below read exactly as they did when there was
+/// one tenancy for the server — the difference is entirely in *whose* is being consulted.
+struct TenancyGuard<'a> {
+    all: std::sync::MutexGuard<'a, HashMap<crate::client::Client, Tenancy>>,
+    client: crate::client::Client,
+}
+
+impl std::ops::Deref for TenancyGuard<'_> {
+    type Target = Tenancy;
+
+    fn deref(&self) -> &Tenancy {
+        self.all
+            .get(&self.client)
+            .expect("state_of inserts before handing out a guard")
+    }
+}
+
+impl std::ops::DerefMut for TenancyGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Tenancy {
+        self.all
+            .get_mut(&self.client)
+            .expect("state_of inserts before handing out a guard")
+    }
+}
+
 impl Lease {
     /// Fails rather than starting when the grace could expire inside a call.
     ///
@@ -352,12 +388,23 @@ impl Lease {
         Ok(Self {
             grace,
             sessions,
-            state: Mutex::new(Tenancy::default()),
+            state: Mutex::new(HashMap::new()),
         })
     }
 
-    fn state(&self) -> std::sync::MutexGuard<'_, Tenancy> {
+    fn all_tenancies(&self) -> std::sync::MutexGuard<'_, HashMap<crate::client::Client, Tenancy>> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// One client's tenancy, created empty on first use — a client that has never connected holds
+    /// nothing, which is what a default `Tenancy` says.
+    fn state_of(&self, client: &crate::client::Client) -> TenancyGuard<'_> {
+        let mut all = self.all_tenancies();
+        all.entry(client.clone()).or_default();
+        TenancyGuard {
+            all,
+            client: client.clone(),
+        }
     }
 
     /// Decides whether a request may be served, **reserving** the server when one is taking it.
@@ -365,8 +412,8 @@ impl Lease {
     /// `session` is the request's `Mcp-Session-Id`; its absence means a client opening a new
     /// session, which is the only moment tenancy is contested. Every decision is made under one
     /// lock, so the answer a request gets is the state it will be served against.
-    fn admit(&self, session: Option<&str>) -> Admission {
-        let mut state = self.state();
+    fn admit(&self, client: &crate::client::Client, session: Option<&str>) -> Admission {
+        let mut state = self.state_of(client);
         // Nothing is served while a teardown is in flight. Briefly refusing a client that could
         // have been served costs a reconnect; serving one costs it the session mid-call.
         if state.releasing {
@@ -428,8 +475,9 @@ impl Lease {
         requested: Option<&str>,
         minted: Option<&str>,
         ok: bool,
+        client: crate::client::Client,
     ) -> Settled {
-        let mut state = self.state();
+        let mut state = self.state_of(&client);
         match claim {
             // This request reserved the server. It may only resolve *its own* reservation: one
             // that outlived the grace has already been cleared and possibly re-issued to somebody
@@ -468,8 +516,8 @@ impl Lease {
     }
 
     /// The holder said goodbye. The sessions stay; the clock starts.
-    fn released(&self, id: &str) {
-        let mut state = self.state();
+    fn released(&self, client: &crate::client::Client, id: &str) {
+        let mut state = self.state_of(client);
         if state.holder.as_deref() != Some(id) {
             return;
         }
@@ -479,7 +527,7 @@ impl Lease {
         // at worst this request and at best a tool call still running on another connection.
         state.farewell = true;
         drop(state);
-        self.try_give_up();
+        self.try_give_up_for(client);
     }
 
     /// One admitted request finished, however it finished.
@@ -488,14 +536,14 @@ impl Lease {
     /// a tenancy that no longer exists, and counting it out of the current one would subtract work
     /// it never did — enough for a concurrent goodbye to see zero while a tool call is still
     /// running.
-    fn leave(&self, epoch: u64) {
-        let mut state = self.state();
+    fn leave(&self, client: &crate::client::Client, epoch: u64) {
+        let mut state = self.state_of(client);
         if state.epoch != epoch {
             return;
         }
         state.in_flight = state.in_flight.saturating_sub(1);
         drop(state);
-        self.try_give_up();
+        self.try_give_up_for(client);
     }
 
     /// Whether the lease has run out, **claiming the teardown** if so.
@@ -504,8 +552,8 @@ impl Lease {
     /// way until [`Self::released_leases`] says the teardown is done. That is what closes the
     /// window [`Sessions::release_leased`] warns it does not close itself: between deciding to
     /// release and having released, no client can be admitted to the sessions being released.
-    fn expired(&self) -> Option<Expired> {
-        let mut state = self.state();
+    fn expired_for(&self, client: &crate::client::Client) -> Option<Expired> {
+        let mut state = self.state_of(client);
         match state.deadline {
             Some(at) if Instant::now() >= at => {
                 let holder = state.holder.take();
@@ -530,6 +578,12 @@ impl Lease {
         }
     }
 
+    /// The clients this lease holds state for, so the sweeper can ask each in turn without holding
+    /// the lock across an `await`.
+    fn clients(&self) -> Vec<crate::client::Client> {
+        self.all_tenancies().keys().cloned().collect()
+    }
+
     /// Hands the server over, if a goodbye is outstanding and nothing is still using it.
     ///
     /// Two conditions, and they are not the same one. `in_flight` is HTTP: the requests this holder
@@ -537,8 +591,8 @@ impl Lease {
     /// so a dropped future or a timed-out call leaves work running against a target the next client
     /// would otherwise be handed. Attempted on every sweep as well as on the two events, because
     /// the engine going idle is not an event this side can see.
-    fn try_give_up(&self) {
-        let mut state = self.state();
+    fn try_give_up_for(&self, client: &crate::client::Client) {
+        let mut state = self.state_of(client);
         if !state.farewell || state.in_flight != 0 {
             return;
         }
@@ -546,7 +600,7 @@ impl Lease {
         if self.sessions.busy() {
             return;
         }
-        state = self.state();
+        state = self.state_of(client);
         // Re-checked: the two locks were not held together, so a request could have arrived.
         if !state.farewell || state.in_flight != 0 {
             return;
@@ -558,8 +612,8 @@ impl Lease {
     }
 
     /// The teardown is done; the server may be taken again.
-    fn released_leases(&self) {
-        self.state().releasing = false;
+    fn released_leases(&self, client: &crate::client::Client) {
+        self.state_of(client).releasing = false;
     }
 }
 
@@ -773,7 +827,7 @@ async fn gate(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
-    let admitted = match lease.admit(session.as_deref()) {
+    let admitted = match lease.admit(&caller, session.as_deref()) {
         Admission::Serve(admitted) => admitted,
         Admission::Occupied => {
             tracing::warn!("refused a second client from {peer}: this server is already held");
@@ -787,6 +841,7 @@ async fn gate(
     // request out, and a goodbye waiting on it completes when the last one does.
     let _in_flight = InFlight {
         lease: lease.clone(),
+        owner: caller.clone(),
         epoch: admitted.epoch,
     };
 
@@ -797,6 +852,9 @@ async fn gate(
     // The whole MCP call runs as this client: the routing, the worker handshake and the engine
     // call all read the identity from here, rather than from a parameter forty-odd tool bodies
     // would have to carry. See [`crate::client`].
+    // Kept for the settlement below, which records whose tenancy this is — the scope moves the
+    // identity into the call.
+    let caller_for_lease = caller.clone();
     let response = crate::client::as_client(caller, mcp.handle(req)).await;
 
     let minted = response
@@ -811,6 +869,7 @@ async fn gate(
         session.as_deref(),
         minted.as_deref(),
         response.status().is_success(),
+        caller_for_lease.clone(),
     ) {
         // Counted rather than asserted. `left_open` says a previous tenancy ended inside the
         // grace, which is true whether or not that client had opened anything — so the
@@ -856,7 +915,7 @@ async fn gate(
     if is_departure(&method, response.status())
         && let Some(id) = session
     {
-        lease.released(&id);
+        lease.released(&caller_for_lease, &id);
         tracing::info!("the client let go; its sessions are held for the grace period");
     }
     Ok(response)
@@ -917,26 +976,36 @@ async fn sweep(
         if let Some(after) = idle_after {
             sessions.release_idle(after).await;
         }
-        // The engine may have gone idle since the last tick, which is not something the HTTP side
-        // is told about.
-        lease.try_give_up();
-        let Some(expired) = lease.expired() else {
-            continue;
-        };
-        tracing::info!("a client's lease ran out; releasing the sessions it left open");
-        sessions.release_leased().await;
-        // The debug sessions are the expensive half, but not the whole of it. A client that
-        // vanished never sent the DELETE that closes its MCP session, so without this the service
-        // keeps that session resident and its id accepted — and every disconnect-and-reconnect
-        // cycle would add another one that no lease will ever sweep again.
-        if let Some(id) = expired.holder
-            && let Err(e) = manager.close_session(&id.into()).await
-        {
-            tracing::warn!("could not close the MCP session of the client that went away: {e}");
+        // Per client, because a tenancy is per client: one caller's expiry says nothing about
+        // another's, and a sweep that stopped at the first would starve the rest.
+        for client in lease.clients() {
+            // The engine may have gone idle since the last tick, which is not something the HTTP
+            // side is told about.
+            lease.try_give_up_for(&client);
+            let Some(expired) = lease.expired_for(&client) else {
+                continue;
+            };
+            tracing::info!(
+                "the lease of client `{client}` ran out; releasing the sessions it left open"
+            );
+            // **That client's sessions, not every session.** Before ownership this was the same
+            // set, because the gate served one client at a time. It is not any more: another
+            // client's targets are in the same registry, and this expiry says nothing about them
+            // (#162).
+            sessions.release_leased(&client).await;
+            // The debug sessions are the expensive half, but not the whole of it. A client that
+            // vanished never sent the DELETE that closes its MCP session, so without this the
+            // service keeps that session resident and its id accepted — and every
+            // disconnect-and-reconnect cycle would add another one no lease will ever sweep again.
+            if let Some(id) = expired.holder
+                && let Err(e) = manager.close_session(&id.into()).await
+            {
+                tracing::warn!("could not close the MCP session of the client that went away: {e}");
+            }
+            // Only now may this client be admitted again: until here, an arriving request would be
+            // let in to sessions this release is closing.
+            lease.released_leases(&client);
         }
-        // Only now may the server be taken again: until this, an arriving client would be admitted
-        // to sessions this release is closing.
-        lease.released_leases();
     }
 }
 
@@ -944,25 +1013,90 @@ async fn sweep(
 mod tests {
     use super::*;
 
+    /// A lease bound to one client, so the rules below read as they did when there was one tenancy
+    /// for the server.
+    ///
+    /// Every test here is about how *a* client's tenancy behaves — claims, adoption, goodbyes,
+    /// expiry — and none of them is about which client it is. Binding the name once keeps that
+    /// distinction visible: a test that needs two clients says so by using two of these.
+    struct For {
+        lease: Lease,
+        client: crate::client::Client,
+    }
+
+    impl For {
+        fn new(lease: Lease, name: &str) -> Self {
+            Self {
+                lease,
+                client: crate::client::Client::new(name),
+            }
+        }
+
+        fn admit(&self, session: Option<&str>) -> Admission {
+            self.lease.admit(&self.client, session)
+        }
+
+        fn settle(
+            &self,
+            claim: Option<u64>,
+            requested: Option<&str>,
+            minted: Option<&str>,
+            ok: bool,
+        ) -> Settled {
+            self.lease
+                .settle(claim, requested, minted, ok, self.client.clone())
+        }
+
+        fn released(&self, id: &str) {
+            self.lease.released(&self.client, id);
+        }
+
+        fn leave(&self, epoch: u64) {
+            self.lease.leave(&self.client, epoch);
+        }
+
+        fn expired(&self) -> Option<Expired> {
+            self.lease.expired_for(&self.client)
+        }
+
+        fn released_leases(&self) {
+            self.lease.released_leases(&self.client);
+        }
+
+        fn state(&self) -> TenancyGuard<'_> {
+            self.lease.state_of(&self.client)
+        }
+
+        fn sessions(&self) -> &Sessions {
+            &self.lease.sessions
+        }
+    }
+
     const CALL: Duration = Duration::from_secs(300);
 
     /// A grace comfortably past the opener's end-to-end bound.
-    fn lease() -> Lease {
-        Lease::new(
-            longest_quiet_call(CALL) + Duration::from_secs(60),
-            CALL,
-            Sessions::new(CALL),
+    fn lease() -> For {
+        For::new(
+            Lease::new(
+                longest_quiet_call(CALL) + Duration::from_secs(60),
+                CALL,
+                Sessions::new(CALL),
+            )
+            .expect("workable"),
+            crate::client::Client::LOCAL,
         )
-        .expect("workable")
     }
 
     /// A lease whose grace expires almost immediately, for the sweep paths.
-    fn brief() -> Lease {
-        Lease {
-            grace: Duration::from_millis(1),
-            sessions: Sessions::new(CALL),
-            state: Mutex::new(Tenancy::default()),
-        }
+    fn brief() -> For {
+        For::new(
+            Lease {
+                grace: Duration::from_millis(1),
+                sessions: Sessions::new(CALL),
+                state: Mutex::new(HashMap::new()),
+            },
+            crate::client::Client::LOCAL,
+        )
     }
 
     /// The floor is the same one the lease refuses to start below, and for the same reason: a
@@ -1027,7 +1161,7 @@ mod tests {
     /// One whole request: admitted, settled, and finished. Every admitted request is counted out
     /// again in `gate` by a guard, so a test that settles without finishing is modelling a request
     /// that never came back.
-    fn request(lease: &Lease, session: Option<&str>, minted: Option<&str>, ok: bool) -> Settled {
+    fn request(lease: &For, session: Option<&str>, minted: Option<&str>, ok: bool) -> Settled {
         let it = admitted(lease.admit(session));
         let settled = lease.settle(it.claim, session, minted, ok);
         lease.leave(it.epoch);
@@ -1035,7 +1169,7 @@ mod tests {
     }
 
     /// A client's `DELETE`, which is itself an admitted request.
-    fn goodbye(lease: &Lease, id: &str) {
+    fn goodbye(lease: &For, id: &str) {
         let it = admitted(lease.admit(Some(id)));
         lease.released(id);
         lease.leave(it.epoch);
@@ -1349,7 +1483,7 @@ mod tests {
 
         // `Sessions::busy` is what the lease consults, and an idle registry is not busy — so this
         // test pins the wiring rather than the debugger, which needs a worker to be busy at all.
-        assert!(!lease.sessions.busy());
+        assert!(!lease.sessions().busy());
     }
 
     /// A request that never came back cannot defer a goodbye for ever.
@@ -1411,14 +1545,61 @@ mod tests {
         );
     }
 
+    /// **Two clients do not contend, on one lease.** The gate serialised the server when the
+    /// registry was global and one client could end another's targets. Sessions are owned now, so a
+    /// shared gate would only mean that one client's long call — a pool walk, an `!analyze` — makes
+    /// every other client wait for a boundary it no longer provides, and per-client namespaces
+    /// would be unusable concurrently ([#162](https://github.com/glslang/windbg-mcp/issues/162)).
+    ///
+    /// Deliberately *not* written with the `For` binding: two bindings would be two leases, which
+    /// cannot contend whatever the code does, and the test would pass against the bug it is for.
+    #[test]
+    fn one_clients_tenancy_does_not_block_another() {
+        let lease = Lease::new(
+            longest_quiet_call(CALL) + Duration::from_secs(60),
+            CALL,
+            Sessions::new(CALL),
+        )
+        .expect("workable");
+        let laptop = crate::client::Client::new("laptop");
+        let ci = crate::client::Client::new("ci");
+
+        // `laptop` takes its tenancy and holds it — the long-call case.
+        let held = admitted(lease.admit(&laptop, None));
+        lease.settle(
+            held.claim,
+            None,
+            Some("session-laptop"),
+            true,
+            laptop.clone(),
+        );
+
+        // Within that client, a second `initialize` is still refused: that contention is real, and
+        // it is the one the claim machinery exists to arbitrate.
+        assert_eq!(
+            lease.admit(&laptop, None),
+            Admission::Occupied,
+            "a second connection from the same client still contends"
+        );
+
+        // Across clients, on the same lease, it is not.
+        assert!(
+            matches!(lease.admit(&ci, None), Admission::Serve(_)),
+            "another client must not wait on a tenancy that no longer bounds anything it can reach"
+        );
+    }
+
     /// A claim keeps alive the sessions it is adopting.
     #[test]
     fn reserving_the_server_renews_what_the_claim_is_adopting() {
-        let lease = Lease {
-            grace: Duration::from_millis(60),
-            sessions: Sessions::new(CALL),
-            state: Mutex::new(Tenancy::default()),
-        };
+        let lease = For::new(
+            Lease {
+                grace: Duration::from_millis(60),
+                sessions: Sessions::new(CALL),
+                state: Mutex::new(HashMap::new()),
+            },
+            crate::client::Client::LOCAL,
+        );
         request(&lease, None, Some("session-a"), true);
         goodbye(&lease, "session-a");
         std::thread::sleep(Duration::from_millis(40));

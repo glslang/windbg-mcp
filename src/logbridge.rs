@@ -188,6 +188,13 @@ impl Ring {
                 Some(wanted) => e.session.as_deref() == Some(wanted.as_str()),
                 None => true,
             })
+            // A record about *someone else's* session is not this caller's to read. The
+            // supervisor's own records carry no session id and stay visible to everyone: they are
+            // about this process rather than about any client's target.
+            .filter(|e| match (&query.visible, e.session.as_deref()) {
+                (Some(mine), Some(about)) => mine.iter().any(|id| id == about),
+                _ => true,
+            })
             .collect();
         let matched = matches.len();
         let from = matched.saturating_sub(query.limit);
@@ -293,6 +300,17 @@ pub struct Query {
     pub since: Option<u64>,
     /// At most this many, taking the most recent.
     pub limit: usize,
+    /// The session ids the caller owns, when the caller is one of several clients.
+    ///
+    /// **The ring is one buffer for the whole server**, so without this a client could read what
+    /// another client's worker said — its session ids, the target it opened, whatever the debugger
+    /// printed on the way to a failure. That is the boundary
+    /// ([#162](https://github.com/glslang/windbg-mcp/issues/162)) leaking through a different tool
+    /// than the one it was written for.
+    ///
+    /// `None` means "everything", which is stdio and the supervisor's own use: one client by
+    /// construction, so there is nothing to separate.
+    pub visible: Option<Vec<String>>,
 }
 
 /// What the ring answered with.
@@ -564,7 +582,57 @@ mod tests {
             level: Level::Trace,
             since: None,
             limit: 100,
+            visible: None,
         }
+    }
+
+    /// One ring serves the whole server, so a client may only read the records of sessions it
+    /// owns. The supervisor's own records carry no session id and stay visible to everyone: they
+    /// are about this process rather than about anyone's target.
+    #[test]
+    fn a_client_reads_only_its_own_sessions_records() {
+        let mut ring = Ring::new(100);
+        ring.file(
+            Level::Info,
+            1,
+            "windbg_mcp::worker".into(),
+            Some("sess-mine".into()),
+            "mine".into(),
+        );
+        ring.file(
+            Level::Info,
+            2,
+            "windbg_mcp::worker".into(),
+            Some("sess-theirs".into()),
+            "theirs".into(),
+        );
+        ring.file(
+            Level::Info,
+            3,
+            "windbg_mcp::engine".into(),
+            None,
+            "the supervisor's".into(),
+        );
+
+        let mine = ring.tail(&Query {
+            visible: Some(vec!["sess-mine".to_string()]),
+            ..query()
+        });
+        let messages: Vec<&str> = mine.entries.iter().map(|e| e.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            vec!["mine", "the supervisor's"],
+            "another client's records are not this caller's to read: {messages:?}"
+        );
+
+        // And naming their session explicitly narrows to a set this caller is not in, so it comes
+        // back empty — the same answer a handle this server never issued gets.
+        let theirs = ring.tail(&Query {
+            session: Some("sess-theirs".to_string()),
+            visible: Some(vec!["sess-mine".to_string()]),
+            ..query()
+        });
+        assert!(theirs.entries.is_empty(), "{:?}", theirs.entries);
     }
 
     /// Severity ordering is what the filter is built on, and it reads backwards from the
