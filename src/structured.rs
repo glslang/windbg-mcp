@@ -604,14 +604,61 @@ pub struct ModuleInfo {
     #[serde(flatten)]
     pub symbols: SymbolState,
     pub user_mode: bool,
+    /// The PE `TimeDateStamp`. With [`Self::size`] it is what a symbol server is keyed by, and
+    /// what says whether an image somewhere else is *this* image — see
+    /// [`docs/coordinates.md`](https://github.com/glslang/windbg-mcp/blob/main/docs/coordinates.md).
     pub timestamp: u32,
     pub checksum: u32,
+    /// Which **PDB** the engine has for this module, when it has one.
+    ///
+    /// The image is identified by [`Self::timestamp`] + [`Self::size`]; its symbols are identified
+    /// by a different pair, and this is it. Absent for a module whose `symbols` is anything but
+    /// `pdb` — this reports what the engine *has*, and a deferred module has nothing until
+    /// something makes it look. That is not "this module has no PDB".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdb: Option<PdbInfo>,
     /// True for a module that has **unloaded** — the rows in [`ModuleList::unloaded`], where
     /// `start`/`end` are where the image *was*. Carried on the row as well as by which list it is
     /// in, from the engine's own flag, so a record that has been lifted out of that list still
     /// says so. Absent from the JSON when false, which is every ordinary module.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unloaded: bool,
+}
+
+/// The identity of a module's PDB, in the form a symbol server is keyed by.
+///
+/// Here so that a client on another machine can fetch the **exact** symbols this engine resolved
+/// without first fetching the image. The identity is recoverable from the image's own debug
+/// directory, so this saves a download rather than enabling something otherwise impossible — and
+/// it lets a caller check the PDB it already holds is the right one, which the image cannot do.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PdbInfo {
+    /// The signature as a symbol server path spells it: 32 uppercase hex digits, no braces and no
+    /// dashes. Not the form a GUID is usually printed in.
+    pub guid: String,
+    /// The age. Note it is appended to the GUID **in hex**, which [`Self::key`] has already done.
+    pub age: u32,
+    /// The path segment those two make — `<guid><age>`, the middle element of
+    /// `<pdb>/<key>/<pdb>`. Carried already-built because assembling it is one line and getting it
+    /// wrong (the age in decimal) produces a URL that 404s, which is a hard failure to read
+    /// backwards.
+    pub key: String,
+    /// Whether the engine matched a PDB it then found does **not** belong to this image. Symbols
+    /// read from it are another build's names, so this is a reason to distrust every symbol on
+    /// this module rather than a detail. Absent from the JSON when false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unmatched: bool,
+}
+
+impl From<win_kexp::dbgeng::PdbIdentity> for PdbInfo {
+    fn from(pdb: win_kexp::dbgeng::PdbIdentity) -> Self {
+        Self {
+            key: format!("{}{:X}", pdb.guid, pdb.age),
+            guid: pdb.guid,
+            age: pdb.age,
+            unmatched: pdb.unmatched,
+        }
+    }
 }
 
 /// How much symbol information the engine has for a module.
@@ -698,6 +745,9 @@ impl From<&win_kexp::dbgeng::Module> for ModuleInfo {
             user_mode: module.user_mode,
             timestamp: module.timestamp,
             checksum: module.checksum,
+            // Filled in by the caller for the modules that have symbols: it is a second question
+            // asked of the engine, and a conversion from a value it already holds cannot ask one.
+            pdb: None,
             unloaded: module.unloaded,
         }
     }
@@ -2294,6 +2344,48 @@ mod tests {
     /// then reads the field correctly until the first target that reports something new — which
     /// is the worst possible moment to change shape. Both are tagged and flattened instead, so
     /// the field stays a string and the unnamed code arrives beside it.
+    /// The wire contract of a PDB identity, which is four separate chances to produce a URL that
+    /// 404s: the GUID's spelling, the age in **hex** rather than decimal, the two concatenated in
+    /// that order, and `unmatched` appearing only when it is true.
+    ///
+    /// Offline, and next to the type, because the smoke tier can only assert this against whatever
+    /// PDB a host happens to have resolved — and an age of 1 hides the hex/decimal confusion
+    /// completely, which is exactly the value a real `nt` reports.
+    #[test]
+    fn a_pdb_identity_is_spelled_the_way_a_symbol_server_path_is() {
+        let identity = |age, unmatched| {
+            serde_json::to_value(PdbInfo::from(win_kexp::dbgeng::PdbIdentity {
+                guid: "FE3F58BDA39D2FC13C370618D1DBDF22".into(),
+                age,
+                unmatched,
+                file: r"c:\symbols\ntkrnlmp.pdb".into(),
+            }))
+            .expect("serializes")
+        };
+
+        // Age 26 is 0x1A: decimal and hex differ, which age 1 cannot show.
+        let twenty_six = identity(26, false);
+        assert_eq!(twenty_six["guid"], "FE3F58BDA39D2FC13C370618D1DBDF22");
+        assert_eq!(twenty_six["age"], 26);
+        assert_eq!(
+            twenty_six["key"], "FE3F58BDA39D2FC13C370618D1DBDF221A",
+            "the key appends the age in hex, not decimal"
+        );
+        assert!(
+            twenty_six.get("unmatched").is_none(),
+            "the ordinary case carries no flag: {twenty_six}"
+        );
+
+        assert_eq!(
+            identity(1, true)["unmatched"],
+            true,
+            "a PDB that does not belong to the image has to say so"
+        );
+        // The local path the engine loaded is not on the wire: it is a fact about the debugger's
+        // filesystem, and this record is for a client somewhere else.
+        assert!(identity(1, false).get("file").is_none());
+    }
+
     #[test]
     fn a_named_state_is_a_string_whether_or_not_it_is_one_we_know() {
         let module = |symbols| {
@@ -2308,6 +2400,7 @@ mod tests {
                 user_mode: false,
                 timestamp: 0,
                 checksum: 0,
+                pdb: None,
                 unloaded: false,
             })
             .expect("serializes")

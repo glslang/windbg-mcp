@@ -1465,6 +1465,36 @@ fn registers(e: &DebugEngine, all: bool) -> Result<Output, Failed> {
     ))
 }
 
+/// A module row with the PDB identity the engine has for it, where it has one.
+///
+/// **One helper for the listing and the opener's summary**, because `TargetSummary::primary_module`
+/// documents itself as exactly the row `modules` returns — and enriching only one of them made
+/// that false, which is a promise breaking rather than a field missing.
+///
+/// **Asked only of the modules the engine has already resolved.** A listing is two hundred rows and
+/// this is a call into the engine per row, so it is asked where the answer will not be empty. Both
+/// PDB-backed states count: `pdb` is the ordinary one, and `dia` is the same PDB reached through
+/// the Debug Interface Access API, which resolves an identity just as well.
+///
+/// A failure costs this one field. A listing must not fail over the provenance of the symbols it
+/// is listing.
+fn with_pdb_identity(
+    e: &DebugEngine,
+    module: &win_kexp::dbgeng::Module,
+    mut info: structured::ModuleInfo,
+) -> structured::ModuleInfo {
+    use win_kexp::dbgeng::SymbolKind;
+    if matches!(module.symbols, SymbolKind::Pdb | SymbolKind::Dia) {
+        match e.module_pdb(module.base) {
+            Ok(pdb) => info.pdb = pdb.map(structured::PdbInfo::from),
+            Err(why) => {
+                tracing::debug!("worker: no PDB identity for {}: {why}", info.listed_name());
+            }
+        }
+    }
+    info
+}
+
 /// The modules, as values and as a listing rendered **from those same values** — optionally
 /// narrowed to the ones whose name matches a pattern.
 ///
@@ -1497,12 +1527,13 @@ fn modules(e: &DebugEngine, filter: Option<&str>) -> Result<Output, Failed> {
     let narrow = |modules: &[win_kexp::dbgeng::Module]| -> Vec<structured::ModuleInfo> {
         modules
             .iter()
-            .map(structured::ModuleInfo::from)
-            .filter(|module| {
+            .map(|module| (structured::ModuleInfo::from(module), module))
+            .filter(|(info, _)| {
                 pattern
                     .as_deref()
-                    .is_none_or(|pattern| matches_module_pattern(pattern, module.listed_name()))
+                    .is_none_or(|pattern| matches_module_pattern(pattern, info.listed_name()))
             })
+            .map(|(info, module)| with_pdb_identity(e, module, info))
             .collect()
     };
     let (matched, matched_unloaded) = (narrow(&loaded), narrow(&unloaded));
@@ -3972,7 +4003,13 @@ fn target_summary(e: &DebugEngine) -> structured::TargetSummary {
         primary_module: modules
             .as_deref()
             .and_then(|modules| primary_module(modules, kernel_mode))
-            .map(|module| Box::new(structured::ModuleInfo::from(module))),
+            .map(|module| {
+                Box::new(with_pdb_identity(
+                    e,
+                    module,
+                    structured::ModuleInfo::from(module),
+                ))
+            }),
         // `Ok(None)` is the target that did not bug check, and `Err` is the target that has no
         // bug check data to read at all (user mode). Both are simply "no bug check here".
         bug_check: e

@@ -6,8 +6,8 @@
       "inputSchema": 904,
       "modelVisible": 2001,
       "name": "attach_kernel",
-      "outputSchema": 11093,
-      "wire": 13248
+      "outputSchema": 13323,
+      "wire": 15478
     },
     {
       "annotations": 122,
@@ -15,8 +15,8 @@
       "inputSchema": 33,
       "modelVisible": 330,
       "name": "attach_kernel_local",
-      "outputSchema": 11093,
-      "wire": 11576
+      "outputSchema": 13323,
+      "wire": 13806
     },
     {
       "annotations": 117,
@@ -24,8 +24,8 @@
       "inputSchema": 204,
       "modelVisible": 499,
       "name": "attach_process",
-      "outputSchema": 11093,
-      "wire": 11740
+      "outputSchema": 13323,
+      "wire": 13970
     },
     {
       "annotations": 68,
@@ -222,8 +222,8 @@
       "inputSchema": 229,
       "modelVisible": 542,
       "name": "launch",
-      "outputSchema": 11093,
-      "wire": 11795
+      "outputSchema": 13323,
+      "wire": 14025
     },
     {
       "annotations": 65,
@@ -231,8 +231,8 @@
       "inputSchema": 1383,
       "modelVisible": 2112,
       "name": "modules",
-      "outputSchema": 8341,
-      "wire": 10549
+      "outputSchema": 10571,
+      "wire": 12779
     },
     {
       "annotations": 128,
@@ -240,8 +240,8 @@
       "inputSchema": 211,
       "modelVisible": 712,
       "name": "open_dump",
-      "outputSchema": 11093,
-      "wire": 11964
+      "outputSchema": 13323,
+      "wire": 14194
     },
     {
       "annotations": 114,
@@ -249,8 +249,8 @@
       "inputSchema": 211,
       "modelVisible": 534,
       "name": "open_trace",
-      "outputSchema": 11093,
-      "wire": 11772
+      "outputSchema": 13323,
+      "wire": 14002
     },
     {
       "annotations": 123,
@@ -466,10 +466,10 @@
     "inputSchema": 40204,
     "instructions": 3163,
     "modelVisible": 67613,
-    "outputSchema": 301626,
-    "payload": 376099,
+    "outputSchema": 317236,
+    "payload": 391709,
     "tools": 51,
-    "wire": 375981,
+    "wire": 391591,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 9757
   }
