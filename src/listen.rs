@@ -606,7 +606,20 @@ async fn bind_when_ready(addr: SocketAddr) -> Result<TcpListener> {
 ///
 /// Trimmed, because a token in a file arrives with whatever line ending wrote it, and a token that
 /// works from an editor but not from `Set-Content` would be an unpleasant afternoon.
-fn bearer_token() -> Result<String> {
+fn credentials() -> Result<crate::client::Credentials> {
+    let creds = crate::client::Credentials::from_entries(std::env::vars(), token_file()?)?;
+    if creds.len() == 0 {
+        bail!(
+            "neither {TOKEN_FILE_ENV} nor {TOKEN_ENV} is set, and no {TOKEN_ENV}_<NAME> either. \
+             The listener will not start without a bearer token: it exposes every tool this server \
+             has, including the ones that write to a live kernel."
+        );
+    }
+    Ok(creds)
+}
+
+/// The token in the file [`TOKEN_FILE_ENV`] names, if it names one.
+fn token_file() -> Result<Option<String>> {
     if let Some(path) = std::env::var_os(TOKEN_FILE_ENV) {
         let path = std::path::PathBuf::from(path);
         let token = std::fs::read_to_string(&path).with_context(|| {
@@ -618,19 +631,9 @@ fn bearer_token() -> Result<String> {
         if token.trim().is_empty() {
             bail!("{} is empty; that is not a token.", path.display());
         }
-        return Ok(token.trim().to_string());
+        return Ok(Some(token.trim().to_string()));
     }
-    let token = std::env::var(TOKEN_ENV).map_err(|_| {
-        anyhow::anyhow!(
-            "neither {TOKEN_FILE_ENV} nor {TOKEN_ENV} is set. The listener will not start without \
-             a bearer token: it exposes every tool this server has, including the ones that write \
-             to a live kernel."
-        )
-    })?;
-    if token.trim().is_empty() {
-        bail!("{TOKEN_ENV} is set but empty; that is not a token.");
-    }
-    Ok(token.trim().to_string())
+    Ok(None)
 }
 
 pub async fn serve(
@@ -640,7 +643,7 @@ pub async fn serve(
     shutdown: impl Future<Output = ()>,
     ready: impl FnOnce(),
 ) -> Result<()> {
-    let token = bearer_token()?;
+    let credentials = Arc::new(credentials()?);
 
     let grace = match std::env::var(GRACE_ENV).ok().and_then(|v| v.parse().ok()) {
         Some(secs) if secs > 0 => Duration::from_secs(secs),
@@ -690,11 +693,12 @@ pub async fn serve(
     // *now*. See [`crate::service`], where "started" is a thing the SCM and its dependants act on.
     ready();
     tracing::info!(
-        "windbg-mcp listening on http://{addr} (lease grace {grace:?}, {}, one client at a time)",
+        "windbg-mcp listening on http://{addr} (lease grace {grace:?}, {}, clients: {})",
         match idle_after {
             Some(after) => format!("idle sessions released after {}m", after.as_secs() / 60),
             None => "idle sessions never released".to_string(),
-        }
+        },
+        credentials.names().join(", ")
     );
 
     tokio::spawn(sweep(
@@ -725,7 +729,7 @@ pub async fn serve(
         let mcp = mcp.clone();
         let manager = manager.clone();
         let lease = lease.clone();
-        let token = token.clone();
+        let credentials = Arc::clone(&credentials);
         tokio::spawn(async move {
             let serve = service_fn(move |req| {
                 gate(
@@ -733,7 +737,7 @@ pub async fn serve(
                     mcp.clone(),
                     manager.clone(),
                     lease.clone(),
-                    token.clone(),
+                    Arc::clone(&credentials),
                     peer,
                 )
             });
@@ -753,15 +757,15 @@ async fn gate(
     mcp: Arc<StreamableHttpService<WindbgServer, LocalSessionManager>>,
     manager: Arc<LocalSessionManager>,
     lease: Arc<Lease>,
-    token: String,
+    credentials: Arc<crate::client::Credentials>,
     peer: SocketAddr,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
-    if !authorised(&req, &token) {
+    let Some(caller) = authorised(&req, &credentials) else {
         // No detail: an unauthenticated caller learns that it is unauthenticated and nothing about
-        // what is here.
+        // what is here — including how many credentials this listener holds.
         tracing::warn!("rejected an unauthenticated request from {peer}");
         return Ok(refuse(StatusCode::UNAUTHORIZED, "unauthorized"));
-    }
+    };
 
     let session = req
         .headers()
@@ -790,7 +794,10 @@ async fn gate(
     // afterwards the request is gone; whether it *was* a departure also depends on the answer.
     let method = req.method().clone();
 
-    let response = mcp.handle(req).await;
+    // The whole MCP call runs as this client: the routing, the worker handshake and the engine
+    // call all read the identity from here, rather than from a parameter forty-odd tool bodies
+    // would have to carry. See [`crate::client`].
+    let response = crate::client::as_client(caller, mcp.handle(req)).await;
 
     let minted = response
         .headers()
@@ -870,12 +877,21 @@ fn is_departure(method: &hyper::Method, status: StatusCode) -> bool {
     method == hyper::Method::DELETE && status.is_success()
 }
 
-fn authorised(req: &Request<Incoming>, token: &str) -> bool {
+/// The client whose token this request presented, or `None` if it presented none this listener
+/// knows.
+///
+/// The credential *is* the identity — see [`crate::client`] for why nothing else can be, on a
+/// transport whose protocol no longer has sessions in it.
+fn authorised(
+    req: &Request<Incoming>,
+    credentials: &crate::client::Credentials,
+) -> Option<crate::client::Client> {
     req.headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .is_some_and(|presented| presented == token)
+        .and_then(|presented| credentials.client_for(presented))
+        .cloned()
 }
 
 fn refuse(status: StatusCode, why: &str) -> Response<BoxBody<Bytes, Infallible>> {
