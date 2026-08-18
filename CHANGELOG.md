@@ -122,6 +122,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`disassemble` answers with typed instructions carrying `RVA` and encoding, not just `u`'s
+  text.** The second half of the same coordinate work, and the last tool that could only answer
+  "what is the code here" as a rendering. Each instruction is now
+  `{address, module, rva, bytes, text}`, on the same terms a stack frame is: `module` and `rva`
+  travel together and are absent when the address is in no loaded module, `attribution_failed`
+  marks the different case of a lookup that failed, and `address` and `bytes` are always there.
+
+  - **The addresses are the engine's arithmetic, not a re-parse.** The new
+    `win-kexp` primitive (`DebugEngine::disassemble`) walks `IDebugControl::Disassemble`, whose
+    every instruction reports where the next one starts; reading an address back out of the
+    rendering would make the record depend on the format it exists to replace.
+  - **`bytes` is what identifies a build.** Two images that disassemble differently are different
+    builds whatever their names say — the "stale image in the analyser" risk, checkable now without
+    trusting a file name. It is the engine's spelling (`d503237f` on ARM64 is the instruction word,
+    not memory order), so it compares against another disassembly rather than against a file.
+  - **`stopped_early` is the code ending, not the call being cut.** Disassembly runs forward into
+    whatever follows a function, which may be unmapped or not code; asking again with a larger
+    count returns the same instructions. A count the caller set is not that, and does not set it.
+  - **The debugger's backtick address form is normalised out of operands** — ``fffff801`3c677ef0``
+    becomes `fffff8013c677ef0` — because this server spells an address one way, and that tick is
+    also the delimiter of the code span the listing prints in. Only where it is an address: MSVC
+    decorates real symbols with backticks (`` `anonymous namespace' ``, `` `vftable' ``) and those
+    survive.
+  - Default 16 instructions, maximum 128. `execute { "command": "uf module!func" }` still follows a
+    whole function, which is the one shape a count cannot ask for, and `execute { "command": "u" }`
+    is the engine's listing with its `module!Symbol+0x1c:` labels.
+
 - **`backtrace` answers with typed frames carrying `module` + `RVA`, not just `k`'s text.** The
   tool ran `k` and handed back whatever DbgEng printed, which names a frame as
   `module!Symbol+0x1c` — a form that is unusable the moment the symbol does not resolve, and on a

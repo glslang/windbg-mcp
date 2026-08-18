@@ -152,11 +152,14 @@ fn is_candidate_culprit(frame: &AttributedFrame) -> bool {
 
 /// Renders an offset within a module: `0x`-prefixed, lowercase, **unpadded**.
 ///
+/// Shared with `disassemble`, so a frame's RVA and an instruction's are the same number written
+/// the same way — the join is between them as much as between either and an analysis server.
+///
 /// Deliberately not [`structured::addr`]. That form exists so addresses sort lexically and
 /// round-trip a full 64-bit value; an RVA is neither an address nor register-sized, it is the
 /// number you paste after `module+`, and `MessageManager+0x0000000000001654` is not a form
 /// anything else in the debugger uses.
-fn offset(value: u64) -> String {
+pub fn offset(value: u64) -> String {
     format!("{value:#x}")
 }
 

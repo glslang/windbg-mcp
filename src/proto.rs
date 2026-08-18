@@ -123,6 +123,22 @@ pub enum EngineOp {
         /// How many frames to walk. Bounded by the supervisor before it gets here.
         frames: u32,
     },
+    /// A run of instructions, as values and as the listing rendered from them.
+    ///
+    /// One op rather than `u` for [`Self::Backtrace`]'s reason: the answer is each instruction's
+    /// `module` + `rva`, which is the engine's own walk plus a containment test the worker has to
+    /// make. `address` is still an *expression* — a symbol, `module+0x1c`, a register — because
+    /// that is what a caller has, and only the worker can ask the debugger to evaluate it.
+    ///
+    /// Unbounded, as the `u` it replaces was: direct engine calls rather than a command, so there
+    /// is no watchdog to carry a patience for.
+    Disassemble {
+        /// The expression to start at, or `None` for the current instruction pointer.
+        #[serde(default)]
+        address: Option<String>,
+        /// How many instructions to render. Bounded by the supervisor before it gets here.
+        count: u32,
+    },
     /// Set a breakpoint (`bp <expression>`) and report what the session now holds.
     ///
     /// A command rather than a typed `AddBreakpoint` because `bp`'s syntax is the point: a

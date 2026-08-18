@@ -562,6 +562,21 @@ fn is_tool_error(response: &Value) -> bool {
     response["result"]["isError"] == json!(true)
 }
 
+/// Whether a string still holds the debugger's own address form — `fffff801`3c677ef0`, eight hex
+/// digits either side of a backtick. The server normalises those out of instruction text and
+/// deliberately leaves every other backtick alone, so this is what an assertion about it can test
+/// without depending on which symbols a host resolved.
+fn carries_a_backtick_address(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes.iter().enumerate().any(|(at, byte)| {
+        *byte == b'`'
+            && at >= 8
+            && at + 8 < bytes.len()
+            && bytes[at - 8..at].iter().all(u8::is_ascii_hexdigit)
+            && bytes[at + 1..at + 9].iter().all(u8::is_ascii_hexdigit)
+    })
+}
+
 fn skip(reason: &str) {
     eprintln!("SKIPPED: {reason}");
 }
@@ -1320,13 +1335,13 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
     })
 }
 
-/// Ceiling on the tool surface a model is given before it has asked anything. 66,717 bytes across
-/// 51 tools today (~16k tokens), +14% headroom — sized so that rewording a description passes and
+/// Ceiling on the tool surface a model is given before it has asked anything. 67,613 bytes across
+/// 51 tools today (~16k tokens), +12% headroom — sized so that rewording a description passes and
 /// a new tool arriving with a `debug_batch`-scale schema does not.
 const MODEL_VISIBLE_CEILING: usize = 76_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
-/// the array's own punctuation and every result-level field are inside it. 368,051 bytes today,
+/// the array's own punctuation and every result-level field are inside it. 376,099 bytes today,
 /// ~80% of that `outputSchema` no model reads, which is why this is a separate and much looser
 /// number rather than a scaled version of the one above.
 ///
@@ -1520,6 +1535,7 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
         ("registers", json!({}), "error"),
         ("modules", json!({}), "error"),
         ("backtrace", json!({}), "error"),
+        ("disassemble", json!({}), "error"),
         (
             "set_breakpoint",
             json!({ "expression": "nt!KeBugCheckEx" }),
@@ -2909,6 +2925,35 @@ const NO_KERNEL_SYMBOLS_SKIP: &str = "`nt` resolved no PDB on this host, so the 
                                       types out of (issue #142). Reads that need no types are \
                                       unaffected and are asserted elsewhere in this tier.";
 
+/// A `disassemble` whose `address` could reach the expression evaluator is refused before a
+/// session is needed — and the refusal has to be *typed*, because the tool declares an
+/// `outputSchema` and a result that skips `structuredContent` is one a schema-checking client
+/// rejects. The coverage test above only exercises each tool's session refusal, so this path is
+/// asserted here.
+#[test]
+fn a_malformed_disassemble_address_is_refused_as_a_typed_error() {
+    let mut server = Server::started();
+    let response = server.call_tool(
+        "disassemble",
+        json!({ "address": "nt!KeBugCheckEx; .reload" }),
+        STEP,
+    );
+    assert_no_error(&response, "disassemble with a command breaker");
+    assert!(
+        is_tool_error(&response),
+        "an address carrying a command separator has to be refused: {response}"
+    );
+    let data = &response["result"]["structuredContent"];
+    assert_eq!(
+        data["status"], "error",
+        "the refusal has to carry structured content, as the schema promises: {response}"
+    );
+    assert_eq!(
+        data["error"]["category"], "invalid_argument",
+        "and say which kind of failure it is: {response}"
+    );
+}
+
 /// An open reports what it is doing while it is doing it, in the order it actually happened.
 ///
 /// The milestones are the supervisor's and the worker's — the engine process coming up, the target
@@ -3280,6 +3325,83 @@ fn a_dump_session_opens_reads_and_closes() {
                 );
             }
         }
+
+        // The same coordinate, from the third tool that computes one. `disassemble` with no
+        // address starts at the current instruction pointer, which is where frame 0 is — so the
+        // first instruction and the innermost frame are the same place, and if the two tools
+        // describe it differently then nothing downstream can join them.
+        let code = server.tool_data(
+            "disassemble",
+            json!({ "session_id": session_id }),
+            TARGET_STEP,
+        );
+        let instructions = code["instructions"]
+            .as_array()
+            .unwrap_or_else(|| panic!("`disassemble` answered without instructions: {code}"))
+            .clone();
+        assert!(
+            !instructions.is_empty(),
+            "a stopped target has an instruction at its program counter: {code}"
+        );
+        let innermost = &frames[0];
+        let first = &instructions[0];
+        assert_eq!(
+            first["address"], innermost["address"],
+            "`disassemble` starts where the program counter is, which is frame 0:\n{code}"
+        );
+        assert_eq!(
+            first["rva"], innermost["rva"],
+            "the same address has one offset into its image, whichever tool computed it:\n{code}"
+        );
+        assert_eq!(
+            first["module"], innermost["module"],
+            "`disassemble` and `backtrace` disagree about which image holds the same address:\n\
+             {code}"
+        );
+
+        for instruction in &instructions {
+            assert!(
+                instruction["address"]
+                    .as_str()
+                    .is_some_and(|a| a.starts_with("0x")),
+                "every instruction has an address: {instruction}"
+            );
+            assert!(
+                instruction["text"].as_str().is_some_and(|t| !t.is_empty()),
+                "and a mnemonic, or it is not an instruction: {instruction}"
+            );
+            // The *address* form specifically — eight hex digits, a tick, eight more. Not every
+            // backtick: MSVC decorates real symbols with them (`` `anonymous namespace' ``) and
+            // those are deliberately kept, so rejecting all of them would make this assertion
+            // depend on which symbols the host resolved.
+            assert!(
+                !carries_a_backtick_address(instruction["text"].as_str().unwrap_or_default()),
+                "the debugger's backtick address form is normalised out of operands: {instruction}"
+            );
+            assert!(
+                instruction["bytes"]
+                    .as_str()
+                    .is_some_and(|b| !b.is_empty() && b.chars().all(|c| c.is_ascii_hexdigit())),
+                "and an encoding, which is what identifies the build: {instruction}"
+            );
+        }
+
+        // Asking for one instruction is not a truncated sixteen: `stopped_early` is about the code
+        // running out, and a cap the caller set is not that.
+        let one = server.tool_data(
+            "disassemble",
+            json!({ "session_id": session_id, "count": 1 }),
+            TARGET_STEP,
+        );
+        assert_eq!(
+            one["instructions"].as_array().map_or(0, Vec::len),
+            1,
+            "{one}"
+        );
+        assert_eq!(
+            one["stopped_early"], false,
+            "a count the caller chose is not the code ending: {one}"
+        );
     } else {
         skip(NO_TARGET_READS_SKIP);
     }
@@ -3515,6 +3637,7 @@ fn tool_results_stay_within_their_budget() {
         ("crash_triage", json!({}), 6_000, 9_000),
         ("registers", json!({}), 13_500, 14_500),
         ("backtrace", json!({}), 3_000, 4_000),
+        ("disassemble", json!({}), 4_000, 6_000),
         ("modules", json!({}), 73_000, 100_000),
         ("execute", json!({ "command": "lm" }), 27_000, 28_500),
     ];

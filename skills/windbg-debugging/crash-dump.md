@@ -81,7 +81,11 @@ offending frame. No elevation needed; works on System32's engine.
    `execute { "command": "k" }`.
 
 6. **Inspect the crash site.**
-   - `disassemble {}` at the current IP, or `disassemble { "address": "module!func" }`.
+   - `disassemble {}` at the current IP, or `disassemble { "address": "module!func" }` — typed
+     instructions, each with its encoding and, where the engine can place the address in a loaded
+     module, its offset into that image; 16 by default. Use
+     `execute { "command": "uf module!func" }` to follow a whole function, which is the one shape
+     a count cannot ask for.
    - `read_memory { "address": "0x...", "size": 64 }` for a hex dump (numeric/hex address
      only — for a register expression use `execute { "command": "db @rsp" }`).
    - `execute { "command": "dt module!_STRUCT <addr>" }` to format a structure.
