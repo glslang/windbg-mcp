@@ -33,6 +33,73 @@ readable by every process on the machine — including a debuggee you `launch`. 
 the environment of both processes this server creates (engine workers, and the TTD recorder), so a
 recorded or launched target cannot read it and claim the server.
 
+### Do not start it *through* ssh and then hang up
+
+The two blocks above assume you are on the Windows machine for the first one. If instead you start
+the listener from an `ssh` command and let that command finish, it dies with the session:
+
+```console
+# on the client machine — starts, binds, logs "listening on ...", and is gone seconds later
+ssh windbg-vm 'powershell -Command "Start-Process windbg-mcp.exe -ArgumentList \"--listen\",\"127.0.0.1:8765\" -WindowStyle Hidden"'
+```
+
+**Windows OpenSSH terminates the session's process tree when the session ends**, and `Start-Process`
+does not escape it. The symptom is confusing because the log looks like a healthy start: the bind
+succeeds, `windbg-mcp listening on http://127.0.0.1:8765` is written, and nothing reports a failure
+— the process is simply not there afterwards, and the port is not bound. Measured: alive at
+`HasExited=False` three seconds in with the ssh session still open, and `Get-NetTCPConnection` on
+the port empty once it closed.
+
+**It is not stdin.** That is the intuitive explanation and it is wrong: the listener role never
+reads stdin. Under stdio, a closed stdin *is* the disconnect and tears every session down; under
+`--listen` there is no such signal, which is what the lease below exists to replace, and
+`serve_http` is handed a shutdown future that never completes (`main.rs`). Worth knowing, because
+"it lost its stdin" sends you looking at the wrong half of the server.
+
+Two ways to keep it up:
+
+**One ssh channel that both forwards and runs it.** Good for a session you are driving anyway — the
+listener lives exactly as long as the tunnel, which is usually what you want, and there is nothing
+left running when you are done:
+
+```console
+ssh -L 8765:127.0.0.1:8765 windbg-vm 'windbg-mcp.exe --listen 127.0.0.1:8765'
+```
+
+The token comes from the environment `setx` put it in, which an ssh session inherits.
+
+**Know what that protects and what it does not.** This server strips `WINDBG_MCP_LISTEN_TOKEN` from
+every child it creates (`engine::spawn_worker`, `ttd::record_launch`), so a debuggee you `launch` or
+a target you `record_trace` does not *inherit* it — which is the accident worth preventing, and the
+common one. It is not a defence against a target that goes looking: `setx` writes to
+`HKCU\Environment`, and a process running as the same user can read that key, a file under that
+user's profile, or the listener's own memory. Nothing the listener can read is hidden from a
+program running as the listener's user.
+
+So the account is the boundary, and **this server cannot put an untrusted target on the other side
+of it**. `launch` creates the process through DbgEng and `record_trace` spawns TTD with `-launch`;
+both run the target as the listener's own account, and there is no alternate-account path in this
+server today. An untrusted binary passed to either can therefore read `HKCU\Environment`, recover
+the token, and claim the listener — which is `execute`, `debug_batch` and `launch` on every session
+it holds.
+
+What that leaves:
+
+- **Do not `launch` or `record_trace` an untrusted binary on a host whose listener token matters.**
+  Record it on a machine that is not serving one, and bring the trace over.
+- **Opening a dump or a trace executes nothing**, so it is unaffected.
+- **`attach_process` is fine** when the target already runs as a **less-privileged** user — there
+  the boundary exists, because this server did not create the process. A different account is not
+  enough by itself: a target running as SYSTEM or as an administrator can read the listener's
+  process memory or your registry hive whatever account it nominally has.
+- **A remote kernel target** — `attach_kernel` over KDNET or serial — is a different machine
+  entirely, which is what this endpoint is mostly used for. `attach_kernel_local` is **not** that:
+  it debugs the machine the listener runs on, so an untrusted driver there is inside the boundary
+  like anything else local.
+
+**Or install it as a service**, which is what the service role is for and what survives a logout, a
+reboot and a hung tunnel — see [Run it as a Windows service](#run-it-as-a-windows-service).
+
 ## Point a client at it
 
 ```console
@@ -65,6 +132,18 @@ as an absent one — and releases the session the call is running against, out f
 caller. The bound is the sum because an opener spends up to 30 s bringing a worker up *before* the
 call budget starts. If the server refuses to start, that message is why; raise the grace or lower
 the call timeout.
+
+**Saying goodbye starts the grace; it does not end it.** A `DELETE` gives up the tenancy — the next
+client is served once the departing one's work has drained, rather than after a whole grace period
+(`Lease::try_give_up` holds it while a request is in flight or a worker is still busy, so a `409`
+just after a `DELETE` is that, not a failure) — but the sessions that client opened stay open for
+one more grace period, and its engine worker processes with them. That is the adoption case below,
+reached deliberately: a client that restarts is the common reason a client says goodbye, and making
+it pay a fresh `attach_kernel` would defeat the property this whole arrangement is for. If you are
+really done, end the sessions first: `end_session` releases **one** target — the one you name, or the
+current one — so a client holding several has to call it for each, and `session_status` is what
+lists them. That is the difference between a live kernel that is free and one still owned for the
+next 390 seconds.
 
 **A returning client adopts what it left.** Sessions are not released the moment a client goes
 away, so reconnecting inside the grace finds them still open — which is better than stdio, where a
