@@ -122,6 +122,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The last progress milestone is no longer dropped when it races the answer**
+  ([#163](https://github.com/glslang/windbg-mcp/issues/163)). A client watching a long call would
+  intermittently miss the milestone it most wants — "the target is open", "the rollback finished" —
+  because that is the one arriving beside the result.
+
+  `relay` takes a step out of the channel and then sends it. If the send was not ready on its first
+  poll, which is ordinary for a write to a peer, and the answer was ready beside it, the loop broke
+  and **that message was gone**: the flush at the end re-sends what is still queued, and this one had
+  already been taken. It now finishes the send on the same bounded terms the flush uses, so a client
+  that has stopped reading still loses the courtesy after a second — it just no longer loses it to a
+  scheduling coin toss.
+
+  The result was never affected; it always carried the truth. What was affected is a client that
+  watches progress and sees a long unwind stop at "rolling it back (up to 2m03s)" with no closing
+  word.
+
+  It surfaced as roughly one debugger-tier run in five failing on one of two tests, which is what
+  made it worth chasing: every test in `src/progress.rs` used a notification that completes on its
+  first poll, so the losing arm was unreachable and the bug lived entirely in the gap between the
+  test double and a real write.
+
 - **A session nobody is using is released, whatever the transport did.** The lease answers "has this
   *client* gone away" by identifying it from `Mcp-Session-Id` — and `2026-07-28` removed the protocol-level
   MCP session (SEP-2567), so on the revision most clients now negotiate no holder is ever installed and

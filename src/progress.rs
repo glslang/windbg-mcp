@@ -288,7 +288,23 @@ where
             // throughout, so it never waits on the notification.
             biased;
             () = &mut sending => {}
-            outcome = &mut work => break 'running outcome,
+            outcome = &mut work => {
+                // **This message is already out of the channel**, so abandoning it here loses it
+                // outright — the flush below can only re-send what is still queued, and cannot see
+                // what this arm took. That is how the *last* milestone went missing about one run
+                // in five ([#163]): a send that is not ready on its first poll, beside an answer
+                // that is, and the milestone a client most wants — "the target is open", "the
+                // rollback finished" — is the one dropped, because it is the one racing the result.
+                //
+                // Finished on the same bounded terms as the flush rather than awaited outright: the
+                // result exists by here and nothing may hold it back, so a client that has stopped
+                // reading still loses the courtesy after `FINAL_FLUSH` — it just no longer loses it
+                // to a scheduling coin toss.
+                //
+                // [#163]: https://github.com/glslang/windbg-mcp/issues/163
+                let _ = tokio::time::timeout(FINAL_FLUSH, sending).await;
+                break 'running outcome;
+            }
         }
     };
 
@@ -337,6 +353,56 @@ mod tests {
             .iter()
             .map(|(_, message)| message.clone())
             .collect()
+    }
+
+    /// A notification that is not ready on its *first* poll is still delivered when the answer is
+    /// ready beside it.
+    ///
+    /// [#163](https://github.com/glslang/windbg-mcp/issues/163): the collector above completes
+    /// immediately, so every test here took the happy path through the inner `select!`. A real
+    /// notification is a write to a peer, and one that returns `Pending` once — which is ordinary —
+    /// used to lose the race to an answer that was already ready. The step had *already been taken
+    /// out of the channel* by then, so the flush at the end could not recover it either: the
+    /// milestone was simply gone, and it was always the last one, because that is the one racing
+    /// the result. Roughly one debugger-tier run in five, on two different tests.
+    #[tokio::test(start_paused = true)]
+    async fn a_notification_that_yields_once_still_reaches_the_client() {
+        let sent: Sent = Arc::default();
+        let into = Arc::clone(&sent);
+        // Pending on the first poll, ready on the next — the cheapest stand-in for a write that
+        // does not complete synchronously.
+        let notify = move |progress: f64, message: String| {
+            let into = Arc::clone(&into);
+            async move {
+                tokio::task::yield_now().await;
+                into.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((progress, message));
+            }
+        };
+
+        relay(
+            async {
+                report(Step::Opened);
+                // **The yield is the whole test.** Without it the work completes on its first poll,
+                // the step is still in the channel, and the tail flush delivers it — which is a
+                // different path and passes either way. Yielding lets the loop *take* the step and
+                // start sending it, and the answer then becomes ready during that send: the only
+                // arrangement in which a milestone is lost outright.
+                tokio::task::yield_now().await;
+            },
+            Duration::from_secs(10),
+            notify,
+        )
+        .await;
+
+        assert_eq!(
+            messages(&sent).len(),
+            1,
+            "the milestone was taken from the channel and then dropped when its send lost the \
+             race — the flush cannot recover what the loop already took: {:?}",
+            messages(&sent)
+        );
     }
 
     /// A milestone reported in the same turn as the answer is still delivered.
