@@ -73,6 +73,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replacement": true for a program reading fields, not for the model. What that costs today is
   itemised as follow-up 24.
 
+- **An ARM64 kernel dump, so the debugger tier reads a *target* on both architectures.**
+  [`docs/samples/121524-4703-01.dmp`](docs/samples/121524-4703-01.dmp) is a `0xFC
+  ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY` off this project's own ARM64 debuggee — a user-mode
+  process jumped into memory that is not executable — captured the way the two x64 samples were, a
+  real crash on a real machine, and the smallest of the five that machine had at 440 KB.
+
+  The three tier assertions that read a target's memory now open the sample paired with the
+  architecture they are running on, rather than naming one file. What that buys is an ARM64
+  `_EPROCESS`, an ARM64 image's headers and an ARM64 stack's frames, read through claims that were
+  previously asserted only against x64: the ARM64 CI entry proved the protocol, the session
+  machinery and a module list, and nothing at all about reading a target
+  ([#143](https://github.com/glslang/windbg-mcp/issues/143)). It also pins the branch of the
+  process read nothing else reaches — this dump does not capture the page
+  `SeAuditProcessCreationInfo` points at, so the answer comes from the 15-byte
+  `_EPROCESS::ImageFileName` and is the truncated `stack_buffer_o`.
+
+- **The gate those assertions used to carry was measuring the wrong thing, and is gone.** Four of
+  them were `ignore`d on anything but `x86_64`, on the reading that an engine cannot follow a
+  pointer into a dump of another architecture
+  ([#142](https://github.com/glslang/windbg-mcp/issues/142)). It can: on an ARM64 host with the
+  SDK's `dbghelp.dll` and `symsrv.dll` beside the binary, one engine reads both x64 samples
+  completely — the `EPROCESS`, the disassembly, and the driver frame at its literal RVA — and the
+  ARM64 sample too, for a 60-of-60 tier. What no engine can do is follow a pointer into a kernel
+  dump without `nt`'s **symbols**: strip the symbol path from that same engine and the reads stop.
+  System32 ships `dbghelp.dll` and **no** `symsrv.dll`, so a machine with nothing beside the binary
+  downloads no PDB — and running *that* configuration by hand reproduces the ARM64 runner's
+  reported failure down to the address and the `0x8007001E`, which is the evidence for what state
+  it is in.
+
+  So the four ask the host instead: one `dq` at `nt`'s base, issued through `execute` rather than
+  through the tools under test, so that a regression in `walk_memory` or `crash_triage` cannot
+  silence the test that exists to catch it. The question is the *read* and not the symbols behind
+  it on purpose — a symbol-shaped gate would be closer to the cause and worse in practice, because
+  the x64 samples still give up a module base on a host that resolves nothing, and standing four
+  assertions down on a runner where they pass today is precisely the quiet failure this replaces.
+  Where the read comes back empty the test prints `SKIPPED` with the reason and what still holds;
+  a host that reads without resolving fails the assertions loudly instead, and the driver-crash
+  one now says in its own message which of the two that is.
+
 ### Changed
 
 - The listener no longer claims a reconnecting client **adopted sessions** when there were none to

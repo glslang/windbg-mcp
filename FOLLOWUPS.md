@@ -620,10 +620,21 @@ The first is the reason the entry existed and still cost a correction: the ARM64
 first attempt**, four assertions of forty-five, and the claim in `setup.md` was wrong. The engine
 parses the dump — bug check, module list, stack attribution — and cannot read *virtual memory* out
 of it, so `walk_memory`, `disassemble` and the `EPROCESS` behind `crash_triage`'s `process_name` all
-fail ([#142](https://github.com/glslang/windbg-mcp/issues/142)). Those four are gated to `x86_64`,
-because the constraint belongs to the **sample**: the checked-in dump is x64, and on another
-architecture they have nothing to assert. Equivalent coverage there needs an ARM64 dump of its own
-([#143](https://github.com/glslang/windbg-mcp/issues/143)).
+fail ([#142](https://github.com/glslang/windbg-mcp/issues/142)). Those four were gated to `x86_64`,
+because the constraint was taken to belong to the **sample**: the checked-in dump is x64, and on
+another architecture they were thought to have nothing to assert.
+
+**That diagnosis was wrong, and the correction is the more useful half of this entry** (2026-08-17,
+while capturing the ARM64 dump for [#143](https://github.com/glslang/windbg-mcp/issues/143)). The
+architectures are not the variable — **symbols** are. A kernel dump's virtual addresses are
+translated through structures the engine locates with `nt`'s symbols, so a host that resolves none
+reads the dump's headers and nothing behind them. On an ARM64 host with the SDK's `dbghelp.dll` and
+`symsrv.dll` beside the binary, one engine reads the x64 samples *and* an ARM64 one completely —
+including the `EPROCESS` and the driver frame at its literal RVA; strip the symbol path from that
+same engine and it reads neither. System32 ships `dbghelp.dll` and no `symsrv.dll`, which is why a
+runner with nothing beside the binary downloads no PDB and fails these four. The tests now ask the
+engine (one `dq` at a module base) instead of asking `cfg!(target_arch)`, and the ARM64 dump is
+checked in for the coverage it genuinely adds: an ARM64 *target*, which nothing else here reads.
 
 The second is a trap with nothing to do with architecture. **Renaming the job removed a required
 status check.** `Smoke test (debugger tier)` is a required context in the repository ruleset,

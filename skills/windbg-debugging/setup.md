@@ -14,15 +14,22 @@ section for the workflow you're about to run before blaming the target.
 ### ARM64 hosts
 
 Crash-dump analysis works on Windows on ARM, and the dump does **not** have to be ARM64: an ARM64
-engine read an x64 kernel minidump here — `!analyze -v`, symbols, failure bucket and pool tag.
+engine reads an x64 kernel minidump in full — `!analyze -v`, symbols, failure bucket, pool tag, the
+`EPROCESS` behind `process_name`, and `walk_memory` / `disassemble` against the captured address
+space.
 
-**But not everything in it.** CI's ARM64 debugger tier found that the same combination cannot read
-the target's **virtual memory**: `walk_memory` and `disassemble` fail with `0x8007001E` /
-`0x80040205`, and `crash_triage` loses `process_name` because the `EPROCESS` behind it is a virtual
-read ([#142](https://github.com/glslang/windbg-mcp/issues/142)). The dump's *structure* — bug check,
-module list, stack attribution — reads fine; following a pointer into the captured address space
-does not. Whether that is the inbox engine specifically, or cross-architecture dumps generally, is
-still open.
+**With the engine bundle below beside `windbg-mcp.exe`, and not without it.** An engine that
+resolves no symbols still reads a dump's *structure* — bug check, module list, stack attribution,
+all of it out of the dump's own headers — and fails everything that follows a **pointer** with
+`0x8007001E` / `0x80040205`, because a kernel dump's virtual addresses are translated through
+structures it locates with `nt`'s symbols. That is what
+[#142](https://github.com/glslang/windbg-mcp/issues/142) was, and it was first read as an
+architecture limitation, which it is not: the same host reads x64 and ARM64 dumps alike once
+symbols resolve, and reads neither when they do not.
+
+`symsrv.dll` is the file this usually comes down to. System32 ships `dbghelp.dll` and **no**
+`symsrv.dll`, so a machine with nothing beside the binary cannot download a PDB over a `srv*` path
+at all — and the symptom is not "no symbols", it is a memory read failing.
 
 Live user-mode and live kernel are untested on ARM64, and the bitness rule above still applies to
 those.

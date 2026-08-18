@@ -102,6 +102,89 @@ const DRIVER_CRASH_DUMP: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/docs/samples/081226-2187-01.dmp"
 );
+/// A third crash dump, and the only **ARM64** target in this suite: a
+/// `0xFC ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY` off this project's own ARM64 debuggee, where a
+/// user-mode process jumped into memory that is not executable and the kernel bug-checked out of
+/// `nt!MiCheckSystemNxFault`.
+///
+/// Captured the same way as the two above — a real crash on a real machine, out of
+/// `C:\Windows\Minidump` — and the smallest of the five that machine had, because every clone
+/// carries it for ever (issue #143).
+///
+/// What it adds is a *target*, not a second copy of the protocol: everything else the ARM64 CI
+/// entry runs reads either the protocol or the dump's **structure** — bug check, module list,
+/// stack attribution — and that much is architecture-independent and already passes against the
+/// x64 samples. Reading an ARM64 `_EPROCESS`, an ARM64 image's headers and an ARM64 stack's
+/// frames happens here and nowhere else that CI can reach.
+const ARM64_SAMPLE_DUMP: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/docs/samples/121524-4703-01.dmp"
+);
+
+/// A checked-in kernel dump together with the facts about *that crash* a test asserts.
+///
+/// The claims below — a walk marks what it cannot read, a batch's rollback runs either way, a bug
+/// check is triaged into its fields — are properties of this server, not of a file, so they are
+/// written once and pointed at whichever real crash this host can read. What differs between two
+/// real crashes is only what is in this record.
+struct KernelSample {
+    /// Where the file is.
+    path: &'static str,
+    /// `bug_check.code`, spelled as the field spells it: lowercase, unpadded.
+    bug_check: &'static str,
+    /// The name out of this build's own table, which is why it needs no `!analyze`.
+    bug_check_name: &'static str,
+    /// `Arg1`, rendered as the field renders it — zero-padded to sixteen digits.
+    first_parameter: &'static str,
+    /// The crashing process, read out of the current `_EPROCESS`.
+    process_name: &'static str,
+}
+
+impl KernelSample {
+    /// How `!analyze` heads this bug check's `FAILURE_BUCKET_ID`: `0x9F`, `0xFC` — the digits
+    /// upper-cased and the `0x` left alone, which is neither spelling of [`Self::bug_check`].
+    fn bucket_prefix(&self) -> String {
+        format!("0x{}", self.bug_check[2..].to_ascii_uppercase())
+    }
+}
+
+/// The sample whose architecture is **this host's**, which is the one every test that reads a
+/// target's memory opens.
+///
+/// A dump is read by the engine on the machine running these tests, so pairing the two is what
+/// gives an ARM64 run a target it is certain to be able to read. It is deliberately not a claim
+/// that the other pairing fails: measured on an ARM64 host with symbols, the x64 samples read
+/// fine, and the driver-crash test below opens one on every architecture for exactly that reason.
+/// What decides whether any of this works is [`engine_can_read_this_target`], not the architecture.
+#[cfg(target_arch = "aarch64")]
+const NATIVE_SAMPLE: KernelSample = KernelSample {
+    path: ARM64_SAMPLE_DUMP,
+    bug_check: "0xfc",
+    bug_check_name: "ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY",
+    // The address that was executed. The x64 sample's `Arg1` is a subtype code instead — both are
+    // facts about their own file, which is what makes either of them assertable.
+    first_parameter: "0x0000019e7b820000",
+    // Fifteen bytes, and cut off at them. This dump does not capture the pool page that
+    // `SeAuditProcessCreationInfo` points at, so the engine falls back to
+    // `_EPROCESS::ImageFileName` — which is the fallback nothing else in this suite exercises,
+    // where [`DRIVER_CRASH_DUMP`] pins the audit name the fallback exists to avoid.
+    process_name: "stack_buffer_o",
+};
+
+/// The x64 pairing, and the fixture this repo had first.
+#[cfg(not(target_arch = "aarch64"))]
+const NATIVE_SAMPLE: KernelSample = KernelSample {
+    path: SAMPLE_DUMP,
+    bug_check: "0x9f",
+    bug_check_name: "DRIVER_POWER_STATE_FAILURE",
+    // The `0x9F` subtype: 3, "a device object has been blocking an IRP for too long".
+    first_parameter: "0x0000000000000003",
+    // The watchdog fires on an idle CPU, so the answer is `System` — and the check that matters is
+    // that it is not the kernel image, which is what the engine's own
+    // `GetCurrentProcessExecutableName` answers on a kernel target for every process there has
+    // ever been.
+    process_name: "System",
+};
 
 // ---- harness ------------------------------------------------------------------
 
@@ -2769,6 +2852,74 @@ fn target_tier() -> Option<&'static str> {
     Some(SAMPLE_DUMP)
 }
 
+/// The same gate for a test that reads a **target's memory** rather than the structure of the dump
+/// around it: [`NATIVE_SAMPLE`], the crash paired with this host's architecture.
+fn native_sample_tier() -> Option<&'static KernelSample> {
+    if std::env::var_os("WINDBG_MCP_SMOKE_DUMP").is_none() {
+        skip("set WINDBG_MCP_SMOKE_DUMP=1 to run the debugger tier");
+        return None;
+    }
+    if !std::path::Path::new(NATIVE_SAMPLE.path).exists() {
+        skip(&format!("sample dump not found at {}", NATIVE_SAMPLE.path));
+        return None;
+    }
+    Some(&NATIVE_SAMPLE)
+}
+
+/// Whether this host can read the *target* behind `session_id`, rather than only the dump around
+/// it — the premise of the four tests below.
+///
+/// **It is a question about symbols, not about architecture**, which is what it was gated on until
+/// [#142](https://github.com/glslang/windbg-mcp/issues/142) was run down. A kernel dump carries its
+/// bug check, its module list and its stack in its own headers, and everything behind a *pointer*
+/// needs `nt`'s symbols: without them the engine answers `0x8007001E` to a read of a module base
+/// and walks a stack into nonsense. Measured on one ARM64 host, four ways — with the SDK's
+/// `dbghelp.dll` and `symsrv.dll` beside the binary it reads the x64 samples and an ARM64 one
+/// completely; with nothing beside the binary (System32 ships `dbghelp.dll` and **no**
+/// `symsrv.dll`, so a `srv*` path downloads nothing) it reproduces that CI failure exactly, same
+/// address and same code; and with the full bundle but `_NT_SYMBOL_PATH` pointed at an empty
+/// directory it fails again, differently per dump. Symbols are the variable in all four.
+///
+/// What it asks is nevertheless the **read**, not the symbols behind it: one `dq` at `nt`'s base,
+/// which is the thing every one of the four needs first. Asking `nt` for a PDB instead would be
+/// closer to the cause and strictly worse as a gate — the x64 samples give up a module base on a
+/// host with no symbols at all, so a symbol-shaped question could stand these four down on a
+/// runner where they pass today, and a skip that quiet is the failure mode this whole gate exists
+/// to avoid. A host that reads but does not resolve fails the assertions instead, which is what it
+/// did before this gate existed and is loud in the right way.
+///
+/// The read goes through `execute` rather than through the tools under test — otherwise a
+/// regression in `walk_memory` or `crash_triage` would silence the test that exists to catch it.
+fn engine_can_read_this_target(server: &mut Server, session_id: &str) -> bool {
+    let modules = server.tool_data("modules", json!({ "session_id": session_id }), TARGET_STEP);
+    let Some(base) = modules["modules"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|m| m["name"] == "nt")
+        .and_then(|m| m["start"].as_str())
+    else {
+        return false;
+    };
+    // A numeric address, so the read does not itself depend on a symbol resolving; `nt` is a PE
+    // image, so a real read of its first qword carries `MZ`.
+    let read = server.call_tool(
+        "execute",
+        json!({ "session_id": session_id, "command": format!("dq {base} L1") }),
+        TARGET_STEP,
+    );
+    !is_tool_error(&read) && text_of(&read["result"]).contains("905a4d")
+}
+
+/// Why a target-reading test stands down. Shared, so the four cannot drift into disagreeing about
+/// what they need.
+const NO_TARGET_READS_SKIP: &str = "this engine cannot read the target: `nt`'s own base did not \
+                                    read, which on a kernel dump means it resolved none of `nt`'s \
+                                    symbols to follow a pointer with (issue #142), usually for \
+                                    want of a `symsrv.dll` beside the engine. The dump's own \
+                                    structure still reads, which is what the rest of this tier \
+                                    asserts.";
+
 /// An open reports what it is doing while it is doing it, in the order it actually happened.
 ///
 /// The milestones are the supervisor's and the worker's — the engine process coming up, the target
@@ -3717,15 +3868,17 @@ const UNMAPPED: &str = "0x1000";
 ///
 /// Everything here is read-only against the checked-in dump, and the one address it assumes
 /// anything about is [`UNMAPPED`], which is unmapped on every Windows target there is.
-#[cfg_attr(
-    not(target_arch = "x86_64"),
-    ignore = "the checked-in dump is x64 and this reads its virtual memory, which an engine of another architecture cannot — see docs/smoke-test.md and issue #142"
-)]
 #[test]
 fn a_walk_marks_what_it_cannot_read_and_keeps_going() {
-    let Some(dump) = target_tier() else { return };
+    let Some(sample) = native_sample_tier() else {
+        return;
+    };
     let mut server = Server::started();
-    let session_id = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+    let session_id = server.open_session("open_dump", json!({ "path": sample.path }), TARGET_STEP);
+    if !engine_can_read_this_target(&mut server, &session_id) {
+        skip(NO_TARGET_READS_SKIP);
+        return;
+    }
 
     // The two anchors of a kernel dump's module list, used as addresses that certainly *are*
     // readable — the alternative is a literal, and a literal would make this test a fact about
@@ -3861,29 +4014,36 @@ fn a_walk_marks_what_it_cannot_read_and_keeps_going() {
     );
 }
 
-/// `crash_triage` against the checked-in bug check, which is a `0x9F DRIVER_POWER_STATE_FAILURE`.
+/// `crash_triage` against the checked-in bug check — a `0x9F DRIVER_POWER_STATE_FAILURE` on x64,
+/// a `0xFC ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY` on ARM64.
 ///
 /// The claim is the one the tool exists for and the one no unit test can make: the fields come
 /// off a real dump through a real engine. `src/triage.rs` proves the assembly over scripted
 /// values; this proves that `ReadBugCheckData`, the stack walk, the per-frame module attribution
 /// and the `!analyze` fallback all reach that assembly with something in them.
 ///
+/// Which crash it is asserted against comes from [`NATIVE_SAMPLE`], because the claim is about the
+/// tool and the sample is whichever real crash this host can read. Everything specific to one of
+/// them is in that record and nowhere else in this body.
+///
 /// Deliberately asserts on the *engine-read* half plus the shape of the rest: the sample's
 /// parameters and its `nt`-topped stack are facts about the file, while what `!analyze` concludes
 /// depends on whether this host has `winext\ext.dll` beside the engine — so the analysis is
 /// checked for being coherent, not for having run.
-#[cfg_attr(
-    not(target_arch = "x86_64"),
-    ignore = "the checked-in dump is x64 and this reads its virtual memory, which an engine of another architecture cannot — see docs/smoke-test.md and issue #142"
-)]
 #[test]
 fn a_bug_check_is_triaged_into_its_fields() {
-    let Some(dump) = target_tier() else { return };
+    let Some(sample) = native_sample_tier() else {
+        return;
+    };
     let mut server = Server::started();
 
-    let response = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
+    let response = server.call_tool("open_dump", json!({ "path": sample.path }), TARGET_STEP);
     assert_no_error(&response, "open_dump");
     let session_id = session_id_of(&response["result"]);
+    if !engine_can_read_this_target(&mut server, &session_id) {
+        skip(NO_TARGET_READS_SKIP);
+        return;
+    }
 
     let triage = server.tool_data(
         "crash_triage",
@@ -3892,17 +4052,16 @@ fn a_bug_check_is_triaged_into_its_fields() {
     );
 
     // The bug check itself, read through `ReadBugCheckData` rather than off any text.
-    assert_eq!(triage["bug_check"]["code"], "0x9f", "{triage}");
+    assert_eq!(triage["bug_check"]["code"], sample.bug_check, "{triage}");
     assert_eq!(
-        triage["bug_check"]["name"], "DRIVER_POWER_STATE_FAILURE",
+        triage["bug_check"]["name"], sample.bug_check_name,
         "the name comes from this build's table, so it does not need `!analyze`: {triage}"
     );
     let parameters = triage["bug_check"]["parameters"]
         .as_array()
         .expect("four parameters");
     assert_eq!(parameters.len(), 4, "{triage}");
-    // Arg1 is the 0x9F subtype: 3, "a device object has been blocking an IRP for too long".
-    assert_eq!(parameters[0], "0x0000000000000003", "{triage}");
+    assert_eq!(parameters[0], sample.first_parameter, "{triage}");
     for parameter in parameters {
         assert_eq!(
             parameter.as_str().map(str::len),
@@ -3969,8 +4128,11 @@ fn a_bug_check_is_triaged_into_its_fields() {
         assert_eq!(frame["index"], position as u64, "{triage}");
     }
 
-    // The sample's crash is entirely inside the kernel's watchdog path, so there is no driver
-    // frame to name — and the tool says why rather than blaming `nt!KeBugCheckEx`.
+    // Neither sample is a driver bug, so what is asserted is the *rule* rather than an outcome:
+    // no frame outside the kernel means no `faulting_frame` and a reason instead of a blamed
+    // `nt!KeBugCheckEx`; a frame that does qualify — the ARM64 sample's is the user-mode address
+    // that was executed, which belongs to no loaded module — is never the kernel itself.
+    // Naming a driver is [`a_driver_crash_names_the_driver_frame_that_analyze_cannot`]'s claim.
     if triage["faulting_frame"].is_null() {
         let note = triage["faulting_frame_note"]
             .as_str()
@@ -3984,12 +4146,12 @@ fn a_bug_check_is_triaged_into_its_fields() {
         );
     }
 
-    // `PROCESS_NAME`, read out of the current `_EPROCESS`. The sample's watchdog fires on an idle
-    // CPU, so the answer is `System` — and the check that matters is that it is *not* the kernel
-    // image, which is what the engine's own `GetCurrentProcessExecutableName` answers on a kernel
-    // target for every process there has ever been.
+    // `PROCESS_NAME`, read out of the current `_EPROCESS` — the sample's own crashing process, and
+    // the check that matters is that it is *not* the kernel image, which is what the engine's own
+    // `GetCurrentProcessExecutableName` answers on a kernel target for every process there has
+    // ever been.
     assert_eq!(
-        triage["process_name"], "System",
+        triage["process_name"], sample.process_name,
         "the crashing process comes from the EPROCESS, not from the loaded kernel image: {triage}"
     );
 
@@ -4017,12 +4179,13 @@ fn a_bug_check_is_triaged_into_its_fields() {
         if analysis["truncated"] == false {
             assert!(
                 notes > 0,
-                "a complete `!analyze` of a 0x9F explains its parameters: {triage}"
+                "a complete `!analyze` of this bug check explains its parameters: {triage}"
             );
+            let bucket_prefix = sample.bucket_prefix();
             assert!(
                 analysis["failure_bucket_id"]
                     .as_str()
-                    .is_some_and(|bucket| bucket.starts_with("0x9F")),
+                    .is_some_and(|bucket| bucket.starts_with(&bucket_prefix)),
                 "the bucket is one of the fields only `!analyze` computes, and it is derived from \
                  the bug check code: {triage}"
             );
@@ -4054,7 +4217,10 @@ fn a_bug_check_is_triaged_into_its_fields() {
         TARGET_STEP,
     );
     assert!(
-        text.contains("BUG CHECK: 0x9f DRIVER_POWER_STATE_FAILURE"),
+        text.contains(&format!(
+            "BUG CHECK: {} {}",
+            sample.bug_check, sample.bug_check_name
+        )),
         "{text}"
     );
     assert!(text.contains("STACK ("), "{text}");
@@ -4124,10 +4290,13 @@ fn a_bug_check_is_triaged_into_its_fields() {
 /// fixed offset into a fixed image, so it is reproducible across every reboot and load base — five
 /// dumps from the same loop reported it at five different addresses — and a change in it means the
 /// attribution arithmetic moved.
-#[cfg_attr(
-    not(target_arch = "x86_64"),
-    ignore = "the checked-in dump is x64 and this reads its virtual memory, which an engine of another architecture cannot — see docs/smoke-test.md and issue #142"
-)]
+///
+/// The one test here that stays pointed at a **specific** file rather than at
+/// [`NATIVE_SAMPLE`]: what it asserts is a property of that crash, and there is no ARM64 driver
+/// bug in this repo to reproduce it with. It is not gated to x64 for that, though — an engine that
+/// resolves symbols reads this dump on either architecture, which was measured on an ARM64 host
+/// after [#142](https://github.com/glslang/windbg-mcp/issues/142) turned out to be about symbols
+/// rather than about architecture.
 #[test]
 fn a_driver_crash_names_the_driver_frame_that_analyze_cannot() {
     if target_tier().is_none() {
@@ -4152,6 +4321,10 @@ fn a_driver_crash_names_the_driver_frame_that_analyze_cannot() {
         text_of(&opened["result"])
     );
     let session_id = session_id_of(&opened["result"]);
+    if !engine_can_read_this_target(&mut server, &session_id) {
+        skip(NO_TARGET_READS_SKIP);
+        return;
+    }
 
     let triage = server.tool_data(
         "crash_triage",
@@ -4171,7 +4344,12 @@ fn a_driver_crash_names_the_driver_frame_that_analyze_cannot() {
         !faulting.is_null(),
         "this crash has a driver frame — finding it is what the tool is for: {triage}"
     );
-    assert_eq!(faulting["module"], "MessageManager", "{triage}");
+    assert_eq!(
+        faulting["module"], "MessageManager",
+        "a host that reads this dump but resolves none of its symbols walks the stack into the bug \
+         check's own parameters and names no driver at all — check whether `nt` came back with a \
+         PDB before reading this as an attribution bug (issue #142): {triage}"
+    );
     assert_eq!(
         faulting["rva"], "0x1654",
         "the RVA is a fixed offset into a fixed image, so it is the same in every dump this bug \
@@ -4268,18 +4446,21 @@ fn a_driver_crash_names_the_driver_frame_that_analyze_cannot() {
 ///
 /// Read-only against the checked-in kernel dump: the mutation the rollback would undo is left to
 /// the live-kernel tier, because a dump has nothing worth restoring.
-#[cfg_attr(
-    not(target_arch = "x86_64"),
-    ignore = "the checked-in dump is x64 and this reads its virtual memory, which an engine of another architecture cannot — see docs/smoke-test.md and issue #142"
-)]
 #[test]
 fn a_batch_commits_or_fails_and_its_rollback_runs_either_way() {
-    let Some(dump) = target_tier() else { return };
+    let Some(sample) = native_sample_tier() else {
+        return;
+    };
     let mut server = Server::started();
 
-    let response = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
+    let response = server.call_tool("open_dump", json!({ "path": sample.path }), TARGET_STEP);
     assert_no_error(&response, "open_dump");
     let session_id = session_id_of(&response["result"]);
+    // The batch disassembles at the captured `@$ip`, which is a read of the target like any other.
+    if !engine_can_read_this_target(&mut server, &session_id) {
+        skip(NO_TARGET_READS_SKIP);
+        return;
+    }
 
     // A batch that should commit: a capture bound from one step and interpolated into the next,
     // which is the whole of the "named values" contract in three steps.
