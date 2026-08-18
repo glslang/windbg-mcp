@@ -151,6 +151,39 @@ client restart costs a KDNET attach, and a KDNET attach costs a reboot of the ta
 how many sessions were inherited when that happens — or that nothing was open, since a client can
 also arrive to find the previous one had let go of an empty server.
 
+## A session nobody is using is released
+
+The lease answers "has this *client* gone away". There is a second question it cannot answer, and on
+the revision most clients now negotiate it is the only one left: **has anyone touched this session
+at all?**
+
+`2026-07-28` removed the protocol-level MCP session ([SEP-2567]), so no `Mcp-Session-Id` is minted
+and the lease — which
+identifies a client by exactly that header — never takes a holder. A client that vanishes on that
+revision leaves its targets held until this process exits, which for a live kernel means a machine
+owned by nobody. See [#162](https://github.com/glslang/windbg-mcp/issues/162) for the whole of it;
+this is the half that needs no client identity and so keeps working whatever the transport does.
+
+| | |
+| --- | --- |
+| Default | **30 minutes** since the last call naming that session |
+| Override | `WINDBG_MCP_SESSION_IDLE_SECS`, whole seconds; `0` disables it |
+| Floor | must exceed the longest a single call can run, or the server refuses to start |
+
+It is deliberately far longer than the lease grace. A lease is renewed by *any* request, so a
+working client renews it constantly; this is per session, and reading a stack for twenty minutes
+before asking the next question is ordinary work, not abandonment.
+
+**A session with a call outstanding is never idle**, however old that call is. That is not a
+detail: an `attach_kernel` parked in `WaitForEvent(INFINITE)` waiting for its target to dial in has
+one call outstanding and nothing else for as long as it takes, and it is precisely the session that
+must not be released. Nor is an opener that has not yet handed its handle back.
+
+Each one is released through the same orderly `EndSession` an explicit `end_session` uses, one at a
+time, because a live kernel that is merely killed is left halted.
+
+[SEP-2567]: https://modelcontextprotocol.io/seps/2567-sessionless-mcp
+
 ## One client at a time
 
 A second client is refused with `409`. This is forced by the registry rather than chosen: session

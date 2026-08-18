@@ -122,6 +122,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A session nobody is using is released, whatever the transport did.** The lease answers "has this
+  *client* gone away" by identifying it from `Mcp-Session-Id` — and `2026-07-28` removed the protocol-level
+  MCP session (SEP-2567), so on the revision most clients now negotiate no holder is ever installed and
+  no lease ever expires. A client that vanished left its targets held until the process exited,
+  which for a live kernel is a machine owned by nobody
+  ([#162](https://github.com/glslang/windbg-mcp/issues/162)).
+
+  The listener now also releases any session that has gone unused for **30 minutes** (
+  `WINDBG_MCP_SESSION_IDLE_SECS`, `0` disables), through the same orderly `EndSession` an explicit
+  `end_session` uses. It needs no notion of a client, which is the point: it is the half of the
+  lease's job that survives a protocol with no sessions in it.
+
+  - **Far longer than the lease grace, deliberately.** A lease is renewed by any request; this is
+    per session, and twenty minutes of reading a stack before the next question is ordinary work.
+  - **A session with a call outstanding is never idle**, however old the call — which is exactly an
+    `attach_kernel` parked in `WaitForEvent(INFINITE)` waiting for its target to dial in, the one
+    session that must never be released. Nor is an opener that has not yet handed back its handle.
+  - The floor is the same one the lease refuses to start below: longer than a single call can run,
+    or a session is released underneath its own caller.
+
+  This is the first of the slices in #162. It does not make two clients safe from each other — that
+  needs a client identity, which a stateless protocol only gets from authentication — but it stops
+  the leak that has no workaround today.
+
 - **The server instructions now fit what the client reads.** They were 3,147 characters against a
   measured 2,048-character limit, so 1,099 were paid for on every connection and discarded — and
   what fell off the end was the `debug_batch` paragraph, the one instruction there that stops a

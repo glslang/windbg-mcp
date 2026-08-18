@@ -81,6 +81,51 @@ pub const TOKEN_ENV: &str = "WINDBG_MCP_LISTEN_TOKEN";
 /// Read *before* [`TOKEN_ENV`], so a host that has both is using the private one.
 pub const TOKEN_FILE_ENV: &str = "WINDBG_MCP_LISTEN_TOKEN_FILE";
 
+/// How long a session may go unused before it is released, from [`IDLE_ENV`] or [`IDLE_RELEASE`].
+///
+/// `0` turns it off, which is a supported answer for a host where every client is trusted to hang
+/// up — and a footgun anywhere else, so it says so once at startup rather than silently.
+fn idle_release(call_timeout: Duration) -> Result<Option<Duration>> {
+    idle_release_from(std::env::var(IDLE_ENV).ok().as_deref(), call_timeout)
+}
+
+/// The mapping behind [`idle_release`], given the variable's value rather than reading it.
+///
+/// Split out for the reason `kdconn::env_entries` is: `std::env::set_var` is `unsafe` in edition
+/// 2024 and mutates state every other test in this binary shares, so three tests setting the same
+/// variable race each other under the default parallel runner. Handing the value in is the only way
+/// to assert the floor, the `0` case and the default without that.
+fn idle_release_from(configured: Option<&str>, call_timeout: Duration) -> Result<Option<Duration>> {
+    let after = match configured {
+        Some(raw) => {
+            let secs: u64 = raw.trim().parse().with_context(|| {
+                format!("`{IDLE_ENV}` must be whole seconds (0 disables), not `{raw}`")
+            })?;
+            if secs == 0 {
+                tracing::warn!(
+                    "{IDLE_ENV}=0: a session nobody uses is never released, so a client that goes \
+                     away without saying so leaves its target held until this process ends"
+                );
+                return Ok(None);
+            }
+            Duration::from_secs(secs)
+        }
+        None => IDLE_RELEASE,
+    };
+    // The same floor the lease refuses to start below, and for the same reason: a call can keep a
+    // session quiet for its whole budget, and releasing one underneath its own caller is worse than
+    // holding an abandoned one.
+    let quiet = longest_quiet_call(call_timeout);
+    if after <= quiet {
+        bail!(
+            "`{IDLE_ENV}` ({after:?}) must be longer than the longest a single call can run \
+             ({quiet:?}), or a session is released while a call is still using it. Raise it, or \
+             set 0 to disable the release entirely."
+        );
+    }
+    Ok(Some(after))
+}
+
 /// Overrides how long a client may be silent before its sessions are released, in whole seconds.
 const GRACE_ENV: &str = "WINDBG_MCP_LEASE_GRACE_SECS";
 
@@ -106,6 +151,21 @@ const SSE_KEEP_ALIVE: Duration = Duration::from_secs(15);
 /// How often the sweeper looks for a lease that has run out. Fine enough that a released target is
 /// released promptly, coarse enough to cost nothing while idle.
 const SWEEP: Duration = Duration::from_secs(5);
+
+/// How long a session may go unused before it is released, and the variable that overrides it.
+///
+/// **The lease cannot cover this any more.** It identifies a client by `Mcp-Session-Id`, and
+/// SEP-2567 removed sessions from `2026-07-28` — the revision most clients now negotiate — so on
+/// that revision no holder is ever installed and no lease ever expires. A client that vanishes
+/// would leave its targets held until the process ended, which for a live kernel means a machine
+/// owned by nobody ([#162](https://github.com/glslang/windbg-mcp/issues/162)).
+///
+/// Deliberately much longer than the lease grace. A lease is renewed by *any* request, so a working
+/// client renews it constantly; this is per session, and a caller reading a stack for twenty minutes
+/// before asking the next question is doing nothing wrong. It is a backstop against abandonment,
+/// not a scheduler.
+const IDLE_RELEASE: Duration = Duration::from_secs(30 * 60);
+const IDLE_ENV: &str = "WINDBG_MCP_SESSION_IDLE_SECS";
 
 /// The header carrying a client's MCP session, which is what identifies the holder.
 const SESSION_HEADER: &str = "Mcp-Session-Id";
@@ -587,6 +647,9 @@ pub async fn serve(
         _ => longest_quiet_call(call_timeout) + GRACE_HEADROOM,
     };
     let lease = Arc::new(Lease::new(grace, call_timeout, sessions.clone())?);
+    // Read before the bind, like the grace above: a misconfigured backstop should be a message at
+    // startup rather than a target nobody releases, discovered hours later.
+    let idle_after = idle_release(call_timeout)?;
 
     if !addr.ip().is_loopback() {
         // Not refused: a host-only adapter is a legitimate choice and this server does not know
@@ -627,10 +690,19 @@ pub async fn serve(
     // *now*. See [`crate::service`], where "started" is a thing the SCM and its dependants act on.
     ready();
     tracing::info!(
-        "windbg-mcp listening on http://{addr} (lease grace {grace:?}, one client at a time)"
+        "windbg-mcp listening on http://{addr} (lease grace {grace:?}, {}, one client at a time)",
+        match idle_after {
+            Some(after) => format!("idle sessions released after {}m", after.as_secs() / 60),
+            None => "idle sessions never released".to_string(),
+        }
     );
 
-    tokio::spawn(sweep(sessions.clone(), lease.clone(), manager.clone()));
+    tokio::spawn(sweep(
+        sessions.clone(),
+        lease.clone(),
+        manager.clone(),
+        idle_after,
+    ));
 
     loop {
         let (stream, peer) = tokio::select! {
@@ -815,9 +887,20 @@ fn refuse(status: StatusCode, why: &str) -> Response<BoxBody<Bytes, Infallible>>
 }
 
 /// Releases what an absent client left behind, once its lease runs out.
-async fn sweep(sessions: Sessions, lease: Arc<Lease>, manager: Arc<LocalSessionManager>) {
+async fn sweep(
+    sessions: Sessions,
+    lease: Arc<Lease>,
+    manager: Arc<LocalSessionManager>,
+    idle_after: Option<Duration>,
+) {
     loop {
         tokio::time::sleep(SWEEP).await;
+        // Independent of the lease, and checked first, because it is the half that still works on
+        // a stateless transport: the lease needs a client to identify, and on `2026-07-28` there
+        // is no session id to identify one by. See [`IDLE_RELEASE`].
+        if let Some(after) = idle_after {
+            sessions.release_idle(after).await;
+        }
         // The engine may have gone idle since the last tick, which is not something the HTTP side
         // is told about.
         lease.try_give_up();
@@ -864,6 +947,48 @@ mod tests {
             sessions: Sessions::new(CALL),
             state: Mutex::new(Tenancy::default()),
         }
+    }
+
+    /// The floor is the same one the lease refuses to start below, and for the same reason: a
+    /// single call can keep a session quiet for its whole budget, so a release shorter than that
+    /// ends a session while its own caller is still waiting on it.
+    #[test]
+    fn an_idle_release_shorter_than_a_call_is_refused() {
+        let too_short = (longest_quiet_call(CALL) - Duration::from_secs(1))
+            .as_secs()
+            .to_string();
+        let why = idle_release_from(Some(&too_short), CALL)
+            .expect_err("a release inside the call budget must be refused");
+        assert!(
+            why.to_string().contains(IDLE_ENV),
+            "the message has to name the variable to change: {why}"
+        );
+    }
+
+    /// Zero is a supported answer — a host where every client hangs up properly — and it disables
+    /// the backstop rather than failing.
+    #[test]
+    fn zero_disables_the_idle_release() {
+        assert_eq!(
+            idle_release_from(Some("0"), CALL).expect("zero is allowed"),
+            None
+        );
+    }
+
+    /// And an unconfigured host gets a default that clears the floor, so it starts.
+    #[test]
+    fn the_default_idle_release_clears_the_floor() {
+        assert_eq!(
+            idle_release_from(None, CALL).expect("the default has to be workable"),
+            Some(IDLE_RELEASE)
+        );
+    }
+
+    /// A value that is not seconds is refused by name rather than silently taking the default.
+    #[test]
+    fn an_unparseable_idle_release_is_refused() {
+        let why = idle_release_from(Some("half an hour"), CALL).expect_err("not a number");
+        assert!(why.to_string().contains(IDLE_ENV), "{why}");
     }
 
     /// The claim an admitted request reserved. Panics if the gate refused, since every caller here

@@ -404,6 +404,14 @@ pub struct Session {
     /// Whether `open` has finished with this session and told its caller about it. Until then it
     /// is not reclaimable however idle it looks — see [`Session::busy`].
     delivered: AtomicBool,
+    /// When a call was last submitted against this session.
+    ///
+    /// The transport's disconnect is what normally releases a target, and under the revision of
+    /// MCP this server now speaks over HTTP there is no disconnect to have: sessions were removed
+    /// from the protocol (SEP-2567), so a client that vanishes is indistinguishable from one that
+    /// is thinking, for ever. This is the only signal left that nobody is coming back
+    /// ([#162](https://github.com/glslang/windbg-mcp/issues/162)).
+    last_used: Mutex<Instant>,
     /// How far the opener got, as [`OpenPhase`]. Separate from the state on purpose.
     phase: AtomicU8,
     /// Whether *some* teardown got a successful `EndSession` out of this worker.
@@ -563,6 +571,22 @@ impl Session {
     /// admitted at the limit, the later one's reconciliation could reclaim the earlier one and
     /// its caller would be handed a `session_id` that was already `Closed`. Undelivered means
     /// in flight as far as anyone outside is concerned.
+    /// Whether nobody has asked this session for anything in `after`, so it can be let go.
+    ///
+    /// **`busy` first, and it is not a formality.** A live kernel attach parked in
+    /// `WaitForEvent(INFINITE)` submits one call and then waits — possibly for hours, legitimately,
+    /// until its target dials in. It has a waiter outstanding the whole time, so `busy()` covers
+    /// it; reading the clock alone would release the one session whose whole job is to wait.
+    fn idle_for(&self, after: Duration) -> bool {
+        !self.busy()
+            && self
+                .last_used
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .elapsed()
+                >= after
+    }
+
     fn busy(&self) -> bool {
         !self.delivered.load(Ordering::Acquire)
             || !self
@@ -1041,6 +1065,10 @@ impl Sessions {
         // `pump`'s thread, the worker's reader — belongs to the session rather than to this call.
         {
             let _reclamation = self.registry();
+            // Touched on submission rather than on completion: a call that is still running keeps
+            // the session `busy()` anyway, and the question this answers is when someone last
+            // *wanted* it.
+            *session.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
             session
                 .waiters
                 .lock()
@@ -1495,6 +1523,60 @@ impl Sessions {
         self.release_every_worker(Teardown::Lease).await
     }
 
+    /// Releases every session nobody has used for `after`, and says how many.
+    ///
+    /// The transport-independent half of what a disconnect used to do. `release_leased` releases
+    /// *a client's* sessions when its lease runs out, which needs a client to identify; this asks
+    /// only whether anyone is still using a target, which is answerable with no notion of a client
+    /// at all — and so keeps working on a stateless transport where there is nothing to identify
+    /// ([#162](https://github.com/glslang/windbg-mcp/issues/162)).
+    ///
+    /// **Claimed under the registry lock, released outside it**, exactly as
+    /// [`Self::claim_overage_victim`] does and for a sharper version of the same reason. Deciding a
+    /// session is idle and then ending it are two moments, and [`Self::call_as`] takes that same
+    /// lock to register a waiter: without the claim, a call arriving in the gap would be routed to
+    /// a session this sweep is about to tear down, and a caller would lose an operation it had
+    /// just started — against a live kernel, mid-command. Closing the state under the lock is what
+    /// makes the gap unreachable: [`Sessions::resolve`] refuses a `Closed` session, so a call is on
+    /// one side of the claim or the other.
+    pub async fn release_idle(&self, after: Duration) -> usize {
+        let claimed = {
+            let registry = self.registry();
+            let stale: Vec<Arc<Session>> = registry
+                .live()
+                .iter()
+                .filter(|session| session.idle_for(after))
+                .cloned()
+                .collect();
+            for session in &stale {
+                session.set_state(SessionState::Closed(format!(
+                    "released after {}s with nobody using it — this server holds no target for a \
+                     client that has stopped asking, because on a stateless transport there is no \
+                     disconnect to notice",
+                    after.as_secs()
+                )));
+            }
+            stale
+        };
+        for session in &claimed {
+            tracing::info!(
+                "releasing session {} — nobody has used it for {}s",
+                session.id,
+                after.as_secs()
+            );
+            // The supervisor's own teardown rather than a caller's call, so it runs past the gate
+            // the claim just closed — and orderly, because a live kernel that is merely killed is
+            // left halted.
+            self.release(
+                &session.clone(),
+                Call::supervisor(EngineOp::EndSession),
+                END_SESSION_TIMEOUT,
+            )
+            .await;
+        }
+        claimed.len()
+    }
+
     async fn release_every_worker(&self, teardown: Teardown) {
         // Closing the gate and taking the snapshot under **one** lock acquisition is what makes
         // one pass enough. [`Self::admit`] re-checks `closing` under this same lock after its
@@ -1814,6 +1896,7 @@ impl Sessions {
             what,
             pid,
             created: Instant::now(),
+            last_used: Mutex::new(Instant::now()),
             state: Mutex::new((SessionState::Opening, Instant::now())),
             tx,
             // Job ids start *past* the opener's, which is reserved — see [`OPENER_JOB`].
@@ -2950,6 +3033,52 @@ mod tests {
         assert!(closed.contains("open_dump"), "{closed}");
     }
 
+    // ---- releasing what nobody is using -------------------------------------------
+
+    /// The clock alone is not the question. A session with a call outstanding is in use however
+    /// long ago that call was submitted — which is the parked kernel attach exactly: one call, then
+    /// a wait for a target that may take hours to dial in.
+    #[test]
+    fn a_session_with_a_call_outstanding_is_never_idle() {
+        let session = dormant("sess-waiting", SessionState::Open);
+        // Backdate it well past any timeout, so only `busy()` can save it.
+        *session.last_used.lock().unwrap() = Instant::now() - Duration::from_secs(3600);
+        assert!(
+            session.idle_for(Duration::from_secs(1)),
+            "with nothing outstanding it is idle"
+        );
+
+        session.waiters.lock().unwrap().insert(
+            1,
+            Waiting {
+                done: oneshot::channel().0,
+                progress: None,
+                unwound: false,
+            },
+        );
+        assert!(
+            !session.idle_for(Duration::from_secs(1)),
+            "a call is outstanding: the session is in use, whatever the clock says"
+        );
+    }
+
+    /// An opener that has not yet been handed back is not idle either, however long the spawn
+    /// takes — the caller has not been told the handle yet, so nobody could have used it.
+    #[test]
+    fn a_session_not_yet_delivered_is_never_idle() {
+        let session = dormant("sess-opening", SessionState::Open);
+        session.delivered.store(false, Ordering::Release);
+        *session.last_used.lock().unwrap() = Instant::now() - Duration::from_secs(3600);
+        assert!(!session.idle_for(Duration::from_secs(1)));
+    }
+
+    /// And the ordinary case: used recently, so left alone.
+    #[test]
+    fn a_session_used_recently_is_left_alone() {
+        let session = dormant("sess-busy", SessionState::Open);
+        assert!(!session.idle_for(Duration::from_secs(60)));
+    }
+
     // ---- the registry (no workers involved) ---------------------------------------
 
     /// A `Session` with no worker behind it, for the routing tests. Its queue has no consumer,
@@ -2978,6 +3107,7 @@ mod tests {
             what: "test".to_string(),
             pid: 0,
             created: Instant::now(),
+            last_used: Mutex::new(Instant::now()),
             state: Mutex::new((state, Instant::now())),
             tx,
             next_id: AtomicU64::new(1),
