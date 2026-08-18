@@ -1341,14 +1341,20 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 const MODEL_VISIBLE_CEILING: usize = 76_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
-/// the array's own punctuation and every result-level field are inside it. 376,099 bytes today,
+/// the array's own punctuation and every result-level field are inside it. 391,709 bytes today,
 /// ~80% of that `outputSchema` no model reads, which is why this is a separate and much looser
 /// number rather than a scaled version of the one above.
 ///
 /// It is a client-side parse and memory cost, and it is the one that grows silently: `schemars`
 /// inlines `$defs` per tool, so adding one shared type to one more output shape can add tens of
 /// kilobytes here while [`MODEL_VISIBLE_CEILING`] does not move.
-const WIRE_CEILING: usize = 412_000;
+///
+/// **Raised from 412,000 once**, when `PdbInfo` — one optional four-field type on `ModuleInfo` —
+/// cost 15,610 B of wire and nothing at all of model context, because `ModuleInfo` is embedded in
+/// half a dozen output shapes and each inlines its own copy. That is `FOLLOWUPS.md` item 24's
+/// first finding priced, and it is recorded in `docs/token-budget.md` rather than absorbed
+/// quietly: this number moving is the only warning that the duplication is compounding.
+const WIRE_CEILING: usize = 460_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 9,757
 /// bytes, because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary from
@@ -3324,6 +3330,43 @@ fn a_dump_session_opens_reads_and_closes() {
                      {from_backtrace}"
                 );
             }
+        }
+
+        // The *other* half of the coordinate: which build, and which symbols for it. Its own
+        // premise — reading a target and *resolving* its symbols fail apart, and `pdb` is
+        // documented as absent for a module whose symbols are still deferred, so asserting it on
+        // a host that reads memory and resolves nothing would report a contract as a regression.
+        if engine_resolves_kernel_symbols(&mut server, &session_id) {
+            let nt = nt_module(&mut server, &session_id).expect("nt is in the module list");
+            let pdb = &nt["pdb"];
+            assert!(
+                !pdb.is_null(),
+                "a module whose symbols resolved has a PDB identity to report: {nt}"
+            );
+            let guid = pdb["guid"]
+                .as_str()
+                .unwrap_or_else(|| panic!("`guid` is a string: {pdb}"));
+            assert!(
+                guid.len() == 32
+                    && guid
+                        .chars()
+                        .all(|c| c.is_ascii_hexdigit() && !c.is_lowercase()),
+                "a PDB GUID is spelled as a symbol server path spells it — 32 uppercase hex \
+                 digits, no braces, no dashes: {pdb}"
+            );
+            // The key is what a caller pastes into `<pdb>/<key>/<pdb>`, and the age goes in
+            // **hex**. Read strictly rather than defaulted: a missing `age` defaulted to zero
+            // would agree with a key built from zero, and the schema regression would pass.
+            let age = pdb["age"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("`age` is a number: {pdb}"));
+            assert_eq!(
+                pdb["key"].as_str().unwrap_or_default(),
+                format!("{guid}{age:X}"),
+                "the key is the guid and the age in hex: {pdb}"
+            );
+        } else {
+            skip(NO_KERNEL_SYMBOLS_SKIP);
         }
 
         // The same coordinate, from the third tool that computes one. `disassemble` with no

@@ -7,7 +7,7 @@ answer this server returns. That makes payload size a correctness-adjacent prope
 call that spends 13k tokens has not failed, but it has taken the space the investigation needed.
 Nothing measured this until [`tests/mcp_smoke.rs`](../tests/mcp_smoke.rs) grew the two tests below,
 and the numbers turned out to be larger than anyone had guessed — a careful reading of the source
-put the tool surface at 90–130 KB, and the wire is 376 KB.
+put the tool surface at 90–130 KB, and the wire is 392 KB.
 
 ## Two costs, and they are not the same
 
@@ -61,10 +61,10 @@ authority — the tables below are a reading of it at the time of writing.
 
 | Component | Bytes | Reaches the model |
 |---|---:|---|
-| **Whole `tools/list` payload** | **376,099** | partly |
-| — the 51 tools themselves | 375,981 | partly |
+| **Whole `tools/list` payload** | **391,709** | partly |
+| — the 51 tools themselves | 391,591 | partly |
 | — result-level fields (`resultType`, `ttlMs`, `cacheScope`) | 118 | no |
-| `outputSchema` (the 33 tools that have one) | 301,626 | no |
+| `outputSchema` (the 33 tools that have one) | 317,236 | no |
 | `inputSchema` (all 51) | 40,204 | yes |
 | `description` (all 51) | 24,752 | yes |
 | `annotations` | 5,449 | no |
@@ -81,8 +81,8 @@ server at two revisions shows what a sum would miss:
 
 | Revision | payload | sum of tools | result-level |
 |---|---:|---:|---|
-| `2026-07-28` | 376,099 | 375,981 | `resultType`, `ttlMs`, `cacheScope` |
-| `2025-06-18` | 376,043 | 375,981 | none |
+| `2026-07-28` | 391,709 | 391,591 | `resultType`, `ttlMs`, `cacheScope` |
+| `2025-06-18` | 391,653 | 391,591 | none |
 
 The sum is **identical** across the two; only the payload figure can tell them apart. The golden
 records both, so the gap stays visible.
@@ -93,22 +93,23 @@ records both, so the gap stays visible.
 
 | Tool | model | wire | text | structured | ratio |
 |---|---:|---:|---:|---:|---:|
-| `modules` | 53,875 | 73,994 | 19,732 | 53,875 | 2.7x |
+| `modules` | 53,897 | 74,016 | 19,732 | 53,897 | 2.7x |
 | `execute` (`lm`) | 19,420 | 19,788 | 19,420 | — | — |
 | `registers` | 9,804 | 10,534 | 618 | 9,804 | **15.9x** |
 | `crash_triage` | 1,855 | 3,133 | 1,159 | 1,855 | 1.6x |
 | `open_dump` | 1,347 | 2,277 | 814 | 1,347 | 1.7x |
-| `disassemble` | 1,808 | 3,219 | 1,291 | 1,808 | 1.4x |
+| `disassemble` | 2,018 | 3,429 | 1,291 | 2,018 | 1.6x |
 | `backtrace` | 945 | 1,588 | 532 | 945 | 1.8x |
 | `session_status` | 297 | 823 | 420 | 297 | 0.7x |
 
-`backtrace`'s and `disassemble`'s rows are the two measured somewhere else: against
-`docs/samples/121524-4703-01.dmp`, on the ARM64 bench, because both became typed after this
-baseline was recorded and that machine opens the sample matching its own architecture. A stack's
-size is the crash's rather than the tool's, and a disassembly's is the code's, so neither is
-comparable to the digit with the row it replaces (572 B of `k` text; `disassemble` had no row at
+**Three rows are measured somewhere else** — `backtrace`, `disassemble` and `modules` — against
+`docs/samples/121524-4703-01.dmp` on the ARM64 bench, because each changed after this baseline was
+recorded and that machine opens the sample matching its own architecture. A stack's size is the
+crash's rather than the tool's and a disassembly's is the code's, so the first two are not
+comparable to the digit with the rows they replace (572 B of `k` text; `disassemble` had no row at
 all, having had no budget). What is comparable is the shape: the model now reads records and not a
-listing.
+listing. `modules` moved by ~100 B for one module's `pdb` object, which is the whole of what that
+field costs a caller — against the 15,610 B it costs the wire in schema, which is finding 1 above.
 
 `registers` is the shape of the problem in miniature: the model reads 9,804 bytes of JSON carrying
 `"kind":"int"` and `"subregister":false` on every row, and never sees the 618-byte `r` output that
@@ -124,6 +125,13 @@ None of these is a bug. They are recorded because they were invisible, and
    `ErrorCategory` (2,089 B) ships **31 times**, `WalkGaps` (2,886 B) and the whole
    allocator/pool subtree nine times each. **200,571 bytes — 70% of all `outputSchema`** — is
    duplicated beyond its first copy.
+1b. **And finding 1 has a price tag now.** Adding `PdbInfo` — one optional four-field type, on one
+   field of `ModuleInfo` — grew the wire by **15,610 B**, because `ModuleInfo` is embedded in the
+   openers' `TargetSummary`, in `modules`, and in the allocator shapes, and `schemars` inlines the
+   new type into every one of them. Model-visible cost: **zero**, since no model reads an
+   `outputSchema`. That ratio — 15 KB of wire for 0 B of context — is the whole of finding 1 in a
+   single change, and it is why the ceiling below moved rather than the type being argued about.
+
 2. **Whole schemas repeat.** The six openers carry a byte-identical 11,093 B output schema; the six
    step tools a byte-identical 4,418 B one. 77,555 B of the above.
 3. **`session_id` is documented 43 times, in three different wordings** (222 B ×22, 292 B ×15,

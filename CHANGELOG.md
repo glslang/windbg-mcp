@@ -122,6 +122,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`modules` reports which PDB the engine has for a module** — `guid`, `age`, and the `key` those
+  two make, which is the middle element of a symbol server's `<pdb>/<key>/<pdb>` path. It completes
+  the coordinate work: the image was already identified by `timestamp` + `size`, and its *symbols*
+  are identified by a different pair that nothing reported.
+
+  - **`key` is carried already-built** rather than left to the caller, because the age goes in
+    **hex** and getting it wrong produces a URL that 404s — a hard failure to read backwards.
+  - **Absent for a module whose symbols are `deferred`**, which on a freshly opened dump is nearly
+    all of them. This reports the PDB the engine *has*, not one it could find; that is not the same
+    as "this module has no PDB", and the `symbols` state beside it says which.
+  - **`unmatched`** says the engine loaded a PDB that does not belong to the image, which makes
+    every symbol on that module another build's names. Absent when false.
+  - It saves a download rather than enabling something otherwise impossible — the same identity is
+    in the image's own debug directory, and [`docs/coordinates.md`](./docs/coordinates.md) walks
+    the whole chain, including the part where an 11 MB image is selected out of a symbol server by
+    two integers.
+
 - **`disassemble` answers with typed instructions carrying `RVA` and encoding, not just `u`'s
   text.** The second half of the same coordinate work, and the last tool that could only answer
   "what is the code here" as a rendering. Each instruction is now
