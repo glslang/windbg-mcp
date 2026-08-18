@@ -10,8 +10,9 @@ session's own transcript turned up, and item 18 what reviewing it did), item 19 
 `walk_memory` (#103, 2026-08-13), items 20–22 from standing the server up on an ARM64 guest
 (#131, #132, #134, 2026-08-16), item 23 from making the listener usable rather than merely
 working (2026-08-17), item 24 from first measuring what this server costs the model driving it
-(2026-08-17), and items 25–26 from giving the debugger tier an ARM64 *target* (#143, #152,
-2026-08-18). Each item notes its repo,
+(2026-08-17), items 25–26 from giving the debugger tier an ARM64 *target* (#143, #152,
+2026-08-18), and item 27 from completing the coordinate work (#156–#158, 2026-08-18). Each item
+notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -720,6 +721,13 @@ landed on their own so that each of the items below can be argued, and measured,
   all `outputSchema`.** Wire and client-parse cost only; no model reads it. The lever is
   `output_schema = schema_for_output::<T>()` on each `#[rmcp::tool]`, or a `list_tools` that emits
   shared definitions.
+
+  **This one has a price now** (2026-08-18): adding `PdbInfo`, one optional four-field type on one
+  field of `ModuleInfo`, grew the wire by **15,610 B** and model context by **zero**, because
+  `ModuleInfo` is embedded in the openers' summary, in `modules` and in the allocator shapes. That
+  is the compounding this finding predicts, measured on a change small enough that nobody would
+  have thought to look. `WIRE_CEILING` moved 412,000 → 460,000 to record it; the next such type
+  costs the same again, and fixing this item is what stops that.
 - **Six openers carry a byte-identical 11,093 B output schema**, six step tools a byte-identical
   4,418 B one. 77,555 B of the above, and the cheapest to collapse.
 - **`session_id` is documented 43 times in three wordings** (222 B ×22, 292 B ×15, 41 B ×5) —
@@ -792,3 +800,31 @@ run against an **ARM64** stack. #143 closed the other three assertions this way 
   `MessageManager` has no PDB. Either keep the PDB off the path so both tests make one claim, or
   assert the symbolized form and let the pair cover both.
 - **Picks up at** [#154](https://github.com/glslang/windbg-mcp/issues/154).
+
+## 27. [windbg-mcp + win-kexp] A deferred module reports no PDB identity
+
+`modules` carries `pdb` — the GUID, age and symbol-server `key` — only for a module whose symbols
+the engine has **already resolved** (`symbols: pdb` or `dia`). On a freshly opened dump that is one
+module out of two hundred: everything else is `deferred`, and a client that wants the right PDB for
+a driver it has not touched yet cannot get the key from here.
+
+That is the honest contract — the field reports the PDB this engine *has*, not the one that exists
+— and it is documented that way in [`docs/coordinates.md`](./docs/coordinates.md). It is also not a
+dead end today: the same identity lives in the image's own CodeView debug directory, so a client
+that has fetched the image by `timestamp` + `size` can read it there, which is exactly how the
+acceptance test did it before this field existed.
+
+**What would close it** is reading the debug directory from the target rather than waiting for a
+symbol load — the headers are mapped, and `.reload` finds the PDB that way itself. Two cautions the
+work would have to respect. Headers in a *minidump* may not be present, so it has to degrade to the
+current behaviour rather than fail. And the plan's rule stands: reading a header structure is not
+"reconstructing an image from target memory", but the boundary is worth stating in the code, since
+the next step past it is the thing that must never happen.
+
+**Why deferred:** the acceptance test measured that this saves a download rather than enabling
+anything, so it is a convenience whose cost — a per-module target read, on the tool that already
+returns the largest answer this server gives — needs weighing against the convenience. Forcing a
+symbol load to populate it would be strictly worse: that is a `.reload` per module, on a listing.
+
+**Depends on nothing.** Picks up at `worker::with_pdb_identity` and
+`win_kexp::DebugEngine::module_pdb`.

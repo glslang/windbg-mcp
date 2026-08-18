@@ -54,8 +54,9 @@ To rebuild and load the new code without stopping the session:
    ```
    This builds the `win-kexp` revision pinned in `Cargo.lock` and writes a fresh
    `target\release\windbg-mcp.exe`. If this `windbg-mcp` change depends on a newly pushed
-   `win-kexp` commit, run `cargo update -p win-kexp` first and commit the resulting `Cargo.lock`
-   bump with the `windbg-mcp` change. The running server keeps executing the *old* code from the
+   `win-kexp` commit, move the pin first — edit the `rev` in `Cargo.toml`, then
+   `cargo update -p win-kexp` — and commit both with the `windbg-mcp` change (see below: the update
+   command alone does **not** move a `rev` pin). The running server keeps executing the *old* code from the
    renamed `.stale` file until its connection is recycled.
 3. **Load the new binary** by reconnecting the server: `/mcp` → reconnect `windbg` (or restart
    Claude Code). Only after this reconnect do the windbg tools run the new code.
@@ -69,17 +70,22 @@ supervisor, and its workers exit with it, so step 4 is still just "after the rec
 
 ## Changing win-kexp (the DbgEng bindings)
 
-`win-kexp` is a **git dependency pinned to `main`**, not a path dependency — a `windbg-mcp` build
-pulls it from GitHub, so **local edits to `C:\workspace\win-kexp` are invisible to a `windbg-mcp`
-build until they are pushed to `win-kexp` `main`** (then bump the pin / rebuild). Add new DbgEng
-primitives as typed `win-kexp` methods (returning `Result<_, DbgEngError>`, not `panic!`/`.expect`),
-not via the `execute` text hatch.
+`win-kexp` is a **git dependency pinned to an exact `rev`**, not a path dependency — a `windbg-mcp`
+build pulls it from GitHub, so **local edits to a win-kexp checkout are invisible to a `windbg-mcp`
+build until they are pushed** and the pin is moved. Add new DbgEng primitives as typed `win-kexp`
+methods (returning `Result<_, DbgEngError>`, not `panic!`/`.expect`), not via the `execute` text
+hatch.
 
-After pushing a required `win-kexp` change to `main`, run `cargo update -p win-kexp` in this repo and
-commit the resulting `Cargo.lock` change before building or opening the dependent `windbg-mcp` PR.
+**`cargo update -p win-kexp` does not move the pin.** `Cargo.toml` names a 40-character `rev`, so
+the update command only re-resolves *that* revision; the pin is moved by editing the `rev` and then
+running `cargo update -p win-kexp` to refresh `Cargo.lock`. Commit both. (This file used to say the
+update command alone was enough, which silently leaves you building the old code.)
 
-To compile-check a `windbg-mcp` change that depends on un-pushed `win-kexp` edits, add a temporary
-patch and `cargo check`, then revert it (do **not** commit it — it breaks CI/other contributors):
+**Develop against the feature branch, not a `[patch]`.** Push the win-kexp branch and point
+`Cargo.toml`'s `rev` at that branch commit while iterating: it needs no local checkout on the build
+machine, it works identically on every machine, and it travels through git like everything else.
+Repoint to the merge commit before the dependent PR merges. A `[patch]` section still works for a
+quick local `cargo check` but must never be committed:
 
 ```toml
 [patch.'https://github.com/glslang/win-kexp']
@@ -87,11 +93,50 @@ win-kexp = { path = "../win-kexp" }
 ```
 `git checkout -- Cargo.toml Cargo.lock` afterwards.
 
+**Both repos require an approving review**, and a solo maintainer cannot self-approve, so a green
+PR still needs `gh pr merge --admin`. In this harness that call is refused by the permission
+classifier — so **the human merges**, and an agent's job ends at "green and waiting". Plan the two
+PRs around that: win-kexp first, then repoint and re-verify.
+
+**win-kexp's `cargo clippy --all-targets -- -D warnings` fails on ARM64 with 4 pre-existing errors**
+(`shellcode.rs`, `process.rs` — ARM64-only paths its x64 CI never lints). Check them against `main`
+before assuming they are yours.
+
 ## Local verification (no session restart needed)
 
 For a compile/behavior check without touching the locked release exe, use the **dev profile**
-(writes `target/debug`, never locked): `cargo test` and `cargo clippy --all-targets`. The release
+(writes `target/debug`, which the registered release server never holds): `cargo test` and
+`cargo clippy --all-targets`. The release
 build differs only in optimization and is exercised by CI on a fresh runner.
+
+**The dev exe can be locked too, and the failure is quiet.** A worker left running — a driver
+script that died mid-session, a debugger tier killed partway — holds `target\debug\windbg-mcp.exe`,
+and `cargo build` then fails at the final replace step with `Access is denied (os error 5)` while
+everything before it succeeded. If you are driving the binary by hand rather than through
+`cargo test`, the next run **silently executes the old code**, which reads as the change not
+working. Kill it **by path, not by name**: the registered release server is the same image, and taking it
+down with `/IM` drops every session it holds — which for a live kernel leaves the guest frozen (see
+the KDNET notes below). Only the processes under `target\debug`:
+
+```pwsh
+Get-Process windbg-mcp -ErrorAction SilentlyContinue |
+  Where-Object { $_.Path -like '*\target\debug\*' } | Stop-Process -Force
+```
+
+Then re-read the build output before believing a behavioural result. Note `cargo clippy` and
+`cargo test --bins` do *not* refresh that exe: clippy only checks, and the test harness is a
+separate binary.
+
+**Driving the server over stdio from a script: do not redirect stderr unless you drain it.** With
+`RUST_LOG` widened the server fills the stderr pipe buffer and blocks mid-request, which looks
+exactly like a hung debugger. Leave stderr inherited (it lands in your terminal, interleaved) or
+read it on a second thread.
+
+**Both review bots comment per commit**, and a round of findings can land *after* a reply to the
+previous round. Before calling a review done, re-check with the head SHA:
+`gh api --paginate repos/<owner>/<repo>/pulls/<n>/comments --jq '.[] |
+select(.original_commit_id=="<sha>")'` — with `--paginate`, since a busy PR's comments span pages
+and the first page is exactly where the older rounds are.
 
 `cargo test` includes `tests/mcp_smoke.rs`, which spawns the **dev** binary (via
 `CARGO_BIN_EXE_windbg-mcp`) and drives it over stdio — so it is also clear of the release lock.

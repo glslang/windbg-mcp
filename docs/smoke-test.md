@@ -222,6 +222,36 @@ parameter notes stay positional, and that the bucket is derived from the bug che
 than for exact strings, which belong to whichever `ext.dll` the host has and would fail this tier
 on a different WinDbg instead of on a change here.
 
+**The coordinate, checked across the three tools that compute one.** `crash_triage`, `backtrace`
+and `disassemble` each answer with `module` + `rva` — the offset into an image, which is what
+survives a reboot and joins against a disassembler ([`coordinates.md`](./coordinates.md)). Nothing
+in the code makes them *disagree*, because they share one walk and one renderer; this is the check
+that says so from outside, where a future refactor can see it. `crash_triage` is run with
+`analyze: false` and its frames compared field-for-field against `backtrace`'s — `!analyze -v` ends
+with the scope at the target's default, so with it off neither call moves anything and the two
+stacks are the same stack rather than two that ought to match. Then `disassemble` with no address,
+which starts at the program counter, is checked to report the same `address`, `rva` and `module` as
+frame 0.
+
+The shape assertions around them hold on a host that resolves nothing: frames are in walk order,
+`module` and `rva` are one coordinate and travel together (an `rva` with no `module` is an offset
+from nothing), an RVA is unpadded because it is pasted after `module+` rather than sorted, and an
+instruction's operands carry no ``fffff801`3c677ef0`` address form — the eight-hex/backtick/eight-hex
+pattern specifically, not every backtick, since MSVC decorates real symbols with them and those are
+deliberately kept.
+
+**The other half of the coordinate is the identity**, and it has its own premise. `modules` reports
+`timestamp` + `size` — the pair a symbol server is keyed by — and, for a module whose symbols the
+engine has actually resolved, the `pdb` identity: `guid`, `age`, and the `key` those make. The
+assertion checks the GUID's spelling (32 uppercase hex digits, no braces, no dashes) and that `key`
+is the GUID with the age **in hex**, which is the composition whose failure mode is a URL that
+404s. It is gated on `engine_resolves_kernel_symbols` and on nothing else — not on the target read that
+guards the frame assertions, because it needs none: `modules` and the engine's own symbol
+bookkeeping answer this without touching a page. The two premises fail apart in both directions, so
+nesting it under the read gate would skip a check on a host perfectly able to run it. The hex/decimal confusion itself cannot
+be caught here at all: a real `nt` reports age 1, where the two are identical, so that is pinned by
+an offline unit test beside `PdbInfo` using age 26.
+
 **A second dump, because the first one could not fail the right way.** The `0x9F` sample is a
 watchdog bug check: it fires on an idle CPU's timer DPC, so there is no driver frame on its stack
 at all, and it exercises the *absent* `faulting_frame` branch and never the one the tool exists
