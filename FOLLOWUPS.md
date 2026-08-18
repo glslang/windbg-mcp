@@ -732,7 +732,7 @@ landed on their own so that each of the items below can be argued, and measured,
   answer this server gives at 53,875 B. The ratio rule in `tool_results_stay_within_their_budget`
   stops this spreading; it does not fix these two.
 - **`modules` has neither a `limit` nor a cap**, alone among the high-volume tools. Everything else
-  uncapped is raw debugger text — `ttd_calls`, `ttd_memory`, `threads`, `disassemble`,
+  uncapped is raw debugger text — `ttd_calls`, `ttd_memory`, `threads`,
   `execute`, `dx`, `ioctl_trace`, `reachable_from_dispatch` — and `read_memory` returns up to
   ~4 MiB of hex by design (`src/worker.rs:117`). Every cap that does exist (`MAX_ROWS`,
   `MAX_NODES`, `MAX_READ_BYTES`) is justified in its own comment as a worker out-of-memory guard.

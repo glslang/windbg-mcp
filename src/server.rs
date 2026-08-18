@@ -1639,11 +1639,24 @@ pub struct DisassembleArgs {
     /// Address or symbol to disassemble at; uses the current instruction pointer if omitted.
     #[serde(default)]
     pub address: Option<String>,
+    /// How many instructions to disassemble (default 16, maximum 128).
+    #[serde(default)]
+    pub count: Option<u32>,
     /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
     /// refuse the call if this server's debug target has been replaced since you opened it.
     #[serde(default)]
     pub session_id: Option<String>,
 }
+
+/// The most instructions `disassemble` will render, and its default.
+///
+/// `u` shows eight and then wants repeating, which is a rhythm built for someone pressing enter;
+/// a caller reading values wants a block. The cap is the same argument as `backtrace`'s — the
+/// instructions are values now, and an uncapped typed answer is an uncapped bill — but the
+/// numbers are lower, because an instruction record is wider than a frame and a disassembly that
+/// needs 128 of them is really a request for `uf` through `execute`.
+const MAX_DISASSEMBLE_COUNT: u32 = 128;
+const DEFAULT_DISASSEMBLE_COUNT: u32 = 16;
 
 #[derive(Deserialize, JsonSchema)]
 pub struct DxArgs {
@@ -3598,32 +3611,52 @@ impl WindbgServer {
         engine_result(out)
     }
 
-    /// Disassemble at an address/symbol (or the current IP).
-    #[rmcp::tool(annotations(
-        title = "Disassemble",
-        read_only_hint = true,
-        open_world_hint = true
-    ))]
+    /// Disassemble at an address/symbol (or the current IP), as typed instructions and as a
+    /// listing rendered from them. Each instruction carries its own **`module` + `rva`** — the
+    /// offset into that image, which is what joins it to a function in a disassembler — plus its
+    /// **encoding**, which is what says whether that disassembler holds the same build. Read the
+    /// pair per instruction rather than inheriting the first: a range can run off the end of an
+    /// image, and an instruction in no module has neither half. Default 16 instructions, maximum
+    /// 128; `stopped_early` says the code ended before the count, which is an answer rather than a
+    /// truncation. For the engine's own listing with its `module!Symbol+0x1c:` labels,
+    /// `execute { "command": "u" }` — or `uf` to follow a whole function.
+    #[rmcp::tool(
+        annotations(
+            title = "Disassemble",
+            read_only_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = schema_for_output::<Outcome<structured::Disassembly>>()
+    )]
     async fn disassemble(
         &self,
         Parameters(args): Parameters<DisassembleArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        // Still refused, though this no longer builds a command: `address` reaches the debugger's
+        // expression evaluator, which is a second grammar with its own way of running a command
+        // (`? @$scriptContents`), and the argument a caller writes should not be able to reach it.
+        //
+        // `typed_error`, not `tool_error`: this tool declares an `outputSchema` now, so every
+        // result it returns has to carry `structuredContent` — a refusal included, or a caller
+        // branching on `category` gets prose instead.
         if let Some(a) = &args.address
             && let Err(e) = reject_command_breakers("address", a, Quotes::Rejected)
         {
-            return tool_error(e);
+            return typed_error(ErrorCategory::InvalidArgument, e, args.session_id);
         }
-        let cmd = match args.address {
-            Some(a) => format!("u {a}"),
-            None => "u".to_string(),
-        };
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::Command { command: cmd },
+                EngineOp::Disassemble {
+                    address: args.address,
+                    count: args
+                        .count
+                        .unwrap_or(DEFAULT_DISASSEMBLE_COUNT)
+                        .clamp(1, MAX_DISASSEMBLE_COUNT),
+                },
             )
             .await;
-        engine_result(out)
+        engine_result_for(args.session_id.as_deref(), out)
     }
 
     /// Evaluate a data-model (LINQ) expression with `dx` — ideal for TTD queries.

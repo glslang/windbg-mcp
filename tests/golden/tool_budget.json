@@ -74,12 +74,12 @@
     },
     {
       "annotations": 64,
-      "description": 55,
-      "inputSchema": 479,
-      "modelVisible": 586,
+      "description": 790,
+      "inputSchema": 640,
+      "modelVisible": 1482,
       "name": "disassemble",
-      "outputSchema": 0,
-      "wire": 665
+      "outputSchema": 7136,
+      "wire": 8713
     },
     {
       "annotations": 74,
@@ -462,14 +462,14 @@
   ],
   "totals": {
     "annotations": 5449,
-    "description": 24017,
-    "inputSchema": 40043,
+    "description": 24752,
+    "inputSchema": 40204,
     "instructions": 3163,
-    "modelVisible": 66717,
-    "outputSchema": 294490,
-    "payload": 368051,
+    "modelVisible": 67613,
+    "outputSchema": 301626,
+    "payload": 376099,
     "tools": 51,
-    "wire": 367933,
+    "wire": 375981,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 9757
   }

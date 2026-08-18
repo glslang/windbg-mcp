@@ -255,9 +255,28 @@
         "readOnly": true
       },
       "name": "disassemble",
-      "output": null,
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/Disassembly",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema"
+      },
       "params": [
         "address: string|null",
+        "count: integer|null/uint32",
         "session_id: string|null"
       ],
       "required": [],

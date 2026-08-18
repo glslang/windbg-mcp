@@ -7,7 +7,7 @@ answer this server returns. That makes payload size a correctness-adjacent prope
 call that spends 13k tokens has not failed, but it has taken the space the investigation needed.
 Nothing measured this until [`tests/mcp_smoke.rs`](../tests/mcp_smoke.rs) grew the two tests below,
 and the numbers turned out to be larger than anyone had guessed — a careful reading of the source
-put the tool surface at 90–130 KB, and the wire is 366 KB.
+put the tool surface at 90–130 KB, and the wire is 376 KB.
 
 ## Two costs, and they are not the same
 
@@ -61,14 +61,14 @@ authority — the tables below are a reading of it at the time of writing.
 
 | Component | Bytes | Reaches the model |
 |---|---:|---|
-| **Whole `tools/list` payload** | **368,051** | partly |
-| — the 51 tools themselves | 367,933 | partly |
+| **Whole `tools/list` payload** | **376,099** | partly |
+| — the 51 tools themselves | 375,981 | partly |
 | — result-level fields (`resultType`, `ttlMs`, `cacheScope`) | 118 | no |
-| `outputSchema` (the 32 tools that have one) | 294,490 | no |
-| `inputSchema` (all 51) | 40,043 | yes |
-| `description` (all 51) | 24,017 | yes |
+| `outputSchema` (the 33 tools that have one) | 301,626 | no |
+| `inputSchema` (all 51) | 40,204 | yes |
+| `description` (all 51) | 24,752 | yes |
 | `annotations` | 5,449 | no |
-| **Model-visible total** | **66,717** (~16k tokens) | — |
+| **Model-visible total** | **67,613** (~16k tokens) | — |
 | `initialize` instructions | 3,163 | yes, first 2,048 chars |
 
 Worst single tool: `debug_batch` at 9,757 model-visible bytes, because its `inputSchema` pulls the
@@ -81,8 +81,8 @@ server at two revisions shows what a sum would miss:
 
 | Revision | payload | sum of tools | result-level |
 |---|---:|---:|---|
-| `2026-07-28` | 368,051 | 367,933 | `resultType`, `ttlMs`, `cacheScope` |
-| `2025-06-18` | 367,995 | 367,933 | none |
+| `2026-07-28` | 376,099 | 375,981 | `resultType`, `ttlMs`, `cacheScope` |
+| `2025-06-18` | 376,043 | 375,981 | none |
 
 The sum is **identical** across the two; only the payload figure can tell them apart. The golden
 records both, so the gap stays visible.
@@ -98,14 +98,17 @@ records both, so the gap stays visible.
 | `registers` | 9,804 | 10,534 | 618 | 9,804 | **15.9x** |
 | `crash_triage` | 1,855 | 3,133 | 1,159 | 1,855 | 1.6x |
 | `open_dump` | 1,347 | 2,277 | 814 | 1,347 | 1.7x |
+| `disassemble` | 1,808 | 3,219 | 1,291 | 1,808 | 1.4x |
 | `backtrace` | 945 | 1,588 | 532 | 945 | 1.8x |
 | `session_status` | 297 | 823 | 420 | 297 | 0.7x |
 
-`backtrace`'s row is the one measured somewhere else: against `docs/samples/121524-4703-01.dmp`,
-on the ARM64 bench, because it became typed after this baseline was recorded and that machine opens
-the sample matching its own architecture. A stack's size is the crash's rather than the tool's, so
-it is not comparable to the digit with the row it replaces (572 B of `k` text, no structured half).
-What is comparable is the shape: the model now reads frames and not a listing.
+`backtrace`'s and `disassemble`'s rows are the two measured somewhere else: against
+`docs/samples/121524-4703-01.dmp`, on the ARM64 bench, because both became typed after this
+baseline was recorded and that machine opens the sample matching its own architecture. A stack's
+size is the crash's rather than the tool's, and a disassembly's is the code's, so neither is
+comparable to the digit with the row it replaces (572 B of `k` text; `disassemble` had no row at
+all, having had no budget). What is comparable is the shape: the model now reads records and not a
+listing.
 
 `registers` is the shape of the problem in miniature: the model reads 9,804 bytes of JSON carrying
 `"kind":"int"` and `"subregister":false` on every row, and never sees the 618-byte `r` output that
@@ -133,7 +136,7 @@ None of these is a bug. They are recorded because they were invisible, and
 5. **`modules` has neither a `limit` nor a cap**, alone among the high-volume tools. 53,875 B here;
    more on a live kernel.
 6. **Several tools have no bound at all** — `ttd_calls`, `ttd_memory`, `threads`,
-   `disassemble`, `execute`, `dx`, `ioctl_trace`, `reachable_from_dispatch` — and `read_memory`
+   `execute`, `dx`, `ioctl_trace`, `reachable_from_dispatch` — and `read_memory`
    returns up to ~4 MiB of hex by design (`src/worker.rs:117`). Every existing cap in this codebase
    (`MAX_ROWS`, `MAX_NODES`, `MAX_READ_BYTES`) is justified in its own comment as a **worker
    out-of-memory guard, not a caller-context guard**. That is not wrong; it means nothing here has

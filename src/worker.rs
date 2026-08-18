@@ -1125,6 +1125,9 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         EngineOp::Registers { all } => registers(e, all),
         EngineOp::Modules { filter } => modules(e, filter.as_deref()),
         EngineOp::Backtrace { frames } => backtrace(e, frames as usize),
+        EngineOp::Disassemble { address, count } => {
+            disassemble(e, address.as_deref(), count as usize)
+        }
         EngineOp::SetBreakpoint { expression } => set_breakpoint(e, &expression),
         EngineOp::ReadMemory { address, size } => read_memory(e, &address, size)
             .map(Output::text)
@@ -2002,6 +2005,187 @@ fn render_backtrace(trace: &structured::StackTrace, asked: usize) -> String {
     out
 }
 
+/// DbgEng writes a 64-bit address as ``fffff801`3c677ef0`` — a backtick separating the halves —
+/// and an instruction's operands are full of them: `bl nt!Foo (fffff801`3c677ef0)`.
+///
+/// Removed here for two reasons that happen to agree. This server spells an address one way
+/// ([`structured::addr`]), and the README says the debugger's form appears only in raw text; and
+/// that tick is the delimiter of the code span this text is printed in, so leaving it means every
+/// operand carrying an address renders as `\u{60}` once [`renderable`] has made it safe.
+///
+/// **Only where it is an address.** Exactly eight hex digits either side, bounded by non-hex,
+/// which is the form DbgEng emits and nothing else is. MSVC decorates real symbols with backticks
+/// — `` `anonymous namespace'::Foo ``, `` `vftable' `` — and stripping those would corrupt a name;
+/// they survive here and are escaped by `renderable` as any other backtick is.
+fn plain_addresses(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let hex = |index: usize| bytes[index].is_ascii_hexdigit();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let separates_two_halves = bytes[at] == b'`'
+            && at >= 8
+            && at + 8 < bytes.len()
+            && (at - 8..at).all(hex)
+            && (at + 1..at + 9).all(hex)
+            && (at == 8 || !hex(at - 9))
+            && (at + 9 == bytes.len() || !hex(at + 9));
+        if separates_two_halves {
+            at += 1;
+            continue;
+        }
+        out.push(bytes[at]);
+        at += 1;
+    }
+    // Only ever drops one ASCII byte, so the boundaries of everything else are untouched.
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A run of instructions, as values and as the listing rendered from them.
+///
+/// `address` is an expression rather than a number because that is what a caller has — a symbol,
+/// `module+0x1c`, a register — and only the debugger can evaluate one. `None` disassembles at the
+/// current instruction pointer, which is what a bare `u` does.
+fn disassemble(e: &DebugEngine, address: Option<&str>, count: usize) -> Result<Output, Failed> {
+    let start = match address {
+        Some(expr) => {
+            resolve(e, expr).ok_or_else(|| format!("could not resolve address `{expr}`"))?
+        }
+        // Not an error worth dressing up: a target with no register context has no current
+        // instruction, and the engine says so better than a guess here would.
+        None => e.instruction_pointer().map_err(failed)?,
+    };
+    let decoded = e.disassemble(start, count).map_err(failed)?;
+
+    // **Asked once per image, not once per instruction.** A disassembly is a contiguous range, so
+    // after the first lookup every following address is almost always inside the same module — and
+    // a containment test is arithmetic where `module_at` is a call into the engine. Correctness
+    // does not rest on the guess: an address outside the module in hand re-asks.
+    let mut held: Option<win_kexp::dbgeng::Module> = None;
+    let mut instructions = Vec::with_capacity(decoded.len());
+    for instruction in &decoded {
+        let inside = |module: &win_kexp::dbgeng::Module| {
+            instruction.address >= module.base && instruction.address < module.end()
+        };
+        let mut attribution_failed = false;
+        if !held.as_ref().is_some_and(inside) {
+            held = match e.module_at(instruction.address) {
+                Ok(module) => module,
+                // Kept apart from `Ok(None)` for the reason a stack walk keeps them apart: one
+                // says the address is outside every image, which is a finding, and the other says
+                // the engine did not answer, which is not.
+                Err(why) => {
+                    tracing::debug!(
+                        "worker: disassembly could not attribute {:#x}: {why}",
+                        instruction.address
+                    );
+                    attribution_failed = true;
+                    None
+                }
+            };
+        }
+        // An unloaded module has no name to qualify anything with, exactly as in a stack walk.
+        let named = held.as_ref().filter(|module| !module.name.is_empty());
+        instructions.push(structured::InstructionInfo {
+            address: structured::addr(instruction.address),
+            module: named.map(|module| module.name.clone()),
+            // `saturating_sub`, as the stack walk's is: the base is the engine's and the address
+            // is the walk's, and an underflow here would print a 16-exabyte offset rather than
+            // fail — the sort of number nobody double-checks.
+            rva: named
+                .map(|module| triage::offset(instruction.address.saturating_sub(module.base))),
+            attribution_failed,
+            bytes: instruction.bytes.clone(),
+            text: plain_addresses(&instruction.text),
+        });
+    }
+
+    let disassembly = structured::Disassembly {
+        start: structured::addr(start),
+        instructions,
+        stopped_early: decoded.len() < count,
+    };
+    Ok(Output::typed(render_disassembly(&disassembly), disassembly))
+}
+
+/// The listing a person reads, built from the records beside it.
+///
+/// Columns are the coordinate, the encoding and the instruction — the absolute address is in the
+/// values and in the heading, because printing it on every row costs a screen's width to repeat
+/// what the module base plus the offset already says.
+fn render_disassembly(disassembly: &structured::Disassembly) -> String {
+    if disassembly.instructions.is_empty() {
+        return format!(
+            "No instructions: the engine disassembled nothing at {}. That address is readable as \
+             a number and not as code — unmapped, paged out, or past the end of what this target \
+             holds.",
+            disassembly.start
+        );
+    }
+    let mut listing = String::new();
+    for instruction in &disassembly.instructions {
+        // The engine's rendering of bytes the *target* holds, going inside a fence: escaped for
+        // the reason a module name is ([#126]), since an operand carries symbol names from the
+        // image and an image can be named anything at all.
+        //
+        // [#126]: https://github.com/glslang/windbg-mcp/issues/126
+        // `module+rva` — the form that can be pasted straight back into the debugger. An
+        // instruction in no module keeps its address, which is all there is to say about it, and
+        // one whose lookup failed says that rather than looking like the first.
+        let coordinate = match (&instruction.module, &instruction.rva) {
+            (Some(module), Some(rva)) => format!("{module}+{rva}"),
+            _ if instruction.attribution_failed => {
+                format!("{} (module lookup failed)", instruction.address)
+            }
+            _ => instruction.address.clone(),
+        };
+        listing.push_str(&format!(
+            "{:<18} {:<20} {}\n",
+            renderable(&coordinate),
+            renderable(&instruction.bytes),
+            renderable(&instruction.text),
+        ));
+    }
+    let mut out = fenced(&listing);
+    out.push_str(&format!(
+        "\n{} instruction{} from {}{}. The first column is the offset into the image, which is \
+         what an analysis server can be asked about; the second is the encoding, which is what \
+         says whether it holds the same build.\n",
+        disassembly.instructions.len(),
+        if disassembly.instructions.len() == 1 {
+            ""
+        } else {
+            "s"
+        },
+        disassembly.start,
+        // Named from the instructions rather than carried separately, and escaped: a module name
+        // is read out of the target, this sentence is outside the fence that protects the rows,
+        // and a backtick in a name would close the code span and leave the rest as markup — the
+        // defect `summary_text` already guards against for the same construct.
+        match disassembly.instructions.first() {
+            Some(first) => match first.module.as_deref() {
+                Some(module) => format!(" in `{}`", renderable(module)),
+                // The row for this instruction says the lookup failed; the sentence must not turn
+                // the same absence into a finding about the target two lines below it.
+                None if first.attribution_failed => {
+                    " in a module the engine could not name".to_string()
+                }
+                None => " in no loaded module".to_string(),
+            },
+            None => String::new(),
+        },
+    ));
+    if disassembly.stopped_early {
+        out.push_str(
+            "The engine stopped before the count asked for: what follows the last instruction \
+             could not be disassembled, so this is where the code ends rather than where the call \
+             ran out. Asking again with a larger count returns the same instructions.\n",
+        );
+    }
+    out
+}
+
+/// Runs `!analyze -v`, whichever spelling this engine resolves.
 /// Runs `!analyze -v`, whichever spelling this engine resolves.
 ///
 /// The bundled minimal engine does not resolve the unqualified `!analyze` even after `.load ext`
@@ -5744,6 +5928,217 @@ mod tests {
         assert!(
             text.contains("3 frames"),
             "the count is the reader's check: {text}"
+        );
+    }
+
+    // ---- rendering a disassembly -------------------------------------------
+
+    fn instruction(address: &str, rva: Option<&str>, text: &str) -> structured::InstructionInfo {
+        structured::InstructionInfo {
+            address: address.to_string(),
+            module: rva.map(|_| "nt".to_string()),
+            rva: rva.map(str::to_string),
+            attribution_failed: false,
+            bytes: "48895c2408".to_string(),
+            text: text.to_string(),
+        }
+    }
+
+    fn disassembly(
+        instructions: Vec<structured::InstructionInfo>,
+        stopped_early: bool,
+    ) -> structured::Disassembly {
+        structured::Disassembly {
+            start: "0xfffff8013c65bca8".to_string(),
+            instructions,
+            stopped_early,
+        }
+    }
+
+    /// The debugger's own address form is a backtick between two halves, and an operand is full of
+    /// them. Left in, every such operand renders as an escape once the line is made safe for the
+    /// fence it goes in — so the tick comes out where it is punctuation.
+    #[test]
+    fn an_address_in_an_operand_loses_the_debuggers_backtick() {
+        assert_eq!(
+            plain_addresses("bl nt!KiSaveProcessorControlState (fffff801`3c677ef0)"),
+            "bl nt!KiSaveProcessorControlState (fffff8013c677ef0)"
+        );
+    }
+
+    /// And nowhere else. MSVC decorates real symbols with backticks, and a blanket strip would
+    /// quietly rename them — the same class of mistake as reading a module name as markup.
+    #[test]
+    fn a_backtick_that_is_part_of_a_symbol_is_left_alone() {
+        for text in [
+            "call `anonymous namespace'::Handler",
+            "mov rax,qword ptr [nt!Foo::`vftable']",
+            // Not eight digits either side, so not the address form.
+            "add rax,dead`beef",
+        ] {
+            assert_eq!(plain_addresses(text), text, "{text}");
+        }
+    }
+
+    /// The coordinate is the first column, because it is the column an analysis server is asked
+    /// about; the absolute address is in the values and the heading.
+    #[test]
+    fn the_listing_leads_with_the_offset_into_the_image() {
+        let text = render_disassembly(&disassembly(
+            vec![instruction(
+                "0xfffff8013c65bca8",
+                Some("0x25bca8"),
+                "add x0,x22,#0x40",
+            )],
+            false,
+        ));
+        let row = text
+            .lines()
+            .find(|line| line.contains("add x0"))
+            .unwrap_or_else(|| panic!("no instruction row:\n{text}"));
+        assert!(row.starts_with("nt+0x25bca8"), "{row}");
+        assert!(
+            text.contains("in `nt`"),
+            "the range names its image once: {text}"
+        );
+    }
+
+    /// Running out of code and running out of budget are different answers, and only one of them
+    /// means "ask again for more".
+    #[test]
+    fn code_that_ends_early_says_it_ended_rather_than_that_it_was_cut() {
+        let ended = render_disassembly(&disassembly(
+            vec![instruction("0xfffff8013c65bca8", Some("0x25bca8"), "ret")],
+            true,
+        ));
+        assert!(ended.contains("could not be disassembled"), "{ended}");
+        assert!(
+            ended.contains("same instructions"),
+            "asking again has to be described as pointless, not offered: {ended}"
+        );
+    }
+
+    /// Nothing at all is an answer about the address, not a failure of the call.
+    #[test]
+    fn an_address_that_disassembles_to_nothing_explains_itself() {
+        let text = render_disassembly(&disassembly(Vec::new(), false));
+        assert!(text.contains("No instructions"), "{text}");
+        assert!(
+            text.contains("0xfffff8013c65bca8"),
+            "and names the address: {text}"
+        );
+    }
+
+    /// A range can run off the end of one image into another, and each instruction says which it
+    /// is in. The answer used to name the image once and let the rest inherit it, which was
+    /// smaller and could not express the two rows below.
+    #[test]
+    fn each_instruction_names_the_image_it_is_actually_in() {
+        let mut second = instruction("0xfffff8013c65bcac", Some("0x20"), "ret");
+        second.module = Some("MessageManager".to_string());
+        let text = render_disassembly(&disassembly(
+            vec![
+                instruction("0xfffff8013c65bca8", Some("0x25bca8"), "nop"),
+                second,
+            ],
+            false,
+        ));
+        assert!(text.contains("nt+0x25bca8"), "{text}");
+        assert!(text.contains("MessageManager+0x20"), "{text}");
+    }
+
+    /// An instruction in **no** module is the row the inheritance rule got wrong: it has nothing
+    /// to inherit, and crediting it to the image around it is a claim about where code lives.
+    #[test]
+    fn an_instruction_in_no_module_is_not_credited_to_its_neighbours_image() {
+        let loose = instruction("0xffffa30712340000", None, "nop");
+        let text = render_disassembly(&disassembly(
+            vec![
+                instruction("0xfffff8013c65bca8", Some("0x25bca8"), "nop"),
+                loose,
+            ],
+            false,
+        ));
+        let row = text
+            .lines()
+            .find(|line| line.contains("0xffffa30712340000"))
+            .unwrap_or_else(|| panic!("no row for the unattributed instruction:\n{text}"));
+        assert!(
+            !row.contains("nt+"),
+            "an address in no module is not an offset into the module beside it: {row}"
+        );
+    }
+
+    /// And a lookup that failed says so rather than looking like the row above.
+    #[test]
+    fn an_instruction_whose_lookup_failed_says_so() {
+        let mut failed = instruction("0xffffa30712340000", None, "nop");
+        failed.attribution_failed = true;
+        let text = render_disassembly(&disassembly(vec![failed], false));
+        assert!(text.contains("lookup failed"), "{text}");
+    }
+
+    /// The row says the lookup failed; the sentence under it must not say the address is in no
+    /// module. They are the two readings the flag exists to keep apart, and one answer cannot
+    /// carry both.
+    #[test]
+    fn the_summary_does_not_call_a_failed_lookup_an_address_in_no_module() {
+        let mut failed = instruction("0xffffa30712340000", None, "nop");
+        failed.attribution_failed = true;
+        let text = render_disassembly(&disassembly(vec![failed], false));
+        assert!(
+            !text.contains("in no loaded module"),
+            "a lookup that did not answer is not a finding about the target:\n{text}"
+        );
+        assert!(text.contains("could not name"), "{text}");
+    }
+
+    /// The summary sentence is outside the fence that protects the rows, and it quotes a module
+    /// The summary sentence is outside the fence that protects the rows, and it quotes a module
+    /// name read out of the target — the same construct `summary_text` already escapes.
+    #[test]
+    fn a_module_name_cannot_escape_the_summary_sentence() {
+        let mut hostile = instruction("0xfffff8013c65bca8", Some("0x25bca8"), "nop");
+        hostile.module = Some("a`b".to_string());
+        let text = render_disassembly(&disassembly(vec![hostile], false));
+        let summary = text
+            .rsplit("```")
+            .next()
+            .expect("the summary follows the fence");
+        assert!(
+            !summary.contains('`') || summary.matches('`').count() == 2,
+            "the name must not add a backtick of its own to the sentence: {summary}"
+        );
+        assert!(
+            summary.contains("\\u{60}"),
+            "it is shown as an escape: {summary}"
+        );
+    }
+
+    /// An operand carries symbol names out of the image, so the same fence threat as a module
+    /// An operand carries symbol names out of the image, so the same fence threat as a module
+    /// name's ([#126]) — at a third call site.
+    ///
+    /// [#126]: https://github.com/glslang/windbg-mcp/issues/126
+    #[test]
+    fn an_instruction_cannot_close_the_fence_it_is_printed_in() {
+        let text = render_disassembly(&disassembly(
+            vec![instruction(
+                "0xfffff8013c65bca8",
+                Some("0x25bca8"),
+                "call a```\n```elsewhere",
+            )],
+            false,
+        ));
+        assert_eq!(
+            text.matches("```").count(),
+            2,
+            "exactly one fence opens and one closes it:\n{text}"
+        );
+        let body = fenced_body(&text).expect("the block opens and closes");
+        assert!(
+            !body.contains('`'),
+            "no backtick reaches the block:\n{body}"
         );
     }
 

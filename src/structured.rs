@@ -1551,6 +1551,68 @@ pub struct StackTrace {
     pub frames_truncated: bool,
 }
 
+/// A run of instructions, as values and as the listing rendered from them.
+///
+/// **The coordinate, on every instruction.** A disassembly is a contiguous range, so naming the
+/// image once for the whole answer and letting each instruction inherit it is tempting, and it was
+/// how this was first written. It is wrong: an instruction the engine places in **no** module has
+/// nothing to inherit, and an absent field that means "look at the range" cannot also mean "there
+/// is nothing to look at" — so a single unattributed instruction was silently credited to the
+/// image around it. Each instruction therefore carries its own `module`, as a stack frame does,
+/// and the pair is read off the instruction alone.
+///
+/// **Rendered from these same values**, so the listing and the records cannot disagree. It is
+/// therefore not `u`'s output: no `module!Symbol+0x1c:` labels between instructions, since a stack
+/// walk of labels is a second question this does not ask. `execute { "command": "u" }` is the
+/// engine's own listing.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Disassembly {
+    /// Where the disassembly began — the call's `address` after the debugger evaluated it, so a
+    /// caller who passed `nt!KeBugCheckEx` learns what that resolved to.
+    pub start: String,
+    /// The instructions, in address order.
+    pub instructions: Vec<InstructionInfo>,
+    /// Whether the engine stopped before `count` instructions because it could not disassemble
+    /// what came next.
+    ///
+    /// Not an error and not a truncation: disassembly runs forward into whatever follows, and
+    /// what follows the end of a function may be unmapped, unreadable, or not code. `true` means
+    /// the range simply ends here — asking again with a larger `count` returns the same
+    /// instructions.
+    pub stopped_early: bool,
+}
+
+/// One instruction of a [`Disassembly`].
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct InstructionInfo {
+    /// Where it is.
+    pub address: String,
+    /// The image holding it, or absent if it is in none — code in a pool allocation, or a driver
+    /// that has unloaded. Travels with [`Self::rva`]: either both are there or neither is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+    /// Its offset from that module's load base — the half that survives a rebase, and the half an
+    /// analysis server can be asked about. Absent exactly when [`Self::module`] is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rva: Option<String>,
+    /// True when the engine's module lookup **failed** for this address, rather than answering
+    /// that no module holds it. The same distinction, and the same reason for keeping it, as
+    /// [`FrameInfo::attribution_failed`]: one is a finding about the target, the other is a call
+    /// that did not answer, and both otherwise arrive as an absent coordinate.
+    ///
+    /// Absent from the JSON when false, which is every instruction of an ordinary disassembly.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attribution_failed: bool,
+    /// The encoding, **as the engine prints it** — `48895c2408` on x64, `d503237f` on ARM64,
+    /// where that is the instruction word rather than the four bytes in memory order. It is a
+    /// spelling to compare against another disassembly of the same architecture, not a byte string
+    /// to match against a file: two images that disassemble differently are different builds
+    /// whatever their names say, and that is the check this is for.
+    pub bytes: String,
+    /// The mnemonic and operands, the engine's own rendering with its column padding collapsed.
+    pub text: String,
+}
+
 /// What `!analyze -v` concluded, kept separate from the values above because it is a heuristic.
 ///
 /// Every field is `!analyze`'s own, extracted from its summary block. They are here because they
