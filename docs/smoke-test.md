@@ -250,7 +250,10 @@ user-mode process jumped into memory that is not executable, and the kernel bug-
 because every clone carries it for ever.
 
 What it adds is an **ARM64 `_EPROCESS`, an ARM64 image's headers and an ARM64 stack's frames**,
-read through the same three claims the x64 samples make. It also pins the one branch of the process
+read through the same three claims the x64 samples make. The fourth claim — attributing a frame to
+a third-party driver — is still asserted only against an x64 stack, because there is no ARM64
+driver crash to assert it on; that is [#154](https://github.com/glslang/windbg-mcp/issues/154), and
+it needs a crash produced rather than a sample found. It also pins the one branch of the process
 read that nothing else reaches: this dump does not capture the pool page `SeAuditProcessCreationInfo`
 points at, so the engine falls back to the 15-byte `_EPROCESS::ImageFileName` and the answer is the
 truncated `stack_buffer_o` — the fallback that the driver crash above, with its full

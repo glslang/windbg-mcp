@@ -124,7 +124,14 @@ $env:WINDBG_MCP_SMOKE_DUMP = "1"; cargo test --test mcp_smoke
 
 That tier now also covers the process-per-session behaviour end to end: two sessions coexisting, a
 kernel attach parked on a dead port being reclaimed by `end_session`, and no worker process
-outliving the connection. A third tier is `#[ignore]`d because it runs commands out to a watchdog
+outliving the connection. It opens the **dump matching this host's architecture** — an ARM64 one is
+checked in beside the two x64 samples — and the four assertions that read a *target* rather than
+the dump's structure check first that this host can: `nt`'s base has to read, plus a resolved PDB
+for the two that walk `nt`'s types. Where it cannot they print `SKIPPED` and pass, so a green tier
+on a machine without symbols is not the same claim as a green tier here; read the `SKIPPED` lines
+(`--nocapture`) before concluding a change is covered. `docs/smoke-test.md` has the measurements
+behind that gate, and the driver-attribution claim still has **no ARM64 fixture at all**
+(issue #154). A third tier is `#[ignore]`d because it runs commands out to a watchdog
 deadline (minutes, not seconds) — run it by hand after a win-kexp watchdog change:
 
 ```pwsh
@@ -225,6 +232,21 @@ at 240s, so on a serial bench "x64-only" and "too slow over this wire" cannot be
 
 ## Live kernel + driver IOCTL gotchas (learned driving HEVD over KDNET)
 
+**Loading HEVD on an ARM64 bench takes two things, and the error names neither.**
+`StartService FAILED 577` ("cannot verify the digital signature") means both `bcdedit /set
+testsigning on` (a reboot) *and* the driver's signing certificate imported into
+`Cert:\LocalMachine\Root` — test signing has nothing to chain to otherwise, and an unexpired cert
+that is simply untrusted looks identical to an expired one. `TrustedPublisher` refuses with
+`E_ACCESSDENIED` and is not needed for `sc start` of a non-PnP driver. Check HVCI
+(`(Get-CimInstance Win32_DeviceGuard -Namespace root\Microsoft\Windows\DeviceGuard).SecurityServicesRunning`)
+before blaming signing; `0` means it is not the cause.
+
+**A crash out of an exploit client is usually not a driver bug.** HEVD's stack-overflow client on
+this bench bug-checks `0xFC` with the kernel faulting at the *user-mode payload* — its ROP chain
+never disables privileged execution of a user page — so the stack is `nt`-only and carries no
+`HEVD` frame at all. A fixture that needs a driver frame wants a path that faults **inside** the
+driver (issue #154), not a failed exploit.
+
 **Attach by `profile`, not by connection string — always, for any live target.** `attach_kernel
 { "profile": "<name>" }` resolves the connection inside the server (`src/kdconn.rs`), so the
 target's debug key never lands in a tool argument — and therefore never in the *client's*
@@ -289,7 +311,12 @@ Issue `.sympath` alone, or use the **`set_symbol_path`** tool (goes through the 
 
 **Nothing resolves at all without `msdia140.dll` beside the engine** — `symsrv.dll` finds a PDB and
 that one *parses* it, so without it every module reports `Symbol Type: EXPORT - PDB not found` even
-when the identity was known and the file was downloaded. It is **not** store-package-only, which
+when the identity was known and the file was downloaded. **`symsrv.dll` is the other half, and
+System32 does not ship it**: on a machine with neither, a `srv*` path downloads nothing. Worth
+knowing because of how that presents on a *dump* — not as missing symbols but as a **memory read
+failing** (`0x8007001E`), since a kernel dump's virtual addresses are translated through structures
+the engine locates with `nt`'s symbols. That symptom was read as an ARM64 engine limitation for a
+while (issue #142); it is not one, and an engine with symbols reads x64 and ARM64 dumps alike. It is **not** store-package-only, which
 this repo believed for a while: Visual Studio Build Tools ships it, including an ARM64 build, at
 `…\BuildTools\DIA SDK\bin\arm64\msdia140.dll`. Copy it next to the exe (`target\release`, and
 `target\debug` for the smoke tiers). **Warm the cache once** afterwards — attach and `.reload /f nt`
