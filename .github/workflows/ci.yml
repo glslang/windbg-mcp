@@ -87,11 +87,17 @@ jobs:
     # one had nothing behind it: it was a claim about a `dbgeng.dll` this project does not ship and
     # cannot test any other way, resting on one manual session (issue #134).
     #
-    # The four assertions that read the checked-in dump's *virtual memory* are gated to x86_64,
-    # because the dump is x64 and an engine of another architecture cannot follow a pointer into it
-    # (issue #142). They report as `ignored` with that reason on ARM64 rather than failing, and the
-    # equivalent coverage there needs an ARM64 dump of its own — which is a sample to capture, not
-    # a test to write.
+    # The four assertions that read a *target* rather than the dump around it open the sample
+    # matching the runner's architecture — an ARM64 dump is checked in for this entry (issue #143)
+    # — and check first that this runner can read one at all, with a single `dq` at `nt`'s base. A
+    # kernel dump's pointers are followed through structures the engine locates with `nt`'s
+    # symbols, and a runner that resolves none reads the dump's own structure and nothing behind
+    # it. That, and not the architecture pairing it was first read as, is issue #142:
+    # Windows ships `dbghelp.dll` in System32 and no `symsrv.dll` anywhere outside the Debugging
+    # Tools, so a runner without them resolves nothing over a `srv*` path — and running that
+    # configuration by hand reproduces the reported failure address for address. Those
+    # four print `SKIPPED` with the reason where it happens, so a green run here never claims more
+    # than it checked.
     #
     # Only this tier is matrixed. The crate is architecture-independent Rust, so `fmt`, clippy and
     # the unit tests in `build` have no reason to differ and a second entry there would buy runtime

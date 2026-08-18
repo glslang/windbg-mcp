@@ -36,15 +36,48 @@ exercises that nothing else does is a real `dbgeng.dll`, and there is a differen
 ([#134](https://github.com/glslang/windbg-mcp/issues/134)). The two entries do not share a cargo
 cache, and an ARM64 failure does not cancel the x64 run.
 
-**Four of its assertions are gated to x86_64**, and the reason is a property of the sample rather
-than of the tests: the checked-in dump is x64, and an engine of another architecture parses its
-structure — bug check, module list, stack attribution — but cannot follow a pointer into the
-captured address space ([#142](https://github.com/glslang/windbg-mcp/issues/142)). So
-`walk_memory`, `disassemble` and the `EPROCESS` read behind `crash_triage`'s `process_name` have
-nothing to assert there. They report as `ignored` with that reason rather than failing, which keeps
-the distinction visible: on ARM64 the tier says what it did not check, instead of passing quietly or
-failing misleadingly. Equivalent coverage on ARM64 needs an **ARM64 dump** of its own — a sample to
-capture, not a test to write. The bounded-command and live-kernel tiers are `#[ignore]`d — one is measured in
+**Four of its assertions read the target's memory rather than the dump's structure, and they stand
+down on a host whose engine cannot.** A kernel dump's virtual addresses are translated through
+structures the engine locates with `nt`'s **symbols**: a host that resolves none still reads the bug
+check, the module list and the stack — all of which come out of the dump's own headers — and fails
+every read behind them with `0x8007001E`. So `walk_memory`, `disassemble` and the `EPROCESS` read
+behind `crash_triage`'s `process_name` have nothing to assert there.
+
+That is what [#142](https://github.com/glslang/windbg-mcp/issues/142) turned out to be. It was read
+as an *architecture* limitation — an ARM64 engine unable to follow a pointer into an x64 dump — and
+it is not one. Measured on one ARM64 host:
+
+- with the SDK's `dbghelp.dll` and `symsrv.dll` beside the binary, one engine reads **both** x64
+  samples and the ARM64 one completely — private symbols, the `EPROCESS`, the driver frame at its
+  literal RVA. The whole tier passes there, 60 of 60;
+- with nothing beside the binary — System32 ships `dbghelp.dll` and **no** `symsrv.dll`, so a
+  `srv*` path downloads nothing — it reproduces the CI failure exactly, down to the address and
+  `0x8007001E`;
+- and with the full bundle but `_NT_SYMBOL_PATH` pointed at an empty directory it fails again, and
+  fails *differently per dump*: the ARM64 sample reads nothing at all, while the x64 sample gives
+  up a module base and then walks a stack of the bug check's own parameters. Neither is an answer,
+  and only one of them looks like a failure.
+
+Same engine, same dumps: symbols are the variable, and the engine's architecture is not.
+
+So the four **ask the host** instead of guessing from `cfg!(target_arch)`: one `dq` at `nt`'s base,
+issued through `execute` rather than through the tools under test, since a regression in
+`walk_memory` must not be able to silence the test that catches it. The question is deliberately
+the *read* rather than the symbols behind it: the third measurement above is a host that reads a
+module base while resolving nothing, so a symbol-shaped gate could stand these four down on a
+runner where they pass today — and a skip that quiet is the failure this gate exists to avoid. A
+host that reads but cannot resolve fails the assertions instead, loudly, as it did before the gate
+existed; the driver-crash assertion says so in its message. Where the read comes back empty the
+test prints `SKIPPED` with the reason and what still holds — which is what an `ignore` keyed to an
+architecture could never say.
+
+**The sample they open follows the host.** Three dumps are checked in (below), and the two crashes
+a *memory* read is asserted against are paired with the architecture the tests are running on — so
+an ARM64 run reads an ARM64 target, which is coverage this suite has nowhere else
+([#143](https://github.com/glslang/windbg-mcp/issues/143)). That pairing is a choice about what to
+cover rather than a workaround: with symbols, either engine reads either dump, and the driver-crash
+assertion below deliberately opens the x64 dump on every architecture because what it asserts is a
+property of *that* crash. The bounded-command and live-kernel tiers are `#[ignore]`d — one is measured in
 minutes, the other touches another machine; see below. Neither is automated, and the rest of the
 live checklist is not either: no runner has a kernel target, a TTD engine, or elevation.
 
@@ -195,6 +228,22 @@ frame as `MessageManager+0x1654`, an RVA asserted as a literal because it is a f
 fixed image and was identical across five dumps that loaded the driver at five different
 addresses; `symbol` absent rather than filled in with the module's own name; a `pool_tag`, which
 only `!analyze` produces; and a process name longer than fifteen characters.
+
+**A third dump, because neither of those is an ARM64 target.** The tier runs on ARM64 and, until
+[#143](https://github.com/glslang/windbg-mcp/issues/143), read nothing there: the assertions that
+touch a target's memory were gated off, so what the ARM64 entry proved was the protocol, the
+session machinery and a module list. [`docs/samples/121524-4703-01.dmp`](samples/121524-4703-01.dmp)
+is a `0xFC ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY` off this project's own ARM64 debuggee — a
+user-mode process jumped into memory that is not executable, and the kernel bug-checked out of
+`nt!MiCheckSystemNxFault`. It is 440 KB, the smallest of the five real crashes that machine had,
+because every clone carries it for ever.
+
+What it adds is an **ARM64 `_EPROCESS`, an ARM64 image's headers and an ARM64 stack's frames**,
+read through the same three claims the x64 samples make. It also pins the one branch of the process
+read that nothing else reaches: this dump does not capture the pool page `SeAuditProcessCreationInfo`
+points at, so the engine falls back to the 15-byte `_EPROCESS::ImageFileName` and the answer is the
+truncated `stack_buffer_o` — the fallback that the driver crash above, with its full
+`mm_exploit_v5.exe`, exists to prefer.
 
 Those checks are made against **typed fields** wherever a tool has them (issue #84): the handle is
 read from `structuredContent`, not from a `session_id:` line; `nt` and `hal` are matched as module
