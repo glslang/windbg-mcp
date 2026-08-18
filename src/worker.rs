@@ -1972,7 +1972,17 @@ fn render_backtrace(trace: &structured::StackTrace, asked: usize) -> String {
     }
     let mut listing = String::new();
     for frame in &trace.frames {
-        listing.push_str(&format!("{:02} {}\n", frame.index, triage::describe(frame)));
+        // Escaped for the same reason a module name is ([#126]): a frame's `module` and `symbol`
+        // are read out of the target, a module can legally be named with a backtick, and this line
+        // is going inside a fence. Applied to the whole rendered line rather than to the fields,
+        // so a form of the coordinate added later cannot escape by being added in the wrong place.
+        //
+        // [#126]: https://github.com/glslang/windbg-mcp/issues/126
+        listing.push_str(&format!(
+            "{:02} {}\n",
+            frame.index,
+            renderable(&triage::describe(frame))
+        ));
     }
     let mut out = fenced(&listing);
     out.push_str(&format!(
@@ -5627,6 +5637,42 @@ mod tests {
             !one(false).contains("goes on past"),
             "a stack that ended on its own must not be reported as capped: {}",
             one(false)
+        );
+    }
+
+    /// A module or symbol is named by the target, so a frame's line is untrusted text going into a
+    /// fence — the same threat [#126](https://github.com/glslang/windbg-mcp/issues/126) fixed for
+    /// a module listing, at a call site that did not exist then.
+    #[test]
+    fn a_frame_name_cannot_close_the_fence_it_is_printed_in() {
+        let hostile = "a```\n```elsewhere";
+        let text = render_backtrace(
+            &structured::StackTrace {
+                frames: vec![frame(
+                    0,
+                    "0xfffff80389201234",
+                    Some((hostile, "0x1234")),
+                    None,
+                )],
+                frames_truncated: false,
+            },
+            32,
+        );
+
+        assert_eq!(
+            text.matches("```").count(),
+            2,
+            "exactly one fence opens and one closes it:\n{text}"
+        );
+        let body = fenced_body(&text).expect("the block opens and closes");
+        assert!(
+            !body.contains('`'),
+            "no backtick reaches the block at all, so none of it can be a delimiter:\n{body}"
+        );
+        assert_eq!(
+            body.lines().count(),
+            1,
+            "one frame is one line, whatever it is called:\n{body}"
         );
     }
 

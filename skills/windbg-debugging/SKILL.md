@@ -32,7 +32,7 @@ already does the job.
 | Group | Tools |
 |-------|-------|
 | Session | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `end_session`, `session_status` |
-| State | `registers`, `read_memory`, `walk_memory`, `backtrace`, `modules`, `threads`, `disassemble`, `dx` |
+| State | `registers`, `read_memory`, `walk_memory`, `backtrace` (typed frames, each `module`+`RVA` as well as its symbol), `modules`, `threads`, `disassemble`, `dx` |
 | Control | `go`, `step_over`, `step_into`, `set_breakpoint`, `run_to_address` |
 | Transaction | `debug_batch` — an ordered sequence with assertions and a rollback the engine runs, not the client |
 | TTD nav | `step_back` (`t-`), `step_over_back` (`p-`), `reverse_go` (`g-`), `goto_position` (`!tt`) |

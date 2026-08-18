@@ -334,7 +334,7 @@ gh attestation verify <zip> --repo glslang/windbg-mcp `
 |-------|-------|
 | Session | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `interrupt`, `end_session`, `session_status` |
 | Server   | `server_log` — the server's own log, the supervisor's and every engine worker's, tagged with the session each record belongs to |
-| State   | `registers`, `read_memory`, `walk_memory`, `backtrace` (the stack as typed frames, each carrying `module`+`RVA` as well as its symbol), `modules`, `threads`, `disassemble`, `dx` |
+| State   | `registers`, `read_memory`, `walk_memory`, `backtrace` (the stack as typed frames, each carrying `module`+`RVA` where the engine can place it, as well as its symbol), `modules`, `threads`, `disassemble`, `dx` |
 | Crash   | `crash_triage` — a bug check as fields: code and parameters, crashing process, the stack as `module+RVA`, and the faulting driver frame |
 | Control | `go`, `step_over`, `step_into`, `set_breakpoint`, `run_to_address` |
 | Transaction | `debug_batch` — an ordered sequence with assertions and a rollback the engine process runs on every path |
@@ -657,7 +657,8 @@ matching `outputSchema` in `tools/list`, so a program can read a field instead o
 | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics` | the chunks/totals/diagnostics as values, each carrying the `walk` behind them |
 | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` | PEB heap roots and Segment Heap allocations/totals/diagnostics, each carrying exact `ntdll` layout provenance, skipped-heap scope, and walk coverage |
 | `walk_memory` | `nodes[]` with each field's `value` — `null` where the debugger could not read it — plus `walked`/`unreadable` counts and a `stopped` reason (`complete`, `cap`, `null_link`, `loop`, `unreadable_link`, `deadline`, `interrupted`), each carrying the address it is about |
-| `crash_triage` | `bug_check` (`code`, `name`, four `parameters`), `process_name`, `frames[]` as `{module, rva, symbol}`, the `faulting_frame` picked out of them — and `!analyze`'s own conclusions kept apart under `analysis` |
+| `backtrace` | `frames[]` as `{index, address, module, rva, symbol, displacement}`, innermost first, plus `frames_truncated` — whether the stack went on past the call's `frames` cap (32 by default, 256 at most). `address` is always there; `module`+`rva` travel together and are **absent when the engine places the address in no loaded module** (a freed pool page, an unloaded driver), and `symbol`+`displacement` are absent when nothing resolves, which is the ordinary case for a driver with no PDB. The same records `crash_triage` reports, from the same walk |
+| `crash_triage` | `bug_check` (`code`, `name`, four `parameters`), `process_name`, `frames[]` as `{module, rva, symbol}` — see `backtrace` above for when each is absent — the `faulting_frame` picked out of them, and `!analyze`'s own conclusions kept apart under `analysis` |
 | `debug_batch` | `outcome` (`committed`/`failed`/`timed_out`/`abandoned`/`interrupted`), the position it stopped `at`, `committed`, `rollback_complete`, what the session holds `after`, and every step of both blocks with what it `changed` and whether an assertion was `unmet` |
 
 Two conventions hold across all of them:

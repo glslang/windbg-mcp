@@ -70,9 +70,15 @@ offending frame. No elevation needed; works on System32's engine.
    switches to the faulting thread on the bug checks that carry an exception context — not on all
    of them, so confirm with `registers {}` rather than assuming.
 
-5. **Read the stack.** `backtrace {}` (`k`). If frames show `module!name` you have symbols;
-   if not, set up symbols (see [setup.md](setup.md)) and `execute { "command": ".reload /f" }`,
-   then `backtrace {}` again.
+5. **Read the stack.** `backtrace {}` — typed frames, each carrying `module` + `rva` (the offset
+   into the image, computed from its load base) as well as the `module!Symbol` the debugger
+   resolves. A frame with **no `symbol`** is a module with no PDB rather than a lost frame, and
+   `module+rva` still names it: to resolve the rest, set up symbols (see [setup.md](setup.md)),
+   `execute { "command": ".reload /f" }`, then ask again. Default 32 frames — `frames_truncated`
+   says when the stack went on past that, so raise `frames` rather than reading a capped stack as
+   a short one. This is **not** `k`'s listing: it has no `Child-SP`/`RetAddr` columns and no
+   `[Inline Frame]` rows, which a stack walk does not return. For those,
+   `execute { "command": "k" }`.
 
 6. **Inspect the crash site.**
    - `disassemble {}` at the current IP, or `disassemble { "address": "module!func" }`.
