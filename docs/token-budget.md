@@ -61,10 +61,10 @@ authority — the tables below are a reading of it at the time of writing.
 
 | Component | Bytes | Reaches the model |
 |---|---:|---|
-| **Whole `tools/list` payload** | **366,431** | partly |
-| — the 51 tools themselves | 366,313 | partly |
+| **Whole `tools/list` payload** | **368,051** | partly |
+| — the 51 tools themselves | 367,933 | partly |
 | — result-level fields (`resultType`, `ttlMs`, `cacheScope`) | 118 | no |
-| `outputSchema` (the 32 tools that have one) | 292,870 | no |
+| `outputSchema` (the 32 tools that have one) | 294,490 | no |
 | `inputSchema` (all 51) | 40,043 | yes |
 | `description` (all 51) | 24,017 | yes |
 | `annotations` | 5,449 | no |
@@ -81,8 +81,8 @@ server at two revisions shows what a sum would miss:
 
 | Revision | payload | sum of tools | result-level |
 |---|---:|---:|---|
-| `2026-07-28` | 366,431 | 366,313 | `resultType`, `ttlMs`, `cacheScope` |
-| `2025-06-18` | 366,375 | 366,313 | none |
+| `2026-07-28` | 368,051 | 367,933 | `resultType`, `ttlMs`, `cacheScope` |
+| `2025-06-18` | 367,995 | 367,933 | none |
 
 The sum is **identical** across the two; only the payload figure can tell them apart. The golden
 records both, so the gap stays visible.

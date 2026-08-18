@@ -33,8 +33,8 @@
       "inputSchema": 474,
       "modelVisible": 1134,
       "name": "backtrace",
-      "outputSchema": 6923,
-      "wire": 8156
+      "outputSchema": 7733,
+      "wire": 8966
     },
     {
       "annotations": 117,
@@ -42,8 +42,8 @@
       "inputSchema": 1319,
       "modelVisible": 2923,
       "name": "crash_triage",
-      "outputSchema": 12853,
-      "wire": 15924
+      "outputSchema": 13663,
+      "wire": 16734
     },
     {
       "annotations": 134,
@@ -466,10 +466,10 @@
     "inputSchema": 40043,
     "instructions": 3163,
     "modelVisible": 66717,
-    "outputSchema": 292870,
-    "payload": 366431,
+    "outputSchema": 294490,
+    "payload": 368051,
     "tools": 51,
-    "wire": 366313,
+    "wire": 367933,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 9757
   }

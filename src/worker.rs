@@ -5548,6 +5548,7 @@ mod tests {
             rva: placed.map(|(_, rva)| rva.to_string()),
             symbol: symbol.map(str::to_string),
             displacement: symbol.map(|_| "0x1c".to_string()),
+            attribution_failed: false,
         }
     }
 
@@ -5606,6 +5607,35 @@ mod tests {
         assert!(
             text.contains("0xffffa30712340000"),
             "a frame the engine could place in no module still has an address: {text}"
+        );
+    }
+
+    /// A lookup that **failed** and an address that is genuinely in no module both come back with
+    /// no coordinate, and they are opposite facts — the second is a finding (freed pool, unloaded
+    /// driver), the first is the engine declining to answer. The line has to say which.
+    #[test]
+    fn a_failed_attribution_does_not_read_as_an_address_in_no_module() {
+        let one = |failed| {
+            render_backtrace(
+                &structured::StackTrace {
+                    frames: vec![structured::FrameInfo {
+                        attribution_failed: failed,
+                        ..frame(0, "0xffffa30712340000", None, None)
+                    }],
+                    frames_truncated: false,
+                },
+                32,
+            )
+        };
+        assert!(
+            one(true).contains("lookup failed"),
+            "a failed lookup has to say so: {}",
+            one(true)
+        );
+        assert!(
+            !one(false).contains("lookup failed"),
+            "an address the engine placed in no module is not a failure: {}",
+            one(false)
         );
     }
 

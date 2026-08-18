@@ -134,7 +134,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Neither half is promised: `module` and `rva` travel together and are absent when the engine
   places the address in no loaded module — a freed pool page, an unloaded driver, a corrupted
   return address, which is what a driver bug tends to leave behind — and `symbol` is absent
-  whenever nothing resolves. `address` is the only field always there. Confirming the image a
+  whenever nothing resolves. `address` is the only field always there. A frame whose module
+  **lookup failed** now says so (`attribution_failed`), because that is the opposite kind of
+  evidence from being in no module and the two were indistinguishable on the wire: the walk has
+  always kept the three states apart internally, since picking a faulting frame needs them, and
+  the distinction stopped at the serializer. It reaches `crash_triage`'s frames too, they being the
+  same records. Confirming the image a
   frame's RVA is against is the *other* half of this phase (`TimeDateStamp`/`SizeOfImage` are on
   `ModuleInfo` already; the PDB GUID and age are not yet), and until it lands the join is on the
   caller to make against a build they know.

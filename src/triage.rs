@@ -301,6 +301,9 @@ pub fn frame_info(attributed: &AttributedFrame) -> structured::FrameInfo {
         rva: module.map(|module| offset(address.saturating_sub(module.base))),
         symbol: symbol.clone(),
         displacement: symbol.map(|_| offset(attributed.frame.displacement)),
+        // The third state, which is the one an absent `module` would otherwise swallow. See
+        // [`Attribution`] for why it is not the same answer as `NoModule`.
+        attribution_failed: matches!(attributed.module, Attribution::Unknown),
     }
 }
 
@@ -655,12 +658,19 @@ pub fn describe(frame: &structured::FrameInfo) -> String {
             Some("0x0") | None => symbol.clone(),
             Some(displacement) => format!("{symbol}+{displacement}"),
         });
-    match (symbol, module_offset(frame)) {
+    let named = match (symbol, module_offset(frame)) {
         (Some(symbol), Some(offset)) => format!("{symbol}  [{offset}]"),
         (Some(symbol), None) => symbol,
         (None, Some(offset)) => offset,
         (None, None) => frame.address.clone(),
+    };
+    // Said on the line rather than left to the field, because the reading it prevents is one a
+    // person makes at a glance: a bare address on a kernel stack looks like a freed pool page or
+    // an unloaded driver, which is a finding, and this one is the engine declining to answer.
+    if frame.attribution_failed {
+        return format!("{named}  (module lookup failed)");
     }
+    named
 }
 
 /// The name of a bug check code.
@@ -1126,6 +1136,35 @@ mod tests {
         assert_eq!(
             found.faulting_frame.and_then(|frame| frame.rva),
             Some("0x1654".to_string())
+        );
+    }
+
+    /// The same distinction, on the wire. Both states leave `module` and `rva` absent, so without
+    /// a field of its own a failed lookup reads to a consumer as "this address is in no module" —
+    /// which is a claim about the target made out of a call that did not answer.
+    #[test]
+    fn a_failed_lookup_is_marked_where_an_address_in_no_module_is_not() {
+        let rendered = |module| {
+            frame_info(&AttributedFrame {
+                frame: frame(0, 0xffffc000_12340000, None, 0),
+                module,
+            })
+        };
+
+        let failed = rendered(Attribution::Unknown);
+        assert!(failed.attribution_failed, "a failed lookup says so");
+        assert_eq!(failed.module, None, "and still has no module to name");
+
+        let none = rendered(Attribution::NoModule);
+        assert!(
+            !none.attribution_failed,
+            "an address the engine placed in no module is an answer, not a failure"
+        );
+
+        let placed = rendered(Attribution::In(module("nt", NT_BASE)));
+        assert!(
+            !placed.attribution_failed,
+            "a placed frame is not a failure"
         );
     }
 
