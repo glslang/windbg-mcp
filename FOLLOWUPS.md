@@ -9,8 +9,9 @@ from transactional batches (#82, 2026-08-09/10 — item 17 is what validating th
 session's own transcript turned up, and item 18 what reviewing it did), item 19 from
 `walk_memory` (#103, 2026-08-13), items 20–22 from standing the server up on an ARM64 guest
 (#131, #132, #134, 2026-08-16), item 23 from making the listener usable rather than merely
-working (2026-08-17), and item 24 from first measuring what this server costs the model driving it
-(2026-08-17). Each item notes its repo,
+working (2026-08-17), item 24 from first measuring what this server costs the model driving it
+(2026-08-17), and items 25–26 from giving the debugger tier an ARM64 *target* (#143, #152,
+2026-08-18). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -747,3 +748,47 @@ say what it means for the other.
 
 Picks up at [`docs/token-budget.md`](./docs/token-budget.md) and the two budget tests in
 `tests/mcp_smoke.rs`.
+
+## 25. [windbg-mcp] The ARM64 CI runner resolves no symbols, so its target reads never run
+
+Since #152 the debugger tier's target-reading assertions decide for themselves whether the host can
+support them, and the two CI entries decide differently: on `windows-latest` all four run and pass,
+on `windows-11-arm` all four print `SKIPPED`. Same code, same dumps. Windows ships `dbghelp.dll` in
+System32 and **no `symsrv.dll`** outside the Debugging Tools, so a runner without them downloads no
+PDB — and without `nt`'s symbols a kernel dump's pointers cannot be followed at all
+([#142](https://github.com/glslang/windbg-mcp/issues/142)).
+
+- **Why deferred:** the job's stated position is that it runs the runner's *stock* engine, on the
+  reasoning that "a runner whose DbgEng cannot open a checked-in dump is something this repo wants
+  to hear about". Provisioning symbols moves it away from what a bare machine gets — and toward
+  what a user following this repo's own setup gets, since that setup copies the engine bundle
+  beside the exe. That is a decision about what the job is *for*, not a fix.
+- **What it costs today:** `docs/samples/121524-4703-01.dmp`, added so an ARM64 run reads an ARM64
+  target, is exercised only on a bench with the engine bundle. CI proves the protocol and the
+  session machinery there and nothing about reading.
+- **Picks up at** [#153](https://github.com/glslang/windbg-mcp/issues/153), which lists the two
+  probes (`dir` of the arm64 Debuggers directory, `where.exe symsrv.dll`) that would confirm this
+  is an image difference rather than something this repo can fix in the workflow.
+
+## 26. [windbg-mcp] No ARM64 driver crash, so frame attribution is asserted only on x64 stacks
+
+`a_driver_crash_names_the_driver_frame_that_analyze_cannot` opens the x64 `MessageManager` dump on
+every architecture. It passes there — an engine with symbols reads either dump either way round —
+but the arithmetic that turns a captured frame into `module+RVA` off the load base has never been
+run against an **ARM64** stack. #143 closed the other three assertions this way and left this one.
+
+- **Why deferred:** it needs a crash to be produced rather than a sample to be found, and the two
+  obvious candidates are already ruled out. The checked-in ARM64 sample and every one of its
+  siblings on that bench are `0xFC` faults at a *user-mode payload* — HEVD's stack-overflow client
+  with an incomplete ROP chain, so nothing disables privileged execution of a user page and the
+  stack carries no `HEVD` frame at all. Completing that chain would remove the crash rather than
+  reshape it.
+- **What it needs:** an HEVD path that faults **inside** the driver (null dereference, pool
+  corruption), plus a few lines of client to send that IOCTL — `hevd-exp` on the bench holds only
+  the stack-overflow one. The driver itself loads again as of 2026-08-18 (`testsigning` on, its
+  certificate in `LocalMachine\Root`; see `CLAUDE.md`).
+- **One decision first:** `HEVD.pdb` ships beside the driver, so its frame *will* symbolize if that
+  PDB is reachable — the opposite of the x64 assertion, which pins `symbol` absent because
+  `MessageManager` has no PDB. Either keep the PDB off the path so both tests make one claim, or
+  assert the symbolized form and let the pair cover both.
+- **Picks up at** [#154](https://github.com/glslang/windbg-mcp/issues/154).
