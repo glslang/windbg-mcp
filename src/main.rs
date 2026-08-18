@@ -14,6 +14,7 @@
 
 mod batch;
 mod cast;
+mod client;
 mod engine;
 mod kdconn;
 mod listen;
