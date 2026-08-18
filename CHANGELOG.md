@@ -122,6 +122,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The server instructions now fit what the client reads.** They were 3,147 characters against a
+  measured 2,048-character limit, so 1,099 were paid for on every connection and discarded — and
+  what fell off the end was the `debug_batch` paragraph, the one instruction there that stops a
+  mutation being left half-applied. Rewritten to 1,996 characters with that guidance inside the
+  budget, kept ASCII so the character and byte counts cannot diverge, and asserted in the protocol
+  tier so it cannot grow back unnoticed.
+
+- **One wording for `session_id`, on every tool that takes one.** It was documented three different
+  ways across 26 tools and not at all on five (`heap_list`, `heap_allocations`, `heap_chunk`,
+  `heap_census`, `heap_diagnostics`), where a caller had no way to know what to pass.
+  `server_log`'s keeps its own wording, because there the field filters records rather than routing
+  a call — a different question that deserves a different sentence.
+
+  The wording also now says what the field *does*. All three originals described only the staleness
+  guard — "pass it to refuse the call if the target has been replaced" — which is the consequence,
+  not the behaviour: the field is a **router**, and omitting it sends the call to the current
+  session, which with several open is not necessarily the one you were last using. That makes this
+  half close to byte-neutral, and the instructions are where the surface actually moves: 67,613 B to
+  **67,076 B** model-visible, plus 1,167 B of instruction text that was being sent and discarded. That is smaller
+  than [`FOLLOWUPS.md`](./FOLLOWUPS.md) item 24 predicted for the `session_id` half, and the reason
+  is worth recording: the 9,514 B that bullet claimed had counted the copies inside `outputSchema`,
+  which the same document establishes no model reads. The real model-visible figure was 4,695 B.
+  Both the item and [`docs/token-budget.md`](./docs/token-budget.md) are corrected, and the doc
+  gains the finding that measurement actually supports — five tools carry a third of the surface,
+  in their *input* schemas, `debug_batch` alone being 15% of it.
+
 - **`modules` reports which PDB the engine has for a module** — `guid`, `age`, and the `key` those
   two make, which is the middle element of a symbol server's `<pdb>/<key>/<pdb>` path. It completes
   the coordinate work: the image was already identified by `timestamp` + `size`, and its *symbols*

@@ -1475,9 +1475,8 @@ pub(crate) fn format_recipe(recipes: &[SegmentRecipe]) -> String {
 /// Parameters for tools that take no arguments beyond the session handle.
 #[derive(Deserialize, JsonSchema)]
 pub struct SessionArgs {
-    /// Session handle returned by open_dump/open_trace/attach_*/launch. Optional: omit it
-    /// to act on whatever session is current, or pass it to have the call refuse to run if
-    /// this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1521,9 +1520,8 @@ pub struct ModulesArgs {
     /// matcher.
     #[serde(default)]
     pub filter: Option<String>,
-    /// Session handle returned by open_dump/open_trace/attach_*/launch. Optional: omit it
-    /// to act on whatever session is current, or pass it to have the call refuse to run if
-    /// this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1536,9 +1534,8 @@ pub struct RegistersArgs {
     /// x64 that is several hundred entries — the `r` text is unaffected either way.
     #[serde(default)]
     pub all: Option<bool>,
-    /// Session handle returned by open_dump/open_trace/attach_*/launch. Optional: omit it
-    /// to act on whatever session is current, or pass it to have the call refuse to run if
-    /// this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1583,8 +1580,8 @@ pub struct CommandLineArgs {
 pub struct ExecuteArgs {
     /// Raw debugger command to run (e.g. "!analyze -v", "u rip", "dt nt!_EPROCESS").
     pub command: String,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1595,8 +1592,8 @@ pub struct ReadMemoryArgs {
     pub address: String,
     /// Number of bytes to read.
     pub size: u32,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1628,8 +1625,8 @@ pub struct WalkMemoryArgs {
     /// nothing beyond the links it already reports.
     #[serde(default)]
     pub fields: Option<Vec<walk::FieldArg>>,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1642,8 +1639,8 @@ pub struct DisassembleArgs {
     /// How many instructions to disassemble (default 16, maximum 128).
     #[serde(default)]
     pub count: Option<u32>,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1662,8 +1659,8 @@ const DEFAULT_DISASSEMBLE_COUNT: u32 = 16;
 pub struct DxArgs {
     /// Data-model (LINQ) expression, e.g. "@$cursession.TTD.Calls(\"ntdll!*\")".
     pub expression: String,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1672,8 +1669,8 @@ pub struct DxArgs {
 pub struct BreakpointArgs {
     /// Breakpoint location: symbol, address, or expression (e.g. "nt!NtCreateFile").
     pub expression: String,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1682,8 +1679,8 @@ pub struct BreakpointArgs {
 pub struct PositionArgs {
     /// TTD position to travel to, e.g. "12:0" or "0" for the start of the trace.
     pub position: String,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1710,8 +1707,8 @@ pub struct TtdCallsArgs {
     /// Function symbol or wildcard pattern to find calls to, e.g.
     /// "kernelbase!CreateFileW" or "ntdll!Nt*".
     pub function: String,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1726,8 +1723,8 @@ pub struct TtdMemoryArgs {
     /// Omit to report every access.
     #[serde(default)]
     pub mode: Option<String>,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1754,8 +1751,8 @@ pub struct SymbolPathArgs {
     /// force-load one module's symbols. Omit to reload all deferred modules.
     #[serde(default)]
     pub reload: Option<String>,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1777,8 +1774,8 @@ pub struct PoolFindTagArgs {
     /// Maximum rows to print (default 64).
     #[serde(default)]
     pub limit: Option<u32>,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1792,8 +1789,8 @@ pub struct PoolChunkArgs {
     /// Force a fresh walk instead of reusing this session's cached snapshot (default false).
     #[serde(default)]
     pub refresh: Option<bool>,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1806,8 +1803,8 @@ pub struct PoolCensusArgs {
     /// Maximum tags to print (default 40).
     #[serde(default)]
     pub limit: Option<u32>,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1824,8 +1821,8 @@ pub struct PoolDiagnosticsArgs {
     /// Force a fresh walk instead of reusing this session's cached snapshot (default false).
     #[serde(default)]
     pub refresh: Option<bool>,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1835,6 +1832,8 @@ pub struct HeapListArgs {
     /// Force a fresh snapshot instead of reusing the one cached for this stopped target.
     #[serde(default)]
     pub refresh: Option<bool>,
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1876,6 +1875,8 @@ pub struct HeapAllocationsArgs {
     /// Maximum rows to return (default 64, maximum 2000).
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1886,6 +1887,8 @@ pub struct HeapChunkArgs {
     pub address: String,
     #[serde(default)]
     pub refresh: Option<bool>,
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1900,6 +1903,8 @@ pub struct HeapCensusArgs {
     /// Maximum groups to return (default 40, maximum 2000).
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1917,6 +1922,8 @@ pub struct HeapDiagnosticsArgs {
     /// Maximum rows to return (default 60, maximum 2000).
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1937,8 +1944,8 @@ pub struct CrashTriageArgs {
     /// where the context has been moved (`.thread`, `~Ns`, `.cxr`) they are not.
     #[serde(default)]
     pub analyze: Option<bool>,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1957,8 +1964,8 @@ pub struct BacktraceArgs {
     /// How many frames to walk (default 32, maximum 256).
     #[serde(default)]
     pub frames: Option<u32>,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1978,8 +1985,8 @@ const DEFAULT_BACKTRACE_FRAMES: u32 = 32;
 pub struct DriverObjectArgs {
     /// Driver object name, e.g. "mydriver" or "\\Driver\\mydriver".
     pub name: String,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -1988,8 +1995,8 @@ pub struct DriverObjectArgs {
 pub struct DeviceObjectArgs {
     /// Device object: a name (e.g. "\\Device\\MyDevice") or an address (0x-hex).
     pub device: String,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -2001,8 +2008,8 @@ pub struct IrpStackArgs {
     /// clobbers the register.
     #[serde(default)]
     pub irp: Option<String>,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -2012,8 +2019,8 @@ pub struct IoctlTraceArgs {
     /// Virtual address of the IRP_MJ_DEVICE_CONTROL dispatch routine, rebased to the
     /// live load base. Recover it via `driver_object` (MajorFunction[0x0e]).
     pub dispatch: String,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -2049,8 +2056,8 @@ pub struct ReachabilityArgs {
     /// the bare verdict + call path.
     #[serde(default)]
     pub recipe: Option<bool>,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -2065,8 +2072,8 @@ pub struct RunToAddressArgs {
     /// (milliseconds). Defaults to the standard execution wait.
     #[serde(default)]
     pub timeout_ms: Option<u32>,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -2108,8 +2115,8 @@ pub struct DebugBatchArgs {
     /// is left of this call's budget — it can only make the batch shorter, never longer.
     #[serde(default)]
     pub timeout_ms: Option<u32>,
-    /// Session handle from open_dump/open_trace/attach_*/launch. Optional; pass it to
-    /// refuse the call if this server's debug target has been replaced since you opened it.
+    /// Which session to act on. Omit for the current one — the newest still open. Pass an
+    /// opener's handle to route to that session, refused if it has closed.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -4320,38 +4327,33 @@ impl WindbgServer {
 // that expands in this crate. Pass `name` only: the attribute takes a string literal, so
 // `version = env!(...)` would not even parse, and spelling the version out by hand would just be a
 // second place to forget to bump.
+// **Sized to what the client actually reads.** Measured at 2,048 characters, and the previous text
+// was 3,147 — so 1,099 characters were paid for on every connection and never arrived, taking the
+// whole `debug_batch` paragraph with them, which is the one instruction here that prevents a
+// half-applied mutation. Kept ASCII so the count cannot differ between characters and bytes, and
+// `the_instructions_fit_what_the_client_reads` fails if it grows back.
 #[rmcp::tool_handler(
     name = "windbg-mcp",
-    instructions = "Drive WinDbg/DbgEng for live user-mode, kernel, crash-dump, and Time Travel Debugging (TTD) analysis. \
-Open a dump or .run trace, attach to a process or the kernel, inspect registers/memory/stacks/modules, and set breakpoints. \
-Each open target is a separate session in its own engine process, so several can be open at once (up to 4) without \
-disturbing each other; pass the `session_id` an opener returns on later calls to route them to that target, and \
-`end_session` when done. An opener answers with a summary of the target — the build, the kernel or primary image and \
-its base, how many modules are loaded, and a crash dump's bug check — rather than the module table; `modules` lists \
-that table when you actually need it, and `crash_triage` reads a bug check with its stack. \
-`session_status` lists what is open and what state each session is in — ask it when an open \
-reports a timeout rather than re-running the open, which would attach or launch a second time. To stop a call that is \
-taking too long without losing the target, call `interrupt` on its session while it is still outstanding: it Ctrl+Breaks \
-the engine, the running call returns whatever it had reached, and the session is free for the next one. A live kernel \
-attach is the exception — it waits for its target indefinitely and cannot be interrupted; if it has been waiting far \
-longer than a healthy link takes, `end_session` reclaims that session (and only that session) by terminating its engine \
-process. \
-Navigate a TTD trace in both directions: go/step_over/step_into forward, and reverse_go/step_over_back/step_back backward, \
-or jump with goto_position. Analyze a trace with the data-model tools ttd_calls (calls to a function), ttd_memory (accesses \
-to an address range), and ttd_events (module/thread/exception events), or run any data-model query with dx. Record new traces \
-with record_trace (needs elevation). For driver IOCTL work: decode_ioctl (decode a control code), driver_object \
-and device_object (walk the driver/device tree and security), irp_stack (dump an IRP's IO_STACK_LOCATION), \
-ioctl_trace (log every dispatched IOCTL), and reachable_from_dispatch (statically test, via a bounded \
-uf-based call-graph walk, whether a code block — by address or module+RVA — is reachable from the IOCTL \
-dispatch routine; REACHABLE is sound, NOT REACHABLE is best-effort, and a REACHABLE verdict includes a \
-directional path recipe of the on-path branch conditions). Confirm a static verdict live with \
-run_to_address (run to a block on a KDNET/VM kernel target and report HIT/STOPPED ELSEWHERE/TIMEOUT). \
-When a sequence *mutates* the target — a patched byte, an armed breakpoint, a resumed thread — run it as \
-one `debug_batch` rather than as separate calls: its `always` block runs inside the engine process on \
-every path, including a failed assertion and an expired deadline, so cleanup cannot be lost to a call \
-that times out or a client that disconnects, and the result names the exact failing step, what each step \
-changed, whether the rollback completed, and whether the target is left stopped, running or gone. \
-Use `execute` for any raw command not covered by a dedicated tool."
+    instructions = "Drive WinDbg/DbgEng for live user-mode, kernel, crash-dump and Time Travel Debugging (TTD) work: open a \
+dump or .run trace, attach to a process or the kernel, inspect registers/memory/stacks/modules, set \
+breakpoints. Each open target is a separate session in its own engine process, so up to 4 coexist \
+without disturbing each other: pass the `session_id` an opener returns on every later call to route it \
+to that target, and `end_session` when done. An opener answers with a summary of the target rather than \
+its module table; `modules` lists that when you need it, and `crash_triage` reads a bug check with its \
+stack. If an open reports a timeout, ask `session_status` rather than running the open again - a second \
+open attaches or launches a second time. To stop a call that is overrunning, `interrupt` its session \
+while it is still outstanding: it returns what it had reached and frees the session. A live kernel \
+attach cannot be interrupted - it waits indefinitely, and `end_session` reclaims that session alone. \
+Stack frames and instructions carry `module`+`rva` beside their address, and `modules` carries each \
+image's identity - the coordinate that survives a reboot and joins a disassembler. TTD: \
+go/step_over/step_into forward, reverse_go/step_over_back/step_back backward, goto_position to jump; \
+ttd_calls, ttd_memory and ttd_events query a trace, dx runs any data-model expression. Driver IOCTL: \
+decode_ioctl, driver_object, device_object, irp_stack, ioctl_trace, and reachable_from_dispatch - is a \
+block reachable from the dispatch routine, where REACHABLE is sound and NOT REACHABLE is best-effort; \
+confirm one live with run_to_address. When a sequence *mutates* the target - a patched byte, an armed \
+breakpoint, a resumed thread - run it as one `debug_batch`: its `always` block runs in the engine \
+process on every path, including a failed assertion, an expired deadline and a client disconnect, so \
+cleanup cannot be lost. Use `execute` for any raw command without a dedicated tool."
 )]
 impl rmcp::ServerHandler for WindbgServer {
     /// Every tool call, recorded on its way through.
