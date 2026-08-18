@@ -1320,13 +1320,13 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
     })
 }
 
-/// Ceiling on the tool surface a model is given before it has asked anything. 66,078 bytes across
-/// 51 tools today (~16k tokens), +15% headroom — sized so that rewording a description passes and
+/// Ceiling on the tool surface a model is given before it has asked anything. 66,717 bytes across
+/// 51 tools today (~16k tokens), +14% headroom — sized so that rewording a description passes and
 /// a new tool arriving with a `debug_batch`-scale schema does not.
 const MODEL_VISIBLE_CEILING: usize = 76_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
-/// the array's own punctuation and every result-level field are inside it. 358,651 bytes today,
+/// the array's own punctuation and every result-level field are inside it. 366,431 bytes today,
 /// ~80% of that `outputSchema` no model reads, which is why this is a separate and much looser
 /// number rather than a scaled version of the one above.
 ///

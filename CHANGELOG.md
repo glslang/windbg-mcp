@@ -125,10 +125,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`backtrace` answers with typed frames carrying `module` + `RVA`, not just `k`'s text.** The
   tool ran `k` and handed back whatever DbgEng printed, which names a frame as
   `module!Symbol+0x1c` — a form that is unusable the moment the symbol does not resolve, and on a
-  driver with no PDB it never does. Every frame now carries the offset into its image as well,
+  driver with no PDB it never does. A frame now carries the offset into its image as well,
   computed from the load base the engine reports, which is the half that survives an unsymbolised
-  driver and stays comparable across reboots and across machines. That is what lets a frame be
-  joined to a function in a disassembler without either side knowing the other exists.
+  driver and stays comparable across reboots — and across machines, for **the same image and
+  build**, which is what an RVA is relative to. That is what lets a frame be joined to a function
+  in a disassembler without either side knowing the other exists.
+
+  Neither half is promised: `module` and `rva` travel together and are absent when the engine
+  places the address in no loaded module — a freed pool page, an unloaded driver, a corrupted
+  return address, which is what a driver bug tends to leave behind — and `symbol` is absent
+  whenever nothing resolves. `address` is the only field always there. Confirming the image a
+  frame's RVA is against is the *other* half of this phase (`TimeDateStamp`/`SizeOfImage` are on
+  `ModuleInfo` already; the PDB GUID and age are not yet), and until it lands the join is on the
+  caller to make against a build they know.
 
   - **The same records as `crash_triage`, from the same walk.** Both tools go through one helper
     (`worker::walk_attributed`) and render through one function (`triage::describe`), so a

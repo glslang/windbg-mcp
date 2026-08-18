@@ -94,7 +94,7 @@ try {
     # ---- Confirm we have a live, stopped context ----
     Show-ToolResult "execute: .echo connected" (Call-Tool "execute" @{ command = ".echo === post-attach ===" } 60000)
     Show-ToolResult "registers" (Call-Tool "registers" @{} 60000)
-    Show-ToolResult "backtrace (k)" (Call-Tool "backtrace" @{} 60000)
+    Show-ToolResult "backtrace (typed frames: module+rva)" (Call-Tool "backtrace" @{} 60000)
     Show-ToolResult "execute: !running -t (current state)" (Call-Tool "execute" @{ command = "!pcr" } 60000)
 
     # ---- 2. Set a breakpoint that the running system will hit promptly ----

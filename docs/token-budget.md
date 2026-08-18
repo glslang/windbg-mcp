@@ -7,7 +7,7 @@ answer this server returns. That makes payload size a correctness-adjacent prope
 call that spends 13k tokens has not failed, but it has taken the space the investigation needed.
 Nothing measured this until [`tests/mcp_smoke.rs`](../tests/mcp_smoke.rs) grew the two tests below,
 and the numbers turned out to be larger than anyone had guessed — a careful reading of the source
-put the tool surface at 90–130 KB, and the wire is 358 KB.
+put the tool surface at 90–130 KB, and the wire is 366 KB.
 
 ## Two costs, and they are not the same
 
@@ -61,14 +61,14 @@ authority — the tables below are a reading of it at the time of writing.
 
 | Component | Bytes | Reaches the model |
 |---|---:|---|
-| **Whole `tools/list` payload** | **358,651** | partly |
-| — the 51 tools themselves | 358,533 | partly |
+| **Whole `tools/list` payload** | **366,431** | partly |
+| — the 51 tools themselves | 366,313 | partly |
 | — result-level fields (`resultType`, `ttlMs`, `cacheScope`) | 118 | no |
-| `outputSchema` (the 31 tools that have one) | 285,745 | no |
-| `inputSchema` (all 51) | 39,964 | yes |
-| `description` (all 51) | 23,457 | yes |
+| `outputSchema` (the 32 tools that have one) | 292,870 | no |
+| `inputSchema` (all 51) | 40,043 | yes |
+| `description` (all 51) | 24,017 | yes |
 | `annotations` | 5,449 | no |
-| **Model-visible total** | **66,078** (~16k tokens) | — |
+| **Model-visible total** | **66,717** (~16k tokens) | — |
 | `initialize` instructions | 3,163 | yes, first 2,048 chars |
 
 Worst single tool: `debug_batch` at 9,757 model-visible bytes, because its `inputSchema` pulls the
@@ -81,8 +81,8 @@ server at two revisions shows what a sum would miss:
 
 | Revision | payload | sum of tools | result-level |
 |---|---:|---:|---|
-| `2026-07-28` | 358,651 | 358,533 | `resultType`, `ttlMs`, `cacheScope` |
-| `2025-06-18` | 358,595 | 358,533 | none |
+| `2026-07-28` | 366,431 | 366,313 | `resultType`, `ttlMs`, `cacheScope` |
+| `2025-06-18` | 366,375 | 366,313 | none |
 
 The sum is **identical** across the two; only the payload figure can tell them apart. The golden
 records both, so the gap stays visible.
