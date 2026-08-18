@@ -368,6 +368,13 @@ terminated, and a terminated kernel session leaves its target halted.
 Omit `session_id` and a call goes to the **current** session: the most recently opened one that will
 still accept work. That is the pre-handle behaviour and it still holds. What supplying the id buys
 is that the call can never land on a target you did not open — it fails loudly instead.
+
+The asymmetry is worth knowing, because it is where the guarantee earns its keep. A raw `execute`
+that replaces or releases the target (`.opendump`, `.attach`, `.detach`) leaves the session
+**retired**: a call naming its handle is refused, while a call naming nothing is still routed there,
+because the worker is genuinely the server's current target and a caller who asked for no guarantee
+gets what is in front of them. So omitting the id is not merely "whatever is current" — it is also
+"whatever that target has since become".
 `decode_ioctl` (pure) and `record_trace` (independent of any debug session) do not take one.
 
 `session_status` lists every session — what it is, what state it is in, how long it has been there,
