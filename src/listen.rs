@@ -966,11 +966,13 @@ async fn gate(
             // requests carrying the session this credential holds are served concurrently, which
             // is how a `DELETE` arrives on one while a tool call runs on another. Two things reach
             // here and the message has to fit both: a second **MCP session** for this credential
-            // (a fresh `initialize`, or an id that is not the one it holds), and a request arriving
-            // while another of its own still holds the claim — which is every overlapping request
-            // from a client that sends no session id at all, since `2026-07-28` removed it.
-            // Saying "another client" would send an operator looking for a colleague who is not
-            // there, and saying "connection" for one who has a network problem they do not have.
+            // (a fresh `initialize`, or an id that is not the one it holds), and a second request
+            // arriving while one of its own is still opening one. Saying "another client" would
+            // send an operator looking for a colleague who is not there, and saying "connection"
+            // for one who has a network problem they do not have.
+            //
+            // A client on a revision with no session id no longer reaches here at all: it opens
+            // nothing, so it contests nothing (#168).
             tracing::warn!(
                 "refused a request from {peer}: this credential is already being served here"
             );
