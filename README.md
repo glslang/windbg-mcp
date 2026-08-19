@@ -235,7 +235,8 @@ against a live kernel, and the token is sent in clear — a hypervisor's guest n
 when the machine being debugged shares it. [`docs/remote-listener.md`](./docs/remote-listener.md)
 covers the tokens — **one per client**, each with its own sessions, so two people or two agents on
 one listener cannot reach each other's targets — the session lease and its grace, and what a `409`
-means (one client's second connection, not a second client). For a one-off, [`docs/remote-phase0.md`](./docs/remote-phase0.md) does the same
+means (one credential asking for a second MCP session, never a second client, and never a request on
+a second connection — those are served concurrently). For a one-off, [`docs/remote-phase0.md`](./docs/remote-phase0.md) does the same
 job over plain `ssh` with no listener.
 
 ### As a Claude Code plugin

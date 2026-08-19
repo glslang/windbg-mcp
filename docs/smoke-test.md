@@ -426,10 +426,12 @@ end-to-end gap is [`FOLLOWUPS.md`](../FOLLOWUPS.md) item 29:
   nothing***. The last clause is the one worth a test: the bearer check runs before the tenancy
   gate, so a wrong token must not reserve or consume a claim — if it did, anything that could
   reach the port could lock the real client out without ever authenticating.
-- *A second connection **from the same client** is refused with `409`*, whether it arrives with a
-  fresh `initialize` or with a session id that is not the holder's, and the holder is undisturbed by
-  either. Since 2026-08-19 the tenancy is per client, so this is one client racing itself — a
-  *different* client is served concurrently and shares nothing with this one.
+- *A second **MCP session** for the same credential is refused with `409`*, whether it asks with a
+  fresh `initialize` or with a session id that is not the one it holds, and the holder is undisturbed
+  by either. Since 2026-08-19 the tenancy is per client, so this is one credential racing itself: a
+  *different* client is served concurrently and shares nothing with this one, and so are further
+  requests carrying the session this one already holds — which is what lets a `DELETE` arrive while
+  a tool call is still running.
 - *Going quiet is not leaving; saying goodbye is.* Every request is its own connection — which is
   what a client behind a tunnel looks like — so silence is the resting state, and a server that
   read it as departure would hand the registry on between two calls of a working client. A

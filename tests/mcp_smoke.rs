@@ -14,7 +14,7 @@
 //!
 //! * **Protocol** (default) — spawns the server, speaks JSON-RPC. No debugger target, no
 //!   symbols, no network. This tier also drives the **listener** (`--listen`) over real HTTP on a
-//!   loopback port: the bearer check, the `409` that keeps a client to one connection at a time,
+//!   loopback port: the bearer check, the `409` that keeps a credential to one MCP session,
 //!   and the difference between a client going quiet and a client saying goodbye. Those need no
 //!   debugger, because the lease is decided before any session is opened — but the sweep meeting a
 //!   real engine worker does, so that half lives in the tier below.
@@ -2778,27 +2778,32 @@ fn an_unauthenticated_request_is_refused_and_costs_the_server_nothing() {
     );
 }
 
-/// One connection at a time **per client**, refused with `409` rather than served alongside.
+/// One MCP session at a time **per credential**, refused with `409` rather than served alongside.
 ///
 /// This was once the whole boundary: handles were minted from one registry, `MAX_SESSIONS` was
 /// shared and `end_session` ended whatever it was handed, so two clients would silently share and
 /// one could end a target the other was using. Sessions are owned now
 /// ([#162](https://github.com/glslang/windbg-mcp/issues/162)), and the tenancy is per client — so
-/// what this asserts is a client racing *itself*, which is the only contention left. The listener
-/// here holds one, unnamed token, so both connections below are that one client.
+/// what this asserts is a credential racing *itself*, which is the only contention left. The
+/// listener here holds one, unnamed token, so both requests below are that one client.
+///
+/// Not about *connections*: requests carrying the session this credential already holds are served
+/// concurrently, which is what makes a `DELETE` on one connection while a tool call runs on another
+/// work at all. What is refused is a **second session** — a fresh `initialize`, or an id that is
+/// not the one it holds.
 #[test]
-fn a_second_connection_from_one_client_is_refused_while_it_holds_the_server() {
+fn a_second_session_for_one_credential_is_refused_while_it_holds_the_server() {
     let mut server = Listener::start(&[]);
     let holder = server.initialize();
 
     let intruder = server.call(None, "initialize", Listener::opening());
     assert_eq!(
         intruder.status, 409,
-        "a second connection from the holder's own client was not refused: {}",
+        "a second session for the holder's own credential was not refused: {}",
         intruder.body
     );
     assert!(
-        intruder.body.contains("one at a time"),
+        intruder.body.contains("one MCP session per credential"),
         "the refusal has to say why, or it reads as a bug: {}",
         intruder.body
     );
