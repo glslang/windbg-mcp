@@ -517,6 +517,21 @@ impl Lease {
         //
         // Counted in-flight all the same: a goodbye still has to wait for the work admitted here.
         if matches!(arriving, Arriving::Stateless) {
+            // **Renewed if there is one; never created.** "Any request renews the lease" is what
+            // keeps a working client's tenancy alive, and this path skipping it would strand a
+            // credential that holds a legacy session and has since started sending stateless
+            // requests — a client that upgraded or restarted mid-grace. The sweep reads the
+            // deadline and nothing else: it zeroes `in_flight` on the way past, so work actually
+            // running would not save the sessions being released underneath it.
+            //
+            // Not created, because a deadline with no holder is a lease against nothing. It would
+            // fire one grace later and release this client's sessions — which for a client that
+            // only ever sends stateless requests is all of them, on a timer it never touched.
+            // Abandonment on that revision is [`IDLE_RELEASE`]'s to catch, per session and far
+            // longer.
+            if state.deadline.is_some() {
+                state.deadline = Some(Instant::now() + self.grace);
+            }
             state.in_flight += 1;
             return Admission::Serve(Admitted {
                 claim: None,
@@ -1779,6 +1794,48 @@ mod tests {
 
         lease.leave(first.epoch);
         lease.leave(second.epoch);
+    }
+
+    /// A stateless request renews a lease its credential already has, and creates none.
+    ///
+    /// Both halves are the same rule seen from two sides, and getting either wrong loses sessions.
+    /// A credential can hold a legacy session and *then* start sending stateless requests — a
+    /// client that upgraded, or restarted inside the grace — and since the sweep reads the deadline
+    /// alone and zeroes `in_flight` on its way past, a request that did not renew would have those
+    /// sessions released out from under it while it was using them. The other way costs as much: a
+    /// deadline installed for a client that holds nothing is a lease against nothing, and it would
+    /// release every session a purely stateless client has, one grace after its first call.
+    #[test]
+    fn a_stateless_request_renews_a_lease_but_does_not_start_one() {
+        let lease = lease();
+
+        // Nothing held: a stateless request must leave it that way.
+        let opening = admitted(lease.admit_stateless());
+        assert_eq!(
+            lease.state().deadline,
+            None,
+            "a request that holds nothing must not be given a clock to run out"
+        );
+        lease.leave(opening.epoch);
+
+        // A legacy session, and then the same credential going stateless.
+        request(&lease, None, Some("session-a"), true);
+        let before = lease
+            .state()
+            .deadline
+            .expect("a credential that holds a session has a deadline");
+
+        std::thread::sleep(Duration::from_millis(5));
+        let it = admitted(lease.admit_stateless());
+        let after = lease
+            .state()
+            .deadline
+            .expect("the lease is still the credential's");
+        assert!(
+            after > before,
+            "a stateless request from the holder's own credential must renew its lease"
+        );
+        lease.leave(it.epoch);
     }
 
     /// Serving them alongside each other does not make them a tenancy.
