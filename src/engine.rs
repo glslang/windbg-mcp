@@ -49,8 +49,14 @@ use crate::worker::{MESSAGES_FLAG, REQUESTS_FLAG, WORKER_FLAG};
 /// a client leaking sessions notices.
 pub const MAX_SESSIONS: usize = 4;
 
-/// How many *closed* sessions to remember, so `session_status` can still answer for a handle
-/// after its target is gone. Live sessions are never evicted, whatever this says.
+/// How many *closed* sessions to remember **per client**, so `session_status` can still answer
+/// for a handle after its target is gone. Live sessions are never evicted, whatever this says.
+///
+/// Per client rather than per server, because a shared bound is a shared fate: one client opening
+/// and closing sessions would age out another client's history, and the answer that client then
+/// gets for its own handle is "unknown" — which reads as "never existed" and advises opening
+/// again. The clients are the configured credentials, a set fixed at startup, so this is still a
+/// bound and not a hole.
 const CLOSED_HISTORY: usize = 8;
 
 /// How long to wait for a freshly spawned worker to report [`WorkerMessage::Ready`]. This covers
@@ -925,10 +931,15 @@ impl Registry {
             .collect()
     }
 
-    /// Drops the oldest settled sessions once the history bound is exceeded. Live sessions are
-    /// never evicted — forgetting one would report its handle as unknown, and the advice that
+    /// Drops the oldest settled sessions once a client's history bound is exceeded. Live sessions
+    /// are never evicted — forgetting one would report its handle as unknown, and the advice that
     /// follows from "unknown" is "open again", which for an attach or a launch means a second
     /// target.
+    ///
+    /// **The bound is per owner**, walked client by client, so what ages a client's history out is
+    /// that client's own churn. A single deque bounded once would have let a busy client evict a
+    /// quiet one's record of a session that failed an hour ago, which is exactly the answer
+    /// `session_status` exists to keep.
     ///
     /// Nor is one that still owns a worker, whatever its state says. A session claimed for
     /// reclamation is `Closed` at once and released in the background, and evicting it in that
@@ -937,14 +948,26 @@ impl Registry {
     /// on its own rather than being asked properly, which is the weaker of the two guarantees a
     /// halted kernel can be given.
     fn trim(&mut self) {
-        while self.all.len() > CLOSED_HISTORY + MAX_SESSIONS {
-            let evictable = self.all.iter().position(|s| {
-                !s.state().is_live() && s.child.lock().unwrap_or_else(|e| e.into_inner()).is_none()
-            });
-            let Some(oldest_settled) = evictable else {
-                return;
-            };
-            self.all.remove(oldest_settled);
+        let mut owners: Vec<crate::client::Client> = Vec::new();
+        for session in &self.all {
+            if !owners.contains(&session.owner) {
+                owners.push(session.owner.clone());
+            }
+        }
+        for owner in owners {
+            while self.all.iter().filter(|s| s.owner == owner).count()
+                > CLOSED_HISTORY + MAX_SESSIONS
+            {
+                let evictable = self.all.iter().position(|s| {
+                    s.owner == owner
+                        && !s.state().is_live()
+                        && s.child.lock().unwrap_or_else(|e| e.into_inner()).is_none()
+                });
+                let Some(oldest_settled) = evictable else {
+                    break;
+                };
+                self.all.remove(oldest_settled);
+            }
         }
     }
 }
@@ -3494,6 +3517,52 @@ mod tests {
         assert!(
             sessions.registry().all.len() <= CLOSED_HISTORY + MAX_SESSIONS,
             "settled sessions should have been trimmed to the bound"
+        );
+    }
+
+    /// History ages out on a client's *own* churn, not the server's. A shared bound would let a
+    /// busy client evict a quiet one's settled sessions, and `session_status` would then answer
+    /// "unknown" for a handle that client is still holding — the one answer that tells a caller to
+    /// open again, which for an attach or a launch means a second target.
+    #[tokio::test]
+    async fn one_clients_history_is_not_evicted_by_anothers_churn() {
+        let sessions = Sessions::new(Duration::from_secs(1));
+        // Mine go in first, so they are the oldest in the deque and a single global bound would
+        // reach them before it reached any of theirs.
+        let mine = crate::client::as_client(crate::client::Client::new("laptop"), async {
+            (0..2)
+                .map(|n| dormant(&format!("mine-{n}"), SessionState::Closed("x".into())))
+                .collect::<Vec<_>>()
+        })
+        .await;
+        let theirs = crate::client::as_client(crate::client::Client::new("ci"), async {
+            (0..(CLOSED_HISTORY + MAX_SESSIONS) * 3)
+                .map(|n| dormant(&format!("theirs-{n}"), SessionState::Closed("x".into())))
+                .collect::<Vec<_>>()
+        })
+        .await;
+        {
+            let mut registry = sessions.registry();
+            for session in mine.into_iter().chain(theirs) {
+                registry.all.push_back(session);
+            }
+            registry.trim();
+        }
+        let registry = sessions.registry();
+        assert!(
+            registry.all.iter().any(|s| s.id == "mine-0")
+                && registry.all.iter().any(|s| s.id == "mine-1"),
+            "another client's churn evicted this client's settled sessions, so its own history \
+             aged out on someone else's activity"
+        );
+        assert_eq!(
+            registry
+                .all
+                .iter()
+                .filter(|s| s.owner == crate::client::Client::new("ci"))
+                .count(),
+            CLOSED_HISTORY + MAX_SESSIONS,
+            "the busy client's own history should still be bounded"
         );
     }
 

@@ -209,7 +209,8 @@ What ownership buys, and it is the whole of it:
 | Listing | `session_status` shows the caller's sessions and no others |
 | Capacity | the four-session cap is per client, so a busy one cannot deny a quiet one |
 | Reclamation | a session is only ever reclaimed to make room for **its own** client |
-| The log | `server_log` shows the caller's sessions' records, plus the supervisor's own, which name no session |
+| History | a closed session ages out of `session_status` on its **own** client's churn, not the server's |
+| The log | `server_log` shows the caller's sessions' records, plus the supervisor's own, which name no session — and the buffer counts it reports are over the records that caller can read |
 | Lease expiry | releases the sessions of the client whose lease ran out, and no others |
 | Contention | **within** a client only — one client's long call does not make another wait |
 
@@ -229,6 +230,15 @@ provides properly.
 **This does not authorise anything beyond separation.** Every client that can authenticate has the
 whole tool surface, including `execute` and `launch`. Tokens separate clients from each other; they
 do not rank them.
+
+**One thing a client can still infer: that another one is busy.** `server_log`'s sequence numbers
+are assigned across the whole server, and that is what makes a `since` cursor exact under eviction —
+so a client reading two of its own records numbered a hundred apart can tell that *something* was
+filed in between. It learns a count. The records, the sessions they belong to and their text stay
+unreachable, and every number the tool reports — how full the buffer is, where the cursor is now,
+what the oldest record is — is over that client's own stream. Numbering per client would close the
+last of it and cost the cursor its stability, which is a bad trade for a shared debug host and a
+worse one for a hostile tenant, who should not be sharing a listener at all.
 
 **A token file is the only credential when one is configured.** `WINDBG_MCP_LISTEN_TOKEN_FILE` shuts
 the environment out entirely — named tokens included — rather than merely outranking the unnamed

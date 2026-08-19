@@ -22,8 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **`session_status` lists only the caller's**, and the four-session **cap is per client**, so a
     busy client cannot deny a quiet one. A session is only ever reclaimed to make room for its own
     client — reclaiming another's is the precise harm a shared registry did.
+  - **Closed-session history is per client too**, so a handle still answers after its target is gone
+    however busy the rest of the server has been. A shared bound is a shared fate: one client's
+    churn would age out another's record of a session that failed, and the answer that client then
+    gets for a handle it is still holding is "unknown" — which reads as "never existed".
   - **`server_log`** shows the caller's sessions' records and the supervisor's own — one ring serves
-    the whole server, so without this a client could read what another's worker printed.
+    the whole server, so without this a client could read what another's worker printed. **Its
+    counts are the caller's too**: how full the buffer is, where the cursor is now and what the
+    oldest record is are all over that client's stream, since numbers about records nobody may read
+    still report another client's activity.
   - **A lease expiry releases the sessions of the client whose lease ran out**, not every session.
     Before ownership those were the same set, because the gate served one client at a time.
   - **The tenancy itself is per client**, so two clients no longer queue behind each other. The gate
