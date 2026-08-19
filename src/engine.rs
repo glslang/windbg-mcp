@@ -1082,6 +1082,18 @@ impl Sessions {
             .collect()
     }
 
+    /// How many live sessions one client holds, **named rather than inferred**.
+    ///
+    /// Every other question about "the caller's sessions" reads the identity from the task-local
+    /// [`crate::client::current`], because it is asked from inside a tool call, where that is
+    /// exactly who is asking. This one is asked by the listener *after* the call has finished and
+    /// its scope has ended, so the ambient answer there is the default `local` — which for a named
+    /// client is either nobody's sessions or somebody else's. So the owner is a parameter: the
+    /// caller of this method is the only thing that still knows.
+    pub fn live_count_for(&self, owner: &crate::client::Client) -> usize {
+        self.registry().live_for(owner).len()
+    }
+
     pub fn snapshot(&self) -> Vec<SessionSnapshot> {
         let registry = self.registry();
         // A caller is shown its own sessions and told which of *those* is current. Another client's
@@ -3155,6 +3167,42 @@ mod tests {
     }
 
     // ---- one registry, several clients ---------------------------------------------
+
+    /// The listener counts a reconnecting client's sessions **after** its identity scope has
+    /// closed — the adoption line is written once the MCP call has been handled — so the count has
+    /// to be asked for by name. Reading the ambient identity there answers about `local`, which for
+    /// a named client is nobody, and the line then reports an adoption of nothing on exactly the
+    /// reconnect it exists to describe.
+    #[tokio::test]
+    async fn a_clients_live_count_is_asked_for_by_name_not_inferred() {
+        let ci = crate::client::Client::new("ci");
+        let sessions = Sessions::new(Duration::from_secs(1));
+        let theirs = crate::client::as_client(ci.clone(), async {
+            (0..2)
+                .map(|n| dormant(&format!("sess-ci-{n}"), SessionState::Open))
+                .collect::<Vec<_>>()
+        })
+        .await;
+        {
+            let mut registry = sessions.registry();
+            for session in theirs {
+                registry.all.push_back(session);
+            }
+        }
+
+        // No scope here, which is the listener's position after the call it just served.
+        assert_eq!(
+            sessions.live_count_for(&ci),
+            2,
+            "a client's sessions have to be countable from outside its own call"
+        );
+        assert_eq!(sessions.live_count_for(&crate::client::Client::local()), 0);
+        assert!(
+            sessions.snapshot().is_empty(),
+            "the ambient answer here is `local`, which is the mistake the parameter exists to \
+             make unavailable"
+        );
+    }
 
     /// The property the whole owner field exists for: a handle is only usable by the client that
     /// opened it, and to anyone else it is not "refused" but *unknown* — saying otherwise would
