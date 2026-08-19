@@ -872,25 +872,26 @@ question in both directions:
   saying goodbye. That is not tenancy, it is teardown, and a live kernel target left attached is the
   expensive failure. Retiring the gate must not retire the sweep.
 - **For retiring it:** `2026-07-28` has no session id at all, so a stateless client never becomes
-  the holder — the gate is reasoning about an identifier its newest callers do not send. And the
+  the holder — the gate is reasoning about an identifier its newest callers do not send, and since
+  #168 it explicitly stands aside for them. And the
   contention it does catch is arguably the client's own business: a client that lost its session id
   (a crash, a restart) and re-`initialize`s inside the grace is told `409` and has to wait the grace
   out, where adopting its own sessions is what it wanted and what the identity now makes safe.
-- **And it actively costs that client concurrency**, which is no longer a prediction. A request
-  carrying no session id takes the *opening* path and holds a claim for its whole duration, so two
-  overlapping ones from the same credential contend: measured against a listener on the bench,
-  `409`s appear as soon as two stateless requests overlap. Every request of such a client is that
-  path, since there is never an id to carry. `server_log` while a pool walk runs — the workflow this
-  server documents for a wedged session — is exactly the overlap in question. The same measurement
-  turned up something larger and separate, filed as
-  [#168](https://github.com/glslang/windbg-mcp/issues/168): the listener answers a `2026-07-28`
-  handshake and then `400`s the request after it. Settle that first — if the newest revision is not
-  served at all, what its clients do to this gate is the second question.
+- **It used to cost that client concurrency, and the fix is a preview of the deletion.** A request
+  carrying no session id took the *opening* path and held a claim for its whole duration, so two
+  overlapping ones from the same credential contended — and every request of such a client is that
+  path, since there is never an id to carry. At its sharpest, a kernel attach whose target never
+  dialled in locked its own credential out of `session_status` and `end_session`, the two calls that
+  recover it. That was [#168](https://github.com/glslang/windbg-mcp/issues/168), and it is fixed by
+  *not reserving* for a request that can never become the holder — which is this item's argument
+  applied to the one case where it was unarguable. What remains is the same question for the cases
+  that are arguable: a legacy client's second `initialize`, and a resume inside the grace.
 
 **What would settle it:** decide whether idle release (`WINDBG_MCP_SESSION_IDLE_SECS`, added in
 [#164](https://github.com/glslang/windbg-mcp/pull/164)) already covers the teardown the lease is
 kept for. If it does, the gate can go and the sweep stays; if it does not, say why in
-`docs/remote-listener.md` and keep both.
+`docs/remote-listener.md` and keep both. Note the `releasing` refusal is *not* part of what would
+go: it is the sweep's, not the gate's, and a stateless request still waits on it.
 
 **Why deferred:** it is a deletion, and a deletion is the change most worth making on its own,
 against a PR that is not also adding the thing it would delete. Picks up at `src/listen.rs`

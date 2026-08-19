@@ -182,6 +182,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the x64 entry reads `mm_exploit_v5.exe` out of `SeAuditProcessCreationInfo`, which is a walk
   through `nt`'s types, and its run shows all four running rather than skipping.
 
+### Fixed
+
+- **A listener client on `2026-07-28` can use more than one request at a time**
+  ([#168](https://github.com/glslang/windbg-mcp/issues/168)). [SEP-2567] removed the MCP session id
+  from the revision current clients negotiate, and the listener's tenancy gate read the absence of
+  that id as "a client opening a session" — the one moment it reserves the server. On a revision
+  where the id never comes, that made *every* request a reservation: two that overlapped got a
+  `409`, and `server_log` while a pool walk ran — the workflow this server documents for a wedged
+  session — was exactly that overlap.
+
+  At its sharpest it cost the recovery path: a kernel attach whose target never dials in parks by
+  design, and a parked call held its reservation for as long as it parked, so the client could
+  reach neither `session_status` nor `end_session`. For that revision, a going-nowhere attach was
+  once again a reason to restart the server — the property
+  [#61](https://github.com/glslang/windbg-mcp/issues/61) established, quietly lost to a revision
+  rather than to a change.
+
+  The gate now distinguishes the two kinds of nothing: a request on a revision that mints no
+  session can never become the holder a reservation arbitrates, so it reserves nothing and is
+  served alongside its client's other work. What it still waits for is a teardown of its own
+  credential's expired sessions, which is the sweep's rule and not the gate's.
+
+  The same issue reported that the listener answered a `2026-07-28` handshake and then `400`d the
+  request after it. **It does not** — that was measured with a hand-rolled probe that sent the body
+  and none of the transport contract the revision adds, and the `400`s were the server enforcing
+  the spec. A request on this revision carries three things: the `MCP-Protocol-Version` header,
+  `params._meta` with `io.modelcontextprotocol/protocolVersion` and `…/clientCapabilities`
+  ([SEP-2567] moved them there when it removed the session that used to hold them), and SEP-2243's
+  `Mcp-Method` header naming the body's method. The smoke tier now drives the revision properly and
+  asserts both halves: a handshake and the calls after it are served, and each under-specified
+  shape is refused with a body naming the part that is missing.
+
+[SEP-2567]: https://modelcontextprotocol.io/seps/2567-sessionless-mcp
+
 ### Changed
 
 - **The last progress milestone is no longer dropped when it races the answer**

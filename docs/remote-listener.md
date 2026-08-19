@@ -235,13 +235,20 @@ for one credential: a fresh `initialize` while a session is held or being opened
 bearing an id that is not the one it holds. A request that arrives while another of the same
 credential's is still *opening* one is refused on the same grounds, which is why the body names both.
 
-**A client that sends no session id at all is the case to watch.** `2026-07-28` removed the session
-([SEP-2567]), so every one of its requests takes the opening path, and two that overlap contend with
-each other — measured on the bench, and recorded as `FOLLOWUPS.md` item 28, which is where the
-question of retiring this gate lives. Measuring it also turned up
-[#168](https://github.com/glslang/windbg-mcp/issues/168), which is the bigger question standing
-behind it: this listener answers a `2026-07-28` handshake and then refuses the request after it, so
-**use a client that negotiates a legacy revision until that is settled**.
+**A client that sends no session id at all contends with nothing.** `2026-07-28` removed the session
+([SEP-2567]), so such a client can never become the holder the gate arbitrates — and a request that
+cannot become one reserves nothing. It used to: every stateless request took the *opening* path, so
+any two that overlapped got a `409`, and a call that parked took its whole credential with it. That
+was [#168](https://github.com/glslang/windbg-mcp/issues/168), and it is fixed; the tier that pins it
+runs a `tools/list`, a `session_status` and an `end_session` alongside a kernel attach that never
+comes back.
+
+What is left of the gate for such a client is the teardown: a request arriving while its own expired
+sessions are being released still waits, because those sessions are being closed underneath it.
+Whether the rest of the gate earns its place is `FOLLOWUPS.md` item 28.
+
+Such a client also never installs a lease at all, which is why abandonment on this revision is the
+idle release's job rather than the grace's — see *A session nobody is using is released*, above.
 
 **One `409` means the opposite of the others**, and says so: after a lease runs out, the sessions are
 released in the background, and a request arriving during that cleanup is refused while the
