@@ -876,13 +876,10 @@ async fn gate(
         // unconditional version of this line told an operator a client had adopted sessions that
         // did not exist, on every ordinary reconnect.
         Settled::Kept { adopted: true } => {
-            match lease
-                .sessions
-                .snapshot()
-                .iter()
-                .filter(|s| s.state.is_live())
-                .count()
-            {
+            // Asked *for* this client rather than as it. The call's identity scope has closed by
+            // here, so anything reading the ambient one would count `local`'s sessions — nobody's,
+            // for a named client, which is the reconnect this line exists to describe.
+            match lease.sessions.live_count_for(&caller_for_lease) {
                 0 => tracing::info!(
                     "a client attached to a server the previous one had let go; nothing was open"
                 ),

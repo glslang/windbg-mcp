@@ -33,6 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     still report another client's activity.
   - **A lease expiry releases the sessions of the client whose lease ran out**, not every session.
     Before ownership those were the same set, because the gate served one client at a time.
+  - The rule for identity is **ambient inside a call, by name outside one**. A tool body reads the
+    caller from the task-local, which is who is asking; the listener's own diagnostics run after
+    that scope has closed and take the client as a parameter, so the one that reports an adoption on
+    reconnect counts the reconnecting client's sessions rather than `local`'s.
   - **The tenancy itself is per client**, so two clients no longer queue behind each other. The gate
     serialised the server when the registry was global and one client could end another's targets;
     keeping it shared would have meant one client's four-minute pool walk making every other client
