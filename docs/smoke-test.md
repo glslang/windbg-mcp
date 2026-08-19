@@ -414,7 +414,10 @@ reach is the wiring, which is what these assert against a real listener on a loo
 hand-written HTTP client (a library that normalised a `409` into an exception, or hid the session
 header, would be asserting on this server's behalf).
 
-Four of them need no debugger, because tenancy is decided before any session is opened:
+Four of them need no debugger, because tenancy is decided before any session is opened. All four
+run a listener holding a **single, unnamed** token, so what they prove they prove for the `local`
+client alone; the per-client rules are unit-tested where they are decided, and closing that
+end-to-end gap is [`FOLLOWUPS.md`](../FOLLOWUPS.md) item 29:
 
 - *It will not start without a token*, and says which variable is missing. The listener exposes
   every tool here, including the ones that write to a live kernel; a quiet default would be a
@@ -423,8 +426,10 @@ Four of them need no debugger, because tenancy is decided before any session is 
   nothing***. The last clause is the one worth a test: the bearer check runs before the tenancy
   gate, so a wrong token must not reserve or consume a claim — if it did, anything that could
   reach the port could lock the real client out without ever authenticating.
-- *A second client is refused with `409`*, whether it arrives with a fresh `initialize` or with a
-  session id that is not the holder's, and the holder is undisturbed by either.
+- *A second connection **from the same client** is refused with `409`*, whether it arrives with a
+  fresh `initialize` or with a session id that is not the holder's, and the holder is undisturbed by
+  either. Since 2026-08-19 the tenancy is per client, so this is one client racing itself — a
+  *different* client is served concurrently and shares nothing with this one.
 - *Going quiet is not leaving; saying goodbye is.* Every request is its own connection — which is
   what a client behind a tunnel looks like — so silence is the resting state, and a server that
   read it as departure would hand the registry on between two calls of a working client. A

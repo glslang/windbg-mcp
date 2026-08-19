@@ -233,8 +233,9 @@ target before exiting, because a live kernel that is merely killed is left froze
 **Bind loopback and forward over SSH.** This endpoint runs `execute`, `debug_batch` and `launch`
 against a live kernel, and the token is sent in clear — a hypervisor's guest network is not private
 when the machine being debugged shares it. [`docs/remote-listener.md`](./docs/remote-listener.md)
-covers the token, the session lease and its grace, why only one client is served at a time, and
-what a `409` means. For a one-off, [`docs/remote-phase0.md`](./docs/remote-phase0.md) does the same
+covers the tokens — **one per client**, each with its own sessions, so two people or two agents on
+one listener cannot reach each other's targets — the session lease and its grace, and what a `409`
+means (one client's second connection, not a second client). For a one-off, [`docs/remote-phase0.md`](./docs/remote-phase0.md) does the same
 job over plain `ssh` with no listener.
 
 ### As a Claude Code plugin

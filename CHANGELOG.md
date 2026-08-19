@@ -47,7 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     keeping it shared would have meant one client's four-minute pool walk making every other client
     wait for a boundary the registry now provides properly — namespaces that cannot be used
     concurrently. Two connections presenting the *same* token still contend, which is one client
-    racing itself.
+    racing itself — and the `409` says so, where it used to report a second client that no longer
+    exists as a category.
   - Under **stdio** everything runs as `local`, so one set of registry rules serves both transports
     rather than one rule and an exception.
   - **Every credential variable is stripped from the processes this server creates** — by prefix,

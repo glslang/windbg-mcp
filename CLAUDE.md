@@ -368,6 +368,38 @@ this repo believed for a while: Visual Studio Build Tools ships it, including an
 — because the first fetch takes minutes and everything around it times out, which reads convincingly
 as the parser having made things worse.
 
+## Several clients on one listener (`src/client.rs`)
+
+A `--listen` server holds **one bearer token per client**: `WINDBG_MCP_LISTEN_TOKEN_<NAME>` names
+one, the unnamed variable names `local`, and a configured `WINDBG_MCP_LISTEN_TOKEN_FILE` shuts the
+environment out entirely rather than merely outranking it. Under stdio everything runs as `local`,
+so there is one set of rules and no transport exception. `docs/remote-listener.md` is the operator's
+half; what follows is what bites while editing.
+
+**Identity is ambient inside a call and by name outside one.** `crate::client::current()` reads a
+task-local that `listen::serve_one` sets around the whole MCP call, which is why no tool signature
+carries a caller. Anything running *outside* that scope — the listener's own diagnostics, a sweep, a
+shutdown — gets the default `local` instead of an error, so it must take the client as a parameter
+(`Sessions::live_count_for` against `Sessions::snapshot`). The bug this rule is written from was a
+log line reporting `local`'s session count to a named client on reconnect.
+
+**A caller sees only its own sessions**, and that is not a fault to debug: routing, `session_status`,
+`server_log`, the four-session cap, closed-session history and lease release are all per client, and
+another client's handle is reported *unknown* rather than refused. Two tokens on one host are two
+namespaces — if a session "vanished", check which token the request carried.
+
+**Credentials are built from variables handed in, not read from the environment**
+(`Credentials::from_entries`), for the same reason as `kdconn::env_entries`: `set_var` is `unsafe` in
+edition 2024 and mutates state the whole test binary shares. And they are **stripped from every
+child process by prefix** (`client::strip_credentials`), so a token variable added later cannot
+quietly reach an engine worker or a `launch`ed debuggee — but a credential under a *different*
+prefix would need its own strip.
+
+Two collisions are refused at startup rather than resolved, because the winner would be a `HashMap`
+ordering detail: one token naming two clients, and two tokens naming one (names are folded, so
+`…_TOKEN` and `…_TOKEN_LOCAL` collide, as do `…_CI` and `…__CI`). **Neither refusal may quote a
+token** — they are printed to stderr and, under the service, to a log file.
+
 ## Recording a session while debugging this server
 
 `WINDBG_MCP_TRANSCRIPT=<path>` makes the supervisor write a JSONL record of every tool call, every

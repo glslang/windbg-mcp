@@ -868,10 +868,15 @@ async fn gate(
             return Ok(refuse(StatusCode::NOT_FOUND, "unknown session"));
         }
         Admission::Occupied => {
-            tracing::warn!("refused a second client from {peer}: this server is already held");
+            // Same client, second connection: tenancy is per client now, so this is never another
+            // client being turned away — and a message saying it was would send an operator
+            // looking for a colleague who is not there.
+            tracing::warn!(
+                "refused a second connection from {peer}: this client already holds a session here"
+            );
             return Ok(refuse(
                 StatusCode::CONFLICT,
-                "another client holds this server; it serves one at a time",
+                "this credential already holds a session here; one at a time per client",
             ));
         }
     };
