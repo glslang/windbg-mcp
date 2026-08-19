@@ -339,6 +339,10 @@ enum Admission {
     Serve(Admitted),
     /// Someone else holds the server, is taking it, or is being cleaned up after.
     Occupied,
+    /// The request carried an MCP session id **another client** minted. Reported to the caller as
+    /// unknown, for the reason the registry reports another client's handle that way: the answer
+    /// must not confirm a session the caller may not use.
+    NotYours,
 }
 
 /// A borrow of one client's tenancy, so the rules below read exactly as they did when there was
@@ -396,6 +400,18 @@ impl Lease {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Whether an MCP session id is held by some client other than this one.
+    ///
+    /// Only the *holder* counts. A departed client's id is closed in the MCP service by the
+    /// `DELETE` that departed, and one whose lease expired is closed by the sweep — so an id no
+    /// tenancy holds is already unusable, and treating it as owned would refuse a client its own
+    /// reconnect on the strength of a record nothing backs.
+    fn held_by_another(&self, caller: &crate::client::Client, session: &str) -> bool {
+        self.all_tenancies()
+            .iter()
+            .any(|(client, tenancy)| client != caller && tenancy.holder.as_deref() == Some(session))
+    }
+
     /// One client's tenancy, created empty on first use — a client that has never connected holds
     /// nothing, which is what a default `Tenancy` says.
     fn state_of(&self, client: &crate::client::Client) -> TenancyGuard<'_> {
@@ -413,6 +429,19 @@ impl Lease {
     /// session, which is the only moment tenancy is contested. Every decision is made under one
     /// lock, so the answer a request gets is the state it will be served against.
     fn admit(&self, client: &crate::client::Client, session: Option<&str>) -> Admission {
+        // **Before this client's own tenancy is consulted at all**, because the id may not be its
+        // to present. The MCP service keeps one session table for the server, so a client that
+        // comes by another's `Mcp-Session-Id` reaches that client's MCP session through it — the
+        // task-local only decides which *debug* sessions the tools then see. A `DELETE` on it is
+        // the sharp end: rmcp closes the session, while the lease that minted it still holds the
+        // id, so the client it belonged to fails every request and its re-`initialize` is refused
+        // for a whole grace period. That is one authenticated client denying another, which is
+        // exactly what ownership is here to stop.
+        if let Some(id) = session
+            && self.held_by_another(client, id)
+        {
+            return Admission::NotYours;
+        }
         let mut state = self.state_of(client);
         // Nothing is served while a teardown is in flight. Briefly refusing a client that could
         // have been served costs a reconnect; serving one costs it the session mid-call.
@@ -829,6 +858,15 @@ async fn gate(
 
     let admitted = match lease.admit(&caller, session.as_deref()) {
         Admission::Serve(admitted) => admitted,
+        // Not a refusal — an id this caller cannot have is an id this server does not have. The
+        // status is the one the spec already gives a session that has gone: a client holding a
+        // stale id of its own is told to start again, which is also the right advice here.
+        Admission::NotYours => {
+            tracing::warn!(
+                "refused a request from {peer} carrying an MCP session id another client holds"
+            );
+            return Ok(refuse(StatusCode::NOT_FOUND, "unknown session"));
+        }
         Admission::Occupied => {
             tracing::warn!("refused a second client from {peer}: this server is already held");
             return Ok(refuse(
@@ -1152,6 +1190,11 @@ mod tests {
         match admission {
             Admission::Serve(admitted) => admitted,
             Admission::Occupied => panic!("the gate refused a request this test needed served"),
+            Admission::NotYours => {
+                panic!(
+                    "the gate took a session id for another client's, which no test here sets up"
+                )
+            }
         }
     }
 
@@ -1583,6 +1626,63 @@ mod tests {
         assert!(
             matches!(lease.admit(&ci, None), Admission::Serve(_)),
             "another client must not wait on a tenancy that no longer bounds anything it can reach"
+        );
+    }
+
+    /// An MCP session id is one client's, and presenting another's is not a way in.
+    ///
+    /// The service keeps one session table for the whole server, so the id is the only thing
+    /// standing between a client and another's MCP session — and a `DELETE` on it closes that
+    /// session while the lease that minted it still holds the id, which leaves its owner failing
+    /// every request and refused its own re-`initialize` for a grace period. One authenticated
+    /// client denying another is the harm ownership exists to stop, so the gate refuses before
+    /// this caller's own tenancy is even consulted.
+    ///
+    /// One lease and two clients, deliberately: two `For` bindings would be two leases, which
+    /// cannot reach each other whatever the code does.
+    #[test]
+    fn one_clients_session_id_is_not_a_way_into_anothers() {
+        let lease = Lease::new(
+            longest_quiet_call(CALL) + Duration::from_secs(60),
+            CALL,
+            Sessions::new(CALL),
+        )
+        .expect("workable");
+        let laptop = crate::client::Client::new("laptop");
+        let ci = crate::client::Client::new("ci");
+
+        let held = admitted(lease.admit(&laptop, None));
+        lease.settle(
+            held.claim,
+            None,
+            Some("session-laptop"),
+            true,
+            laptop.clone(),
+        );
+
+        assert_eq!(
+            lease.admit(&ci, Some("session-laptop")),
+            Admission::NotYours,
+            "another client's session id was admitted, so its holder could be deleted out from \
+             under it"
+        );
+        // And the owner is unaffected — the check must not cost a client its own session.
+        assert!(
+            matches!(
+                lease.admit(&laptop, Some("session-laptop")),
+                Admission::Serve(_)
+            ),
+            "the holder must still be served its own id"
+        );
+        // An id nobody holds is not owned by anybody: a client resuming inside the grace has to
+        // get through, which is the arm this check sits in front of.
+        assert!(
+            matches!(
+                lease.admit(&ci, Some("session-nobodys")),
+                Admission::Serve(_)
+            ),
+            "an id no tenancy holds is unusable in the service anyway, and refusing it would \
+             refuse a legitimate resume"
         );
     }
 

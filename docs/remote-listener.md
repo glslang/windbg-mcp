@@ -212,6 +212,7 @@ What ownership buys, and it is the whole of it:
 | History | a closed session ages out of `session_status` on its **own** client's churn, not the server's |
 | The log | `server_log` shows the caller's sessions' records, plus the supervisor's own, which name no session — and the buffer counts it reports are over the records that caller can read |
 | Lease expiry | releases the sessions of the client whose lease ran out, and no others |
+| Session ids | an `Mcp-Session-Id` another client holds is reported **unknown**, before this caller's own tenancy is consulted |
 | Contention | **within** a client only — one client's long call does not make another wait |
 
 **Why authentication is the identity.** `2026-07-28` removed the protocol-level MCP session
