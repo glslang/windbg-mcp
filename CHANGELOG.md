@@ -46,9 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     serialised the server when the registry was global and one client could end another's targets;
     keeping it shared would have meant one client's four-minute pool walk making every other client
     wait for a boundary the registry now provides properly — namespaces that cannot be used
-    concurrently. Two connections presenting the *same* token still contend, which is one client
+    concurrently. A second *MCP session* for the same token still contends, which is one credential
     racing itself — and the `409` says so, where it used to report a second client that no longer
-    exists as a category.
+    exists as a category. Further requests carrying a session it already holds are not contention at
+    all and never were: they are served concurrently, which is what lets a `DELETE` arrive while a
+    tool call is still running.
   - Under **stdio** everything runs as `local`, so one set of registry rules serves both transports
     rather than one rule and an exception.
   - **Every credential variable is stripped from the processes this server creates** — by prefix,

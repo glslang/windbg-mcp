@@ -868,15 +868,19 @@ async fn gate(
             return Ok(refuse(StatusCode::NOT_FOUND, "unknown session"));
         }
         Admission::Occupied => {
-            // Same client, second connection: tenancy is per client now, so this is never another
-            // client being turned away — and a message saying it was would send an operator
-            // looking for a colleague who is not there.
+            // Never another client — tenancy is per client now — and never a *connection* either:
+            // requests carrying the session this credential holds are served concurrently, which
+            // is how a `DELETE` arrives on one while a tool call runs on another. What is refused
+            // is a second **MCP session** for the same credential: a fresh `initialize` while one
+            // is held or being opened, or a request bearing an id that is not the one it holds.
+            // Saying "another client" would send an operator looking for a colleague who is not
+            // there, and saying "connection" for one who has a network problem they do not have.
             tracing::warn!(
-                "refused a second connection from {peer}: this client already holds a session here"
+                "refused a request from {peer}: this credential already holds a session here"
             );
             return Ok(refuse(
                 StatusCode::CONFLICT,
-                "this credential already holds a session here; one at a time per client",
+                "this credential already holds a session here, or is opening one;                  one MCP session per credential at a time",
             ));
         }
     };
@@ -1624,7 +1628,7 @@ mod tests {
         assert_eq!(
             lease.admit(&laptop, None),
             Admission::Occupied,
-            "a second connection from the same client still contends"
+            "a second session for the same credential still contends"
         );
 
         // Across clients, on the same lease, it is not.

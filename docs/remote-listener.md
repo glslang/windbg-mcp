@@ -222,11 +222,17 @@ requests. The credential is what is left, and it is what every other stateless H
 a client presents for itself would be a label; a name only the holder of a token can present is a
 boundary.
 
-**Two clients do not queue behind each other.** The lease still arbitrates *within* a client — two
-connections presenting the same token contend, and the second gets a `409` — because that is one
-client racing itself. Across clients there is nothing to arbitrate: a pool walk that keeps one
-client busy for four minutes used to make every other client wait, for a boundary the registry now
-provides properly.
+**Two clients do not queue behind each other.** The lease still arbitrates *within* a client — a
+second **MCP session** for one token contends, and gets a `409` — because that is one credential
+racing itself. Across clients there is nothing to arbitrate: a pool walk that keeps one client busy
+for four minutes used to make every other client wait, for a boundary the registry now provides
+properly.
+
+A `409` is never about *connections*. Requests carrying the session a credential already holds are
+served concurrently, which is what lets a `DELETE` arrive on one connection while a tool call runs
+on another — the topology every streamable-HTTP client uses. What it refuses is a fresh
+`initialize` while a session is held or being opened, or a request bearing an id that is not the one
+this credential holds.
 
 **This does not authorise anything beyond separation.** Every client that can authenticate has the
 whole tool surface, including `execute` and `launch`. Tokens separate clients from each other; they
