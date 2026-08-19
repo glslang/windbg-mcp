@@ -860,17 +860,22 @@ became per client in the same change, because a shared one would have made names
 concurrently — one client's pool walk stalling every other client for a boundary the registry
 already provides.
 
-**So what is left for it to arbitrate is one client racing itself**: two connections presenting the
-same token, where the second gets a `409`. The question this item is for is whether that is worth a
-gate — and it is a real question in both directions:
+**So what is left for it to arbitrate is one credential racing itself**: a second *MCP session* for
+one token — a fresh `initialize` while one is held or being opened, or a request bearing an id that
+is not the one it holds — which gets a `409`. Note what that is *not*: further requests carrying the
+session a credential already holds are served concurrently, `in_flight` and all, because that is how
+a `DELETE` arrives on one connection while a tool call runs on another. Connections were never the
+unit. The question this item is for is whether what remains is worth a gate, and it is a real
+question in both directions:
 
 - **For keeping it:** the lease is also what *releases* sessions when a client goes away without
   saying goodbye. That is not tenancy, it is teardown, and a live kernel target left attached is the
   expensive failure. Retiring the gate must not retire the sweep.
-- **For retiring it:** a client legitimately has more than one connection in flight — that is how
-  streamable HTTP works — and every `409` it earns is a reconnect the protocol did not ask for.
-  `2026-07-28` has no session id at all, so a stateless client cannot even become the holder; the
-  gate is reasoning about an identifier its newest callers do not send.
+- **For retiring it:** `2026-07-28` has no session id at all, so a stateless client never becomes
+  the holder — the gate is reasoning about an identifier its newest callers do not send. And the
+  contention it does catch is arguably the client's own business: a client that lost its session id
+  (a crash, a restart) and re-`initialize`s inside the grace is told `409` and has to wait the grace
+  out, where adopting its own sessions is what it wanted and what the identity now makes safe.
 
 **What would settle it:** decide whether idle release (`WINDBG_MCP_SESSION_IDLE_SECS`, added in
 [#164](https://github.com/glslang/windbg-mcp/pull/164)) already covers the teardown the lease is
