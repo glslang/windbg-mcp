@@ -55,6 +55,7 @@ use hyper::header::AUTHORIZATION;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
+use rmcp::model::ProtocolVersion;
 use rmcp::transport::streamable_http_server::SessionManager;
 use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
 use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
@@ -170,6 +171,38 @@ const IDLE_ENV: &str = "WINDBG_MCP_SESSION_IDLE_SECS";
 
 /// The header carrying a client's MCP session, which is what identifies the holder.
 const SESSION_HEADER: &str = "Mcp-Session-Id";
+
+/// The header naming the revision a request is on.
+///
+/// `2026-07-28` carries in every request what the handshake used to settle once, and this is the
+/// part of that the gate needs: whether a session id is coming.
+const PROTOCOL_HEADER: &str = "MCP-Protocol-Version";
+
+/// Whether this request is on a revision that mints no `Mcp-Session-Id`.
+///
+/// Read from a header because the gate never parses a body — it hands the request to rmcp intact,
+/// and buffering it here to look would be a copy of every tool call's arguments for one bit.
+///
+/// **Matched against the revisions rmcp knows, rather than compared as a string.** The comparison
+/// is lexicographic and that is correct for revisions, which are ISO dates — but a header that is
+/// not a revision at all (`draft`) sorts above every date, and would be read as newer than the
+/// newest thing there is. Anything unrecognised is treated as a revision that has sessions, which
+/// is the answer that costs a wrong guess least: it reserves, as this gate always did.
+///
+/// An `initialize` may legitimately arrive without this header — it is the request that establishes
+/// the revision — so a stateless client's *first* request still reserves. That costs nothing: it
+/// mints no session, so [`Lease::settle`] gives the reservation straight back.
+fn mints_no_session(headers: &hyper::HeaderMap) -> bool {
+    headers
+        .get(PROTOCOL_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| {
+            ProtocolVersion::KNOWN_VERSIONS
+                .iter()
+                .find(|known| known.as_str() == value)
+        })
+        .is_some_and(|version| *version >= ProtocolVersion::V_2026_07_28)
+}
 
 /// Whether this process was asked to listen, and where.
 pub fn requested(args: &[String]) -> Option<Result<SocketAddr>> {
@@ -332,6 +365,25 @@ struct Admitted {
     epoch: u64,
 }
 
+/// What a request presents to the gate, which is all tenancy is decided from.
+///
+/// Three cases rather than `Option<&str>`, because the absence of a session id stopped meaning one
+/// thing. It used to mean "a client opening a session"; since [SEP-2567] removed the session from
+/// `2026-07-28` it also means "a client that will never have one", and those two want opposite
+/// answers — the first is the only moment tenancy is contested, and the second contests nothing.
+///
+/// [SEP-2567]: https://modelcontextprotocol.io/seps/2567-sessionless-mcp
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Arriving<'a> {
+    /// An `Mcp-Session-Id` the client is presenting.
+    Holding(&'a str),
+    /// No session id, on a revision that mints them: an `initialize`, or a client resuming inside
+    /// the grace.
+    Opening,
+    /// No session id, and none is coming.
+    Stateless,
+}
+
 /// What the tenancy gate decided about one request.
 #[derive(Debug, PartialEq, Eq)]
 enum Admission {
@@ -429,10 +481,10 @@ impl Lease {
 
     /// Decides whether a request may be served, **reserving** the server when one is taking it.
     ///
-    /// `session` is the request's `Mcp-Session-Id`; its absence means a client opening a new
-    /// session, which is the only moment tenancy is contested. Every decision is made under one
-    /// lock, so the answer a request gets is the state it will be served against.
-    fn admit(&self, client: &crate::client::Client, session: Option<&str>) -> Admission {
+    /// What the request presents is an [`Arriving`]: the `Mcp-Session-Id` it carries, or which kind
+    /// of nothing it carries instead. Every decision is made under one lock, so the answer a
+    /// request gets is the state it will be served against.
+    fn admit(&self, client: &crate::client::Client, arriving: Arriving<'_>) -> Admission {
         // **Before this client's own tenancy is consulted at all**, because the id may not be its
         // to present. The MCP service keeps one session table for the server, so a client that
         // comes by another's `Mcp-Session-Id` reaches that client's MCP session through it — the
@@ -441,7 +493,7 @@ impl Lease {
         // id, so the client it belonged to fails every request and its re-`initialize` is refused
         // for a whole grace period. That is one authenticated client denying another, which is
         // exactly what ownership is here to stop.
-        if let Some(id) = session
+        if let Arriving::Holding(id) = arriving
             && self.held_by_another(client, id)
         {
             return Admission::NotYours;
@@ -455,9 +507,25 @@ impl Lease {
         if state.releasing {
             return Admission::Releasing;
         }
-        match (session, state.holder.as_deref()) {
+        // **Nothing to reserve.** The claim exists so that two requests cannot both become the
+        // holder; a request that will never mint a session cannot become one, so reserving against
+        // it refuses work for a contest that is not happening. It was refusing rather a lot of it:
+        // on `2026-07-28` *every* request takes this path, so any two that overlapped contended,
+        // and a call that parks — a kernel attach whose target never dials in — locked the
+        // credential out of `session_status` and `end_session`, which are the two things that
+        // recover it ([#168](https://github.com/glslang/windbg-mcp/issues/168)).
+        //
+        // Counted in-flight all the same: a goodbye still has to wait for the work admitted here.
+        if matches!(arriving, Arriving::Stateless) {
+            state.in_flight += 1;
+            return Admission::Serve(Admitted {
+                claim: None,
+                epoch: state.epoch,
+            });
+        }
+        match (arriving, state.holder.as_deref()) {
             // The holder, still talking.
-            (Some(id), Some(held)) if id == held => {
+            (Arriving::Holding(id), Some(held)) if id == held => {
                 state.deadline = Some(Instant::now() + self.grace);
                 state.in_flight += 1;
                 Admission::Serve(Admitted {
@@ -467,14 +535,14 @@ impl Lease {
             }
             // A session id belonging to someone else. This is the arm that made the race above
             // persist rather than pass: serving it leaves both clients working.
-            (Some(_), Some(_)) => Admission::Occupied,
+            (Arriving::Holding(_), Some(_)) => Admission::Occupied,
             // A session id with nobody holding the server — a client resuming what it left inside
             // the grace. Reserved like an `initialize`, because it is the same contest: a lease
             // expiry leaves the old session id valid in the service, so a resume can race a fresh
             // client and both would pass a gate that only served them. The holder is still not
             // taken until `settle` hears the session was real, or a stale id would lock the server
             // out for a whole grace period.
-            (Some(_), None) if state.claim.is_none() => {
+            (Arriving::Holding(_), None) if state.claim.is_none() => {
                 state.in_flight += 1;
                 let epoch = state.epoch;
                 Admission::Serve(Admitted {
@@ -484,7 +552,7 @@ impl Lease {
             }
             // A new client, and nobody attached or attaching: it reserves the server here, and
             // inherits whatever the last one left open.
-            (None, None) if state.claim.is_none() => {
+            (Arriving::Opening, None) if state.claim.is_none() => {
                 state.in_flight += 1;
                 let epoch = state.epoch;
                 Admission::Serve(Admitted {
@@ -863,7 +931,13 @@ async fn gate(
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
 
-    let admitted = match lease.admit(&caller, session.as_deref()) {
+    let arriving = match session.as_deref() {
+        Some(id) => Arriving::Holding(id),
+        None if mints_no_session(req.headers()) => Arriving::Stateless,
+        None => Arriving::Opening,
+    };
+
+    let admitted = match lease.admit(&caller, arriving) {
         Admission::Serve(admitted) => admitted,
         // Not a refusal — an id this caller cannot have is an id this server does not have. The
         // status is the one the spec already gives a session that has gone: a client holding a
@@ -1101,7 +1175,18 @@ mod tests {
         }
 
         fn admit(&self, session: Option<&str>) -> Admission {
-            self.lease.admit(&self.client, session)
+            self.lease.admit(
+                &self.client,
+                match session {
+                    Some(id) => Arriving::Holding(id),
+                    None => Arriving::Opening,
+                },
+            )
+        }
+
+        /// A request on the revision that has no session id to present.
+        fn admit_stateless(&self) -> Admission {
+            self.lease.admit(&self.client, Arriving::Stateless)
         }
 
         fn settle(
@@ -1639,7 +1724,7 @@ mod tests {
         let ci = crate::client::Client::new("ci");
 
         // `laptop` takes its tenancy and holds it — the long-call case.
-        let held = admitted(lease.admit(&laptop, None));
+        let held = admitted(lease.admit(&laptop, Arriving::Opening));
         lease.settle(
             held.claim,
             None,
@@ -1651,15 +1736,96 @@ mod tests {
         // Within that client, a second `initialize` is still refused: that contention is real, and
         // it is the one the claim machinery exists to arbitrate.
         assert_eq!(
-            lease.admit(&laptop, None),
+            lease.admit(&laptop, Arriving::Opening),
             Admission::Occupied,
             "a second session for the same credential still contends"
         );
 
         // Across clients, on the same lease, it is not.
         assert!(
-            matches!(lease.admit(&ci, None), Admission::Serve(_)),
+            matches!(lease.admit(&ci, Arriving::Opening), Admission::Serve(_)),
             "another client must not wait on a tenancy that no longer bounds anything it can reach"
+        );
+    }
+
+    /// A revision with no session id is not a client opening one, and the gate must not treat it
+    /// as one.
+    ///
+    /// The `2026-07-28` half of [#168](https://github.com/glslang/windbg-mcp/issues/168). Before
+    /// [`Arriving`] existed there was one "no session id" case and it meant *opening*, so it
+    /// reserved — which on a revision that never sends an id made every request a reservation, and
+    /// every overlapping pair a `409`. Two things are asserted, and the second is the one that
+    /// bites: they overlap, and they keep overlapping while one of them never finishes.
+    #[test]
+    fn stateless_requests_do_not_contend_with_each_other() {
+        let lease = lease();
+
+        let first = admitted(lease.admit_stateless());
+        assert_eq!(
+            first.claim, None,
+            "a request that cannot become the holder must reserve nothing"
+        );
+        let second = admitted(lease.admit_stateless());
+        assert_eq!(second.claim, None);
+
+        // The parked case: the first never returns, and the client still has to be able to ask what
+        // is going on and end it.
+        assert!(
+            matches!(lease.admit_stateless(), Admission::Serve(_)),
+            "a call that never comes back must not lock its own credential out"
+        );
+
+        lease.leave(first.epoch);
+        lease.leave(second.epoch);
+    }
+
+    /// Serving them alongside each other does not make them a tenancy.
+    ///
+    /// A stateless request settles nothing and holds nothing, so no lease is ever installed for a
+    /// client that only sends them — which is deliberate, and why abandonment on this revision is
+    /// [`IDLE_RELEASE`]'s to catch rather than the lease's. What must not happen is the middle
+    /// state: a holder recorded for a session that does not exist, which nothing would ever sweep.
+    #[test]
+    fn a_stateless_request_becomes_nobodys_tenancy() {
+        let lease = lease();
+
+        let it = admitted(lease.admit_stateless());
+        assert!(!adopted(lease.settle(it.claim, None, None, true)));
+        lease.leave(it.epoch);
+
+        assert!(
+            lease.expired().is_none(),
+            "a client that holds nothing has no lease to run out"
+        );
+        // And an ordinary opener is still free to take the tenancy afterwards.
+        assert!(
+            matches!(lease.admit(None), Admission::Serve(_)),
+            "a stateless request must leave the server takeable"
+        );
+    }
+
+    /// A teardown still stops one, because what is being released is the sessions behind it.
+    ///
+    /// The claim is what a stateless request stops taking; the `releasing` check is not, and the
+    /// distinction matters: a request admitted mid-teardown reaches a registry whose sessions are
+    /// being closed underneath it.
+    #[test]
+    fn a_stateless_request_waits_for_a_teardown_like_any_other() {
+        let lease = brief();
+        let claim = admitted(lease.admit(None));
+        lease.settle(claim.claim, None, Some("session-a"), true);
+        std::thread::sleep(Duration::from_millis(5));
+
+        assert!(lease.expired().is_some(), "the grace is spent");
+        assert!(
+            matches!(lease.admit_stateless(), Admission::Releasing),
+            "a stateless request must not be let in to sessions that are being closed"
+        );
+
+        lease.released_leases();
+        assert!(
+            matches!(lease.admit_stateless(), Admission::Serve(_)),
+            "and must be served the moment the teardown is done"
         );
     }
 
@@ -1685,7 +1851,7 @@ mod tests {
         let laptop = crate::client::Client::new("laptop");
         let ci = crate::client::Client::new("ci");
 
-        let held = admitted(lease.admit(&laptop, None));
+        let held = admitted(lease.admit(&laptop, Arriving::Opening));
         lease.settle(
             held.claim,
             None,
@@ -1695,7 +1861,7 @@ mod tests {
         );
 
         assert_eq!(
-            lease.admit(&ci, Some("session-laptop")),
+            lease.admit(&ci, Arriving::Holding("session-laptop")),
             Admission::NotYours,
             "another client's session id was admitted, so its holder could be deleted out from \
              under it"
@@ -1703,7 +1869,7 @@ mod tests {
         // And the owner is unaffected — the check must not cost a client its own session.
         assert!(
             matches!(
-                lease.admit(&laptop, Some("session-laptop")),
+                lease.admit(&laptop, Arriving::Holding("session-laptop")),
                 Admission::Serve(_)
             ),
             "the holder must still be served its own id"
@@ -1712,7 +1878,7 @@ mod tests {
         // get through, which is the arm this check sits in front of.
         assert!(
             matches!(
-                lease.admit(&ci, Some("session-nobodys")),
+                lease.admit(&ci, Arriving::Holding("session-nobodys")),
                 Admission::Serve(_)
             ),
             "an id no tenancy holds is unusable in the service anyway, and refusing it would \
