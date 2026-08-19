@@ -2803,7 +2803,7 @@ fn a_second_session_for_one_credential_is_refused_while_it_holds_the_server() {
         intruder.body
     );
     assert!(
-        intruder.body.contains("one MCP session per credential"),
+        intruder.body.contains("already using this server"),
         "the refusal has to say why, or it reads as a bug: {}",
         intruder.body
     );
