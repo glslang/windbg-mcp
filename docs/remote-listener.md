@@ -238,7 +238,10 @@ credential's is still *opening* one is refused on the same grounds, which is why
 **A client that sends no session id at all is the case to watch.** `2026-07-28` removed the session
 ([SEP-2567]), so every one of its requests takes the opening path, and two that overlap contend with
 each other — measured on the bench, and recorded as `FOLLOWUPS.md` item 28, which is where the
-question of retiring this gate lives.
+question of retiring this gate lives. Measuring it also turned up
+[#168](https://github.com/glslang/windbg-mcp/issues/168), which is the bigger question standing
+behind it: this listener answers a `2026-07-28` handshake and then refuses the request after it, so
+**use a client that negotiates a legacy revision until that is settled**.
 
 **One `409` means the opposite of the others**, and says so: after a lease runs out, the sessions are
 released in the background, and a request arriving during that cleanup is refused while the

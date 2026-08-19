@@ -881,7 +881,11 @@ question in both directions:
   overlapping ones from the same credential contend: measured against a listener on the bench,
   `409`s appear as soon as two stateless requests overlap. Every request of such a client is that
   path, since there is never an id to carry. `server_log` while a pool walk runs — the workflow this
-  server documents for a wedged session — is exactly the overlap in question.
+  server documents for a wedged session — is exactly the overlap in question. The same measurement
+  turned up something larger and separate, filed as
+  [#168](https://github.com/glslang/windbg-mcp/issues/168): the listener answers a `2026-07-28`
+  handshake and then `400`s the request after it. Settle that first — if the newest revision is not
+  served at all, what its clients do to this gate is the second question.
 
 **What would settle it:** decide whether idle release (`WINDBG_MCP_SESSION_IDLE_SECS`, added in
 [#164](https://github.com/glslang/windbg-mcp/pull/164)) already covers the teardown the lease is
