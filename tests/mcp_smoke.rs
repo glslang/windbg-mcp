@@ -14,10 +14,12 @@
 //!
 //! * **Protocol** (default) — spawns the server, speaks JSON-RPC. No debugger target, no
 //!   symbols, no network. This tier also drives the **listener** (`--listen`) over real HTTP on a
-//!   loopback port: the bearer check, the `409` that keeps a credential to one MCP session,
-//!   and the difference between a client going quiet and a client saying goodbye. Those need no
-//!   debugger, because the lease is decided before any session is opened — but the sweep meeting a
-//!   real engine worker does, so that half lives in the tier below.
+//!   loopback port: the bearer check, the `409` that keeps a credential to one MCP session, the
+//!   difference between a client going quiet and a client saying goodbye, and `2026-07-28` —
+//!   which has none of those, having removed the session id, and is therefore the revision that
+//!   proves the gate stands aside rather than merely arbitrating well. Those need no debugger,
+//!   because the lease is decided before any session is opened — but the sweep meeting a real
+//!   engine worker does, so that half lives in the tier below.
 //! * **Target** (`WINDBG_MCP_SMOKE_DUMP=1`) — opens the sample crash dump through DbgEng, so
 //!   it needs `dbgeng.dll` and may reach a symbol server. Off by default; this is the tier
 //!   that catches a `win-kexp` regression. It also runs a `debug_batch` to both outcomes, and
@@ -2300,6 +2302,16 @@ fn a_call_that_asked_for_no_progress_is_sent_none() {
 /// Tenancy is keyed on `Mcp-Session-Id`, so this has to be a revision whose handshake mints one.
 const LEASE_REVISION: &str = "2025-06-18";
 
+/// The revision that removed the session id, and therefore the lease's grip on a client.
+///
+/// [SEP-2567] made `2026-07-28` stateless: the handshake mints no `Mcp-Session-Id`, so a client on
+/// this revision never becomes a holder and never sends an id back. It is also the revision current
+/// clients negotiate, which is why "answered the handshake and then refused everything after it"
+/// was worth a tier of its own.
+///
+/// [SEP-2567]: https://modelcontextprotocol.io/seps/2567-sessionless-mcp
+const STATELESS_REVISION: &str = "2026-07-28";
+
 /// A free loopback port, taken by binding and letting go.
 ///
 /// Racy in principle and not in practice: the window is microseconds, tests each take their own,
@@ -2453,6 +2465,23 @@ impl Listener {
         session: Option<&str>,
         body: Option<&Value>,
     ) -> Reply {
+        self.send_with(method, token, session, body, &[])
+    }
+
+    /// [`Self::send`], plus headers the caller names.
+    ///
+    /// Only `2026-07-28` needs this, and it needs it twice over: that revision carries the
+    /// negotiated protocol in a header on *every* request rather than in a handshake, and SEP-2243
+    /// has each request name its own method in one too. Both are transport-level, so neither is
+    /// expressible in the JSON-RPC body the other helpers build.
+    fn send_with(
+        &self,
+        method: &str,
+        token: Option<&str>,
+        session: Option<&str>,
+        body: Option<&Value>,
+        extra: &[(&str, &str)],
+    ) -> Reply {
         use std::io::Read;
 
         let mut stream = std::net::TcpStream::connect(&self.addr)
@@ -2472,6 +2501,9 @@ impl Listener {
         }
         if let Some(session) = session {
             request.push_str(&format!("Mcp-Session-Id: {session}\r\n"));
+        }
+        for (name, value) in extra {
+            request.push_str(&format!("{name}: {value}\r\n"));
         }
         match body.map(|b| b.to_string()) {
             Some(body) => {
@@ -2506,6 +2538,81 @@ impl Listener {
             "capabilities": {},
             "clientInfo": { "name": "windbg-mcp-lease-smoke", "version": "1" },
         })
+    }
+
+    /// One `2026-07-28` request, spelled the way that revision requires.
+    ///
+    /// Three things travel with a stateless request, and the server rejects it if any is absent —
+    /// which is the whole of [#168](https://github.com/glslang/windbg-mcp/issues/168):
+    ///
+    /// - the `MCP-Protocol-Version` header, since there is no handshake left to remember what was
+    ///   negotiated;
+    /// - `params._meta` carrying `io.modelcontextprotocol/protocolVersion` and
+    ///   `…/clientCapabilities`, which SEP-2567 moved into every request when it removed the
+    ///   session that used to hold them;
+    /// - SEP-2243's `Mcp-Method` header, naming the body's method to whatever is between the two
+    ///   machines without it having to parse the body — and, where the method addresses something
+    ///   by name, an `Mcp-Name` beside it.
+    ///
+    /// `initialize` is exempt from the latter two — it is the request that establishes them.
+    fn stateless(&mut self, method: &str, params: Value) -> Reply {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.stateless_at(id, method, params)
+    }
+
+    /// [`Self::stateless`] with the request id named rather than counted.
+    ///
+    /// Immutable, which is the whole reason it is separate: a request that has to run *alongside*
+    /// another cannot be sent through a `&mut self` borrow, and overlap is what the stateless
+    /// revision makes ordinary.
+    fn stateless_at(&self, id: i64, method: &str, mut params: Value) -> Reply {
+        params["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion": STATELESS_REVISION,
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        let name = params["name"].as_str().map(str::to_owned);
+        let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        let mut headers = vec![
+            ("MCP-Protocol-Version", STATELESS_REVISION),
+            ("Mcp-Method", method),
+        ];
+        if let Some(name) = name.as_deref() {
+            headers.push(("Mcp-Name", name));
+        }
+        self.send_with(
+            "POST",
+            Some(&self.token.clone()),
+            None,
+            Some(&body),
+            &headers,
+        )
+    }
+
+    /// The `2026-07-28` handshake, which mints nothing and is therefore not a session.
+    ///
+    /// Sent for the same reason a stateless client sends it: to learn what the server is. Nothing
+    /// afterwards depends on it having happened, which is the property being asserted.
+    fn stateless_opening(&mut self) -> Reply {
+        let id = self.next_id;
+        self.next_id += 1;
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": STATELESS_REVISION,
+                "capabilities": {},
+                "clientInfo": { "name": "windbg-mcp-stateless-smoke", "version": "1" },
+            },
+        });
+        self.send_with(
+            "POST",
+            Some(&self.token.clone()),
+            None,
+            Some(&body),
+            &[("MCP-Protocol-Version", STATELESS_REVISION)],
+        )
     }
 
     /// The handshake, answering with the session id the lease keys tenancy on.
@@ -2824,6 +2931,263 @@ fn a_second_session_for_one_credential_is_refused_while_it_holds_the_server() {
     // And the holder is undisturbed by either.
     let status = server.tool(&holder, "session_status", json!({}));
     assert_eq!(status["status"], "ok", "{status}");
+}
+
+/// The listener serves `2026-07-28` — the handshake *and* everything after it.
+///
+/// [#168](https://github.com/glslang/windbg-mcp/issues/168) reported the opposite: the handshake
+/// answered `200` and the next request `400`, which would leave `--listen` usable only by clients
+/// negotiating a legacy revision while advertising the newest one. It was measured with a
+/// hand-rolled probe that sent the body and none of the transport contract that revision adds, so
+/// what it found was the server enforcing the spec rather than failing to implement it. This is the
+/// same sequence, spelled the way the revision requires — and it is the reason
+/// [`Listener::stateless`] carries three things instead of one.
+#[test]
+fn the_listener_serves_the_stateless_revision_it_negotiates() {
+    let mut server = Listener::start(&[]);
+
+    let opening = server.stateless_opening();
+    assert_eq!(
+        opening.status,
+        200,
+        "the {STATELESS_REVISION} handshake was refused ({}): {}\n--- stderr ---\n{}",
+        opening.status,
+        opening.body,
+        server.stderr()
+    );
+    assert_eq!(
+        opening.result("initialize")["protocolVersion"],
+        json!(STATELESS_REVISION),
+        "the handshake must negotiate the revision it was offered: {}",
+        opening.body
+    );
+    // SEP-2567 removed the session id, so there is nothing here for the lease to key tenancy on.
+    // Asserted rather than assumed: every rule the gate has is written in terms of this header,
+    // and its absence is what makes the rest of this test a different client to the ones above.
+    assert!(
+        opening.session.is_none(),
+        "{STATELESS_REVISION} must mint no Mcp-Session-Id: {}",
+        opening.body
+    );
+
+    // The request the issue said was refused.
+    let listed = server.stateless("tools/list", json!({}));
+    assert_eq!(
+        listed.status,
+        200,
+        "tools/list on {STATELESS_REVISION} was refused ({}): {}\n--- stderr ---\n{}",
+        listed.status,
+        listed.body,
+        server.stderr()
+    );
+    let tools = listed.result("tools/list")["tools"].clone();
+    assert!(
+        tools.as_array().is_some_and(|t| !t.is_empty()),
+        "a served tools/list has tools in it: {}",
+        listed.body
+    );
+
+    // And a call, not only a listing: `tools/call` is the method that carries an `Mcp-Name` beside
+    // its `Mcp-Method`, so it exercises a rule `tools/list` cannot reach.
+    let called = server.stateless(
+        "tools/call",
+        json!({ "name": "session_status", "arguments": {} }),
+    );
+    assert_eq!(
+        called.status,
+        200,
+        "a stateless tools/call was refused ({}): {}\n--- stderr ---\n{}",
+        called.status,
+        called.body,
+        server.stderr()
+    );
+    assert_eq!(
+        called.result("tools/call")["structuredContent"]["status"],
+        json!("ok"),
+        "a stateless tools/call must answer like any other: {}",
+        called.body
+    );
+}
+
+/// A stateless request missing part of its contract is refused **and told which part**.
+///
+/// This is the other half of [#168](https://github.com/glslang/windbg-mcp/issues/168): the two
+/// shapes the probe sent, pinned so the same `400` cannot be read as a broken listener a second
+/// time. Both bodies are JSON-RPC errors naming the missing piece — the probe reported them as
+/// empty because `Invoke-WebRequest` throws on a 4xx and leaves the body on the exception, not
+/// because the server sent nothing.
+#[test]
+fn an_under_specified_stateless_request_is_told_which_part_it_is_missing() {
+    let mut server = Listener::start(&[]);
+    let token = server.token.clone();
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/list",
+        "params": {},
+    });
+
+    // The revision in the header and nothing else: SEP-2567 moved the negotiated protocol and the
+    // client's capabilities into every request's `_meta`, and this one has neither.
+    let bare = server.send_with(
+        "POST",
+        Some(&token),
+        None,
+        Some(&body),
+        &[("MCP-Protocol-Version", STATELESS_REVISION)],
+    );
+    assert_eq!(
+        bare.status, 400,
+        "a request with no _meta was served: {}",
+        bare.body
+    );
+    assert!(
+        bare.body
+            .contains("io.modelcontextprotocol/protocolVersion")
+            && bare
+                .body
+                .contains("io.modelcontextprotocol/clientCapabilities"),
+        "the refusal has to name the keys it wanted: {}",
+        bare.body
+    );
+
+    // `_meta` supplied, and still short one thing: SEP-2243 has every request name its own method
+    // in a header. This is the shape the issue's probe sent, and the one that made it look like
+    // the metadata was not the problem.
+    let mut with_meta = body.clone();
+    with_meta["params"]["_meta"] = json!({
+        "io.modelcontextprotocol/protocolVersion": STATELESS_REVISION,
+        "io.modelcontextprotocol/clientCapabilities": {},
+    });
+    let unheaded = server.send_with(
+        "POST",
+        Some(&token),
+        None,
+        Some(&with_meta),
+        &[("MCP-Protocol-Version", STATELESS_REVISION)],
+    );
+    assert_eq!(
+        unheaded.status, 400,
+        "a request with no Mcp-Method header was served: {}",
+        unheaded.body
+    );
+    assert!(
+        unheaded.body.contains("Mcp-Method"),
+        "the refusal has to name the header it wanted: {}",
+        unheaded.body
+    );
+
+    // And the server is undamaged by either — a refusal at this layer must not consume a claim,
+    // for the same reason the unauthenticated one must not.
+    let listed = server.stateless("tools/list", json!({}));
+    assert_eq!(
+        listed.status, 200,
+        "a well-formed request after two refused ones: {}",
+        listed.body
+    );
+}
+
+/// A stateless client can work while one of its own calls is still running.
+///
+/// The second finding of [#168](https://github.com/glslang/windbg-mcp/issues/168), and the one that
+/// survived the first. A request carrying no `Mcp-Session-Id` takes the gate's *opening* path and
+/// holds a claim for its whole duration — and on `2026-07-28` there is never an id to carry, so
+/// that is **every** request. Two that overlap contend, and the second gets a `409`.
+///
+/// Measured here at its sharpest rather than as a race. A kernel attach whose target never dials in
+/// parks in `WaitForEvent(INFINITE)` and does not come back; that is a supported state, and
+/// `session_status` and `end_session` are how a client is supposed to see it and reclaim it. If the
+/// claim it holds locks its own credential out, a stateless client cannot do either, and the
+/// property [#61](https://github.com/glslang/windbg-mcp/issues/61) established — that a parked
+/// attach costs one session and not the server — is not true for the revision current clients
+/// negotiate.
+#[test]
+fn a_stateless_client_can_work_while_one_of_its_own_calls_is_parked() {
+    let server = Listener::start(&[]);
+    let token = server.token.clone();
+    // Nothing is listening on it, so the attach parks rather than failing. Its own port, so a
+    // stray listener on this host cannot turn the park into an error and the test into a pass.
+    let connection = format!("net:port={},key=1.1.1.1", free_port());
+    let parked = json!({
+        "jsonrpc": "2.0",
+        "id": 9001,
+        "method": "tools/call",
+        "params": {
+            "name": "attach_kernel",
+            "arguments": { "connection": connection },
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": STATELESS_REVISION,
+                "io.modelcontextprotocol/clientCapabilities": {},
+            },
+        },
+    });
+
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            // Never read: the attach is still waiting for a target when this test ends, and the
+            // listener's `Drop` is what takes it down.
+            let _ = server.send_with(
+                "POST",
+                Some(&token),
+                None,
+                Some(&parked),
+                &[
+                    ("MCP-Protocol-Version", STATELESS_REVISION),
+                    ("Mcp-Method", "tools/call"),
+                    ("Mcp-Name", "attach_kernel"),
+                ],
+            );
+        });
+
+        // Long enough for the attach to be admitted and holding its claim. Not a race the test can
+        // lose in the direction that matters: if it has *not* started yet, the assertions below
+        // pass for the wrong reason rather than failing for the wrong one.
+        std::thread::sleep(Duration::from_secs(3));
+
+        let listed = server.stateless_at(1, "tools/list", json!({}));
+        assert_eq!(
+            listed.status,
+            200,
+            "a second stateless request was refused ({}) while the first was still running: \
+             {}\n--- stderr ---\n{}",
+            listed.status,
+            listed.body,
+            server.stderr()
+        );
+
+        // The two a client actually needs in this state: see the parked session, and end it.
+        let status = server.stateless_at(
+            2,
+            "tools/call",
+            json!({ "name": "session_status", "arguments": {} }),
+        );
+        assert_eq!(
+            status.status, 200,
+            "session_status is how a client sees a parked attach, and it was refused: {}",
+            status.body
+        );
+        let sessions = status.result("tools/call")["structuredContent"]["sessions"].clone();
+        let attaching = sessions
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|s| s["kind"] == json!("kernel"))
+            .and_then(|s| s["session_id"].as_str().map(str::to_owned));
+        let Some(attaching) = attaching else {
+            panic!("the parked attach is not in session_status: {sessions}");
+        };
+
+        let ended = server.stateless_at(
+            3,
+            "tools/call",
+            json!({ "name": "end_session", "arguments": { "session_id": attaching } }),
+        );
+        assert_eq!(
+            ended.status, 200,
+            "end_session is the only way out of a parked attach, and it was refused: {}",
+            ended.body
+        );
+    });
 }
 
 /// Going quiet is not leaving; saying goodbye is.
