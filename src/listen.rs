@@ -337,8 +337,12 @@ struct Admitted {
 enum Admission {
     /// Hand it to the MCP service.
     Serve(Admitted),
-    /// Someone else holds the server, is taking it, or is being cleaned up after.
+    /// This credential already has an MCP session here, or is opening one.
     Occupied,
+    /// This credential's own sessions are being let go after its lease ran out. Separate from
+    /// [`Self::Occupied`] because the advice is the opposite: nothing is held, and the request that
+    /// arrives a moment later is served.
+    Releasing,
     /// The request carried an MCP session id **another client** minted. Reported to the caller as
     /// unknown, for the reason the registry reports another client's handle that way: the answer
     /// must not confirm a session the caller may not use.
@@ -444,9 +448,12 @@ impl Lease {
         }
         let mut state = self.state_of(client);
         // Nothing is served while a teardown is in flight. Briefly refusing a client that could
-        // have been served costs a reconnect; serving one costs it the session mid-call.
+        // have been served costs a reconnect; serving one costs it the session mid-call. Its own
+        // answer, because at this moment the credential holds nothing and is opening nothing — the
+        // reply that says otherwise sends a client looking for a session of its own that it does
+        // not have, when what it has to do is ask again.
         if state.releasing {
-            return Admission::Occupied;
+            return Admission::Releasing;
         }
         match (session, state.holder.as_deref()) {
             // The holder, still talking.
@@ -867,6 +874,19 @@ async fn gate(
             );
             return Ok(refuse(StatusCode::NOT_FOUND, "unknown session"));
         }
+        // The sweeper is letting this credential's own sessions go. Transient, and the fix is to
+        // ask again rather than to change anything.
+        Admission::Releasing => {
+            tracing::warn!(
+                "refused a request from {peer}: this credential's expired sessions are still \
+                 being released"
+            );
+            return Ok(refuse(
+                StatusCode::CONFLICT,
+                "this credential's previous sessions are still being released after its lease ran \
+                 out; ask again in a moment",
+            ));
+        }
         Admission::Occupied => {
             // Never another client — tenancy is per client now — and never a *connection* either:
             // requests carrying the session this credential holds are served concurrently, which
@@ -1204,6 +1224,7 @@ mod tests {
                     "the gate took a session id for another client's, which no test here sets up"
                 )
             }
+            Admission::Releasing => panic!("the gate is letting go of sessions this test needs"),
         }
     }
 
@@ -1775,8 +1796,9 @@ mod tests {
 
         assert!(lease.expired().is_some(), "the grace is spent");
         assert!(
-            matches!(lease.admit(None), Admission::Occupied),
-            "the server is not vacant yet — the sessions are still being let go"
+            matches!(lease.admit(None), Admission::Releasing),
+            "the server is not vacant yet — the sessions are still being let go, and saying so is \
+             not the same as saying this credential holds one"
         );
 
         lease.released_leases();
