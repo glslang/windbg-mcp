@@ -234,6 +234,11 @@ on another — the topology every streamable-HTTP client uses. What it refuses i
 `initialize` while a session is held or being opened, or a request bearing an id that is not the one
 this credential holds.
 
+**One `409` means the opposite of the others**, and says so: after a lease runs out, the sessions are
+released in the background, and a request arriving during that cleanup is refused while the
+credential holds nothing at all. Its body names the release rather than a session, because the fix
+is to ask again in a moment rather than to go looking for a session you do not have.
+
 **This does not authorise anything beyond separation.** Every client that can authenticate has the
 whole tool surface, including `execute` and `launch`. Tokens separate clients from each other; they
 do not rank them.

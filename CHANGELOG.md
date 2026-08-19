@@ -50,7 +50,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     racing itself — and the `409` says so, where it used to report a second client that no longer
     exists as a category. Further requests carrying a session it already holds are not contention at
     all and never were: they are served concurrently, which is what lets a `DELETE` arrive while a
-    tool call is still running.
+    tool call is still running. The one `409` that means something else — a request arriving while
+    the sweeper releases this credential's expired sessions, when it holds nothing at all — now says
+    so, instead of describing a session the caller does not have.
   - Under **stdio** everything runs as `local`, so one set of registry rules serves both transports
     rather than one rule and an exception.
   - **Every credential variable is stripped from the processes this server creates** — by prefix,
