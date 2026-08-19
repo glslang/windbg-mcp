@@ -33,6 +33,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     still report another client's activity.
   - **A lease expiry releases the sessions of the client whose lease ran out**, not every session.
     Before ownership those were the same set, because the gate served one client at a time.
+  - **An `Mcp-Session-Id` another client holds is reported unknown**, and the check runs before the
+    caller's own tenancy is consulted. The MCP service keeps one session table for the server, so on
+    a legacy revision the id was the only thing between a client and another's MCP session — and a
+    `DELETE` on it closed that session while the lease that minted it still held the id, leaving its
+    owner failing every request and refused its own re-`initialize` for a grace period.
   - The rule for identity is **ambient inside a call, by name outside one**. A tool body reads the
     caller from the task-local, which is who is asking; the listener's own diagnostics run after
     that scope has closed and take the client as a parameter, so the one that reports an adoption on
