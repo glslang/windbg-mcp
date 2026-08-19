@@ -460,7 +460,8 @@ arrives on a `200`. It polls the attach to the `attaching` state rather than sle
 attach that failed fast leaves a kernel record a laxer check would accept, and nothing would be
 holding a claim to contend with. It lives here rather than above because without `dbgeng.dll` the
 attach fails during initialisation instead of parking, which would quietly turn a test about a call
-that does not return into one about a call that failed. Budget ~5s.
+that does not return into one about a call that failed. Budget ~21s, most of it the worker coming
+up and the `end_session` that terminates it.
 
 The second is the sweep meeting a real engine worker: *a lease
 that runs out releases what the absent client left*. The target is **a kernel attach nothing will
