@@ -14,10 +14,10 @@
 //!
 //! * **Protocol** (default) — spawns the server, speaks JSON-RPC. No debugger target, no
 //!   symbols, no network. This tier also drives the **listener** (`--listen`) over real HTTP on a
-//!   loopback port: the bearer check, the `409` that keeps it to one client at a time, and the
-//!   difference between a client going quiet and a client saying goodbye. Those need no debugger,
-//!   because the lease is decided before any session is opened — but the sweep meeting a real
-//!   engine worker does, so that half lives in the tier below.
+//!   loopback port: the bearer check, the `409` that keeps a client to one connection at a time,
+//!   and the difference between a client going quiet and a client saying goodbye. Those need no
+//!   debugger, because the lease is decided before any session is opened — but the sweep meeting a
+//!   real engine worker does, so that half lives in the tier below.
 //! * **Target** (`WINDBG_MCP_SMOKE_DUMP=1`) — opens the sample crash dump through DbgEng, so
 //!   it needs `dbgeng.dll` and may reach a symbol server. Off by default; this is the tier
 //!   that catches a `win-kexp` regression. It also runs a `debug_batch` to both outcomes, and
@@ -2778,20 +2778,23 @@ fn an_unauthenticated_request_is_refused_and_costs_the_server_nothing() {
     );
 }
 
-/// One client at a time, refused with `409` rather than served alongside.
+/// One connection at a time **per client**, refused with `409` rather than served alongside.
 ///
-/// Not a policy choice so much as an admission: `session_id` handles are minted from one registry,
-/// `MAX_SESSIONS` is shared, and `end_session` ends whatever it is handed — so two clients would
-/// silently share, and one could end a target the other was using.
+/// This was once the whole boundary: handles were minted from one registry, `MAX_SESSIONS` was
+/// shared and `end_session` ended whatever it was handed, so two clients would silently share and
+/// one could end a target the other was using. Sessions are owned now
+/// ([#162](https://github.com/glslang/windbg-mcp/issues/162)), and the tenancy is per client — so
+/// what this asserts is a client racing *itself*, which is the only contention left. The listener
+/// here holds one, unnamed token, so both connections below are that one client.
 #[test]
-fn a_second_client_is_refused_while_the_first_holds_the_server() {
+fn a_second_connection_from_one_client_is_refused_while_it_holds_the_server() {
     let mut server = Listener::start(&[]);
     let holder = server.initialize();
 
     let intruder = server.call(None, "initialize", Listener::opening());
     assert_eq!(
         intruder.status, 409,
-        "a second client was not refused: {}",
+        "a second connection from the holder's own client was not refused: {}",
         intruder.body
     );
     assert!(

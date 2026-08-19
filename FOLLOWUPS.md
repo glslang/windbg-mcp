@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in ten clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in eleven clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/win-kexp#71, 2026-08-01), items 13–14 from the bounded-command coverage review
@@ -11,7 +11,8 @@ session's own transcript turned up, and item 18 what reviewing it did), item 19 
 (#131, #132, #134, 2026-08-16), item 23 from making the listener usable rather than merely
 working (2026-08-17), item 24 from first measuring what this server costs the model driving it
 (2026-08-17), items 25–26 from giving the debugger tier an ARM64 *target* (#143, #152,
-2026-08-18), and item 27 from completing the coordinate work (#156–#158, 2026-08-18). Each item
+2026-08-18), item 27 from completing the coordinate work (#156–#158, 2026-08-18), and items 28–29
+from giving each client its own sessions (#162, #164–#166, 2026-08-19). Each item
 notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
@@ -843,3 +844,60 @@ symbol load to populate it would be strictly worse: that is a `.reload` per modu
 
 **Depends on nothing.** Picks up at `worker::with_pdb_identity` and
 `win_kexp::DebugEngine::module_pdb`.
+
+## 28. [windbg-mcp] The tenancy gate may no longer earn its place
+
+The listener's **lease** was built when the registry was one map for the whole server: handles
+minted from it, the cap shared, `end_session` ending whatever it was handed. Serving one client at a
+time was the only thing standing between two clients and each other's targets, so the gate was
+load-bearing.
+
+Ownership took that job over ([#162](https://github.com/glslang/windbg-mcp/issues/162), merged
+2026-08-19). A handle routes only for its owner, `session_status` and `server_log` show only the
+caller's, the cap and the closed-session history are per client, a lease expiry releases only that
+client's sessions, and an `Mcp-Session-Id` another client holds is reported unknown. The gate itself
+became per client in the same change, because a shared one would have made namespaces unusable
+concurrently — one client's pool walk stalling every other client for a boundary the registry
+already provides.
+
+**So what is left for it to arbitrate is one client racing itself**: two connections presenting the
+same token, where the second gets a `409`. The question this item is for is whether that is worth a
+gate — and it is a real question in both directions:
+
+- **For keeping it:** the lease is also what *releases* sessions when a client goes away without
+  saying goodbye. That is not tenancy, it is teardown, and a live kernel target left attached is the
+  expensive failure. Retiring the gate must not retire the sweep.
+- **For retiring it:** a client legitimately has more than one connection in flight — that is how
+  streamable HTTP works — and every `409` it earns is a reconnect the protocol did not ask for.
+  `2026-07-28` has no session id at all, so a stateless client cannot even become the holder; the
+  gate is reasoning about an identifier its newest callers do not send.
+
+**What would settle it:** decide whether idle release (`WINDBG_MCP_SESSION_IDLE_SECS`, added in
+[#164](https://github.com/glslang/windbg-mcp/pull/164)) already covers the teardown the lease is
+kept for. If it does, the gate can go and the sweep stays; if it does not, say why in
+`docs/remote-listener.md` and keep both.
+
+**Why deferred:** it is a deletion, and a deletion is the change most worth making on its own,
+against a PR that is not also adding the thing it would delete. Picks up at `src/listen.rs`
+(`Lease::admit`, `Lease::settle`) and the ~90 lease tests beside it.
+
+## 29. [windbg-mcp] The listener smoke tier only ever runs one, unnamed client
+
+Every listener assertion in `tests/mcp_smoke.rs` starts the server with a single
+`WINDBG_MCP_LISTEN_TOKEN`, so everything the tier proves is proved for the `local` client alone. The
+per-client behaviour — routing, the unknown-handle answer, per-client capacity and history, the
+per-client tenancy, the session-id ownership check — is covered by unit tests in `src/engine.rs`,
+`src/listen.rs` and `src/client.rs`, and by nothing end to end.
+
+The gap has already cost one bug: the adoption diagnostic counted `local`'s sessions for a named
+client reconnecting, because the count was taken after the identity scope had closed. A unit test
+pins the mechanism now, but the call site — an HTTP handler — is still unexercised.
+
+**What would close it:** a tier that starts the listener with two tokens (`…_TOKEN_CI` beside the
+unnamed one), opens a session as each, and asserts that neither can see, route to or end the
+other's; then walks one client through open → `DELETE` → reconnect-inside-the-grace and reads the
+adoption line back out of `server_log`. All of it is dump-tier work — none of it needs a live
+target.
+
+**Why deferred:** the per-client rules are unit-tested at the level they are decided, so this buys
+call-site coverage rather than new claims. Picks up at the listener helpers in `tests/mcp_smoke.rs`.
