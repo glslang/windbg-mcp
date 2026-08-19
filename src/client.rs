@@ -116,13 +116,23 @@ impl Credentials {
         file_token: Option<String>,
     ) -> Result<Self> {
         let mut by_token: HashMap<String, Client> = HashMap::new();
+        // Client name to the *variable* that configured it — never to the token. Both refusals
+        // below are printed at startup, to stderr in the foreground and to the service log under
+        // the SCM, so a message quoting the credential it is complaining about would write a
+        // working listener token into whatever collects those. The variable is also the more useful
+        // half: it is what the operator has to go and change.
         let mut named: HashMap<String, String> = HashMap::new();
-        let mut insert = |token: String, name: &str| -> Result<()> {
+        let mut insert = |token: String, name: &str, from: &str| -> Result<()> {
             if let Some(existing) = by_token.get(&token) {
+                // One client is one credential (the check below), so the variable that configured
+                // this token is the one that configured that client.
+                let first = named
+                    .get(existing.name())
+                    .map_or("another variable", String::as_str);
                 bail!(
-                    "the same token is configured for `{existing}` and `{name}`. One credential \
-                     cannot name two clients: sessions opened with it would belong to whichever \
-                     name happened to win."
+                    "`{from}` and `{first}` are the same token, configured for `{name}` and \
+                     `{existing}`. One credential cannot name two clients: sessions opened with it \
+                     would belong to whichever name happened to win."
                 );
             }
             // **And the other way round.** Two *different* tokens landing on one name is the more
@@ -134,11 +144,11 @@ impl Credentials {
             if let Some(other) = named.get(name) {
                 bail!(
                     "two different tokens are configured for the client `{name}` (`{other}` and \
-                     this one). Each client is one credential: two would share every session, \
+                     `{from}`). Each client is one credential: two would share every session, \
                      which is the isolation this is for, silently absent."
                 );
             }
-            named.insert(name.to_string(), token.clone());
+            named.insert(name.to_string(), from.to_string());
             by_token.insert(token, Client::new(name));
             Ok(())
         };
@@ -151,7 +161,7 @@ impl Credentials {
         // So a file shuts the environment out entirely rather than merely outranking the unnamed
         // variable.
         if let Some(token) = file_token {
-            insert(token, Client::LOCAL)?;
+            insert(token, Client::LOCAL, TOKEN_FILE_ENV)?;
             return Ok(Self { by_token });
         }
         for (key, value) in vars {
@@ -164,7 +174,7 @@ impl Credentials {
             }
             match credential_suffix(&key) {
                 // The unnamed variable, which is what every existing setup uses.
-                Some("") => insert(token, Client::LOCAL)?,
+                Some("") => insert(token, Client::LOCAL, &key)?,
                 // `WINDBG_MCP_LISTEN_TOKEN_CI` names the client `ci`, the same lowercasing a
                 // kernel profile's variable gets.
                 Some(suffix) => {
@@ -172,7 +182,7 @@ impl Credentials {
                     if name.is_empty() {
                         continue;
                     }
-                    insert(token, &name)?;
+                    insert(token, &name, &key)?;
                 }
                 None => {}
             }
@@ -315,6 +325,43 @@ mod tests {
         );
         let why = clash.expect_err("a duplicate token is a configuration error");
         assert!(why.to_string().contains("cannot name two clients"), "{why}");
+        assert!(
+            why.to_string().contains("WINDBG_MCP_LISTEN_TOKEN_A")
+                && why.to_string().contains("WINDBG_MCP_LISTEN_TOKEN_B"),
+            "the refusal has to name the two variables, since they are what has to change: {why}"
+        );
+    }
+
+    /// **Neither refusal may quote the credential it is refusing.** Both are printed at startup —
+    /// to stderr in the foreground, to `%ProgramData%\windbg-mcp\service.log` under the SCM — so a
+    /// message carrying the token would leave a working listener credential in whatever collects
+    /// those, which outlives the misconfiguration by as long as the file does.
+    #[test]
+    fn a_refusal_never_quotes_the_token_it_refuses() {
+        let secrets = ["s3cret-alpha", "s3cret-beta"];
+        let refusals = [
+            // One credential, two names.
+            vec![
+                ("WINDBG_MCP_LISTEN_TOKEN_A", secrets[0]),
+                ("WINDBG_MCP_LISTEN_TOKEN_B", secrets[0]),
+            ],
+            // Two credentials, one name.
+            vec![
+                ("WINDBG_MCP_LISTEN_TOKEN_CI", secrets[0]),
+                ("WINDBG_MCP_LISTEN_TOKEN__CI", secrets[1]),
+            ],
+        ];
+        for pairs in refusals {
+            let why = Credentials::from_entries(vars(&pairs), None)
+                .expect_err("a configuration error")
+                .to_string();
+            for secret in secrets {
+                assert!(
+                    !why.contains(secret),
+                    "a startup refusal wrote a bearer token into the log: {why}"
+                );
+            }
+        }
     }
 
     /// Windows environment names are case-insensitive, and `std::env::var` honours that — so a host

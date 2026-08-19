@@ -50,7 +50,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so there is no connection either; `clientInfo` is not retained. The credential is what is left,
   and a name only the holder of a token can present is a boundary — where a name a client picks for
   itself would be a label. Configuring one token for two names is refused at startup rather than
-  resolved, because the winner would be a hash-map ordering detail.
+  resolved, because the winner would be a hash-map ordering detail. Both refusals name the
+  *variables* to change and never the token: they are printed to stderr, and under the service to a
+  log file, so quoting the credential would leave a working one there.
 
   This separates clients; it does not rank them. Everyone who can authenticate still has the whole
   tool surface.
