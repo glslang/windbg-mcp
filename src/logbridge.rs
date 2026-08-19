@@ -102,6 +102,14 @@ impl Level {
 pub struct Entry {
     /// Assigned by the ring, in arrival order, and never reused within a run. This is what makes
     /// `since` paging exact and what makes an eviction visible as a gap.
+    ///
+    /// **Numbered across the whole server, not per client**, and that is a deliberate limit rather
+    /// than an oversight: the counter is what makes a cursor stable under eviction, and the ring
+    /// cannot number per client without knowing which client each session belongs to — a fact that
+    /// lives in the registry and arrives here only as [`Query::visible`], one query at a time. So a
+    /// client reading two of its own records a hundred apart can tell that *something* was filed in
+    /// between. It learns a count and nothing else; the records themselves, their sessions and
+    /// their text stay unreachable.
     pub seq: u64,
     /// Milliseconds since the Unix epoch, stamped **where the record happened** — in the worker,
     /// for a worker's. So `at` and `seq` can disagree by the width of a pipe write, and each is
@@ -179,21 +187,32 @@ impl Ring {
     }
 
     fn tail(&self, query: &Query) -> Tail {
-        let matches: Vec<&Entry> = self
+        // What this caller may read at all, before any filter they asked for. A record about
+        // *someone else's* session is not theirs to read; the supervisor's own records carry no
+        // session id and stay visible to everyone, being about this process rather than about any
+        // client's target.
+        //
+        // Everything below is counted over *this* stream rather than over the ring, because a
+        // number about records the caller cannot read is still a report of another client's
+        // activity: a `held` that climbs while nothing of theirs is filed says another client is
+        // busy, and an `oldest_seq` that moves says its records are being evicted. Neither leaks
+        // content, and both are answers to a question the boundary says a client may not ask.
+        let visible: Vec<&Entry> = self
             .entries
             .iter()
+            .filter(|e| match (&query.visible, e.session.as_deref()) {
+                (Some(mine), Some(about)) => mine.iter().any(|id| id == about),
+                _ => true,
+            })
+            .collect();
+        let matches: Vec<&Entry> = visible
+            .iter()
+            .copied()
             .filter(|e| e.level <= query.level)
             .filter(|e| query.since.is_none_or(|since| e.seq >= since))
             .filter(|e| match &query.session {
                 Some(wanted) => e.session.as_deref() == Some(wanted.as_str()),
                 None => true,
-            })
-            // A record about *someone else's* session is not this caller's to read. The
-            // supervisor's own records carry no session id and stay visible to everyone: they are
-            // about this process rather than about any client's target.
-            .filter(|e| match (&query.visible, e.session.as_deref()) {
-                (Some(mine), Some(about)) => mine.iter().any(|id| id == about),
-                _ => true,
             })
             .collect();
         let matched = matches.len();
@@ -201,10 +220,16 @@ impl Ring {
         Tail {
             entries: matches[from..].iter().map(|e| (*e).clone()).collect(),
             matched,
-            next_since: self.next_seq,
-            held: self.entries.len(),
+            // One past the newest record this caller can see, rather than one past the newest the
+            // ring has filed. It still advances past everything they could have been shown — which
+            // is what the cursor promises — and a caller who can see nothing keeps the cursor they
+            // came with rather than being handed a count of what happened elsewhere.
+            next_since: visible
+                .last()
+                .map_or_else(|| query.since.unwrap_or(0), |e| e.seq + 1),
+            held: visible.len(),
             capacity: self.capacity,
-            oldest_seq: self.entries.front().map(|e| e.seq),
+            oldest_seq: visible.first().map(|e| e.seq),
         }
     }
 }
@@ -313,20 +338,24 @@ pub struct Query {
     pub visible: Option<Vec<String>>,
 }
 
-/// What the ring answered with.
+/// What the ring answered with — **as this caller sees it**. Every count here is over the records
+/// [`Query::visible`] admits, so a client is told about the buffer it can read rather than about
+/// the buffer the server keeps.
 pub struct Tail {
     /// Oldest first, which is reading order.
     pub entries: Vec<Entry>,
     /// How many matched the query before `limit` clipped it.
     pub matched: usize,
-    /// Pass this as `since` next time to get only what is new. It is the next seq the ring will
-    /// issue, not the last one returned, so a query that matched nothing still advances.
+    /// Pass this as `since` next time to get only what is new. It is one past the newest record
+    /// this caller can see, not the last one returned, so a query that matched nothing still
+    /// advances.
     pub next_since: u64,
-    /// How many records the ring is holding, and how many it can.
+    /// How many records the caller can read, and how many the ring can hold in all. The capacity
+    /// is a configured constant and says nothing about anyone's activity, so it stays as it is.
     pub held: usize,
     pub capacity: usize,
-    /// The oldest seq still held. A `since` older than this means records were evicted between
-    /// the two calls, which is the only way a reader can find out.
+    /// The oldest seq this caller can still see. A `since` older than this means records were
+    /// evicted between the two calls, which is the only way a reader can find out.
     pub oldest_seq: Option<u64>,
 }
 
@@ -633,6 +662,63 @@ mod tests {
             ..query()
         });
         assert!(theirs.entries.is_empty(), "{:?}", theirs.entries);
+    }
+
+    /// The filter is only half the boundary. A caller who is told how full the buffer is, how far
+    /// its cursor has moved and what its oldest record is can watch all three climb while nothing
+    /// of theirs is filed — which is a report of another client's activity, arrived at without
+    /// reading a single one of its records.
+    #[test]
+    fn the_buffers_own_numbers_do_not_report_another_clients_activity() {
+        let mut ring = Ring::new(100);
+        ring.file(
+            Level::Info,
+            1,
+            "windbg_mcp::worker".into(),
+            Some("sess-mine".into()),
+            "mine".into(),
+        );
+        let mine = Query {
+            visible: Some(vec!["sess-mine".to_string()]),
+            ..query()
+        };
+        let before = ring.tail(&mine);
+        assert_eq!(before.held, 1, "one record of this caller's is in the ring");
+
+        // A busy neighbour, filing steadily and telling this caller nothing.
+        for n in 0..7 {
+            ring.file(
+                Level::Info,
+                2,
+                "windbg_mcp::worker".into(),
+                Some("sess-theirs".into()),
+                format!("theirs {n}"),
+            );
+        }
+        let after = ring.tail(&Query {
+            since: Some(before.next_since),
+            ..mine
+        });
+
+        assert!(
+            after.entries.is_empty(),
+            "nothing of this caller's was filed: {:?}",
+            after.entries
+        );
+        assert_eq!(
+            after.held, before.held,
+            "the buffer looked seven records fuller, so a caller polling it can count another \
+             client's records without reading one"
+        );
+        assert_eq!(
+            after.next_since, before.next_since,
+            "the cursor advanced past records this caller was never shown, which is the same \
+             count arriving as a gap"
+        );
+        assert_eq!(
+            after.oldest_seq, before.oldest_seq,
+            "the oldest record moved, which reports eviction pressure this caller did not cause"
+        );
     }
 
     /// Severity ordering is what the filter is built on, and it reads backwards from the
