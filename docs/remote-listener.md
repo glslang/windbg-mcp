@@ -230,9 +230,15 @@ properly.
 
 A `409` is never about *connections*. Requests carrying the session a credential already holds are
 served concurrently, which is what lets a `DELETE` arrive on one connection while a tool call runs
-on another — the topology every streamable-HTTP client uses. What it refuses is a fresh
-`initialize` while a session is held or being opened, or a request bearing an id that is not the one
-this credential holds.
+on another — the topology every streamable-HTTP client uses. What it refuses is a second MCP session
+for one credential: a fresh `initialize` while a session is held or being opened, or a request
+bearing an id that is not the one it holds. A request that arrives while another of the same
+credential's is still *opening* one is refused on the same grounds, which is why the body names both.
+
+**A client that sends no session id at all is the case to watch.** `2026-07-28` removed the session
+([SEP-2567]), so every one of its requests takes the opening path, and two that overlap contend with
+each other — measured on the bench, and recorded as `FOLLOWUPS.md` item 28, which is where the
+question of retiring this gate lives.
 
 **One `409` means the opposite of the others**, and says so: after a lease runs out, the sessions are
 released in the background, and a request arriving during that cleanup is refused while the

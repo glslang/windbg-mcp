@@ -876,6 +876,12 @@ question in both directions:
   contention it does catch is arguably the client's own business: a client that lost its session id
   (a crash, a restart) and re-`initialize`s inside the grace is told `409` and has to wait the grace
   out, where adopting its own sessions is what it wanted and what the identity now makes safe.
+- **And it actively costs that client concurrency**, which is no longer a prediction. A request
+  carrying no session id takes the *opening* path and holds a claim for its whole duration, so two
+  overlapping ones from the same credential contend: measured against a listener on the bench,
+  `409`s appear as soon as two stateless requests overlap. Every request of such a client is that
+  path, since there is never an id to carry. `server_log` while a pool walk runs — the workflow this
+  server documents for a wedged session — is exactly the overlap in question.
 
 **What would settle it:** decide whether idle release (`WINDBG_MCP_SESSION_IDLE_SECS`, added in
 [#164](https://github.com/glslang/windbg-mcp/pull/164)) already covers the teardown the lease is

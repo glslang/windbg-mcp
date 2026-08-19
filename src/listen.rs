@@ -890,17 +890,21 @@ async fn gate(
         Admission::Occupied => {
             // Never another client — tenancy is per client now — and never a *connection* either:
             // requests carrying the session this credential holds are served concurrently, which
-            // is how a `DELETE` arrives on one while a tool call runs on another. What is refused
-            // is a second **MCP session** for the same credential: a fresh `initialize` while one
-            // is held or being opened, or a request bearing an id that is not the one it holds.
+            // is how a `DELETE` arrives on one while a tool call runs on another. Two things reach
+            // here and the message has to fit both: a second **MCP session** for this credential
+            // (a fresh `initialize`, or an id that is not the one it holds), and a request arriving
+            // while another of its own still holds the claim — which is every overlapping request
+            // from a client that sends no session id at all, since `2026-07-28` removed it.
             // Saying "another client" would send an operator looking for a colleague who is not
             // there, and saying "connection" for one who has a network problem they do not have.
             tracing::warn!(
-                "refused a request from {peer}: this credential already holds a session here"
+                "refused a request from {peer}: this credential is already being served here"
             );
             return Ok(refuse(
                 StatusCode::CONFLICT,
-                "this credential already holds a session here, or is opening one;                  one MCP session per credential at a time",
+                "this credential is already using this server: it holds an MCP session, or a \
+                 request of its own is still opening one. Send the session id it holds, or ask \
+                 again once that request has finished.",
             ));
         }
     };
