@@ -201,8 +201,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The gate now distinguishes the two kinds of nothing: a request on a revision that mints no
   session can never become the holder a reservation arbitrates, so it reserves nothing and is
-  served alongside its client's other work. What it still waits for is a teardown of its own
-  credential's expired sessions, which is the sweep's rule and not the gate's.
+  served alongside its client's other work. The one refusal it still meets is a teardown of its own
+  credential's expired sessions — refused with the `409` that says to ask again once the release is
+  done, which is the sweep's rule and not the gate's.
+
+  Two lease bugs on the same path came out of review and are fixed here too, both of which end with
+  a client losing sessions it was using. A stateless request now **renews** a lease its credential
+  already has, since the sweep reads the deadline alone — a credential holding a legacy session and
+  since sending stateless requests would otherwise have had those sessions released while it was
+  working. And a reservation that mints no session now gives its **deadline** back along with its
+  claim: a `2026-07-28` `initialize` may omit the `MCP-Protocol-Version` header, so it is
+  classified as an opener, reserves, and takes nothing — leaving a clock running against a tenancy
+  that holds nothing, which one grace later released whatever that client had since opened.
 
   The same issue reported that the listener answered a `2026-07-28` handshake and then `400`d the
   request after it. **It does not** — that was measured with a hand-rolled probe that sent the body

@@ -630,7 +630,25 @@ impl Lease {
             }
             // Anything else, including an `initialize` that failed: the reservation is already
             // given back above, and nobody took the server.
-            _ => Settled::Kept { adopted: false },
+            _ => {
+                // **And the clock it started goes back too.** Reserving arms a deadline, so a
+                // request that reserved and then took nothing would leave one running against a
+                // tenancy that holds nothing — and a deadline is all the sweep reads. One grace
+                // later it would start a teardown with no holder, release this client's sessions,
+                // and refuse its next request with `Releasing` while it was working normally.
+                //
+                // Reachable by an ordinary client: a `2026-07-28` `initialize` may omit the
+                // `MCP-Protocol-Version` header (it is the request that establishes it), so it is
+                // classified as an opener, reserves, and then mints no session — and every session
+                // that client goes on to open is on that clock.
+                //
+                // `left_open` is the exception: a previous client's sessions are waiting to be
+                // adopted or swept, and that deadline is exactly what sweeps them.
+                if state.holder.is_none() && !state.left_open {
+                    state.deadline = None;
+                }
+                Settled::Kept { adopted: false }
+            }
         }
     }
 
@@ -1794,6 +1812,39 @@ mod tests {
 
         lease.leave(first.epoch);
         lease.leave(second.epoch);
+    }
+
+    /// A reservation that took nothing gives its deadline back, not just its claim.
+    ///
+    /// A `2026-07-28` `initialize` may omit the `MCP-Protocol-Version` header — it is the request
+    /// that establishes it — so it reaches the gate looking like any other opener, reserves, and
+    /// then mints no session. Reserving arms a deadline; the sweep reads the deadline and nothing
+    /// else. Left armed, it would start a teardown one grace later against a tenancy that holds
+    /// nothing, release whatever that client had since opened, and refuse its next request with
+    /// `Releasing` — a client losing its sessions on a timer started by its own handshake.
+    #[test]
+    fn a_reservation_that_minted_nothing_leaves_no_clock_running() {
+        let lease = lease();
+
+        // The headerless stateless handshake: admitted as an opener, mints nothing.
+        let it = admitted(lease.admit(None));
+        assert!(
+            lease.state().deadline.is_some(),
+            "reserving arms a deadline — that is the thing this test is about giving back"
+        );
+        assert!(!adopted(lease.settle(it.claim, None, None, true)));
+        lease.leave(it.epoch);
+
+        assert_eq!(
+            lease.state().deadline,
+            None,
+            "a reservation that took nothing must not leave a clock running against a tenancy that \
+             holds nothing"
+        );
+        assert!(
+            lease.expired().is_none(),
+            "and so there is nothing for the sweep to act on"
+        );
     }
 
     /// A stateless request renews a lease its credential already has, and creates none.
