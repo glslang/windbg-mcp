@@ -891,7 +891,8 @@ question in both directions:
 [#164](https://github.com/glslang/windbg-mcp/pull/164)) already covers the teardown the lease is
 kept for. If it does, the gate can go and the sweep stays; if it does not, say why in
 `docs/remote-listener.md` and keep both. Note the `releasing` refusal is *not* part of what would
-go: it is the sweep's, not the gate's, and a stateless request still waits on it.
+go: it is the sweep's, not the gate's, and a stateless request is refused by it like any other —
+told to ask again once the release is done.
 
 **Why deferred:** it is a deletion, and a deletion is the change most worth making on its own,
 against a PR that is not also adding the thing it would delete. Picks up at `src/listen.rs`

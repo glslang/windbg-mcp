@@ -15,11 +15,12 @@
 //! * **Protocol** (default) — spawns the server, speaks JSON-RPC. No debugger target, no
 //!   symbols, no network. This tier also drives the **listener** (`--listen`) over real HTTP on a
 //!   loopback port: the bearer check, the `409` that keeps a credential to one MCP session, the
-//!   difference between a client going quiet and a client saying goodbye, and `2026-07-28` —
-//!   which has none of those, having removed the session id, and is therefore the revision that
-//!   proves the gate stands aside rather than merely arbitrating well. Those need no debugger,
-//!   because the lease is decided before any session is opened — but the sweep meeting a real
-//!   engine worker does, so that half lives in the tier below.
+//!   difference between a client going quiet and a client saying goodbye, and `2026-07-28` being
+//!   served at all — the revision that removed the session id, and so arrives with none of the
+//!   things the rules above are written in terms of. Those need no debugger, because the lease is
+//!   decided before any session is opened. Two that do — the sweep meeting a real engine worker,
+//!   and a stateless client working alongside a call of its own that parks — live in the tier
+//!   below.
 //! * **Target** (`WINDBG_MCP_SMOKE_DUMP=1`) — opens the sample crash dump through DbgEng, so
 //!   it needs `dbgeng.dll` and may reach a symbol server. Off by default; this is the tier
 //!   that catches a `win-kexp` regression. It also runs a `debug_batch` to both outcomes, and
@@ -2566,27 +2567,89 @@ impl Listener {
     /// Immutable, which is the whole reason it is separate: a request that has to run *alongside*
     /// another cannot be sent through a `&mut self` borrow, and overlap is what the stateless
     /// revision makes ordinary.
-    fn stateless_at(&self, id: i64, method: &str, mut params: Value) -> Reply {
-        params["_meta"] = json!({
-            "io.modelcontextprotocol/protocolVersion": STATELESS_REVISION,
-            "io.modelcontextprotocol/clientCapabilities": {},
-        });
-        let name = params["name"].as_str().map(str::to_owned);
-        let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        let mut headers = vec![
-            ("MCP-Protocol-Version", STATELESS_REVISION),
-            ("Mcp-Method", method),
-        ];
-        if let Some(name) = name.as_deref() {
-            headers.push(("Mcp-Name", name));
-        }
+    fn stateless_at(&self, id: i64, method: &str, params: Value) -> Reply {
+        let (body, name) = Self::stateless_body(id, method, params);
         self.send_with(
             "POST",
             Some(&self.token.clone()),
             None,
             Some(&body),
-            &headers,
+            &Self::stateless_headers(method, name.as_deref()),
         )
+    }
+
+    /// The body of a stateless request, and the value its `Mcp-Name` must mirror.
+    ///
+    /// Split out because one request in this tier is sent *without* waiting for a reply, and
+    /// building its shape a second time by hand is how a test ends up measuring something the rest
+    /// of the tier no longer sends.
+    fn stateless_body(id: i64, method: &str, mut params: Value) -> (Value, Option<String>) {
+        params["_meta"] = json!({
+            "io.modelcontextprotocol/protocolVersion": STATELESS_REVISION,
+            "io.modelcontextprotocol/clientCapabilities": {},
+        });
+        // SEP-2243 maps the header per method rather than per parameter: `tools/call` and
+        // `prompts/get` mirror `params.name`, `resources/read` mirrors `params.uri`, and every
+        // other method sends none. Keyed on the method for that reason — a `name` argument that
+        // happens to belong to some other method's parameters is not this header's value.
+        let name = match method {
+            "tools/call" | "prompts/get" => params["name"].as_str().map(str::to_owned),
+            "resources/read" => params["uri"].as_str().map(str::to_owned),
+            _ => None,
+        };
+        let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
+        (body, name)
+    }
+
+    fn stateless_headers<'h>(method: &'h str, name: Option<&'h str>) -> Vec<(&'h str, &'h str)> {
+        let mut headers = vec![
+            ("MCP-Protocol-Version", STATELESS_REVISION),
+            ("Mcp-Method", method),
+        ];
+        if let Some(name) = name {
+            headers.push(("Mcp-Name", name));
+        }
+        headers
+    }
+
+    /// A stateless request sent for its *effect*, whose reply is never waited for.
+    ///
+    /// One request in this tier is not expected to answer at all — a kernel attach parked on a
+    /// target that will never dial in — and it has to stay running while other requests are made
+    /// alongside it. So this neither reads nor parses: it writes the request and hands back the
+    /// **still-open connection**, which the caller holds for as long as the request should live.
+    /// Closing it is what ends the request, so dropping the returned stream is the cleanup.
+    ///
+    /// Waiting for it on a second thread was the obvious shape and the wrong one: the reply never
+    /// comes, so the join at the end of the test blocks for the whole read timeout and then panics
+    /// parsing an empty buffer — reporting the missing reply instead of whichever assertion
+    /// actually failed.
+    #[must_use = "the connection is what keeps the request alive; dropping it ends the request"]
+    fn stateless_unanswered(&self, id: i64, method: &str, params: Value) -> std::net::TcpStream {
+        let (body, name) = Self::stateless_body(id, method, params);
+        let headers = Self::stateless_headers(method, name.as_deref());
+        let body = body.to_string();
+        let mut request = format!(
+            "POST / HTTP/1.1\r\nHost: {}\r\nAccept: application/json, text/event-stream\r\n\
+             Connection: close\r\nAuthorization: Bearer {}\r\n",
+            self.addr, self.token
+        );
+        for (name, value) in &headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            body.len()
+        ));
+
+        let mut stream = std::net::TcpStream::connect(&self.addr)
+            .unwrap_or_else(|e| panic!("cannot reach the listener at {}: {e}", self.addr));
+        stream
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .expect("set a read timeout");
+        stream.write_all(request.as_bytes()).expect("write request");
+        stream.flush().expect("flush request");
+        stream
     }
 
     /// The `2026-07-28` handshake, which mints nothing and is therefore not a session.
@@ -3085,109 +3148,6 @@ fn an_under_specified_stateless_request_is_told_which_part_it_is_missing() {
         "a well-formed request after two refused ones: {}",
         listed.body
     );
-}
-
-/// A stateless client can work while one of its own calls is still running.
-///
-/// The second finding of [#168](https://github.com/glslang/windbg-mcp/issues/168), and the one that
-/// survived the first. A request carrying no `Mcp-Session-Id` takes the gate's *opening* path and
-/// holds a claim for its whole duration — and on `2026-07-28` there is never an id to carry, so
-/// that is **every** request. Two that overlap contend, and the second gets a `409`.
-///
-/// Measured here at its sharpest rather than as a race. A kernel attach whose target never dials in
-/// parks in `WaitForEvent(INFINITE)` and does not come back; that is a supported state, and
-/// `session_status` and `end_session` are how a client is supposed to see it and reclaim it. If the
-/// claim it holds locks its own credential out, a stateless client cannot do either, and the
-/// property [#61](https://github.com/glslang/windbg-mcp/issues/61) established — that a parked
-/// attach costs one session and not the server — is not true for the revision current clients
-/// negotiate.
-#[test]
-fn a_stateless_client_can_work_while_one_of_its_own_calls_is_parked() {
-    let server = Listener::start(&[]);
-    let token = server.token.clone();
-    // Nothing is listening on it, so the attach parks rather than failing. Its own port, so a
-    // stray listener on this host cannot turn the park into an error and the test into a pass.
-    let connection = format!("net:port={},key=1.1.1.1", free_port());
-    let parked = json!({
-        "jsonrpc": "2.0",
-        "id": 9001,
-        "method": "tools/call",
-        "params": {
-            "name": "attach_kernel",
-            "arguments": { "connection": connection },
-            "_meta": {
-                "io.modelcontextprotocol/protocolVersion": STATELESS_REVISION,
-                "io.modelcontextprotocol/clientCapabilities": {},
-            },
-        },
-    });
-
-    std::thread::scope(|scope| {
-        scope.spawn(|| {
-            // Never read: the attach is still waiting for a target when this test ends, and the
-            // listener's `Drop` is what takes it down.
-            let _ = server.send_with(
-                "POST",
-                Some(&token),
-                None,
-                Some(&parked),
-                &[
-                    ("MCP-Protocol-Version", STATELESS_REVISION),
-                    ("Mcp-Method", "tools/call"),
-                    ("Mcp-Name", "attach_kernel"),
-                ],
-            );
-        });
-
-        // Long enough for the attach to be admitted and holding its claim. Not a race the test can
-        // lose in the direction that matters: if it has *not* started yet, the assertions below
-        // pass for the wrong reason rather than failing for the wrong one.
-        std::thread::sleep(Duration::from_secs(3));
-
-        let listed = server.stateless_at(1, "tools/list", json!({}));
-        assert_eq!(
-            listed.status,
-            200,
-            "a second stateless request was refused ({}) while the first was still running: \
-             {}\n--- stderr ---\n{}",
-            listed.status,
-            listed.body,
-            server.stderr()
-        );
-
-        // The two a client actually needs in this state: see the parked session, and end it.
-        let status = server.stateless_at(
-            2,
-            "tools/call",
-            json!({ "name": "session_status", "arguments": {} }),
-        );
-        assert_eq!(
-            status.status, 200,
-            "session_status is how a client sees a parked attach, and it was refused: {}",
-            status.body
-        );
-        let sessions = status.result("tools/call")["structuredContent"]["sessions"].clone();
-        let attaching = sessions
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|s| s["kind"] == json!("kernel"))
-            .and_then(|s| s["session_id"].as_str().map(str::to_owned));
-        let Some(attaching) = attaching else {
-            panic!("the parked attach is not in session_status: {sessions}");
-        };
-
-        let ended = server.stateless_at(
-            3,
-            "tools/call",
-            json!({ "name": "end_session", "arguments": { "session_id": attaching } }),
-        );
-        assert_eq!(
-            ended.status, 200,
-            "end_session is the only way out of a parked attach, and it was refused: {}",
-            ended.body
-        );
-    });
 }
 
 /// Going quiet is not leaving; saying goodbye is.
@@ -5891,6 +5851,117 @@ fn two_sessions_coexist_and_do_not_disturb_each_other() {
     );
 
     server.tool_text("end_session", json!({ "session_id": first }), TARGET_STEP);
+}
+
+/// A stateless client can work while one of its own calls is parked — the same property as the
+/// test below, over the listener, for the revision that has no session id.
+///
+/// The second finding of [#168](https://github.com/glslang/windbg-mcp/issues/168), and the one that
+/// survived the first. A request carrying no `Mcp-Session-Id` used to take the gate's *opening*
+/// path and hold a claim for its whole duration — and on `2026-07-28` there is never an id to
+/// carry, so that was **every** request. Two that overlapped contended.
+///
+/// Measured at its sharpest rather than as a race. A kernel attach whose target never dials in
+/// parks in `WaitForEvent(INFINITE)` and does not come back; that is a supported state, and
+/// `session_status` and `end_session` are how a client sees it and reclaims it. If the claim it
+/// held locked its own credential out, a stateless client could do neither, and the property
+/// [#61](https://github.com/glslang/windbg-mcp/issues/61) established — that a parked attach costs
+/// one session and not the server — was not true for the revision current clients negotiate.
+///
+/// In this tier and not the one above it, because a park needs a real engine worker: without
+/// `dbgeng.dll` the attach fails during initialisation instead of parking, and a test whose whole
+/// subject is a call that does not return would quietly become one about a call that failed fast.
+#[test]
+fn a_stateless_client_can_work_while_one_of_its_own_calls_is_parked() {
+    let Some(_) = target_tier() else { return };
+    let server = Listener::start(&[]);
+
+    // Nothing is listening on it, so the attach parks rather than failing. Its own port, so a
+    // stray listener on this host cannot turn the park into an error and the test into a pass.
+    let connection = format!("net:port={},key=1.1.1.1", free_port());
+    // Held for the rest of the test: this connection *is* the parked request.
+    let _parked = server.stateless_unanswered(
+        9001,
+        "tools/call",
+        json!({ "name": "attach_kernel", "arguments": { "connection": connection } }),
+    );
+
+    // **Polled to the `attaching` state, not slept towards it.** A fixed wait would pass for the
+    // wrong reason twice over: too short and nothing is holding a claim yet, and an attach that
+    // failed fast leaves a kernel record behind that a laxer check would accept. Each poll is
+    // itself a second stateless request overlapping the first, so the status asserted here is the
+    // contention this test is about.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut id = 1;
+    let attaching = loop {
+        let status = server.stateless_at(
+            id,
+            "tools/call",
+            json!({ "name": "session_status", "arguments": {} }),
+        );
+        id += 1;
+        assert_eq!(
+            status.status,
+            200,
+            "a second stateless request was refused ({}) while the first was still running:              {}\n--- stderr ---\n{}",
+            status.status,
+            status.body,
+            server.stderr()
+        );
+        let parked = status.result("tools/call")["structuredContent"]["sessions"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|s| s["kind"] == json!("kernel") && s["state"]["state"] == json!("attaching"))
+            .and_then(|s| s["session_id"].as_str().map(str::to_owned));
+        if let Some(id) = parked {
+            break Some(id);
+        }
+        if Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let Some(attaching) = attaching else {
+        // The attach never parked — most likely the UDP port was taken on this host. Nothing to
+        // assert about a park that did not happen, and the same stand-down the test below takes.
+        skip("attach_kernel did not reach the parked state (port busy?)");
+        return;
+    };
+
+    // The plain case, now that the park is established rather than assumed.
+    let listed = server.stateless_at(id, "tools/list", json!({}));
+    id += 1;
+    assert_eq!(
+        listed.status,
+        200,
+        "tools/list was refused ({}) alongside a parked attach: {}\n--- stderr ---\n{}",
+        listed.status,
+        listed.body,
+        server.stderr()
+    );
+
+    // And the way out. `200` is not enough on its own here — a tool error is also carried on a
+    // `200`, so a refusal inside the call would read as success at the HTTP layer.
+    let ended = server.stateless_at(
+        id,
+        "tools/call",
+        json!({ "name": "end_session", "arguments": { "session_id": attaching } }),
+    );
+    assert_eq!(
+        ended.status, 200,
+        "end_session is the only way out of a parked attach, and it was refused: {}",
+        ended.body
+    );
+    let payload = ended
+        .payload
+        .as_ref()
+        .expect("end_session answered with no JSON-RPC payload");
+    assert!(
+        !is_tool_error(payload),
+        "end_session reported a tool error while reclaiming the parked attach: {}",
+        ended.body
+    );
 }
 
 /// Issue #61, end to end: a kernel attach whose target never dials in waits forever, and that

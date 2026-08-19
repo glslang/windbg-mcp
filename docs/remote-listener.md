@@ -235,7 +235,7 @@ for one credential: a fresh `initialize` while a session is held or being opened
 bearing an id that is not the one it holds. A request that arrives while another of the same
 credential's is still *opening* one is refused on the same grounds, which is why the body names both.
 
-**A client that sends no session id at all contends with nothing.** `2026-07-28` removed the session
+**A client on a sessionless revision contends with nothing.** `2026-07-28` removed the session
 ([SEP-2567]), so such a client can never become the holder the gate arbitrates — and a request that
 cannot become one reserves nothing. It used to: every stateless request took the *opening* path, so
 any two that overlapped got a `409`, and a call that parked took its whole credential with it. That
@@ -243,9 +243,13 @@ was [#168](https://github.com/glslang/windbg-mcp/issues/168), and it is fixed; t
 runs a `tools/list`, a `session_status` and an `end_session` alongside a kernel attach that never
 comes back.
 
+This is about the revision, not about the header being absent. A client on a revision that *has*
+sessions and sends no id is opening one — an `initialize`, or a resume — and still takes the
+opening path, `409` and all.
+
 What is left of the gate for such a client is the teardown: a request arriving while its own expired
-sessions are being released still waits, because those sessions are being closed underneath it.
-Whether the rest of the gate earns its place is `FOLLOWUPS.md` item 28.
+sessions are being released is refused with the `409` below and should ask again once the release
+is done. Whether the rest of the gate earns its place is `FOLLOWUPS.md` item 28.
 
 Such a client also never installs a lease at all, which is why abandonment on this revision is the
 idle release's job rather than the grace's — see *A session nobody is using is released*, above.

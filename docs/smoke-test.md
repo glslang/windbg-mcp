@@ -414,7 +414,7 @@ reach is the wiring, which is what these assert against a real listener on a loo
 hand-written HTTP client (a library that normalised a `409` into an exception, or hid the session
 header, would be asserting on this server's behalf).
 
-Seven of them need no debugger, because tenancy is decided before any session is opened. All seven
+Six of them need no debugger, because tenancy is decided before any session is opened. All six
 run a listener holding a **single, unnamed** token, so what they prove they prove for the `local`
 client alone; the per-client rules are unit-tested where they are decided, and closing that
 end-to-end gap is [`FOLLOWUPS.md`](../FOLLOWUPS.md) item 29:
@@ -440,22 +440,29 @@ end-to-end gap is [`FOLLOWUPS.md`](../FOLLOWUPS.md) item 29:
   negotiate has no session id
   ([SEP-2567](https://modelcontextprotocol.io/seps/2567-sessionless-mcp)), so it exercises the
   listener as a client that never presents one: the handshake mints nothing, and a `tools/list` and
-  a `tools/call` after it are answered. Its three tests exist because [#168](https://github.com/glslang/windbg-mcp/issues/168)
-  reported the opposite from a hand-rolled probe, so each spells the revision the way it has to be
-  spelled — the `MCP-Protocol-Version` header, `params._meta` carrying the protocol version and the
-  client's capabilities, and SEP-2243's `Mcp-Method` (plus `Mcp-Name` where the method names
-  something).
+  a `tools/call` after it are answered. It exists because
+  [#168](https://github.com/glslang/windbg-mcp/issues/168) reported the opposite from a hand-rolled
+  probe, so it spells the revision the way it has to be spelled — the `MCP-Protocol-Version`
+  header, `params._meta` carrying the protocol version and the client's capabilities, and
+  SEP-2243's `Mcp-Method` (plus `Mcp-Name`, which SEP-2243 maps per method: `params.name` for
+  `tools/call` and `prompts/get`, `params.uri` for `resources/read`, and nothing for the rest).
 - *An under-specified stateless request is told which part it is missing*, rather than merely
   refused. Both shapes the probe sent are pinned here, so the same `400` cannot be read as a broken
   listener a second time.
-- *A stateless client can work while one of its own calls is parked.* The gate reserves the server
-  for a request that is opening a session, and a request with no session id used to look exactly
-  like one — so on this revision every request reserved, and a call that never returned took its
-  whole credential with it. The park is a **kernel attach nothing will answer**, and what runs
-  alongside it is the recovery path itself: `tools/list`, `session_status`, `end_session`. Budget
-  ~23s, nearly all of it the deliberate wait for the attach to be in flight.
 
-The eighth is in the debugger tier, because it is the sweep meeting a real engine worker: *a lease
+Two more are in the debugger tier, because each needs a real engine worker.
+
+The first is the contention half of #168 at its sharpest: *a stateless client can work while one of
+its own calls is parked*. The park is a **kernel attach nothing will answer**, and what
+runs alongside it is the recovery path itself — `tools/list`, `session_status`, `end_session`, the
+last checked for a tool error as well as an HTTP status, since a refusal inside the call also
+arrives on a `200`. It polls the attach to the `attaching` state rather than sleeping towards it: an
+attach that failed fast leaves a kernel record a laxer check would accept, and nothing would be
+holding a claim to contend with. It lives here rather than above because without `dbgeng.dll` the
+attach fails during initialisation instead of parking, which would quietly turn a test about a call
+that does not return into one about a call that failed. Budget ~5s.
+
+The second is the sweep meeting a real engine worker: *a lease
 that runs out releases what the absent client left*. The target is **a kernel attach nothing will
 answer**, deliberately — a parked attach is the worst case in one move, since the session exists,
 holds a worker, and cannot be interrupted, so releasing it means terminating a process rather than
