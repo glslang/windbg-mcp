@@ -377,9 +377,10 @@ so there is one set of rules and no transport exception. `docs/remote-listener.m
 half; what follows is what bites while editing.
 
 **Identity is ambient inside a call and by name outside one.** `crate::client::current()` reads a
-task-local that `listen::serve_one` sets around the whole MCP call, which is why no tool signature
-carries a caller. Anything running *outside* that scope — the listener's own diagnostics, a sweep, a
-shutdown — gets the default `local` instead of an error, so it must take the client as a parameter
+task-local that `listen::gate` sets — with `client::as_client`, around the `mcp.handle(req)` that
+is the whole MCP call — which is why no tool signature carries a caller. Anything running *outside*
+that scope — the listener's own diagnostics, a sweep, a shutdown — gets the default `local` instead
+of an error, so it must take the client as a parameter
 (`Sessions::live_count_for` against `Sessions::snapshot`). The bug this rule is written from was a
 log line reporting `local`'s session count to a named client on reconnect.
 
