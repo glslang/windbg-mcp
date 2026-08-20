@@ -40,44 +40,48 @@ claude mcp add windbg-vm --scope local --transport http http://127.0.0.1:8765/ \
   --header "Authorization: Bearer <the same string>"
 ```
 
-Then point a local model at it, either way round:
+Then drive a local model against it **through ollama's server API**. No second harness is involved
+and nothing has to be launched: a session you already have runs the script, which is how every number
+further down this page was produced.
 
-- **An interactive harness.** With [ollama](https://ollama.com) 0.32.12 or newer, `ollama launch
-  claude --model <model-tag>` wires a local model into Claude Code (`ollama launch --help` lists the
-  integrations it knows). The MCP registration above is unaffected by which model is driving.
-- **The ollama server API, with no harness at all** — which is what makes the question repeatable.
-  [`tools/local_model_drive.py`](../tools/local_model_drive.py) speaks MCP over HTTP to the listener,
-  hands the whole tool surface to `POST /api/chat`, executes the tool calls that come back and feeds
-  the results in. It reads the bearer token from the client's own registration, so nothing has to be
-  pasted on a command line:
+[`tools/local_model_drive.py`](../tools/local_model_drive.py) speaks MCP over HTTP to the listener,
+hands the whole tool surface to `POST /api/chat`, executes the tool calls that come back and feeds
+the results in. It reads the bearer token from the client's own registration, so nothing has to be
+pasted on a command line:
 
-  ```console
-  python3 tools/local_model_drive.py [tasks.json]     # tasks.json: a JSON list of prompts
-  ```
+```console
+python3 tools/local_model_drive.py [tasks.json]     # tasks.json: a JSON list of prompts
+```
 
-  It executes only a **read-only allow-list**, and reports anything else back to the model as
-  refused. That is deliberate: the surface includes `execute` and `launch`, and a debug host is the
-  wrong place to discover unattended what a model does with them — but a wrong pick is still
-  *measured*, which is the point.
+It executes only a **read-only allow-list**, and reports anything else back to the model as refused.
+That is deliberate: the surface includes `execute` and `launch`, and a debug host is the wrong place
+to discover unattended what a model does with them — but a wrong pick is still *measured*, which is
+the point.
 
-  **Give the driver its own credential.** Falling back to the registered client's token puts it in
-  *that client's* namespace, which is ownership working exactly as designed — the driver then sees,
-  routes to and could end the sessions your editor has open. A token of its own makes it a separate
-  client with a separate namespace, which is what the per-client work is for:
+**Give the driver its own credential.** Falling back to the registered client's token puts it in
+*that client's* namespace, which is ownership working exactly as designed — the driver then sees,
+routes to and could end the sessions your editor has open. A token of its own makes it a separate
+client with a separate namespace, which is what the per-client work is for:
 
-  ```console
-  # on the Windows machine, beside the unnamed token
-  setx WINDBG_MCP_LISTEN_TOKEN_DRIVER "<another long random string>"
-  # on the client machine
-  WINDBG_MCP_TOKEN="<the same string>" python3 tools/local_model_drive.py tasks.json
-  ```
+```console
+# on the Windows machine, beside the unnamed token
+setx WINDBG_MCP_LISTEN_TOKEN_DRIVER "<another long random string>"
+# on the client machine
+WINDBG_MCP_TOKEN="<the same string>" python3 tools/local_model_drive.py tasks.json
+```
 
-  Sharing the token is survivable rather than safe, and the script is fenced accordingly: it will
-  only `end_session` a session **this run opened** — counting only the handles an *opener* returned,
-  never every handle it has seen, since `session_status` and `server_log` name the whole client's —
-  refuses one with no `session_id` at all (the server would resolve the client's *current* session,
-  which may not be the driver's), and ends what it opened on the way out — so a run neither strands a worker for the lease grace nor leaves the
-  next run adopting its leftovers.
+Sharing the token is survivable rather than safe, and the script is fenced accordingly: it will only
+`end_session` a session **this run opened** — counting only the handles an *opener* returned, never
+every handle it has seen, since `session_status` and `server_log` name the whole client's — refuses
+one with no `session_id` at all (the server would resolve the client's *current* session, which may
+not be the driver's), and ends what it opened on the way out, so a run neither strands a worker for
+the lease grace nor leaves the next run adopting its leftovers.
+
+**A different arrangement, not a prerequisite:** `ollama launch claude --model <tag>` (ollama 0.32.12
+or newer) makes the local model *the agent* — it drives the harness itself, with these tools as its
+tools, rather than being called through the API by something else. That is the end state the
+split-plane plan is aimed at, and it is worth knowing about; it is not how anything on this page was
+measured, and it is not needed to measure it.
 
 ## What this server costs a model, measured
 
