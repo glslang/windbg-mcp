@@ -297,6 +297,18 @@ pub fn env_credentials(
 /// **A leading `{` is what tells them apart**, so a bare token may not begin with one. That is a
 /// rule rather than a guess: a token that did would be refused at startup, by name, rather than
 /// quietly read as something else.
+///
+/// **Which is a change of meaning for one pre-existing file**, and review was right to name it: an
+/// install predating this wrote whatever the shell held, so a token that begins with `{` — a
+/// braced GUID is the plausible way to get one — stops the service at its next start rather than
+/// authenticating. That refusal says how to fix it (put the token in a one-entry object), and the
+/// changelog carries the same note, because the alternative is worse. Falling back to the bare
+/// reading when the JSON does not parse would rescue that file at the cost of the failure this
+/// shape exists to prevent: a hand-written object with a typo in it, read as one long token that
+/// authenticates nobody and says nothing. A loud refusal on the rare file beats a silent one on
+/// the file people will actually hand-edit. No marker helps here either — whatever marks the
+/// object, a token could carry it — and only a signal outside the file could be unambiguous, which
+/// is a heavier format than a credential file wants.
 pub struct TokenFile {
     entries: Vec<Configured>,
 }
@@ -361,8 +373,9 @@ impl TokenFile {
         let Entries(object) = serde_json::from_str(text).map_err(|e| {
             anyhow!(
                 "{} begins with `{{`, so it is read as a JSON object of client name to token — and \
-                 it is not valid JSON ({e}). A file holding one token is still a token file; it \
-                 just may not start with `{{`.",
+                 it is not valid JSON ({e}). If this file holds a single bearer token that happens \
+                 to begin with `{{` — one written before this file could name clients — write it \
+                 as `{{\"local\": \"<that token>\"}}` and it will authenticate exactly as it did.",
                 path.display()
             )
         })?;
@@ -748,6 +761,33 @@ mod tests {
         assert_eq!(creds.len(), 1, "the environment must not add credentials");
         assert_eq!(creds.client_for("from-the-environment"), None);
         assert_eq!(creds.client_for("also-from-the-environment"), None);
+    }
+
+    /// The one file whose meaning this changed, and the way out, which the refusal has to carry:
+    /// a token written before the file could name clients that happens to begin with `{`. It is
+    /// read as the JSON shape now, so the listener refuses to start — and the same token in a
+    /// one-entry object authenticates exactly as it did.
+    ///
+    /// Not softened to "fall back to the bare reading when the JSON does not parse": that would
+    /// rescue this file at the cost of turning a hand-written object with a typo in it into one
+    /// long token that authenticates nobody and says nothing.
+    #[test]
+    fn a_legacy_token_beginning_with_a_brace_is_refused_and_told_how_to_survive() {
+        let legacy = "{6F9619FF-8B86-D011-B42D-00CF4FC964FF}";
+        let why = TokenFile::parse(legacy, Path::new(FILE))
+            .expect_err("a file beginning with `{` is the JSON shape")
+            .to_string();
+        assert!(why.contains(FILE), "{why}");
+        assert!(
+            why.contains(r#"`{"local": "<that token>"}`"#),
+            "the refusal has to carry the way out, since it is all the operator sees: {why}"
+        );
+        let creds = Credentials::from_entries(
+            vars(&[]),
+            Some(file(&format!(r#"{{"local": "{legacy}"}}"#))),
+        )
+        .expect("the same token, in the shape this file now takes");
+        assert_eq!(creds.client_for(legacy).map(Client::name), Some("local"));
     }
 
     /// **And because it is the only credential, it has to be able to name more than one.** A

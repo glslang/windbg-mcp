@@ -89,6 +89,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rewrite. It validates them the way the listener would, because the SCM registers a service once
   and a credential it refuses then fails it at every start.
 
+  **Upgrading with a token that begins with `{`:** an install predating this wrote whatever the
+  shell held, so such a file is now read as the JSON shape and the service refuses to start rather
+  than authenticating. Write it as `{"local": "<that token>"}` — the refusal in the service log says
+  so too — and it works exactly as it did. Any other token is unaffected. The rule is not softened
+  to a fallback on purpose: reading a file whose JSON does not parse as one long token would turn a
+  hand-written object with a typo in it into a credential that authenticates nobody and explains
+  nothing, which is the likelier file by far.
+
   Its refusals name the file and the key and never a value, for the same reason the environment's
   name the variable: they are printed at startup, and under the service into a log file. A client
   name is now held to one rule wherever it was configured — a variable whose suffix is not a name is
