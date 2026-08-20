@@ -1006,12 +1006,21 @@ Two things worth carrying:
   quote the value they rejected — and every value in this file is a credential. `Credentials` and
   `TokenFile` grew hand-written `Debug`s that print names only, for the same reason `Connection`
   has one.
-- **A name-shaped token is a name.** A charset check on the keys catches a connection string or
+- **A name-shaped token is a name.** A charset check on client names catches a connection string or
   anything carrying a line break, but it cannot catch an entry written back to front, since a
   bearer token is a perfectly good client name — and that entry configures a client named after
   your token, which the startup line prints. That is not fixable in code; it is why the refusal
   that *is* detectable quotes nothing, and why `docs/remote-listener.md` says which way round the
   file goes.
+
+Review found the two gaps that came of writing the file's rules as *the file's*. A name from the
+environment was not held to the charset check, which an install then copies into the file — so a
+variable the listener accepted could install cleanly and fail the service at every start; there is
+one name rule now, wherever the credential was configured, and the environment is still not read at
+all when a file is present. And a repeated key in the file was collapsed by `serde_json::Map` to the
+last of the two, silently, which is the shape this module refuses everywhere else — so the object is
+deserialized through a visitor that keeps every pair, and a name written twice is a refusal that
+names the file.
 
 The end-to-end half is one protocol-tier smoke assertion
 (`a_token_file_names_its_own_clients_and_shuts_the_environment_out`): a real listener, a real file

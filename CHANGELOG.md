@@ -90,8 +90,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a credential it refuses then fails it at every start.
 
   Its refusals name the file and the key and never a value, for the same reason the environment's
-  name the variable: they are printed at startup, and under the service into a log file. One thing
-  they cannot catch is an entry written back to front — a token is a valid client name — so the
+  name the variable: they are printed at startup, and under the service into a log file. A client
+  name is now held to one rule wherever it was configured — a variable whose suffix is not a name is
+  refused rather than skipped, since an install copies those names into the file — and a name
+  written twice in the file is refused rather than collapsed to the last of them. One thing none of
+  it can catch is an entry written back to front, since a token is a valid client name, so the
   documentation says which way round it goes.
 
 - **`server_log` — the server's own log, readable from wherever the client is.** The supervisor
