@@ -414,10 +414,11 @@ pub struct Session {
     ///
     /// The registry is one map for the whole server — handles are minted from it, the cap is
     /// shared, and `end_session` ends what it is handed — so two clients on one listener could see
-    /// and end each other's targets. The tenancy gate stood in for a boundary by serving one client
-    /// at a time, and `2026-07-28` removed the identifier that gate was keyed on
+    /// and end each other's targets. The listener's tenancy gate stood in for a boundary by serving
+    /// one client at a time, and `2026-07-28` removed the identifier that gate was keyed on
     /// ([#162](https://github.com/glslang/windbg-mcp/issues/162)). Recording the owner makes the
-    /// separation a property of the registry rather than of how many clients are let in.
+    /// separation a property of the registry rather than of how many clients are let in — which is
+    /// what let the gate be retired entirely.
     ///
     /// Always [`crate::client::Client::LOCAL`] under stdio, so the rules below are uniform rather
     /// than conditional.
@@ -1054,18 +1055,6 @@ impl Sessions {
         }
     }
 
-    /// Every session, newest first, as `session_status` reports them.
-    /// Whether any live session still has work the engine has not finished.
-    ///
-    /// **Not the same question as "is anyone waiting for it".** A job outlives the wait for it —
-    /// [`Self::call_as`] cancels only the waiter, and says so — so a dropped request, a timeout, or
-    /// a client that vanished all leave a job running against a target. Anything deciding it is
-    /// safe to hand that target to somebody else has to ask this, not whether the caller is still
-    /// there. See [`crate::listen`], which is the caller that has to.
-    pub fn busy(&self) -> bool {
-        self.registry().live().iter().any(|session| session.busy())
-    }
-
     /// Every session id the calling client owns, live or settled.
     ///
     /// For `server_log`, which reads one ring for the whole server: a record naming a session is
@@ -1610,9 +1599,10 @@ impl Sessions {
     /// server that can never debug anything again.
     ///
     /// The caller owns the race this leaves open. Nothing stops a session registering behind the
-    /// snapshot, so this must only be called once the tenancy gate says no client holds the
-    /// server — otherwise a client connecting exactly as the grace expires could have the session
-    /// it just opened released underneath it.
+    /// snapshot, so the listener marks that client's lease `releasing` under the same lock that
+    /// read its deadline, and refuses its requests until this returns — otherwise a client
+    /// connecting exactly as its grace expires could have the session it just opened released
+    /// underneath it.
     pub async fn release_leased(&self, owner: &crate::client::Client) {
         self.release_workers_of(Teardown::Lease, Some(owner)).await
     }
@@ -1692,8 +1682,8 @@ impl Sessions {
         // approximate.
         //
         // That guarantee is bought by `closing` and so belongs to shutdown alone; a lease release
-        // does not get it, which is why the tenancy gate has to stand in for it (see
-        // [`Self::release_leased`]).
+        // does not get it, which is why the listener has to shut that client out for the duration
+        // (see [`Self::release_leased`]).
         //
         // Every session that still *owns a worker*, not every live one. A session claimed for
         // reclamation is already `Closed` while its release runs in the background, and a

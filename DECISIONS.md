@@ -5,6 +5,53 @@ status. Keep entries short; link to code with `file:line` where it helps a futur
 
 ---
 
+## The boundary is ownership, so the gate that stood in for it is gone (2026-08-20, #162)
+
+**Context.** The entry below ("Tenancy is held until the engine is idle") decided that one client
+holds the listener at a time, and it was right for the registry it was written against: handles were
+minted from one map for the whole server, `MAX_SESSIONS` was shared, and `end_session` ended whatever
+it was handed. Nothing in there was scoped to a client, so serving one at a time *was* the boundary —
+"forced by the registry rather than chosen", as it says.
+
+`2026-07-28` removed the protocol-level MCP session (SEP-2567), which removed the identifier that
+gate was keyed on, and #162 answered that by giving the registry the boundary it never had: a session
+belongs to the client that opened it, identified by the credential it authenticated with, and
+routing, the cap, the closed-session history, `server_log` and lease release are all per client.
+
+**Decision.** Retire the gate. Once sessions are owned, the contention it had left to arbitrate was
+one credential racing *itself* — a second `initialize`, or a request bearing an id that is not the
+one it holds — and inside a namespace that is not a boundary: both MCP sessions reach the same debug
+sessions, because they are the same client. A `409` there cost a client its own concurrency and
+bought nothing, and at its sharpest it cost the recovery path: a request that reserved locked its own
+credential out of `session_status` and `end_session` (#168).
+
+**The lease stays, as a clock.** That was the question `FOLLOWUPS.md` item 28 was filed to settle,
+and the answer is not "idle release covers it". Idle release (`WINDBG_MCP_SESSION_IDLE_SECS`, #164)
+deliberately spares a session with a call outstanding, which is exactly the parked `attach_kernel` a
+vanished client leaves behind, and it knows nothing about MCP sessions, so an abandoned one would
+stay resident in the service with its id accepted. So: any request renews the lease, an expiry
+releases that client's sessions and closes its MCP sessions, and a request arriving mid-release is
+told to ask again — the sweep's refusal, which was never tenancy.
+
+**What this deletion vindicates about the entry below.** That one ended with a lesson: seven review
+rounds went on conditions added one layer *above* the resource being protected — a reservation
+needed a lifetime, the lifetime a resolution, the resolution an undo, the in-flight counter an epoch
+— and each answer was true of its level and silent about the one below. Removing the gate removed all
+four, and the property they were approximating turned out to be enforced by the floor that was there
+from the start: a sweep fires only after a whole grace with nothing admitted, and `Lease::new` refuses
+a grace shorter than the longest a call can keep a client quiet, so **no request of that credential's
+can still be in flight when its lease expires**. The corollary for next time is the same lesson with
+the sign flipped: when a chain of conditions keeps needing another link, check whether something
+below it already answers the question — and whether the thing being guarded is a boundary at all.
+
+**Status.** Landed 2026-08-20 (#162 slice 3b, closing item 28). `Presence` replaces `Tenancy`; the
+reservation, `Admission::Occupied`, the `Stale` settlement, the in-flight count and its epoch, the
+`Sessions::busy` handover and every read of `MCP-Protocol-Version` are gone. A credential's MCP
+sessions are a set, because an id recorded for nobody is one any credential may present. Ninety lease
+tests became twenty, and the smoke tier now asserts the opposite of the `409` it used to.
+
+---
+
 ## A service's stop is the only part of it that can break something (2026-08-17)
 
 **Context.** `--listen` as a foreground process dies with the login session, inherits whatever
@@ -43,7 +90,7 @@ console, so the role writes to `%ProgramData%\windbg-mcp\service.log` — `serve
 channel, but only once the listener is up, which is exactly the failure not worth diagnosing that
 way.
 
-**What it does not change.** The lease, the single-tenancy rule and the bearer check are all
+**What it does not change.** The lease, the client boundary and the bearer check are all
 untouched; a service is a way to *run* the listener, not a second one. The foreground path hands
 over a shutdown future that never fires, so its behaviour is byte for byte what it was.
 
@@ -187,7 +234,9 @@ was wrong for a year of nobody noticing because it had no test. It had no test b
 unreachable without an HTTP harness, not because anyone decided to skip it. It is now a named
 predicate (`listen::is_departure`) with the same unit coverage every rule beside it has.
 
-**Status.** Implemented (#135, #137). Three of the four things this listed as missing have since
+**Status.** Implemented (#135, #137); the single-tenancy half was **retired** on 2026-08-20 — see
+the entry above, which is where the reasoning now lives. The lease itself stands, as the clock this
+describes minus the gate. Three of the four things this listed as missing have since
 landed, each with an entry of its own above: the log reaches a remote client (as a tool, not a
 notification), the lease has the smoke tier whose absence made seven rounds of review the way these
 were found rather than the second, and a long call now reports its progress. **Service installation**, the fourth,

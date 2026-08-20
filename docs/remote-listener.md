@@ -133,14 +133,12 @@ caller. The bound is the sum because an opener spends up to 30 s bringing a work
 call budget starts. If the server refuses to start, that message is why; raise the grace or lower
 the call timeout.
 
-**Saying goodbye starts the grace; it does not end it.** A `DELETE` gives up the tenancy — the next
-client is served once the departing one's work has drained, rather than after a whole grace period
-(`Lease::try_give_up` holds it while a request is in flight or a worker is still busy, so a `409`
-just after a `DELETE` is that, not a failure) — but the sessions that client opened stay open for
-one more grace period, and its engine worker processes with them. That is the adoption case below,
-reached deliberately: a client that restarts is the common reason a client says goodbye, and making
-it pay a fresh `attach_kernel` would defeat the property this whole arrangement is for. If you are
-really done, end the sessions first: `end_session` releases **one** target — the one you name, or the
+**Saying goodbye starts the grace; it does not end it.** A `DELETE` closes the MCP session it
+names, and the clock starts — but the debug sessions that client opened stay open for one more grace
+period, and their engine worker processes with them. That is the adoption case below, reached
+deliberately: a client that restarts is the common reason a client says goodbye, and making it pay a
+fresh `attach_kernel` would defeat the property this whole arrangement is for. If you are really
+done, end the sessions first: `end_session` releases **one** target — the one you name, or the
 current one — so a client holding several has to call it for each, and `session_status` is what
 lists them. That is the difference between a live kernel that is free and one still owned for the
 next 390 seconds.
@@ -148,8 +146,8 @@ next 390 seconds.
 **A returning client adopts what it left.** Sessions are not released the moment a client goes
 away, so reconnecting inside the grace finds them still open — which is better than stdio, where a
 client restart costs a KDNET attach, and a KDNET attach costs a reboot of the target. The log says
-how many sessions were inherited when that happens — or that nothing was open, since a client can
-also arrive to find the previous one had let go of an empty server.
+how many sessions were inherited when that happens — or that nothing was open, since a credential
+can also come back to find the MCP session it let go of had nothing open behind it.
 
 ## A session nobody is using is released
 
@@ -157,12 +155,19 @@ The lease answers "has this *client* gone away". There is a second question it c
 the revision most clients now negotiate it is the only one left: **has anyone touched this session
 at all?**
 
-`2026-07-28` removed the protocol-level MCP session ([SEP-2567]), so no `Mcp-Session-Id` is minted
-and the lease — which
-identifies a client by exactly that header — never takes a holder. A client that vanishes on that
-revision leaves its targets held until this process exits, which for a live kernel means a machine
-owned by nobody. See [#162](https://github.com/glslang/windbg-mcp/issues/162) for the whole of it;
-this is the half that needs no client identity and so keeps working whatever the transport does.
+`2026-07-28` removed the protocol-level MCP session ([SEP-2567]), and a lease is armed by one — so a
+client on that revision is never given a clock. A client that vanishes there would leave its targets
+held until this process exits, which for a live kernel means a machine owned by nobody. See
+[#162](https://github.com/glslang/windbg-mcp/issues/162) for the whole of it; this is the half that
+needs no client identity and so keeps working whatever the transport does.
+
+**Not fixed by arming the lease from the credential instead**, which is now what identifies a
+client and could perfectly well carry a clock. The two mechanisms answer different questions on
+purpose. A lease releases *everything* that credential holds, busy sessions included, on the
+reasoning that a client silent for a grace has gone; a `2026-07-28` client is legitimately silent
+for far longer than 390 seconds — a model thinking between calls — and releasing a live kernel from
+under a caller who is merely thinking is a worse failure than holding an abandoned one for half an
+hour.
 
 | | |
 | --- | --- |
@@ -211,9 +216,9 @@ What ownership buys, and it is the whole of it:
 | Reclamation | a session is only ever reclaimed to make room for **its own** client |
 | History | a closed session ages out of `session_status` on its **own** client's churn, not the server's |
 | The log | `server_log` shows the caller's sessions' records, plus the supervisor's own, which name no session — and the buffer counts it reports are over the records that caller can read |
-| Lease expiry | releases the sessions of the client whose lease ran out, and no others |
-| Session ids | an `Mcp-Session-Id` another client holds is reported **unknown**, before this caller's own tenancy is consulted |
-| Contention | **within** a client only — one client's long call does not make another wait |
+| Lease expiry | releases the sessions of the client whose lease ran out, and no others — and refuses only that client's requests while the release runs |
+| Session ids | an `Mcp-Session-Id` another client holds is reported **unknown**, before this caller's own lease is consulted at all |
+| Contention | none — no client waits on another, and no client waits on itself |
 
 **Why authentication is the identity.** `2026-07-28` removed the protocol-level MCP session
 ([SEP-2567]), so there is no session id to key on; requests arrive on whatever socket a client's
@@ -222,42 +227,35 @@ requests. The credential is what is left, and it is what every other stateless H
 a client presents for itself would be a label; a name only the holder of a token can present is a
 boundary.
 
-**Two clients do not queue behind each other.** The lease still arbitrates *within* a client — a
-second **MCP session** for one token contends, and gets a `409` — because that is one credential
-racing itself. Across clients there is nothing to arbitrate: a pool walk that keeps one client busy
-for four minutes used to make every other client wait, for a boundary the registry now provides
-properly.
+**Nothing queues behind anything.** Two clients never did after ownership landed, and since
+`FOLLOWUPS.md` item 28 was settled a client does not queue behind *itself* either: the tenancy gate
+is gone. It refused a credential a second **MCP session** — a fresh `initialize` while it held one,
+or a request bearing an id that was not the one it held — with a `409`. That was the whole boundary
+once, when handles were minted from one registry, the cap was shared and `end_session` ended
+whatever it was handed. Ownership took the job over, and what the gate had left to arbitrate was one
+credential racing itself, which inside its own namespace is not a boundary at all: both MCP sessions
+reach the same debug sessions, because they are the same client.
 
-A `409` is never about *connections*. Requests carrying the session a credential already holds are
-served concurrently, which is what lets a `DELETE` arrive on one connection while a tool call runs
-on another — the topology every streamable-HTTP client uses. What it refuses is a second MCP session
-for one credential: a fresh `initialize` while a session is held or being opened, or a request
-bearing an id that is not the one it holds. A request that arrives while another of the same
-credential's is still *opening* one is refused on the same grounds, which is why the body names both.
+So a credential may hold several MCP sessions, and each is recorded — an id owned by nobody is one
+*any* credential may present, and the answer to another client's id is still **unknown**.
 
-**A client on a sessionless revision contends with nothing.** `2026-07-28` removed the session
-([SEP-2567]), so such a client can never become the holder the gate arbitrates — and a request that
-cannot become one reserves nothing. It used to: every stateless request took the *opening* path, so
-any two that overlapped got a `409`, and a call that parked took its whole credential with it. That
-was [#168](https://github.com/glslang/windbg-mcp/issues/168), and it is fixed; the tier that pins it
-runs a `tools/list`, a `session_status` and an `end_session` alongside a kernel attach that never
-comes back.
+**What a `409` means now, and it is the only one left.** After a lease runs out, that credential's
+sessions are released in the background, and a request arriving during the cleanup is refused while
+it holds nothing at all — the body names the release, because the fix is to ask again in a moment
+rather than to go looking for a session you do not have. Nothing else here answers `409`: an id
+this server never issued is a `404` from the MCP service, and one another client holds is the same
+`404`, deliberately — the answer must not confirm a session the caller may not touch.
 
-This is about the revision, not about the header being absent. A client on a revision that *has*
-sessions and sends no id is opening one — an `initialize`, or a resume — and still takes the
-opening path, `409` and all.
-
-What is left of the gate for such a client is the teardown: a request arriving while its own expired
-sessions are being released is refused with the `409` below and should ask again once the release
-is done. Whether the rest of the gate earns its place is `FOLLOWUPS.md` item 28.
+**A client on a sessionless revision is refused less still.** `2026-07-28` sends no id, so it can
+never present one that is not its own, and the only thing it can be told to wait for is its own
+release. It used to be told far more: every request took the gate's *opening* path, so any two that
+overlapped got a `409`, and a kernel attach whose target never dialled in locked its whole
+credential out of `session_status` and `end_session` — the two calls that recover it. That was
+[#168](https://github.com/glslang/windbg-mcp/issues/168), fixed by not reserving for a request that
+could never become the holder, and the classification behind it is gone with the gate.
 
 Such a client also never installs a lease at all, which is why abandonment on this revision is the
 idle release's job rather than the grace's — see *A session nobody is using is released*, above.
-
-**One `409` means the opposite of the others**, and says so: after a lease runs out, the sessions are
-released in the background, and a request arriving during that cleanup is refused while the
-credential holds nothing at all. Its body names the release rather than a session, because the fix
-is to ask again in a moment rather than to go looking for a session you do not have.
 
 **This does not authorise anything beyond separation.** Every client that can authenticate has the
 whole tool surface, including `execute` and `launch`. Tokens separate clients from each other; they

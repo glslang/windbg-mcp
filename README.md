@@ -234,11 +234,10 @@ target before exiting, because a live kernel that is merely killed is left froze
 against a live kernel, and the token is sent in clear — a hypervisor's guest network is not private
 when the machine being debugged shares it. [`docs/remote-listener.md`](./docs/remote-listener.md)
 covers the tokens — **one per client**, each with its own sessions, so two people or two agents on
-one listener cannot reach each other's targets — the session lease and its grace, and what a `409`
-means (one credential asking for a second MCP session, never a second client, and never a request on
-a second connection — those are served concurrently, as are a `2026-07-28` client's, which have no
-session to ask twice for, except while that credential's own expired sessions are still being
-released). For a one-off, [`docs/remote-phase0.md`](./docs/remote-phase0.md) does the same
+one listener cannot reach each other's targets — the session lease and its grace, and the one thing
+a `409` means: this credential's own expired sessions are still being released, so ask again in a
+moment. Nothing else is refused for contention — a credential may hold several MCP sessions, and
+requests of one client never wait on another's. For a one-off, [`docs/remote-phase0.md`](./docs/remote-phase0.md) does the same
 job over plain `ssh` with no listener.
 
 ### As a Claude Code plugin

@@ -17,6 +17,11 @@
 //! client opened it. A name that another client cannot present is a boundary; a name it chooses for
 //! itself would be a label.
 //!
+//! That boundary is the only one left. The gate that served one client at a time has since been
+//! retired outright (`FOLLOWUPS.md` item 28): once a session belongs to a client, one credential
+//! opening a second MCP session contests nothing — both reach the same debug sessions, because
+//! they are the same client.
+//!
 //! # How it reaches a tool
 //!
 //! The same way a progress sink does, and for the same reason: the identity is known at the

@@ -389,35 +389,37 @@ log line reporting `local`'s session count to a named client on reconnect.
 another client's handle is reported *unknown* rather than refused. Two tokens on one host are two
 namespaces — if a session "vanished", check which token the request carried.
 
-**A request with no session id is two different things, and the gate has to tell them apart.**
-`Arriving` names all three: `Holding(id)`, `Opening` — no id and no header naming a sessionless
-revision, chiefly a legacy `initialize` — and `Stateless`, which is `2026-07-28`. Note `Opening` is
-a *fallback*, not a claim about the revision: a `2026-07-28` handshake that omits the header lands
-there too, which is why a reservation must survive minting nothing. **`Stateless` is the one variant that never
-reserves.** Not the same as "only `Opening` reserves": a `Holding` request whose credential has no
-current holder is a client *resuming* inside the grace, and it reserves too, because a resume can
-race a fresh `initialize` and a gate that merely served both would let them both through. Reading
-the absence of an id as "opening" is what made every request of a stateless client a reservation:
-two that overlapped contended, and a call that parked locked its own credential out of
-`session_status` and `end_session`, so a going-nowhere kernel attach was a reason to restart the
-server again for the revision current clients negotiate (#168, fixed 2026-08-19). The revision is
-read from `MCP-Protocol-Version` and matched against `ProtocolVersion::KNOWN_VERSIONS` rather than
-compared as a string — the comparison is lexicographic and correct for ISO dates, but `draft` sorts
-above every date and would be read as the newest thing there is.
+**There is no tenancy gate any more, and stale memory of it is the likeliest thing to mislead you
+here.** Retired 2026-08-20 (`FOLLOWUPS.md` item 28, once #162's ownership had taken the boundary
+over). What `Lease` is now: a clock, plus the two answers that were never tenancy. `admit` refuses an
+`Mcp-Session-Id` **another client** records (`404`, *unknown* — never "someone else's") and a request
+whose own credential is mid-release (`409`, ask again in a moment), and otherwise renews. Gone with
+the gate: the reservation and its generation counter, `Occupied`/`409`, the in-flight count and its
+epoch, the handover that waited on `Sessions::busy` (and `Sessions::busy` itself), `Arriving`, and
+every read of `MCP-Protocol-Version` — the classification behind #168 is deleted rather than fixed,
+so a request now presents an id or nothing and the revision does not enter into it. A credential may
+hold **several** MCP sessions; they are kept in a set, because an id recorded for nobody is one any
+credential may present.
 
-**Two lease rules a stateless request breaks if you forget them**, both ending the same way: a
-client losing sessions it was using. The sweep reads `deadline` alone and zeroes `in_flight` on its
-way past, so work actually running does not save them.
+**One lease rule survives, and forgetting it costs a client sessions it was using.** An **admitted**
+request renews an existing deadline and creates none:
 
-- An **admitted** stateless request renews an existing deadline and never creates one. Refused ones
-  renew nothing, deliberately: a refusal that renewed would let repeated bad requests keep an
-  abandoned client's sessions alive. A credential holding a
-  legacy session and since sending stateless requests would otherwise be swept mid-call; and a
-  deadline created where no holder exists is a lease against nothing, which would release a purely
-  stateless client's sessions on a timer it never set. That abandonment is `IDLE_RELEASE`'s.
-- A reservation that mints nothing gives the **deadline** back along with the claim. A `2026-07-28`
-  `initialize` may legitimately omit `MCP-Protocol-Version` — it is the request that establishes it
-  — so it arrives looking like an opener, reserves, and then takes nothing.
+- *admitted*, because a refusal that renewed would let a stream of wrong session ids hold an
+  abandoned client's live kernel target open for ever — the failure the sweep exists to prevent. Both
+  refusals return before the renewal, and that ordering is the rule.
+- *any* request, not any request of a shape: a credential holding a legacy session can go on to send
+  `2026-07-28` ones (a client that upgraded, or restarted inside the grace), and the sweep reads
+  `deadline` and nothing else.
+- *creates none*, because a clock armed for a credential that holds nothing releases everything it
+  opens one grace later. Only a settled MCP session arms one, which is what makes the trap that used
+  to sit beside this — a reservation minting nothing and having to hand its deadline back —
+  unreachable rather than handled.
+
+The sweep zeroes nothing and waits for nothing, so what keeps it from releasing a session mid-call is
+the startup floor in `Lease::new`: a grace longer than the longest a call can keep a client quiet
+means **no request of that credential's can still be in flight when its lease expires**. That is the
+property the epochs and claim generations were protecting one layer above, and it was already
+enforced.
 
 **Driving the listener by hand on `2026-07-28` needs three things, and sending one gets a `400`
 that looks like a broken server.** Every request *after the handshake* carries the
