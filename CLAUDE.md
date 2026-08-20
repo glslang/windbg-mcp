@@ -389,6 +389,46 @@ log line reporting `local`'s session count to a named client on reconnect.
 another client's handle is reported *unknown* rather than refused. Two tokens on one host are two
 namespaces — if a session "vanished", check which token the request carried.
 
+**A request with no session id is two different things, and the gate has to tell them apart.**
+`Arriving` names all three: `Holding(id)`, `Opening` — a revision that *has* sessions, opening or
+resuming one — and `Stateless`, which is `2026-07-28` and has none. Only `Opening` reserves. Reading
+the absence of an id as "opening" is what made every request of a stateless client a reservation:
+two that overlapped contended, and a call that parked locked its own credential out of
+`session_status` and `end_session`, so a going-nowhere kernel attach was a reason to restart the
+server again for the revision current clients negotiate (#168, fixed 2026-08-19). The revision is
+read from `MCP-Protocol-Version` and matched against `ProtocolVersion::KNOWN_VERSIONS` rather than
+compared as a string — the comparison is lexicographic and correct for ISO dates, but `draft` sorts
+above every date and would be read as the newest thing there is.
+
+**Two lease rules a stateless request breaks if you forget them**, both ending the same way: a
+client losing sessions it was using. The sweep reads `deadline` alone and zeroes `in_flight` on its
+way past, so work actually running does not save them.
+
+- A stateless request **renews** an existing deadline and never creates one. A credential holding a
+  legacy session and since sending stateless requests would otherwise be swept mid-call; and a
+  deadline created where no holder exists is a lease against nothing, which would release a purely
+  stateless client's sessions on a timer it never set. That abandonment is `IDLE_RELEASE`'s.
+- A reservation that mints nothing gives the **deadline** back along with the claim. A `2026-07-28`
+  `initialize` may legitimately omit `MCP-Protocol-Version` — it is the request that establishes it
+  — so it arrives looking like an opener, reserves, and then takes nothing.
+
+**Driving the listener by hand on `2026-07-28` needs three things, and sending one gets a `400`
+that looks like a broken server.** Every request carries the `MCP-Protocol-Version` header,
+`params._meta` with `io.modelcontextprotocol/protocolVersion` *and* `…/clientCapabilities`
+(SEP-2567 moved them there when it removed the session that held them), and SEP-2243's `Mcp-Method`
+— plus `Mcp-Name`, which is mapped **per method**: `params.name` for `tools/call` and `prompts/get`,
+`params.uri` for `resources/read`, nothing for the rest. `PowerShell`'s `Invoke-WebRequest` throws
+on a 4xx and leaves the body on the exception, so those refusals read as empty when they in fact
+name what is missing. Before believing any protocol-level claim about `--listen`, read the validator
+that produced it: the rmcp source is on the Mac and needs no Windows build, at
+`~/.cargo/registry/src/*/rmcp-<ver>/src/transport/streamable_http_server/tower.rs`.
+
+**A listener test that needs a real engine worker belongs in the debugger tier**, however cheap it
+looks — the protocol tier's contract is "no debugger target". An attach cannot *park* without
+`dbgeng.dll`: it fails during initialisation instead, which turns a test about a call that does not
+return into one about a call that failed fast. CI's Windows runner happens to have the DLL, so
+getting this wrong does not show up as a red build.
+
 **Credentials are built from variables handed in, not read from the environment**
 (`Credentials::from_entries`), for the same reason as `kdconn::env_entries`: `set_var` is `unsafe` in
 edition 2024 and mutates state the whole test binary shares. And they are **stripped from every
