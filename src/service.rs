@@ -230,12 +230,23 @@ fn token_file_contents(credentials: &[(String, String)]) -> String {
 /// object instead — the token is not the operator's mistake — and a writer that asks cannot drift
 /// from a reader that changes.
 ///
+/// **The question is about the credential, not the name**, and getting that wrong was the second
+/// finding: a token that is itself a one-entry object — `{"local":"replacement"}` — parses to a
+/// client called `local`, so a check on the name alone said yes and the service would then have
+/// accepted `replacement` instead of what the operator set. So: exactly one credential, and it is
+/// *this* token naming `local`.
+///
 /// No filesystem is touched: [`crate::client::TokenFile::parse`] takes the text, and the path is
 /// only what its refusals would name.
 fn reads_back_bare(token: &str) -> bool {
     crate::client::TokenFile::parse(token, &token_file())
         .and_then(|file| crate::client::Credentials::from_entries(std::iter::empty(), Some(file)))
-        .is_ok_and(|creds| creds.names() == [crate::client::Client::LOCAL])
+        .is_ok_and(|creds| {
+            creds.len() == 1
+                && creds
+                    .client_for(token)
+                    .is_some_and(|client| client.name() == crate::client::Client::LOCAL)
+        })
 }
 
 /// `SYSTEM` and `Administrators`, by SID so a localised Windows is not a special case.
@@ -862,6 +873,13 @@ mod tests {
             // the reader would take it for the JSON one. Nothing is wrong with the token, so it
             // goes in the object rather than being refused.
             vec![("local".to_string(), "{not-json-just-a-token".to_string())],
+            // The nastier one: a token that *is* a one-entry object naming `local`. Written bare
+            // it parses — to a different token — so this asserts the whole credential survives,
+            // not just the client's name.
+            vec![(
+                "local".to_string(),
+                r#"{"local":"replacement"}"#.to_string(),
+            )],
         ] {
             let written = token_file_contents(&credentials);
             let creds = read_back(&written);
