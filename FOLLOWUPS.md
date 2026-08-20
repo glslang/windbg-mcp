@@ -1023,7 +1023,10 @@ deserialized through a visitor that keeps every pair, and a name written twice i
 names the file. The third finding was the same shape from the writer's side — a token that happens
 to begin with `{` cannot go in the file bare, because the reader takes a leading brace as the JSON
 shape — and the fix is the general one: the installer asks the reader whether the bare form reads
-back as what it meant, rather than restating the rule in a second place.
+back as what it meant, rather than restating the rule in a second place. Worth knowing that the
+first version of *that* asked the wrong question — it checked the client's name, which a token that
+is itself a one-entry object satisfies while carrying a different token — so the round trip is on
+the whole credential: exactly one, and it is this token naming `local`.
 
 The end-to-end half is one protocol-tier smoke assertion
 (`a_token_file_names_its_own_clients_and_shuts_the_environment_out`): a real listener, a real file
