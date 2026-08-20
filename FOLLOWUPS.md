@@ -1020,7 +1020,10 @@ one name rule now, wherever the credential was configured, and the environment i
 all when a file is present. And a repeated key in the file was collapsed by `serde_json::Map` to the
 last of the two, silently, which is the shape this module refuses everywhere else — so the object is
 deserialized through a visitor that keeps every pair, and a name written twice is a refusal that
-names the file.
+names the file. The third finding was the same shape from the writer's side — a token that happens
+to begin with `{` cannot go in the file bare, because the reader takes a leading brace as the JSON
+shape — and the fix is the general one: the installer asks the reader whether the bare form reads
+back as what it meant, rather than restating the rule in a second place.
 
 The end-to-end half is one protocol-tier smoke assertion
 (`a_token_file_names_its_own_clients_and_shuts_the_environment_out`): a real listener, a real file

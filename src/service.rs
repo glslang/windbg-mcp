@@ -198,10 +198,12 @@ pub fn token_file() -> PathBuf {
 /// only shape that can carry more than one and the same one `WINDBG_MCP_PROFILES` uses.
 ///
 /// Both are read back by [`crate::client::TokenFile`], which is where the shapes are defined; this
-/// only has to pick between them.
+/// only has to pick between them — and picks by [asking it](reads_back_bare) rather than by
+/// restating its rule.
 fn token_file_contents(credentials: &[(String, String)]) -> String {
     if let [(name, token)] = credentials
         && name == crate::client::Client::LOCAL
+        && reads_back_bare(token)
     {
         return token.clone();
     }
@@ -217,6 +219,23 @@ fn token_file_contents(credentials: &[(String, String)]) -> String {
     // a service that then refuses every caller — which is the exact outcome this path exists to
     // prevent.
     serde_json::to_string_pretty(&named).expect("a map of strings serializes") + "\n"
+}
+
+/// Whether `token`, written on its own, reads back as the one `local` credential it is meant to be.
+///
+/// **Asked of the reader rather than restated here**, because the bare shape is the reader's to
+/// define and this is the second place that would have to know its rules. Review caught the first
+/// thing that costs: a random token beginning with `{` is read as the JSON shape, so writing it
+/// bare is an install that reports success and a service that fails at every start. It goes in the
+/// object instead — the token is not the operator's mistake — and a writer that asks cannot drift
+/// from a reader that changes.
+///
+/// No filesystem is touched: [`crate::client::TokenFile::parse`] takes the text, and the path is
+/// only what its refusals would name.
+fn reads_back_bare(token: &str) -> bool {
+    crate::client::TokenFile::parse(token, &token_file())
+        .and_then(|file| crate::client::Credentials::from_entries(std::iter::empty(), Some(file)))
+        .is_ok_and(|creds| creds.names() == [crate::client::Client::LOCAL])
 }
 
 /// `SYSTEM` and `Administrators`, by SID so a localised Windows is not a special case.
@@ -839,6 +858,10 @@ mod tests {
             // A shell with only a named token configures no `local`, and that is not a special
             // case: it is one client, which happens not to be that one.
             vec![("ci".to_string(), "for-ci".to_string())],
+            // And a lone `local` whose token begins with `{`, which the bare shape cannot carry:
+            // the reader would take it for the JSON one. Nothing is wrong with the token, so it
+            // goes in the object rather than being refused.
+            vec![("local".to_string(), "{not-json-just-a-token".to_string())],
         ] {
             let written = token_file_contents(&credentials);
             let creds = read_back(&written);
