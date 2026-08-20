@@ -406,3 +406,47 @@ tell two kernel targets apart. `attach_kernel` with no arguments lists the profi
 `record_trace` captures the recorder's startup output to `<out_dir>\ttd_record.log` and
 watches it briefly, so a fast failure (e.g. un-elevated → `0x80070005 Access is denied`)
 is reported as an error rather than a false "recording started".
+
+## The server on another machine
+
+Everything above is about the machine the **server** runs on, which need not be the machine the
+client and the model run on. DbgEng is Windows-only and holds one debuggee per process; nothing
+about the client is. So the engine bundle, the symbols and the elevation table are the *debugger
+host's* problem, and the setup question that changes when the client is elsewhere is only how it
+gets there.
+
+```console
+# on the debugger host, with WINDBG_MCP_LISTEN_TOKEN already set
+windbg-mcp.exe --listen 127.0.0.1:8765
+# on the client machine
+ssh -N -L 8765:127.0.0.1:8765 <debugger-host>
+claude mcp add windbg-vm --transport http http://127.0.0.1:8765/ \
+  --header "Authorization: Bearer $WINDBG_MCP_LISTEN_TOKEN"
+```
+
+Four things decide whether that works, and each fails in a way that reads as something else:
+
+- **A token is required and the server refuses to start without one.** This endpoint runs
+  `execute`, `debug_batch` and `launch`, so an unauthenticated port is arbitrary code on the host
+  holding your kernel debugger. A start that exits immediately, having said so on stderr, is this.
+- **Bind loopback and forward over ssh.** The token is sent in clear, and a hypervisor's guest
+  network is not private when the machine being debugged is on it. A non-loopback bind warns on
+  every start rather than refusing, because sometimes you mean it.
+- **Symbols are still fetched by the server**, from the debugger host's `_NT_SYMBOL_PATH` — never
+  over the link from the client, and never over the KD wire from the target. A client with symbols
+  configured and a server without resolves nothing.
+- **For anything longer than one session, install it as a service** (`--install-service --listen
+  <addr>`, elevated). It survives logout and starts at boot, and it gets a defined working
+  directory — which is what decides whether the engine DLLs beside the exe are the ones that load.
+  Note `LocalSystem` does not read *your* `%USERPROFILE%`, so kernel profiles have to be configured
+  machine-wide for a service to see them.
+
+Two behaviours differ from stdio and are worth knowing before they surprise you. A client that
+disconnects does not immediately release its targets: a **lease** does that after a grace period,
+so a client restart inside the grace comes back to the sessions it left — which is what keeps a
+client restart from costing a KDNET attach. And every client authenticates as itself: two tokens
+are two namespaces, so a session opened under one is *unknown* to the other rather than refused.
+If a handle has "vanished", check which token the request carried.
+
+`docs/remote-listener.md` in the repository is the operator's reference for the rest — the grace
+and how to change it, what a `409` means, and running behind a service.
