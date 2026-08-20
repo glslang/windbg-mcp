@@ -910,7 +910,7 @@ nobody is one any credential may present — tracking only the newest would have
 the ownership check closes. Ninety lease tests became twenty; the ones that went were about
 sequencing a handover that no longer happens.
 
-## 29. [windbg-mcp] The listener smoke tier only ever runs one, unnamed client
+## 29. [windbg-mcp] The listener smoke tier only ever runs one, unnamed client — **done** (2026-08-20)
 
 Every listener assertion in `tests/mcp_smoke.rs` starts the server with a single
 `WINDBG_MCP_LISTEN_TOKEN`, so everything the tier proves is proved for the `local` client alone. The
@@ -933,7 +933,29 @@ target.
 **Why deferred:** the per-client rules are unit-tested at the level they are decided, so this buys
 call-site coverage rather than new claims. Picks up at the listener helpers in `tests/mcp_smoke.rs`.
 
-## 30. [windbg-mcp] Nothing covers a `2026-07-28` handshake that omits the protocol header
+**What landed** (2026-08-20) is the tier this entry asked for —
+`two_clients_on_one_listener_keep_their_sessions_to_themselves`: two tokens on one port, a dump open
+as each, neither able to see, route to or end the other's, the `404` for a request bearing the
+other's `Mcp-Session-Id`, and the adoption line read back out of `server_log` after an
+open → `DELETE` → reconnect. **It was not call-site coverage. Its first assertion failed**: both
+clients saw both sessions.
+
+**The identity never reached a tool call.** `listen::gate` scopes the caller around
+`mcp.handle(req)` — the HTTP task — while rmcp serves a legacy MCP session from a task it
+`tokio::spawn`s at `initialize` (`spawn_session_worker`), and a task-local does not cross a spawn.
+So every call ran as the default `local`, both clients' sessions were owned by `local`, and the
+whole of [#162](https://github.com/glslang/windbg-mcp/issues/162) was correct machinery being handed
+the wrong caller — in the transport it was written for. `WindbgServer` now carries the client it was
+built for, captured in the listener's service factory (which does run inside the gate's scope) and
+re-entered in `call_tool`.
+
+**Worth keeping: "unit-tested where it is decided" is not coverage of the thing being decided.**
+Each rule's test supplied the identity itself, so the one input that was wrong in production was the
+one input no test ever provided. The reasoning that deferred this item — that it buys call-site
+coverage rather than new claims — was sound and still wrong, because the call site was where the
+input came from.
+
+## 30. [windbg-mcp] Nothing covers a `2026-07-28` handshake that omits the protocol header — **done** (2026-08-20)
 
 rmcp allows a stateless `initialize` to arrive without `MCP-Protocol-Version` — it is the request
 that establishes the revision, so the header is optional on exactly that one. Nothing here drives
@@ -958,6 +980,14 @@ mechanism to catch, so it is worth doing only if the arming rule ever grows a se
 **Why deferred:** it buys call-site coverage of a path whose hazard has been deleted rather than
 handled. Picks up at the listener helpers in `tests/mcp_smoke.rs`, beside
 `the_listener_serves_the_stateless_revision_it_negotiates`.
+
+**What landed** (2026-08-20): `a_stateless_handshake_may_omit_the_protocol_header`, in the place
+this entry named. The handshake is served, negotiates the revision out of its body, mints no
+`Mcp-Session-Id`, and the `tools/list` and `tools/call` after it are ordinary. Nothing surprising,
+which is what the entry predicted — item 28 deleted the mechanism that made this shape dangerous, so
+what is pinned here is the shape and not the hazard. The half that would watch a session survive the
+grace after such a handshake is still not done, for the reason above: it needs an opener, and so a
+worker.
 
 ## 31. [windbg-mcp] A service-hosted listener can hold only one client — **done** (2026-08-20)
 

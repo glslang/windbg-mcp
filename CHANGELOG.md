@@ -217,6 +217,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Two clients on one listener shared a namespace after all**
+  ([#162](https://github.com/glslang/windbg-mcp/issues/162), found while closing `FOLLOWUPS.md`
+  item 29). Ownership was decided correctly everywhere it is decided — and the identity it was
+  decided from never reached a tool call. `listen::gate` scopes the caller around
+  `mcp.handle(req)`, which is the HTTP task; rmcp serves a legacy MCP session from a task it spawns
+  at `initialize`, and a task-local does not cross a spawn. So every call ran as the default
+  `local`: both clients' sessions were owned by `local`, both clients saw both, and either could
+  route to or end the other's — the precise harm per-client namespaces were built to stop, in the
+  transport they were built for.
+
+  Nothing in the suite could see it. Every rule is unit-tested where it is decided, and those tests
+  set the identity themselves; the smoke tier ran one client, for whom `local` is the right answer.
+  It took two credentials on one port with a session each.
+
+  The service instance now **carries** its client — captured in the listener's service factory,
+  which does run inside the gate's scope, and re-entered in `call_tool`, the one place every tool
+  passes. Stdio is unaffected: it has one client and no way to authenticate a second.
+
 - **A listener client on `2026-07-28` can use more than one request at a time**
   ([#168](https://github.com/glslang/windbg-mcp/issues/168)). [SEP-2567] removed the MCP session id
   from the revision current clients negotiate, and the listener's tenancy gate read the absence of

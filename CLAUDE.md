@@ -386,12 +386,24 @@ variable in the shell rather than the unnamed one alone. Under stdio everything 
 so there is one set of rules and no transport exception. `docs/remote-listener.md` is the operator's
 half; what follows is what bites while editing.
 
-**Identity is ambient inside a call and by name outside one.** `crate::client::current()` reads a
-task-local that `listen::gate` sets — with `client::as_client`, around the `mcp.handle(req)` that
-is the whole MCP call — which is why no tool signature carries a caller. Anything running *outside*
-that scope — the listener's own diagnostics, a sweep, a shutdown — gets the default `local` instead
-of an error, so it must take the client as a parameter
-(`Sessions::live_count_for` against `Sessions::snapshot`). The bug this rule is written from was a
+**Identity is ambient inside a call, carried by the instance, and by name outside both.**
+`crate::client::current()` reads a task-local, which is why no tool signature carries a caller. What
+sets it around a tool call is **`call_tool`**, from the client its `WindbgServer` was built with —
+*not* `listen::gate`'s `as_client` around `mcp.handle(req)`. The gate's scope covers the HTTP task;
+rmcp serves a legacy MCP session from a task it `tokio::spawn`s at `initialize`
+(`streamable_http_server::tower::spawn_session_worker`), and a task-local does not cross a spawn. So
+the credential is captured where the instance is built — the listener's service factory, which does
+run inside the gate's scope — and re-entered per call.
+
+**Getting that wrong is invisible to everything but two real clients.** It was wrong from #162 until
+the two-client smoke tier found it (`FOLLOWUPS.md` item 29): every call ran as the default `local`,
+so both clients' sessions were owned by `local` and each could see, route to and end the other's,
+while every unit test passed — each sets the identity itself, and the tier ran one client, for whom
+`local` is the right answer.
+
+Anything running *outside* a call — the listener's own diagnostics, a sweep, a shutdown — gets the
+default `local` instead of an error, so it must take the client as a parameter
+(`Sessions::live_count_for` against `Sessions::snapshot`). The bug that rule is written from was a
 log line reporting `local`'s session count to a named client on reconnect.
 
 **A caller sees only its own sessions**, and that is not a fault to debug: routing, `session_status`,
