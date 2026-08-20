@@ -217,12 +217,13 @@ The server has to run where DbgEng does, but the client and the model do not. `-
 serves the same tools over HTTP instead of stdio, so a Mac can drive a Windows VM:
 
 ```console
-# Windows, with WINDBG_MCP_LISTEN_TOKEN set
+# Windows, with WINDBG_MCP_LISTEN_TOKEN set to a long random string
 windbg-mcp.exe --listen 127.0.0.1:8765
-# client machine
+# client machine — the same string, spelled out: the variable lives on the Windows
+# host, and a shell without it sends an empty bearer and gets a 401 on every call
 ssh -N -L 8765:127.0.0.1:8765 windbg-vm
 claude mcp add windbg-vm --transport http http://127.0.0.1:8765/ \
-  --header "Authorization: Bearer $WINDBG_MCP_LISTEN_TOKEN"
+  --header "Authorization: Bearer <the same string>"
 ```
 
 Install it as a **Windows service** (`--install-service --listen <addr>`, elevated) and it survives
