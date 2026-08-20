@@ -899,8 +899,12 @@ told to ask again once the release is done.
 it was using — the sweep reads `deadline` alone and zeroes `in_flight` on its way past, so work
 actually running does not save them:
 
-- a request **renews** an existing deadline. Whatever replaces `admit`, a credential that is plainly
-  alive must not be swept mid-call.
+- a request the gate **admits** renews an existing deadline. The qualifier is load-bearing in both
+  directions: a credential that is plainly alive must not be swept mid-call, and a *refused* request
+  must not renew anything — `NotYours`, `Releasing` and `Occupied` all return before any deadline is
+  touched today. Renewing on arrival instead would let a stream of wrong session ids or repeated
+  `initialize`s hold an abandoned client's live kernel target open for ever, which is the failure
+  the sweep exists to prevent.
 - a reservation that mints nothing gives its **deadline** back, not just its claim. If reserving
   goes away entirely this stops mattering; if it survives in any form, it still does.
 

@@ -409,7 +409,9 @@ above every date and would be read as the newest thing there is.
 client losing sessions it was using. The sweep reads `deadline` alone and zeroes `in_flight` on its
 way past, so work actually running does not save them.
 
-- A stateless request **renews** an existing deadline and never creates one. A credential holding a
+- An **admitted** stateless request renews an existing deadline and never creates one. Refused ones
+  renew nothing, deliberately: a refusal that renewed would let repeated bad requests keep an
+  abandoned client's sessions alive. A credential holding a
   legacy session and since sending stateless requests would otherwise be swept mid-call; and a
   deadline created where no holder exists is a lease against nothing, which would release a purely
   stateless client's sessions on a timer it never set. That abandonment is `IDLE_RELEASE`'s.
