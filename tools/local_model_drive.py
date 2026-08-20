@@ -67,6 +67,11 @@ MAX_STEPS = 6
 # the lease grace and the next run does not adopt it.
 OPENED = []
 
+# Sessions this credential already had when the run started — a prior run that
+# crashed before its cleanup, or another invocation sharing the token. They are not
+# this run's to adopt and not its to release, so reconciliation skips them.
+PRE_EXISTING = set()
+
 # The tools that can *create* a session, and so the only ones whose answers name a
 # handle this run is responsible for.
 OPENERS = {"open_dump", "open_trace"}
@@ -313,22 +318,47 @@ def run(task, tools):
     print(f"  gave up after {MAX_STEPS} steps")
 
 
-def reconcile_opened():
-    """Adopt every session in this credential's namespace, after an ambiguous opener.
+def live_sessions():
+    """Every session id this credential can see, from the structured answer."""
+    out = mcp("tools/call", {"name": "session_status", "arguments": {}})
+    structured = (out.get("result") or {}).get("structuredContent") or {}
+    return [s["session_id"] for s in structured.get("sessions") or [] if s.get("session_id")]
 
-    Sound because openers require a credential of this run's own: on a borrowed one
-    they are refused outright, so anything here is this run's to account for. Read
-    from `structuredContent.sessions`, like every other handle in this script.
+
+def snapshot_existing():
+    """Record what was already open, before this run opens anything.
+
+    Without this, the reconciliation below adopts the whole namespace — including a
+    session a crashed run left behind or a second invocation sharing the credential —
+    and the cleanup then ends somebody else's target. The fence is per *run*, so the
+    baseline has to be per run too.
     """
     try:
-        out = mcp("tools/call", {"name": "session_status", "arguments": {}})
+        PRE_EXISTING.update(live_sessions())
+    except Exception as e:
+        print(f"  could not read the credential's existing sessions: {e}")
+        return
+    if PRE_EXISTING:
+        print(f"  {len(PRE_EXISTING)} session(s) already open on this credential; "
+              "this run will neither adopt nor release them")
+
+
+def reconcile_opened():
+    """Adopt sessions that appeared during this run, after an ambiguous opener.
+
+    Sound because openers require a credential of this run's own: on a borrowed one
+    they are refused outright. Bounded by the startup snapshot, so what another
+    invocation or a crashed predecessor left behind stays theirs. Two runs sharing
+    one credential *concurrently* can still overlap here — the answer to that is the
+    same as everywhere else on this page: a credential per run.
+    """
+    try:
+        sessions = live_sessions()
     except Exception as e:
         print(f"  could not reconcile after an ambiguous open: {e}")
         return
-    structured = (out.get("result") or {}).get("structuredContent") or {}
-    for entry in structured.get("sessions") or []:
-        found = entry.get("session_id")
-        if found and found not in OPENED:
+    for found in sessions:
+        if found not in OPENED and found not in PRE_EXISTING:
             OPENED.append(found)
             print(f"  adopted {found} after an ambiguous open")
 
@@ -398,6 +428,8 @@ def main():
     whose = "its own" if DEDICATED else "borrowed from the editor — openers refused"
     mode = " (scenario: sessions kept between tasks)" if SCENARIO else ""
     print(f"credential: {whose}{mode}")
+    if DEDICATED:
+        snapshot_existing()
     tasks = json.load(open(sys.argv[1])) if len(sys.argv) > 1 else [
         "What debug sessions do I currently have open on this server?"
     ]
