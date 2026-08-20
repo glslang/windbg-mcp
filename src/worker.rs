@@ -3732,8 +3732,15 @@ fn render_find_tag(
         );
     }
     let total: u64 = spans.iter().map(|span| span.size).sum();
+    // The same warning, and the case that needs it *more*. A rendering that finds nothing is at
+    // least not an answer about something else; a rendering that finds the literal `.` bytes
+    // reports another tag's chunks as though they were the ones the caller meant — the collision
+    // this whole distinction exists to prevent, arriving as a confident result. It goes above the
+    // table rather than after it, because it is a caveat on the rows, not a footnote to them.
+    let rendering = pool_tag_rendering_hint(tag);
     let mut out = format!(
-        "tag `{tag}`{scope}: {} allocation(s), {total:#x} bytes total\n\n{POOL_COLUMNS}\n",
+        "tag `{tag}`{scope}: {} allocation(s), {total:#x} bytes total{rendering}\n\n\
+         {POOL_COLUMNS}\n",
         spans.len()
     );
     for span in spans.iter().take(limit) {
@@ -4302,16 +4309,15 @@ mod tests {
     /// Widening the tag column for the raw form is exactly the edit that breaks this, so the
     /// invariant is pinned rather than eyeballed: every column of a rendered row must start
     /// where the header says it does.
-    #[test]
-    fn tag_columns_line_up() {
-        let raw = u32::from_le_bytes([0x00, 0x01, 0x80, 0xff]);
-        let span = PoolSpan {
+    /// One allocated chunk carrying `raw_tag`, for the rendering tests below.
+    fn tagged_chunk(raw_tag: u32) -> PoolSpan {
+        PoolSpan {
             header_address: 0xffff_e20d_bc6a_f030,
             usable_address: 0xffff_e20d_bc6a_f040,
             size: 0x70,
             requested_size: None,
-            raw_tag: raw,
-            display_tag: "....".into(),
+            raw_tag,
+            display_tag: win_kexp::pool::tag_label(raw_tag),
             pool_kind: win_kexp::pool::PoolKind::NonPagedNx,
             numa_node: 0,
             heap: win_kexp::pool::HeapIdentity {
@@ -4323,7 +4329,42 @@ mod tests {
             backend: win_kexp::pool::PoolBackend::Vs,
             state: PoolState::Allocated,
             size_class: 0x70,
-        };
+        }
+    }
+
+    /// The collision this distinction exists for, arriving as an *answer* rather than an empty.
+    ///
+    /// A caller copies `....` from a binary tag's row, and the snapshot also holds chunks whose
+    /// tag really is four dots. Those match, so the empty branch never runs — and without the
+    /// caveat the rows read as the binary tag's chunks. A confident answer about a different tag
+    /// is worse than finding nothing, so the warning cannot be conditioned on emptiness.
+    #[test]
+    fn a_rendering_that_matches_a_different_tag_is_still_flagged() {
+        let dots = u32::from_le_bytes(*b"....");
+        let answered = render_find_tag("....", None, &[tagged_chunk(dots)], 64);
+        assert!(
+            answered.contains("0x2e2e2e2e") && answered.contains("rendering"),
+            "rows for the literal dots must still say what was actually searched for: {answered}"
+        );
+
+        // An unambiguous tag keeps its answer clean — the caveat is for renderings, not for
+        // every result.
+        let plain = render_find_tag(
+            "Tgsm",
+            None,
+            &[tagged_chunk(u32::from_le_bytes(*b"Tgsm"))],
+            64,
+        );
+        assert!(
+            !plain.contains("rendering"),
+            "an unambiguous tag needs no caveat: {plain}"
+        );
+    }
+
+    #[test]
+    fn tag_columns_line_up() {
+        let raw = u32::from_le_bytes([0x00, 0x01, 0x80, 0xff]);
+        let span = tagged_chunk(raw);
         let row = pool_row(&span);
         let tag_at = POOL_COLUMNS.find("tag").expect("header names a tag column");
         assert_eq!(
