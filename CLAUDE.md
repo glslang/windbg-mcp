@@ -109,10 +109,12 @@ For a compile/behavior check without touching the locked release exe, use the **
 `cargo clippy --all-targets`. The release
 build differs only in optimization and is exercised by CI on a fresh runner.
 
-**The pass count does not say which tiers ran.** Each gate is inside its test, so
-`cargo test` reports the same **64 passed** with the debugger tier off as with it on; what differs is
-the runtime (~1.3s against ~52s) and the `SKIPPED` lines, which only `--nocapture` prints. Read one
-of those two before believing a run covered a debugger claim.
+**The pass count does not say which tiers ran.** Each gate is inside its test, so the `mcp_smoke`
+harness reports the same **64 passed** with the debugger tier off as with it on — that harness's own
+result line, since a plain `cargo test` runs the crate's several hundred unit tests beside it and
+prints a result line per binary. What differs between the two runs is the runtime (~1.3s against
+~52s for `cargo test --test mcp_smoke`) and the `SKIPPED` lines, which only `--nocapture` prints.
+Read one of those two before believing a run covered a debugger claim.
 
 **The dev exe can be locked too, and the failure is quiet.** A worker left running — a driver
 script that died mid-session, a debugger tier killed partway — holds `target\debug\windbg-mcp.exe`,

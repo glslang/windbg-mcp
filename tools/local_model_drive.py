@@ -19,7 +19,11 @@ Configuration, all optional:
     WINDBG_MCP_TOKEN    bearer token; falls back to the Claude Code registration
                         in ~/.claude.json for WINDBG_MCP_PROJECT, so the token
                         never has to be pasted on a command line
-    WINDBG_MCP_PROJECT  which registration to read it from (default: this repo)
+    WINDBG_MCP_PROJECT  which project's registrations to read it from (default: this repo)
+    WINDBG_MCP_SERVER   which registration in that project, by name, when the URL
+                        does not identify one on its own
+    RESULT_LIMIT        truncate tool results to this many characters before the
+                        model sees them; `0`, the default, passes them whole
 """
 import json
 import os
@@ -46,20 +50,46 @@ ALLOWED = {
 }
 
 MAX_STEPS = 6
-RESULT_LIMIT = 6000
+# Results reach the model **whole** by default. Truncating them would quietly defeat
+# one of the things this harness exists to measure — whether a single answer fits a
+# local model's window — and would have it reason from JSON cut off mid-structure
+# without being told. A cap is available for a deliberately clamped run, and says so
+# in the transcript when it bites.
+RESULT_LIMIT = int(os.environ.get("RESULT_LIMIT", "0"))
+
+
+def same_endpoint(a, b):
+    """Whether two registration URLs name the same listener, modulo a trailing slash."""
+    return a.rstrip("/") == b.rstrip("/")
 
 
 def bearer():
-    """The token, from the environment or from this client's own registration."""
+    """The token, from the environment or from this client's registration **for this listener**.
+
+    Matched by URL, or by name when `WINDBG_MCP_SERVER` says which. Never "the first
+    registration that has a token": a project can hold several, and handing this
+    listener another server's credential would send that secret to a host it does not
+    belong to — and then fail the handshake, which is the milder half.
+    """
     if os.environ.get("WINDBG_MCP_TOKEN"):
         return "Bearer " + os.environ["WINDBG_MCP_TOKEN"]
     registry = json.load(open(os.path.expanduser("~/.claude.json")))
-    servers = registry["projects"][PROJECT]["mcpServers"]
-    for entry in servers.values():
+    servers = registry.get("projects", {}).get(PROJECT, {}).get("mcpServers", {})
+    wanted = os.environ.get("WINDBG_MCP_SERVER")
+    for name, entry in servers.items():
+        if wanted and name != wanted:
+            continue
+        if not wanted and not same_endpoint(entry.get("url", ""), MCP_URL):
+            continue
         auth = (entry.get("headers") or {}).get("Authorization")
         if auth:
             return auth
-    raise SystemExit("no token: set WINDBG_MCP_TOKEN, or register the server with a bearer header")
+        raise SystemExit(f"registration `{name}` has no Authorization header")
+    raise SystemExit(
+        f"no registration for {MCP_URL} in {PROJECT} "
+        f"(registered: {', '.join(servers) or 'none'}). "
+        "Set WINDBG_MCP_TOKEN, or WINDBG_MCP_SERVER to name one."
+    )
 
 
 AUTH = bearer()
@@ -105,14 +135,35 @@ def handshake():
     return out["result"]["protocolVersion"]
 
 
+def ollama(path, body=None):
+    url = OLLAMA.replace("/api/chat", path)
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method="POST" if data else "GET")
+    if data:
+        req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=60) as response:
+        return json.load(response)
+
+
 def pick_model():
+    """The configured tag, or the first installed one that can actually call tools.
+
+    Asked rather than assumed: an embedding model, or a chat model without tool
+    support, is a perfectly ordinary first entry in `ollama list`, and picking it
+    fails at the first `/api/chat` with an error about the wrong thing.
+    """
     if MODEL:
         return MODEL
-    tags = urllib.request.urlopen(OLLAMA.replace("/api/chat", "/api/tags"), timeout=30)
-    models = json.load(tags).get("models", [])
-    if not models:
+    installed = [m["name"] for m in ollama("/api/tags").get("models", [])]
+    if not installed:
         raise SystemExit("no ollama models pulled; `ollama pull <tag>` first")
-    return models[0]["name"]
+    for tag in installed:
+        if "tools" in (ollama("/api/show", {"model": tag}).get("capabilities") or []):
+            return tag
+    raise SystemExit(
+        "none of the installed models declares the `tools` capability "
+        f"({', '.join(installed)}); set LOCAL_MODEL to one that does"
+    )
 
 
 def as_ollama(tools):
@@ -133,13 +184,24 @@ def chat(messages, tools):
 
 
 def call_tool(name, args):
+    """Run one tool call. Returns (text for the model, ok, full size in characters)."""
     if name not in ALLOWED:
-        return f"refused: `{name}` is not permitted in this harness", None
+        return f"refused: `{name}` is not permitted in this harness", None, 0
     try:
         out = mcp("tools/call", {"name": name, "arguments": args})
     except Exception as e:  # a transport failure is a result the model can react to
-        return f"transport error: {e}", False
-    return json.dumps(out.get("result", out))[:RESULT_LIMIT], "error" not in out
+        return f"transport error: {e}", False, 0
+    result = out.get("result", {})
+    # **Both kinds of failure.** A protocol error arrives as a top-level `error`; an
+    # ordinary tool failure — a bad address, a stale handle — arrives as a perfectly
+    # good result carrying `isError`. Counting only the first reports a failed call as
+    # a successful one, which is exactly the telemetry this harness is for.
+    ok = "error" not in out and not result.get("isError")
+    text = json.dumps(result if result else out)
+    size = len(text)
+    if RESULT_LIMIT and size > RESULT_LIMIT:
+        text = text[:RESULT_LIMIT] + f"\n[truncated by the harness: {size} characters in full]"
+    return text, ok, size
 
 
 def run(task, tools):
@@ -168,8 +230,8 @@ def run(task, tools):
             args = call["function"].get("arguments") or {}
             if isinstance(args, str):
                 args = json.loads(args or "{}")
-            text, ok = call_tool(name, args)
-            print(f"  [{took:>6}s] -> {name}({json.dumps(args)[:120]}) ok={ok}")
+            text, ok, size = call_tool(name, args)
+            print(f"  [{took:>6}s] -> {name}({json.dumps(args)[:120]}) ok={ok} result={size} chars")
             print(f"           {text[:200]}")
             messages.append({"role": "tool", "tool_name": name, "content": text})
     print(f"  gave up after {MAX_STEPS} steps")
