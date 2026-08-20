@@ -47,7 +47,7 @@ use win_kexp::heap::{self as heap_query, HeapAllocation, HeapBackend, HeapState,
 use win_kexp::pool::query::{self, PoolPageFilter, PoolWalk};
 use win_kexp::pool::{
     DiagnosticShape, PoolDiagnostics, PoolSpan, PoolState, display_is_ambiguous, parse_tag,
-    raw_tag_hex,
+    raw_tag_hex, tag_label,
 };
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
@@ -2926,21 +2926,6 @@ const POOL_COLUMNS: &str =
 /// and a tag that has to be shown as its bytes must not shove the rest of the row out of line.
 const TAG_WIDTH: usize = 10;
 
-/// How a tag should be shown to someone who might hand it back.
-///
-/// The printed form where it identifies the tag, and the tag's raw bytes where it does not.
-/// That distinction is the whole point: `display_tag` renders every unprintable byte as `.`, and
-/// a literal `.` the same way, so `....` names no particular tag — and `pool_find_tag` parses it
-/// happily as four ASCII bytes and answers about a tag nobody allocated. Printing the raw form
-/// wherever the rendering is ambiguous is what keeps every tag in these tables queryable.
-fn tag_label(span_tag: u32, display_tag: &str) -> String {
-    if display_is_ambiguous(span_tag) {
-        raw_tag_hex(span_tag)
-    } else {
-        display_tag.to_string()
-    }
-}
-
 /// Why a query for an ambiguous *rendering* found nothing, when it is worth saying.
 ///
 /// Empty for the ordinary case — a plain tag that simply is not allocated, and a raw form, which
@@ -2975,7 +2960,7 @@ fn pool_row(span: &PoolSpan) -> String {
         format!("{:?}", span.state),
         format!("{:?}", span.pool_kind),
         format!("{:?}", span.backend),
-        tag_label(span.raw_tag, &span.display_tag),
+        tag_label(span.raw_tag),
         span.numa_node,
     )
 }
@@ -3766,7 +3751,7 @@ fn render_chunk(address: u64, found: &query::PoolNeighbourhood) -> String {
         fmt_addr(address),
         address.saturating_sub(chunk.usable_address),
         chunk.size,
-        tag_label(chunk.raw_tag, &chunk.display_tag),
+        tag_label(chunk.raw_tag),
         chunk.state,
     );
     if let Some(previous) = &found.previous {
@@ -3966,7 +3951,7 @@ fn render_census(census: &[query::PoolTagSummary], limit: usize) -> String {
     for entry in census.iter().take(limit) {
         out.push_str(&format!(
             "{:<TAG_WIDTH$}  {:>7}  {:>11}  {:>8}  {:>6}\n",
-            tag_label(entry.raw_tag, &entry.display_tag),
+            tag_label(entry.raw_tag),
             entry.allocations,
             format!("{:#x}", entry.total_bytes),
             entry.nonpaged_allocations,
@@ -4278,22 +4263,10 @@ mod tests {
 
     // ---- pool tags ------------------------------------------------------------------
 
-    /// A tag is shown in the form that can be handed back, which is not always the printed one.
-    #[test]
-    fn an_unprintable_tag_is_shown_as_its_bytes() {
-        // Printable: the rendering identifies it, so it is what a reader sees.
-        assert_eq!(tag_label(u32::from_le_bytes(*b"Tgsm"), "Tgsm"), "Tgsm");
-        assert_eq!(tag_label(u32::from_le_bytes(*b"Ntf "), "Ntf "), "Ntf ");
-
-        // Not printable: `display_tag` already collapsed these to the same four dots, so the
-        // rendering cannot be the label — two distinct tags would be shown identically and
-        // neither could be queried.
-        let binary = u32::from_le_bytes([0x00, 0x01, 0x80, 0xff]);
-        let dots = u32::from_le_bytes(*b"....");
-        assert_eq!(tag_label(binary, "...."), "0x000180ff");
-        assert_eq!(tag_label(dots, "...."), "0x2e2e2e2e");
-        assert_ne!(tag_label(binary, "...."), tag_label(dots, "...."));
-    }
+    // What `tag_label` returns for a given tag is win-kexp's own test
+    // (`test_raw_tag_round_trips_where_the_displayed_one_cannot`); the rule is defined there so
+    // the extension's output and this server's cannot disagree. What is this crate's to prove is
+    // that its two tables *use* it — `tag_columns_line_up` below.
 
     /// The empty answer that is about the question rather than about the pool.
     #[test]
