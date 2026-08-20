@@ -171,7 +171,7 @@ hour.
 
 | | |
 | --- | --- |
-| Default | **30 minutes** since the last call naming that session |
+| Default | **30 minutes** since the last call that reached that session's engine. `session_status` and `server_log` are answered by the supervisor and never routed, so they name a session without touching its clock |
 | Override | `WINDBG_MCP_SESSION_IDLE_SECS`, whole seconds; `0` disables it |
 | Floor | must exceed the longest a single call can run, or the server refuses to start |
 
