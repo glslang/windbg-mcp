@@ -24,15 +24,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     every start when that is not loopback, because the argument for skipping a tunnel — a
     hypervisor network that does not route off the host — is exactly wrong on a debugger host: the
     guest being debugged is on that network, and is a sandbox by design.
-  - **A session lease replaces "stdio closed".** Under stdio the disconnect *is* the teardown
-    signal, and it drives a real `EndSession` through every worker rather than killing it, because
-    a live kernel that is merely killed is left frozen. HTTP has no such event, so each credential
-    holds a deadline that every admitted request renews, and a sweep releases what an absent client
-    left — the same clean release, on a timer instead of an EOF.
-  - **Silence is not departure and a goodbye is.** Every request is its own connection, so quiet is
-    the resting state; a `DELETE` is the client saying it is done. One that comes back inside the
-    grace **adopts what it left**, which is what makes a client restart cost nothing where under
-    stdio it costs a KDNET attach — and a KDNET attach costs a reboot of the target.
+  - **A session lease stands in for "stdio closed" — for the clients that can have one.** Under
+    stdio the disconnect *is* the teardown signal, and it drives a real `EndSession` through every
+    worker rather than killing it, because a live kernel that is merely killed is left frozen. HTTP
+    has no such event, so a credential that holds a settled MCP session holds a deadline with it,
+    renewed by every admitted request, and a sweep releases what an absent client left. **A
+    `2026-07-28` client has no such session and is therefore never given a clock** — SEP-2567
+    removed the id a lease is armed by — so what covers an abandoned target there is the per-session
+    idle release under **Changed** below, which is a different question deliberately answered
+    differently: it is far longer, it is per session rather than per credential, and it spares a
+    session with a call still outstanding. A parked `attach_kernel` is exactly that, so it is held
+    until somebody ends it rather than until a timer notices.
+  - **Silence is not departure and a goodbye is** — both of them session-id behaviours, so both
+    belong to the client above that has one. Every request is its own connection, so quiet is the
+    resting state; a `DELETE` is the client saying it is done. One that comes back inside the grace
+    **adopts what it left**, which is what makes a client restart cost nothing where under stdio it
+    costs a KDNET attach — and a KDNET attach costs a reboot of the target.
   - **The grace has a floor and the floor is derived, not chosen**: the longest a single call can
     keep a client quiet is `WORKER_READY_TIMEOUT` plus the call timeout, since an opener spends up
     to 30s bringing a worker up before its budget starts. A shorter grace would release a session
@@ -176,8 +183,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   documentation says which way round it goes.
 
 - **`server_log` — the server's own log, readable from wherever the client is.** The supervisor
-  keeps a bounded ring of the most recent records, its own and every engine worker's, and serves
-  them as a tool: filterable by session and level, paged with a `since` cursor, answered without
+  keeps a bounded ring of the most recent records, its own and every engine worker's, and serves a
+  caller its own share of them — the supervisor's, which name no session, plus those of the sessions
+  that caller opened (under stdio, one client by construction, that is all of them): filterable by session and level, paged with a `since` cursor, answered without
   ever touching a session's engine — so it still answers while the session it is about is wedged,
   like `session_status`.
 
