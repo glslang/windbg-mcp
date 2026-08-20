@@ -18,10 +18,11 @@
 //!   for one credential that the retired tenancy gate used to refuse and this server now serves,
 //!   the difference between a client going quiet and a client saying goodbye, and `2026-07-28`
 //!   being served at all — the revision that removed the session id, and so arrives with none of
-//!   the things the rules above are written in terms of. Those need no debugger, because the
-//!   lease is decided before any session is opened. Two that do — the sweep meeting a real engine
-//!   worker, and a stateless client working alongside a call of its own that parks — live in the
-//!   tier below.
+//!   the things the rules above are written in terms of, including on the one request that may
+//!   omit its protocol header. Those need no debugger, because the lease is decided before any
+//!   session is opened. Three that do — the sweep meeting a real engine worker, a stateless
+//!   client working alongside a call of its own that parks, and two credentials that may not
+//!   reach each other's sessions — live in the tier below.
 //! * **Target** (`WINDBG_MCP_SMOKE_DUMP=1`) — opens the sample crash dump through DbgEng, so
 //!   it needs `dbgeng.dll` and may reach a symbol server. Off by default; this is the tier
 //!   that catches a `win-kexp` regression. It also runs a `debug_batch` to both outcomes, and
@@ -2530,10 +2531,27 @@ impl Listener {
 
     /// A JSON-RPC request from the authorised client.
     fn call(&mut self, session: Option<&str>, method: &str, params: Value) -> Reply {
+        let token = self.token.clone();
+        self.call_as(&token, session, method, params)
+    }
+
+    /// [`Self::call`], from a credential this helper did not configure.
+    ///
+    /// Every rule ownership is made of needs **two** of them to be visible at all: a handle
+    /// another client opened, an `Mcp-Session-Id` another client holds, a count taken for the
+    /// wrong client. One token can state none of those, which is what left the per-client
+    /// behaviour unexercised end to end (`FOLLOWUPS.md` item 29).
+    fn call_as(
+        &mut self,
+        token: &str,
+        session: Option<&str>,
+        method: &str,
+        params: Value,
+    ) -> Reply {
         let id = self.next_id;
         self.next_id += 1;
         let body = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
-        self.send("POST", Some(&self.token.clone()), session, Some(&body))
+        self.send("POST", Some(token), session, Some(&body))
     }
 
     fn opening() -> Value {
@@ -2563,6 +2581,24 @@ impl Listener {
         let id = self.next_id;
         self.next_id += 1;
         self.stateless_at(id, method, params)
+    }
+
+    /// [`Self::stateless`], from a credential this helper did not configure.
+    ///
+    /// The stateless revision reaches the registry by a different route — no MCP session, so no
+    /// task spawned to serve one — and a boundary that held on only one of the two routes would
+    /// depend on which revision a client had negotiated.
+    fn stateless_as(&mut self, token: &str, method: &str, params: Value) -> Reply {
+        let id = self.next_id;
+        self.next_id += 1;
+        let (body, name) = Self::stateless_body(id, method, params);
+        self.send_with(
+            "POST",
+            Some(token),
+            None,
+            Some(&body),
+            &Self::stateless_headers(method, name.as_deref()),
+        )
     }
 
     /// [`Self::stateless`] with the request id named rather than counted.
@@ -2660,6 +2696,16 @@ impl Listener {
     /// Sent for the same reason a stateless client sends it: to learn what the server is. Nothing
     /// afterwards depends on it having happened, which is the property being asserted.
     fn stateless_opening(&mut self) -> Reply {
+        self.stateless_opening_with(&[("MCP-Protocol-Version", STATELESS_REVISION)])
+    }
+
+    /// [`Self::stateless_opening`], with the transport headers named rather than assumed.
+    ///
+    /// Exists for the empty slice. `initialize` is the one request of this revision that may
+    /// arrive **without** `MCP-Protocol-Version` — it is the request that establishes the revision,
+    /// so there is nothing yet for a header to restate — and sending it anyway, as the handshake
+    /// above does, is legal and is what left the other shape undriven (`FOLLOWUPS.md` item 30).
+    fn stateless_opening_with(&mut self, headers: &[(&str, &str)]) -> Reply {
         let id = self.next_id;
         self.next_id += 1;
         let body = json!({
@@ -2677,13 +2723,19 @@ impl Listener {
             Some(&self.token.clone()),
             None,
             Some(&body),
-            &[("MCP-Protocol-Version", STATELESS_REVISION)],
+            headers,
         )
     }
 
     /// The handshake, answering with the session id a lease is armed by.
     fn initialize(&mut self) -> String {
-        let reply = self.call(None, "initialize", Self::opening());
+        let token = self.token.clone();
+        self.initialize_as(&token)
+    }
+
+    /// [`Self::initialize`], for the credential named rather than the one configured.
+    fn initialize_as(&mut self, token: &str) -> String {
+        let reply = self.call_as(token, None, "initialize", Self::opening());
         assert_eq!(
             reply.status,
             200,
@@ -2696,9 +2748,12 @@ impl Listener {
             .session
             .clone()
             .unwrap_or_else(|| panic!("initialize minted no Mcp-Session-Id: {}", reply.body));
+        // The credential that opened it, not the configured one: an ack carrying another client's
+        // token would present this session id to a namespace that does not hold it, and be
+        // answered `404` by the very ownership check the tests below are about.
         let ack = self.send(
             "POST",
-            Some(&self.token.clone()),
+            Some(token),
             Some(&session),
             Some(&json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })),
         );
@@ -2713,7 +2768,18 @@ impl Listener {
 
     /// The typed half of a tool call that worked.
     fn tool(&mut self, session: &str, name: &str, args: Value) -> Value {
-        let reply = self.call(
+        let token = self.token.clone();
+        self.tool_as(&token, session, name, args)
+    }
+
+    /// [`Self::tool`], for the credential named rather than the one configured.
+    ///
+    /// "Worked" here is the **transport** answering, not the tool succeeding: a call refused for
+    /// naming another client's handle is a perfectly good `200` carrying an error, which is the
+    /// distinction the ownership tests turn on.
+    fn tool_as(&mut self, token: &str, session: &str, name: &str, args: Value) -> Value {
+        let reply = self.call_as(
+            token,
             Some(session),
             "tools/call",
             json!({ "name": name, "arguments": args }),
@@ -2728,7 +2794,12 @@ impl Listener {
 
     /// The client saying it is done, which is the only departure the server is ever told about.
     fn goodbye(&self, session: &str) -> Reply {
-        self.send("DELETE", Some(&self.token.clone()), Some(session), None)
+        self.goodbye_as(&self.token.clone(), session)
+    }
+
+    /// [`Self::goodbye`], for the credential named rather than the one configured.
+    fn goodbye_as(&self, token: &str, session: &str) -> Reply {
+        self.send("DELETE", Some(token), Some(session), None)
     }
 }
 
@@ -3136,6 +3207,86 @@ fn the_listener_serves_the_stateless_revision_it_negotiates() {
         called.result("tools/call")["structuredContent"]["status"],
         json!("ok"),
         "a stateless tools/call must answer like any other: {}",
+        called.body
+    );
+}
+
+/// The handshake may omit `MCP-Protocol-Version`, and the client is ordinary afterwards.
+///
+/// It is the one request of `2026-07-28` that may: `initialize` *establishes* the revision, so rmcp
+/// does not require the header that restates it. Nothing here drove that shape until now — stdio
+/// has no headers to omit and [`Listener::stateless_opening`] sends one — which left the likeliest
+/// handshake a real client sends as the only one untested.
+///
+/// **The hazard it carried has been deleted rather than covered**, and that is why this asserts
+/// what it does. The listener used to classify a request by that header, so a headerless handshake
+/// was read as an *opener*: it reserved, minted nothing, and left a deadline armed — a client's own
+/// handshake starting the clock that would release whatever it had open, one grace later.
+/// [#171](https://github.com/glslang/windbg-mcp/pull/171) deleted the classification and the
+/// reservation both, so nothing arms a deadline before a settled MCP session exists. What survives
+/// any particular mechanism is that the shape is served and the client works after it
+/// (`FOLLOWUPS.md` item 30).
+#[test]
+fn a_stateless_handshake_may_omit_the_protocol_header() {
+    let mut server = Listener::start(&[]);
+
+    let opening = server.stateless_opening_with(&[]);
+    assert_eq!(
+        opening.status,
+        200,
+        "a headerless {STATELESS_REVISION} handshake was refused ({}): {}\n--- stderr ---\n{}",
+        opening.status,
+        opening.body,
+        server.stderr()
+    );
+    assert_eq!(
+        opening.result("initialize")["protocolVersion"],
+        json!(STATELESS_REVISION),
+        "the handshake must negotiate the revision its body offered, header or no header: {}",
+        opening.body
+    );
+    assert!(
+        opening.session.is_none(),
+        "{STATELESS_REVISION} mints no Mcp-Session-Id, however it arrives: {}",
+        opening.body
+    );
+
+    // And the client is ordinary afterwards. The exemption is for `initialize` alone, so these
+    // carry the full contract — the point is that reaching it by the route that skips the header
+    // leaves the server in the same place as the route that does not.
+    let listed = server.stateless("tools/list", json!({}));
+    assert_eq!(
+        listed.status,
+        200,
+        "tools/list after a headerless handshake was refused ({}): {}\n--- stderr ---\n{}",
+        listed.status,
+        listed.body,
+        server.stderr()
+    );
+    assert!(
+        listed.result("tools/list")["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()),
+        "a served tools/list has tools in it: {}",
+        listed.body
+    );
+
+    let called = server.stateless(
+        "tools/call",
+        json!({ "name": "session_status", "arguments": {} }),
+    );
+    assert_eq!(
+        called.status,
+        200,
+        "a tools/call after a headerless handshake was refused ({}): {}\n--- stderr ---\n{}",
+        called.status,
+        called.body,
+        server.stderr()
+    );
+    assert_eq!(
+        called.result("tools/call")["structuredContent"]["status"],
+        json!("ok"),
+        "the server has to answer a call like any other: {}",
         called.body
     );
 }
@@ -6297,6 +6448,222 @@ fn a_lease_that_runs_out_releases_what_the_absent_client_left() {
         status["sessions"].as_array().is_none_or(Vec::is_empty),
         "the next client inherited a session the sweep should have released: {status}"
     );
+}
+
+/// The handle an `open_dump` through the listener minted, named by whose it is.
+fn opened_handle(opened: &Value, whose: &str) -> String {
+    opened["session_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("`{whose}`'s open_dump minted no handle: {opened}"))
+        .to_string()
+}
+
+/// The handles `session_status` reports to one client, which is the whole of what that client can
+/// see of this server.
+fn sessions_listed(server: &mut Listener, token: &str, mcp: &str) -> Vec<String> {
+    server.tool_as(token, mcp, "session_status", json!({}))["sessions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s["session_id"].as_str().map(str::to_string))
+        .collect()
+}
+
+/// Two credentials on one listener: neither can see, route to or end the other's session, and a
+/// client that comes back adopts what it left.
+///
+/// Every rule here is unit-tested where it is decided — `Sessions::resolve` and `Sessions::snapshot`
+/// in `src/engine.rs`, admission in `src/listen.rs`, the identity scope in `src/client.rs`. What
+/// none of them reaches is the **call site**: an HTTP handler, one real registry, and two tokens on
+/// one port. The gap has already cost a bug — the adoption diagnostic counted `local`'s sessions
+/// for a *named* client, because the count was taken after the identity scope had closed, so the
+/// one line an operator reads on reconnect described a client that was not reconnecting
+/// (`FOLLOWUPS.md` item 29).
+///
+/// Debugger tier, and not by preference: every claim here needs a session that exists. A handle
+/// another client cannot use has to be a handle, and an adoption counts **debug** sessions rather
+/// than the MCP ones the protocol tier can mint on its own.
+#[test]
+fn two_clients_on_one_listener_keep_their_sessions_to_themselves() {
+    let Some(dump) = target_tier() else {
+        return;
+    };
+    // A second credential beside the unnamed one the helper always sets, which names `local`.
+    let ci_token = format!("smoke-ci-{}", std::process::id());
+    let mut server = Listener::start(&[("WINDBG_MCP_LISTEN_TOKEN_CI", &ci_token)]);
+    let local_token = server.token.clone();
+    assert!(
+        server.wait_for_stderr("clients: ci, local", Duration::from_secs(30)),
+        "this listener is supposed to hold two credentials; it says otherwise:\n{}",
+        server.stderr()
+    );
+
+    let local_mcp = server.initialize_as(&local_token);
+    let ci_mcp = server.initialize_as(&ci_token);
+    assert_ne!(local_mcp, ci_mcp, "two clients, two MCP sessions");
+
+    let opened = server.tool_as(
+        &local_token,
+        &local_mcp,
+        "open_dump",
+        json!({ "path": dump }),
+    );
+    let local_session = opened_handle(&opened, "local");
+    let opened = server.tool_as(&ci_token, &ci_mcp, "open_dump", json!({ "path": dump }));
+    let ci_session = opened_handle(&opened, "ci");
+    assert_ne!(
+        local_session, ci_session,
+        "each client opened a session of its own"
+    );
+
+    // Seeing. A caller is shown its own sessions and nothing else — another client's handles would
+    // be unusable, and listing them would say how many clients this server has and what they are
+    // debugging.
+    let seen_by_local = sessions_listed(&mut server, &local_token, &local_mcp);
+    let seen_by_ci = sessions_listed(&mut server, &ci_token, &ci_mcp);
+    assert_eq!(
+        seen_by_local,
+        vec![local_session.clone()],
+        "`local` was shown something other than exactly its own session"
+    );
+    assert_eq!(
+        seen_by_ci,
+        vec![ci_session.clone()],
+        "`ci` was shown something other than exactly its own session"
+    );
+
+    // The same question on `2026-07-28`, which reaches the registry by the other route: no MCP
+    // session, so no task spawned to serve one, and the identity arrives with the request itself.
+    // Both routes are asserted because the bug this test found was one of them losing it — a fix
+    // that held for only one would make the boundary depend on which revision a client negotiated.
+    let stateless = server.stateless_as(
+        &ci_token,
+        "tools/call",
+        json!({ "name": "session_status", "arguments": {} }),
+    );
+    assert_eq!(
+        stateless.status, 200,
+        "a stateless call from `ci` was refused ({}): {}",
+        stateless.status, stateless.body
+    );
+    let seen: Vec<String> = stateless.result("tools/call")["structuredContent"]["sessions"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s["session_id"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![ci_session.clone()],
+        "a stateless call must see its own client's sessions and no others: {}",
+        stateless.body
+    );
+
+    // And asking after it by name is *unknown* rather than refused: the answer must not confirm a
+    // session the caller may not touch, so it is the same one a handle that never existed gets.
+    let asked = server.tool_as(
+        &ci_token,
+        &ci_mcp,
+        "session_status",
+        json!({ "session_id": local_session }),
+    );
+    assert_eq!(
+        asked["unknown_handle"],
+        json!(true),
+        "another client's handle must come back unknown: {asked}"
+    );
+    assert!(
+        asked["sessions"].as_array().is_some_and(Vec::is_empty),
+        "and it must describe nothing: {asked}"
+    );
+
+    // Routing and ending are one check, since `end_session` resolves the handle before it ends
+    // anything.
+    let refused = server.tool_as(
+        &ci_token,
+        &ci_mcp,
+        "end_session",
+        json!({ "session_id": local_session }),
+    );
+    assert_eq!(
+        refused["status"],
+        json!("error"),
+        "`ci` was allowed to end `local`'s session: {refused}"
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .is_some_and(|said| said.contains("unknown session handle")),
+        "the refusal has to read as unknown rather than as someone else's: {refused}"
+    );
+    // The half that would have cost somebody a target: it is still there.
+    assert_eq!(
+        sessions_listed(&mut server, &local_token, &local_mcp),
+        vec![local_session.clone()],
+        "`ci`'s end_session reached `local`'s session after all"
+    );
+
+    // The MCP session id itself. A request bearing another client's is answered `404` — the same
+    // status an id this server never issued gets, deliberately: from the caller's side "not yours"
+    // and "not a session here" must be indistinguishable.
+    let borrowed = server.call_as(&ci_token, Some(&local_mcp), "tools/list", json!({}));
+    assert_eq!(
+        borrowed.status, 404,
+        "`ci` was served on `local`'s Mcp-Session-Id: {}",
+        borrowed.body
+    );
+
+    // Coming back. `ci` says goodbye and returns inside the grace: what it left open is still open,
+    // and it is the returning client's own sessions that the line describes.
+    let farewell = server.goodbye_as(&ci_token, &ci_mcp);
+    assert!(
+        (200..300).contains(&farewell.status),
+        "the DELETE was refused ({}): {}",
+        farewell.status,
+        farewell.body
+    );
+    let ci_again = server.initialize_as(&ci_token);
+    assert_ne!(ci_again, ci_mcp, "a reconnect is a new MCP session");
+    assert_eq!(
+        sessions_listed(&mut server, &ci_token, &ci_again),
+        vec![ci_session.clone()],
+        "a client returning inside the grace adopts the session it left open"
+    );
+
+    // Read through `server_log` rather than off stderr, because that is the channel a client on
+    // another machine has — and because the **count** in it is what was wrong: taken for `local` on
+    // a named client's reconnect, an adoption of one session was reported as nothing having been
+    // open.
+    let page = server.tool_as(&ci_token, &ci_again, "server_log", json!({ "limit": 500 }));
+    let said: Vec<String> = page["records"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r["message"].as_str().map(str::to_string))
+        .collect();
+    assert!(
+        said.iter()
+            .any(|m| m.contains("adopted the 1 session(s) it had left open")),
+        "the adoption line must count the returning client's own sessions: {said:?}"
+    );
+    assert!(
+        !said.iter().any(|m| m.contains("nothing was open")),
+        "`ci` came back to a session it had left open, so nothing may report otherwise: {said:?}"
+    );
+
+    // And each client can end what it opened, which is the same ownership rule read the other way
+    // round — and the cleanup, so neither worker outlives this test.
+    for (whose, token, mcp, session) in [
+        ("local", &local_token, &local_mcp, &local_session),
+        ("ci", &ci_token, &ci_again, &ci_session),
+    ] {
+        let ended = server.tool_as(token, mcp, "end_session", json!({ "session_id": session }));
+        assert_eq!(
+            ended["status"],
+            json!("ok"),
+            "`{whose}` could not end the session it opened: {ended}"
+        );
+    }
 }
 
 /// A profile-named attach opens the session it names, and the key never leaves this process.

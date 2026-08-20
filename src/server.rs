@@ -47,6 +47,18 @@ pub struct WindbgServer {
     /// passed in separately, so the tool surface and the supervisor can never end up recording
     /// into two different files.
     rec: crate::record::Recorder,
+    /// Whose calls this instance answers, carried rather than read from the task it runs on.
+    ///
+    /// **The identity does not survive the transport on its own**, which is what this field is
+    /// here to fix. `listen::gate` scopes the caller around `mcp.handle(req)`, but rmcp serves a
+    /// legacy MCP session from a task it `tokio::spawn`s at `initialize`
+    /// (`streamable_http_server::tower::spawn_session_worker`), and a task-local does not cross a
+    /// spawn — so every tool call ran as the default `local`, and two credentials shared one
+    /// namespace however carefully the registry kept them apart. An instance is built per MCP
+    /// session (and per request on the stateless revision) *inside* the scope, which is the one
+    /// moment the caller is knowable, so the identity is captured there and re-entered around
+    /// every call.
+    client: crate::client::Client,
 }
 
 fn text_result(s: String) -> Result<CallToolResult, ErrorData> {
@@ -2494,9 +2506,20 @@ impl WindbgServer {
 #[rmcp::tool_router]
 impl WindbgServer {
     pub fn new(sessions: Sessions) -> Self {
+        Self::for_client(sessions, crate::client::Client::local())
+    }
+
+    /// The tool surface as one **named** client sees it.
+    ///
+    /// Only the listener has anything else to pass: stdio has exactly one client and no way to
+    /// authenticate a second, so [`Self::new`] is `local` by construction. Called from inside the
+    /// caller's identity scope — see the [`client`](Self::client) field for why nothing downstream
+    /// can read it instead.
+    pub fn for_client(sessions: Sessions, client: crate::client::Client) -> Self {
         Self {
             rec: sessions.recorder(),
             sessions,
+            client,
         }
     }
 
@@ -4378,6 +4401,24 @@ impl rmcp::ServerHandler for WindbgServer {
     /// one place every tool passes, rather than a line in each of forty-odd bodies. See
     /// [`crate::progress`].
     async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
+        // Every tool passes here, and every tool asks the registry who is calling — so this is the
+        // one place the identity has to be put back. It cannot be read from the task: this one was
+        // spawned by rmcp at `initialize` and knows nothing about the request that arrived on it.
+        crate::client::as_client(self.client.clone(), self.dispatch(request, context)).await
+    }
+}
+
+impl WindbgServer {
+    /// [`rmcp::ServerHandler::call_tool`]'s body, minus the identity scope around it.
+    ///
+    /// Split out for the early return: the recording path and the free one are one function, and
+    /// wrapping a `return` in a scope means a closure or a duplicated tail. This way there is one
+    /// call to [`crate::client::as_client`] and one place to forget it.
+    async fn dispatch(
         &self,
         request: rmcp::model::CallToolRequestParams,
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
