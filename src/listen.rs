@@ -377,8 +377,11 @@ struct Admitted {
 enum Arriving<'a> {
     /// An `Mcp-Session-Id` the client is presenting.
     Holding(&'a str),
-    /// No session id, on a revision that mints them: an `initialize`, or a client resuming inside
-    /// the grace.
+    /// No session id, on a revision that mints them — an `initialize`.
+    ///
+    /// Not a resume: a client picking up what it left inside the grace presents the id it held, so
+    /// it arrives as [`Self::Holding`] even though nobody currently holds the server. That case
+    /// reserves too, and for the same reason this one does.
     Opening,
     /// No session id, and none is coming.
     Stateless,
