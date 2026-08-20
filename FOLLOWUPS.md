@@ -1029,9 +1029,15 @@ is itself a one-entry object satisfies while carrying a different token — so t
 the whole credential: exactly one, and it is this token naming `local`. The last one was a *document*
 — a JSON example with the file's path commented above it, which does not begin with `{` and is
 therefore read as one token spanning four lines. The example lost its comment, and the parse now
-refuses a token carrying a line break at all — from any source, since it is a fact about the
-transport rather than about where the token was written: nothing can present one in an
-`Authorization` header, so a listener that accepts it is a listener that accepts nobody.
+refuses, from any source, a token that cannot travel in an `Authorization` header at all — a
+listener that accepts one is a listener that accepts nobody.
+
+**The lesson of the review rounds is one thing said three times.** A rule about a value was
+*described* in the code — a name charset, then a line-break test — and each round found the next
+character class it had not thought of. The two checks that stopped generating findings are the two
+that ask the thing that will actually do the work: the installer asks the reader whether the file
+shape round-trips, and `is_presentable` builds the header a client would send and reads it back the
+way `authorised` does. Where a rule belongs to something else, deriving it beats restating it.
 
 The end-to-end half is one protocol-tier smoke assertion
 (`a_token_file_names_its_own_clients_and_shuts_the_environment_out`): a real listener, a real file
