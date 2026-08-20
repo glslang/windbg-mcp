@@ -823,7 +823,7 @@ run against an **ARM64** stack. #143 closed the other three assertions this way 
   assert the symbolized form and let the pair cover both.
 - **Picks up at** [#154](https://github.com/glslang/windbg-mcp/issues/154).
 
-## 27. [windbg-mcp + win-kexp] A deferred module reports no PDB identity
+## 27. [windbg-mcp + win-kexp] A deferred module reports no PDB identity — **measured and declined** (2026-08-20)
 
 `modules` carries `pdb` — the GUID, age and symbol-server `key` — only for a module whose symbols
 the engine has **already resolved** (`symbols: pdb` or `dia`). On a freshly opened dump that is one
@@ -850,6 +850,38 @@ symbol load to populate it would be strictly worse: that is a `.reload` per modu
 
 **Depends on nothing.** Picks up at `worker::with_pdb_identity` and
 `win_kexp::DebugEngine::module_pdb`.
+
+**Built and measured, 2026-08-20 — and declined.** The parse is small and was not the problem: ~60
+lines reading the DOS stub, the optional header's data directories, the debug directory and the
+`RSDS` record, unit-testable against a synthetic image without a debugger. Wired in as a fallback
+for every module the engine has no PDB for, on the ARM64 kernel sample:
+
+| | baseline | with the image fallback |
+| --- | --- | --- |
+| `modules`, model-visible | 53,897 B | **73,597 B** (+37%, over its 73,000 B budget) |
+| `tool_results_stay_within_their_budget` | 1.31 s | **179.6 s** cold, **10.6 s** warm |
+
+**The cold number is the finding.** Reading a header the dump did not capture makes the engine go
+and *get the image* — from the image path, which on this host is a symbol server — so a listing of
+two hundred modules becomes two hundred image downloads. Which means the field cannot save the
+download it exists to save: on a minidump the answer is paid for with the very fetch a client would
+otherwise do itself, only on the debugger host and with 60 bytes to show for it. Warm, it is still
+8× the baseline, because each row is a symsrv cache hit.
+
+Where it would be cheap is a target whose headers are already in memory — a live target, or a
+full-memory dump — and that is also the case where the caller can just load symbols for the one
+module they care about and read the engine's own answer.
+
+So: not always-on (the numbers), not behind a `pdb: true` argument either (a knob whose honest
+description is "this may download two hundred images" is a knob nobody can use safely), and not
+behind a match-count threshold (an answer whose *content* varies with how many rows matched). The
+contract in [`docs/coordinates.md`](./docs/coordinates.md) stands as written: this field reports the
+PDB the engine **has**.
+
+**What would change the answer** is a way to read a header without the engine paging the image in —
+`SYMOPT_NO_IMAGE_SEARCH` would do it, but it is a global symbol option and setting it for one field
+would change how every symbol on the target resolves. Worth revisiting only with a per-read way to
+say "from the dump only".
 
 ## 28. [windbg-mcp] The tenancy gate no longer earned its place — **done** (2026-08-20)
 
