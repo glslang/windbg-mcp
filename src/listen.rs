@@ -642,7 +642,19 @@ pub async fn serve(
     let mcp = {
         let sessions = sessions.clone();
         Arc::new(StreamableHttpService::new(
-            move || Ok(WindbgServer::new(sessions.clone())),
+            // **The one moment the caller is knowable.** rmcp builds a service instance per MCP
+            // session — here, on the task handling that session's `initialize`, which
+            // [`gate`] has scoped to the credential that authenticated — and then serves every
+            // later call to that session from a task it spawned, where nothing of the request
+            // remains. So the identity is read here and carried by the instance; see
+            // `WindbgServer::client`. On the stateless revision there is no session and no spawn,
+            // and this runs per request, which reaches the same answer by the shorter route.
+            move || {
+                Ok(WindbgServer::for_client(
+                    sessions.clone(),
+                    crate::client::current(),
+                ))
+            },
             manager.clone(),
             // A tool call can be quiet for minutes; without a keep-alive the stream looks idle to
             // anything between the two machines and gets collected.
