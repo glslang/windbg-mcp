@@ -9,6 +9,74 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--listen`: the same tool surface over HTTP, so the client and the model need not be on the
+  debugger host** ([#135](https://github.com/glslang/windbg-mcp/pull/135)). DbgEng is Windows-only
+  and holds one debuggee per process; nothing about the *client* has to be. `windbg-mcp.exe --listen
+  127.0.0.1:8765` serves every tool over streamable HTTP, with the process tree below it unchanged —
+  same supervisor, same private pipes to each engine worker, same teardown.
+
+  - **A bearer token is required, and the server refuses to start without one.** The surface
+    includes `execute` and `launch`, so a port with no lock on it is arbitrary code on the machine
+    holding your kernel debugger. `WINDBG_MCP_LISTEN_TOKEN` names it.
+  - **Bind loopback and forward with `ssh -L`.** The listener binds what it is told and *warns* on
+    every start when that is not loopback, because the argument for skipping a tunnel — a
+    hypervisor network that does not route off the host — is exactly wrong on a debugger host: the
+    guest being debugged is on that network, and is a sandbox by design.
+  - **A session lease replaces "stdio closed".** Under stdio the disconnect *is* the teardown
+    signal, and it drives a real `EndSession` through every worker rather than killing it, because
+    a live kernel that is merely killed is left frozen. HTTP has no such event, so each credential
+    holds a deadline that every admitted request renews, and a sweep releases what an absent client
+    left — the same clean release, on a timer instead of an EOF.
+  - **Silence is not departure and a goodbye is.** Every request is its own connection, so quiet is
+    the resting state; a `DELETE` is the client saying it is done. One that comes back inside the
+    grace **adopts what it left**, which is what makes a client restart cost nothing where under
+    stdio it costs a KDNET attach — and a KDNET attach costs a reboot of the target.
+  - **The grace has a floor and the floor is derived, not chosen**: the longest a single call can
+    keep a client quiet is `WORKER_READY_TIMEOUT` plus the call timeout, since an opener spends up
+    to 30s bringing a worker up before its budget starts. A shorter grace would release a session
+    underneath the request that opened it, so it is refused at startup rather than truncated.
+    `WINDBG_MCP_LEASE_GRACE_SECS` overrides it.
+
+  [`docs/remote-listener.md`](./docs/remote-listener.md) is the operator's half.
+
+- **The listener installs as a Windows service** ([#151](https://github.com/glslang/windbg-mcp/pull/151)).
+  `--install-service --listen <addr>`, elevated, registers it with the SCM as `windbg-mcp`,
+  auto-start, `LocalSystem`; `--uninstall-service` stops and removes it. That is what gives it
+  `PATH`, boot start and a life independent of a login shell. Elevation is *not* among the reasons:
+  Windows OpenSSH already hands an Administrators member a full token.
+
+  - **The stop is the whole of the difficulty.** A service killed rather than asked leaves a
+    detached-but-halted kernel frozen, so `listen::serve` grew a shutdown future for this one case —
+    nothing else in this server needs one — and the SCM is told a preshutdown wait sized from what
+    releasing every worker can actually take, refreshed at every start rather than left on the
+    default.
+  - **The token moves out of the environment**, because `launch` under `LocalSystem` would make a
+    machine-scope variable a local privilege escalation. `install` writes it to
+    `%ProgramData%\windbg-mcp\token`, ACL'd to SYSTEM and Administrators, and refuses to install
+    from a user-writable directory unless `--allow-unprotected-path` says the machine is yours.
+  - **`LocalSystem` does not read your `profiles.json`** — its `%USERPROFILE%` is the system
+    profile — so kernel profiles have to be configured machine-wide or the service sees none.
+    Verified rather than assumed, and `install` says so where an operator will read it.
+  - A service has no console, so the role also writes to `%ProgramData%\windbg-mcp\service.log`.
+    `server_log` is the better channel and is only reachable once the listener is up, which is
+    exactly the case that file is for.
+
+- **A long call says how it is going** ([#147](https://github.com/glslang/windbg-mcp/pull/147),
+  `src/progress.rs`). A caller that puts a `progressToken` in a call's `_meta` gets
+  `notifications/progress` while the call runs. The worker already emitted the milestones; what was
+  missing was a route out to the client — and two decisions that are the difference between a
+  progress bar and a liveness signal.
+
+  - **Seconds elapsed, with no `total`.** A denominator would have to be a per-tool budget, and in
+    an opener's case that budget does not even cover the 30s worker handshake before it starts.
+  - **Ten seconds without a word is itself reported.** The milestones alone would have left the two
+    longest silences exactly as they were: a parked kernel attach reports once in the first second
+    and may never report again, and a pool walk or a `crash_triage` has no milestones at all.
+    Incidentally this makes progress something a client can extend its own request timeout on.
+
+  It matters most over `--listen`, where a quiet five-minute call and a dead link look identical
+  from the other machine.
+
 - **Per-client session namespaces, so two clients on one listener cannot reach each other's
   targets** ([#162](https://github.com/glslang/windbg-mcp/issues/162), slices 2 and 3). A listener
   may now hold several bearer tokens — `WINDBG_MCP_LISTEN_TOKEN_<NAME>` names a client, the unnamed
