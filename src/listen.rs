@@ -87,7 +87,7 @@ pub const LISTEN_FLAG: &str = "--listen";
 /// command line is readable by every process on the machine — including a `launch`ed debuggee.
 pub const TOKEN_ENV: &str = "WINDBG_MCP_LISTEN_TOKEN";
 
-/// A file to read the bearer token from instead, for when an environment variable is not private
+/// A file to read credentials from instead, for when an environment variable is not private
 /// enough.
 ///
 /// It is not, for a **service**: a service reads the *machine* environment, and that is readable by
@@ -96,7 +96,10 @@ pub const TOKEN_ENV: &str = "WINDBG_MCP_LISTEN_TOKEN";
 /// local privilege escalation rather than an inconvenience — see [`crate::service`], which writes
 /// this file with an ACL that excludes ordinary users and points the service at it.
 ///
-/// Read *before* [`TOKEN_ENV`], so a host that has both is using the private one.
+/// Read *instead of* [`TOKEN_ENV`] and every named token, not merely before them: a host that has
+/// a file is a host whose environment is not trusted. Which is why the file names its own clients —
+/// a bare token is `local`, a JSON object of name to token is as many as it lists
+/// ([`crate::client::TokenFile`]).
 pub const TOKEN_FILE_ENV: &str = "WINDBG_MCP_LISTEN_TOKEN_FILE";
 
 /// How long a session may go unused before it is released, from [`IDLE_ENV`] or [`IDLE_RELEASE`].
@@ -573,10 +576,8 @@ async fn bind_when_ready(addr: SocketAddr) -> Result<TcpListener> {
     }
 }
 
-/// The bearer token, from a file if one is named and from the environment otherwise.
-///
-/// Trimmed, because a token in a file arrives with whatever line ending wrote it, and a token that
-/// works from an editor but not from `Set-Content` would be an unpleasant afternoon.
+/// The credentials this listener accepts, from a file if one is named and from the environment
+/// otherwise.
 fn credentials() -> Result<crate::client::Credentials> {
     let creds = crate::client::Credentials::from_entries(std::env::vars(), token_file()?)?;
     if creds.len() == 0 {
@@ -589,22 +590,23 @@ fn credentials() -> Result<crate::client::Credentials> {
     Ok(creds)
 }
 
-/// The token in the file [`TOKEN_FILE_ENV`] names, if it names one.
-fn token_file() -> Result<Option<String>> {
-    if let Some(path) = std::env::var_os(TOKEN_FILE_ENV) {
-        let path = std::path::PathBuf::from(path);
-        let token = std::fs::read_to_string(&path).with_context(|| {
-            format!(
-                "{TOKEN_FILE_ENV} names {}, which cannot be read",
-                path.display()
-            )
-        })?;
-        if token.trim().is_empty() {
-            bail!("{} is empty; that is not a token.", path.display());
-        }
-        return Ok(Some(token.trim().to_string()));
-    }
-    Ok(None)
+/// The credentials in the file [`TOKEN_FILE_ENV`] names, if it names one.
+///
+/// The read is here and the parse is in [`crate::client`], which is the same split every other
+/// rule about who may connect follows — and it lets the file's two shapes be asserted without a
+/// filesystem.
+fn token_file() -> Result<Option<crate::client::TokenFile>> {
+    let Some(path) = std::env::var_os(TOKEN_FILE_ENV) else {
+        return Ok(None);
+    };
+    let path = std::path::PathBuf::from(path);
+    let text = std::fs::read_to_string(&path).with_context(|| {
+        format!(
+            "{TOKEN_FILE_ENV} names {}, which cannot be read",
+            path.display()
+        )
+    })?;
+    crate::client::TokenFile::parse(&text, &path).map(Some)
 }
 
 pub async fn serve(

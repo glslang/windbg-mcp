@@ -270,11 +270,40 @@ what the oldest record is — is over that client's own stream. Numbering per cl
 last of it and cost the cursor its stability, which is a bad trade for a shared debug host and a
 worse one for a hostile tenant, who should not be sharing a listener at all.
 
-**A token file is the only credential when one is configured.** `WINDBG_MCP_LISTEN_TOKEN_FILE` shuts
-the environment out entirely — named tokens included — rather than merely outranking the unnamed
-variable. That precedence is load-bearing: the service installer ACLs that file to SYSTEM and
-Administrators *because* the machine environment is readable by unprivileged processes, so a
-variable standing beside it would reintroduce exactly what the file was written to avoid.
+**A token file is the only credential when one is configured, so it names its own clients.**
+`WINDBG_MCP_LISTEN_TOKEN_FILE` shuts the environment out entirely — named tokens included — rather
+than merely outranking the unnamed variable. That precedence is load-bearing: the service installer
+ACLs that file to SYSTEM and Administrators *because* the machine environment is readable by
+unprivileged processes, so a variable standing beside it would reintroduce exactly what the file was
+written to avoid.
+
+Which is why the file takes either shape. A **bare token**, which names `local` and is what this
+file has always held:
+
+```text
+<a long random string>
+```
+
+Or a **JSON object of client name to token**, the same shape `WINDBG_MCP_PROFILES` uses for kernel
+profiles:
+
+```json
+{
+  "local":  "<a long random string>",
+  "ci":     "<another>",
+  "laptop": "<another>"
+}
+```
+
+A leading `{` is what tells them apart, so a bare token may not begin with one — a file that does is
+refused at startup, by name, rather than read as the other thing. Keys are client names, values are
+their tokens: **written the other way round it configures a client named after your token**, and the
+line this server logs at startup says who may connect. Nothing can detect that for you, since a
+token is a valid name.
+
+Everything else about the file is unchanged: one file, one ACL, and every rule above about what
+owning a session means applies to the clients it names exactly as it does to tokens from the
+environment.
 
 **Every credential variable is stripped from the processes this server creates** — engine workers
 and the TTD recorder — by prefix rather than by name, so a token added later cannot quietly reach a
@@ -368,6 +397,14 @@ machine environment is readable by every local process, the listener is reachabl
 same, and `launch` takes an arbitrary command line and runs it from a worker this service spawned —
 as `LocalSystem`. The token is the only thing in the way, so it has to stay unreadable by an
 unprivileged process, which is the one property the foreground listener gets for free.
+
+**Every credential in the installing shell is copied, not just the unnamed one.** A service reads
+its file and nothing else, so this is the only way it can hold more than one client — set
+`WINDBG_MCP_LISTEN_TOKEN_CI` beside `WINDBG_MCP_LISTEN_TOKEN` before installing and the file it
+writes names both. One client called `local` is written as a bare token, as it always was; anything
+else is the JSON object above. The install validates them the way the listener would, so a shell
+that could not start a foreground listener cannot register a service either — which matters here,
+because the SCM registers a service once and a bad credential then fails it at every start.
 
 `windbg-mcp.exe --uninstall-service` removes it, stopping it first and waiting for it — a delete
 issued against a running service only marks it, and this one has debug targets to let go of.

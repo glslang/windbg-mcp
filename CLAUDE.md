@@ -379,7 +379,10 @@ as the parser having made things worse.
 
 A `--listen` server holds **one bearer token per client**: `WINDBG_MCP_LISTEN_TOKEN_<NAME>` names
 one, the unnamed variable names `local`, and a configured `WINDBG_MCP_LISTEN_TOKEN_FILE` shuts the
-environment out entirely rather than merely outranking it. Under stdio everything runs as `local`,
+environment out entirely rather than merely outranking it — so that file names its own clients (a
+bare token is `local`; a JSON object of name to token is as many as it lists), which is the only way
+a service-hosted listener holds more than one, and `--install-service` copies every credential
+variable in the shell rather than the unnamed one alone. Under stdio everything runs as `local`,
 so there is one set of rules and no transport exception. `docs/remote-listener.md` is the operator's
 half; what follows is what bites while editing.
 

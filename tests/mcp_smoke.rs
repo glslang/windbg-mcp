@@ -2952,6 +2952,67 @@ fn an_unauthenticated_request_is_refused_and_costs_the_server_nothing() {
     );
 }
 
+/// A token file may name **more than one client**, and it is still the only credential there is.
+///
+/// Both halves matter, and they pull against each other. The precedence is load-bearing: the
+/// service installer ACLs that file to SYSTEM and Administrators *because* the machine environment
+/// is readable by unprivileged processes, so an environment token standing beside it would
+/// reintroduce exactly what the file was written to avoid. But a file that could only ever name one
+/// client made the per-client boundary of
+/// [#162](https://github.com/glslang/windbg-mcp/issues/162) unreachable in the deployment
+/// `docs/remote-listener.md` recommends — a service reads nothing else, so two agents on one host
+/// shared a namespace (`FOLLOWUPS.md` item 31).
+///
+/// Protocol tier: no target, no worker. What is exercised here is the call site — a real listener
+/// reading a real file — over the parse and precedence rules unit-tested in `src/client.rs`.
+#[test]
+fn a_token_file_names_its_own_clients_and_shuts_the_environment_out() {
+    let at = marker_path("token-file");
+    let for_local = "smoke-file-token-local";
+    let for_ci = "smoke-file-token-ci";
+    std::fs::write(
+        &at,
+        format!(r#"{{ "local": "{for_local}", "ci": "{for_ci}" }}"#),
+    )
+    .unwrap_or_else(|e| panic!("cannot write {}: {e}", at.display()));
+
+    // The helper sets `WINDBG_MCP_LISTEN_TOKEN` on every listener it starts, which is the variable
+    // this file has to shut out — so the environment half needs no arranging.
+    let mut server = Listener::start(&[("WINDBG_MCP_LISTEN_TOKEN_FILE", &at.to_string_lossy())]);
+    assert!(
+        server.wait_for_stderr("clients: ci, local", Duration::from_secs(30)),
+        "the startup line should name both clients the file configures:\n{}",
+        server.stderr()
+    );
+
+    let from_the_environment = server.token.clone();
+    let refused = server.send(
+        "POST",
+        Some(&from_the_environment),
+        None,
+        Some(&json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {} })),
+    );
+    assert_eq!(
+        refused.status, 401,
+        "a file was configured, so the environment token must authenticate nobody: {}",
+        refused.body
+    );
+
+    // And each client the file names is served, through the whole handshake.
+    for (whose, token) in [("local", for_local), ("ci", for_ci)] {
+        server.token = token.to_string();
+        let session = server.initialize();
+        let status = server.tool(&session, "session_status", json!({}));
+        assert_eq!(
+            status["status"], "ok",
+            "the client `{whose}`, which the token file names, was not served: {status}"
+        );
+    }
+
+    drop(server);
+    let _ = std::fs::remove_file(&at);
+}
+
 /// A credential's second MCP session is **served alongside** the first, not refused.
 ///
 /// This was a `409` until the gate was retired, and it was once the whole boundary: handles were
