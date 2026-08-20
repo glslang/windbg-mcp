@@ -958,3 +958,31 @@ mechanism to catch, so it is worth doing only if the arming rule ever grows a se
 **Why deferred:** it buys call-site coverage of a path whose hazard has been deleted rather than
 handled. Picks up at the listener helpers in `tests/mcp_smoke.rs`, beside
 `the_listener_serves_the_stateless_revision_it_negotiates`.
+
+## 31. [windbg-mcp] A service-hosted listener can hold only one client
+
+`Credentials::from_entries` treats a configured `WINDBG_MCP_LISTEN_TOKEN_FILE` as the **only**
+credential: it loads that token as `local` and returns, ignoring every environment token including
+named ones. That precedence is deliberate and load-bearing — the service installer ACLs the file to
+SYSTEM and Administrators precisely because the machine environment is readable by unprivileged
+processes, and a variable standing beside it would let a stale or planted one authenticate to a
+LocalSystem listener that has `launch` on it.
+
+The consequence is that **the per-client work of [#162](https://github.com/glslang/windbg-mcp/issues/162)
+is unreachable in the deployment `docs/remote-listener.md` recommends.** A foreground listener can
+hold `local`, `ci` and `laptop`; the service can hold one client, so two agents on one service-hosted
+host share a namespace — which is exactly what ownership was built to stop.
+
+It surfaced from the other end, in review of [#173](https://github.com/glslang/windbg-mcp/pull/173):
+the local-model driver must not open sessions on a borrowed credential, because a client over the
+four-session cap has its oldest idle session reclaimed and the driver's open can evict the editor's
+target. The runbook's answer — give the driver its own token — cannot be followed under the service.
+
+**What would close it:** a token file that can name more than one client. The obvious shape is the
+same one `WINDBG_MCP_PROFILES` already uses for kernel profiles — a JSON object of name to token,
+with a bare string still read as `local` so every existing install keeps working. The ACL story is
+unchanged, since it is one file either way.
+
+**Why deferred:** it is a file-format change to the one file that holds credentials, and it wants to
+land on its own rather than inside a runbook PR. Picks up at `Credentials::from_entries`
+(`src/client.rs`) and `service::install`, which writes the file.

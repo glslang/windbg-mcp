@@ -58,24 +58,39 @@ That is deliberate: the surface includes `execute` and `launch`, and a debug hos
 to discover unattended what a model does with them — but a wrong pick is still *measured*, which is
 the point.
 
-**Give the driver its own credential.** Falling back to the registered client's token puts it in
-*that client's* namespace, which is ownership working exactly as designed — the driver then sees,
-routes to and could end the sessions your editor has open. A token of its own makes it a separate
-client with a separate namespace, which is what the per-client work is for:
+**The driver needs a credential of its own before it may open anything.** Falling back to the
+registered client's token puts it in *that client's* namespace — ownership working exactly as
+designed — and no fence inside the script can make that safe: a client over the four-session cap has
+its oldest **idle** session reclaimed by the server, so a dump this run opens can evict the editor's
+target without any tool call naming it. So openers are refused unless `WINDBG_MCP_TOKEN` names a
+credential chosen for this run. Read-only work still runs on the borrowed one.
 
 ```console
-# on the Windows machine, beside the unnamed token
+# on the Windows machine, beside the unnamed token — foreground listener only, see below
 setx WINDBG_MCP_LISTEN_TOKEN_DRIVER "<another long random string>"
 # on the client machine
 WINDBG_MCP_TOKEN="<the same string>" python3 tools/local_model_drive.py tasks.json
 ```
 
-Sharing the token is survivable rather than safe, and the script is fenced accordingly: it will only
-`end_session` a session **this run opened** — counting only the handles an *opener* returned, never
-every handle it has seen, since `session_status` and `server_log` name the whole client's — refuses
-one with no `session_id` at all (the server would resolve the client's *current* session, which may
-not be the driver's), and ends what it opened on the way out, so a run neither strands a worker for
-the lease grace nor leaves the next run adopting its leftovers.
+**A listener installed as the service can hold only one client**, so that recipe needs the foreground
+one. The installer points the service at an ACL'd token file, and a configured file is the *only*
+credential this server will read — it shuts the environment out entirely, named tokens included,
+because the machine environment is readable by unprivileged processes and this endpoint has `launch`
+on it (`Credentials::from_entries`). That precedence is right and the one-client consequence is a
+gap: `FOLLOWUPS.md` item 31. Until it closes, isolating the driver means a foreground listener with
+named tokens; against the service, the driver reads and does not open.
+
+Within one namespace the script is still fenced as far as it can be: it will only `end_session` a
+session **this run opened** — counting only the handles an *opener* returned, never every handle it
+has seen, since `session_status` and `server_log` name the whole client's and an opener refused at
+the cap lists them too — refuses one with no `session_id` at all (the server would resolve the
+client's *current* session, which may not be the driver's), and ends what it opened on the way out,
+so a run neither strands a worker for the lease grace nor leaves the next run adopting its leftovers.
+
+**Each task gets its own targets.** A task list is a list of separate conversations, so sessions are
+released after each one; otherwise a later task's `session_id`-less call routes to an earlier task's
+target and its measurement depends on the prompts before it. A list meant as one continuing
+investigation says so with `WINDBG_MCP_SCENARIO=1`.
 
 **A different arrangement, not a prerequisite:** `ollama launch claude --model <tag>` (ollama 0.32.12
 or newer) makes the local model *the agent* — it drives the harness itself, with these tools as its
