@@ -17,6 +17,11 @@ connected MCP client holds a lock on (see [`CLAUDE.md`](../CLAUDE.md)). The prot
 adding the debugger tier takes it to ~50s, almost all of it two tests waiting out real timers — a
 lease grace, and a call staying silent long enough to have to report that it is still running.
 
+**The pass count is the same either way**, because each gate is inside its own test: 64 passed with
+the tier off, 64 passed with it on. The runtime is what tells them apart, and `--nocapture` is what
+prints the `SKIPPED` reason — a run that reports 64 green having taken a second covered no debugger
+claim at all.
+
 ### Tiers
 
 | Tier | Gate | Needs | Catches |

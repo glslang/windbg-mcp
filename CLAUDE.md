@@ -109,6 +109,11 @@ For a compile/behavior check without touching the locked release exe, use the **
 `cargo clippy --all-targets`. The release
 build differs only in optimization and is exercised by CI on a fresh runner.
 
+**The pass count does not say which tiers ran.** Each gate is inside its test, so
+`cargo test` reports the same **64 passed** with the debugger tier off as with it on; what differs is
+the runtime (~1.3s against ~52s) and the `SKIPPED` lines, which only `--nocapture` prints. Read one
+of those two before believing a run covered a debugger claim.
+
 **The dev exe can be locked too, and the failure is quiet.** A worker left running — a driver
 script that died mid-session, a debugger tier killed partway — holds `target\debug\windbg-mcp.exe`,
 and `cargo build` then fails at the final replace step with `Access is denied (os error 5)` while
@@ -420,6 +425,20 @@ the startup floor in `Lease::new`: a grace longer than the longest a call can ke
 means **no request of that credential's can still be in flight when its lease expires**. That is the
 property the epochs and claim generations were protecting one layer above, and it was already
 enforced.
+
+**What rmcp does with session ids, which the ownership answer now leans on.** Two facts, both in
+`…/rmcp-3.1.2/src/transport/streamable_http_server/tower.rs`:
+
+- a legacy `initialize` **always** mints one — `create_session()` then `spawn_session_worker`, with no
+  check on who is asking — so nothing but this server ever refused a credential a second MCP session,
+  and now nothing does. Hence a client's ids are a **set** (an id this server stops recording is one
+  any credential may present) and an expiry closes **every** one of them (each abandoned handshake
+  otherwise leaves a live service task behind).
+- an id the service does not know — never issued, closed by a `DELETE`, or closed by the sweep —
+  comes back `404 Not Found: Session not found`. That is deliberately the same status
+  `Admission::NotYours` answers with: from the caller's side "not yours" and "not a session here"
+  are indistinguishable, and splitting them into a distinguishable pair would confirm a session the
+  caller may not touch.
 
 **Driving the listener by hand on `2026-07-28` needs three things, and sending one gets a `400`
 that looks like a broken server.** Every request *after the handshake* carries the
