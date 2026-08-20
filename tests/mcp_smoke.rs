@@ -14,13 +14,14 @@
 //!
 //! * **Protocol** (default) — spawns the server, speaks JSON-RPC. No debugger target, no
 //!   symbols, no network. This tier also drives the **listener** (`--listen`) over real HTTP on a
-//!   loopback port: the bearer check, the `409` that keeps a credential to one MCP session, the
-//!   difference between a client going quiet and a client saying goodbye, and `2026-07-28` being
-//!   served at all — the revision that removed the session id, and so arrives with none of the
-//!   things the rules above are written in terms of. Those need no debugger, because the lease is
-//!   decided before any session is opened. Two that do — the sweep meeting a real engine worker,
-//!   and a stateless client working alongside a call of its own that parks — live in the tier
-//!   below.
+//!   loopback port: the bearer check, a token file naming its own clients, the second MCP session
+//!   for one credential that the retired tenancy gate used to refuse and this server now serves,
+//!   the difference between a client going quiet and a client saying goodbye, and `2026-07-28`
+//!   being served at all — the revision that removed the session id, and so arrives with none of
+//!   the things the rules above are written in terms of. Those need no debugger, because the
+//!   lease is decided before any session is opened. Two that do — the sweep meeting a real engine
+//!   worker, and a stateless client working alongside a call of its own that parks — live in the
+//!   tier below.
 //! * **Target** (`WINDBG_MCP_SMOKE_DUMP=1`) — opens the sample crash dump through DbgEng, so
 //!   it needs `dbgeng.dll` and may reach a symbol server. Off by default; this is the tier
 //!   that catches a `win-kexp` regression. It also runs a `debug_batch` to both outcomes, and
