@@ -73,9 +73,10 @@ Then point a local model at it, either way round:
   ```
 
   Sharing the token is survivable rather than safe, and the script is fenced accordingly: it will
-  only `end_session` a session **this run opened**, refuses one with no `session_id` at all (the
-  server would resolve the client's *current* session, which may not be the driver's), and ends what
-  it opened on the way out — so a run neither strands a worker for the lease grace nor leaves the
+  only `end_session` a session **this run opened** — counting only the handles an *opener* returned,
+  never every handle it has seen, since `session_status` and `server_log` name the whole client's —
+  refuses one with no `session_id` at all (the server would resolve the client's *current* session,
+  which may not be the driver's), and ends what it opened on the way out — so a run neither strands a worker for the lease grace nor leaves the
   next run adopting its leftovers.
 
 ## What this server costs a model, measured
