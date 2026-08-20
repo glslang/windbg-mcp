@@ -236,8 +236,9 @@ when the machine being debugged shares it. [`docs/remote-listener.md`](./docs/re
 covers the tokens — **one per client**, each with its own sessions, so two people or two agents on
 one listener cannot reach each other's targets — the session lease and its grace, and what a `409`
 means (one credential asking for a second MCP session, never a second client, and never a request on
-a second connection — those are served concurrently, as is every request of a `2026-07-28` client,
-which has no session to ask twice for). For a one-off, [`docs/remote-phase0.md`](./docs/remote-phase0.md) does the same
+a second connection — those are served concurrently, as are a `2026-07-28` client's, which have no
+session to ask twice for, except while that credential's own expired sessions are still being
+released). For a one-off, [`docs/remote-phase0.md`](./docs/remote-phase0.md) does the same
 job over plain `ssh` with no listener.
 
 ### As a Claude Code plugin

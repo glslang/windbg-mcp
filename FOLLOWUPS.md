@@ -943,9 +943,14 @@ grace later. It is fixed and unit-tested at the lease level
 caused it is the one shape the tier does not send.
 
 **What would close it:** a listener assertion that opens with a headerless `2026-07-28` handshake
-and then works normally — a `tools/list` and a `tools/call` — plus, if the grace can be shortened
-far enough to make it quick, that its sessions are still there afterwards. All protocol-tier work;
-none of it needs a target.
+and then works normally — a `tools/list` and a `tools/call`. That much is protocol-tier work and
+needs no target.
+
+The half that would exercise the regression *end to end* is not: seeing sessions survive the grace
+means having a session, which means an opener (`open_dump`), which means a real engine worker and
+therefore the **debugger tier** — the same rule the parked test was moved for. Split it that way
+rather than claiming the whole thing is cheap; a protocol-tier version on its own asserts that the
+handshake is served, not that nothing sweeps afterwards.
 
 **Why deferred:** the mechanism is pinned where it is decided, so this buys call-site coverage of a
 path the server now handles correctly rather than a new claim. Picks up at the listener helpers in
