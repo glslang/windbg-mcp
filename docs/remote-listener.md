@@ -394,6 +394,14 @@ Three things that surprise people, all of them consequences of running as `Local
   and re-ACL the token file to match — at the cost of local kernel and process attach, which need
   privileges that account does not have.
 
+## Driving it with a local model
+
+Same listener, same registration — what changes is the budget, since the surface and every answer
+now have to fit a window you are paying for in RAM rather than in tokens.
+[`local-model.md`](./local-model.md) is the runbook: the three pieces, the measured cost of this
+server's tool surface, and why the context your runtime *serves* is the number that matters rather
+than the one on the model card.
+
 ## Not there yet
 
 Nothing on this page is known-missing. `FOLLOWUPS.md` is where anything new lands.
