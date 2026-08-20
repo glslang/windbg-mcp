@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in eleven clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in twelve clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/win-kexp#71, 2026-08-01), items 13–14 from the bounded-command coverage review
@@ -11,9 +11,9 @@ session's own transcript turned up, and item 18 what reviewing it did), item 19 
 (#131, #132, #134, 2026-08-16), item 23 from making the listener usable rather than merely
 working (2026-08-17), item 24 from first measuring what this server costs the model driving it
 (2026-08-17), items 25–26 from giving the debugger tier an ARM64 *target* (#143, #152,
-2026-08-18), item 27 from completing the coordinate work (#156–#158, 2026-08-18), and items 28–29
-from giving each client its own sessions (#162, #164–#166, 2026-08-19). Each item
-notes its repo,
+2026-08-18), item 27 from completing the coordinate work (#156–#158, 2026-08-18), items 28–29
+from giving each client its own sessions (#162, #164–#166, 2026-08-19), and item 30 from serving
+the stateless revision concurrently (#168 / #169, 2026-08-19). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -894,6 +894,16 @@ kept for. If it does, the gate can go and the sweep stays; if it does not, say w
 go: it is the sweep's, not the gate's, and a stateless request is refused by it like any other —
 told to ask again once the release is done.
 
+**Two rules the deletion must not take with it**, both learned in review of
+[#169](https://github.com/glslang/windbg-mcp/pull/169) and both ending in a client losing sessions
+it was using — the sweep reads `deadline` alone and zeroes `in_flight` on its way past, so work
+actually running does not save them:
+
+- a request **renews** an existing deadline. Whatever replaces `admit`, a credential that is plainly
+  alive must not be swept mid-call.
+- a reservation that mints nothing gives its **deadline** back, not just its claim. If reserving
+  goes away entirely this stops mattering; if it survives in any form, it still does.
+
 **Why deferred:** it is a deletion, and a deletion is the change most worth making on its own,
 against a PR that is not also adding the thing it would delete. Picks up at `src/listen.rs`
 (`Lease::admit`, `Lease::settle`) and the ~90 lease tests beside it.
@@ -918,3 +928,25 @@ target.
 
 **Why deferred:** the per-client rules are unit-tested at the level they are decided, so this buys
 call-site coverage rather than new claims. Picks up at the listener helpers in `tests/mcp_smoke.rs`.
+
+## 30. [windbg-mcp] Nothing covers a `2026-07-28` handshake that omits the protocol header
+
+rmcp allows a stateless `initialize` to arrive without `MCP-Protocol-Version` — it is the request
+that establishes the revision, so the header is optional on exactly that one. The listener therefore
+cannot classify it from the header, reads it as an **opener**, reserves, and then mints no session.
+
+That path is real and was briefly a bug: the reservation gave back its claim and left its *deadline*
+armed, so a client's own handshake started a clock that released whatever it had since opened one
+grace later. It is fixed and unit-tested at the lease level
+(`a_reservation_that_minted_nothing_leaves_no_clock_running`), but nothing drives it **over HTTP**:
+`Listener::stateless_opening` sends the header, and stdio has no headers to omit, so the shape that
+caused it is the one shape the tier does not send.
+
+**What would close it:** a listener assertion that opens with a headerless `2026-07-28` handshake
+and then works normally — a `tools/list` and a `tools/call` — plus, if the grace can be shortened
+far enough to make it quick, that its sessions are still there afterwards. All protocol-tier work;
+none of it needs a target.
+
+**Why deferred:** the mechanism is pinned where it is decided, so this buys call-site coverage of a
+path the server now handles correctly rather than a new claim. Picks up at the listener helpers in
+`tests/mcp_smoke.rs`, beside `the_listener_serves_the_stateless_revision_it_negotiates`.
