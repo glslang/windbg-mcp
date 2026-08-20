@@ -167,10 +167,11 @@ impl Credentials {
         for Configured { name, token, from } in configured {
             if !is_presentable(token) {
                 bail!(
-                    "the token in {from} carries a line break, so nothing can present it: a bearer \
-                     token travels in an `Authorization` header, and a header value cannot span \
-                     lines. It is not quoted here — it is printed at startup — and it is not \
-                     repaired either, since a credential that is quietly not the one you wrote is \
+                    "the token in {from} cannot travel in an `Authorization` header, so nothing \
+                     could ever authenticate with it: this server reads that header back as \
+                     visible ASCII, which rules out a line break and anything outside it. It is \
+                     not quoted here — this is printed at startup — and it is not repaired \
+                     either, since a credential that is quietly not the one you wrote is exactly \
                      what this refuses."
                 );
             }
@@ -336,10 +337,11 @@ impl TokenFile {
             // **The copy-paste trap, made loud.** Anything not beginning with `{` is the bare
             // shape, so a JSON object with a comment above it — which is what an operator copies
             // out of a document — is read as one token that happens to span the file.
-            // [`Credentials::build`] would refuse it anyway, since nothing can present a token
-            // carrying a line break; this says the more useful thing first, because here the
-            // diagnosis is available: what is wrong is the file's *shape*, not its credential.
-            if !is_presentable(text) {
+            // [`Credentials::build`] refuses that anyway, since nothing can present it; this says
+            // the more useful thing first. A line break is tested for here rather than
+            // presentability at large because it is being read as *evidence about the shape* —
+            // what is wrong is that this is not a token file, not that its credential is unusable.
+            if text.contains(['\n', '\r']) {
                 bail!(
                     "{} is not a token: it runs over more than one line, and a bearer token cannot \
                      contain a line break — nothing could present it. If this was meant to name \
@@ -421,16 +423,23 @@ impl TokenFile {
 
 /// Whether a token could be presented at all.
 ///
-/// A bearer token travels in an `Authorization` header, and a header value cannot span lines — so a
-/// credential carrying a line break authenticates nobody, whatever else is right about it. Every
-/// source of credentials is held to this in [`Credentials::build`], because it is a fact about the
-/// transport rather than about where the token was written down: a variable can hold one as easily
-/// as a JSON string can, and the installer would copy it into the file and report success.
+/// **Asked of the transport rather than described**, the same way the installer asks the reader
+/// which file shape round-trips. A bearer token gets here as `Authorization: Bearer <token>`, and
+/// `authorised` reads it back with `HeaderValue::to_str` — which yields only visible ASCII. So the
+/// question is exactly whether this string survives that round trip: build the header value a
+/// client would send, and read it back out the way the listener does. A token that does not
+/// survive it authenticates nobody, however right everything else about it is.
+///
+/// Two rounds of review arrived here one case at a time — a line break first, then non-ASCII text
+/// — which is what a hand-written charset would have kept doing. Every source of credentials is
+/// held to it in [`Credentials::build`], because it is a fact about the header rather than about
+/// where the token was written down: a variable can hold such a token as easily as a JSON string
+/// can, and the installer would copy it into the file and report success.
 ///
 /// Refused rather than repaired. What the operator wrote is not what would work, and this module's
 /// whole job is that a credential is either configured or said to be absent.
 fn is_presentable(token: &str) -> bool {
-    !token.contains(['\n', '\r'])
+    hyper::header::HeaderValue::from_str(token).is_ok_and(|value| value.to_str().is_ok())
 }
 
 /// A JSON object's entries **in the order they were written, duplicates and all**.
@@ -864,24 +873,29 @@ mod tests {
         }
     }
 
-    /// A token carrying a line break is refused wherever it was configured, because nothing could
-    /// present it: a bearer token travels in an `Authorization` header, and a header value cannot
-    /// span lines. Accepting one is a listener that starts and authenticates nobody.
+    /// A token that cannot travel in an `Authorization` header is refused wherever it was
+    /// configured — a line break, non-ASCII text, anything `HeaderValue::to_str` will not yield —
+    /// because `authorised` reads the header back that way and could never match it. Accepting one
+    /// is a listener that starts and authenticates nobody.
     #[test]
     fn a_token_that_cannot_be_presented_is_refused() {
-        let secret = "s3cret\nalpha";
         let refusals = [
-            // From the environment, which the installer would then copy into the file.
-            Credentials::from_entries(vars(&[(TOKEN_ENV, secret)]), None),
+            // A line break, from the environment — which the installer would copy into the file.
+            Credentials::from_entries(vars(&[(TOKEN_ENV, "s3cret\nalpha")]), None),
             // And from the file, where a JSON string can carry an escaped one.
             TokenFile::parse(r#"{"ci": "s3cret\nalpha"}"#, Path::new(FILE))
+                .and_then(|f| Credentials::from_entries(vars(&[]), Some(f))),
+            // Non-ASCII, which `HeaderValue::to_str` will not yield either — so `authorised` can
+            // never match it, and every request from that client would be a 401.
+            Credentials::from_entries(vars(&[(TOKEN_ENV, "s3cret-café")]), None),
+            TokenFile::parse(r#"{"ci": "s3cret-café"}"#, Path::new(FILE))
                 .and_then(|f| Credentials::from_entries(vars(&[]), Some(f))),
         ];
         for refusal in refusals {
             let why = refusal
                 .expect_err("a token nothing can present is a configuration error")
                 .to_string();
-            assert!(why.contains("line break"), "{why}");
+            assert!(why.contains("`Authorization` header"), "{why}");
             assert!(
                 !why.contains("s3cret"),
                 "a startup refusal wrote a bearer token into the log: {why}"
