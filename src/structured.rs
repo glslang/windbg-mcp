@@ -1038,7 +1038,10 @@ pub struct PoolChunkInfo {
     pub header_address: String,
     pub size: u64,
     pub state: PoolChunkState,
+    /// The tag as the debugger prints it — a label, not a key. See [`PoolTagTotals::tag`].
     pub tag: String,
+    /// The same tag as its four bytes, in memory order: what `pool_find_tag` can be handed back.
+    pub raw_tag: String,
     pub pool: PoolKindName,
     pub backend: PoolBackendName,
     pub numa_node: u16,
@@ -1096,6 +1099,7 @@ impl From<&win_kexp::pool::PoolSpan> for PoolChunkInfo {
                 PoolState::Unreadable => PoolChunkState::Unreadable,
             },
             tag: span.display_tag.clone(),
+            raw_tag: win_kexp::pool::raw_tag_hex(span.raw_tag),
             pool: match span.pool_kind {
                 PoolKind::NonPagedExecutable => PoolKindName::NonPagedExecutable,
                 PoolKind::NonPagedNx => PoolKindName::NonPagedNx,
@@ -1122,7 +1126,12 @@ impl From<&win_kexp::pool::PoolSpan> for PoolChunkInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PoolTagMatches {
     pub layout: AllocatorLayoutInfo,
+    /// The tag as the caller named it, in whichever form they used.
     pub tag: String,
+    /// The four bytes that name actually resolved to, in memory order. Worth reading back when
+    /// `tag` was a rendering: `....` resolves to literal `.` bytes, which is rarely what was
+    /// meant, and this is where that shows.
+    pub raw_tag: String,
     pub scope: PoolScope,
     /// How many allocated chunks carry the tag. A floor rather than a total unless
     /// `walk.coverage` is `complete`.
@@ -1177,7 +1186,14 @@ pub struct PoolCensus {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct PoolTagTotals {
+    /// The tag as the debugger prints it. A **label, not a key**: unprintable bytes render as
+    /// `.` and so does a literal `.`, so several distinct tags can share one rendering — which
+    /// is not hypothetical, since the heaviest two tags on a live kernel are routinely binary.
+    /// Pass `raw_tag` to `pool_find_tag`, not this.
     pub tag: String,
+    /// The same tag as its four bytes: `0x` and two hex digits each, in memory order. This is
+    /// what identifies it, and what `pool_find_tag` accepts alongside the printed form.
+    pub raw_tag: String,
     pub allocations: usize,
     pub total_bytes: u64,
     pub paged_allocations: usize,
