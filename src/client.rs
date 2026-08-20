@@ -34,19 +34,24 @@
 //! has.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 
 /// The unnamed token, and the prefix of a named one.
 const TOKEN_ENV: &str = "WINDBG_MCP_LISTEN_TOKEN";
 
-/// The variable naming a *file* to read a token from, which shares that prefix and is not one.
+/// The variable naming a *file* to read credentials from, which shares that prefix and is not one.
 ///
 /// Excluded by name rather than by shape: its value is a path, so without this it would configure
 /// a client called `file` whose credential is `C:\...\token` — a token nobody holds, under a name
 /// nobody chose, and the real token silently absent.
 const TOKEN_FILE_ENV: &str = "WINDBG_MCP_LISTEN_TOKEN_FILE";
+
+/// How long a client's name may be — the same bound a kernel profile's name has, and for the same
+/// reason: a name is rendered in log lines and in refusals, so it has to be a name.
+const NAME_LIMIT: usize = 64;
 
 /// Who a call belongs to.
 ///
@@ -84,9 +89,20 @@ impl std::fmt::Display for Client {
 }
 
 /// The tokens this listener accepts, and the client each one names.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct Credentials {
     by_token: HashMap<String, Client>,
+}
+
+/// **The names, never the tokens** — the same reason [`crate::kdconn::Connection`]'s is redacted.
+/// A derived one would put every credential this listener accepts into whatever formatted it, and
+/// the things that format a value like this are a log line and a test's panic message.
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("clients", &self.names())
+            .finish()
+    }
 }
 
 impl Credentials {
@@ -106,36 +122,54 @@ impl Credentials {
         names
     }
 
-    /// Builds the set from `(variable, value)` pairs and the file token, if there is one.
+    /// Builds the set from `(variable, value)` pairs, or from the token file if there is one.
     ///
     /// Takes the variables rather than reading the environment for the reason
     /// [`crate::kdconn::env_entries`] does: `set_var` is `unsafe` in edition 2024 and mutates state
     /// the whole test binary shares, so the only way to assert that
     /// `WINDBG_MCP_LISTEN_TOKEN_CI` names the client `ci` is to hand the scan its variables.
     ///
+    /// **A configured file is the *only* credential.** That precedence predates named tokens and
+    /// is load-bearing: the service installer writes the file to `%ProgramData%` with an ACL of
+    /// SYSTEM and Administrators precisely because the machine environment is readable by
+    /// unprivileged processes. Letting an environment token stand beside it would mean a stale or
+    /// planted variable authenticating to a LocalSystem listener — which has `launch` on it. So a
+    /// file shuts the environment out entirely rather than merely outranking the unnamed variable,
+    /// and names its own clients ([`TokenFile`]) rather than leaving the deployment that needs it
+    /// most with room for one.
+    pub fn from_entries(
+        vars: impl Iterator<Item = (String, String)>,
+        file: Option<TokenFile>,
+    ) -> Result<Self> {
+        match file {
+            Some(file) => Self::build(&file.entries),
+            None => Self::build(&from_env(vars)),
+        }
+    }
+
+    /// The two refusals every source of credentials is held to, wherever it was configured.
+    ///
     /// A token appearing twice is refused rather than resolved. Two names for one credential means
     /// a caller's sessions land under whichever name won a `HashMap` insertion, which is a rule
     /// nobody could predict and a boundary that would move.
-    pub fn from_entries(
-        vars: impl Iterator<Item = (String, String)>,
-        file_token: Option<String>,
-    ) -> Result<Self> {
+    fn build(configured: &[Configured]) -> Result<Self> {
         let mut by_token: HashMap<String, Client> = HashMap::new();
-        // Client name to the *variable* that configured it — never to the token. Both refusals
-        // below are printed at startup, to stderr in the foreground and to the service log under
-        // the SCM, so a message quoting the credential it is complaining about would write a
-        // working listener token into whatever collects those. The variable is also the more useful
-        // half: it is what the operator has to go and change.
-        let mut named: HashMap<String, String> = HashMap::new();
-        let mut insert = |token: String, name: &str, from: &str| -> Result<()> {
-            if let Some(existing) = by_token.get(&token) {
-                // One client is one credential (the check below), so the variable that configured
-                // this token is the one that configured that client.
+        // Client name to *what configured it* — never to the token. Both refusals below are
+        // printed at startup, to stderr in the foreground and to the service log under the SCM, so
+        // a message quoting the credential it is complaining about would write a working listener
+        // token into whatever collects those. The source is also the more useful half: it is what
+        // the operator has to go and change.
+        let mut named: HashMap<&str, &str> = HashMap::new();
+        for Configured { name, token, from } in configured {
+            if let Some(existing) = by_token.get(token) {
+                // One client is one credential (the check below), so whatever configured this
+                // token is what configured that client.
                 let first = named
                     .get(existing.name())
-                    .map_or("another variable", String::as_str);
+                    .copied()
+                    .unwrap_or("another entry");
                 bail!(
-                    "`{from}` and `{first}` are the same token, configured for `{name}` and \
+                    "{from} and {first} are the same token, configured for `{name}` and \
                      `{existing}`. One credential cannot name two clients: sessions opened with it \
                      would belong to whichever name happened to win."
                 );
@@ -144,56 +178,213 @@ impl Credentials {
             // insidious half: nothing looks wrong, both callers authenticate, and they silently
             // share a namespace — routing, listing, capacity, teardown rights, the lot. Names are
             // folded before comparison, so `WINDBG_MCP_LISTEN_TOKEN` and `…_TOKEN_LOCAL` collide
-            // (both `local`), as do `…_CI` and `…__CI`. A boundary two credentials can stand on is
-            // not a boundary, so this is a configuration error rather than a merge.
-            if let Some(other) = named.get(name) {
+            // (both `local`), as do `…_CI` and `…__CI`, and so do two spellings of one key in the
+            // token file. A boundary two credentials can stand on is not a boundary, so this is a
+            // configuration error rather than a merge.
+            if let Some(other) = named.get(name.as_str()) {
                 bail!(
-                    "two different tokens are configured for the client `{name}` (`{other}` and \
-                     `{from}`). Each client is one credential: two would share every session, \
-                     which is the isolation this is for, silently absent."
+                    "two different tokens are configured for the client `{name}` ({other} and \
+                     {from}). Each client is one credential: two would share every session, which \
+                     is the isolation this is for, silently absent."
                 );
             }
-            named.insert(name.to_string(), from.to_string());
-            by_token.insert(token, Client::new(name));
-            Ok(())
-        };
-
-        // **A configured file is the *only* credential.** That precedence predates named tokens
-        // and is load-bearing: the service installer writes the token to `%ProgramData%` with an
-        // ACL of SYSTEM and Administrators precisely because the machine environment is readable by
-        // unprivileged processes. Letting an environment token stand beside it would mean a stale
-        // or planted variable authenticating to a LocalSystem listener — which has `launch` on it.
-        // So a file shuts the environment out entirely rather than merely outranking the unnamed
-        // variable.
-        if let Some(token) = file_token {
-            insert(token, Client::LOCAL, TOKEN_FILE_ENV)?;
-            return Ok(Self { by_token });
-        }
-        for (key, value) in vars {
-            let token = value.trim().to_string();
-            if token.is_empty() {
-                continue;
-            }
-            if is_token_file(&key) {
-                continue;
-            }
-            match credential_suffix(&key) {
-                // The unnamed variable, which is what every existing setup uses.
-                Some("") => insert(token, Client::LOCAL, &key)?,
-                // `WINDBG_MCP_LISTEN_TOKEN_CI` names the client `ci`, the same lowercasing a
-                // kernel profile's variable gets.
-                Some(suffix) => {
-                    let name = suffix.trim_start_matches('_').to_ascii_lowercase();
-                    if name.is_empty() {
-                        continue;
-                    }
-                    insert(token, &name, &key)?;
-                }
-                None => {}
-            }
+            named.insert(name.as_str(), from.as_str());
+            by_token.insert(token.clone(), Client::new(name));
         }
         Ok(Self { by_token })
     }
+}
+
+/// One configured credential: the client it names, the token, and where it came from.
+///
+/// The third field is what a refusal quotes, and it is deliberately never the token — a variable
+/// name, or a key and the file holding it. It arrives already quoted, because how a source is
+/// referred to is the source's business: `` `WINDBG_MCP_LISTEN_TOKEN_CI` `` reads as a variable and
+/// `` `ci` in C:\ProgramData\windbg-mcp\token `` reads as an entry, and one template cannot
+/// render both.
+struct Configured {
+    name: String,
+    token: String,
+    from: String,
+}
+
+/// The credentials a set of environment variables configures — names derived, nothing validated.
+///
+/// Validation is [`Credentials::build`]'s, so that the listener and [`env_credentials`] hold a
+/// configuration to exactly one standard.
+fn from_env(vars: impl Iterator<Item = (String, String)>) -> Vec<Configured> {
+    let mut configured = Vec::new();
+    for (key, value) in vars {
+        let token = value.trim().to_string();
+        // An empty value is not a token — it is a variable somebody exported and never set.
+        if token.is_empty() || is_token_file(&key) {
+            continue;
+        }
+        let name = match credential_suffix(&key) {
+            // The unnamed variable, which is what every existing setup uses.
+            Some("") => Client::LOCAL.to_string(),
+            // `WINDBG_MCP_LISTEN_TOKEN_CI` names the client `ci`, the same lowercasing a kernel
+            // profile's variable gets.
+            Some(suffix) => suffix.trim_start_matches('_').to_ascii_lowercase(),
+            None => continue,
+        };
+        if name.is_empty() {
+            continue;
+        }
+        configured.push(Configured {
+            from: format!("`{key}`"),
+            name,
+            token,
+        });
+    }
+    configured
+}
+
+/// What this process's environment configures, as `(client, token)` pairs.
+///
+/// For [`crate::service::install`], which copies the installing shell's credentials into the file
+/// the service reads. It validates by building the same [`Credentials`] the listener would, so an
+/// install cannot write a file the service then refuses to start on — which is the worst shape
+/// this can take, since the SCM registers a service once and it fails at every start afterwards.
+pub fn env_credentials(
+    vars: impl Iterator<Item = (String, String)>,
+) -> Result<Vec<(String, String)>> {
+    let configured = from_env(vars);
+    Credentials::build(&configured)?;
+    Ok(configured.into_iter().map(|c| (c.name, c.token)).collect())
+}
+
+/// The credentials a token file holds.
+///
+/// **Two shapes, because the file has two jobs.** A **bare token** names [`Client::LOCAL`]: that is
+/// what a hand-written file has always been, and what [`crate::service::install`] writes for a
+/// single-client host, so an install predating this keeps working with a file nobody has to touch.
+/// A **JSON object of name to token** names several — the shape `WINDBG_MCP_PROFILES` already uses
+/// for kernel profiles, so it is one an operator of this server has met before.
+///
+/// The second shape exists because of the precedence in [`Credentials::from_entries`]: a configured
+/// file is the *only* credential, so until it a service-hosted listener could hold exactly one
+/// client — and the per-client boundary was unreachable in precisely the deployment
+/// `docs/remote-listener.md` recommends (`FOLLOWUPS.md` item 31). It is one file either way, so
+/// the ACL that makes the file worth having is unchanged.
+///
+/// **A leading `{` is what tells them apart**, so a bare token may not begin with one. That is a
+/// rule rather than a guess: a token that did would be refused at startup, by name, rather than
+/// quietly read as something else.
+pub struct TokenFile {
+    entries: Vec<Configured>,
+}
+
+/// The names, never the tokens — as [`Credentials`]'s is, and for the same reason. [`Configured`]
+/// has no `Debug` at all, so a container that grows a derived one fails to compile rather than
+/// quietly starting to print credentials.
+impl std::fmt::Debug for TokenFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenFile")
+            .field(
+                "clients",
+                &self.entries.iter().map(|c| &c.name).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+impl TokenFile {
+    /// Parses a token file's text. `path` is here only to name the file in a refusal.
+    ///
+    /// **No message this can produce quotes a value from the file**, because every value in it is a
+    /// credential and every one of these refusals is printed at startup — to stderr in the
+    /// foreground, to the service log under the SCM. That is also why the JSON is walked as generic
+    /// values rather than deserialized into a typed map, exactly as [`crate::kdconn`] walks the
+    /// profile file: serde's type errors quote the value they rejected (`invalid type: integer 5`),
+    /// while a syntax error carries a position and nothing else.
+    pub fn parse(text: &str, path: &Path) -> Result<Self> {
+        // **A leading UTF-8 BOM is not a broken file.** Windows PowerShell 5.1's `Set-Content
+        // -Encoding utf8` — an obvious way to write this file — puts one in front, and U+FEFF is
+        // not whitespace, so it survives a trim and lands *inside* the token. That is a file which
+        // looks exactly right and authenticates nobody.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(text).trim();
+        if text.is_empty() {
+            bail!("{} is empty; that is not a token.", path.display());
+        }
+        if !text.starts_with('{') {
+            return Ok(Self {
+                entries: vec![Configured {
+                    name: Client::LOCAL.to_string(),
+                    token: text.to_string(),
+                    from: path.display().to_string(),
+                }],
+            });
+        }
+        let object: serde_json::Map<String, serde_json::Value> = serde_json::from_str(text)
+            .map_err(|e| {
+                anyhow!(
+                    "{} begins with `{{`, so it is read as a JSON object of client name to token — \
+                     and it is not valid JSON ({e}). A file holding one token is still a token \
+                     file; it just may not start with `{{`.",
+                    path.display()
+                )
+            })?;
+        let mut entries = Vec::new();
+        for (key, value) in object {
+            let name = key.trim().to_ascii_lowercase();
+            if !is_client_name(&name) {
+                bail!(
+                    "an entry in {} is named something that is not a client name (letters, digits, \
+                     `-`, `_` or `.`, up to {NAME_LIMIT} characters). It is not quoted here on \
+                     purpose: the likeliest way to write this file wrong is back to front, which \
+                     would make that name a bearer token — and this refusal is printed at startup.",
+                    path.display()
+                );
+            }
+            let Some(token) = value.as_str() else {
+                bail!(
+                    "`{name}` in {} must be a string: the bearer token that client presents.",
+                    path.display()
+                );
+            };
+            let token = token.trim();
+            if token.is_empty() {
+                bail!(
+                    "`{name}` in {} has no token. Give it one or remove the entry: a name nothing \
+                     can present is a client that cannot connect.",
+                    path.display()
+                );
+            }
+            entries.push(Configured {
+                from: format!("`{name}` in {}", path.display()),
+                name,
+                token: token.to_string(),
+            });
+        }
+        if entries.is_empty() {
+            bail!(
+                "{} names no clients. It is a JSON object, so it has to map at least one client \
+                 name to that client's token — `{{\"local\": \"<token>\"}}`.",
+                path.display()
+            );
+        }
+        Ok(Self { entries })
+    }
+}
+
+/// Whether this is a client name rather than something else that got put where one belongs.
+///
+/// The charset is what makes a name safe to *render*: no line breaks, so nothing configured here
+/// can inject a line into the service log, and no `"`, `{` or `=`, so a connection string or a
+/// token carrying one cannot pass for a name. The same rule a kernel profile's name follows.
+///
+/// **What it cannot do is tell a token from a name**, because a name-shaped token is a name: a file
+/// written back to front — `{"<token>": "ci"}` — configures a client called after your token, and
+/// the line that says who may connect prints client names. Nothing here can catch that, which is
+/// why the refusal it *can* catch does not quote what it rejected, and why the operator-facing
+/// documentation says which way round the file goes.
+fn is_client_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= NAME_LIMIT
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
 }
 
 /// The part of a credential variable's name after the prefix, if it is one.
@@ -289,6 +480,14 @@ mod tests {
             .into_iter()
     }
 
+    /// Where a token file lives on the host this is all written for. Never read: [`TokenFile`]
+    /// parses text, so these tests need no filesystem and the path is only what a refusal names.
+    const FILE: &str = r"C:\ProgramData\windbg-mcp\token";
+
+    fn file(text: &str) -> TokenFile {
+        TokenFile::parse(text, Path::new(FILE)).expect("a token file these tests can use")
+    }
+
     /// The unnamed variable is what every existing listener uses, so it keeps working and names the
     /// same client stdio calls run as.
     #[test]
@@ -367,6 +566,27 @@ mod tests {
                 );
             }
         }
+        // And the same for the file, whose every *value* is a credential — and whose *key* is one
+        // too when the entry was written back to front.
+        for text in [
+            format!(r#"{{"a": "{}", "b": "{}"}}"#, secrets[0], secrets[0]),
+            format!(r#"{{"ci": "{} "#, secrets[0]),
+            format!(r#"{{"ci": ["{}"]}}"#, secrets[0]),
+            // Back to front, with a key no name could be — which is the shape this refuses, and
+            // the shape most likely to be holding a credential.
+            format!(r#"{{"{}=x": "ci"}}"#, secrets[0]),
+        ] {
+            let why = TokenFile::parse(&text, Path::new(FILE))
+                .and_then(|f| Credentials::from_entries(vars(&[]), Some(f)))
+                .expect_err("a configuration error")
+                .to_string();
+            for secret in secrets {
+                assert!(
+                    !why.contains(secret),
+                    "a startup refusal wrote a bearer token into the log: {why}"
+                );
+            }
+        }
     }
 
     /// Windows environment names are case-insensitive, and `std::env::var` honours that — so a host
@@ -402,7 +622,7 @@ mod tests {
                 (TOKEN_ENV, "from-the-environment"),
                 ("WINDBG_MCP_LISTEN_TOKEN_CI", "also-from-the-environment"),
             ]),
-            Some("from-the-file".to_string()),
+            Some(file("from-the-file")),
         )
         .expect("valid");
         assert_eq!(
@@ -412,6 +632,92 @@ mod tests {
         assert_eq!(creds.len(), 1, "the environment must not add credentials");
         assert_eq!(creds.client_for("from-the-environment"), None);
         assert_eq!(creds.client_for("also-from-the-environment"), None);
+    }
+
+    /// **And because it is the only credential, it has to be able to name more than one.** A
+    /// service-hosted listener reads nothing else, so before this the deployment
+    /// `docs/remote-listener.md` recommends could hold exactly one client — with the per-client
+    /// boundary that #162 built unreachable on the host that most needs it (`FOLLOWUPS.md` 31).
+    #[test]
+    fn a_token_file_may_name_several_clients() {
+        let creds = Credentials::from_entries(
+            vars(&[(TOKEN_ENV, "from-the-environment")]),
+            Some(file(
+                r#"{ "local": "for-local", "ci": "for-ci", "laptop": "for-laptop" }"#,
+            )),
+        )
+        .expect("valid");
+        assert_eq!(creds.names(), vec!["ci", "laptop", "local"]);
+        assert_eq!(creds.client_for("for-ci").map(Client::name), Some("ci"));
+        assert_eq!(
+            creds.client_for("for-laptop").map(Client::name),
+            Some("laptop")
+        );
+        // Still the only credential: naming several clients does not let the environment back in.
+        assert_eq!(creds.client_for("from-the-environment"), None);
+    }
+
+    /// The shape is chosen by the file's first character, so a token stays a token.
+    ///
+    /// Every file written before this one is a bare token, and the installer still writes one for a
+    /// single-client host — so the common file must not need re-writing to keep working.
+    #[test]
+    fn a_bare_token_file_is_a_token_and_a_json_one_is_a_map() {
+        for (text, whose) in [
+            ("plain-token", "local"),
+            (r#"{"ci": "plain-token"}"#, "ci"),
+            // Whitespace and a trailing newline are how a file arrives from an editor, and a BOM is
+            // how it arrives from Windows PowerShell 5.1's `Set-Content -Encoding utf8`. U+FEFF is
+            // not whitespace, so without the strip it lands inside the token: a file that looks
+            // right and authenticates nobody.
+            ("\u{feff}  plain-token\r\n", "local"),
+            ("\u{feff}{\"ci\": \"plain-token\"}\n", "ci"),
+        ] {
+            let creds = Credentials::from_entries(vars(&[]), Some(file(text)))
+                .unwrap_or_else(|e| panic!("{text:?} is a token file: {e}"));
+            assert_eq!(
+                creds.client_for("plain-token").map(Client::name),
+                Some(whose),
+                "{text:?}"
+            );
+        }
+    }
+
+    /// The refusals a badly written token file earns, and every one of them at startup rather than
+    /// as a client that cannot connect for reasons nobody can see.
+    #[test]
+    fn a_token_file_that_names_nothing_usable_is_refused() {
+        for (text, expected) in [
+            ("", "is empty"),
+            ("   \n", "is empty"),
+            ("{}", "names no clients"),
+            (r#"{"ci": }"#, "not valid JSON"),
+            (r#"{"ci": 5}"#, "must be a string"),
+            (r#"{"ci": "  "}"#, "has no token"),
+            // Written back to front, with a token no name could be — the detectable half of that
+            // mistake. The other half is not: see `is_client_name`.
+            (
+                r#"{"net:port=50000,key=1.2.3.4": "ci"}"#,
+                "not a client name",
+            ),
+            // Two spellings of one name are two tokens for one client, the same as the environment.
+            (r#"{"ci": "one", "CI ": "two"}"#, "two different tokens"),
+            // And one token under two names is the other half of it.
+            (
+                r#"{"ci": "same", "laptop": "same"}"#,
+                "cannot name two clients",
+            ),
+        ] {
+            let why = TokenFile::parse(text, Path::new(FILE))
+                .and_then(|f| Credentials::from_entries(vars(&[]), Some(f)))
+                .expect_err(&format!("{text:?} is not a usable token file"))
+                .to_string();
+            assert!(why.contains(expected), "{text:?} was refused with: {why}");
+            assert!(
+                why.contains(FILE),
+                "a refusal has to name the file it is about: {why}"
+            );
+        }
     }
 
     /// Two credentials normalising to one name is refused, and it is the quieter half of the same
@@ -456,7 +762,7 @@ mod tests {
                 ("WINDBG_MCP_LISTEN_TOKEN_FILE", r"C:\somewhere\token"),
                 ("PATH", "/usr/bin"),
             ]),
-            Some("from-the-file".to_string()),
+            Some(file("from-the-file")),
         )
         .expect("valid");
         assert_eq!(

@@ -40,11 +40,19 @@
 //! a worker this service spawned. So any local user who can read that variable can have
 //! `LocalSystem`, and the token is the only thing in the way.
 //!
-//! So [`install`] takes the token out of the installing shell's *user* environment, writes it to
-//! [`token_file`], strips inheritance and grants read to `SYSTEM` and `Administrators` only, and
-//! points the service at it with [`crate::listen::TOKEN_FILE_ENV`]. The property that makes the
-//! foreground listener safe — the token is not readable by an unprivileged process — is the one
-//! being preserved, by the only mechanism that preserves it once the reader is a service.
+//! So [`install`] takes the credentials out of the installing shell's *user* environment, writes
+//! them to [`token_file`], strips inheritance and grants read to `SYSTEM` and `Administrators`
+//! only, and points the service at it with [`crate::listen::TOKEN_FILE_ENV`]. The property that
+//! makes the foreground listener safe — the token is not readable by an unprivileged process — is
+//! the one being preserved, by the only mechanism that preserves it once the reader is a service.
+//!
+//! **Credentials, plural, because a service reads nothing else.** A file shuts the environment out
+//! entirely (that is the point of it), so a service-hosted listener holds exactly the clients its
+//! file names — and until it could name more than one, the per-client boundary this server has
+//! could not be had in the deployment it recommends. The install copies every
+//! `WINDBG_MCP_LISTEN_TOKEN*` variable in the shell, and writes the shape that fits: one client
+//! named `local` is a bare token, as it always was, and anything else is a JSON object of name to
+//! token. Same file, same ACL, same reasoning.
 //!
 //! The same applies to **kernel connection profiles**, and less obviously, because they are a file
 //! rather than a variable: `LocalSystem`'s `%USERPROFILE%` is
@@ -181,6 +189,36 @@ pub fn token_file() -> PathBuf {
     state_dir().join("token")
 }
 
+/// What goes in [`token_file`]: the credentials from the installing shell, in the shape that fits.
+///
+/// **One client called `local` is written as a bare token**, which is what this file has always
+/// held and what a hand-written one still is — so an upgrade does not rewrite the file of the
+/// install everybody has, and an operator comparing it against `$env:WINDBG_MCP_LISTEN_TOKEN` sees
+/// the same thing they always did. Anything else is a JSON object of name to token, which is the
+/// only shape that can carry more than one and the same one `WINDBG_MCP_PROFILES` uses.
+///
+/// Both are read back by [`crate::client::TokenFile`], which is where the shapes are defined; this
+/// only has to pick between them.
+fn token_file_contents(credentials: &[(String, String)]) -> String {
+    if let [(name, token)] = credentials
+        && name == crate::client::Client::LOCAL
+    {
+        return token.clone();
+    }
+    let named: std::collections::BTreeMap<&str, &str> = credentials
+        .iter()
+        .map(|(name, token)| (name.as_str(), token.as_str()))
+        .collect();
+    // Pretty, and a trailing newline: this is a file an operator will open when something is wrong,
+    // and `Get-Content` on a single long line is not a way to read one.
+    //
+    // `expect` rather than a fallback, on a map of strings that cannot fail to serialize: the
+    // fallback would be an empty credential file written by an install that reported success, and
+    // a service that then refuses every caller — which is the exact outcome this path exists to
+    // prevent.
+    serde_json::to_string_pretty(&named).expect("a map of strings serializes") + "\n"
+}
+
 /// `SYSTEM` and `Administrators`, by SID so a localised Windows is not a special case.
 const SYSTEM_SID: &str = "*S-1-5-18";
 const ADMINISTRATORS_SID: &str = "*S-1-5-32-544";
@@ -289,7 +327,10 @@ fn under_protected_root(exe: &std::path::Path) -> bool {
 /// replaced the *running* service's token, which would keep serving on the one in its memory and
 /// switch to a different one at its next restart, having reported a failure. Nothing is started
 /// here, so there is no window in which the file exists and something is serving with it.
-fn finish_install(service: &windows_service::service::Service, token: &str) -> Result<()> {
+fn finish_install(
+    service: &windows_service::service::Service,
+    credentials: &[(String, String)],
+) -> Result<()> {
     service
         .set_description(DESCRIPTION)
         .context("the service's description could not be set")?;
@@ -320,7 +361,7 @@ fn finish_install(service: &windows_service::service::Service, token: &str) -> R
                     token_at.display()
                 )
             })?;
-        file.write_all(token.trim().as_bytes())
+        file.write_all(token_file_contents(credentials).as_bytes())
             .with_context(|| format!("cannot write {}", token_at.display()))?;
     }
     restrict_to_administrators(&token_at, "R")
@@ -329,22 +370,25 @@ fn finish_install(service: &windows_service::service::Service, token: &str) -> R
 /// Registers the service to run this exe with `--service --listen <addr>`.
 pub fn install(addr: SocketAddr, allow_unprotected: bool) -> Result<()> {
     // Refused rather than warned about, and this changed once the token moved into a file: an
-    // install has to *have* the token to write it down, and a service registered without one is a
-    // service that fails at every start.
-    let token = std::env::var(crate::listen::TOKEN_ENV)
-        .ok()
-        .filter(|t| !t.trim().is_empty())
-        .with_context(|| {
-            format!(
-                "set {} in this shell first — the install copies it into a file only SYSTEM and \
-                 Administrators can read, which is how the service gets it. A *machine-scope* \
-                 environment variable would work and must not be used: it is readable by every \
-                 local process, and this endpoint's `launch` runs arbitrary commands as \
-                 LocalSystem.\n    $env:{} = \"<a long random string>\"",
-                crate::listen::TOKEN_ENV,
-                crate::listen::TOKEN_ENV
-            )
-        })?;
+    // install has to *have* a credential to write it down, and a service registered without one is
+    // a service that fails at every start. Validated here too, by the listener's own rules, so a
+    // shell that could not start a foreground listener cannot register a service either.
+    let credentials = crate::client::env_credentials(std::env::vars())?;
+    if credentials.is_empty() {
+        bail!(
+            "set {} in this shell first — the install copies it into a file only SYSTEM and \
+             Administrators can read, which is how the service gets it. A *machine-scope* \
+             environment variable would work and must not be used: it is readable by every local \
+             process, and this endpoint's `launch` runs arbitrary commands as \
+             LocalSystem.\n    $env:{} = \"<a long random string>\"\n\nEvery {}_<NAME> in this \
+             shell is copied too, each naming a client of its own — which under a service is the \
+             only way to have more than one, since the file it reads is the whole of what it \
+             accepts.",
+            crate::listen::TOKEN_ENV,
+            crate::listen::TOKEN_ENV,
+            crate::listen::TOKEN_ENV
+        );
+    }
 
     let exe = std::env::current_exe().context("cannot find this executable's own path")?;
     if !under_protected_root(&exe) && !allow_unprotected {
@@ -396,7 +440,7 @@ pub fn install(addr: SocketAddr, allow_unprotected: bool) -> Result<()> {
     // after the SCM work fixed one half-done install (a failed create no longer replaces a running
     // service's token) and would otherwise create another: a registration left behind by a token
     // step that refused. An install either happened or it did not.
-    if let Err(e) = finish_install(&service, &token) {
+    if let Err(e) = finish_install(&service, &credentials) {
         let undone = service.delete().is_ok();
         // Waited out, not merely asked for. A delete marks a service and completes when the last
         // handle to it closes, so returning here without waiting makes "nothing was installed"
@@ -751,6 +795,62 @@ mod tests {
         // And the flag the SCM passes is the one `requested` answers `Run` to, which is the join
         // between installing and starting that nothing else checks.
         assert_eq!(requested(&rendered), Some(Role::Run));
+    }
+
+    /// The file the installer writes is the file the listener reads — asserted end to end, because
+    /// the two halves are in different modules and nothing else joins them. A service that starts
+    /// and accepts nobody is the failure shape, and it costs a reinstall to find out.
+    #[test]
+    fn what_the_install_writes_is_what_the_listener_reads_back() {
+        // Never opened — `TokenFile` parses text — but it is the real path, so the refusals
+        // this exercises name what an operator would actually go and look at.
+        let at = token_file();
+        let read_back = |written: &str| {
+            crate::client::Credentials::from_entries(
+                std::iter::empty(),
+                Some(
+                    crate::client::TokenFile::parse(written, &at)
+                        .unwrap_or_else(|e| panic!("the installer wrote {written:?}: {e}")),
+                ),
+            )
+            .unwrap_or_else(|e| panic!("the installer wrote {written:?}: {e}"))
+        };
+
+        // One client called `local` keeps the shape every existing install has: the token, and
+        // nothing around it.
+        let one = [(
+            crate::client::Client::LOCAL.to_string(),
+            "s3cret".to_string(),
+        )];
+        let written = token_file_contents(&one);
+        assert_eq!(written, "s3cret", "a single local token is written bare");
+        assert_eq!(
+            read_back(&written).client_for("s3cret").map(|c| c.name()),
+            Some("local")
+        );
+
+        // Anything else is the JSON object, which is the only shape that can carry more than one —
+        // and under a service the only way to have a second client at all.
+        for credentials in [
+            vec![
+                ("local".to_string(), "for-local".to_string()),
+                ("ci".to_string(), "for-ci".to_string()),
+            ],
+            // A shell with only a named token configures no `local`, and that is not a special
+            // case: it is one client, which happens not to be that one.
+            vec![("ci".to_string(), "for-ci".to_string())],
+        ] {
+            let written = token_file_contents(&credentials);
+            let creds = read_back(&written);
+            assert_eq!(creds.len(), credentials.len());
+            for (name, token) in &credentials {
+                assert_eq!(
+                    creds.client_for(token).map(|c| c.name()),
+                    Some(name.as_str()),
+                    "{written}"
+                );
+            }
+        }
     }
 
     /// The log has to land somewhere a service account can write and an operator will look, and it

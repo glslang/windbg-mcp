@@ -72,16 +72,30 @@ can evict the editor's target without any tool call naming it. The script theref
 without a token rather than borrowing one; it cannot tell one token from another, so supplying a
 credential that really is its own is yours to get right.
 
-**A listener installed as the service can hold only one client**, so driver work wants the foreground
-one. The installer points the service at an ACL'd token file, and a configured file is the *only*
-credential this server will read — it shuts the environment out entirely, named tokens included,
-because the machine environment is readable by unprivileged processes and this endpoint has `launch`
-on it (`Credentials::from_entries`). That precedence is right; the one-client consequence is a gap,
-filed as `FOLLOWUPS.md` item 31. Until it closes, handing the driver the service's own token is
-sharing the namespace knowingly — which is a decision, not a default.
+**Under the service, that variable is not where the token goes.** The installer points the service
+at an ACL'd token file, and a configured file is the *only* credential this server will read — it
+shuts the environment out entirely, named tokens included, because the machine environment is
+readable by unprivileged processes and this endpoint has `launch` on it
+(`Credentials::from_entries`). So the driver's credential goes **in the file**, which names its own
+clients:
 
-Within one namespace the script still fences what it can: it ends only sessions **this run opened**,
-counting the handles an *opener* returned rather than every handle it has seen, and leaving alone
+```jsonc
+// %ProgramData%\windbg-mcp\token
+{
+  "local":  "<what your editor presents>",
+  "driver": "<another long random string>"
+}
+```
+
+`--install-service` writes that for you from the credential variables in the installing shell, so
+setting `WINDBG_MCP_LISTEN_TOKEN_DRIVER` beside the unnamed one before installing is enough. Editing
+the file afterwards works too — it is read at startup, so restart the service. Handing the driver
+the *editor's* token is still possible and is sharing the namespace knowingly, which is a decision
+rather than a default.
+
+Should you share one anyway, the script still fences what it can within that namespace: it ends only
+sessions **this run opened**, counting the handles an *opener* returned rather than every handle it
+has seen, and leaving alone
 whatever the credential already had when it started — a predecessor that died before its cleanup, or
 a run going on beside it. What it opened, it releases on the way out.
 

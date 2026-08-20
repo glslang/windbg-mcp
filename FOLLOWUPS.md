@@ -959,26 +959,26 @@ mechanism to catch, so it is worth doing only if the arming rule ever grows a se
 handled. Picks up at the listener helpers in `tests/mcp_smoke.rs`, beside
 `the_listener_serves_the_stateless_revision_it_negotiates`.
 
-## 31. [windbg-mcp] A service-hosted listener can hold only one client
+## 31. [windbg-mcp] A service-hosted listener can hold only one client — **done** (2026-08-20)
 
-`Credentials::from_entries` treats a configured `WINDBG_MCP_LISTEN_TOKEN_FILE` as the **only**
-credential: it loads that token as `local` and returns, ignoring every environment token including
-named ones. That precedence is deliberate and load-bearing — the service installer ACLs the file to
+`Credentials::from_entries` treated a configured `WINDBG_MCP_LISTEN_TOKEN_FILE` as the **only**
+credential, and read one token out of it: it loaded that token as `local` and returned, ignoring
+every environment token including named ones. That precedence is deliberate and load-bearing — the service installer ACLs the file to
 SYSTEM and Administrators precisely because the machine environment is readable by unprivileged
 processes, and a variable standing beside it would let a stale or planted one authenticate to a
 LocalSystem listener that has `launch` on it.
 
-The consequence is that **the per-client work of [#162](https://github.com/glslang/windbg-mcp/issues/162)
-is unreachable in the deployment `docs/remote-listener.md` recommends.** A foreground listener can
-hold `local`, `ci` and `laptop`; the service can hold one client, so two agents on one service-hosted
-host share a namespace — which is exactly what ownership was built to stop.
+The consequence was that **the per-client work of [#162](https://github.com/glslang/windbg-mcp/issues/162)
+was unreachable in the deployment `docs/remote-listener.md` recommends.** A foreground listener could
+hold `local`, `ci` and `laptop`; the service could hold one client, so two agents on one
+service-hosted host shared a namespace — which is exactly what ownership was built to stop.
 
 It surfaced from the other end, in review of [#173](https://github.com/glslang/windbg-mcp/pull/173):
 a local-model driver must not share a credential with the editor, because a client over the
 four-session cap has its oldest idle session reclaimed, so the driver's `open_dump` can evict the
 editor's target with nothing naming it. That driver now **requires** a credential of its own rather
-than defending against sharing one — which is the right shape and makes this item the only thing
-standing between it and the recommended deployment: under the service there is no second credential
+than defending against sharing one — which is the right shape, and made this item the only thing
+standing between it and the recommended deployment: under the service there was no second credential
 to give it.
 
 **What would close it:** a token file that can name more than one client. The obvious shape is the
@@ -986,6 +986,34 @@ same one `WINDBG_MCP_PROFILES` already uses for kernel profiles — a JSON objec
 with a bare string still read as `local` so every existing install keeps working. The ACL story is
 unchanged, since it is one file either way.
 
-**Why deferred:** it is a file-format change to the one file that holds credentials, and it wants to
-land on its own rather than inside a runbook PR. Picks up at `Credentials::from_entries`
-(`src/client.rs`) and `service::install`, which writes the file.
+**Why it was deferred:** it is a file-format change to the one file that holds credentials, and it
+wanted to land on its own rather than inside a runbook PR.
+
+**What landed.** The obvious shape, as predicted: `client::TokenFile` reads either a **bare token**
+— which names `local`, so every file written before this keeps working untouched — or a **JSON
+object of client name to token**, the shape `WINDBG_MCP_PROFILES` already uses. A leading `{` is
+what tells them apart, which makes "a bare token may not begin with `{`" a rule rather than a guess:
+a file that does is refused at startup by name. The precedence is untouched — a configured file is
+still the only credential — and `service::install` now copies **every** `WINDBG_MCP_LISTEN_TOKEN*`
+variable in the installing shell, writing a bare token for a lone `local` and the object otherwise,
+validated through the same `Credentials` the listener builds so a shell that could not start a
+foreground listener cannot register a service.
+
+Two things worth carrying:
+
+- **The parse is the same problem `kdconn` solved for profiles, and gets the same answer**: values
+  are walked as generic JSON rather than deserialized into a typed map, because serde's type errors
+  quote the value they rejected — and every value in this file is a credential. `Credentials` and
+  `TokenFile` grew hand-written `Debug`s that print names only, for the same reason `Connection`
+  has one.
+- **A name-shaped token is a name.** A charset check on the keys catches a connection string or
+  anything carrying a line break, but it cannot catch an entry written back to front, since a
+  bearer token is a perfectly good client name — and that entry configures a client named after
+  your token, which the startup line prints. That is not fixable in code; it is why the refusal
+  that *is* detectable quotes nothing, and why `docs/remote-listener.md` says which way round the
+  file goes.
+
+The end-to-end half is one protocol-tier smoke assertion
+(`a_token_file_names_its_own_clients_and_shuts_the_environment_out`): a real listener, a real file
+naming two clients, the environment token refused `401`, and both file clients served through a full
+handshake.

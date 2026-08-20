@@ -53,7 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     rather than one rule and an exception.
   - **Every credential variable is stripped from the processes this server creates** — by prefix,
     so a token added later cannot quietly reach a debuggee — and a configured token *file* shuts the
-    environment out entirely, which is the precedence a LocalSystem service depends on.
+    environment out entirely, which is the precedence a LocalSystem service depends on. That file
+    names its own clients (below), because a service reads nothing else.
 
   **Why authentication is the identity.** `2026-07-28` removed the protocol-level MCP session, so
   there is no session id to key on; requests arrive on whatever socket a client's pool hands them,
@@ -66,6 +67,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   This separates clients; it does not rank them. Everyone who can authenticate still has the whole
   tool surface.
+
+- **The token file can name more than one client, so a service-hosted listener can hold more than
+  one.** A configured `WINDBG_MCP_LISTEN_TOKEN_FILE` is the *only* credential — deliberately, since
+  the service installer ACLs it to SYSTEM and Administrators precisely because the machine
+  environment is readable by unprivileged processes. The consequence was that the per-client work
+  above could not be had in the deployment `docs/remote-listener.md` recommends: a foreground
+  listener could hold `local`, `ci` and `laptop`; the service could hold one, so two agents on one
+  host shared a namespace, and one of them going over the four-session cap could evict the other's
+  target with nothing naming it.
+
+  The file now takes either shape: a **bare token**, which names `local` and is what it has always
+  held, or a **JSON object of client name to token** — the shape `WINDBG_MCP_PROFILES` already uses
+  for kernel profiles. A leading `{` is what tells them apart, so a bare token may not begin with
+  one; a file that does is refused at startup by name rather than read as the other thing. The ACL
+  story is unchanged, since it is one file either way.
+
+  `--install-service` copies **every** `WINDBG_MCP_LISTEN_TOKEN*` variable in the installing shell
+  rather than the unnamed one alone, and writes the shape that fits — a bare token for a single
+  `local`, the object otherwise — so an existing single-client install keeps a file nobody has to
+  rewrite. It validates them the way the listener would, because the SCM registers a service once
+  and a credential it refuses then fails it at every start.
+
+  Its refusals name the file and the key and never a value, for the same reason the environment's
+  name the variable: they are printed at startup, and under the service into a log file. One thing
+  they cannot catch is an entry written back to front — a token is a valid client name — so the
+  documentation says which way round it goes.
 
 - **`server_log` — the server's own log, readable from wherever the client is.** The supervisor
   keeps a bounded ring of the most recent records, its own and every engine worker's, and serves
