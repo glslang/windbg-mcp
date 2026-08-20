@@ -390,8 +390,10 @@ another client's handle is reported *unknown* rather than refused. Two tokens on
 namespaces — if a session "vanished", check which token the request carried.
 
 **A request with no session id is two different things, and the gate has to tell them apart.**
-`Arriving` names all three: `Holding(id)`, `Opening` — a revision that *has* sessions, opening one —
-and `Stateless`, which is `2026-07-28` and has none. **`Stateless` is the one variant that never
+`Arriving` names all three: `Holding(id)`, `Opening` — no id and no header naming a sessionless
+revision, chiefly a legacy `initialize` — and `Stateless`, which is `2026-07-28`. Note `Opening` is
+a *fallback*, not a claim about the revision: a `2026-07-28` handshake that omits the header lands
+there too, which is why a reservation must survive minting nothing. **`Stateless` is the one variant that never
 reserves.** Not the same as "only `Opening` reserves": a `Holding` request whose credential has no
 current holder is a client *resuming* inside the grace, and it reserves too, because a resume can
 race a fresh `initialize` and a gate that merely served both would let them both through. Reading

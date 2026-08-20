@@ -377,7 +377,12 @@ struct Admitted {
 enum Arriving<'a> {
     /// An `Mcp-Session-Id` the client is presenting.
     Holding(&'a str),
-    /// No session id, on a revision that mints them — an `initialize`.
+    /// No session id, and no revision header naming one that has none.
+    ///
+    /// Chiefly a legacy `initialize`. It is also where a `2026-07-28` handshake lands when it omits
+    /// `MCP-Protocol-Version` — legal, since that request is the one *establishing* the revision —
+    /// so an `Opening` claim may mint nothing at all, and [`Lease::settle`] has to give back its
+    /// deadline as well as its claim.
     ///
     /// Not a resume: a client picking up what it left inside the grace presents the id it held, so
     /// it arrives as [`Self::Holding`] even though nobody currently holds the server. That case
