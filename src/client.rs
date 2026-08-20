@@ -324,6 +324,22 @@ impl TokenFile {
             bail!("{} is empty; that is not a token.", path.display());
         }
         if !text.starts_with('{') {
+            // **A bearer token is one line, and this is the copy-paste trap made loud.** Anything
+            // that does not begin with `{` is the bare shape, so a JSON object with a comment
+            // above it — which is what an operator copies out of a document — is read as one token
+            // that happens to span the file. It could never authenticate anyone either way: a line
+            // break cannot travel in an `Authorization` header, so nothing can present it. A
+            // listener that starts and accepts nobody is the worst answer available here, and this
+            // is the one place that can tell.
+            if text.contains(['\n', '\r']) {
+                bail!(
+                    "{} is not a token: it runs over more than one line, and a bearer token cannot \
+                     contain a line break — nothing could present it. If this was meant to name \
+                     clients, it has to be a JSON object and start with `{{`: no comment above it, \
+                     since a file that does not begin with `{{` is read as one token.",
+                    path.display()
+                );
+            }
             return Ok(Self {
                 entries: vec![Configured {
                     name: Client::LOCAL.to_string(),
@@ -759,6 +775,13 @@ mod tests {
         for (text, expected) in [
             ("", "is empty"),
             ("   \n", "is empty"),
+            // The copy-paste trap: a JSON object with the file's path commented above it. It does
+            // not begin with `{`, so it is the bare shape — a "token" spanning four lines, which
+            // no `Authorization` header could ever carry.
+            (
+                "// C:\\ProgramData\\windbg-mcp\\token\n{\"ci\": \"one\"}",
+                "more than one line",
+            ),
             ("{}", "names no clients"),
             (r#"{"ci": }"#, "not valid JSON"),
             (r#"{"ci": 5}"#, "must be a string"),

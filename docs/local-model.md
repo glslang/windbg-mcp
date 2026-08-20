@@ -77,10 +77,10 @@ at an ACL'd token file, and a configured file is the *only* credential this serv
 shuts the environment out entirely, named tokens included, because the machine environment is
 readable by unprivileged processes and this endpoint has `launch` on it
 (`Credentials::from_entries`). So the driver's credential goes **in the file**, which names its own
-clients:
+clients — `%ProgramData%\windbg-mcp\token`, as strict JSON (no comments; a file that does not begin
+with `{` is read as a single bare token):
 
-```jsonc
-// %ProgramData%\windbg-mcp\token
+```json
 {
   "local":  "<what your editor presents>",
   "driver": "<another long random string>"

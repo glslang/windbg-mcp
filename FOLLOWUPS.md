@@ -1026,7 +1026,11 @@ shape — and the fix is the general one: the installer asks the reader whether 
 back as what it meant, rather than restating the rule in a second place. Worth knowing that the
 first version of *that* asked the wrong question — it checked the client's name, which a token that
 is itself a one-entry object satisfies while carrying a different token — so the round trip is on
-the whole credential: exactly one, and it is this token naming `local`.
+the whole credential: exactly one, and it is this token naming `local`. The last one was a *document*
+— a JSON example with the file's path commented above it, which does not begin with `{` and is
+therefore read as one token spanning four lines. The example lost its comment, and the parse now
+refuses a bare token carrying a line break at all: nothing could present one in an `Authorization`
+header, so a listener that accepts it is a listener that accepts nobody.
 
 The end-to-end half is one protocol-tier smoke assertion
 (`a_token_file_names_its_own_clients_and_shuts_the_environment_out`): a real listener, a real file
