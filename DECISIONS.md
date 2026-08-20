@@ -5,6 +5,42 @@ status. Keep entries short; link to code with `file:line` where it helps a futur
 
 ---
 
+## Ask the component that owns a fact; do not infer it one layer up (2026-08-20)
+
+**Context.** This is the second time a review has walked a correct fix inward one layer at a time,
+and the second time it terminated only when somebody asked the thing that actually knows. Two
+instances make it a rule rather than a war story, which is why it gets an entry of its own.
+
+- **The lease** (#135/#137, entry below). Seven rounds on "is it safe to hand the server over?": a
+  reservation needed a lifetime, the lifetime a resolution, the resolution an undo for what it had
+  minted, the in-flight counter an epoch. It ended at `Sessions::busy` — the engine's own account of
+  whether a session still has work — because a job outlives the request that queued it, so "the HTTP
+  request ended" was never "the target is free".
+- **The local-model driver** (#173). Three rounds on "whose debug session is this?": first
+  `end_session` was fenced to sessions this run opened, then the *scrape* that decided that was
+  narrowed to openers, then the scrape itself turned out to be the bug — an opener refused at the
+  four-session cap builds its error out of **every live handle** (`Sessions::take_slot`), so reading
+  an answer's prose marks sessions the call did not create. It ended at
+  `structuredContent.session_id`, the field whose whole job is to name the session a call is about.
+
+**Decision.** For any question about the ownership or state of a resource, find the component that
+can answer for it authoritatively and ask *that*, before adding a condition at the layer you happen
+to be standing on. In this codebase that has three shapes worth naming: the engine answers for
+whether a session is busy, the credential answers for which client is asking (#162 — not the session
+id, not the connection, neither of which survives a stateless revision), and a typed result answers
+for which session it concerns. **Prose is never the answer**: a message names things the call did not
+create, while the structured field names exactly the one it did.
+
+**Why it keeps happening.** Each intermediate answer is *true at its own level* and silent about the
+one below, so it survives review and passes its tests — and the next round finds the seam it left.
+The tell is a chain of conditions that keeps needing one more link; that is the signal to stop adding
+links and go looking for the component that already knows.
+
+**Status.** Recorded, not enforced — there is nothing to enforce it with. Both instances are in the
+entries below, and #173's is the cheaper one to read: four commits, each fixing the previous fix.
+
+---
+
 ## The boundary is ownership, so the gate that stood in for it is gone (2026-08-20, #162)
 
 **Context.** The entry below ("Tenancy is held until the engine is idle") decided that one client
@@ -226,7 +262,8 @@ It terminated at `Sessions::busy`. An engine job outlives the request that queue
 "the target is free". Asking the engine's own account of whether a session has work outstanding is
 the last question in the chain, because it *is* the resource. **The lesson for anything that
 extends this: name the resource being protected and find who can answer for it authoritatively,
-before adding a condition at the layer you happen to be standing on.**
+before adding a condition at the layer you happen to be standing on.** It recurred in #173 and now
+has an entry of its own — see *Ask the component that owns a fact* above.
 
 **A corollary, from #136.** The one tenancy rule that lived in the HTTP handler rather than in
 `Lease` — whether a `DELETE` counts as the client leaving — was also the one that was wrong, and it
