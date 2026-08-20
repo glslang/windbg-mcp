@@ -39,6 +39,7 @@ already does the job.
 | TTD analysis | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
 | Kernel pool | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics` |
 | User Segment Heap | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` |
+| Server | `server_log` — the server's own records, the supervisor's and every engine worker's, tagged by session |
 | Raw | `execute` — run any debugger command, returns full text output |
 
 The forward control tools (`go`/`step_over`/`step_into`) and the reverse ones
@@ -65,6 +66,14 @@ teardown while the batch runs — `end_session`, or a client disconnect — stop
 step and rolls it back first, reported as `BATCH: ABANDONED`; it cannot cut short a step already
 inside the debugger, so a batch built from long steps waits out the one it is in before it unwinds
 (the teardown waits with it).
+
+**`server_log` answers "why did that fail?" when the result did not.** It serves both processes'
+records — the supervisor's, and every engine worker's tagged with its session — so it reaches the
+run-up to a session that failed to *open*, which has no handle to ask anything else about. Reach
+for it after an opener that errored, a worker that died, or a call that timed out with nothing to
+show for it; `session_status` says what state a session is in, and this says what it did to get
+there. It is also the only route to a worker's own output when the server is on another machine,
+where its stderr is not on your screen.
 
 ## Cross-cutting gotchas (apply to every workflow)
 
