@@ -1032,6 +1032,16 @@ therefore read as one token spanning four lines. The example lost its comment, a
 refuses, from any source, a token that cannot travel in an `Authorization` header at all — a
 listener that accepts one is a listener that accepts nobody.
 
+One finding was taken as a fact rather than as its proposed remedy: a token file written by an
+earlier install whose token *begins* with `{` — a braced GUID is the plausible way to have one —
+now reads as the JSON shape and stops the service at its next start. The remedy offered was a
+format marker or a fallback to the bare reading when the JSON does not parse; both are worse than
+the problem. A marker is not unambiguous either, since a token can carry whatever marks the object,
+and the fallback rescues that rare file by turning the likely one — a hand-written object with a
+typo in it — into one long token that authenticates nobody and explains nothing. So the rule stands
+and the refusal carries the way out (`{"local": "<that token>"}`), with the same note in the
+changelog and a test pinning it.
+
 **The lesson of the review rounds is one thing said three times.** A rule about a value was
 *described* in the code — a name charset, then a line-break test — and each round found the next
 character class it had not thought of. The two checks that stopped generating findings are the two
