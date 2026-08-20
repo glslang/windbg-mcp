@@ -11,17 +11,19 @@ with a repeatable answer rather than an impression from a chat session.
 `tasks.json` is a list of strings, one per task; without it, one default task
 runs. See `docs/local-model.md` for what to make of the numbers it prints.
 
-Configuration, all optional:
+`WINDBG_MCP_TOKEN` is **required, and must be a credential of this run's own** — not
+the one your editor is registered with. A shared credential is a shared namespace:
+this run would see, route to and (at the four-session cap) cause the reclamation of
+the editor's targets, and no fence inside a script can prevent the last of those.
+The script cannot tell one token from another, so this is the operator's to get
+right; `docs/local-model.md` has the listener side of it.
 
+Configuration:
+
+    WINDBG_MCP_TOKEN    bearer token for a client of this run's own — required
     LOCAL_MODEL         ollama model tag       (default: the first tool-capable one)
     OLLAMA_URL          ollama chat endpoint   (default: http://localhost:11434/api/chat)
     WINDBG_MCP_URL      the listener           (default: http://127.0.0.1:8765/)
-    WINDBG_MCP_TOKEN    bearer token; falls back to the Claude Code registration
-                        in ~/.claude.json for WINDBG_MCP_PROJECT, so the token
-                        never has to be pasted on a command line
-    WINDBG_MCP_PROJECT  which project's registrations to read it from (default: this repo)
-    WINDBG_MCP_SERVER   which registration in that project, by name, when the URL
-                        does not identify one on its own
     RESULT_LIMIT        truncate tool results to this many characters before the
                         model sees them; `0`, the default, passes them whole
     WINDBG_MCP_SCENARIO treat the task list as one continuing investigation, keeping
@@ -36,9 +38,6 @@ import urllib.request
 MCP_URL = os.environ.get("WINDBG_MCP_URL", "http://127.0.0.1:8765/")
 OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/chat")
 MODEL = os.environ.get("LOCAL_MODEL", "")
-PROJECT = os.environ.get(
-    "WINDBG_MCP_PROJECT", os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-)
 REVISION = "2025-06-18"
 
 # Tool calls this harness will actually execute. Everything else is reported back
@@ -46,14 +45,9 @@ REVISION = "2025-06-18"
 # the surface includes `launch` and `execute`, and a debug host is the wrong place
 # to find out what a model does with them unattended.
 #
-# `end_session` is in here and is the one destructive member, so it is fenced twice
-# over (see `call_tool`): this run may only end sessions it opened itself. Falling
-# back to the registered client's token puts the driver in **that client's**
-# namespace — which is the ownership model working as designed — so an
-# `end_session` with no `session_id` would resolve whatever session that client has
-# current and close somebody else's target. Give the driver its own credential
-# (`WINDBG_MCP_LISTEN_TOKEN_DRIVER` on the listener, `WINDBG_MCP_TOKEN` here) and it
-# gets a namespace of its own instead.
+# `end_session` is the one destructive member, and it is fenced to sessions this run
+# opened: the rest of the namespace belongs to a run that crashed before its cleanup,
+# or to one running beside this one.
 ALLOWED = {
     "open_dump", "open_trace", "crash_triage", "backtrace", "modules", "registers",
     "threads", "session_status", "end_session", "decode_ioctl", "disassemble",
@@ -100,44 +94,26 @@ def opened_session(result):
 RESULT_LIMIT = int(os.environ.get("RESULT_LIMIT", "0"))
 
 
-def same_endpoint(a, b):
-    """Whether two registration URLs name the same listener, modulo a trailing slash."""
-    return a.rstrip("/") == b.rstrip("/")
-
-
 def bearer():
-    """The token, from the environment or from this client's registration **for this listener**.
+    """The token this run authenticates with, which it does not go looking for.
 
-    Matched by URL, or by name when `WINDBG_MCP_SERVER` says which. Never "the first
-    registration that has a token": a project can hold several, and handing this
-    listener another server's credential would send that secret to a host it does not
-    belong to — and then fail the handshake, which is the milder half.
+    Reading it from whatever the editor is registered with was the earlier
+    behaviour, and it is what six rounds of review were about: it put this run in
+    the editor's namespace, where opening a session can reclaim the editor's idle
+    one and no fence in this file can see it happen. Requiring the operator to name
+    a credential deletes that class rather than defending against it.
     """
-    if os.environ.get("WINDBG_MCP_TOKEN"):
-        return "Bearer " + os.environ["WINDBG_MCP_TOKEN"]
-    registry = json.load(open(os.path.expanduser("~/.claude.json")))
-    servers = registry.get("projects", {}).get(PROJECT, {}).get("mcpServers", {})
-    wanted = os.environ.get("WINDBG_MCP_SERVER")
-    for name, entry in servers.items():
-        if wanted and name != wanted:
-            continue
-        if not wanted and not same_endpoint(entry.get("url", ""), MCP_URL):
-            continue
-        auth = (entry.get("headers") or {}).get("Authorization")
-        if auth:
-            return auth
-        raise SystemExit(f"registration `{name}` has no Authorization header")
-    raise SystemExit(
-        f"no registration for {MCP_URL} in {PROJECT} "
-        f"(registered: {', '.join(servers) or 'none'}). "
-        "Set WINDBG_MCP_TOKEN, or WINDBG_MCP_SERVER to name one."
-    )
+    token = os.environ.get("WINDBG_MCP_TOKEN", "").strip()
+    if not token:
+        raise SystemExit(
+            "set WINDBG_MCP_TOKEN to a bearer token for a client of this run's own — not the one "
+            "your editor uses, since a shared credential is a shared namespace. Configure one with "
+            "WINDBG_MCP_LISTEN_TOKEN_DRIVER on a foreground listener; see docs/local-model.md."
+        )
+    return "Bearer " + token
 
 
 AUTH = bearer()
-# Whether this run has a credential of its own, rather than borrowing the editor's.
-# It decides whether openers may run at all — see `call_tool`.
-DEDICATED = bool(os.environ.get("WINDBG_MCP_TOKEN"))
 SCENARIO = bool(os.environ.get("WINDBG_MCP_SCENARIO"))
 SESSION = None
 
@@ -233,25 +209,12 @@ def call_tool(name, args):
     """Run one tool call. Returns (text for the model, ok, full size in characters)."""
     if name not in ALLOWED:
         return f"refused: `{name}` is not permitted in this harness", None, 0
-    if name in OPENERS and not DEDICATED:
-        # **Opening on a borrowed credential can cost the lender a session**, and no
-        # fence in this script can stop it: a client over `MAX_SESSIONS` has its
-        # oldest *idle* session reclaimed by the server, so the target this run opens
-        # can evict the editor's — without any tool call naming it. The only fix is
-        # not to share the namespace.
-        return ("refused: opening a session needs a credential of this run's own. Set "
-                "WINDBG_MCP_TOKEN to a token configured for a client of its own "
-                "(WINDBG_MCP_LISTEN_TOKEN_DRIVER on a foreground listener); borrowing the "
-                "editor's would put this run in the editor's namespace, where opening can "
-                "reclaim its idle sessions."), None, 0
-    if name == "end_session":
-        wanted = args.get("session_id")
-        if not wanted:
-            return ("refused: name the `session_id` to end. Without one the server ends this "
-                    "client's *current* session, which this harness may not have opened."), None, 0
-        if wanted not in OPENED:
-            return (f"refused: `{wanted}` was not opened by this run, so it is not this "
-                    "harness's to end"), None, 0
+    if name == "end_session" and args.get("session_id") not in OPENED:
+        # One rule, and it covers the call that names nothing: without a `session_id`
+        # the server ends this credential's *current* session, which may be a
+        # predecessor's leftover rather than anything this run opened.
+        return (f"refused: `{args.get('session_id') or 'the current session'}` was not opened by "
+                "this run, so it is not this harness's to end"), None, 0
     try:
         out = mcp("tools/call", {"name": name, "arguments": args})
     except Exception as e:  # a transport failure is a result the model can react to
@@ -346,8 +309,8 @@ def snapshot_existing():
 def reconcile_opened():
     """Adopt sessions that appeared during this run, after an ambiguous opener.
 
-    Sound because openers require a credential of this run's own: on a borrowed one
-    they are refused outright. Bounded by the startup snapshot, so what another
+    Sound because this run authenticates as a client of its own, so the namespace is
+    the driver's rather than the editor's. Bounded by the startup snapshot, so what another
     invocation or a crashed predecessor left behind stays theirs. Two runs sharing
     one credential *concurrently* can still overlap here — the answer to that is the
     same as everywhere else on this page: a credential per run.
@@ -425,11 +388,9 @@ def main():
     offered = as_ollama(tools)
     surface = len(json.dumps(offered, separators=(",", ":")))
     print(f"tools offered: {len(tools)} ({surface} B of minified JSON)")
-    whose = "its own" if DEDICATED else "borrowed from the editor — openers refused"
-    mode = " (scenario: sessions kept between tasks)" if SCENARIO else ""
-    print(f"credential: {whose}{mode}")
-    if DEDICATED:
-        snapshot_existing()
+    if SCENARIO:
+        print("scenario: sessions are kept between tasks")
+    snapshot_existing()
     tasks = json.load(open(sys.argv[1])) if len(sys.argv) > 1 else [
         "What debug sessions do I currently have open on this server?"
     ]

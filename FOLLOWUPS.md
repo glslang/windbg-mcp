@@ -974,9 +974,12 @@ hold `local`, `ci` and `laptop`; the service can hold one client, so two agents 
 host share a namespace — which is exactly what ownership was built to stop.
 
 It surfaced from the other end, in review of [#173](https://github.com/glslang/windbg-mcp/pull/173):
-the local-model driver must not open sessions on a borrowed credential, because a client over the
-four-session cap has its oldest idle session reclaimed and the driver's open can evict the editor's
-target. The runbook's answer — give the driver its own token — cannot be followed under the service.
+a local-model driver must not share a credential with the editor, because a client over the
+four-session cap has its oldest idle session reclaimed, so the driver's `open_dump` can evict the
+editor's target with nothing naming it. That driver now **requires** a credential of its own rather
+than defending against sharing one — which is the right shape and makes this item the only thing
+standing between it and the recommended deployment: under the service there is no second credential
+to give it.
 
 **What would close it:** a token file that can name more than one client. The obvious shape is the
 same one `WINDBG_MCP_PROFILES` already uses for kernel profiles — a JSON object of name to token,

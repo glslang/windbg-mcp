@@ -46,11 +46,11 @@ further down this page was produced.
 
 [`tools/local_model_drive.py`](../tools/local_model_drive.py) speaks MCP over HTTP to the listener,
 hands the whole tool surface to `POST /api/chat`, executes the tool calls that come back and feeds
-the results in. It reads the bearer token from the client's own registration, so nothing has to be
-pasted on a command line:
+the results in. It needs a bearer token **of its own** — an environment variable rather than an
+argument, the same rule the listener's own token follows:
 
 ```console
-python3 tools/local_model_drive.py [tasks.json]     # tasks.json: a JSON list of prompts
+WINDBG_MCP_TOKEN="<the driver's token>" python3 tools/local_model_drive.py [tasks.json]
 ```
 
 It executes only a **read-only allow-list**, and reports anything else back to the model as refused.
@@ -58,34 +58,32 @@ That is deliberate: the surface includes `execute` and `launch`, and a debug hos
 to discover unattended what a model does with them — but a wrong pick is still *measured*, which is
 the point.
 
-**The driver needs a credential of its own before it may open anything.** Falling back to the
-registered client's token puts it in *that client's* namespace — ownership working exactly as
-designed — and no fence inside the script can make that safe: a client over the four-session cap has
-its oldest **idle** session reclaimed by the server, so a dump this run opens can evict the editor's
-target without any tool call naming it. So openers are refused unless `WINDBG_MCP_TOKEN` names a
-credential chosen for this run. Read-only work still runs on the borrowed one.
+**Configure that token as a client of its own**, on the Windows machine, beside the one your editor
+uses:
 
 ```console
-# on the Windows machine, beside the unnamed token — foreground listener only, see below
 setx WINDBG_MCP_LISTEN_TOKEN_DRIVER "<another long random string>"
-# on the client machine
-WINDBG_MCP_TOKEN="<the same string>" python3 tools/local_model_drive.py tasks.json
 ```
 
-**A listener installed as the service can hold only one client**, so that recipe needs the foreground
+That is not a nicety. A shared credential is a shared **namespace**: the driver would see and route
+to the editor's sessions, and — the part no fence in a script can prevent — a client over the
+four-session cap has its oldest *idle* session reclaimed by the server, so a dump the driver opens
+can evict the editor's target without any tool call naming it. The script therefore refuses to run
+without a token rather than borrowing one; it cannot tell one token from another, so supplying a
+credential that really is its own is yours to get right.
+
+**A listener installed as the service can hold only one client**, so driver work wants the foreground
 one. The installer points the service at an ACL'd token file, and a configured file is the *only*
 credential this server will read — it shuts the environment out entirely, named tokens included,
 because the machine environment is readable by unprivileged processes and this endpoint has `launch`
-on it (`Credentials::from_entries`). That precedence is right and the one-client consequence is a
-gap: `FOLLOWUPS.md` item 31. Until it closes, isolating the driver means a foreground listener with
-named tokens; against the service, the driver reads and does not open.
+on it (`Credentials::from_entries`). That precedence is right; the one-client consequence is a gap,
+filed as `FOLLOWUPS.md` item 31. Until it closes, handing the driver the service's own token is
+sharing the namespace knowingly — which is a decision, not a default.
 
-Within one namespace the script is still fenced as far as it can be: it will only `end_session` a
-session **this run opened** — counting only the handles an *opener* returned, never every handle it
-has seen, since `session_status` and `server_log` name the whole client's and an opener refused at
-the cap lists them too — refuses one with no `session_id` at all (the server would resolve the
-client's *current* session, which may not be the driver's), and ends what it opened on the way out,
-so a run neither strands a worker for the lease grace nor leaves the next run adopting its leftovers.
+Within one namespace the script still fences what it can: it ends only sessions **this run opened**,
+counting the handles an *opener* returned rather than every handle it has seen, and leaving alone
+whatever the credential already had when it started — a predecessor that died before its cleanup, or
+a run going on beside it. What it opened, it releases on the way out.
 
 **Each task gets its own targets.** A task list is a list of separate conversations, so sessions are
 released after each one; otherwise a later task's `session_id`-less call routes to an earlier task's
