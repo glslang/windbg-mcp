@@ -46,8 +46,8 @@ use win_kexp::dbgeng::{CommandRun, DebugEngine, InterruptHandle, Interruption, R
 use win_kexp::heap::{self as heap_query, HeapAllocation, HeapBackend, HeapState, HeapWalk};
 use win_kexp::pool::query::{self, PoolPageFilter, PoolWalk};
 use win_kexp::pool::{
-    DiagnosticShape, PoolDiagnostics, PoolSpan, PoolState, display_is_ambiguous, parse_tag,
-    raw_tag_hex, tag_label,
+    DiagnosticShape, PoolDiagnostics, PoolSpan, PoolState, display_is_ambiguous, parse_raw_tag,
+    parse_tag, raw_tag_hex, tag_label,
 };
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
@@ -2932,8 +2932,13 @@ const TAG_WIDTH: usize = 10;
 /// says exactly which four bytes it meant. It speaks only for the case that would otherwise
 /// mislead: a rendering containing `.`, which searched for literal `.` bytes rather than for
 /// whatever the table it was copied from was showing.
+///
+/// The raw form is recognised by `parse_raw_tag`, the same predicate the parser uses, and not by
+/// its `0x` prefix. A prefix is not the form: `0x..` is four printable bytes and an ordinary
+/// tag — an *ambiguous* one, which is exactly a case this owes an explanation, and which a
+/// prefix test would wave through as raw.
 fn pool_tag_rendering_hint(tag: &str) -> String {
-    if tag.starts_with("0x") || tag.starts_with("0X") {
+    if parse_raw_tag(tag).is_some() {
         return String::new();
     }
     match parse_tag(tag) {
@@ -4281,6 +4286,15 @@ mod tests {
         // which already says exactly which bytes it meant.
         assert_eq!(pool_tag_rendering_hint("Tgsm"), "");
         assert_eq!(pool_tag_rendering_hint("0x000180ff"), "");
+
+        // A `0x` prefix is not the raw form. `0x..` is four printable bytes — an ordinary,
+        // *ambiguous* tag — so it is owed the same explanation as `....`, and testing the prefix
+        // rather than the form would have silently skipped it.
+        let prefixed = pool_tag_rendering_hint("0x..");
+        assert!(
+            prefixed.contains(&raw_tag_hex(u32::from_le_bytes(*b"0x.."))),
+            "a four-byte tag that merely starts with `0x` is still a rendering: {prefixed}"
+        );
     }
 
     /// The header and the rows are two literals that have to agree, and nothing else checks it.
