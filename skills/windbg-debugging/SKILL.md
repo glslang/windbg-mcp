@@ -39,7 +39,7 @@ already does the job.
 | TTD analysis | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
 | Kernel pool | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics` |
 | User Segment Heap | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` |
-| Server | `server_log` — the server's own records, the supervisor's and every engine worker's, tagged by session |
+| Server | `server_log` — the server's own records: the supervisor's, plus your own sessions' workers, tagged by session |
 | Raw | `execute` — run any debugger command, returns full text output |
 
 The forward control tools (`go`/`step_over`/`step_into`) and the reverse ones
@@ -68,7 +68,9 @@ inside the debugger, so a batch built from long steps waits out the one it is in
 (the teardown waits with it).
 
 **`server_log` answers "why did that fail?" when the result did not.** It serves both processes'
-records — the supervisor's, and every engine worker's tagged with its session — so it reaches the
+records — the supervisor's, and those of the sessions **you** opened, each tagged with its session.
+(A listener may hold several clients, and another client's worker records are no more readable than
+its sessions are; under stdio there is one client, so this is everything.) That reaches the
 run-up to a session that failed to *open*, which has no handle to ask anything else about. Reach
 for it after an opener that errored, a worker that died, or a call that timed out with nothing to
 show for it; `session_status` says what state a session is in, and this says what it did to get
