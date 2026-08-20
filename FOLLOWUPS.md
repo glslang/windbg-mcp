@@ -845,80 +845,73 @@ symbol load to populate it would be strictly worse: that is a `.reload` per modu
 **Depends on nothing.** Picks up at `worker::with_pdb_identity` and
 `win_kexp::DebugEngine::module_pdb`.
 
-## 28. [windbg-mcp] The tenancy gate may no longer earn its place
+## 28. [windbg-mcp] The tenancy gate no longer earned its place — **done** (2026-08-20)
 
-The listener's **lease** was built when the registry was one map for the whole server: handles
-minted from it, the cap shared, `end_session` ending whatever it was handed. Serving one client at a
-time was the only thing standing between two clients and each other's targets, so the gate was
+The listener's **lease** was built when the registry was one map for the whole server: handles minted
+from it, the cap shared, `end_session` ending whatever it was handed. Serving one client at a time
+was the only thing standing between two clients and each other's targets, so the gate was
 load-bearing.
 
 Ownership took that job over ([#162](https://github.com/glslang/windbg-mcp/issues/162), merged
-2026-08-19). A handle routes only for its owner, `session_status` and `server_log` show only the
-caller's, the cap and the closed-session history are per client, a lease expiry releases only that
-client's sessions, and an `Mcp-Session-Id` another client holds is reported unknown. The gate itself
-became per client in the same change, because a shared one would have made namespaces unusable
-concurrently — one client's pool walk stalling every other client for a boundary the registry
-already provides.
+2026-08-19) — a handle routes only for its owner, the cap and the closed-session history are per
+client, and an `Mcp-Session-Id` another client holds is reported unknown — which left the gate
+arbitrating one credential racing *itself*: a second MCP session for one token, refused with a
+`409`. **Inside a namespace that is not a boundary**, because both of that credential's MCP sessions
+reach the same debug sessions. So the gate is gone, and what it cost is gone with it: a client that
+lost its session id to a crash or a restart was told `409` and had to wait out the grace, where
+adopting its own sessions was what it wanted and what ownership had made safe.
 
-**So what is left for it to arbitrate is one credential racing itself**: a second *MCP session* for
-one token — a fresh `initialize` while one is held or being opened, or a request bearing an id that
-is not the one it holds — which gets a `409`. Note what that is *not*: further requests carrying the
-session a credential already holds are served concurrently, `in_flight` and all, because that is how
-a `DELETE` arrives on one connection while a tool call runs on another. Connections were never the
-unit. The question this item is for is whether what remains is worth a gate, and it is a real
-question in both directions:
+**Retired, with the clock kept.** The question this item asked was whether idle release
+(`WINDBG_MCP_SESSION_IDLE_SECS`, #164) already covers the teardown the lease was kept for. It does
+not, and the measurement is two lines of `Sessions`: `release_idle` skips a session with a call
+outstanding — which is exactly the parked `attach_kernel` a vanished client leaves behind, since a
+park is one call that never returns — and it knows nothing about MCP sessions, so an abandoned one
+would stay resident in the service with its id accepted, one per reconnect cycle. `release_leased`
+does both. So the lease stays as a **clock**: any request renews it, an expiry releases that
+client's sessions and closes its MCP sessions, and the `releasing` refusal stays too, since it is
+the sweep's and not the gate's.
 
-- **For keeping it:** the lease is also what *releases* sessions when a client goes away without
-  saying goodbye. That is not tenancy, it is teardown, and a live kernel target left attached is the
-  expensive failure. Retiring the gate must not retire the sweep.
-- **For retiring it:** `2026-07-28` has no session id at all, so a stateless client never becomes
-  the holder — the gate is reasoning about an identifier its newest callers do not send, and since
-  #168 it explicitly stands aside for them. And the
-  contention it does catch is arguably the client's own business: a client that lost its session id
-  (a crash, a restart) and re-`initialize`s inside the grace is told `409` and has to wait the grace
-  out, where adopting its own sessions is what it wanted and what the identity now makes safe.
-- **It used to cost that client concurrency, and the fix is a preview of the deletion.** A request
-  carrying no session id took the *opening* path and held a claim for its whole duration, so two
-  overlapping ones from the same credential contended — and every request of such a client is that
-  path, since there is never an id to carry. At its sharpest, a kernel attach whose target never
-  dialled in locked its own credential out of `session_status` and `end_session`, the two calls that
-  recover it. That was [#168](https://github.com/glslang/windbg-mcp/issues/168), and it is fixed by
-  *not reserving* for a request that can never become the holder — which is this item's argument
-  applied to the one case where it was unarguable. What remains is the same question for the cases
-  that are arguable: a legacy client's second `initialize`, and a resume inside the grace.
+**The lease is still armed by an MCP session**, so a `2026-07-28` client still has no clock —
+deliberately, now that the credential could carry one. A lease releases everything that credential
+holds, busy or not, on the reasoning that a client silent for a grace has gone; a stateless client is
+legitimately silent for far longer than 390 seconds, and releasing a live kernel from under a caller
+who is thinking is worse than holding an abandoned one for the idle window. `docs/remote-listener.md`
+says so where it explains why both mechanisms exist.
 
-**What would settle it:** decide whether idle release (`WINDBG_MCP_SESSION_IDLE_SECS`, added in
-[#164](https://github.com/glslang/windbg-mcp/pull/164)) already covers the teardown the lease is
-kept for. If it does, the gate can go and the sweep stays; if it does not, say why in
-`docs/remote-listener.md` and keep both. Note the `releasing` refusal is *not* part of what would
-go: it is the sweep's, not the gate's, and a stateless request is refused by it like any other —
-told to ask again once the release is done.
+**Both rules this item said the deletion must not take with it survived, one of them by becoming
+unreachable.**
 
-**Two rules the deletion must not take with it**, both learned in review of
-[#169](https://github.com/glslang/windbg-mcp/pull/169) and both ending in a client losing sessions
-it was using — the sweep reads `deadline` alone and zeroes `in_flight` on its way past, so work
-actually running does not save them:
+- An **admitted** request renews an existing deadline and never creates one. It is no longer a rule
+  about stateless requests but the whole of what `admit` does, for every request shape — and both
+  refusals still return before the renewal, so a stream of wrong session ids cannot hold an
+  abandoned client's target open.
+- A reservation that minted nothing had to give its **deadline** back. Nothing arms a deadline before
+  a settled MCP session exists, so there is no clock for a request that takes nothing to hand back.
+  The test that pinned it is now `nothing_arms_a_clock_before_an_mcp_session_exists`.
 
-- a request the gate **admits** renews an existing deadline. The qualifier is load-bearing in both
-  directions: a credential that is plainly alive must not be swept mid-call, and a *refused* request
-  must not renew anything — `NotYours`, `Releasing` and `Occupied` all return before any deadline is
-  touched today. Renewing on arrival instead would let a stream of wrong session ids or repeated
-  `initialize`s hold an abandoned client's live kernel target open for ever, which is the failure
-  the sweep exists to prevent.
-- a reservation that mints nothing gives its **deadline** back, not just its claim. If reserving
-  goes away entirely this stops mattering; if it survives in any form, it still does.
+And the sweep's own safety turned out to be already enforced a layer below the machinery that was
+protecting it: a sweep fires only after a whole grace with nothing admitted, and `Lease::new` refuses
+a grace shorter than the longest a call can keep a client quiet — so no request of that credential's
+can still be in flight when its lease expires. That is what the claim generations and in-flight
+epochs were for, one level above the thing being protected, which is the pattern `DECISIONS.md`
+already named for this code.
 
-**Why deferred:** it is a deletion, and a deletion is the change most worth making on its own,
-against a PR that is not also adding the thing it would delete. Picks up at `src/listen.rs`
-(`Lease::admit`, `Lease::settle`) and the ~90 lease tests beside it.
+**What went:** `Tenancy` (now `Presence`), the reservation and `claims_issued`, `Admission::Occupied`
+and its `409`, `Settled::Stale` and the minted session it had to close, `InFlight`/`leave`/`epoch`,
+`farewell`/`try_give_up_for`, `Sessions::busy`, `Arriving`, `mints_no_session` and every read of
+`MCP-Protocol-Version`. A credential's MCP sessions became a **set**, because an id recorded for
+nobody is one any credential may present — tracking only the newest would have re-opened the hole
+the ownership check closes. Ninety lease tests became twenty; the ones that went were about
+sequencing a handover that no longer happens.
 
 ## 29. [windbg-mcp] The listener smoke tier only ever runs one, unnamed client
 
 Every listener assertion in `tests/mcp_smoke.rs` starts the server with a single
 `WINDBG_MCP_LISTEN_TOKEN`, so everything the tier proves is proved for the `local` client alone. The
 per-client behaviour — routing, the unknown-handle answer, per-client capacity and history, the
-per-client tenancy, the session-id ownership check — is covered by unit tests in `src/engine.rs`,
-`src/listen.rs` and `src/client.rs`, and by nothing end to end.
+per-client lease and the release that refuses only its own client, the session-id ownership check —
+is covered by unit tests in `src/engine.rs`, `src/listen.rs` and `src/client.rs`, and by nothing end
+to end.
 
 The gap has already cost one bug: the adoption diagnostic counted `local`'s sessions for a named
 client reconnecting, because the count was taken after the identity scope had closed. A unit test
@@ -926,7 +919,8 @@ pins the mechanism now, but the call site — an HTTP handler — is still unexe
 
 **What would close it:** a tier that starts the listener with two tokens (`…_TOKEN_CI` beside the
 unnamed one), opens a session as each, and asserts that neither can see, route to or end the
-other's; then walks one client through open → `DELETE` → reconnect-inside-the-grace and reads the
+other's — including the `404` for a request bearing the other's `Mcp-Session-Id`, which is now the
+only cross-client refusal there is; then walks one client through open → `DELETE` → reconnect-inside-the-grace and reads the
 adoption line back out of `server_log`. All of it is dump-tier work — none of it needs a live
 target.
 
@@ -936,26 +930,25 @@ call-site coverage rather than new claims. Picks up at the listener helpers in `
 ## 30. [windbg-mcp] Nothing covers a `2026-07-28` handshake that omits the protocol header
 
 rmcp allows a stateless `initialize` to arrive without `MCP-Protocol-Version` — it is the request
-that establishes the revision, so the header is optional on exactly that one. The listener therefore
-cannot classify it from the header, reads it as an **opener**, reserves, and then mints no session.
+that establishes the revision, so the header is optional on exactly that one. Nothing here drives
+that shape: `Listener::stateless_opening` sends the header, and stdio has no headers to omit.
 
-That path is real and was briefly a bug: the reservation gave back its claim and left its *deadline*
-armed, so a client's own handshake started a clock that released whatever it had since opened one
-grace later. It is fixed and unit-tested at the lease level
-(`a_reservation_that_minted_nothing_leaves_no_clock_running`), but nothing drives it **over HTTP**:
-`Listener::stateless_opening` sends the header, and stdio has no headers to omit, so the shape that
-caused it is the one shape the tier does not send.
+**The mechanism that made it a bug is gone**, which is most of what this item was for. The listener
+used to classify a request by that header, so a headerless handshake was read as an *opener*,
+reserved, minted nothing, and left its *deadline* armed — a client's own handshake starting a clock
+that released whatever it had since opened, one grace later. Item 28 deleted the classification and
+the reservation both: nothing arms a deadline before a settled MCP session exists, and the listener
+does not read the header at all. What is left to cover is that rmcp serves the shape and that the
+server behaves normally afterwards.
 
 **What would close it:** a listener assertion that opens with a headerless `2026-07-28` handshake
-and then works normally — a `tools/list` and a `tools/call`. That much is protocol-tier work and
-needs no target.
+and then works normally — a `tools/list` and a `tools/call`. Protocol-tier work, no target needed.
 
-The half that would exercise the regression *end to end* is not: seeing sessions survive the grace
-means having a session, which means an opener (`open_dump`), which means a real engine worker and
-therefore the **debugger tier** — the same rule the parked test was moved for. Split it that way
-rather than claiming the whole thing is cheap; a protocol-tier version on its own asserts that the
-handshake is served, not that nothing sweeps afterwards.
+The half that would watch a session *survive the grace* after such a handshake is not: having a
+session means an opener (`open_dump`), which means a real engine worker and therefore the **debugger
+tier** — the same rule the parked test was moved for. It is also the half that no longer has a
+mechanism to catch, so it is worth doing only if the arming rule ever grows a second arm.
 
-**Why deferred:** the mechanism is pinned where it is decided, so this buys call-site coverage of a
-path the server now handles correctly rather than a new claim. Picks up at the listener helpers in
-`tests/mcp_smoke.rs`, beside `the_listener_serves_the_stateless_revision_it_negotiates`.
+**Why deferred:** it buys call-site coverage of a path whose hazard has been deleted rather than
+handled. Picks up at the listener helpers in `tests/mcp_smoke.rs`, beside
+`the_listener_serves_the_stateless_revision_it_negotiates`.

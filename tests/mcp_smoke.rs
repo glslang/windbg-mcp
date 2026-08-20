@@ -2289,8 +2289,8 @@ fn a_call_that_asked_for_no_progress_is_sent_none() {
 // lease is the only part of this server whose failures cost a *target* rather than a call.
 //
 // Every rule of it has unit tests in `src/listen.rs`, against the state machine directly. What
-// those cannot reach is the wiring: the bearer check that runs before the gate, the
-// `Mcp-Session-Id` header tenancy is keyed on, an HTTP status a client actually branches on, and —
+// those cannot reach is the wiring: the bearer check that runs before any of it, the
+// `Mcp-Session-Id` header ownership is keyed on, an HTTP status a client actually branches on, and —
 // in the debugger tier — the sweep releasing a real engine worker. That had been checked by hand
 // against the guest three times, which is how this tier came to exist.
 //
@@ -2300,7 +2300,9 @@ fn a_call_that_asked_for_no_progress_is_sent_none() {
 
 /// The protocol revision the lease is exercised against.
 ///
-/// Tenancy is keyed on `Mcp-Session-Id`, so this has to be a revision whose handshake mints one.
+/// A lease is armed by an MCP session, so this has to be a revision whose handshake mints one — a
+/// `2026-07-28` client is never given a clock at all, and abandonment there is the idle release's.
+/// [`STATELESS_REVISION`] is what exercises the rest of the wiring on that revision.
 const LEASE_REVISION: &str = "2025-06-18";
 
 /// The revision that removed the session id, and therefore the lease's grip on a client.
@@ -2678,7 +2680,7 @@ impl Listener {
         )
     }
 
-    /// The handshake, answering with the session id the lease keys tenancy on.
+    /// The handshake, answering with the session id a lease is armed by.
     fn initialize(&mut self) -> String {
         let reply = self.call(None, "initialize", Self::opening());
         assert_eq!(
@@ -2920,9 +2922,11 @@ fn service_is_registered() -> bool {
 /// An unauthenticated caller is refused, told nothing about what is here — and costs the server
 /// nothing.
 ///
-/// The last clause is the one worth a test. The bearer check runs *before* the tenancy gate, so a
-/// wrong token must not reserve, renew or consume a claim; if it did, anything that could reach
-/// the port could keep the real client locked out without ever authenticating.
+/// The last clause is the one worth a test. The bearer check runs *before* the lease is touched, so
+/// a wrong token must not renew one or reach the state behind it. It used to matter more sharply
+/// than it does: while the gate existed, a request that reserved kept every other request of that
+/// credential out, so anything that could reach the port could lock the real client out without
+/// ever authenticating.
 #[test]
 fn an_unauthenticated_request_is_refused_and_costs_the_server_nothing() {
     let mut server = Listener::start(&[]);
@@ -2948,52 +2952,54 @@ fn an_unauthenticated_request_is_refused_and_costs_the_server_nothing() {
     );
 }
 
-/// One MCP session at a time **per credential**, refused with `409` rather than served alongside.
+/// A credential's second MCP session is **served alongside** the first, not refused.
 ///
-/// This was once the whole boundary: handles were minted from one registry, `MAX_SESSIONS` was
-/// shared and `end_session` ended whatever it was handed, so two clients would silently share and
-/// one could end a target the other was using. Sessions are owned now
-/// ([#162](https://github.com/glslang/windbg-mcp/issues/162)), and the tenancy is per client — so
-/// what this asserts is a credential racing *itself*, which is the only contention left. The
-/// listener here holds one, unnamed token, so both requests below are that one client.
+/// This was a `409` until the gate was retired, and it was once the whole boundary: handles were
+/// minted from one registry, `MAX_SESSIONS` was shared and `end_session` ended whatever it was
+/// handed, so two clients would silently share and one could end a target the other was using.
+/// Ownership took that job over ([#162](https://github.com/glslang/windbg-mcp/issues/162)), and
+/// what the gate had left to arbitrate was one credential racing *itself* — which inside a
+/// namespace is not a boundary at all: both MCP sessions reach the same debug sessions, because
+/// they are the same client. `FOLLOWUPS.md` item 28 is where that was decided; this is the property
+/// that replaces the refusal.
 ///
-/// Not about *connections*: requests carrying the session this credential already holds are served
-/// concurrently, which is what makes a `DELETE` on one connection while a tool call runs on another
-/// work at all. What is refused is a **second session** — a fresh `initialize`, or an id that is
-/// not the one it holds.
+/// The half underneath still has to hold, and the last assertion is it: an id **this server never
+/// issued** is not served. An id *another client* holds is refused too — that one needs two tokens,
+/// so it is unit-tested in `src/listen.rs` (and is item 29's gap end to end).
 #[test]
-fn a_second_session_for_one_credential_is_refused_while_it_holds_the_server() {
+fn a_second_session_for_one_credential_is_served_alongside_the_first() {
     let mut server = Listener::start(&[]);
-    let holder = server.initialize();
 
-    let intruder = server.call(None, "initialize", Listener::opening());
-    assert_eq!(
-        intruder.status, 409,
-        "a second session for the holder's own credential was not refused: {}",
-        intruder.body
-    );
-    assert!(
-        intruder.body.contains("already using this server"),
-        "the refusal has to say why, or it reads as a bug: {}",
-        intruder.body
+    // Both through the full handshake, ack included: the assertion that each was served lives in
+    // the helper, which panics with the status and the server's stderr if one is refused.
+    let first = server.initialize();
+    let second = server.initialize();
+    assert_ne!(
+        first, second,
+        "each initialize mints an MCP session of its own"
     );
 
-    // A session id that is not the holder's is refused on the same grounds — this is the arm that
-    // makes the refusal a rule about tenancy rather than about `initialize`.
+    // And both are usable, against the one namespace of debug sessions behind them.
+    for (which, id) in [("the first", &first), ("the second", &second)] {
+        let status = server.tool(id, "session_status", json!({}));
+        assert_eq!(
+            status["status"], "ok",
+            "{which} MCP session of one credential was not served: {status}"
+        );
+    }
+
+    // An id nothing here issued is still not served — decided by the service now, which is where
+    // an unknown session belongs once the listener has stopped refusing one on tenancy grounds.
     let stranger = server.call(
         Some("not-a-session-this-server-issued"),
         "tools/list",
         json!({}),
     );
-    assert_eq!(
-        stranger.status, 409,
-        "a stranger's session id was served: {}",
+    assert_ne!(
+        stranger.status, 200,
+        "an MCP session id this server never issued was served: {}",
         stranger.body
     );
-
-    // And the holder is undisturbed by either.
-    let status = server.tool(&holder, "session_status", json!({}));
-    assert_eq!(status["status"], "ok", "{status}");
 }
 
 /// The listener serves `2026-07-28` — the handshake *and* everything after it.
@@ -3024,8 +3030,8 @@ fn the_listener_serves_the_stateless_revision_it_negotiates() {
         "the handshake must negotiate the revision it was offered: {}",
         opening.body
     );
-    // SEP-2567 removed the session id, so there is nothing here for the lease to key tenancy on.
-    // Asserted rather than assumed: every rule the gate has is written in terms of this header,
+    // SEP-2567 removed the session id, so there is nothing here for a lease to be armed by.
+    // Asserted rather than assumed: ownership is what the listener still reads this header for,
     // and its absence is what makes the rest of this test a different client to the ones above.
     assert!(
         opening.session.is_none(),
@@ -3140,8 +3146,8 @@ fn an_under_specified_stateless_request_is_told_which_part_it_is_missing() {
         unheaded.body
     );
 
-    // And the server is undamaged by either — a refusal at this layer must not consume a claim,
-    // for the same reason the unauthenticated one must not.
+    // And the server is undamaged by either — a refusal at this layer must not touch the lease
+    // state behind it, for the same reason the unauthenticated one must not.
     let listed = server.stateless("tools/list", json!({}));
     assert_eq!(
         listed.status, 200,
@@ -3154,23 +3160,16 @@ fn an_under_specified_stateless_request_is_told_which_part_it_is_missing() {
 ///
 /// The distinction is the whole reason a lease exists. Every request here is its own connection —
 /// which is what a client behind a tunnel looks like — so "the client is silent" is the resting
-/// state, and a server that treated silence as departure would hand the registry on between two
-/// calls of a working client.
+/// state, and a server that treated silence as departure would release a working client's targets
+/// between two of its calls.
 #[test]
 fn a_silence_is_not_a_departure_and_a_goodbye_is() {
     let mut server = Listener::start(&[]);
     let holder = server.initialize();
 
-    // Nothing is connected at this moment, and the holder still holds.
-    let too_early = server.call(None, "initialize", Listener::opening());
-    assert_eq!(
-        too_early.status, 409,
-        "silence was read as departure — a client between two calls would lose its targets: {}",
-        too_early.body
-    );
-
-    // Returning with the same id is served: the property stdio cannot offer, where a client
-    // restart costs a KDNET attach and a KDNET attach costs a reboot of the target.
+    // Nothing is connected at this moment, and the client is still here: returning with the id it
+    // left with is served. That is the property stdio cannot offer, where a client restart costs a
+    // KDNET attach and a KDNET attach costs a reboot of the target.
     let resumed = server.call(Some(&holder), "tools/list", json!({}));
     assert_eq!(
         resumed.status, 200,
@@ -3184,6 +3183,17 @@ fn a_silence_is_not_a_departure_and_a_goodbye_is() {
         "the DELETE was refused ({}): {}",
         farewell.status,
         farewell.body
+    );
+
+    // And a goodbye *is* a departure: the id it said goodbye with is gone. This used to be read off
+    // a `409` — a second `initialize` was refused while the first was held, so "still held" was
+    // visible in the refusal — and nothing refuses that since the gate was retired. What says the
+    // client left is the id it left with no longer being served.
+    let stale = server.call(Some(&holder), "tools/list", json!({}));
+    assert_ne!(
+        stale.status, 200,
+        "the id the client said goodbye with was still served: {}",
+        stale.body
     );
 
     let next = server.initialize();
@@ -5859,7 +5869,9 @@ fn two_sessions_coexist_and_do_not_disturb_each_other() {
 /// The second finding of [#168](https://github.com/glslang/windbg-mcp/issues/168), and the one that
 /// survived the first. A request carrying no `Mcp-Session-Id` used to take the gate's *opening*
 /// path and hold a claim for its whole duration — and on `2026-07-28` there is never an id to
-/// carry, so that was **every** request. Two that overlapped contended.
+/// carry, so that was **every** request. Two that overlapped contended. The gate has since been
+/// retired entirely, so there is no classification left to get wrong; this stays because the
+/// property is the client's, not the mechanism's.
 ///
 /// Measured at its sharpest rather than as a race. A kernel attach whose target never dials in
 /// parks in `WaitForEvent(INFINITE)` and does not come back; that is a supported state, and
@@ -6127,10 +6139,10 @@ fn a_lease_that_runs_out_releases_what_the_absent_client_left() {
         }),
     );
     // The *tool* is expected to report a failure — the attach parks, and the call budget here is
-    // one second — but the **listener** has to have admitted it. Without this, a `401` or a `409`
-    // from a tenancy regression would fall through to the skip below and be reported as a busy
-    // port on the host, and the one assertion in this file that costs a target would pass in
-    // silence.
+    // one second — but the **listener** has to have admitted it. Without this, a refusal from a
+    // regression in the listener — a `401`, the `404` an ownership check answers with, the `409` a
+    // teardown does — would fall through to the skip below and be reported as a busy port on the
+    // host, and the one assertion in this file that costs a target would pass in silence.
     assert_eq!(
         requested.status,
         200,

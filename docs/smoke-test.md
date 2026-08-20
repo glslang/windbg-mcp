@@ -414,7 +414,7 @@ reach is the wiring, which is what these assert against a real listener on a loo
 hand-written HTTP client (a library that normalised a `409` into an exception, or hid the session
 header, would be asserting on this server's behalf).
 
-Six of them need no debugger, because tenancy is decided before any session is opened. All six
+Six of them need no debugger, because none of them needs a session to be open. All six
 run a listener holding a **single, unnamed** token, so what they prove they prove for the `local`
 client alone; the per-client rules are unit-tested where they are decided, and closing that
 end-to-end gap is [`FOLLOWUPS.md`](../FOLLOWUPS.md) item 29:
@@ -423,19 +423,23 @@ end-to-end gap is [`FOLLOWUPS.md`](../FOLLOWUPS.md) item 29:
   every tool here, including the ones that write to a live kernel; a quiet default would be a
   server nobody knows is open.
 - *An unauthenticated request is refused, told nothing about what is here, and **costs the server
-  nothing***. The last clause is the one worth a test: the bearer check runs before the tenancy
-  gate, so a wrong token must not reserve or consume a claim — if it did, anything that could
-  reach the port could lock the real client out without ever authenticating.
-- *A second **MCP session** for the same credential is refused with `409`*, whether it asks with a
-  fresh `initialize` or with a session id that is not the one it holds, and the holder is undisturbed
-  by either. Since 2026-08-19 the tenancy is per client, so this is one credential racing itself: a
-  *different* client is served concurrently and shares nothing with this one, and so are further
-  requests carrying the session this one already holds — which is what lets a `DELETE` arrive while
-  a tool call is still running.
+  nothing***. The last clause is the one worth a test: the bearer check runs before the lease is
+  touched, so a wrong token must not renew one or reach the state behind it. It mattered more
+  sharply while the gate existed — a request that reserved kept every other request of that
+  credential out, so anything that could reach the port could lock the real client out without ever
+  authenticating.
+- *A credential's second **MCP session** is served alongside its first.* This was a `409` until the
+  tenancy gate was retired (2026-08-20, [`FOLLOWUPS.md`](../FOLLOWUPS.md) item 28): with sessions
+  owned per client, a credential opening a second MCP session contests nothing — both reach the same
+  debug sessions, because they are the same client. Both are exercised, and the assertion underneath
+  is that an id **this server never issued** is still not served. An id *another client* holds is
+  refused too; that needs two tokens, so it is unit-tested and is part of item 29's gap.
 - *Going quiet is not leaving; saying goodbye is.* Every request is its own connection — which is
-  what a client behind a tunnel looks like — so silence is the resting state, and a server that
-  read it as departure would hand the registry on between two calls of a working client. A
-  `DELETE` does hand it on.
+  what a client behind a tunnel looks like — so silence is the resting state, and a server that read
+  it as departure would release a working client's targets between two of its calls. Returning with
+  the id it left with is served; after a `DELETE` that id is not. The second half used to be read off
+  the `409` a second `initialize` got while the first was held, which is exactly what no longer
+  happens.
 - *`2026-07-28` is served — the handshake **and** everything after it.* The revision current clients
   negotiate has no session id
   ([SEP-2567](https://modelcontextprotocol.io/seps/2567-sessionless-mcp)), so it exercises the
@@ -457,8 +461,9 @@ its own calls is parked*. The park is a **kernel attach nothing will answer**, a
 runs alongside it is the recovery path itself — `tools/list`, `session_status`, `end_session`, the
 last checked for a tool error as well as an HTTP status, since a refusal inside the call also
 arrives on a `200`. It polls the attach to the `attaching` state rather than sleeping towards it: an
-attach that failed fast leaves a kernel record a laxer check would accept, and nothing would be
-holding a claim to contend with. It lives here rather than above because without `dbgeng.dll` the
+attach that failed fast leaves a kernel record a laxer check would accept, and there would be
+nothing parked to contend with. The mechanism that made it contend is gone with the gate; the
+property is the client's, so the test stays. It lives here rather than above because without `dbgeng.dll` the
 attach fails during initialisation instead of parking, which would quietly turn a test about a call
 that does not return into one about a call that failed. Budget ~21s, most of it the worker coming
 up and the `end_session` that terminates it.

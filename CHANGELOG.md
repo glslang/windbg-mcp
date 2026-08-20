@@ -34,7 +34,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - **A lease expiry releases the sessions of the client whose lease ran out**, not every session.
     Before ownership those were the same set, because the gate served one client at a time.
   - **An `Mcp-Session-Id` another client holds is reported unknown**, and the check runs before the
-    caller's own tenancy is consulted. The MCP service keeps one session table for the server, so on
+    caller's own lease is consulted. The MCP service keeps one session table for the server, so on
     a legacy revision the id was the only thing between a client and another's MCP session — and a
     `DELETE` on it closed that session while the lease that minted it still held the id, leaving its
     owner failing every request and refused its own re-`initialize` for a grace period.
@@ -42,17 +42,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     caller from the task-local, which is who is asking; the listener's own diagnostics run after
     that scope has closed and take the client as a parameter, so the one that reports an adoption on
     reconnect counts the reconnecting client's sessions rather than `local`'s.
-  - **The tenancy itself is per client**, so two clients no longer queue behind each other. The gate
-    serialised the server when the registry was global and one client could end another's targets;
-    keeping it shared would have meant one client's four-minute pool walk making every other client
-    wait for a boundary the registry now provides properly — namespaces that cannot be used
-    concurrently. A second *MCP session* for the same token still contends, which is one credential
-    racing itself — and the `409` says so, where it used to report a second client that no longer
-    exists as a category. Further requests carrying a session it already holds are not contention at
-    all and never were: they are served concurrently, which is what lets a `DELETE` arrive while a
-    tool call is still running. The one `409` that means something else — a request arriving while
-    the sweeper releases this credential's expired sessions, when it holds nothing at all — now says
-    so, instead of describing a session the caller does not have.
+  - **The tenancy itself became per client** — the gate serialised the server when the registry was
+    global and one client could end another's targets, and keeping it shared would have meant one
+    client's four-minute pool walk making every other client wait for a boundary the registry now
+    provides properly. It has since been retired outright (see **Changed**, below): with sessions
+    owned, the contention it had left to arbitrate was one credential racing itself, which inside a
+    namespace is not a boundary at all. The `409` it answered with is gone; the one that remains is
+    a request arriving while the sweeper releases this credential's own expired sessions.
   - Under **stdio** everything runs as `local`, so one set of registry rules serves both transports
     rather than one rule and an exception.
   - **Every credential variable is stripped from the processes this server creates** — by prefix,
@@ -107,12 +103,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   library that normalised a `409` into an exception, or hid the `Mcp-Session-Id` header, would be
   asserting on the server's behalf.
 
-  Four assertions need no debugger, because tenancy is decided before any session is opened: the
-  listener refuses to start without a token and says which variable is missing; an unauthenticated
-  request is refused, told nothing about what is here, and **costs the server nothing** (the bearer
-  check runs before the tenancy gate, so a wrong token must not consume a claim); a second client
-  is refused with `409` whether it arrives with a fresh `initialize` or somebody else's session id;
-  and going quiet is not leaving while a `DELETE` is. The fifth is in the debugger tier and waits
+  Four assertions need no debugger, because none of them needs a session to be open: the listener
+  refuses to start without a token and says which variable is missing; an unauthenticated request is
+  refused, told nothing about what is here, and **costs the server nothing** (the bearer check runs
+  before the lease is touched); a credential's second MCP session is served alongside its first,
+  while an id this server never issued is not; and going quiet is not leaving while a `DELETE` is. The fifth is in the debugger tier and waits
   out a real grace against a **parked kernel attach** — a session that exists, holds a worker, and
   cannot be interrupted, so releasing it means terminating a process. See
   [`docs/smoke-test.md`](./docs/smoke-test.md).
@@ -199,20 +194,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [#61](https://github.com/glslang/windbg-mcp/issues/61) established, quietly lost to a revision
   rather than to a change.
 
-  The gate now distinguishes the two kinds of nothing: a request on a revision that mints no
-  session can never become the holder a reservation arbitrates, so it reserves nothing and is
-  served alongside its client's other work. The one refusal it still meets is a teardown of its own
-  credential's expired sessions — refused with the `409` that says to ask again once the release is
-  done, which is the sweep's rule and not the gate's.
+  The fix was for the gate to distinguish the two kinds of nothing: a request on a revision that
+  mints no session can never become the holder a reservation arbitrates, so it reserved nothing and
+  was served alongside its client's other work. The gate has since been retired altogether (see
+  **Changed**), which deletes that classification rather than refining it — a request now presents a
+  session id or nothing, and the revision does not enter into it. The one refusal such a client still
+  meets is a teardown of its own credential's expired sessions, told to ask again once the release is
+  done, which was always the sweep's rule and not the gate's.
 
   Two lease bugs on the same path came out of review and are fixed here too, both of which end with
   a client losing sessions it was using. A stateless request now **renews** a lease its credential
   already has, since the sweep reads the deadline alone — a credential holding a legacy session and
   since sending stateless requests would otherwise have had those sessions released while it was
-  working. And a reservation that mints no session now gives its **deadline** back along with its
-  claim: a `2026-07-28` `initialize` may omit the `MCP-Protocol-Version` header, so it is
-  classified as an opener, reserves, and takes nothing — leaving a clock running against a tenancy
-  that holds nothing, which one grace later released whatever that client had since opened.
+  working; that rule outlived the gate, and is now simply what every admitted request does. And a
+  reservation that minted no session gave its **deadline** back along with its claim: a `2026-07-28`
+  `initialize` may omit the `MCP-Protocol-Version` header, so it was classified as an opener,
+  reserved, and took nothing — leaving a clock running against a tenancy that held nothing, which one
+  grace later released whatever that client had since opened. With reserving gone, nothing arms a
+  deadline before an MCP session exists, so there is no longer a clock to hand back.
 
   The same issue reported that the listener answered a `2026-07-28` handshake and then `400`d the
   request after it. **It does not** — that was measured with a hand-rolled probe that sent the body
@@ -227,6 +226,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 [SEP-2567]: https://modelcontextprotocol.io/seps/2567-sessionless-mcp
 
 ### Changed
+
+- **The listener's single-tenancy gate is retired; the lease is now a clock and nothing else**
+  ([#162](https://github.com/glslang/windbg-mcp/issues/162) slice 3b, `FOLLOWUPS.md` item 28). A
+  credential may open a second MCP session, and two of its requests never wait on each other. The
+  `409` that refused one is gone.
+
+  The gate was the boundary between two clients when the registry was one map for the whole server —
+  handles minted from it, the four-session cap shared, `end_session` ending whatever it was handed.
+  Ownership took that job over in the slices above, and what the gate had left to arbitrate was one
+  credential racing *itself*: a fresh `initialize` while it held one, or a request bearing an id that
+  was not the one it held. Inside a namespace neither is a boundary — both MCP sessions reach the
+  same debug sessions, because they are the same client — so what the refusal cost was a client's own
+  concurrency, and what it bought was nothing.
+
+  - **The clock stays, and it is the whole of what the lease was kept for.** Any request renews it;
+    when it runs out, that client's sessions are released exactly as a disconnect would have released
+    them, its MCP sessions are closed in the service, and its requests are refused until the release
+    is done. Idle release (`WINDBG_MCP_SESSION_IDLE_SECS`) does **not** subsume it: it spares a
+    session with a call outstanding, which is precisely the parked `attach_kernel` a vanished client
+    leaves behind, and it knows nothing about MCP sessions.
+  - **The lease is still armed by an MCP session, so a `2026-07-28` client still has no clock** —
+    deliberately, now that it could have one. A lease releases everything that credential holds,
+    busy or not, on the reasoning that a client silent for a grace has gone; a stateless client is
+    legitimately silent for far longer, and releasing a live kernel from under a caller who is
+    thinking is worse than holding an abandoned one for the idle window.
+  - **A credential's MCP sessions are recorded as a set**, not as one holder. An id recorded for
+    nobody is one any credential may present, so tracking only the newest would have handed a client
+    another's older id the moment that client opened a second — the harm the ownership check exists
+    to stop, arriving through the removal of the refusal in front of it.
+  - **Two refusals remain, and neither was ever tenancy.** An `Mcp-Session-Id` another client holds
+    is reported *unknown* (`404`); a request arriving while its own credential's expired sessions are
+    still being released is told to ask again (`409`) — the sweep's refusal, and now the only `409`
+    this server has.
+  - **What went with the gate:** the reservation and its generation counter, the in-flight count and
+    its epoch, the handover that waited on `Sessions::busy` (and `Sessions::busy` itself), the
+    `Stale` settlement that had to close a session minted by a claim that had expired, and every
+    read of `MCP-Protocol-Version`. A request now presents a session id or nothing, and the revision
+    does not enter into it — so the classification behind
+    [#168](https://github.com/glslang/windbg-mcp/issues/168) is deleted rather than fixed, and the
+    trap beside it (a reservation that minted nothing having to hand its deadline back) is
+    unreachable rather than handled: only a settled MCP session arms a deadline.
+  - **The one lease rule that survives is the one that loses sessions if forgotten.** An *admitted*
+    request renews an existing deadline and creates none. A refused one renews nothing, or a stream
+    of wrong session ids would hold an abandoned client's live kernel open for ever. What keeps the
+    sweep from releasing a session mid-call is the startup floor that was always there: a grace
+    longer than the longest a call can keep a client quiet means no request of that credential's can
+    still be in flight when its lease expires — which is what the epochs and claim generations were
+    protecting one layer above.
 
 - **The last progress milestone is no longer dropped when it races the answer**
   ([#163](https://github.com/glslang/windbg-mcp/issues/163)). A client watching a long call would
