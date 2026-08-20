@@ -250,6 +250,12 @@ def call_tool(name, args):
     try:
         out = mcp("tools/call", {"name": name, "arguments": args})
     except Exception as e:  # a transport failure is a result the model can react to
+        if name in OPENERS:
+            # **Ambiguous, not failed.** The call may have reached the server and
+            # opened a target before the answer went missing, and nothing else will
+            # ever name that handle: the model retries and gets a second target, and
+            # the cleanup has nothing to release. Ask what exists instead of assuming.
+            reconcile_opened()
         return f"transport error: {e}", False, 0
     result = out.get("result", {})
     # **Both kinds of failure.** A protocol error arrives as a top-level `error`; an
@@ -307,6 +313,26 @@ def run(task, tools):
     print(f"  gave up after {MAX_STEPS} steps")
 
 
+def reconcile_opened():
+    """Adopt every session in this credential's namespace, after an ambiguous opener.
+
+    Sound because openers require a credential of this run's own: on a borrowed one
+    they are refused outright, so anything here is this run's to account for. Read
+    from `structuredContent.sessions`, like every other handle in this script.
+    """
+    try:
+        out = mcp("tools/call", {"name": "session_status", "arguments": {}})
+    except Exception as e:
+        print(f"  could not reconcile after an ambiguous open: {e}")
+        return
+    structured = (out.get("result") or {}).get("structuredContent") or {}
+    for entry in structured.get("sessions") or []:
+        found = entry.get("session_id")
+        if found and found not in OPENED:
+            OPENED.append(found)
+            print(f"  adopted {found} after an ambiguous open")
+
+
 def close_transport_session():
     """Say goodbye to the MCP session as well as to the debug sessions.
 
@@ -337,13 +363,27 @@ def release_what_this_run_opened():
     that was supposed to start clean starts with somebody's leftovers — or trips the
     four-session cap and reclaims one.
     """
+    # **What could not be released stays on the list.** Clearing it regardless would
+    # leave the final pass with nothing to retry, and the next task routing its
+    # session-less calls to a target this one was supposed to have let go.
+    kept = []
     for session in list(OPENED):
         try:
-            mcp("tools/call", {"name": "end_session", "arguments": {"session_id": session}})
-            print(f"  released {session}")
+            out = mcp("tools/call", {"name": "end_session", "arguments": {"session_id": session}})
+            error = ((out.get("result") or {}).get("structuredContent") or {}).get("error") or {}
+            category = error.get("category")
+            if not error:
+                print(f"  released {session}")
+            elif category in ("stale_session", "worker_lost"):
+                # Gone either way, so there is nothing left to retry.
+                print(f"  {session} was already gone ({category})")
+            else:
+                kept.append(session)
+                print(f"  could not release {session}: {error.get('message', category)}")
         except Exception as e:
+            kept.append(session)
             print(f"  could not release {session}: {e}")
-    OPENED.clear()
+    OPENED[:] = kept
 
 
 def main():
