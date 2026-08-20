@@ -390,8 +390,11 @@ another client's handle is reported *unknown* rather than refused. Two tokens on
 namespaces — if a session "vanished", check which token the request carried.
 
 **A request with no session id is two different things, and the gate has to tell them apart.**
-`Arriving` names all three: `Holding(id)`, `Opening` — a revision that *has* sessions, opening or
-resuming one — and `Stateless`, which is `2026-07-28` and has none. Only `Opening` reserves. Reading
+`Arriving` names all three: `Holding(id)`, `Opening` — a revision that *has* sessions, opening one —
+and `Stateless`, which is `2026-07-28` and has none. **`Stateless` is the one variant that never
+reserves.** Not the same as "only `Opening` reserves": a `Holding` request whose credential has no
+current holder is a client *resuming* inside the grace, and it reserves too, because a resume can
+race a fresh `initialize` and a gate that merely served both would let them both through. Reading
 the absence of an id as "opening" is what made every request of a stateless client a reservation:
 two that overlapped contended, and a call that parked locked its own credential out of
 `session_status` and `end_session`, so a going-nowhere kernel attach was a reason to restart the
@@ -413,11 +416,18 @@ way past, so work actually running does not save them.
   — so it arrives looking like an opener, reserves, and then takes nothing.
 
 **Driving the listener by hand on `2026-07-28` needs three things, and sending one gets a `400`
-that looks like a broken server.** Every request carries the `MCP-Protocol-Version` header,
-`params._meta` with `io.modelcontextprotocol/protocolVersion` *and* `…/clientCapabilities`
-(SEP-2567 moved them there when it removed the session that held them), and SEP-2243's `Mcp-Method`
-— plus `Mcp-Name`, which is mapped **per method**: `params.name` for `tools/call` and `prompts/get`,
-`params.uri` for `resources/read`, nothing for the rest. `PowerShell`'s `Invoke-WebRequest` throws
+that looks like a broken server.** Every request *after the handshake* carries the
+`MCP-Protocol-Version` header, `params._meta` with `io.modelcontextprotocol/protocolVersion` *and*
+`…/clientCapabilities` (SEP-2567 moved them there when it removed the session that held them), and
+SEP-2243's `Mcp-Method` — plus `Mcp-Name`, which is mapped **per method**: `params.name` for
+`tools/call` and `prompts/get`, `params.uri` for `resources/read`, nothing for the rest.
+
+`initialize` is the exception and is exempt from all three: it is the request that *establishes*
+the revision, so it carries the version in its body, needs no `_meta` and no `Mcp-Method`, and may
+omit the header as well. Sending the header anyway is legal and is what `Listener::stateless_opening`
+does — which is precisely why the headerless handshake is untested (`FOLLOWUPS.md` item 30). Send
+the recipe above on a handshake and you will take the ordinary path rather than the one that
+carried the bug. `PowerShell`'s `Invoke-WebRequest` throws
 on a 4xx and leaves the body on the exception, so those refusals read as empty when they in fact
 name what is missing. Before believing any protocol-level claim about `--listen`, read the validator
 that produced it: the rmcp source is on the Mac and needs no Windows build, at
