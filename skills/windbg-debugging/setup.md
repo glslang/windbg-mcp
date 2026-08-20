@@ -438,10 +438,13 @@ Four things decide whether that works, and each fails in a way that reads as som
   over the link from the client, and never over the KD wire from the target. A client with symbols
   configured and a server without resolves nothing.
 - **For anything longer than one session, install it as a service** (`--install-service --listen
-  <addr>`, elevated). It survives logout and starts at boot, and it gets a defined working
-  directory — which is what decides whether the engine DLLs beside the exe are the ones that load.
-  Note `LocalSystem` does not read *your* `%USERPROFILE%`, so kernel profiles have to be configured
-  machine-wide for a service to see them.
+  <addr>`, elevated) — and then **start it**. Installing only *registers* it; "starts
+  automatically" means from the next boot, so `Start-Service windbg-mcp` is what gets you an
+  endpoint in this one. Skip that and everything keeps working until the foreground listener stops,
+  and there is nothing listening after it. Once running it survives logout, comes back at boot, and
+  has a defined working directory — which is what decides whether the engine DLLs beside the exe
+  are the ones that load. Note `LocalSystem` does not read *your* `%USERPROFILE%`, so kernel
+  profiles have to be configured machine-wide for a service to see them.
 
 Two behaviours differ from stdio and are worth knowing before they surprise you.
 
