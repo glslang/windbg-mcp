@@ -1079,7 +1079,7 @@ checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
 [[package]]
 name = "win-kexp"
 version = "0.1.0"
-source = "git+https://github.com/glslang/win-kexp?rev=ef8e4cb3e29c7314bce1bf34655068388dcb36c2#ef8e4cb3e29c7314bce1bf34655068388dcb36c2"
+source = "git+https://github.com/glslang/win-kexp?rev=44b8efd3c9f5b4b4814a09baf6a970442e8e6a63#44b8efd3c9f5b4b4814a09baf6a970442e8e6a63"
 dependencies = [
  "byte-strings",
  "goblin",

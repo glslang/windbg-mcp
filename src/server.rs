@@ -1771,9 +1771,11 @@ pub struct SymbolPathArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct PoolFindTagArgs {
-    /// Pool tag to find: 1..4 ASCII bytes, e.g. "Tgsm". This is the tag as the debugger
-    /// *displays* it — the tag bytes in memory order. A driver whose source passes the C
-    /// literal 'msgT' therefore appears here as "Tgsm", not "msgT".
+    /// Pool tag to find, either way a listing names one: 1..4 ASCII bytes, e.g. "Tgsm", or the
+    /// `raw_tag` form — "0x" and the four bytes as hex, e.g. "0x5467736d". Both are in memory
+    /// order, so a driver whose source passes the C literal 'msgT' appears as "Tgsm".
+    /// Prefer `raw_tag` when copying from a table: a tag containing "." is a *rendering* of
+    /// bytes that cannot be printed, and querying it finds literal "." bytes instead.
     pub tag: String,
     /// Restrict to one allocator: true = paged only, false = nonpaged only. Omit for both.
     #[serde(default)]

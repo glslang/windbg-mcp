@@ -8399,17 +8399,19 @@ struct KernelSymbols {
 
 /// What `pool_census` had to say about the heaviest tag it found.
 ///
-/// Three outcomes, not two, and collapsing the last two is a real bug: "the census listed
-/// nothing" is a claim about the *pool* and worth asserting on, while "the heaviest tag does not
-/// render unambiguously" is a fact about **rendering** that says nothing about the walk. Treating
-/// the second as the first fails a perfectly healthy run whose busiest tag happens to be binary.
+/// Two outcomes, and it used to be three. The third was "the heaviest tag does not render
+/// unambiguously", which stood down the cross-check below on any tag `display_tag` could not
+/// print — and on this bench that was the *common* case, since the two heaviest tags on a live
+/// kernel are routinely binary and both render `....`. It stood down because the rendering was
+/// the only identifier the census emitted, and handing it back queries a different tag rather
+/// than failing.
+///
+/// The census now carries `raw_tag` beside it, so every tag it lists can be queried and the
+/// stand-down has nothing left to describe. A missing `raw_tag` is a defect in the server, not a
+/// fact about the pool, so it fails here rather than skipping.
 enum HeaviestTag {
     /// A tag that can be handed straight back to `pool_find_tag`.
     Queryable(String),
-    /// A tag is listed, but this test cannot reconstruct the bytes behind it. `display_tag`
-    /// maps every unprintable byte to `.` — and a literal `.` to the same thing — so a rendering
-    /// containing one could have come from either.
-    Ambiguous,
     /// The census listed no allocated chunk at all.
     NothingListed,
 }
@@ -8425,13 +8427,17 @@ fn heaviest_census_tag(census: &Value) -> HeaviestTag {
     let Some(first) = census["tags"].as_array().and_then(|tags| tags.first()) else {
         return HeaviestTag::NothingListed;
     };
-    let tag = first["tag"].as_str().unwrap_or_default().to_string();
-    if tag.chars().count() != 4 || tag.contains('.') {
-        // Still a rendering, and still ambiguous: the *tag* is four raw bytes, and every
-        // unprintable one — like a literal `.` — comes back as `.`.
-        return HeaviestTag::Ambiguous;
-    }
-    HeaviestTag::Queryable(tag)
+    // The raw form, never `tag`. `tag` is a rendering: it maps every unprintable byte to `.`,
+    // and a literal `.` to the same thing, so feeding it back to `pool_find_tag` asks about the
+    // four ASCII bytes `....` — a tag nobody allocated — and reads as the walk having lost the
+    // heaviest tag in the pool.
+    let raw = first["raw_tag"].as_str().unwrap_or_default();
+    assert!(
+        !raw.is_empty(),
+        "every census entry names its tag's bytes, or the heaviest tag in the pool cannot be \
+         queried at all: {first}"
+    );
+    HeaviestTag::Queryable(raw.to_string())
 }
 
 /// A walk's diagnostic total has to account for the categories reported under it.
@@ -8751,7 +8757,7 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
                     .as_array()
                     .into_iter()
                     .flatten()
-                    .find(|t| t["tag"] == tag.as_str())
+                    .find(|t| t["raw_tag"] == tag.as_str())
                     .cloned()
                     .unwrap_or_else(|| panic!("the census listed `{tag}`: {totals}"));
                 assert_eq!(
@@ -8769,12 +8775,6 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
             HeaviestTag::Queryable(tag) => eprintln!(
                 "NOTE: the walk was incomplete, so the census/find_tag cross-check on `{tag}` was \
                  skipped — those would be two different walks"
-            ),
-            // Not a failure, and not evidence about the walk: plenty of drivers use tag bytes
-            // that do not render, and the busiest allocator on this target may be one of them.
-            HeaviestTag::Ambiguous => eprintln!(
-                "NOTE: the heaviest tag does not render unambiguously, so the census/find_tag \
-                 cross-check was skipped"
             ),
             HeaviestTag::NothingListed => assert!(
                 !complete,

@@ -217,6 +217,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The pool's heaviest tag could not be queried, and asking for it answered about a different
+  one.** `pool_census` and `pool_chunk` named a tag only by how it *prints*, and that rendering
+  maps every unprintable byte to `.` — and a literal `.` to the same thing. So a tag with a
+  binary byte came back as `....`, several distinct tags shared that one rendering in the same
+  table, and handing it back to `pool_find_tag` was not an error: `....` is four valid ASCII
+  bytes, so the query silently asked about a tag nobody had allocated and reported no matches.
+  A tag with a byte outside ASCII could not be named at all.
+
+  This is not a corner case. On a live kernel the two heaviest tags by bytes are routinely binary
+  — on the bench this was found on, ~66 MB and ~15 MB, both rendering `....` — so the single
+  largest pool consumer was the one thing the tool could not be asked about.
+
+  Every census entry and chunk now carries **`raw_tag`** beside the printed form: `0x` and the
+  four bytes as hex, in memory order, so it reads in the same direction as the rendering
+  (`Tgsm` is `0x5467736d`). `pool_find_tag` accepts either form — the two cannot collide, since
+  the raw form is exactly 10 characters and a printed tag is at most 4, so `0x2e` still means the
+  four-byte tag it always did. The tables print the raw form wherever the rendering is ambiguous,
+  and querying a rendering now says what it really searched for instead of just finding nothing.
+
+  Found by the live-kernel smoke tier, which had been standing down on exactly this — its
+  census/`find_tag` cross-check skipped itself whenever the heaviest tag was binary, which on a
+  real target was most of the time. It now runs.
+
 - **Two clients on one listener shared a namespace after all**
   ([#162](https://github.com/glslang/windbg-mcp/issues/162), found while closing `FOLLOWUPS.md`
   item 29). Ownership was decided correctly everywhere it is decided — and the identity it was

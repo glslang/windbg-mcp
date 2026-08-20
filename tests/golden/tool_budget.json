@@ -258,8 +258,8 @@
       "inputSchema": 602,
       "modelVisible": 1025,
       "name": "pool_census",
-      "outputSchema": 12311,
-      "wire": 13490
+      "outputSchema": 12863,
+      "wire": 14042
     },
     {
       "annotations": 129,
@@ -267,8 +267,8 @@
       "inputSchema": 760,
       "modelVisible": 1752,
       "name": "pool_chunk",
-      "outputSchema": 14042,
-      "wire": 15954
+      "outputSchema": 14288,
+      "wire": 16200
     },
     {
       "annotations": 127,
@@ -282,11 +282,11 @@
     {
       "annotations": 122,
       "description": 511,
-      "inputSchema": 1218,
-      "modelVisible": 1783,
+      "inputSchema": 1420,
+      "modelVisible": 1985,
       "name": "pool_find_tag",
-      "outputSchema": 13964,
-      "wire": 15900
+      "outputSchema": 14554,
+      "wire": 16692
     },
     {
       "annotations": 90,
@@ -463,13 +463,13 @@
   "totals": {
     "annotations": 5449,
     "description": 24752,
-    "inputSchema": 39667,
+    "inputSchema": 39869,
     "instructions": 1990,
-    "modelVisible": 67076,
-    "outputSchema": 317236,
-    "payload": 391172,
+    "modelVisible": 67278,
+    "outputSchema": 318624,
+    "payload": 392762,
     "tools": 51,
-    "wire": 391054,
+    "wire": 392644,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 9746
   }

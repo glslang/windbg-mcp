@@ -31,6 +31,13 @@ validated VS family. An unfamiliar or ambiguous family is intentionally refused.
   cache automatically, but explicit refresh makes the intent clear at the final observation.
 - Read both `layout` and `walk`. `deadline_truncated` and `partial` counts are floors, and an
   uncovered address is not evidence that it was never pool.
+- Query a tag by its `raw_tag`, not by the `tag` a listing prints. The printed form renders every
+  unprintable byte as `.` — and a literal `.` the same way — so a tag containing `.` names no
+  particular tag, and `pool_find_tag` will read it as four literal `.` bytes and report no
+  matches. This is not a corner case: the heaviest tags on a live kernel are routinely binary, and
+  several distinct ones can share a single `....` rendering. Every census entry and chunk carries
+  `raw_tag` (`0x` plus the four bytes, in memory order) beside the printed form, and
+  `pool_find_tag` accepts either.
 
 ## User heap workflow
 

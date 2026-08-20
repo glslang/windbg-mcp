@@ -45,7 +45,10 @@ use std::time::{Duration, Instant};
 use win_kexp::dbgeng::{CommandRun, DebugEngine, InterruptHandle, Interruption, RunToOutcome};
 use win_kexp::heap::{self as heap_query, HeapAllocation, HeapBackend, HeapState, HeapWalk};
 use win_kexp::pool::query::{self, PoolPageFilter, PoolWalk};
-use win_kexp::pool::{DiagnosticShape, PoolDiagnostics, PoolSpan, PoolState};
+use win_kexp::pool::{
+    DiagnosticShape, PoolDiagnostics, PoolSpan, PoolState, display_is_ambiguous, parse_tag,
+    raw_tag_hex,
+};
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
 use crate::batch::{self, BatchOp, Debuggee, Ran};
@@ -2913,9 +2916,51 @@ fn run_batch(e: &DebugEngine, job: u64, op: BatchOp, queued: Duration) -> Result
 }
 
 /// Column header for the chunk tables below. Kept next to [`pool_row`] so the two cannot
-/// drift out of alignment.
+/// drift out of alignment — `tag_columns_line_up` is what enforces it.
 const POOL_COLUMNS: &str =
-    "address               size  state          kind                    backend  tag   numa";
+    "address              size  state          kind                    backend  tag         numa";
+
+/// Width of the tag column, in both tables.
+///
+/// Ten, not four, because [`tag_label`] falls back to the raw form — `0x` and eight hex digits —
+/// and a tag that has to be shown as its bytes must not shove the rest of the row out of line.
+const TAG_WIDTH: usize = 10;
+
+/// How a tag should be shown to someone who might hand it back.
+///
+/// The printed form where it identifies the tag, and the tag's raw bytes where it does not.
+/// That distinction is the whole point: `display_tag` renders every unprintable byte as `.`, and
+/// a literal `.` the same way, so `....` names no particular tag — and `pool_find_tag` parses it
+/// happily as four ASCII bytes and answers about a tag nobody allocated. Printing the raw form
+/// wherever the rendering is ambiguous is what keeps every tag in these tables queryable.
+fn tag_label(span_tag: u32, display_tag: &str) -> String {
+    if display_is_ambiguous(span_tag) {
+        raw_tag_hex(span_tag)
+    } else {
+        display_tag.to_string()
+    }
+}
+
+/// Why a query for an ambiguous *rendering* found nothing, when it is worth saying.
+///
+/// Empty for the ordinary case — a plain tag that simply is not allocated, and a raw form, which
+/// says exactly which four bytes it meant. It speaks only for the case that would otherwise
+/// mislead: a rendering containing `.`, which searched for literal `.` bytes rather than for
+/// whatever the table it was copied from was showing.
+fn pool_tag_rendering_hint(tag: &str) -> String {
+    if tag.starts_with("0x") || tag.starts_with("0X") {
+        return String::new();
+    }
+    match parse_tag(tag) {
+        Some(raw) if display_is_ambiguous(raw) => format!(
+            "\n\n`{tag}` is a rendering rather than a tag: a table prints every unprintable byte \
+             as `.`, and a literal `.` the same way, so this searched for the four bytes {} and \
+             nothing else. If you copied it from a listing, query the `raw_tag` beside it.",
+            raw_tag_hex(raw)
+        ),
+        _ => String::new(),
+    }
+}
 
 /// Renders one chunk as a fixed-width row.
 ///
@@ -2924,13 +2969,13 @@ const POOL_COLUMNS: &str =
 /// bookkeeping starts and is rarely what a caller is holding.
 fn pool_row(span: &PoolSpan) -> String {
     format!(
-        "{:<18}  {:>5}  {:<13}  {:<22}  {:<7}  {:<4}  {}",
+        "{:<18}  {:>5}  {:<13}  {:<22}  {:<7}  {:<TAG_WIDTH$}  {}",
         fmt_addr(span.usable_address),
         format!("{:#x}", span.size),
         format!("{:?}", span.state),
         format!("{:?}", span.pool_kind),
         format!("{:?}", span.backend),
-        span.display_tag,
+        tag_label(span.raw_tag, &span.display_tag),
         span.numa_node,
     )
 }
@@ -3111,6 +3156,9 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
                 out,
                 structured::PoolTagMatches {
                     layout: (&answer.walk.layout).into(),
+                    // The query succeeded, so the tag parsed; the fallback cannot be reached and
+                    // echoing the caller's own text is the harmless answer if it ever were.
+                    raw_tag: parse_tag(&tag).map_or_else(|| tag.clone(), raw_tag_hex),
                     tag,
                     scope: match filter {
                         None => structured::PoolScope::Both,
@@ -3233,6 +3281,7 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
                         .take(limit)
                         .map(|entry| structured::PoolTagTotals {
                             tag: entry.display_tag.clone(),
+                            raw_tag: raw_tag_hex(entry.raw_tag),
                             allocations: entry.allocations,
                             total_bytes: entry.total_bytes,
                             paged_allocations: entry.paged_allocations,
@@ -3679,12 +3728,17 @@ fn render_find_tag(
         None => "",
     };
     if spans.is_empty() {
+        // The one empty answer that is not about the pool at all: a rendering was handed back as
+        // if it were a tag. `....` parses as four perfectly good ASCII bytes, so this found
+        // nothing for a reason no amount of walk coverage explains, and saying so here is what
+        // keeps it from reading as "the tag is not allocated".
+        let rendering = pool_tag_rendering_hint(tag);
         return format!(
-            "No allocated chunks carry tag `{tag}`{scope}.\n\nOnly *allocated* chunks are \
-             indexed by tag: a freed chunk's tag is not reliably preserved by the allocator, so \
-             this never reports freed memory. To ask about one address that may have been freed, \
-             use `pool_chunk`. If the target has run since the snapshot was taken, retry with \
-             refresh=true."
+            "No allocated chunks carry tag `{tag}`{scope}.{rendering}\n\nOnly *allocated* chunks \
+             are indexed by tag: a freed chunk's tag is not reliably preserved by the allocator, \
+             so this never reports freed memory. To ask about one address that may have been \
+             freed, use `pool_chunk`. If the target has run since the snapshot was taken, retry \
+             with refresh=true."
         );
     }
     let total: u64 = spans.iter().map(|span| span.size).sum();
@@ -3712,7 +3766,7 @@ fn render_chunk(address: u64, found: &query::PoolNeighbourhood) -> String {
         fmt_addr(address),
         address.saturating_sub(chunk.usable_address),
         chunk.size,
-        chunk.display_tag,
+        tag_label(chunk.raw_tag, &chunk.display_tag),
         chunk.state,
     );
     if let Some(previous) = &found.previous {
@@ -3905,14 +3959,14 @@ fn render_census(census: &[query::PoolTagSummary], limit: usize) -> String {
         return "The pool snapshot contains no allocated chunks.".to_string();
     }
     let mut out = format!(
-        "{} distinct tag(s) allocated, heaviest first.\n\ntag      allocs        bytes  \
+        "{} distinct tag(s) allocated, heaviest first.\n\ntag          allocs        bytes  \
          nonpaged   paged\n",
         census.len()
     );
     for entry in census.iter().take(limit) {
         out.push_str(&format!(
-            "{:<6}  {:>7}  {:>11}  {:>8}  {:>6}\n",
-            entry.display_tag,
+            "{:<TAG_WIDTH$}  {:>7}  {:>11}  {:>8}  {:>6}\n",
+            tag_label(entry.raw_tag, &entry.display_tag),
             entry.allocations,
             format!("{:#x}", entry.total_bytes),
             entry.nonpaged_allocations,
@@ -4221,6 +4275,118 @@ mod tests {
     use win_kexp::pool::WalkStalls;
 
     use super::*;
+
+    // ---- pool tags ------------------------------------------------------------------
+
+    /// A tag is shown in the form that can be handed back, which is not always the printed one.
+    #[test]
+    fn an_unprintable_tag_is_shown_as_its_bytes() {
+        // Printable: the rendering identifies it, so it is what a reader sees.
+        assert_eq!(tag_label(u32::from_le_bytes(*b"Tgsm"), "Tgsm"), "Tgsm");
+        assert_eq!(tag_label(u32::from_le_bytes(*b"Ntf "), "Ntf "), "Ntf ");
+
+        // Not printable: `display_tag` already collapsed these to the same four dots, so the
+        // rendering cannot be the label — two distinct tags would be shown identically and
+        // neither could be queried.
+        let binary = u32::from_le_bytes([0x00, 0x01, 0x80, 0xff]);
+        let dots = u32::from_le_bytes(*b"....");
+        assert_eq!(tag_label(binary, "...."), "0x000180ff");
+        assert_eq!(tag_label(dots, "...."), "0x2e2e2e2e");
+        assert_ne!(tag_label(binary, "...."), tag_label(dots, "...."));
+    }
+
+    /// The empty answer that is about the question rather than about the pool.
+    #[test]
+    fn a_rendering_handed_back_as_a_tag_says_so() {
+        let hint = pool_tag_rendering_hint("....");
+        assert!(
+            hint.contains("0x2e2e2e2e") && hint.contains("rendering"),
+            "querying a rendering must say which bytes it really searched for: {hint}"
+        );
+
+        // The two cases that must stay quiet: a tag that simply is not allocated, and a raw form,
+        // which already says exactly which bytes it meant.
+        assert_eq!(pool_tag_rendering_hint("Tgsm"), "");
+        assert_eq!(pool_tag_rendering_hint("0x000180ff"), "");
+    }
+
+    /// The header and the rows are two literals that have to agree, and nothing else checks it.
+    ///
+    /// Widening the tag column for the raw form is exactly the edit that breaks this, so the
+    /// invariant is pinned rather than eyeballed: every column of a rendered row must start
+    /// where the header says it does.
+    #[test]
+    fn tag_columns_line_up() {
+        let raw = u32::from_le_bytes([0x00, 0x01, 0x80, 0xff]);
+        let span = PoolSpan {
+            header_address: 0xffff_e20d_bc6a_f030,
+            usable_address: 0xffff_e20d_bc6a_f040,
+            size: 0x70,
+            requested_size: None,
+            raw_tag: raw,
+            display_tag: "....".into(),
+            pool_kind: win_kexp::pool::PoolKind::NonPagedNx,
+            numa_node: 0,
+            heap: win_kexp::pool::HeapIdentity {
+                pool_state: 0,
+                heap: 0,
+                special: false,
+            },
+            subsegment: None,
+            backend: win_kexp::pool::PoolBackend::Vs,
+            state: PoolState::Allocated,
+            size_class: 0x70,
+        };
+        let row = pool_row(&span);
+        let tag_at = POOL_COLUMNS.find("tag").expect("header names a tag column");
+        assert_eq!(
+            row[tag_at..tag_at + TAG_WIDTH].trim(),
+            "0x000180ff",
+            "the tag column must sit under its header:\n{POOL_COLUMNS}\n{row}"
+        );
+        let numa_at = POOL_COLUMNS
+            .find("numa")
+            .expect("header names a numa column");
+        assert_eq!(
+            row[numa_at..].trim(),
+            "0",
+            "widening the tag column must move every column after it:\n{POOL_COLUMNS}\n{row}"
+        );
+
+        // The census is a second table with its own header literal and the same tag column.
+        let census = render_census(
+            &[query::PoolTagSummary {
+                display_tag: "....".into(),
+                raw_tag: raw,
+                allocations: 18633,
+                total_bytes: 0x3f6_6cf0,
+                paged_allocations: 13115,
+                nonpaged_allocations: 5518,
+            }],
+            40,
+        );
+        let (header, entry) = census
+            .lines()
+            .skip_while(|line| !line.starts_with("tag"))
+            .take(2)
+            .collect::<Vec<_>>()
+            .split_first()
+            .map(|(head, rest)| (*head, rest[0]))
+            .expect("the census renders a header and a row");
+        let tag_at = header.find("tag").expect("header names a tag column");
+        assert_eq!(
+            entry[tag_at..tag_at + TAG_WIDTH].trim(),
+            "0x000180ff",
+            "an unprintable tag must be queryable from the census too:\n{header}\n{entry}"
+        );
+        // `rfind`, because "paged" also sits inside "nonpaged" two columns earlier.
+        let paged_at = header.rfind("paged").expect("header names a paged column");
+        assert_eq!(
+            entry[paged_at..].trim(),
+            "13115",
+            "the census columns must line up under their header:\n{header}\n{entry}"
+        );
+    }
 
     // ---- pool walk diagnostics ------------------------------------------------------
 
