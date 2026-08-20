@@ -27,6 +27,7 @@ Configuration, all optional:
 """
 import json
 import os
+import re
 import sys
 import time
 import urllib.request
@@ -43,6 +44,15 @@ REVISION = "2025-06-18"
 # to the model as refused, so a wrong pick is *measured* rather than performed —
 # the surface includes `launch` and `execute`, and a debug host is the wrong place
 # to find out what a model does with them unattended.
+#
+# `end_session` is in here and is the one destructive member, so it is fenced twice
+# over (see `call_tool`): this run may only end sessions it opened itself. Falling
+# back to the registered client's token puts the driver in **that client's**
+# namespace — which is the ownership model working as designed — so an
+# `end_session` with no `session_id` would resolve whatever session that client has
+# current and close somebody else's target. Give the driver its own credential
+# (`WINDBG_MCP_LISTEN_TOKEN_DRIVER` on the listener, `WINDBG_MCP_TOKEN` here) and it
+# gets a namespace of its own instead.
 ALLOWED = {
     "open_dump", "open_trace", "crash_triage", "backtrace", "modules", "registers",
     "threads", "session_status", "end_session", "decode_ioctl", "disassemble",
@@ -50,6 +60,12 @@ ALLOWED = {
 }
 
 MAX_STEPS = 6
+
+# The debug sessions this run opened, which are the only ones it may end — and the
+# ones it ends on the way out, so a run does not leave a worker holding a target for
+# the lease grace and the next run does not adopt it.
+OPENED = []
+SESSION_ID = re.compile(r"sess-[0-9a-f]+-\d+")
 # Results reach the model **whole** by default. Truncating them would quietly defeat
 # one of the things this harness exists to measure — whether a single answer fits a
 # local model's window — and would have it reason from JSON cut off mid-structure
@@ -187,6 +203,14 @@ def call_tool(name, args):
     """Run one tool call. Returns (text for the model, ok, full size in characters)."""
     if name not in ALLOWED:
         return f"refused: `{name}` is not permitted in this harness", None, 0
+    if name == "end_session":
+        wanted = args.get("session_id")
+        if not wanted:
+            return ("refused: name the `session_id` to end. Without one the server ends this "
+                    "client's *current* session, which this harness may not have opened."), None, 0
+        if wanted not in OPENED:
+            return (f"refused: `{wanted}` was not opened by this run, so it is not this "
+                    "harness's to end"), None, 0
     try:
         out = mcp("tools/call", {"name": name, "arguments": args})
     except Exception as e:  # a transport failure is a result the model can react to
@@ -199,6 +223,15 @@ def call_tool(name, args):
     ok = "error" not in out and not result.get("isError")
     text = json.dumps(result if result else out)
     size = len(text)
+    if ok:
+        # Whatever this call opened is now this run's to clean up. Read out of the
+        # answer rather than tracked per tool, because every opener names its handle
+        # and none of them names it the same way twice.
+        for found in SESSION_ID.findall(text):
+            if name != "end_session" and found not in OPENED:
+                OPENED.append(found)
+        if name == "end_session":
+            OPENED[:] = [s for s in OPENED if s != args.get("session_id")]
     if RESULT_LIMIT and size > RESULT_LIMIT:
         text = text[:RESULT_LIMIT] + f"\n[truncated by the harness: {size} characters in full]"
     return text, ok, size
@@ -237,6 +270,23 @@ def run(task, tools):
     print(f"  gave up after {MAX_STEPS} steps")
 
 
+def release_what_this_run_opened():
+    """End the run's own sessions, so the next one starts from nothing.
+
+    Without this a task that opens a dump and never says goodbye leaves a worker
+    holding it for the whole lease grace, the next run adopts it, and a measurement
+    that was supposed to start clean starts with somebody's leftovers — or trips the
+    four-session cap and reclaims one.
+    """
+    for session in list(OPENED):
+        try:
+            mcp("tools/call", {"name": "end_session", "arguments": {"session_id": session}})
+            print(f"  released {session}")
+        except Exception as e:
+            print(f"  could not release {session}: {e}")
+    OPENED.clear()
+
+
 def main():
     global MODEL
     MODEL = pick_model()
@@ -249,9 +299,12 @@ def main():
     tasks = json.load(open(sys.argv[1])) if len(sys.argv) > 1 else [
         "What debug sessions do I currently have open on this server?"
     ]
-    for i, task in enumerate(tasks, 1):
-        print(f"\n=== task {i}: {task[:110]}")
-        run(task, offered)
+    try:
+        for i, task in enumerate(tasks, 1):
+            print(f"\n=== task {i}: {task[:110]}")
+            run(task, offered)
+    finally:
+        release_what_this_run_opened()
 
 
 if __name__ == "__main__":

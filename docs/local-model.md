@@ -60,6 +60,24 @@ Then point a local model at it, either way round:
   wrong place to discover unattended what a model does with them — but a wrong pick is still
   *measured*, which is the point.
 
+  **Give the driver its own credential.** Falling back to the registered client's token puts it in
+  *that client's* namespace, which is ownership working exactly as designed — the driver then sees,
+  routes to and could end the sessions your editor has open. A token of its own makes it a separate
+  client with a separate namespace, which is what the per-client work is for:
+
+  ```console
+  # on the Windows machine, beside the unnamed token
+  setx WINDBG_MCP_LISTEN_TOKEN_DRIVER "<another long random string>"
+  # on the client machine
+  WINDBG_MCP_TOKEN="<the same string>" python3 tools/local_model_drive.py tasks.json
+  ```
+
+  Sharing the token is survivable rather than safe, and the script is fenced accordingly: it will
+  only `end_session` a session **this run opened**, refuses one with no `session_id` at all (the
+  server would resolve the client's *current* session, which may not be the driver's), and ends what
+  it opened on the way out — so a run neither strands a worker for the lease grace nor leaves the
+  next run adopting its leftovers.
+
 ## What this server costs a model, measured
 
 [`token-budget.md`](./token-budget.md) has the method and the golden; these are the numbers that
