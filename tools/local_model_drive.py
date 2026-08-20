@@ -26,8 +26,9 @@ Configuration:
     WINDBG_MCP_URL      the listener           (default: http://127.0.0.1:8765/)
     RESULT_LIMIT        truncate tool results to this many characters before the
                         model sees them; `0`, the default, passes them whole
-    WINDBG_MCP_SCENARIO treat the task list as one continuing investigation, keeping
-                        its sessions open between tasks instead of releasing each
+    WINDBG_MCP_SCENARIO treat the task list as one continuing investigation: one
+                        transcript and one set of sessions across every task, rather
+                        than a conversation and a target apiece
 """
 import json
 import os
@@ -248,13 +249,21 @@ def call_tool(name, args):
     return text, ok, size
 
 
-def run(task, tools):
-    messages = [
+def run(task, tools, transcript=None):
+    """Work one task, and hand back the transcript it leaves behind.
+
+    A task is its own conversation unless `transcript` says otherwise: in scenario
+    mode the same one carries across tasks, so "disassemble the address you found"
+    means something. Keeping the *session* and dropping the *messages* would be a
+    continuing investigation the model cannot remember — target reuse dressed up as
+    one, which is what the flag would then be lying about.
+    """
+    messages = transcript or [
         {"role": "system", "content":
          "You are a Windows kernel debugging assistant. Use the provided tools to answer. "
          "Call one tool at a time and use its result. Be concise."},
-        {"role": "user", "content": task},
     ]
+    messages.append({"role": "user", "content": task})
     first_prompt_tokens = None
     for step in range(MAX_STEPS):
         started = time.time()
@@ -268,7 +277,7 @@ def run(task, tools):
         calls = message.get("tool_calls") or []
         if not calls:
             print(f"  [{took:>6}s] answer: {(message.get('content') or '')[:400]}")
-            return
+            return messages
         for call in calls:
             name = call["function"]["name"]
             args = call["function"].get("arguments") or {}
@@ -279,6 +288,7 @@ def run(task, tools):
             print(f"           {text[:200]}")
             messages.append({"role": "tool", "tool_name": name, "content": text})
     print(f"  gave up after {MAX_STEPS} steps")
+    return messages
 
 
 def live_sessions():
@@ -394,15 +404,17 @@ def main():
     tasks = json.load(open(sys.argv[1])) if len(sys.argv) > 1 else [
         "What debug sessions do I currently have open on this server?"
     ]
+    transcript = None
     try:
         for i, task in enumerate(tasks, 1):
             print(f"\n=== task {i}: {task[:110]}")
-            run(task, offered)
+            transcript = run(task, offered, transcript)
             # Each task is its own conversation, so it gets its own targets: a session
             # left open would be routed to by the next task's `session_id`-less call,
             # which makes that task's measurement depend on the one before it. A task
             # list meant as one continuing investigation says so with WINDBG_MCP_SCENARIO.
             if not SCENARIO:
+                transcript = None
                 release_what_this_run_opened()
     finally:
         release_what_this_run_opened()
