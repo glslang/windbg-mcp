@@ -109,6 +109,7 @@ as a sighting rather than a benchmark.
 | Prompt tokens, first turn of every task | **17,095–17,127**, by the model's own tokenizer |
 | Share of the window | ~6.5% |
 | Tool picks | 9 calls across 6 tasks, **all correct first try** |
+| Largest answer actually taken | `modules`, **53,772 characters**, passed to the model whole |
 
 Three things worth carrying:
 
@@ -125,6 +126,17 @@ Three things worth carrying:
   `crash_triage`. It identified `0xFC` on the ARM64 dump, and `0x13A` with `MessageManager` as the
   third-party driver on the other, which is what
   [`messagemanager-walkthrough.md`](./messagemanager-walkthrough.md) says it is.
+
+A fourth thing showed up when the harness stopped truncating results, and it is the one that costs
+time rather than context: the turn that *consumed* those 53,772 characters took **169s**, because
+~13k new tokens have to be evaluated before the model says anything. Prefix caching pays for the
+surface once; it does nothing for a large answer, which is charged in full the moment it arrives. On
+a local box the practical cap on `modules` and `read_memory` is patience, not the window.
+
+`read_memory` at address 0 is worth running once for a different reason: it fails, and it fails as a
+perfectly good MCP result carrying `isError` rather than as a protocol error. A harness that watches
+only for the latter records a failed call as a successful one — which this one did until review
+caught it.
 
 What this run does **not** cover: a long investigation where the transcript grows past the surface,
 anything behind the allow-list (`execute`, `debug_batch`, `launch`), a smaller box where the served
