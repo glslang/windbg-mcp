@@ -165,6 +165,15 @@ impl Credentials {
         // the operator has to go and change.
         let mut named: HashMap<&str, &str> = HashMap::new();
         for Configured { name, token, from } in configured {
+            if !is_presentable(token) {
+                bail!(
+                    "the token in {from} carries a line break, so nothing can present it: a bearer \
+                     token travels in an `Authorization` header, and a header value cannot span \
+                     lines. It is not quoted here — it is printed at startup — and it is not \
+                     repaired either, since a credential that is quietly not the one you wrote is \
+                     what this refuses."
+                );
+            }
             if let Some(existing) = by_token.get(token) {
                 // One client is one credential (the check below), so whatever configured this
                 // token is what configured that client.
@@ -324,14 +333,13 @@ impl TokenFile {
             bail!("{} is empty; that is not a token.", path.display());
         }
         if !text.starts_with('{') {
-            // **A bearer token is one line, and this is the copy-paste trap made loud.** Anything
-            // that does not begin with `{` is the bare shape, so a JSON object with a comment
-            // above it — which is what an operator copies out of a document — is read as one token
-            // that happens to span the file. It could never authenticate anyone either way: a line
-            // break cannot travel in an `Authorization` header, so nothing can present it. A
-            // listener that starts and accepts nobody is the worst answer available here, and this
-            // is the one place that can tell.
-            if text.contains(['\n', '\r']) {
+            // **The copy-paste trap, made loud.** Anything not beginning with `{` is the bare
+            // shape, so a JSON object with a comment above it — which is what an operator copies
+            // out of a document — is read as one token that happens to span the file.
+            // [`Credentials::build`] would refuse it anyway, since nothing can present a token
+            // carrying a line break; this says the more useful thing first, because here the
+            // diagnosis is available: what is wrong is the file's *shape*, not its credential.
+            if !is_presentable(text) {
                 bail!(
                     "{} is not a token: it runs over more than one line, and a bearer token cannot \
                      contain a line break — nothing could present it. If this was meant to name \
@@ -409,6 +417,20 @@ impl TokenFile {
         }
         Ok(Self { entries })
     }
+}
+
+/// Whether a token could be presented at all.
+///
+/// A bearer token travels in an `Authorization` header, and a header value cannot span lines — so a
+/// credential carrying a line break authenticates nobody, whatever else is right about it. Every
+/// source of credentials is held to this in [`Credentials::build`], because it is a fact about the
+/// transport rather than about where the token was written down: a variable can hold one as easily
+/// as a JSON string can, and the installer would copy it into the file and report success.
+///
+/// Refused rather than repaired. What the operator wrote is not what would work, and this module's
+/// whole job is that a credential is either configured or said to be absent.
+fn is_presentable(token: &str) -> bool {
+    !token.contains(['\n', '\r'])
 }
 
 /// A JSON object's entries **in the order they were written, duplicates and all**.
@@ -838,6 +860,31 @@ mod tests {
             assert!(
                 why.to_string().contains("two different tokens"),
                 "{why} (from {pairs:?})"
+            );
+        }
+    }
+
+    /// A token carrying a line break is refused wherever it was configured, because nothing could
+    /// present it: a bearer token travels in an `Authorization` header, and a header value cannot
+    /// span lines. Accepting one is a listener that starts and authenticates nobody.
+    #[test]
+    fn a_token_that_cannot_be_presented_is_refused() {
+        let secret = "s3cret\nalpha";
+        let refusals = [
+            // From the environment, which the installer would then copy into the file.
+            Credentials::from_entries(vars(&[(TOKEN_ENV, secret)]), None),
+            // And from the file, where a JSON string can carry an escaped one.
+            TokenFile::parse(r#"{"ci": "s3cret\nalpha"}"#, Path::new(FILE))
+                .and_then(|f| Credentials::from_entries(vars(&[]), Some(f))),
+        ];
+        for refusal in refusals {
+            let why = refusal
+                .expect_err("a token nothing can present is a configuration error")
+                .to_string();
+            assert!(why.contains("line break"), "{why}");
+            assert!(
+                !why.contains("s3cret"),
+                "a startup refusal wrote a bearer token into the log: {why}"
             );
         }
     }
