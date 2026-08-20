@@ -454,9 +454,14 @@ no such event, and two different mechanisms cover it:
   left — which is what keeps a client restart from costing a KDNET attach.
 - On **`2026-07-28`** — which is what most clients now negotiate — there is no session id, so no
   lease is ever armed. What reclaims a target there is the per-session **idle release**: 30 minutes
-  since the last call naming that session. It is deliberately not the lease: a stateless client is
-  legitimately silent for a long time (a model thinking between calls), and releasing a live kernel
-  from under someone who is merely thinking is worse than holding an abandoned one for half an hour.
+  since the last call that *reached that session's engine*. It is deliberately not the lease: a
+  stateless client is legitimately silent for a long time (a model thinking between calls), and
+  releasing a live kernel from under someone who is merely thinking is worse than holding an
+  abandoned one for half an hour.
+  - **Polling does not count as using it.** `session_status` and `server_log` name a session but are
+    answered by the supervisor and never routed to its worker — which is what keeps them working
+    while that session is wedged — so neither touches the idle clock. A loop that watches a session
+    without asking it anything will watch it be released.
 
 That second mechanism **spares a session with a call still outstanding**, and a parked
 `attach_kernel` is exactly that — so a kernel attach whose target never dialled in is held until
