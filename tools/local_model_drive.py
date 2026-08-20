@@ -24,6 +24,8 @@ Configuration, all optional:
                         does not identify one on its own
     RESULT_LIMIT        truncate tool results to this many characters before the
                         model sees them; `0`, the default, passes them whole
+    WINDBG_MCP_SCENARIO treat the task list as one continuing investigation, keeping
+                        its sessions open between tasks instead of releasing each
 """
 import json
 import os
@@ -128,6 +130,10 @@ def bearer():
 
 
 AUTH = bearer()
+# Whether this run has a credential of its own, rather than borrowing the editor's.
+# It decides whether openers may run at all — see `call_tool`.
+DEDICATED = bool(os.environ.get("WINDBG_MCP_TOKEN"))
+SCENARIO = bool(os.environ.get("WINDBG_MCP_SCENARIO"))
 SESSION = None
 
 
@@ -222,6 +228,17 @@ def call_tool(name, args):
     """Run one tool call. Returns (text for the model, ok, full size in characters)."""
     if name not in ALLOWED:
         return f"refused: `{name}` is not permitted in this harness", None, 0
+    if name in OPENERS and not DEDICATED:
+        # **Opening on a borrowed credential can cost the lender a session**, and no
+        # fence in this script can stop it: a client over `MAX_SESSIONS` has its
+        # oldest *idle* session reclaimed by the server, so the target this run opens
+        # can evict the editor's — without any tool call naming it. The only fix is
+        # not to share the namespace.
+        return ("refused: opening a session needs a credential of this run's own. Set "
+                "WINDBG_MCP_TOKEN to a token configured for a client of its own "
+                "(WINDBG_MCP_LISTEN_TOKEN_DRIVER on a foreground listener); borrowing the "
+                "editor's would put this run in the editor's namespace, where opening can "
+                "reclaim its idle sessions."), None, 0
     if name == "end_session":
         wanted = args.get("session_id")
         if not wanted:
@@ -338,6 +355,9 @@ def main():
     offered = as_ollama(tools)
     surface = len(json.dumps(offered, separators=(",", ":")))
     print(f"tools offered: {len(tools)} ({surface} B of minified JSON)")
+    whose = "its own" if DEDICATED else "borrowed from the editor — openers refused"
+    mode = " (scenario: sessions kept between tasks)" if SCENARIO else ""
+    print(f"credential: {whose}{mode}")
     tasks = json.load(open(sys.argv[1])) if len(sys.argv) > 1 else [
         "What debug sessions do I currently have open on this server?"
     ]
@@ -345,6 +365,12 @@ def main():
         for i, task in enumerate(tasks, 1):
             print(f"\n=== task {i}: {task[:110]}")
             run(task, offered)
+            # Each task is its own conversation, so it gets its own targets: a session
+            # left open would be routed to by the next task's `session_id`-less call,
+            # which makes that task's measurement depend on the one before it. A task
+            # list meant as one continuing investigation says so with WINDBG_MCP_SCENARIO.
+            if not SCENARIO:
+                release_what_this_run_opened()
     finally:
         release_what_this_run_opened()
         close_transport_session()
