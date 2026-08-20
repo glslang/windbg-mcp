@@ -142,8 +142,12 @@ impl Credentials {
         file: Option<TokenFile>,
     ) -> Result<Self> {
         match file {
+            // The environment is not read at all when a file is configured — not even to complain
+            // about it, which is the precedence stated as code: a host with a file is a host whose
+            // environment is not trusted, so a variable there cannot stop this server starting any
+            // more than it can authenticate to it.
             Some(file) => Self::build(&file.entries),
-            None => Self::build(&from_env(vars)),
+            None => Self::build(&from_env(vars)?),
         }
     }
 
@@ -178,9 +182,10 @@ impl Credentials {
             // insidious half: nothing looks wrong, both callers authenticate, and they silently
             // share a namespace — routing, listing, capacity, teardown rights, the lot. Names are
             // folded before comparison, so `WINDBG_MCP_LISTEN_TOKEN` and `…_TOKEN_LOCAL` collide
-            // (both `local`), as do `…_CI` and `…__CI`, and so do two spellings of one key in the
-            // token file. A boundary two credentials can stand on is not a boundary, so this is a
-            // configuration error rather than a merge.
+            // (both `local`), as do `…_CI` and `…__CI`. (Two spellings of one *key* never reach
+            // here: `TokenFile::parse` refuses a repeated name against the file itself, which can
+            // say which file and which name.) A boundary two credentials can stand on is not a
+            // boundary, so this is a configuration error rather than a merge.
             if let Some(other) = named.get(name.as_str()) {
                 bail!(
                     "two different tokens are configured for the client `{name}` ({other} and \
@@ -212,7 +217,7 @@ struct Configured {
 ///
 /// Validation is [`Credentials::build`]'s, so that the listener and [`env_credentials`] hold a
 /// configuration to exactly one standard.
-fn from_env(vars: impl Iterator<Item = (String, String)>) -> Vec<Configured> {
+fn from_env(vars: impl Iterator<Item = (String, String)>) -> Result<Vec<Configured>> {
     let mut configured = Vec::new();
     for (key, value) in vars {
         let token = value.trim().to_string();
@@ -228,8 +233,19 @@ fn from_env(vars: impl Iterator<Item = (String, String)>) -> Vec<Configured> {
             Some(suffix) => suffix.trim_start_matches('_').to_ascii_lowercase(),
             None => continue,
         };
-        if name.is_empty() {
-            continue;
+        // **Held to the same rule as a key in the file**, rather than skipped as it used to be.
+        // Skipping is the shape this module refuses everywhere else: a credential the operator
+        // configured, silently not configured, and a client that cannot authenticate for a reason
+        // nothing says out loud. It also has to be *this* rule and not a laxer one, because
+        // `env_credentials` writes these names into the token file — a name only the environment
+        // would take is an install that succeeds and a service that then fails at every start.
+        if !is_client_name(&name) {
+            bail!(
+                "`{key}` does not name a client. What follows `{TOKEN_ENV}_` is the name, and a \
+                 name is letters, digits, `-`, `_` or `.`, up to {NAME_LIMIT} characters — \
+                 `{TOKEN_ENV}_CI` names `ci`. The token it carries is not quoted here and is not \
+                 the problem."
+            );
         }
         configured.push(Configured {
             from: format!("`{key}`"),
@@ -237,7 +253,7 @@ fn from_env(vars: impl Iterator<Item = (String, String)>) -> Vec<Configured> {
             token,
         });
     }
-    configured
+    Ok(configured)
 }
 
 /// What this process's environment configures, as `(client, token)` pairs.
@@ -249,7 +265,7 @@ fn from_env(vars: impl Iterator<Item = (String, String)>) -> Vec<Configured> {
 pub fn env_credentials(
     vars: impl Iterator<Item = (String, String)>,
 ) -> Result<Vec<(String, String)>> {
-    let configured = from_env(vars);
+    let configured = from_env(vars)?;
     Credentials::build(&configured)?;
     Ok(configured.into_iter().map(|c| (c.name, c.token)).collect())
 }
@@ -316,16 +332,15 @@ impl TokenFile {
                 }],
             });
         }
-        let object: serde_json::Map<String, serde_json::Value> = serde_json::from_str(text)
-            .map_err(|e| {
-                anyhow!(
-                    "{} begins with `{{`, so it is read as a JSON object of client name to token — \
-                     and it is not valid JSON ({e}). A file holding one token is still a token \
-                     file; it just may not start with `{{`.",
-                    path.display()
-                )
-            })?;
-        let mut entries = Vec::new();
+        let Entries(object) = serde_json::from_str(text).map_err(|e| {
+            anyhow!(
+                "{} begins with `{{`, so it is read as a JSON object of client name to token — and \
+                 it is not valid JSON ({e}). A file holding one token is still a token file; it \
+                 just may not start with `{{`.",
+                path.display()
+            )
+        })?;
+        let mut entries: Vec<Configured> = Vec::new();
         for (key, value) in object {
             let name = key.trim().to_ascii_lowercase();
             if !is_client_name(&name) {
@@ -351,6 +366,18 @@ impl TokenFile {
                     path.display()
                 );
             }
+            // **A repeated key is refused, not resolved**, which is why [`Entries`] keeps every
+            // pair a `serde_json::Map` would have collapsed. Which of two entries wins is a
+            // parser's business, not a boundary's: the operator sees both tokens written down and
+            // one of them silently authenticates nobody.
+            if entries.iter().any(|e| e.name == name) {
+                bail!(
+                    "`{name}` appears more than once in {}. Give each client one entry: which of \
+                     the two would be accepted is whichever the parser kept, so the other is a \
+                     credential you can read in the file and nobody can present.",
+                    path.display()
+                );
+            }
             entries.push(Configured {
                 from: format!("`{name}` in {}", path.display()),
                 name,
@@ -368,11 +395,53 @@ impl TokenFile {
     }
 }
 
+/// A JSON object's entries **in the order they were written, duplicates and all**.
+///
+/// `serde_json::Map` is the obvious target and the wrong one: it keeps the last of two entries
+/// under one key and says nothing, so a file naming `ci` twice would configure one client, and the
+/// token that lost is one the operator can read in the file and no client can present. Collecting
+/// the pairs is what lets [`TokenFile::parse`] refuse that.
+///
+/// It quotes nothing either: keys arrive as `String` and values as `serde_json::Value`, so no
+/// serde type error can be raised about a value here — the check that a value is a string is
+/// [`TokenFile::parse`]'s, which names the key instead.
+struct Entries(Vec<(String, serde_json::Value)>);
+
+impl<'de> serde::Deserialize<'de> for Entries {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EveryPair;
+        impl<'de> serde::de::Visitor<'de> for EveryPair {
+            type Value = Entries;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object of client name to token")
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<Entries, M::Error> {
+                let mut pairs = Vec::new();
+                while let Some(pair) = map.next_entry::<String, serde_json::Value>()? {
+                    pairs.push(pair);
+                }
+                Ok(Entries(pairs))
+            }
+        }
+        deserializer.deserialize_map(EveryPair)
+    }
+}
+
 /// Whether this is a client name rather than something else that got put where one belongs.
 ///
 /// The charset is what makes a name safe to *render*: no line breaks, so nothing configured here
 /// can inject a line into the service log, and no `"`, `{` or `=`, so a connection string or a
 /// token carrying one cannot pass for a name. The same rule a kernel profile's name follows.
+///
+/// **One rule, wherever the credential was configured** — a key in the token file and the suffix of
+/// a variable are both held to it. The asymmetry that is not there any more is what review found
+/// first: an install copies the environment's names *into* the file, so a name only the environment
+/// would take is an install that succeeds and a service that then fails at every start.
 ///
 /// **What it cannot do is tell a token from a name**, because a name-shaped token is a name: a file
 /// written back to front — `{"<token>": "ci"}` — configures a client called after your token, and
@@ -700,8 +769,13 @@ mod tests {
                 r#"{"net:port=50000,key=1.2.3.4": "ci"}"#,
                 "not a client name",
             ),
-            // Two spellings of one name are two tokens for one client, the same as the environment.
-            (r#"{"ci": "one", "CI ": "two"}"#, "two different tokens"),
+            // One name written twice, which a `serde_json::Map` would have collapsed to the last
+            // of them — leaving a token written in the file that authenticates nobody.
+            (r#"{"ci": "one", "ci": "two"}"#, "appears more than once"),
+            (r#"{"ci": "one", "ci": "one"}"#, "appears more than once"),
+            // Two *spellings* of one name are the same thing, since names are folded before they
+            // are compared — which is what makes this a name collision rather than two clients.
+            (r#"{"ci": "one", "CI ": "two"}"#, "appears more than once"),
             // And one token under two names is the other half of it.
             (
                 r#"{"ci": "same", "laptop": "same"}"#,
@@ -743,6 +817,44 @@ mod tests {
                 "{why} (from {pairs:?})"
             );
         }
+    }
+
+    /// A variable whose suffix is not a client name is refused, and the refusal names the variable
+    /// rather than what it carries.
+    ///
+    /// It used to be skipped, which is the failure this module refuses everywhere else: a
+    /// credential the operator configured, silently not configured. And it has to be the *same*
+    /// rule the file is held to, because `env_credentials` copies these names into the file — a
+    /// name only the environment would take is an install that reports success and a service that
+    /// fails at every start, which is precisely what validating at install time is for.
+    #[test]
+    fn a_variable_that_does_not_name_a_client_is_refused() {
+        let secret = "s3cret-alpha";
+        for key in [
+            "WINDBG_MCP_LISTEN_TOKEN_MY CLIENT",
+            "WINDBG_MCP_LISTEN_TOKEN_ci=laptop",
+            &format!("WINDBG_MCP_LISTEN_TOKEN_{}", "x".repeat(NAME_LIMIT + 1)),
+            // The prefix with nothing after it but a separator: a typo, not the unnamed variable.
+            "WINDBG_MCP_LISTEN_TOKEN_",
+        ] {
+            let why = Credentials::from_entries(vars(&[(key, secret)]), None)
+                .expect_err(&format!("`{key}` does not name a client"))
+                .to_string();
+            assert!(why.contains("does not name a client"), "{key}: {why}");
+            assert!(
+                !why.contains(secret),
+                "a startup refusal wrote a bearer token into the log: {why}"
+            );
+        }
+        // And the same variable is *ignored* when a file is configured, rather than refusing the
+        // start: a file shuts the environment out entirely, so nothing there can stop this server
+        // any more than it can authenticate to it.
+        let creds = Credentials::from_entries(
+            vars(&[("WINDBG_MCP_LISTEN_TOKEN_MY CLIENT", secret)]),
+            Some(file("from-the-file")),
+        )
+        .expect("a file is read instead of the environment, not beside it");
+        assert_eq!(creds.names(), vec!["local"]);
     }
 
     /// An empty value is not a token — it is a variable somebody exported and never set.
