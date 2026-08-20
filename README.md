@@ -238,7 +238,9 @@ one listener cannot reach each other's targets — the session lease and its gra
 a `409` means: this credential's own expired sessions are still being released, so ask again in a
 moment. Nothing else is refused for contention — a credential may hold several MCP sessions, and
 requests of one client never wait on another's. For a one-off, [`docs/remote-phase0.md`](./docs/remote-phase0.md) does the same
-job over plain `ssh` with no listener.
+job over plain `ssh` with no listener; for driving it from a **local model** rather than a hosted
+one, [`docs/local-model.md`](./docs/local-model.md) is the runbook and the numbers that decide
+whether it fits.
 
 ### As a Claude Code plugin
 

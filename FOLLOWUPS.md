@@ -762,6 +762,12 @@ landed on their own so that each of the items below can be argued, and measured,
   `MAX_NODES`, `MAX_READ_BYTES`) is justified in its own comment as a worker out-of-memory guard.
   A caller-context guard is a different constraint and does not exist yet.
 
+**Where this bites first is a local model**, whose window is bought in RAM rather than rented:
+[`docs/local-model.md`](./docs/local-model.md) is the runbook, and it names the three client-side
+knobs the split-plane plan proposed — a tool-surface profile, a per-call response budget, a
+text-or-data switch — none of which this server has. The two bullets above are the server-side half
+of the same problem.
+
 **Depends on nothing**, but it **collides with item 11**, which proposes adding `structuredContent`
 to `ttd_calls`, `ttd_memory` and `driver_object` — three of the highest-volume text-only tools.
 Under the client rule measured here, structured content *replaces* the text rather than
