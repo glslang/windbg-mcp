@@ -27,7 +27,6 @@ Configuration, all optional:
 """
 import json
 import os
-import re
 import sys
 import time
 import urllib.request
@@ -65,14 +64,27 @@ MAX_STEPS = 6
 # ones it ends on the way out, so a run does not leave a worker holding a target for
 # the lease grace and the next run does not adopt it.
 OPENED = []
-SESSION_ID = re.compile(r"sess-[0-9a-f]+-\d+")
 
 # The tools that can *create* a session, and so the only ones whose answers name a
-# handle this run is responsible for. Scanning every successful answer instead would
-# be worse than not tracking at all: `session_status` lists the whole client's
-# sessions and `server_log` names them too, so on a shared credential the cleanup
-# would end the editor's targets — the exact harm the fence above exists to prevent.
+# handle this run is responsible for.
 OPENERS = {"open_dump", "open_trace"}
+
+
+def opened_session(result):
+    """The handle an opener created, from the answer's own field — never from its prose.
+
+    `structuredContent.session_id` on success, `structuredContent.error.session_id`
+    on a failure, which is where an opener that created a target and *then* failed
+    reports the only handle that can reach it.
+
+    Reading the text instead is wrong twice over, and both ways end with this run
+    terminating sessions it does not own: `session_status` and `server_log` name the
+    whole client's sessions, and an opener refused at the four-session cap lists every
+    live handle in its own error message (`Sessions::take_slot`). The structured field
+    is the server's answer to "which session is this about"; the prose is not.
+    """
+    structured = result.get("structuredContent") or {}
+    return structured.get("session_id") or (structured.get("error") or {}).get("session_id")
 # Results reach the model **whole** by default. Truncating them would quietly defeat
 # one of the things this harness exists to measure — whether a single answer fits a
 # local model's window — and would have it reason from JSON cut off mid-structure
@@ -232,12 +244,12 @@ def call_tool(name, args):
     size = len(text)
     if name in OPENERS:
         # **Whatever the call reported.** An opener can register a session and then
-        # fail — a dump that opens and a later step that does not — and the handle is
-        # named in the answer either way. Tracking only the successes would leave that
+        # fail — a dump that opens and a later step that does not — and the answer
+        # carries the handle either way. Tracking only the successes would leave that
         # worker holding its target until the lease grace ran out.
-        for found in SESSION_ID.findall(text):
-            if found not in OPENED:
-                OPENED.append(found)
+        found = opened_session(result)
+        if found and found not in OPENED:
+            OPENED.append(found)
     elif name == "end_session" and ok:
         OPENED[:] = [s for s in OPENED if s != args.get("session_id")]
     if RESULT_LIMIT and size > RESULT_LIMIT:
@@ -278,6 +290,28 @@ def run(task, tools):
     print(f"  gave up after {MAX_STEPS} steps")
 
 
+def close_transport_session():
+    """Say goodbye to the MCP session as well as to the debug sessions.
+
+    The revision this speaks mints an `Mcp-Session-Id`, and a run that simply stops
+    leaves it resident in the server until a whole grace passes with no traffic at
+    all — so repeated runs on one credential pile them up, each new request renewing
+    the lease that would have swept them. A `DELETE` is what the protocol provides.
+    """
+    global SESSION
+    if not SESSION:
+        return
+    req = urllib.request.Request(MCP_URL, method="DELETE")
+    req.add_header("Authorization", AUTH)
+    req.add_header("Mcp-Session-Id", SESSION)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as response:
+            print(f"  closed the MCP session ({response.status})")
+    except Exception as e:
+        print(f"  could not close the MCP session: {e}")
+    SESSION = None
+
+
 def release_what_this_run_opened():
     """End the run's own sessions, so the next one starts from nothing.
 
@@ -313,6 +347,7 @@ def main():
             run(task, offered)
     finally:
         release_what_this_run_opened()
+        close_transport_session()
 
 
 if __name__ == "__main__":
