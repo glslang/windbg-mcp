@@ -416,12 +416,14 @@ host's* problem, and the setup question that changes when the client is elsewher
 gets there.
 
 ```console
-# on the debugger host, with WINDBG_MCP_LISTEN_TOKEN already set
+# on the debugger host, with WINDBG_MCP_LISTEN_TOKEN set to a long random string
 windbg-mcp.exe --listen 127.0.0.1:8765
-# on the client machine
+# on the client machine — the same string, spelled out: the variable is set on the
+# debugger host, and a shell that does not have it expands it to nothing, which is
+# an `Authorization: Bearer ` header and a `401` on every call
 ssh -N -L 8765:127.0.0.1:8765 <debugger-host>
 claude mcp add windbg-vm --transport http http://127.0.0.1:8765/ \
-  --header "Authorization: Bearer $WINDBG_MCP_LISTEN_TOKEN"
+  --header "Authorization: Bearer <the same string>"
 ```
 
 Four things decide whether that works, and each fails in a way that reads as something else:
@@ -441,12 +443,29 @@ Four things decide whether that works, and each fails in a way that reads as som
   Note `LocalSystem` does not read *your* `%USERPROFILE%`, so kernel profiles have to be configured
   machine-wide for a service to see them.
 
-Two behaviours differ from stdio and are worth knowing before they surprise you. A client that
-disconnects does not immediately release its targets: a **lease** does that after a grace period,
-so a client restart inside the grace comes back to the sessions it left — which is what keeps a
-client restart from costing a KDNET attach. And every client authenticates as itself: two tokens
-are two namespaces, so a session opened under one is *unknown* to the other rather than refused.
-If a handle has "vanished", check which token the request carried.
+Two behaviours differ from stdio and are worth knowing before they surprise you.
+
+**A disconnect is not a teardown, and what reclaims an abandoned target depends on the revision the
+client negotiated.** Under stdio, closing the connection releases every session. Over HTTP there is
+no such event, and two different mechanisms cover it:
+
+- A client whose revision still mints an `Mcp-Session-Id` holds a **lease**: silence past the grace
+  releases everything that credential has open, and coming back *inside* the grace adopts what it
+  left — which is what keeps a client restart from costing a KDNET attach.
+- On **`2026-07-28`** — which is what most clients now negotiate — there is no session id, so no
+  lease is ever armed. What reclaims a target there is the per-session **idle release**: 30 minutes
+  since the last call naming that session. It is deliberately not the lease: a stateless client is
+  legitimately silent for a long time (a model thinking between calls), and releasing a live kernel
+  from under someone who is merely thinking is worse than holding an abandoned one for half an hour.
+
+That second mechanism **spares a session with a call still outstanding**, and a parked
+`attach_kernel` is exactly that — so a kernel attach whose target never dialled in is held until
+somebody ends it, not until a timer notices. `session_status` says how long it has been waiting;
+`end_session` reclaims it and terminates the worker.
+
+**Every client authenticates as itself.** Two tokens are two namespaces, so a session opened under
+one is *unknown* to the other rather than refused. If a handle has "vanished", check which token the
+request carried.
 
 `docs/remote-listener.md` in the repository is the operator's reference for the rest — the grace
 and how to change it, what a `409` means, and running behind a service.
