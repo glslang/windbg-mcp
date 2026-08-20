@@ -85,10 +85,15 @@ counting the handles an *opener* returned rather than every handle it has seen, 
 whatever the credential already had when it started — a predecessor that died before its cleanup, or
 a run going on beside it. What it opened, it releases on the way out.
 
-**Each task gets its own targets.** A task list is a list of separate conversations, so sessions are
-released after each one; otherwise a later task's `session_id`-less call routes to an earlier task's
-target and its measurement depends on the prompts before it. A list meant as one continuing
-investigation says so with `WINDBG_MCP_SCENARIO=1`.
+**Each task gets its own conversation and its own targets.** A task list is a list of separate
+questions, so the transcript is fresh and the sessions are released after each one; otherwise a later
+task's `session_id`-less call routes to an earlier task's target, and its measurement depends on the
+prompts before it.
+
+`WINDBG_MCP_SCENARIO=1` says the list is one continuing investigation instead — **one transcript and
+one set of sessions across every task**, so "disassemble the address you just found" means something.
+It is also how you would measure the case the run below does not cover: the prompt-token count
+printed for each task is the transcript growing, and scenario mode is what makes it grow.
 
 **A different arrangement, not a prerequisite:** `ollama launch claude --model <tag>` (ollama 0.32.12
 or newer) makes the local model *the agent* — it drives the harness itself, with these tools as its
