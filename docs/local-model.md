@@ -16,8 +16,8 @@ in the environment rather than on a command line:
 setx WINDBG_MCP_LISTEN_TOKEN "<a long random string>"
 ```
 
-**2 — the link.** One ssh channel that both forwards the port and runs the listener, so the server
-lives exactly as long as the tunnel and nothing is left behind:
+**2 — the link.** For a session you are driving anyway, one ssh channel both forwards the port and
+runs the listener, so the server lives exactly as long as the tunnel and nothing is left behind:
 
 ```console
 ssh -L 8765:127.0.0.1:8765 <vm> 'windbg-mcp.exe --listen 127.0.0.1:8765'
@@ -27,6 +27,12 @@ Starting it through `ssh` and letting that command *finish* does not work, and t
 like a healthy start — see [Do not start it through ssh and then hang
 up](./remote-listener.md#do-not-start-it-through-ssh-and-then-hang-up).
 
+**For anything less throwaway, install it as a service** (`--install-service --listen 127.0.0.1:8765`,
+elevated) and the listener survives a logout, a reboot and a dropped tunnel — the forward is then the
+only thing you restart. That is the whole reason the service role exists; see [Run it as a Windows
+service](./remote-listener.md#run-it-as-a-windows-service), which also covers why the token moves to
+an ACL'd file rather than the machine environment.
+
 **3 — the control plane.** Register the server once, against the forwarded port:
 
 ```console
@@ -34,15 +40,25 @@ claude mcp add windbg-vm --scope local --transport http http://127.0.0.1:8765/ \
   --header "Authorization: Bearer <the same string>"
 ```
 
-Then start the client against a local model. With [ollama](https://ollama.com) 0.32.12 or newer:
+Then point a local model at it, either way round:
 
-```console
-ollama launch claude --model <model-tag>
-```
+- **An interactive harness.** With [ollama](https://ollama.com) 0.32.12 or newer, `ollama launch
+  claude --model <model-tag>` wires a local model into Claude Code (`ollama launch --help` lists the
+  integrations it knows). The MCP registration above is unaffected by which model is driving.
+- **The ollama server API, with no harness at all** — which is what makes the question repeatable.
+  [`tools/local_model_drive.py`](../tools/local_model_drive.py) speaks MCP over HTTP to the listener,
+  hands the whole tool surface to `POST /api/chat`, executes the tool calls that come back and feeds
+  the results in. It reads the bearer token from the client's own registration, so nothing has to be
+  pasted on a command line:
 
-`ollama launch` wires a local model into a coding harness — `ollama launch --help` lists the
-integrations it knows, of which `claude` is Claude Code. The MCP registration above is unaffected by
-which model is driving: the client is the same client.
+  ```console
+  python3 tools/local_model_drive.py [tasks.json]     # tasks.json: a JSON list of prompts
+  ```
+
+  It executes only a **read-only allow-list**, and reports anything else back to the model as
+  refused. That is deliberate: the surface includes `execute` and `launch`, and a debug host is the
+  wrong place to discover unattended what a model does with them — but a wrong pick is still
+  *measured*, which is the point.
 
 ## What this server costs a model, measured
 
@@ -81,10 +97,44 @@ Worked example, measured on the bench this page was written on: `ollama show` re
 17k-token surface is about 6.5% of the window. That is a fact about that machine's memory, not about
 the model: the same tag on a smaller box is served at 4k or 32k by the same default.
 
+## What one run showed
+
+Measured 20 August 2026 with `tools/local_model_drive.py`, against a 27.8B nvfp4 build served at
+262,144 (see above), on the two checked-in kernel dumps. One model, one bench, six tasks — read it
+as a sighting rather than a benchmark.
+
+| | |
+| --- | --- |
+| Tools offered | 51 (68,970 B in ollama's function shape; the same surface `token-budget.md` measures at 67,076 B as MCP reports it) |
+| Prompt tokens, first turn of every task | **17,095–17,127**, by the model's own tokenizer |
+| Share of the window | ~6.5% |
+| Tool picks | 9 calls across 6 tasks, **all correct first try** |
+
+Three things worth carrying:
+
+- **The ≈4 B/token rule of thumb held.** 67,076 B predicted ~16.8k; the tokenizer said ~17.1k. The
+  golden's bytes are a usable proxy for what a model is charged.
+- **The surface costs context every turn but compute only once.** The first turn after a cold load
+  took 86.5s, nearly all of it evaluating those 17k tokens; every later turn started in 0.6–4.7s,
+  because the runtime caches the prefix. A surface that fits is therefore paid for once per model
+  load, not once per question.
+- **Selection was not the problem it was predicted to be.** The plan's section 07 expected a
+  30B-class model to struggle with a surface this size; this one picked `open_dump` with the right
+  path, `modules` and then *refined its own call* with a `filter`, `decode_ioctl`, and
+  `session_status` — and answered the bug check off the opener's summary without needing
+  `crash_triage`. It identified `0xFC` on the ARM64 dump, and `0x13A` with `MessageManager` as the
+  third-party driver on the other, which is what
+  [`messagemanager-walkthrough.md`](./messagemanager-walkthrough.md) says it is.
+
+What this run does **not** cover: a long investigation where the transcript grows past the surface,
+anything behind the allow-list (`execute`, `debug_batch`, `launch`), a smaller box where the served
+context is 4k or 32k, and any model but this one.
+
 ## What to measure
 
 The claims worth testing are about the *client's* budget, not this server's correctness, and the
-smoke tiers cannot reach them:
+smoke tiers cannot reach them — which is why the driver script exists and why the run above is
+written down rather than remembered:
 
 - **Does the surface fit**, at the context the runtime is actually serving.
 - **Does the model pick the right tool out of 51**, which is orthogonal to window size and is the
