@@ -66,6 +66,13 @@ MAX_STEPS = 6
 # the lease grace and the next run does not adopt it.
 OPENED = []
 SESSION_ID = re.compile(r"sess-[0-9a-f]+-\d+")
+
+# The tools that can *create* a session, and so the only ones whose answers name a
+# handle this run is responsible for. Scanning every successful answer instead would
+# be worse than not tracking at all: `session_status` lists the whole client's
+# sessions and `server_log` names them too, so on a shared credential the cleanup
+# would end the editor's targets — the exact harm the fence above exists to prevent.
+OPENERS = {"open_dump", "open_trace"}
 # Results reach the model **whole** by default. Truncating them would quietly defeat
 # one of the things this harness exists to measure — whether a single answer fits a
 # local model's window — and would have it reason from JSON cut off mid-structure
@@ -223,15 +230,16 @@ def call_tool(name, args):
     ok = "error" not in out and not result.get("isError")
     text = json.dumps(result if result else out)
     size = len(text)
-    if ok:
-        # Whatever this call opened is now this run's to clean up. Read out of the
-        # answer rather than tracked per tool, because every opener names its handle
-        # and none of them names it the same way twice.
+    if name in OPENERS:
+        # **Whatever the call reported.** An opener can register a session and then
+        # fail — a dump that opens and a later step that does not — and the handle is
+        # named in the answer either way. Tracking only the successes would leave that
+        # worker holding its target until the lease grace ran out.
         for found in SESSION_ID.findall(text):
-            if name != "end_session" and found not in OPENED:
+            if found not in OPENED:
                 OPENED.append(found)
-        if name == "end_session":
-            OPENED[:] = [s for s in OPENED if s != args.get("session_id")]
+    elif name == "end_session" and ok:
+        OPENED[:] = [s for s in OPENED if s != args.get("session_id")]
     if RESULT_LIMIT and size > RESULT_LIMIT:
         text = text[:RESULT_LIMIT] + f"\n[truncated by the harness: {size} characters in full]"
     return text, ok, size
