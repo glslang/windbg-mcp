@@ -107,6 +107,26 @@ const DRIVER_CRASH_DUMP: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/docs/samples/081226-2187-01.dmp"
 );
+/// The **ARM64** driver crash, and the counterpart to [`DRIVER_CRASH_DUMP`]: a
+/// `0x139 KERNEL_SECURITY_CHECK_FAILURE` raised by HEVD's own `__report_gsfailure` after an
+/// `IRP_MJ_DEVICE_CONTROL` overran the `/GS`-protected stack buffer behind
+/// `HEVD_IOCTL_BUFFER_OVERFLOW_STACK_GS`.
+///
+/// It exists because the attribution arithmetic - a captured frame turned into `module+RVA` off
+/// the load base - had never run against an **ARM64** stack
+/// ([#154](https://github.com/glslang/windbg-mcp/issues/154)). The ARM64 sample that was already
+/// here is a `0xFC` fault at a *user-mode* payload and carries no driver frame at all, which is
+/// the opposite shape.
+///
+/// A fail fast is what makes it capturable: HEVD wraps its triggers in `__try/__except`, so its
+/// null dereference, its non-paged pool overflow and its UAF double free all return a status and
+/// leave the machine running. `brk #0xf003` cannot be caught, so the bug check is raised inside
+/// the driver. `docs/smoke-test.md` has the recipe.
+const ARM64_DRIVER_CRASH_DUMP: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/docs/samples/082126-7015-01.dmp"
+);
+
 /// An **ARM64** kernel dump — `0xFC ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY`, a user-mode process
 /// jumping into memory that is not executable — so that an ARM64 run reads an ARM64 `_EPROCESS`,
 /// an ARM64 image's headers and an ARM64 stack's frames. Nothing else in this suite does
@@ -116,6 +136,82 @@ const ARM64_SAMPLE_DUMP: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/docs/samples/121524-4703-01.dmp"
 );
+
+/// A checked-in **driver** crash and the facts about it that
+/// [`a_driver_crash_names_the_driver_frame_an_all_kernel_walk_would_miss`] asserts, so one test
+/// body covers both architectures' stacks rather than naming one file.
+struct DriverCrashSample {
+    path: &'static str,
+    /// What this host has to be able to do before the fixture is opened at all: an ARM64 crash on
+    /// an x64 host and the reverse both read fine *with symbols*, so this is a label for the skip
+    /// rather than a gate on the architecture.
+    what: &'static str,
+    /// `bug_check.code`: lowercase, unpadded.
+    bug_check: &'static str,
+    bug_check_name: &'static str,
+    /// The third-party driver the crash belongs to, and the offset into it the faulting frame is
+    /// expected at. The RVA is a literal on purpose rather than out of brittleness: it is a fixed
+    /// offset into a fixed image, reproducible across every reboot and load base - five x64 dumps
+    /// from the same loop reported `0x1654` at five different addresses - so a change in it means
+    /// the attribution arithmetic moved.
+    module: &'static str,
+    rva: &'static str,
+    /// A symbolised `nt` frame the same walk has to carry, which is what makes the point that one
+    /// stack holds both kinds of frame - the mix every real driver crash has.
+    kernel_frame: &'static str,
+    /// Whether `!analyze` names [`Self::module`] itself.
+    ///
+    /// The two fixtures disagree, and the disagreement is the coverage. `MessageManager` has **no
+    /// PDB**, so `!analyze` calls the crash `Unknown_Module` and the computed frame is the only
+    /// thing that names the driver - which is why the frame is computed rather than taken from the
+    /// analysis. `HEVD` ships a PDB, so `!analyze` does name it, and the computed frame is checked
+    /// against an independent answer instead.
+    analyze_names_the_module: bool,
+    /// Whether `!analyze` reports a freed-pool tag, which only a few bug checks produce.
+    carries_a_pool_tag: bool,
+    /// Whether the crashing process's name is longer than the 15 bytes
+    /// `_EPROCESS::ImageFileName` holds, so the audit name is the only way to report it whole.
+    /// True for `mm_exploit_v5.exe`, which is what caught that field silently truncating it;
+    /// `powershell.exe` fits, so the ARM64 fixture says nothing about that path.
+    process_name_needs_the_audit_name: bool,
+}
+
+/// Every driver crash checked in, asserted on **every** host rather than paired by architecture.
+///
+/// Pairing is what the other fixtures do, and it would be wrong here. An engine that resolves
+/// symbols reads either dump either way round (measured after
+/// [#142](https://github.com/glslang/windbg-mcp/issues/142) turned out to be about symbols rather
+/// than architecture), and pairing would mean an ARM64 runner stopped reading the x64 crash it
+/// reads today - trading one architecture's coverage for the other's instead of adding it.
+const DRIVER_CRASHES: &[DriverCrashSample] = &[
+    DriverCrashSample {
+        path: DRIVER_CRASH_DUMP,
+        what: "the x64 MessageManager crash",
+        bug_check: "0x13a",
+        bug_check_name: "KERNEL_MODE_HEAP_CORRUPTION",
+        module: "MessageManager",
+        rva: "0x1654",
+        kernel_frame: "nt!ExFreePoolWithTag",
+        analyze_names_the_module: false,
+        carries_a_pool_tag: true,
+        process_name_needs_the_audit_name: true,
+    },
+    DriverCrashSample {
+        path: ARM64_DRIVER_CRASH_DUMP,
+        what: "the ARM64 HEVD crash",
+        bug_check: "0x139",
+        bug_check_name: "KERNEL_SECURITY_CHECK_FAILURE",
+        module: "HEVD",
+        // `mov w0, #2; brk #0xf003` - the ARM64 spelling of
+        // `__fastfail(FAST_FAIL_STACK_COOKIE_CHECK_FAILURE)`, inside the driver's own
+        // `__report_gsfailure`.
+        rva: "0x10dc",
+        kernel_frame: "nt!KeBugCheckEx",
+        analyze_names_the_module: true,
+        carries_a_pool_tag: false,
+        process_name_needs_the_audit_name: false,
+    },
+];
 
 /// A checked-in kernel dump and the facts about *that crash* a test asserts, so one test body can
 /// be pointed at either real crash rather than naming one file.
@@ -142,8 +238,8 @@ impl KernelSample {
 /// The sample matching this host's architecture, which every test that reads a target opens.
 ///
 /// The pairing is a choice about coverage, not a workaround: an engine with symbols reads either
-/// dump either way round, which is why [`DRIVER_CRASH_DUMP`] stays x64 everywhere. See
-/// `docs/smoke-test.md`.
+/// dump either way round, which is why the driver crashes in [`DRIVER_CRASHES`] are all opened on
+/// every host instead. See `docs/smoke-test.md`.
 #[cfg(target_arch = "aarch64")]
 const NATIVE_SAMPLE: KernelSample = KernelSample {
     path: ARM64_SAMPLE_DUMP,
@@ -4944,7 +5040,7 @@ fn a_bug_check_is_triaged_into_its_fields() {
     // no frame outside the kernel means no `faulting_frame` and a reason instead of a blamed
     // `nt!KeBugCheckEx`; a frame that does qualify — the ARM64 sample's is the user-mode address
     // that was executed, which belongs to no loaded module — is never the kernel itself.
-    // Naming a driver is [`a_driver_crash_names_the_driver_frame_that_analyze_cannot`]'s claim.
+    // Naming a driver is [`a_driver_crash_names_the_driver_frame_an_all_kernel_walk_would_miss`]'s claim.
     if triage["faulting_frame"].is_null() {
         let note = triage["faulting_frame_note"]
             .as_str()
@@ -5083,53 +5179,41 @@ fn a_bug_check_is_triaged_into_its_fields() {
 }
 
 /// `crash_triage` against a **driver** crash — the case the tool was written for, and the one the
-/// `0x9F` sample structurally cannot cover.
+/// `0x9F` and `0xFC` samples structurally cannot cover.
 ///
-/// [`DRIVER_CRASH_DUMP`] is a `0x13A KERNEL_MODE_HEAP_CORRUPTION` raised out of
-/// `nt!ExFreePoolWithTag` by `MessageManager.sys`, a driver with **no PDB**. Everything the issue
-/// behind this tool asked for is here and nowhere else in the suite:
+/// Run once per fixture in [`DRIVER_CRASHES`], because what the tool exists for is on those two
+/// crashes and nowhere else in the suite:
 ///
-/// * a `faulting_frame` that exists, six frames below the top, under a stack of kernel allocator
-///   internals that would otherwise be blamed;
-/// * that frame named `module+RVA` off the load base, because there is no symbol to name it with —
-///   and `!analyze` calling the same crash `Unknown_Module`, which is why the frame is computed
-///   here rather than taken from it;
-/// * a `pool_tag`, which only `!analyze` can produce;
-/// * a process name longer than 15 characters, which is what caught `_EPROCESS::ImageFileName`
-///   silently truncating `mm_exploit_v5.exe` to `mm_exploit_v5.`.
-///
-/// The RVA is asserted as a literal. That is the point rather than brittleness: `0x1654` is a
-/// fixed offset into a fixed image, so it is reproducible across every reboot and load base — five
-/// dumps from the same loop reported it at five different addresses — and a change in it means the
-/// attribution arithmetic moved.
-///
-/// The one test here that stays pointed at a **specific** file rather than at
-/// [`NATIVE_SAMPLE`]: what it asserts is a property of that crash, and there is no ARM64 driver
-/// bug in this repo to reproduce it with. It is not gated to x64 for that, though — an engine that
-/// resolves symbols reads this dump on either architecture, which was measured on an ARM64 host
-/// after [#142](https://github.com/glslang/windbg-mcp/issues/142) turned out to be about symbols
-/// rather than about architecture.
+/// * a `faulting_frame` that exists, several frames below the top, under a stack of kernel
+///   internals that a "blame frame 0" rule would name instead;
+/// * that frame named `module+RVA` off the load base — the arithmetic this test is really about,
+///   and the reason a second fixture was captured: until
+///   [#154](https://github.com/glslang/windbg-mcp/issues/154) it had only ever run against x64
+///   frames;
+/// * `!analyze`'s own attribution beside it, which the two fixtures disagree about on purpose
+///   (see [`DriverCrashSample::analyze_names_the_module`]).
 #[test]
-fn a_driver_crash_names_the_driver_frame_that_analyze_cannot() {
+fn a_driver_crash_names_the_driver_frame_an_all_kernel_walk_would_miss() {
     if target_tier().is_none() {
         return;
     }
-    if !std::path::Path::new(DRIVER_CRASH_DUMP).exists() {
-        skip(&format!(
-            "driver crash dump not found at {DRIVER_CRASH_DUMP}"
-        ));
+    for sample in DRIVER_CRASHES {
+        assert_driver_crash_names_its_driver(sample);
+    }
+}
+
+fn assert_driver_crash_names_its_driver(sample: &DriverCrashSample) {
+    if !std::path::Path::new(sample.path).exists() {
+        skip(&format!("{} was not found at {}", sample.what, sample.path));
         return;
     }
     let mut server = Server::started();
-    let opened = server.call_tool(
-        "open_dump",
-        json!({ "path": DRIVER_CRASH_DUMP }),
-        TARGET_STEP,
-    );
+    let opened = server.call_tool("open_dump", json!({ "path": sample.path }), TARGET_STEP);
     assert_no_error(&opened, "open_dump");
     assert!(
         !is_tool_error(&opened),
-        "opening the driver crash dump failed:\n{}",
+        "opening {} failed:\n{}",
+        sample.what,
         text_of(&opened["result"])
     );
     let session_id = session_id_of(&opened["result"]);
@@ -5148,71 +5232,82 @@ fn a_driver_crash_names_the_driver_frame_that_analyze_cannot() {
         TARGET_STEP,
     );
 
-    assert_eq!(triage["bug_check"]["code"], "0x13a", "{triage}");
+    assert_eq!(triage["bug_check"]["code"], sample.bug_check, "{triage}");
     assert_eq!(
-        triage["bug_check"]["name"], "KERNEL_MODE_HEAP_CORRUPTION",
+        triage["bug_check"]["name"], sample.bug_check_name,
         "{triage}"
     );
 
-    // The headline: a driver frame, found past the kernel's allocator frames.
+    // The headline: a driver frame, found past the kernel's own.
     let faulting = &triage["faulting_frame"];
     assert!(
         !faulting.is_null(),
-        "this crash has a driver frame — finding it is what the tool is for: {triage}"
+        "{} has a driver frame — finding it is what the tool is for: {triage}",
+        sample.what
     );
     assert_eq!(
-        faulting["module"], "MessageManager",
+        faulting["module"], sample.module,
         "a host that reads this dump but resolves none of its symbols walks the stack into the bug \
          check's own parameters and names no driver at all — check whether `nt` came back with a \
          PDB before reading this as an attribution bug (issue #142): {triage}"
     );
     assert_eq!(
-        faulting["rva"], "0x1654",
+        faulting["rva"], sample.rva,
         "the RVA is a fixed offset into a fixed image, so it is the same in every dump this bug \
          produces however the driver was loaded: {triage}"
     );
     assert!(
         faulting["index"].as_u64().is_some_and(|index| index > 0),
-        "the driver is never frame 0 — `nt!KeBugCheckEx` is: {triage}"
+        "the driver is never frame 0 — the bug check itself is: {triage}"
     );
-    // No PDB, so no symbol. Reported as absent rather than filled in with the module's own name,
-    // which is what the engine offers and which would read as "this frame resolved".
-    assert!(faulting["symbol"].is_null(), "{triage}");
-    assert!(faulting["displacement"].is_null(), "{triage}");
     assert_eq!(
         triage["frames_truncated"], false,
         "this stack is well inside the default cap: {triage}"
     );
 
-    // The frames above it are the allocator path, symbolised from `nt`'s own PDB — so the same
-    // walk carries both kinds of frame, which is the mix a real driver crash always has.
+    // The frames above it are kernel internals, symbolised from `nt`'s own PDB — so the same walk
+    // carries both kinds of frame, which is the mix a real driver crash always has.
     let frames = triage["frames"].as_array().expect("frames");
     assert!(
         frames.iter().any(|frame| frame["symbol"]
             .as_str()
-            .is_some_and(|s| s.starts_with("nt!ExFreePoolWithTag"))),
-        "the free that raised the bug check should be on the stack: {triage}"
+            .is_some_and(|s| s.starts_with(sample.kernel_frame))),
+        "`{}` should be on this stack: {triage}",
+        sample.kernel_frame
     );
 
-    // A name longer than `_EPROCESS::ImageFileName` can hold, which is the whole point of reading
-    // the audit name instead.
     let process = triage["process_name"]
         .as_str()
         .unwrap_or_else(|| panic!("the crashing process should be named: {triage}"));
-    assert!(
-        process.len() > 15 && process.ends_with(".exe"),
-        "the full image name, not the 15-byte field's truncation of it: {triage}"
-    );
+    assert!(process.ends_with(".exe"), "{triage}");
+    if sample.process_name_needs_the_audit_name {
+        // A name longer than `_EPROCESS::ImageFileName` can hold, which is the whole point of
+        // reading the audit name instead.
+        assert!(
+            process.len() > 15,
+            "the full image name, not the 15-byte field's truncation of it: {triage}"
+        );
+    }
 
     let analysis = &triage["analysis"];
     if analysis["ran"] == true {
-        // `!analyze` cannot name this driver — it has no PDB — which is precisely why the frame
-        // above is computed from the load base instead of taken from here.
-        assert_ne!(
-            analysis["module_name"], "MessageManager",
-            "if `!analyze` learns to attribute a PDB-less driver, this test's premise is stale \
-             and the docs claiming otherwise need revisiting: {triage}"
-        );
+        if sample.analyze_names_the_module {
+            // Here the computed frame is checked against an independent answer: this driver ships
+            // a PDB, so `!analyze` blames it too and the two have to agree.
+            assert_eq!(
+                analysis["module_name"], sample.module,
+                "`!analyze` and the computed frame disagree about which driver crashed: {triage}"
+            );
+        } else {
+            // And here it is the *only* answer — no PDB, so `!analyze` cannot name the driver,
+            // which is precisely why the frame is computed from the load base instead of taken
+            // from the analysis.
+            assert_ne!(
+                analysis["module_name"], sample.module,
+                "if `!analyze` learns to attribute a PDB-less driver, this test's premise is stale \
+                 and the docs claiming otherwise need revisiting: {triage}"
+            );
+        }
         // Only where the analysis got that far: a truncated run may have been cut off before
         // `PROCESS_NAME`, and demanding a field the tool says may be missing would fail the tier
         // for the one behaviour it exists to allow. Same guard as the other dump's check.
@@ -5222,7 +5317,7 @@ fn a_driver_crash_names_the_driver_frame_that_analyze_cannot() {
                 "the audit name and `!analyze`'s PROCESS_NAME are the same process: {triage}"
             );
         }
-        if analysis["truncated"] == false {
+        if analysis["truncated"] == false && sample.carries_a_pool_tag {
             // The pool tag exists only in `!analyze`'s output, and this bug check is one of the
             // few that produces one.
             assert!(
@@ -5239,11 +5334,9 @@ fn a_driver_crash_names_the_driver_frame_that_analyze_cannot() {
         json!({ "session_id": session_id, "analyze": false }),
         TARGET_STEP,
     );
-    assert!(
-        text.contains("FAULTING FRAME: MessageManager+0x1654"),
-        "{text}"
-    );
-    assert!(!text.contains("[MessageManager+0x1654]"), "{text}");
+    let frame = format!("{}+{}", sample.module, sample.rva);
+    assert!(text.contains(&format!("FAULTING FRAME: {frame}")), "{text}");
+    assert!(!text.contains(&format!("[{frame}]")), "{text}");
 
     server.tool_data(
         "end_session",
