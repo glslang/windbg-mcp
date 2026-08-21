@@ -52,7 +52,8 @@ four at a time).
 
 ## Inspect and control
 
-1. **Survey.** `modules {}` (`lm`), `threads {}` (`~`), `registers {}`.
+1. **Survey.** `modules {}` (`lm`, 64 rows of it — `filter` for one driver, `limit` for more),
+   `threads {}` (`~`), `registers {}`.
 2. **Set a breakpoint.** `set_breakpoint { "expression": "kernelbase!CreateFileW" }`
    (symbol, address, or expression). For kernel, e.g. `nt!NtCreateFile`.
 3. **Run to it.** `go {}` — continues and pumps to the next stop. On hit, inspect with

@@ -64,7 +64,8 @@ reads.
 
 > **Symbols — ask for the PDB when it exists.** Production/third-party drivers usually ship no
 > PDB, so `module!Dispatch` won't resolve and you work **address-based** (rebase static RVAs to the
-> live load base — `modules {}` / `lm m <driver>` — because of ASLR). **But if the user built the
+> live load base — `modules { "filter": "<driver>" }`, which is also how you get one driver's row
+> out of a table that answers with 64 of them — because of ASLR). **But if the user built the
 > driver or has its PDB, symbols are available** and make everything readable. Find the exact PDB
 > the engine wants with `execute { "command": "!sym noisy; .reload /f <driver>.sys" }` (it prints
 > `<pdb>\<GUID>\…`), then **ask the user for the folder holding that PDB** — it must be on *this*
