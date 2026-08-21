@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`modules` answers with a page of the table rather than all of it** ([`FOLLOWUPS.md`](./FOLLOWUPS.md)
+  item 24). It was the largest single answer this server gives - 53,933 B of model-visible JSON for
+  227 modules, a fifth of a whole tool surface for one question, and on a local model a turn of
+  prefill measured in minutes as well as the window it fills. A new `limit` (default 64, maximum
+  2000) bounds the whole listing, the loaded and unloaded halves sharing it through the same
+  `split_row_budget` the heap diagnostics use, so neither can crowd the other out. Measured against
+  the same checked-in dump `docs/token-budget.md` records its baseline on: **12,268 B model /
+  16,871 B wire for the default page against 53,933 B / 74,052 B for all 227 modules**, for 383 B
+  of tool surface paid once a conversation.
+
+  The counts are what keep it honest, and they are values rather than prose: `loaded` is the
+  target's inventory as before, and the new `matched` / `unloaded_matched` say how many rows each
+  half would have had - so a page is never mistaken for the whole table. The text says the same
+  thing and names the argument that undoes it. Every existing cap in this codebase is a worker
+  out-of-memory guard; this is the first one whose constraint is the **caller's** context.
+
 - **Driver-frame attribution is now asserted on an ARM64 stack as well**
   ([#154](https://github.com/glslang/windbg-mcp/issues/154)). A `0x139` crash raised inside HEVD by
   its own stack-cookie fail fast is checked in as `docs/samples/082126-7015-01.dmp`, and the smoke

@@ -30,16 +30,20 @@ Kernel base = 0xfffff803`89200000 PsLoadedModuleList = 0xfffff803`8a0f52d0
 Debug session time: Thu May 21 12:44:54.667 2026 (UTC + 1:00)
 
 Bug check 0x9f DRIVER_POWER_STATE_FAILURE, parameters 0x0000000000000003 …
-227 module(s) loaded, `nt` at 0xfffff80389200000; `modules` lists the table and `modules { "filter": "<name>" }` answers for one.
+227 module(s) loaded, `nt` at 0xfffff80389200000; `modules` lists a page of the table and `modules { "filter": "<name>" }` answers for one.
 ```
 
-The same fields come back as `structuredContent.summary`. The **table** is `modules`, which is
-worth one call here because it already tells a story: third-party drivers present include
-`nvlddmkm` (NVIDIA), `nvhda64v` (NVIDIA HD-audio, many unloaded instances),
+The same fields come back as `structuredContent.summary`. The **table** is `modules`, and it is
+worth a call here because it tells a story — but read it deliberately: 227 rows is the largest
+single answer this server gives, so a call names 64 of them unless `limit` says otherwise, and
+`filter` is the better question once a driver's name is known. `modules { "limit": 2000 }` is the
+whole inventory when the inventory is what you want, which is what the drivers below were read
+from: `nvlddmkm` (NVIDIA), `nvhda64v` (NVIDIA HD-audio, many unloaded instances),
 `RzDev_*`/`RzCommon` (Razer), and the virtualization stack (`VBox*`, `vmx86`/`hcmon`/`vmnet*`,
 plus Hyper-V `Vid`/`winhvr`). Each row carries its symbol state as its own column — `nt` reads
 `pdb` on a host with symbols for this build, and `deferred` (not fetched *yet*) is not the same
-answer as `none`.
+answer as `none`. `loaded` is the target's count either way, so a page never reads as the
+inventory.
 
 ## 2. Triage in one call
 

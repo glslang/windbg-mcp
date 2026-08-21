@@ -1532,6 +1532,11 @@ pub struct ModulesArgs {
     /// matcher.
     #[serde(default)]
     pub filter: Option<String>,
+    /// Maximum rows in the whole listing, the loaded and unloaded halves sharing it (default 64,
+    /// 1 to 2000). `loaded`, `matched` and `unloaded_matched` report the totals whatever this is,
+    /// so a short listing is never mistaken for the whole table.
+    #[serde(default)]
+    pub limit: Option<u32>,
     /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
     /// session and be refused if its target was replaced or closed.
     #[serde(default)]
@@ -3579,11 +3584,12 @@ impl WindbgServer {
     /// List modules, as typed values and as a listing rendered from those same values: each
     /// module's name, image name, start/end addresses and **symbol state** — `deferred` (not
     /// fetched yet) is not the same as `none` (this module has no symbols), which `lm` renders as
-    /// an easily-missed parenthesis. Pass `filter` to ask about one driver rather than reading a
-    /// table of two hundred; the answer still reports how many are loaded. The modules that have
-    /// **unloaded** come back in their own `unloaded` list, narrowed by the same filter — that is
-    /// what can name an address in a driver that is no longer there. For the engine's own listing
-    /// verbatim, `execute { "command": "lm" }`.
+    /// an easily-missed parenthesis. A listing is at most `limit` rows (default 64) and reports
+    /// how many matched, so pass `filter` to ask about one driver rather than paging through a
+    /// table of two hundred. The modules that have **unloaded** come back in their own
+    /// `unloaded` list, narrowed by the same filter — that is what can name an address in a driver
+    /// that is no longer there. For the engine's own listing verbatim,
+    /// `execute { "command": "lm" }`.
     #[rmcp::tool(
         annotations(
             title = "List modules",
@@ -3620,9 +3626,7 @@ impl WindbgServer {
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::Modules {
-                    filter: args.filter,
-                },
+                EngineOp::modules(args.filter, args.limit),
             )
             .await;
         engine_result_for(args.session_id.as_deref(), out)

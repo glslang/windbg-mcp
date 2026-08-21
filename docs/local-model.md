@@ -164,7 +164,7 @@ as a sighting rather than a benchmark.
 | Prompt tokens, first turn of every task | **17,095–17,127**, by the model's own tokenizer |
 | Share of the window | ~6.5% |
 | Tool picks | 9 calls across 6 tasks, **all correct first try** |
-| Largest answer actually taken | `modules`, **53,772 characters**, passed to the model whole |
+| Largest answer actually taken | `modules`, **53,772 characters**, passed to the model whole — the run that made the case for capping it, below |
 
 Three things worth carrying:
 
@@ -206,13 +206,17 @@ written down rather than remembered:
 - **Does the surface fit**, at the context the runtime is actually serving.
 - **Does the model pick the right tool out of 51**, which is orthogonal to window size and is the
   part a bigger context does not fix.
-- **Do individual answers blow the window.** `modules` has no `limit` and `read_memory` returns up
-  to ~4 MiB by design; both are `FOLLOWUPS.md` item 24's last bullets, and both are reachable in one
-  careless call.
+- **Do individual answers blow the window.** `read_memory` returns up to ~4 MiB by design, and is
+  reachable in one careless call. `modules` was the other half of that and is **fixed** since
+  2026-08-21: it answers with 64 rows unless a `limit` says otherwise, which on the checked-in
+  kernel sample is 12,268 B of model context rather than 53,933 B, with `loaded` / `matched` still
+  reporting the whole inventory. The 169-second turn above was that call, and it should now cost
+  roughly a quarter of it — a measurement this page wants and does not have yet.
 
-If a model does not cope, the knobs are all **client-side** today — a tool-surface profile, a
+If a model does not cope, the remaining knobs are all **client-side** — a tool-surface profile, a
 per-call response budget, a text-or-data content switch. This server has none of them: every caller
-gets all 51 tools, and there is no way to ask for fewer.
+gets all 51 tools, and there is no way to ask for fewer. What it does have is one per-tool answer
+to the second of the three, which is `modules`' `limit`.
 
 ## Picking this up after a break
 

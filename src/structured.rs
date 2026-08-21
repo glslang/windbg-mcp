@@ -536,7 +536,9 @@ impl From<&win_kexp::dbgeng::RegisterValue> for RegisterValue {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ModuleList {
-    /// The **loaded** modules being listed: every one, or those [`Self::filter`] matched.
+    /// The **loaded** modules this listing carries: those [`Self::filter`] matched, or every one —
+    /// in either case as many as the call's `limit` left room for, with [`Self::matched`] saying
+    /// how many there were.
     pub modules: Vec<ModuleInfo>,
     /// The modules that have **unloaded** — the engine's second list, narrowed by the same
     /// filter and rendered under its own heading in the text.
@@ -554,11 +556,29 @@ pub struct ModuleList {
     ///
     /// **A module in this list has no [`ModuleInfo::name`]** — there is nothing left to qualify a
     /// symbol with — so it is matched, and rendered, by its image name.
+    ///
+    /// Sharing [`Self::modules`]' `limit` rather than having one of its own — two halves that each
+    /// took the budget in full would double it — but with a share of it reserved: spending the
+    /// budget in print order would let a two-hundred-row loaded table erase this list, and "no
+    /// loaded module matches, but twenty-six unloaded images do" is the answer it exists to give.
     pub unloaded: Vec<ModuleInfo>,
     /// How many modules are loaded **in total** — which is the whole point of carrying it: a
-    /// partial listing could otherwise be read as the inventory. Equal to `modules.len()` unless
-    /// a filter narrowed the listing, and `modules.len()` is then how many matched.
+    /// partial listing could otherwise be read as the inventory. Equal to [`Self::matched`] unless
+    /// a filter narrowed the listing.
     pub loaded: usize,
+    /// How many loaded modules the listing is a listing **of**: what [`Self::filter`] matched,
+    /// before the call's `limit` cut it. Equal to [`Self::loaded`] when nothing was filtered.
+    ///
+    /// Carried always rather than only when it differs from `modules.len()`, because the question
+    /// it answers — "is this the whole set?" — is one a caller has to be able to ask of every
+    /// answer, and a length that is sometimes the total and sometimes a page of it cannot be read
+    /// without knowing which. The two rules this server already keeps for a truncated answer are
+    /// both here: the count comes from the same walk as the rows, and it is a value rather than
+    /// something the text alone says.
+    pub matched: usize,
+    /// [`Self::matched`] for the unloaded half: how many of the images that have unloaded matched,
+    /// before the same `limit` cut that table.
+    pub unloaded_matched: usize,
     /// The pattern this listing was narrowed by, as it was actually applied rather than as it was
     /// typed: a `filter` with no wildcards is widened to `*filter*` (see the tool's argument), and
     /// this is what says so. Absent when nothing was filtered.

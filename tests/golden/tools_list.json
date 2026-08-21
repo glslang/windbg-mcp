@@ -732,6 +732,7 @@
       },
       "params": [
         "filter: string|null",
+        "limit: integer|null/uint32",
         "session_id: string|null"
       ],
       "required": [],

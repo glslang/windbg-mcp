@@ -93,7 +93,7 @@ records both, so the gap stays visible.
 
 | Tool | model | wire | text | structured | ratio |
 |---|---:|---:|---:|---:|---:|
-| `modules` | 53,897 | 74,016 | 19,732 | 53,897 | 2.7x |
+| `modules` (the whole table, which was the default then) | 53,897 | 74,016 | 19,732 | 53,897 | 2.7x |
 | `execute` (`lm`) | 19,420 | 19,788 | 19,420 | — | — |
 | `registers` | 9,804 | 10,534 | 618 | 9,804 | **15.9x** |
 | `crash_triage` | 1,855 | 3,133 | 1,159 | 1,855 | 1.6x |
@@ -101,6 +101,12 @@ records both, so the gap stays visible.
 | `disassemble` | 2,018 | 3,429 | 1,291 | 2,018 | 1.6x |
 | `backtrace` | 945 | 1,588 | 532 | 945 | 1.8x |
 | `session_status` | 297 | 823 | 420 | 297 | 0.7x |
+
+**`modules` no longer answers with that table**, and the row is kept as the baseline it was: the
+default is one page of it (finding 5). The tier re-measures both halves against **this same dump**
+and prints them under `--nocapture` — 12,268 B model / 16,871 B wire for the page, against
+53,933 B / 74,052 B for all 227 modules — so the row above and the page figure are directly
+comparable, and the 36 B between 53,897 and 53,933 is what the rows have accumulated since.
 
 **Three rows are measured somewhere else** — `backtrace`, `disassemble` and `modules` — against
 `docs/samples/121524-4703-01.dmp` on the ARM64 bench, because each changed after this baseline was
@@ -113,8 +119,9 @@ field costs a caller — against the 15,610 B it costs the wire in schema, which
 
 `registers` is the shape of the problem in miniature: the model reads 9,804 bytes of JSON carrying
 `"kind":"int"` and `"subregister":false` on every row, and never sees the 618-byte `r` output that
-says the same thing better. `modules` is the largest single answer this server gives — roughly
-13k tokens, a fifth of a whole tool surface, for one question.
+says the same thing better. `modules` **was** the largest single answer this server gives — roughly
+13k tokens, a fifth of a whole tool surface, for one question — which is what finding 5 is, and
+what it has since done about it.
 
 ## What the baseline exposes
 
@@ -159,14 +166,29 @@ None of these is a bug. They are recorded because they were invisible, and
    Rewritten to 1,990 characters with the batch guidance inside the budget, kept ASCII so the
    character and byte counts cannot diverge, and pinned by an assertion in the protocol tier so it
    cannot grow back unnoticed.
-5. **`modules` has neither a `limit` nor a cap**, alone among the high-volume tools. 53,875 B here;
-   more on a live kernel.
+5. **`modules` had neither a `limit` nor a cap**, alone among the high-volume tools — **fixed**.
+   53,875 B here; more on a live kernel. It now takes a `limit` (default 64 rows, maximum 2000)
+   that bounds the **whole** listing, the loaded and unloaded halves sharing it through the same
+   `split_row_budget` the heap diagnostics use so that neither crowds the other out. Measured on
+   the sample this page's table is measured on, so the numbers are comparable: **12,268 B model /
+   16,871 B wire for the default page, against 53,933 B / 74,052 B for all 227 modules**. The tool
+   surface
+   grew 383 B for the argument, paid once a conversation against ~41 KB saved on every call.
+
+   Two things this settled that the finding did not anticipate. The counts have to be **values**,
+   not prose — `loaded` was already the inventory, and `matched` / `unloaded_matched` are new, so a
+   page can never be read as the whole table. And the halves need one budget with a share reserved
+   rather than one budget each: two halves that each take `limit` in full quietly double the
+   ceiling, which is the rule `the_row_limit_bounds_the_whole_listing` already stated for the
+   diagnostics listing one tool over.
 6. **Several tools have no bound at all** — `ttd_calls`, `ttd_memory`, `threads`,
    `execute`, `dx`, `ioctl_trace`, `reachable_from_dispatch` — and `read_memory`
-   returns up to ~4 MiB of hex by design (`src/worker.rs:117`). Every existing cap in this codebase
-   (`MAX_ROWS`, `MAX_NODES`, `MAX_READ_BYTES`) is justified in its own comment as a **worker
-   out-of-memory guard, not a caller-context guard**. That is not wrong; it means nothing here has
-   ever had the caller's context window as its constraint.
+   returns up to ~4 MiB of hex by design (`src/worker.rs:117`). Every cap in this codebase at the
+   time this was written (`MAX_ROWS`, `MAX_NODES`, `MAX_READ_BYTES`) is justified in its own comment
+   as a **worker out-of-memory guard, not a caller-context guard**. That is not wrong; it means
+   nothing here had ever had the caller's context window as its constraint. `DEFAULT_MODULE_ROWS`
+   (finding 5) is the first one that does, and it says so where it is defined — the rest of this
+   list is still bounded by what the target happens to hold.
 7. **A typed answer can be much larger than the rendering it replaces.** `registers` is 15.9x its
    own text, because every row carries `"kind":"int"` and `"subregister":false`. This is the one
    finding that is purely model-visible and purely this server's to fix, and it is what the ratio
