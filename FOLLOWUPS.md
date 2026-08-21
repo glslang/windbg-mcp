@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twelve clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in sixteen clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/win-kexp#71, 2026-08-01), items 13–14 from the bounded-command coverage review
@@ -12,8 +12,10 @@ session's own transcript turned up, and item 18 what reviewing it did), item 19 
 working (2026-08-17), item 24 from first measuring what this server costs the model driving it
 (2026-08-17), items 25–26 from giving the debugger tier an ARM64 *target* (#143, #152,
 2026-08-18), item 27 from completing the coordinate work (#156–#158, 2026-08-18), items 28–29
-from giving each client its own sessions (#162, #164–#166, 2026-08-19), and item 30 from serving
-the stateless revision concurrently (#168 / #169, 2026-08-19). Each item notes its repo,
+from giving each client its own sessions (#162, #164–#166, 2026-08-19), item 30 from serving
+the stateless revision concurrently (#168 / #169, 2026-08-19), item 31 from giving a service-hosted
+listener more than one client (2026-08-20), and item 32 from running the debugger tier on the
+ARM64 runner image that replaces `windows-11-arm` in September 2026. Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
