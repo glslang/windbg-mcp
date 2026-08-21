@@ -110,7 +110,7 @@ For a compile/behavior check without touching the locked release exe, use the **
 build differs only in optimization and is exercised by CI on a fresh runner.
 
 **The pass count does not say which tiers ran.** Each gate is inside its test, so the `mcp_smoke`
-harness reports the same **64 passed** with the debugger tier off as with it on — that harness's own
+harness reports the same **67 passed** with the debugger tier off as with it on — that harness's own
 result line, since a plain `cargo test` runs the crate's several hundred unit tests beside it and
 prints a result line per binary. What differs between the two runs is the runtime (~1.3s against
 ~52s for `cargo test --test mcp_smoke`) and the `SKIPPED` lines, which only `--nocapture` prints.
@@ -133,6 +133,22 @@ Get-Process windbg-mcp -ErrorAction SilentlyContinue |
 Then re-read the build output before believing a behavioural result. Note `cargo clippy` and
 `cargo test --bins` do *not* refresh that exe: clippy only checks, and the test harness is a
 separate binary.
+
+**A `.ps1` this repo ships has to parse under Windows PowerShell 5.1, and three ways of failing
+that are invisible on the machine you write it on.** The scripts in `tools/` and `examples/` run on
+*debuggees*, where 5.1 is the only PowerShell there is, and all three faults below abort before the
+script does anything — `tools/ioctl_harness.ps1` had all three at once:
+
+- **Non-ASCII in a BOM-less UTF-8 file.** 5.1 decodes such a file in the ANSI code page, so an em
+  dash becomes three characters, the last of which is a quotation mark that *ends a string* — and
+  the parse error is reported tens of lines later, pointing at a brace. Keep these files ASCII
+  (`grep -P '[^\x00-\x7F]'`); PowerShell 7 hides this completely by assuming UTF-8.
+- **A hex literal that does not fit `Int32`.** `0x80000000` is a *bit pattern* in 5.1, so it is
+  negative and a `uint32` parameter refuses it; 7 widens the same literal to `Int64` and the call
+  succeeds. `[Convert]::ToUInt32('80000000', 16)` reads the same on both — the `[uint32]` cast of
+  either the literal or a `'0x…'` string fails on 5.1.
+- **Returning an empty array.** `return [byte[]] @()` is unrolled by the pipeline into nothing, so
+  the caller gets `$null` and every `.Length` on it fails under `Set-StrictMode`. `return , ([byte[]] @())`.
 
 **Driving the server over stdio from a script: do not redirect stderr unless you drain it.** With
 `RUST_LOG` widened the server fills the stderr pipe buffer and blocks mid-request, which looks
@@ -177,13 +193,16 @@ $env:WINDBG_MCP_SMOKE_DUMP = "1"; cargo test --test mcp_smoke
 That tier now also covers the process-per-session behaviour end to end: two sessions coexisting, a
 kernel attach parked on a dead port being reclaimed by `end_session`, and no worker process
 outliving the connection. It opens the **dump matching this host's architecture** — an ARM64 one is
-checked in beside the two x64 samples — and the four assertions that read a *target* rather than
+checked in beside the two x64 samples, and each architecture also has a **driver** crash — and the
+four assertions that read a *target* rather than
 the dump's structure check first that this host can: `nt`'s base has to read, plus a resolved PDB
 for the two that walk `nt`'s types. Where it cannot they print `SKIPPED` and pass, so a green tier
 on a machine without symbols is not the same claim as a green tier here; read the `SKIPPED` lines
 (`--nocapture`) before concluding a change is covered. `docs/smoke-test.md` has the measurements
-behind that gate, and the driver-attribution claim still has **no ARM64 fixture at all**
-(issue #154). A third tier is `#[ignore]`d because it runs commands out to a watchdog
+behind that gate. The driver-attribution test is the one that is **not** paired by architecture: it
+is a table run over every checked-in driver crash on every host, because an engine with symbols
+reads either dump either way round and pairing would have cost an ARM64 runner the x64 crash it
+already read. A third tier is `#[ignore]`d because it runs commands out to a watchdog
 deadline (minutes, not seconds) — run it by hand after a win-kexp watchdog change:
 
 ```pwsh
@@ -278,6 +297,12 @@ Three traps on that bench, each of which cost real time:
 - **A worker killed while holding a broken-in kernel leaves the guest frozen** — `prlctl exec` hangs
   on it. Attaching and detaching properly is the fix:
   `kd -k com:port=COM1,baud=115200 -c ".time;qd"`.
+- **Do not hard-reset the debuggee to clear a corrupted kernel pool.** Two `prlctl reset`s in a row
+  put it into WinRE ("Your device ran into a problem and couldn't be repaired"), which wants console
+  input `prlctl` cannot send and `prlctl exec` cannot see past — a third reset happened to boot
+  through it, but nothing guarantees that. Let a bug check reboot the machine itself
+  (`AutoReboot=1` is already set there), and expect a file written just before a reset to come back
+  whitespace-filled.
 
 **A pool walk will not finish over 115200 baud.** It reads every committed pool page and times out
 at 240s, so on a serial bench "x64-only" and "too slow over this wire" cannot be told apart.
@@ -297,7 +322,30 @@ before blaming signing; `0` means it is not the cause.
 this bench bug-checks `0xFC` with the kernel faulting at the *user-mode payload* — its ROP chain
 never disables privileged execution of a user page — so the stack is `nt`-only and carries no
 `HEVD` frame at all. A fixture that needs a driver frame wants a path that faults **inside** the
-driver (issue #154), not a failed exploit.
+driver, not a failed exploit.
+
+**Getting HEVD to bug-check at all is harder than it looks, because it is written to survive.**
+Every trigger is wrapped in `__try/__except`, so a kernel-mode access violation is caught and
+returned as a status: the null dereference answers `STATUS_ACCESS_VIOLATION` with the machine still
+running, the non-paged pool overflow answers *success* and quietly corrupts the pool, and the UAF
+double free answers success twice and surfaces minutes later on a heap-maintenance worker thread as
+a `0x13A` whose stack is `nt`-only — the one shape a driver-attribution fixture must not have.
+What SEH cannot catch is a **fail fast**. `HEVD_IOCTL_BUFFER_OVERFLOW_STACK_GS` compiles its trigger
+with `/GS`, so overrunning the buffer corrupts the cookie and the driver's own `__report_gsfailure`
+runs `mov w0, #2; brk #0xf003` — `0x139 KERNEL_SECURITY_CHECK_FAILURE`, raised inside the driver.
+That is how `docs/samples/082126-7015-01.dmp` was made (issue #154); `docs/smoke-test.md` has the
+one-line recipe.
+
+**Read a driver's IOCTL codes out of its own dispatch — do not take them from a published list.**
+This build's are not the ones HEVD's widely-quoted table gives, and the code that table calls the
+null dereference is `FREE_UAF_OBJECT` here. Sending the wrong one is not always harmless: several
+of them corrupt the kernel silently. The dispatch walk earlier in this section and `decode_ioctl`
+are how to read them; on ARM64 the switch is a chain of `sub wN, wM, #0x222, lsl #12` against a
+literal, and each case block's `DbgPrintEx` format string names the handler.
+
+**Also: HEVD returns `STATUS_UNSUCCESSFUL` from handlers that succeeded.** `AllocateUaFObject*`
+initialises its status to `0xC0000001` and never sets it on the success path, so `sc`-style error 31
+out of the harness means nothing. Trust the resulting state, not the status.
 
 **Attach by `profile`, not by connection string — always, for any live target.** `attach_kernel
 { "profile": "<name>" }` resolves the connection inside the server (`src/kdconn.rs`), so the
@@ -365,8 +413,8 @@ Issue `.sympath` alone, or use the **`set_symbol_path`** tool (goes through the 
 that one *parses* it, so without it every module reports `Symbol Type: EXPORT - PDB not found` even
 when the identity was known and the file was downloaded. **`symsrv.dll` is the other half, and
 System32 usually does not ship it**: on a machine with neither, a `srv*` path downloads nothing.
-*Usually*, because it is not a constant and this repo believed it was — probing both CI runners for
-#153 found one in `windows-latest`'s System32 and none in `windows-11-arm`'s, so check the host in
+*Usually*, because it is not a constant and this repo believed it was — probing both CI runners
+(issue #153) found one in `windows-latest`'s System32 and none in `windows-11-arm`'s, so check the host in
 front of you (`where.exe symsrv.dll`) rather than assuming either way. Worth
 knowing because of how that presents on a *dump* — not as missing symbols but as a **memory read
 failing** (`0x8007001E`), since a kernel dump's virtual addresses are translated through structures
