@@ -187,6 +187,13 @@ jobs:
       - name: The target-reading assertions must have run
         shell: pwsh
         run: |
+          # Prove the log is the log before reading anything out of it. A stand-down is printed by
+          # `eprintln!`, so it is only in this file because of the `2>&1` above - and if that ever
+          # stopped capturing, every check below would pass by finding nothing, which is the same
+          # false green this step exists to prevent.
+          if (-not (Select-String -Path smoke.log -SimpleMatch -Pattern 'test result:' -Quiet)) {
+            throw 'smoke.log does not hold the test output; the checks below would pass vacuously'
+          }
           $skips = Select-String -Path smoke.log -SimpleMatch -Pattern @(
             "could not read ``nt``'s own base",
             "``nt`` resolved no PDB on this host"
