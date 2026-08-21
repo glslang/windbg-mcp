@@ -23,7 +23,10 @@ landed** (process-per-session, 2026-08-02); it is kept here rather than deleted 
 **Items 16, 17 and 18 have landed** (2026-08-10) and are kept for the opposite reason: each turned
 out to need something its entry did not anticipate — item 18 needed much less of item 7 than it
 claimed to, item 17 needed a walk deadline nothing had asked for, and item 16 needed a probe before
-it could measure anything at all. **Items 20 and 22 have landed** (2026-08-16, #131 and #134) and are kept because each needed
+it could measure anything at all. **Items 25 and 26 have landed** (2026-08-21, #153 and #154), and both are kept because each turned
+out to rest on something that was not so: item 25's premise about what Windows ships was only true
+on one of the two runner images, and item 26's "one decision first" was the wrong decision to be
+weighing. **Items 20 and 22 have landed** (2026-08-16, #131 and #134) and are kept because each needed
 something its entry did not see — item 22's job rename silently removed a required status check.
 Item 20's fix needed something the entry did not see: the two installers spell x64 differently, so the reordering it proposed would have
 picked the wrong architecture by another route. **Item 7 has landed** too (2026-08-10, the
@@ -779,26 +782,36 @@ say what it means for the other.
 Picks up at [`docs/token-budget.md`](./docs/token-budget.md) and the two budget tests in
 `tests/mcp_smoke.rs`.
 
-## 25. [windbg-mcp] The ARM64 CI runner resolves no symbols, so its target reads never run
+## 25. [windbg-mcp] The ARM64 CI runner resolves no symbols, so its target reads never run — **done** (2026-08-21, #153)
 
 Since #152 the debugger tier's target-reading assertions decide for themselves whether the host can
-support them, and the two CI entries decide differently: on `windows-latest` all four run and pass,
-on `windows-11-arm` all four print `SKIPPED`. Same code, same dumps. Windows ships `dbghelp.dll` in
-System32 and **no `symsrv.dll`** outside the Debugging Tools, so a runner without them downloads no
-PDB — and without `nt`'s symbols a kernel dump's pointers cannot be followed at all
-([#142](https://github.com/glslang/windbg-mcp/issues/142)).
+support them, and the two CI entries decided differently: on `windows-latest` all four ran and
+passed, on `windows-11-arm` all four printed `SKIPPED`. Same code, same dumps.
 
-- **Why deferred:** the job's stated position is that it runs the runner's *stock* engine, on the
-  reasoning that "a runner whose DbgEng cannot open a checked-in dump is something this repo wants
-  to hear about". Provisioning symbols moves it away from what a bare machine gets — and toward
-  what a user following this repo's own setup gets, since that setup copies the engine bundle
-  beside the exe. That is a decision about what the job is *for*, not a fix.
-- **What it costs today:** `docs/samples/121524-4703-01.dmp`, added so an ARM64 run reads an ARM64
-  target, is exercised only on a bench with the engine bundle. CI proves the protocol and the
-  session machinery there and nothing about reading.
-- **Picks up at** [#153](https://github.com/glslang/windbg-mcp/issues/153), which lists the two
-  probes (`dir` of the arm64 Debuggers directory, `where.exe symsrv.dll`) that would confirm this
-  is an image difference rather than something this repo can fix in the workflow.
+**The probe the entry asked for answered it, and not the way either the entry or the issue
+guessed.** The reasoning here was that Windows ships `dbghelp.dll` in System32 and no `symsrv.dll`
+outside the Debugging Tools, so a runner with neither downloads no PDB. Measured on both runners:
+
+- `windows-latest` **has** a `symsrv.dll` in System32, servicing-versioned like an inbox component.
+  That, not the kit, is where its stock engine gets its symbol store — which is why it resolves
+  symbols with `_NT_SYMBOL_PATH` unset;
+- `windows-11-arm` has none anywhere in System32, matching this project's own ARM64 bench;
+- **both** images carry the Debugging Tools, `symsrv.dll` and a full `dbgeng.dll` included.
+
+So the deferral rested on a premise that was only half true, and the thing that was supposedly
+unavailable was already on the runner's disk. The fix is the issue's option 1, one entry only: copy
+the kit's `dbghelp.dll` and `symsrv.dll` beside the binary under test on the ARM64 entry.
+
+**What the entry called a decision about what the job is for turned out to be smaller than that.**
+The job's position is that it runs the runner's *stock* engine. `dbgeng.dll` is deliberately not
+copied, so it still does — the entry goes on loading the image's own engine, which is the claim it
+was matrixed for (#134). What it gains is the symbol *half*, which this repo had already measured
+to be all an inbox engine needs. "Stock" was never a single thing anyway: the two images' System32
+differ, and that difference alone produced the asymmetry.
+
+**A skip passes, so the fix needed a guard of its own.** The job now fails if either target-read
+stand-down appears in the output; without that, a copy that stopped working would read exactly like
+a green run — which is the shape of failure this whole item is about.
 
 ## 26. [windbg-mcp] No ARM64 driver crash, so frame attribution is asserted only on x64 stacks
 

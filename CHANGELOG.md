@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The ARM64 CI entry resolves symbols, so its target-reading assertions run**
+  ([#153](https://github.com/glslang/windbg-mcp/issues/153)). Both runner images carry the
+  Debugging Tools; what differs is System32. `windows-latest` ships a `symsrv.dll` there beside
+  the `dbghelp.dll` that is always present, so its stock engine reaches the symbol server;
+  `windows-11-arm` has none, so a `srv*` path downloaded nothing, `nt` resolved no PDB, and all
+  four assertions that read a *target* stood down. That entry now copies the kit's `dbghelp.dll`
+  and `symsrv.dll` beside the binary under test - `dbgeng.dll` is deliberately left alone, so it
+  goes on loading the image's own engine - and the job fails if either stand-down appears in the
+  output, since a skip otherwise reads exactly like a green run.
+
+  This also retires the claim that Windows ships no `symsrv.dll` outside the Debugging Tools. It
+  holds on ARM64 and does not hold on the x64 runner image.
+
 ## [0.10.0] - 2026-08-20
 
 ### Added

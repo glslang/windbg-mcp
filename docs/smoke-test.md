@@ -57,15 +57,26 @@ it is not one. Measured on one ARM64 host:
 - with the SDK's `dbghelp.dll` and `symsrv.dll` beside the binary, one engine reads **both** x64
   samples and the ARM64 one completely — private symbols, the `EPROCESS`, the driver frame at its
   literal RVA. The whole tier passes there, 60 of 60;
-- with nothing beside the binary — System32 ships `dbghelp.dll` and **no** `symsrv.dll`, so a
-  `srv*` path downloads nothing — it reproduces the CI failure exactly, down to the address and
-  `0x8007001E`;
+- with nothing beside the binary — that host's System32 ships `dbghelp.dll` and **no**
+  `symsrv.dll`, so a `srv*` path downloads nothing — it reproduces the CI failure exactly, down to
+  the address and `0x8007001E`;
 - and with the full bundle but `_NT_SYMBOL_PATH` pointed at an empty directory it fails again, and
   fails *differently per dump*: the ARM64 sample reads nothing at all, while the x64 sample gives
   up a module base and then walks a stack of the bug check's own parameters. Neither is an answer,
   and only one of them looks like a failure.
 
 Same engine, same dumps: symbols are the variable, and the engine's architecture is not.
+
+**Whether System32 has a `symsrv.dll` is not a constant, which is what
+[#153](https://github.com/glslang/windbg-mcp/issues/153) turned on.** Probing both CI runners
+directly: `windows-latest` has one at `C:\Windows\System32\symsrv.dll`, servicing-versioned like
+an inbox component, which is why its stock engine resolves symbols with `_NT_SYMBOL_PATH` unset.
+`windows-11-arm` has none anywhere in System32, matching this project's own ARM64 bench. Both
+images do carry the Debugging Tools, `symsrv.dll` included, so on the ARM64 entry the missing half
+was already on disk — the job copies the kit's `dbghelp.dll` and `symsrv.dll` beside the binary
+under test and leaves `dbgeng.dll` stock, so what that entry exercises is still the image's own
+engine. Read any blanket statement about what "Windows ships" in this repo with that measurement
+in mind.
 
 So they **ask the host** instead of guessing from `cfg!(target_arch)`, and each asks for the
 premise it actually has. `walk_memory` and the batch work on numeric addresses, so they need only
