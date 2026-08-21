@@ -66,7 +66,7 @@ $build = Join-Path $PSScriptRoot 'build.cmd'
 
 if (-not $SkipHarnessBuild) {
     # Windows PowerShell 5.1 wraps a native command's stderr as error records, and under `Stop`
-    # those are terminating — so a build that *succeeded* aborts this script if anything on the
+    # those are terminating - so a build that *succeeded* aborts this script if anything on the
     # way printed to stderr. `vcvars64.bat` does: on a toolchain without `vswhere.exe` beside it
     # it complains and carries on, `cl` runs, and the fixture is produced. The same wart is
     # already handled for the cargo call below; the exit code is the only thing that says whether
