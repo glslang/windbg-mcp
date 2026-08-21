@@ -364,7 +364,10 @@ Issue `.sympath` alone, or use the **`set_symbol_path`** tool (goes through the 
 **Nothing resolves at all without `msdia140.dll` beside the engine** — `symsrv.dll` finds a PDB and
 that one *parses* it, so without it every module reports `Symbol Type: EXPORT - PDB not found` even
 when the identity was known and the file was downloaded. **`symsrv.dll` is the other half, and
-System32 does not ship it**: on a machine with neither, a `srv*` path downloads nothing. Worth
+System32 usually does not ship it**: on a machine with neither, a `srv*` path downloads nothing.
+*Usually*, because it is not a constant and this repo believed it was — probing both CI runners for
+#153 found one in `windows-latest`'s System32 and none in `windows-11-arm`'s, so check the host in
+front of you (`where.exe symsrv.dll`) rather than assuming either way. Worth
 knowing because of how that presents on a *dump* — not as missing symbols but as a **memory read
 failing** (`0x8007001E`), since a kernel dump's virtual addresses are translated through structures
 the engine locates with `nt`'s symbols. That symptom was read as an ARM64 engine limitation for a
