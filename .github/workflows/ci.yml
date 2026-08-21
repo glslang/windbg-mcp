@@ -95,12 +95,10 @@ jobs:
     # reads the dump's own structure and nothing behind it. The two conditions are asked
     # separately because they fail apart — this entry is where that was learned, by reading a
     # module base and then failing a stack walk. That, and not the architecture pairing it was
-    # first read as, is issue #142:
-    # Windows ships `dbghelp.dll` in System32 and no `symsrv.dll` anywhere outside the Debugging
-    # Tools, so a runner without them resolves nothing over a `srv*` path — and running that
-    # configuration by hand reproduces the reported failure address for address. Those
-    # four print `SKIPPED` with the reason where it happens, so a green run here never claims more
-    # than it checked.
+    # first read as, is issue #142. What decides whether a runner resolves anything is
+    # `symsrv.dll`, and the two images differ in whether they have one: that is what the copy step
+    # below is for, and why it runs on one entry only (issue #153). Those four print `SKIPPED`
+    # with the reason where it happens, so a green run here never claims more than it checked.
     #
     # Only this tier is matrixed. The crate is architecture-independent Rust, so `fmt`, clippy and
     # the unit tests in `build` have no reason to differ and a second entry there would buy runtime
@@ -144,67 +142,60 @@ jobs:
           # other's target directory — objects for the wrong triple, rebuilt every run at best.
           key: ${{ matrix.arch }}
 
+      # `cargo test` builds this itself; doing it as its own step is what gives the copy below
+      # somewhere to copy *to*.
+      - name: Build the binary under test
+        run: cargo build
+
+      # Measured, not assumed (issue #153): `windows-latest` carries `symsrv.dll` in System32
+      # beside the `dbghelp.dll` that ships there, so its stock engine reaches the symbol server
+      # and all four target-reading assertions run. `windows-11-arm` has no `symsrv.dll` in
+      # System32 at all, so a `srv*` path downloads nothing, `nt` resolves no PDB, and every one
+      # of the four stands down. Both images do carry the Debugging Tools, so the half that is
+      # missing is already on the runner's disk.
+      #
+      # `dbgeng.dll` is deliberately **not** copied. The entry goes on loading the image's own
+      # engine, which is the claim it was matrixed for (issue #134) and the one this repo wants to
+      # hear about breaking; what it gains is the symbol half, which was measured on this
+      # project's own ARM64 bench to be all an inbox engine needs (`docs/smoke-test.md`). It is
+      # also exactly what `skills/windbg-debugging/setup.md` tells a user to do, so the entry moves
+      # from what a bare machine gets to what a reader of this repo's setup gets.
+      - name: Give the ARM64 engine its symbol half (issue #153)
+        if: matrix.arch == 'arm64'
+        shell: pwsh
+        run: |
+          $kit = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64'
+          foreach ($dll in 'dbghelp.dll', 'symsrv.dll') {
+            $from = Join-Path $kit $dll
+            if (-not (Test-Path $from)) {
+              # A red build is the point: the runner image stopped shipping the Debugging Tools,
+              # and this entry is back to asserting nothing about reading a target.
+              throw "$from is missing - the ARM64 image no longer carries the Debugging Tools"
+            }
+            Copy-Item $from 'target\debug' -Force
+            Write-Host "copied $dll beside the binary under test"
+          }
+
       - name: Smoke test against the sample dump
         env:
           WINDBG_MCP_SMOKE_DUMP: "1"
-        run: cargo test --test mcp_smoke -- --nocapture
+        run: cargo test --test mcp_smoke -- --nocapture 2>&1 | Tee-Object -FilePath smoke.log
+        shell: pwsh
 
-  # TEMPORARY (issue #153): answers the two probes that decide whether the ARM64 entry's
-  # symbol-less engine is an image difference or something this repo can fix in the workflow.
-  # Delete once #153 is settled.
-  probe-symbols:
-    name: Probe symbols (${{ matrix.arch }})
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x64
-            runner: windows-latest
-          - arch: arm64
-            runner: windows-11-arm
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 10
-    steps:
-      - name: Where the engine and its symbol halves come from
+      # The copy above is the only thing standing between this entry and four silent `SKIPPED`s,
+      # and a skip passes. Without this check a broken copy reads exactly like a green run.
+      - name: The target-reading assertions must have run
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Continue'
-          Write-Host "=== PROCESSOR_ARCHITECTURE: $env:PROCESSOR_ARCHITECTURE"
-          Write-Host "=== _NT_SYMBOL_PATH: '$env:_NT_SYMBOL_PATH'"
-
-          Write-Host "`n=== Windows Kits Debuggers directory"
-          $kits = 'C:\Program Files (x86)\Windows Kits\10\Debuggers'
-          if (Test-Path $kits) {
-            Get-ChildItem $kits | Select-Object -ExpandProperty Name
-            foreach ($d in Get-ChildItem $kits -Directory) {
-              Write-Host "--- $($d.FullName)"
-              Get-ChildItem $d.FullName -Filter '*.dll' |
-                Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
-            }
-          } else {
-            Write-Host "ABSENT: $kits"
+          $skips = Select-String -Path smoke.log -SimpleMatch -Pattern @(
+            "could not read ``nt``'s own base",
+            "``nt`` resolved no PDB on this host"
+          )
+          if ($skips) {
+            $skips | ForEach-Object { Write-Host $_.Line }
+            throw 'this runner stood down from reading a target; see the SKIPPED lines above'
           }
-
-          Write-Host "`n=== where.exe"
-          foreach ($dll in 'symsrv.dll', 'dbghelp.dll', 'dbgeng.dll', 'dbgcore.dll', 'dbgmodel.dll', 'msdia140.dll') {
-            $found = & where.exe $dll 2>&1
-            if ($LASTEXITCODE -eq 0) { Write-Host "$dll ->"; $found | ForEach-Object { Write-Host "    $_" } }
-            else { Write-Host "$dll -> NOT ON PATH" }
-          }
-
-          Write-Host "`n=== every symsrv.dll / dbgeng.dll under the roots that could hold one"
-          $roots = 'C:\Windows\System32', 'C:\Windows\SysWOW64', 'C:\Program Files', 'C:\Program Files (x86)'
-          foreach ($dll in 'symsrv.dll', 'dbgeng.dll', 'msdia140.dll') {
-            foreach ($root in $roots) {
-              if (-not (Test-Path $root)) { continue }
-              Get-ChildItem -Path $root -Filter $dll -Recurse -File -ErrorAction SilentlyContinue |
-                Select-Object -First 20 |
-                ForEach-Object { Write-Host ("{0,10}  {1}  {2}" -f $_.Length, $_.VersionInfo.FileVersion, $_.FullName) }
-            }
-          }
-
-          Write-Host "`n=== PATH entries naming a kit or a debugger"
-          $env:PATH -split ';' | Where-Object { $_ -match 'Windows Kits|Debugg' } | ForEach-Object { Write-Host "    $_" }
+          Write-Host 'no target-read skips: the four assertions ran'
 
   docs:
     name: Documentation lint
