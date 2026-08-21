@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **CI runs the debugger tier on the new ARM64 runner image as well.** GitHub's Visual Studio 2026
+  ARM64 image went generally available on 2026-08-20 as `windows-11-vs2026-arm`, and the
+  `windows-11-arm` label migrates onto it between 21 and 30 September 2026. The tier's ARM64 half
+  is now a pair of entries, one per label, because what this job exercises that nothing else does
+  is a real inbox `dbgeng.dll` and the two labels are - until the migration completes - two
+  different OS builds carrying two different ones. Running both is what makes a break attributable
+  to the image rather than to the change under review; the older entry is meant to be dropped once
+  the labels converge ([`FOLLOWUPS.md`](./FOLLOWUPS.md) item 32). The cargo cache is now keyed by
+  runner label rather than by architecture, or the two ARM64 entries would share one. The x64 entry
+  needs no pairing: `windows-latest` has been the Visual Studio 2026 image since its own migration.
+
 - **The ARM64 CI entry resolves symbols, so its target-reading assertions run**
   ([#153](https://github.com/glslang/windbg-mcp/issues/153)). Both runner images carry the
   Debugging Tools; what differs is System32. `windows-latest` ships a `symsrv.dll` there beside

@@ -1128,3 +1128,27 @@ The end-to-end half is one protocol-tier smoke assertion
 (`a_token_file_names_its_own_clients_and_shuts_the_environment_out`): a real listener, a real file
 naming two clients, the environment token refused `401`, and both file clients served through a full
 handshake.
+
+## 32. [windbg-mcp] Two ARM64 CI entries, one of which expires
+
+The debugger tier's ARM64 half is a **pair**: `windows-11-arm` and `windows-11-vs2026-arm`. That is
+deliberate and temporary. GitHub's Visual Studio 2026 ARM64 image went generally available on
+2026-08-20 under the new label, and the `windows-11-arm` label is migrated onto it between 21 and
+30 September 2026 — so today the two labels are two *OS builds* (10.0.26200.9168 against .8875 when
+this was written) and therefore two inbox `dbgeng.dll`s, which is the one thing this job exists to
+load. Running both is what makes a break during that window attributable to the image rather than
+to the change under review, and what gives the repo notice before every PR meets it at once.
+
+- **What to do, and when:** after the migration completes, the two labels name the same image and
+  the pair buys a second run of the same tier. Drop the `windows-11-arm` entry — not the new one:
+  the new label is the stable name for that image, and `windows-11-arm` is the one whose meaning
+  moved. The x64 entry is untouched either way; `windows-latest` migrated to the Visual Studio 2026
+  Windows Server 2025 image before this.
+- **How you will know it converged:** the two entries stop differing in the OS build they report,
+  and `actions/runner-images`' `Windows11-Arm64-Readme.md` stops naming a separate VS2022 image.
+  Until then, an entry that fails alone is the interesting one — read which label it is before
+  reading the diff.
+- **What it could still turn up in the meantime:** the copy step assumes the kit at
+  `C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64`, which both images carry today (the
+  same WDK build, 10.1.26100.6584). It throws by name if that stops being true, which is the
+  failure this pair is here to catch early rather than on the migration date.
