@@ -27,9 +27,11 @@ structures it locates with `nt`'s symbols. That is what
 architecture limitation, which it is not: the same host reads x64 and ARM64 dumps alike once
 symbols resolve, and reads neither when they do not.
 
-`symsrv.dll` is the file this usually comes down to. System32 ships `dbghelp.dll` and **no**
-`symsrv.dll`, so a machine with nothing beside the binary cannot download a PDB over a `srv*` path
-at all — and the symptom is not "no symbols", it is a memory read failing.
+`symsrv.dll` is the file this usually comes down to. System32 always ships `dbghelp.dll` and
+**often has no `symsrv.dll` beside it**, and a machine without one cannot download a PDB over a
+`srv*` path at all — the symptom being not "no symbols" but a memory read failing. Whether it is
+there is worth checking rather than assuming: `where.exe symsrv.dll`. Of the two GitHub Actions
+Windows images, the x64 one has a System32 `symsrv.dll` and the ARM64 one does not.
 
 Live user-mode and live kernel are untested on ARM64, and the bitness rule above still applies to
 those.
