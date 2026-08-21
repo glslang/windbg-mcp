@@ -98,14 +98,20 @@ pub enum EngineOp {
     Registers {
         all: bool,
     },
-    /// The loaded modules, as text (`lm`) *and* as values.
+    /// The loaded modules, as values *and* as the listing rendered from them.
     ///
-    /// `filter` is a module-name pattern, already validated as an operand by the supervisor and
-    /// normalised in the worker — where it has to be, because the same normalised pattern must
-    /// reach `lm m` and the typed listing or the two channels would answer different questions.
+    /// `filter` is a module-name pattern, refused by the supervisor only when it is blank and
+    /// normalised in the worker — where it has to be, because the pattern the values are matched
+    /// by is the one the listing is rendered from, and [#120] left exactly one of each.
+    ///
+    /// `limit` is how many rows that listing prints in all — the loaded and unloaded halves share
+    /// it — defaulted and clamped by the supervisor as every other row cap here is.
+    ///
+    /// [#120]: https://github.com/glslang/windbg-mcp/issues/120
     Modules {
         #[serde(default)]
         filter: Option<String>,
+        limit: usize,
     },
     /// The current thread's call stack, as values and as the listing rendered from them.
     ///
@@ -294,6 +300,26 @@ impl EngineOp {
         }
     }
 
+    /// A `modules` listing, with this server's row cap applied to a caller who named none.
+    ///
+    /// Here rather than at the call site because that is where the allocator ops' defaults are,
+    /// and because the number is a judgement about the *caller's* budget rather than about the
+    /// engine — see [`DEFAULT_MODULE_ROWS`].
+    ///
+    /// **At least one row**, which is the one clamp here that is not about size. The note under a
+    /// listing says the unloaded images it counts are "listed above", and the budget guarantees
+    /// each half a share of anything left — so every count in the note describes rows that are
+    /// actually there, *unless* the listing is allowed to carry none at all. A caller asking for
+    /// counts alone is asking for `matched` and `loaded`, which one row carries as well as none.
+    pub fn modules(filter: Option<String>, limit: Option<u32>) -> Self {
+        Self::Modules {
+            filter,
+            limit: limit
+                .unwrap_or(DEFAULT_MODULE_ROWS)
+                .clamp(1, MAX_MODULE_ROWS) as usize,
+        }
+    }
+
     /// Whether this op creates the worker's target, and so reports the `Committed`/`Opened`
     /// milestones below.
     pub fn is_opener(&self) -> bool {
@@ -375,6 +401,26 @@ pub const MAX_ROWS: u32 = 2000;
 fn clamp_rows(limit: Option<u32>, default: u32) -> usize {
     limit.unwrap_or(default).min(MAX_ROWS) as usize
 }
+
+/// Rows a `modules` listing prints, in all, when the caller names no `limit`.
+///
+/// **A caller-context guard, which is not what the cap above is.** [`MAX_ROWS`] is there because
+/// the worker builds an allocator answer in one buffer before it crosses the pipe; a module table
+/// costs the worker nothing worth naming. What it costs is the *caller*: the whole table is the
+/// largest single answer this server gives — some 54 KB of JSON on this repo's own kernel sample,
+/// a fifth of a whole tool surface — and a local model pays for every byte of it twice, once in
+/// its window and once in the prefill that has to read it. A caller after one driver has `filter`;
+/// a caller after the inventory raises this and spends the context deliberately. The counts are
+/// reported either way, so a cut listing is never mistaken for the whole table.
+/// [`docs/token-budget.md`](https://github.com/glslang/windbg-mcp/blob/main/docs/token-budget.md)
+/// has the measurement this was chosen against.
+pub const DEFAULT_MODULE_ROWS: u32 = 64;
+
+/// Most rows a `modules` listing will print, however large a `limit` asks for.
+///
+/// Past any real module table — a kernel loads a few hundred — so it is how a caller says "all of
+/// them" without first knowing how many there are, rather than a limit anyone meets by accident.
+pub const MAX_MODULE_ROWS: u32 = 2000;
 
 impl PoolOp {
     /// Rows each question prints when the caller names no `limit`.
@@ -633,6 +679,34 @@ mod tests {
             unreachable!("still a pool query")
         };
         assert_eq!(patience_ms, 42_000);
+    }
+
+    /// The module listing's cap is the supervisor's to apply, like the allocator ones — so a
+    /// worker is told a number rather than an intention, and the default cannot differ between
+    /// the two roles.
+    #[test]
+    fn a_module_listings_row_cap_is_applied_before_crossing_the_worker_pipe() {
+        let EngineOp::Modules { limit, filter } = EngineOp::modules(Some("nt".into()), None) else {
+            unreachable!("still a module listing")
+        };
+        assert_eq!(limit, DEFAULT_MODULE_ROWS as usize);
+        assert_eq!(
+            filter.as_deref(),
+            Some("nt"),
+            "the pattern is the worker's to normalise"
+        );
+
+        let EngineOp::Modules { limit, .. } = EngineOp::modules(None, Some(u32::MAX)) else {
+            unreachable!()
+        };
+        assert_eq!(limit, MAX_MODULE_ROWS as usize);
+
+        // And never nothing: a listing carrying no rows at all would leave the note counting
+        // unloaded images it says are listed above it.
+        let EngineOp::Modules { limit, .. } = EngineOp::modules(None, Some(0)) else {
+            unreachable!()
+        };
+        assert_eq!(limit, 1);
     }
 
     #[test]

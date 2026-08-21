@@ -18,10 +18,10 @@ adding the debugger tier takes it to ~50s, almost all of it two tests waiting ou
 lease grace, and a call staying silent long enough to have to report that it is still running.
 
 **The pass count is the same either way**, because each gate is inside its own test: `cargo test
---test mcp_smoke` reports 67 passed with the tier off and 67 passed with it on. (A plain `cargo test`
+--test mcp_smoke` reports 68 passed with the tier off and 68 passed with it on. (A plain `cargo test`
 runs the unit tests beside it and prints a result line per binary, so it is this harness's own line
 to read.) The runtime is what tells the two runs apart, and `--nocapture` is what prints the
-`SKIPPED` reason — a run that reports 67 green having taken a second covered no debugger claim at
+`SKIPPED` reason — a run that reports 68 green having taken a second covered no debugger claim at
 all.
 
 ### Tiers
@@ -239,6 +239,19 @@ literally* now: `nt[fd]*`, `n\t*`, `nt v`, `nté` and `nt; .detach` each come ba
 listing in both channels rather than as an error, and the session is still the dump it was
 afterwards — there is no command for a `;` to end. The one refusal left is a filter that narrows by
 nothing.
+
+**And it checks that a listing is a *page* of the table** rather than all of it, which is the one
+claim about this tool that only a real target with a real module count can support. A call naming
+no `limit` comes back with 64 rows counted **across both halves**, with the unloaded rows still
+among them — the share that stops two hundred loaded modules crowding out the images that have
+gone — while `loaded`, `matched` and `unloaded_matched` go on reporting the target rather than the
+page, and the text says which half was cut and names `limit` as the way to see the rest. Then the
+same call with `limit: 2000` returns the whole table, so the page is a default and not a ceiling.
+The saving is asserted as a ratio, since the bytes belong to the host: the tier prints both
+figures under `--nocapture`, which on this sample reads `12268 B model / 16871 B wire for the
+default page, against 53933 B / 74052 B for all 227 modules` — the same dump
+[`token-budget.md`](./token-budget.md) records its baseline against, so the two can be read
+together.
 
 It also triages the dump's bug check (`crash_triage`), which is the one place the tier depends on
 the sample being a *crash* dump rather than any dump: the `0x9F` code and its four parameters read

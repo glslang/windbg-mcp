@@ -760,18 +760,31 @@ landed on their own so that each of the items below can be argued, and measured,
   waste but one tool honestly describing a rich argument. The levers are design choices: a smaller
   step vocabulary, a `$ref` the client resolves, or a surface that does not offer every tool to
   every caller.
-- **`modules` has neither a `limit` nor a cap**, alone among the high-volume tools. Everything else
-  uncapped is raw debugger text — `ttd_calls`, `ttd_memory`, `threads`,
-  `execute`, `dx`, `ioctl_trace`, `reachable_from_dispatch` — and `read_memory` returns up to
-  ~4 MiB of hex by design (`src/worker.rs:117`). Every cap that does exist (`MAX_ROWS`,
-  `MAX_NODES`, `MAX_READ_BYTES`) is justified in its own comment as a worker out-of-memory guard.
-  A caller-context guard is a different constraint and does not exist yet.
+- **`modules` had neither a `limit` nor a cap**, alone among the high-volume tools — **done**
+  (2026-08-21). Everything else uncapped is raw debugger text — `ttd_calls`, `ttd_memory`,
+  `threads`, `execute`, `dx`, `ioctl_trace`, `reachable_from_dispatch` — and `read_memory` returns
+  up to ~4 MiB of hex by design (`src/worker.rs:117`). Every cap that existed (`MAX_ROWS`,
+  `MAX_NODES`, `MAX_READ_BYTES`) was justified in its own comment as a worker out-of-memory guard;
+  `DEFAULT_MODULE_ROWS` is the first whose constraint is the **caller's** context, and it says so
+  where it is defined. Default 64 rows, maximum 2000, measured at 12,268 B model / 16,871 B wire
+  against 53,933 B / 74,052 B for the whole 227-module table — for 383 B of tool surface, paid once
+  a conversation rather than per call.
+
+  Two things it turned on that this bullet did not see. The cap is only safe because the **counts
+  are values**: `matched` and `unloaded_matched` were added beside `loaded` so a page can never be
+  read as the inventory, which is the same rule `frames_truncated` keeps for a stack. And one
+  budget is shared between the loaded and unloaded halves rather than one each — through the
+  `split_row_budget` the heap diagnostics already used, whose own test says why: two sections that
+  each restart the budget quietly double the ceiling it was chosen to be. Reaching for a cap
+  per half was the first thing tried here, and this repo had already argued it down one tool over.
 
 **Where this bites first is a local model**, whose window is bought in RAM rather than rented:
 [`docs/local-model.md`](./docs/local-model.md) is the runbook, and it names the three client-side
 knobs the split-plane plan proposed — a tool-surface profile, a per-call response budget, a
-text-or-data switch — none of which this server has. The two bullets above are the server-side half
-of the same problem.
+text-or-data switch — none of which this server had. The `modules` bullet above is the first of
+them landing as a *per-tool* answer rather than a caller-wide one: a response budget one tool at a
+time, chosen by whoever owns that tool's shape. Whether the general knob is still wanted is now a
+question about the tools that have no bound at all, not about the one that did the most damage.
 
 **Depends on nothing**, but it **collides with item 11**, which proposes adding `structuredContent`
 to `ttd_calls`, `ttd_memory` and `driver_object` — three of the highest-volume text-only tools.

@@ -53,8 +53,8 @@ use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
 use crate::batch::{self, BatchOp, Debuggee, Ran};
 use crate::proto::{
-    EngineOp, Failed, HeapBackendFilter, HeapOp, HeapStateFilter, Output, PoolOp, ReachabilityOp,
-    WorkerMessage, WorkerRequest,
+    EngineOp, Failed, HeapBackendFilter, HeapOp, HeapStateFilter, MAX_MODULE_ROWS, Output, PoolOp,
+    ReachabilityOp, WorkerMessage, WorkerRequest,
 };
 use crate::server::{
     fmt_addr, format_recipe, format_report, hexdump, matches_module_pattern, module_pattern,
@@ -1126,7 +1126,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             timeout_ms,
         } => resumed(e, &command, timeout_ms),
         EngineOp::Registers { all } => registers(e, all),
-        EngineOp::Modules { filter } => modules(e, filter.as_deref()),
+        EngineOp::Modules { filter, limit } => modules(e, filter.as_deref(), limit),
         EngineOp::Backtrace { frames } => backtrace(e, frames as usize),
         EngineOp::Disassemble { address, count } => {
             disassemble(e, address.as_deref(), count as usize)
@@ -1515,7 +1515,14 @@ fn with_pdb_identity(
 /// narrowed by the same pattern and rendered under their own heading: on this repo's sample a
 /// filter of `nvhda` matches no loaded module and twenty-six unloaded ones, which is an answer
 /// rather than the "nothing matched" it once read as.
-fn modules(e: &DebugEngine, filter: Option<&str>) -> Result<Output, Failed> {
+///
+/// **`limit` rows in all**, because the whole table is the largest answer this server gives and a
+/// caller pays for all of it ([`crate::proto::DEFAULT_MODULE_ROWS`]). One budget across both
+/// halves rather than one each — [`split_row_budget`] shares it, so a two-hundred-row loaded table
+/// cannot squeeze out the unloaded rows and two halves cannot double the ceiling between them.
+/// What the cap must not cost is the counts: the note and the values report what *matched*, so a
+/// listing that stops short says so rather than reading as a smaller target.
+fn modules(e: &DebugEngine, filter: Option<&str>, limit: usize) -> Result<Output, Failed> {
     let pattern = filter.map(module_pattern);
     let loaded = e.modules().map_err(failed)?;
     // Unloaded modules are best-effort: not every Windows version tracks them, the ones that do
@@ -1525,28 +1532,61 @@ fn modules(e: &DebugEngine, filter: Option<&str>) -> Result<Output, Failed> {
         .unloaded_modules()
         .inspect_err(|why| tracing::debug!("worker: unloaded modules could not be read: {why}"))
         .unwrap_or_default();
-    // Converted first, then filtered, so the name a row is *matched* by is read from the same
-    // record — by the same accessor — as the name it is *listed* by.
-    let narrow = |modules: &[win_kexp::dbgeng::Module]| -> Vec<structured::ModuleInfo> {
-        modules
-            .iter()
-            .map(|module| (structured::ModuleInfo::from(module), module))
-            .filter(|(info, _)| {
-                pattern
-                    .as_deref()
-                    .is_none_or(|pattern| matches_module_pattern(pattern, info.listed_name()))
-            })
-            .map(|(info, module)| with_pdb_identity(e, module, info))
-            .collect()
-    };
-    let (matched, matched_unloaded) = (narrow(&loaded), narrow(&unloaded));
+    // Filtered first and counted before either half is cut, because the counts are of the target
+    // and the rows are a page of it — and the share is where the two halves meet, so that neither
+    // can take the budget in full.
+    let (matched, matched_unloaded) = (
+        matching(&loaded, pattern.as_deref()),
+        matching(&unloaded, pattern.as_deref()),
+    );
+    let (total, total_unloaded) = (matched.len(), matched_unloaded.len());
+    let (for_loaded, for_unloaded) = split_row_budget(limit, total, total_unloaded);
     let list = structured::ModuleList {
         loaded: loaded.len(),
         filter: pattern,
-        modules: matched,
-        unloaded: matched_unloaded,
+        modules: identified(e, matched, for_loaded),
+        matched: total,
+        unloaded: identified(e, matched_unloaded, for_unloaded),
+        unloaded_matched: total_unloaded,
     };
     Ok(Output::typed(render_modules(&list), list))
+}
+
+/// The records a pattern matched, each still paired with the engine's own — which is what the PDB
+/// lookup needs, and the reason matching and cutting are two steps rather than one iterator.
+///
+/// Converted before it is matched, so the name a row is *matched* by is read from the same record,
+/// by the same accessor, as the name it is *listed* by ([#120]).
+///
+/// [#120]: https://github.com/glslang/windbg-mcp/issues/120
+fn matching<'a>(
+    modules: &'a [win_kexp::dbgeng::Module],
+    pattern: Option<&str>,
+) -> Vec<(structured::ModuleInfo, &'a win_kexp::dbgeng::Module)> {
+    modules
+        .iter()
+        .map(|module| (structured::ModuleInfo::from(module), module))
+        .filter(|(info, _)| {
+            pattern.is_none_or(|pattern| matches_module_pattern(pattern, info.listed_name()))
+        })
+        .collect()
+}
+
+/// The first `take` of those rows, with each one's PDB identity read.
+///
+/// Asked last, and only about the rows the answer carries: [`with_pdb_identity`] is an engine call
+/// per row, so cutting first is the difference between one lookup per module the target has loaded
+/// and one per row printed. The cap buys time here as well as context at the other end.
+fn identified(
+    e: &DebugEngine,
+    matched: Vec<(structured::ModuleInfo, &win_kexp::dbgeng::Module)>,
+    take: usize,
+) -> Vec<structured::ModuleInfo> {
+    matched
+        .into_iter()
+        .take(take)
+        .map(|(info, module)| with_pdb_identity(e, module, info))
+        .collect()
 }
 
 /// The listing a person reads, built from the records beside it.
@@ -1619,23 +1659,55 @@ fn module_table(rows: &[structured::ModuleInfo], names: &str) -> String {
 }
 
 /// The one line under the rows: what this listing is, and what it is a part of.
+///
+/// **Counted from what matched, not from what was printed.** Both halves are cut to the call's
+/// `limit`, so the row counts and the match counts are different numbers — and it is the match
+/// counts that answer the question the note is here for. [`truncation_note`] then says what the
+/// rows are, which is the only part of this the cap changed.
 fn listing_note(list: &structured::ModuleList) -> String {
-    match &list.filter {
-        Some(pattern) => narrowing_note(
-            pattern,
-            list.modules.len(),
-            list.loaded,
-            list.unloaded.len(),
-        ),
+    let note = match &list.filter {
+        Some(pattern) => narrowing_note(pattern, list.matched, list.loaded, list.unloaded_matched),
         // The whole table. `loaded` is still worth printing under it — it is the number a reader
         // would otherwise count — and the unloaded half is named as the separate thing it is.
-        None if list.unloaded.is_empty() => format!("{} module(s) loaded.", list.loaded),
+        None if list.unloaded_matched == 0 => format!("{} module(s) loaded.", list.loaded),
         None => format!(
             "{} module(s) loaded, and {} that have since **unloaded** — {WHERE_UNLOADED}",
-            list.loaded,
+            list.loaded, list.unloaded_matched
+        ),
+    };
+    match truncation_note(list) {
+        Some(cut) => format!("{note} {cut}"),
+        None => note,
+    }
+}
+
+/// What the note adds when `limit` stopped a table short of what matched — and nothing at all when
+/// it did not, which is every filtered listing anyone actually types.
+///
+/// Said per table even though the budget is shared, because a caller reads the two tables as two
+/// answers: which half was cut is what tells them whether to raise `limit` or to narrow with
+/// `filter`. It names `limit` rather than saying rows are missing, for the same reason
+/// `backtrace`'s truncation line names `frames` — an answer that stops short has to name the
+/// argument that undoes it.
+fn truncation_note(list: &structured::ModuleList) -> Option<String> {
+    let cut = (
+        list.modules.len() < list.matched,
+        list.unloaded.len() < list.unloaded_matched,
+    );
+    let rows = match cut {
+        (false, false) => return None,
+        (true, false) => format!("the first {} row(s)", list.modules.len()),
+        (false, true) => format!("the first {} unloaded row(s)", list.unloaded.len()),
+        (true, true) => format!(
+            "the first {} loaded and {} unloaded row(s)",
+            list.modules.len(),
             list.unloaded.len()
         ),
-    }
+    };
+    Some(format!(
+        "Showing {rows} — raise `limit` (up to {MAX_MODULE_ROWS}) to see the rest, or narrow with \
+         `filter`."
+    ))
 }
 
 /// Where the unloaded rows are, said wherever any of them are in the answer: above under their own
@@ -3830,20 +3902,23 @@ fn select_categories<'a>(
         .collect()
 }
 
-/// Splits `limit` rows between the two halves of a diagnostics listing.
+/// Splits `limit` rows between the two halves of a listing that has two.
 ///
-/// `limit` bounds the whole reply — the worker builds it as one `String` before it crosses the
-/// pipe — so the two sections share one budget rather than each taking it in full.
+/// `limit` bounds the whole reply rather than each section of it, for whichever reason the caller
+/// of this has: the diagnostics listing because the worker builds the reply as one `String` before
+/// it crosses the pipe, the module listing because the number is a bound on what the *caller* pays
+/// for the answer. Either way, two sections that each took the budget in full would quietly double
+/// the ceiling it was chosen to be.
 ///
-/// Spending it in print order would be simpler and is wrong: a flood of examples would take
-/// the lot and drop the category counts entirely, which is the very number this listing exists
-/// to report. So each half is offered half the budget and hands back what it does not need.
-/// Every shape contributes at least one example, so the categories are never the more numerous
-/// half — in practice this means "the categories in full, the examples take the rest", and the
-/// even split only bites on a target with an unusual number of distinct complaints.
-fn split_row_budget(limit: usize, examples: usize, categories: usize) -> (usize, usize) {
-    let for_examples = examples.min((limit / 2).max(limit.saturating_sub(categories)));
-    (for_examples, categories.min(limit - for_examples))
+/// Spending it in print order would be simpler and is wrong: whichever half prints first would take
+/// the lot on a target that has a lot of it, and the other half is never the less interesting one —
+/// it is the category counts in a diagnostics listing, and the images that have *unloaded* in a
+/// module one, which is the half that can name a driver no longer there. So each half is offered
+/// half the budget and hands back what it does not need, which in practice means "the smaller half
+/// whole, the larger half takes the rest" and only splits evenly when both are over.
+fn split_row_budget(limit: usize, first: usize, second: usize) -> (usize, usize) {
+    let for_first = first.min((limit / 2).max(limit.saturating_sub(second)));
+    (for_first, second.min(limit - for_first))
 }
 
 /// Lists the walk's complaints: the verbatim ones it kept, then what the counts say.
@@ -4127,13 +4202,13 @@ fn summary_text(diagnostic: &str, summary: &structured::TargetSummary) -> String
             // closes one. The table solves the same problem with a fence; a sentence cannot carry
             // a fence, so it carries the span instead.
             Some(module) => format!(
-                "{loaded} module(s) loaded, `{}` at {}; `modules` lists the table and \
+                "{loaded} module(s) loaded, `{}` at {}; `modules` lists a page of the table and \
                  `modules {{ \"filter\": \"<name>\" }}` answers for one.",
                 renderable(&module.name),
                 module.start
             ),
             None => format!(
-                "{loaded} module(s) loaded; `modules` lists the table and \
+                "{loaded} module(s) loaded; `modules` lists a page of the table and \
                  `modules {{ \"filter\": \"<name>\" }}` answers for one."
             ),
         });
@@ -5528,6 +5603,14 @@ mod tests {
 
     /// A listing of three modules and one that has since unloaded, as the engine reports them.
     fn sample_list(filter: Option<&str>) -> structured::ModuleList {
+        capped_sample_list(filter, usize::MAX)
+    }
+
+    /// The same listing, cut to `limit` rows the way [`modules`] cuts it — through the same
+    /// [`split_row_budget`], so the fixture cannot describe a division the tool does not make. The
+    /// rows are the head of what matched and the counts are of what matched, which is the pairing
+    /// the note and the values both rest on.
+    fn capped_sample_list(filter: Option<&str>, limit: usize) -> structured::ModuleList {
         let pdb = |name: &str, base| win_kexp::dbgeng::Module {
             symbols: win_kexp::dbgeng::SymbolKind::Pdb,
             ..module(name, base)
@@ -5549,11 +5632,16 @@ mod tests {
                 })
                 .collect()
         };
+        let (matched, matched_unloaded) = (narrow(&loaded), narrow(&unloaded));
+        let (for_loaded, for_unloaded) =
+            split_row_budget(limit, matched.len(), matched_unloaded.len());
         structured::ModuleList {
             loaded: loaded.len(),
             filter: filter.map(module_pattern),
-            modules: narrow(&loaded),
-            unloaded: narrow(&unloaded),
+            matched: matched.len(),
+            unloaded_matched: matched_unloaded.len(),
+            modules: matched.into_iter().take(for_loaded).collect(),
+            unloaded: matched_unloaded.into_iter().take(for_unloaded).collect(),
         }
     }
 
@@ -5566,8 +5654,14 @@ mod tests {
     /// extra row, a missing row and a reordered one all fail.
     #[test]
     fn the_listing_names_exactly_the_modules_its_values_do() {
-        for filter in [None, Some("nt"), Some("nvhda"), Some("nosuchmodule")] {
-            let list = sample_list(filter);
+        // Every limit as well as every filter: a cap is a second way for the two halves to end up
+        // describing different sets, and it cuts the rows and the values in one place precisely so
+        // that it cannot. `0` is in the list because a caller may ask for the counts alone.
+        for (filter, limit) in [None, Some("nt"), Some("nvhda"), Some("nosuchmodule")]
+            .into_iter()
+            .flat_map(|filter| [usize::MAX, 2, 1, 0].map(|limit| (filter, limit)))
+        {
+            let list = capped_sample_list(filter, limit);
             let expected: Vec<(String, String)> = list
                 .modules
                 .iter()
@@ -5578,7 +5672,7 @@ mod tests {
             assert_eq!(
                 listed_rows(&text),
                 expected,
-                "the rows and the values disagree for `{filter:?}`:\n{text}"
+                "the rows and the values disagree for `{filter:?}` at limit {limit}:\n{text}"
             );
         }
     }
@@ -5662,12 +5756,14 @@ mod tests {
         let long = "api_ms_win_core_synch_l1_2_0";
         let list = structured::ModuleList {
             loaded: 2,
+            matched: 2,
             filter: None,
             modules: [module(long, 0x1000), module("nt", 0x2000)]
                 .iter()
                 .map(structured::ModuleInfo::from)
                 .collect(),
             unloaded: Vec::new(),
+            unloaded_matched: 0,
         };
         let text = render_modules(&list);
         assert!(text.contains(long), "a long name is printed whole:\n{text}");
@@ -5693,9 +5789,11 @@ mod tests {
         let listing = |filter: &str| {
             render_modules(&structured::ModuleList {
                 loaded: 227,
+                matched: 0,
                 filter: Some(module_pattern(filter)),
                 modules: Vec::new(),
                 unloaded: Vec::new(),
+                unloaded_matched: 0,
             })
         };
 
@@ -5774,12 +5872,14 @@ mod tests {
         let hostile = "drv\u{2028}0xfffff80389200000  0xfffff8038a650000  nt";
         let list = structured::ModuleList {
             loaded: 2,
+            matched: 2,
             filter: None,
             modules: [module(hostile, 0x1000), module("nt", 0x2000)]
                 .iter()
                 .map(structured::ModuleInfo::from)
                 .collect(),
             unloaded: Vec::new(),
+            unloaded_matched: 0,
         };
         let text = render_modules(&list);
         assert_eq!(
@@ -5817,12 +5917,14 @@ mod tests {
         let hostile = "[ntdll.dll](https://elsewhere)";
         let list = structured::ModuleList {
             loaded: 2,
+            matched: 2,
             filter: None,
             modules: [module(hostile, 0x1000), module("nt", 0x2000)]
                 .iter()
                 .map(structured::ModuleInfo::from)
                 .collect(),
             unloaded: Vec::new(),
+            unloaded_matched: 0,
         };
         let text = render_modules(&list);
 
@@ -5851,12 +5953,14 @@ mod tests {
         let hostile = "a```\n```elsewhere";
         let list = structured::ModuleList {
             loaded: 1,
+            matched: 1,
             filter: None,
             modules: [module(hostile, 0x1000)]
                 .iter()
                 .map(structured::ModuleInfo::from)
                 .collect(),
             unloaded: Vec::new(),
+            unloaded_matched: 0,
         };
         let text = render_modules(&list);
 
@@ -5943,6 +6047,106 @@ mod tests {
         assert!(
             note.contains("3 of 227 loaded") && note.contains("2 that have since **unloaded**"),
             "{note}"
+        );
+    }
+
+    /// **The cap does not touch the counts.** A listing cut to `limit` still says how many
+    /// matched, and says separately how many rows it printed — the row count quietly becoming the
+    /// match count would be #120's disagreement arrived at from the other side, with the text and
+    /// the values agreeing with each other and both wrong about the target.
+    #[test]
+    fn a_listing_cut_by_its_limit_says_so_and_still_counts_what_matched() {
+        // Three loaded and one unloaded in a budget of three: the unloaded row keeps its share,
+        // and the loaded half takes the rest.
+        let list = capped_sample_list(None, 3);
+        assert_eq!(
+            list.modules.len(),
+            2,
+            "the rows are the head of what matched"
+        );
+        assert_eq!(list.matched, 3, "and the count is still of what matched");
+        assert_eq!(list.loaded, 3);
+        assert_eq!(list.unloaded.len(), 1, "the other half kept its share");
+
+        let text = render_modules(&list);
+        assert_eq!(
+            listed_rows(&text).len(),
+            3,
+            "two loaded rows and the unloaded one, which the budget had room for:\n{text}"
+        );
+        assert!(
+            text.contains("3 module(s) loaded"),
+            "the inventory is what it always was:\n{text}"
+        );
+        assert!(
+            text.contains("Showing the first 2 row(s)"),
+            "and the listing says it is a part of it:\n{text}"
+        );
+        assert!(
+            text.contains("raise `limit`"),
+            "an answer that stops short names the argument that undoes it:\n{text}"
+        );
+
+        // Nothing was cut, so nothing is said about a cut: the note a caller reads on every
+        // ordinary filtered call is the one it always was.
+        let whole = render_modules(&sample_list(Some("nt")));
+        assert!(
+            !whole.contains("limit"),
+            "an uncut listing says nothing about the cap:\n{whole}"
+        );
+    }
+
+    /// One budget across both halves, and **neither half may be squeezed out of it** — the same
+    /// rule the diagnostics listing keeps, for the same reason: spending the budget in print order
+    /// would let a two-hundred-row loaded table erase the unloaded rows, and "no loaded module
+    /// matches, but twenty-six unloaded images do" is the whole reason that list is carried.
+    #[test]
+    fn one_budget_is_shared_between_the_halves_and_each_is_reported_on_its_own() {
+        // The shape the rule exists for: far more loaded rows than budget, and a tail a listing
+        // that simply printed until it ran out would never reach.
+        assert_eq!(
+            split_row_budget(64, 213, 26),
+            (38, 26),
+            "the smaller half whole, the larger half takes the rest — and 64 rows in all"
+        );
+        assert_eq!(
+            split_row_budget(64, 213, 0),
+            (64, 0),
+            "a listing with nothing unloaded spends the whole budget on the rows it has"
+        );
+
+        let cut_tail = structured::ModuleList {
+            loaded: 227,
+            matched: 1,
+            filter: Some(module_pattern("nvhda")),
+            modules: [module("nvhda64v", 0x1000)]
+                .iter()
+                .map(structured::ModuleInfo::from)
+                .collect(),
+            unloaded: [unloaded_module("nvhda64v.sys", 0x2000)]
+                .iter()
+                .map(structured::ModuleInfo::from)
+                .collect(),
+            unloaded_matched: 26,
+        };
+        let text = render_modules(&cut_tail);
+        assert!(
+            text.contains("26 that have since **unloaded**"),
+            "the unloaded count is of what matched, not of what fitted:\n{text}"
+        );
+        assert!(
+            text.contains("Showing the first 1 unloaded row(s)"),
+            "and only the half that was cut is reported as cut:\n{text}"
+        );
+
+        let both = structured::ModuleList {
+            matched: 227,
+            ..cut_tail
+        };
+        let text = render_modules(&both);
+        assert!(
+            text.contains("Showing the first 1 loaded and 1 unloaded row(s)"),
+            "both halves cut is one sentence naming both:\n{text}"
         );
     }
 

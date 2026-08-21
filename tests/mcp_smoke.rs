@@ -3584,8 +3584,16 @@ fn engine_resolves_kernel_symbols(server: &mut Server, session_id: &str) -> bool
 }
 
 /// The `nt` record out of `modules`, which both probes above start from.
+///
+/// Filtered rather than read out of the whole table, because the table is capped at `limit` rows
+/// and `nt` is nowhere in particular in it — a probe that depends on the kernel falling inside the
+/// first page of a listing would stand the tier down for a reason that is not about symbols.
 fn nt_module(server: &mut Server, session_id: &str) -> Option<Value> {
-    let modules = server.tool_data("modules", json!({ "session_id": session_id }), TARGET_STEP);
+    let modules = server.tool_data(
+        "modules",
+        json!({ "session_id": session_id, "filter": "nt" }),
+        TARGET_STEP,
+    );
     modules["modules"]
         .as_array()
         .into_iter()
@@ -3855,7 +3863,11 @@ fn a_dump_session_opens_reads_and_closes() {
     // Read as module *records*, not as tokens on a rendered row: `lm` lays its columns out from
     // the address width and the longest module name, so the third-token rule this replaces
     // failed on a layout shift and named the wrong cause.
-    let modules = server.tool_data("modules", json!({ "session_id": session_id }), TARGET_STEP);
+    let modules = server.tool_data(
+        "modules",
+        json!({ "session_id": session_id, "limit": 2000 }),
+        TARGET_STEP,
+    );
     let by_name = |want: &str| -> Value {
         modules["modules"]
             .as_array()
@@ -3883,6 +3895,10 @@ fn a_dump_session_opens_reads_and_closes() {
         modules["loaded"].as_u64().unwrap_or_default() as usize,
         modules["modules"].as_array().map_or(0, Vec::len),
         "the count and the list have to be the same walk: {modules}"
+    );
+    assert_eq!(
+        modules["matched"], modules["loaded"],
+        "nothing was filtered and nothing was cut, so every count is the same one: {modules}"
     );
 
     // Registers come back as values too, with the instruction pointer called out.
@@ -4232,7 +4248,11 @@ fn an_open_summarises_the_target_instead_of_listing_its_modules() {
 
     // The inventory, from the tool that owns it. Nothing loads between the two calls in a dump,
     // so the counts are comparable — and they are the same walk, not two renderings of one.
-    let modules = server.tool_data("modules", json!({ "session_id": session_id }), TARGET_STEP);
+    let modules = server.tool_data(
+        "modules",
+        json!({ "session_id": session_id, "filter": "nt" }),
+        TARGET_STEP,
+    );
     let loaded = modules["loaded"].as_u64().unwrap_or_default();
     assert!(
         loaded > 20,
@@ -4359,7 +4379,9 @@ fn tool_results_stay_within_their_budget() {
         ("registers", json!({}), 13_500, 14_500),
         ("backtrace", json!({}), 3_000, 4_000),
         ("disassemble", json!({}), 4_000, 6_000),
-        ("modules", json!({}), 73_000, 100_000),
+        // One page of rows rather than the whole table since the row cap landed — the ceiling
+        // moved 73,000 -> 24,000 with it, and is the figure that would catch the cap being lost.
+        ("modules", json!({}), 24_000, 32_000),
         ("execute", json!({ "command": "lm" }), 27_000, 28_500),
     ];
 
@@ -4516,10 +4538,9 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
         "the listing says how big it is:\n{text}"
     );
     // The other half of what `lm` prints, carried as values rather than described in prose.
-    let every_unloaded = all["unloaded"]
-        .as_array()
-        .expect("the unloaded tail is a list, empty or not")
-        .len();
+    // Counted from `unloaded_matched` rather than from the rows: the rows are a page of that half,
+    // and what a later filter is compared against is how many there were.
+    let every_unloaded = all["unloaded_matched"].as_u64().unwrap_or_default();
     assert!(
         every_unloaded > 0,
         "this kernel dump carries unloaded modules; `lm` prints them: {all}"
@@ -4584,14 +4605,19 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
         "the kernel itself matches `nt`: {narrowed}"
     );
     assert!(
-        text.contains(&format!("{} of {loaded}", matched.len())),
+        text.contains(&format!(
+            "{} of {loaded}",
+            narrowed["matched"].as_u64().unwrap_or_default()
+        )),
         "the text says how much of the table this is:\n{text}"
     );
 
     // `*` is the same listing as no filter at all — the wildcard path and the plain path agree.
+    // Asked for whole, because that is the claim: `limit` is a separate decision from `filter`,
+    // and two listings cut to the same 64 rows would agree without saying anything.
     let everything = server.tool_data(
         "modules",
-        json!({ "session_id": session_id, "filter": "*" }),
+        json!({ "session_id": session_id, "filter": "*", "limit": 2000 }),
         TARGET_STEP,
     );
     assert_eq!(
@@ -4659,7 +4685,8 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
         .as_array()
         .expect("the unloaded half is a list");
     assert!(
-        !matched_unloaded.is_empty() && matched_unloaded.len() < every_unloaded,
+        !matched_unloaded.is_empty()
+            && gone["unloaded_matched"].as_u64().unwrap_or_default() < every_unloaded,
         "the filter narrows the unloaded half too, to some of the {every_unloaded} rows: {gone}"
     );
     for module in matched_unloaded {
@@ -4683,7 +4710,7 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
     assert!(
         text.contains(&format!(
             "{} that have since **unloaded** do",
-            matched_unloaded.len()
+            gone["unloaded_matched"].as_u64().unwrap_or_default()
         )),
         "matching only unloaded modules is a finding, not a miss:\n{text}"
     );
@@ -4753,6 +4780,132 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
     assert_eq!(after["loaded"].as_u64(), Some(loaded), "{after}");
 }
 
+/// **What one `modules` call costs the caller, and what a cut listing still tells them.**
+///
+/// The whole table was this server's largest single answer — ~54 KB of JSON for "which drivers are
+/// loaded", a fifth of a whole tool surface, and on a local model a turn of prefill measured in
+/// minutes rather than the window it also fills (`docs/local-model.md`). So the default listing is
+/// a page of it, and the three things that keeps honest are asserted here against a real dump:
+/// the totals do not move, the text says the rows are a page, and the whole table is still one
+/// argument away.
+///
+/// The saving is asserted as a *ratio* rather than as bytes, since the byte figures move with what
+/// the runner resolves — a PDB identity per row is the largest thing on a row — while the shape of
+/// the claim does not. Both are printed under `--nocapture`, against the same dump
+/// `docs/token-budget.md` records its baseline on, so the page and that table read together.
+#[test]
+fn a_module_listing_is_a_page_of_the_table_and_says_so() {
+    let Some(dump) = target_tier() else { return };
+    let mut server = Server::started();
+    let session_id = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+
+    let whole = server.call_tool(
+        "modules",
+        json!({ "session_id": session_id, "limit": 2000 }),
+        TARGET_STEP,
+    );
+    assert_no_error(&whole, "modules with the cap raised");
+    let table = whole["result"]["structuredContent"].clone();
+    let loaded = table["loaded"].as_u64().unwrap_or_default();
+    assert!(
+        loaded > 64,
+        "this claim is about a table that does not fit in one page; got {loaded} modules"
+    );
+    assert_eq!(
+        table["modules"].as_array().map_or(0, Vec::len) as u64,
+        loaded,
+        "the cap raised past the table is the whole table: {table}"
+    );
+
+    let page = server.call_tool("modules", json!({ "session_id": session_id }), TARGET_STEP);
+    assert_no_error(&page, "modules");
+    let first = page["result"]["structuredContent"].clone();
+    let rows = |listing: &Value| -> usize {
+        ["modules", "unloaded"]
+            .iter()
+            .map(|half| listing[half].as_array().map_or(0, Vec::len))
+            .sum()
+    };
+    assert_eq!(
+        rows(&first),
+        64,
+        "a caller who names no `limit` gets one page of rows, counted across both halves: {first}"
+    );
+    assert!(
+        first["unloaded"]
+            .as_array()
+            .is_some_and(|half| !half.is_empty()),
+        "and the half that can name a driver no longer there is not squeezed out of it by the \
+         two hundred loaded rows: {first}"
+    );
+
+    // The counts are of the target, not of the page — the one thing a truncated inventory must
+    // not get wrong, because a caller reads them as "what is loaded".
+    assert_eq!(first["loaded"].as_u64(), Some(loaded), "{first}");
+    assert_eq!(
+        first["matched"].as_u64(),
+        Some(loaded),
+        "nothing was filtered, so every loaded module matched: {first}"
+    );
+    assert_eq!(
+        first["unloaded_matched"], table["unloaded_matched"],
+        "and the unloaded half is counted the same way in both: {first}"
+    );
+
+    // The text says the same thing, and names the argument that undoes it.
+    let text = text_of(&page["result"]);
+    assert!(
+        text.contains(&format!("{loaded} module(s) loaded")),
+        "the inventory is still what the note reports:\n{text}"
+    );
+    assert!(
+        // Whether the unloaded half was cut as well depends on how many this dump carries, and
+        // the sentence names both halves only when both were — so the assertion is on the count
+        // that is always there, which is the loaded rows this page actually printed.
+        text.contains(&format!(
+            "Showing the first {}",
+            first["modules"].as_array().map_or(0, Vec::len)
+        )) && text.contains("raise `limit`"),
+        "a listing that stops short says so, and says how to get the rest:\n{text}"
+    );
+    assert_eq!(
+        listed_rows(&text),
+        valued_rows(&first),
+        "the page's rows and its values are still one set of records:\n{text}"
+    );
+
+    // What it bought, in both channels the budget test above measures: what a model is charged
+    // (`structuredContent`, which replaces the text for a client that reads it) and what every
+    // client pays on the wire.
+    let (paged, everything) = (json_bytes(&page["result"]), json_bytes(&whole["result"]));
+    let (paged_model, model_everything) = (json_bytes(&first), json_bytes(&table));
+    assert!(
+        paged * 2 < everything,
+        "the default listing has to be a fraction of the table it is a page of, or the cap is \
+         costing callers an argument for nothing: {paged} B against {everything} B"
+    );
+    // Printed, because this is the figure the cap exists for and it is different on every host —
+    // the budget table above records what a call costs, and this records what it saved.
+    eprintln!(
+        "\n  modules: {paged_model} B model / {paged} B wire for the default page, against \
+         {model_everything} B / {everything} B for all {loaded} modules\n"
+    );
+
+    // And an explicit `limit` is honoured on the way down as well as up, so a caller working in a
+    // very small window can ask for a very small answer.
+    let five = server.tool_data(
+        "modules",
+        json!({ "session_id": session_id, "limit": 5 }),
+        TARGET_STEP,
+    );
+    assert_eq!(rows(&five), 5, "{five}");
+    assert_eq!(
+        five["matched"].as_u64(),
+        Some(loaded),
+        "a smaller page is still a page of the same table: {five}"
+    );
+}
+
 /// An address that is unmapped on **any** Windows target, so a hole needs no knowledge of this
 /// particular dump.
 ///
@@ -4787,8 +4940,14 @@ fn a_walk_marks_what_it_cannot_read_and_keeps_going() {
     // The two anchors of a kernel dump's module list, used as addresses that certainly *are*
     // readable — the alternative is a literal, and a literal would make this test a fact about
     // one file.
-    let modules = server.tool_data("modules", json!({ "session_id": session_id }), TARGET_STEP);
-    let base = |want: &str| -> String {
+    let mut base = |want: &str| -> String {
+        // Asked for by name rather than looked for in the whole table, which is a page of rows
+        // now — and `nt` is nowhere in particular in it.
+        let modules = server.tool_data(
+            "modules",
+            json!({ "session_id": session_id, "filter": want }),
+            TARGET_STEP,
+        );
         modules["modules"]
             .as_array()
             .into_iter()
@@ -9807,7 +9966,11 @@ fn a_messagemanager_ctf_fixture_is_visible_through_mcp() {
         // Matched against module *names*, not against a substring of the whole `lm` listing:
         // "messagemanager appears somewhere in that text" was true of a symbol path echoed into
         // the same output, which is the kind of accidental pass a field cannot give.
-        let modules = server.tool_data("modules", json!({ "session_id": session }), TARGET_STEP);
+        let modules = server.tool_data(
+            "modules",
+            json!({ "session_id": session, "filter": "MessageManager" }),
+            TARGET_STEP,
+        );
         let driver = modules["modules"]
             .as_array()
             .into_iter()
@@ -9823,7 +9986,11 @@ fn a_messagemanager_ctf_fixture_is_visible_through_mcp() {
             "the fixture reported ready, but KD does not list MessageManager.sys after the full \
              module reload:\n{}\n\nsymbol setup said:{}",
             text_of(
-                &server.call_tool("modules", json!({ "session_id": session }), TARGET_STEP)["result"]
+                &server.call_tool(
+                    "modules",
+                    json!({ "session_id": session, "limit": 2000 }),
+                    TARGET_STEP
+                )["result"]
             ),
             symbols.transcript
         );
