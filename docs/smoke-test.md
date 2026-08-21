@@ -310,14 +310,56 @@ user-mode process jumped into memory that is not executable, and the kernel bug-
 because every clone carries it for ever.
 
 What it adds is an **ARM64 `_EPROCESS`, an ARM64 image's headers and an ARM64 stack's frames**,
-read through the same three claims the x64 samples make. The fourth claim — attributing a frame to
-a third-party driver — is still asserted only against an x64 stack, because there is no ARM64
-driver crash to assert it on; that is [#154](https://github.com/glslang/windbg-mcp/issues/154), and
-it needs a crash produced rather than a sample found. It also pins the one branch of the process
+read through the same three claims the x64 samples make. It also pins the one branch of the process
 read that nothing else reaches: this dump does not capture the pool page `SeAuditProcessCreationInfo`
 points at, so the engine falls back to the 15-byte `_EPROCESS::ImageFileName` and the answer is the
 truncated `stack_buffer_o` — the fallback that the driver crash above, with its full
 `mm_exploit_v5.exe`, exists to prefer.
+
+**A fourth dump, because the fourth claim had never run on an ARM64 stack.** Attributing a frame
+to a third-party driver — turning a captured frame into `module+RVA` off the load base — was
+asserted only against x64 frames until
+[#154](https://github.com/glslang/windbg-mcp/issues/154). The ARM64 sample above cannot stand in:
+its `0xFC` is a fault at the *user-mode* payload, so its faulting frame is in no module at all,
+which is the opposite shape. That needed a crash produced rather than a sample found, and the
+producing turned out to be the hard part.
+
+[`docs/samples/082126-7015-01.dmp`](samples/082126-7015-01.dmp) is a
+`0x139 KERNEL_SECURITY_CHECK_FAILURE` off the same ARM64 debuggee, with HEVD loaded.
+**Every obvious trigger fails to crash it**, and the reason is worth recording because it costs an
+afternoon otherwise: HEVD wraps its triggers in `__try/__except`, so a kernel-mode access violation
+is caught and returned as a status. Its null dereference returns `STATUS_ACCESS_VIOLATION` and the
+machine runs on; its non-paged pool overflow returns success; its use-after-free double free
+returns success twice and is detected minutes later on a heap-maintenance worker thread, as a
+`0x13A` whose stack is `nt`-only — no driver frame anywhere, which is exactly the fixture this one
+is not.
+
+What SEH cannot catch is a **fail fast**. `HEVD_IOCTL_BUFFER_OVERFLOW_STACK_GS` compiles its
+trigger with `/GS`, so overrunning the stack buffer corrupts the cookie and the driver's own
+`__report_gsfailure` runs `mov w0, #2; brk #0xf003` — the ARM64 spelling of
+`__fastfail(FAST_FAIL_STACK_COOKIE_CHECK_FAILURE)`. The bug check is raised **inside the driver**,
+and the faulting frame is `HEVD+0x10dc`, that instruction's fixed offset in a fixed image.
+
+Reproducing it takes one call, through this repo's own harness, on the debuggee:
+
+```pwsh
+$hex = '41' * 1024   # the buffer is far shorter; the cookie is what matters
+.\tools\ioctl_harness.ps1 -Device \\.\HackSysExtremeVulnerableDriver -Code 0x222007 -InputHex $hex
+```
+
+`0x222007` was read out of the driver's own dispatch rather than taken from HEVD's headers, and
+that check earned its keep: this build's IOCTL codes are not the ones the widely-quoted list gives,
+and the code that list calls the null dereference is `FREE_UAF_OBJECT` here. `decode_ioctl` and the
+dispatch walk in `CLAUDE.md` are how to redo it against another build.
+
+**The two driver crashes are asserted on every host, not paired by architecture** — the one place
+this suite deliberately does not pair. An engine that resolves symbols reads either dump either way
+round, so pairing them would mean an ARM64 runner stopped reading the x64 crash it reads today:
+trading one architecture's coverage for the other's rather than adding it. What the pair covers
+that neither does alone is `!analyze`. `MessageManager` has no PDB, so `!analyze` calls the crash
+`Unknown_Module` and the computed frame is the only thing that names the driver. `HEVD` ships a
+PDB, so `!analyze` blames it by name and the computed frame is checked against an independent
+answer instead.
 
 Those checks are made against **typed fields** wherever a tool has them (issue #84): the handle is
 read from `structuredContent`, not from a `session_id:` line; `nt` and `hal` are matched as module

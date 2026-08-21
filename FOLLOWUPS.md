@@ -813,28 +813,41 @@ differ, and that difference alone produced the asymmetry.
 stand-down appears in the output; without that, a copy that stopped working would read exactly like
 a green run — which is the shape of failure this whole item is about.
 
-## 26. [windbg-mcp] No ARM64 driver crash, so frame attribution is asserted only on x64 stacks
+## 26. [windbg-mcp] No ARM64 driver crash, so frame attribution is asserted only on x64 stacks — **done** (2026-08-21, #154)
 
-`a_driver_crash_names_the_driver_frame_that_analyze_cannot` opens the x64 `MessageManager` dump on
-every architecture. It passes there — an engine with symbols reads either dump either way round —
-but the arithmetic that turns a captured frame into `module+RVA` off the load base has never been
+`a_driver_crash_names_the_driver_frame_that_analyze_cannot` opened the x64 `MessageManager` dump on
+every architecture. It passed there — an engine with symbols reads either dump either way round —
+but the arithmetic that turns a captured frame into `module+RVA` off the load base had never been
 run against an **ARM64** stack. #143 closed the other three assertions this way and left this one.
 
-- **Why deferred:** it needs a crash to be produced rather than a sample to be found, and the two
-  obvious candidates are already ruled out. The checked-in ARM64 sample and every one of its
-  siblings on that bench are `0xFC` faults at a *user-mode payload* — HEVD's stack-overflow client
-  with an incomplete ROP chain, so nothing disables privileged execution of a user page and the
-  stack carries no `HEVD` frame at all. Completing that chain would remove the crash rather than
-  reshape it.
-- **What it needs:** an HEVD path that faults **inside** the driver (null dereference, pool
-  corruption), plus a few lines of client to send that IOCTL — `hevd-exp` on the bench holds only
-  the stack-overflow one. The driver itself loads again as of 2026-08-18 (`testsigning` on, its
-  certificate in `LocalMachine\Root`; see `CLAUDE.md`).
-- **One decision first:** `HEVD.pdb` ships beside the driver, so its frame *will* symbolize if that
-  PDB is reachable — the opposite of the x64 assertion, which pins `symbol` absent because
-  `MessageManager` has no PDB. Either keep the PDB off the path so both tests make one claim, or
-  assert the symbolized form and let the pair cover both.
-- **Picks up at** [#154](https://github.com/glslang/windbg-mcp/issues/154).
+**What it needed was a crash produced, and producing it was the whole difficulty.** HEVD wraps its
+triggers in `__try/__except`, so every access violation it can raise is caught and returned as a
+status: the null dereference returns `STATUS_ACCESS_VIOLATION` with the machine still running, the
+non-paged pool overflow returns success, and the UAF double free returns success *twice* and is
+detected minutes later on a heap-maintenance worker thread — a `0x13A` whose stack is `nt`-only,
+which is precisely the fixture this was not looking for. What SEH cannot catch is a **fail fast**:
+`HEVD_IOCTL_BUFFER_OVERFLOW_STACK_GS` compiles its trigger with `/GS`, so overrunning the buffer
+corrupts the cookie and the driver's own `__report_gsfailure` raises
+`0x139 KERNEL_SECURITY_CHECK_FAILURE` from `mov w0, #2; brk #0xf003`. `docs/samples/082126-7015-01.dmp`.
+
+**The decision the entry said to make first went the other way, and the fixture decided it.**
+`HEVD.pdb` ships beside the driver, so the entry expected to choose between keeping the PDB off the
+symbol path and asserting the symbolized form. What the capture showed is that the interesting
+disagreement is not `symbol` but **`!analyze`**: it names `HEVD` by name, where it calls the
+PDB-less `MessageManager` crash `Unknown_Module`. So the pair covers both — for one fixture the
+computed frame is the *only* thing that names the driver, and for the other it is checked against
+an independent answer.
+
+**And the test is not paired by architecture, which is what the entry proposed.** It is a table run
+on every host. Pairing would have meant an ARM64 runner stopped reading the x64 crash it reads
+today, trading one architecture's coverage for the other's rather than adding it.
+
+Three faults in `tools/ioctl_harness.ps1` came out of using it for this, all of them Windows
+PowerShell 5.1-only and each fatal before an IOCTL was sent: em dashes in a BOM-less UTF-8 file
+(decoded in the ANSI code page, so `—` ended a string), `0x80000000` read as a negative Int32 for
+the access mask, and an empty `-InputHex` returning `$null` because the pipeline unrolls an empty
+array. All three are fixed; a 7-only tool that documents itself as needing no compiler was not
+much use on a target that has only 5.1.
 
 ## 27. [windbg-mcp + win-kexp] A deferred module reports no PDB identity — **measured and declined** (2026-08-20)
 

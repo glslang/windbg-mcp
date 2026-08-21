@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Driver-frame attribution is now asserted on an ARM64 stack as well**
+  ([#154](https://github.com/glslang/windbg-mcp/issues/154)). A `0x139` crash raised inside HEVD by
+  its own stack-cookie fail fast is checked in as `docs/samples/082126-7015-01.dmp`, and the smoke
+  tier's driver-crash test became a table run over every checked-in driver crash on every host.
+  The pair also covers `!analyze` both ways round: it cannot name the PDB-less `MessageManager`,
+  and does name `HEVD`.
+
 - **CI runs the debugger tier on the new ARM64 runner image as well.** GitHub's Visual Studio 2026
   ARM64 image went generally available on 2026-08-20 as `windows-11-vs2026-arm`, and the
   `windows-11-arm` label migrates onto it between 21 and 30 September 2026. The tier's ARM64 half
@@ -32,6 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   This also retires the claim that Windows ships no `symsrv.dll` outside the Debugging Tools. It
   holds on ARM64 and does not hold on the x64 runner image.
+
+### Fixed
+
+- **`tools/ioctl_harness.ps1` could not run under Windows PowerShell 5.1**, which is the only
+  PowerShell a stock debuggee has. Three faults, each fatal before an IOCTL was sent: em dashes in
+  a BOM-less UTF-8 file (5.1 decodes such a file in the ANSI code page, so `—` became a string
+  terminator and the parse failed tens of lines later), `0x80000000` read as a negative `Int32` so
+  the access mask was refused by `CreateFileW`, and the default empty `-InputHex` returning `$null`
+  because the pipeline unrolls an empty array - so an IOCTL taking no input buffer could not be
+  sent at all.
 
 ## [0.10.0] - 2026-08-20
 
