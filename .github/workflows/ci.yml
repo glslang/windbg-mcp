@@ -149,6 +149,63 @@ jobs:
           WINDBG_MCP_SMOKE_DUMP: "1"
         run: cargo test --test mcp_smoke -- --nocapture
 
+  # TEMPORARY (issue #153): answers the two probes that decide whether the ARM64 entry's
+  # symbol-less engine is an image difference or something this repo can fix in the workflow.
+  # Delete once #153 is settled.
+  probe-symbols:
+    name: Probe symbols (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: windows-latest
+          - arch: arm64
+            runner: windows-11-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - name: Where the engine and its symbol halves come from
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Write-Host "=== PROCESSOR_ARCHITECTURE: $env:PROCESSOR_ARCHITECTURE"
+          Write-Host "=== _NT_SYMBOL_PATH: '$env:_NT_SYMBOL_PATH'"
+
+          Write-Host "`n=== Windows Kits Debuggers directory"
+          $kits = 'C:\Program Files (x86)\Windows Kits\10\Debuggers'
+          if (Test-Path $kits) {
+            Get-ChildItem $kits | Select-Object -ExpandProperty Name
+            foreach ($d in Get-ChildItem $kits -Directory) {
+              Write-Host "--- $($d.FullName)"
+              Get-ChildItem $d.FullName -Filter '*.dll' |
+                Select-Object Name, Length | Format-Table -AutoSize | Out-String | Write-Host
+            }
+          } else {
+            Write-Host "ABSENT: $kits"
+          }
+
+          Write-Host "`n=== where.exe"
+          foreach ($dll in 'symsrv.dll', 'dbghelp.dll', 'dbgeng.dll', 'dbgcore.dll', 'dbgmodel.dll', 'msdia140.dll') {
+            $found = & where.exe $dll 2>&1
+            if ($LASTEXITCODE -eq 0) { Write-Host "$dll ->"; $found | ForEach-Object { Write-Host "    $_" } }
+            else { Write-Host "$dll -> NOT ON PATH" }
+          }
+
+          Write-Host "`n=== every symsrv.dll / dbgeng.dll under the roots that could hold one"
+          $roots = 'C:\Windows\System32', 'C:\Windows\SysWOW64', 'C:\Program Files', 'C:\Program Files (x86)'
+          foreach ($dll in 'symsrv.dll', 'dbgeng.dll', 'msdia140.dll') {
+            foreach ($root in $roots) {
+              if (-not (Test-Path $root)) { continue }
+              Get-ChildItem -Path $root -Filter $dll -Recurse -File -ErrorAction SilentlyContinue |
+                Select-Object -First 20 |
+                ForEach-Object { Write-Host ("{0,10}  {1}  {2}" -f $_.Length, $_.VersionInfo.FileVersion, $_.FullName) }
+            }
+          }
+
+          Write-Host "`n=== PATH entries naming a kit or a debugger"
+          $env:PATH -split ';' | Where-Object { $_ -match 'Windows Kits|Debugg' } | ForEach-Object { Write-Host "    $_" }
+
   docs:
     name: Documentation lint
     runs-on: ubuntu-latest
