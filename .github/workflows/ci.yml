@@ -96,9 +96,10 @@ jobs:
     # separately because they fail apart — this entry is where that was learned, by reading a
     # module base and then failing a stack walk. That, and not the architecture pairing it was
     # first read as, is issue #142. What decides whether a runner resolves anything is
-    # `symsrv.dll`, and the two images differ in whether they have one: that is what the copy step
-    # below is for, and why it runs on one entry only (issue #153). Those four print `SKIPPED`
-    # with the reason where it happens, so a green run here never claims more than it checked.
+    # `symsrv.dll`, and the images differ in whether they have one: that is what the copy step
+    # below is for, and why it runs on the ARM64 entries only (issue #153). Those four print
+    # `SKIPPED` with the reason where it happens, so a green run here never claims more than it
+    # checked.
     #
     # Only this tier is matrixed. The crate is architecture-independent Rust, so `fmt`, clippy and
     # the unit tests in `build` have no reason to differ and a second entry there would buy runtime
@@ -107,6 +108,8 @@ jobs:
     strategy:
       # An ARM64 failure must not cancel the x64 run: x64 is the result this repo has trusted for
       # every release, and a new runner label is exactly the thing most likely to be flaky first.
+      # For the same reason neither ARM64 entry may cancel the other — the whole point of running
+      # both images is to see which of them a failure belongs to.
       fail-fast: false
       matrix:
         include:
@@ -122,6 +125,23 @@ jobs:
           - arch: arm64
             runner: windows-11-arm
             suffix: ", arm64"
+          # The image behind `windows-11-arm` is being replaced under it. The Visual Studio 2026
+          # ARM64 image went generally available on 2026-08-20 as `windows-11-vs2026-arm`, and
+          # GitHub migrates the `windows-11-arm` label onto it between 21 and 30 September 2026.
+          # What that changes for this job is not the compiler — the crate is Rust, and the x64
+          # entry has been building against a VS2026 image ever since `windows-latest` migrated —
+          # but the **OS build**, and with it the inbox `dbgeng.dll` that this entry exists to
+          # load: 10.0.26200.9168 against .8875 when this was written. So run the new label now,
+          # while the old one is still beside it to compare against. A break that only the new
+          # image has is one this repo would otherwise meet on the migration date, on every PR at
+          # once, with nothing green next to it to say which half moved.
+          #
+          # This entry has an expiry: once the migration completes, the two labels name the same
+          # image and the pair buys a second run of the same thing. Drop the older entry then
+          # (`FOLLOWUPS.md` item 32).
+          - arch: arm64
+            runner: windows-11-vs2026-arm
+            suffix: ", arm64 vs2026"
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
@@ -138,9 +158,11 @@ jobs:
       - name: Cache cargo registry and build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          # Keyed by architecture, or the two entries share one cache and each restores the
-          # other's target directory — objects for the wrong triple, rebuilt every run at best.
-          key: ${{ matrix.arch }}
+          # Keyed by runner label rather than by architecture, or entries share one cache and
+          # each restores another's target directory — objects for the wrong triple across the two
+          # architectures, and a target directory linked by a different MSVC across the two ARM64
+          # images. Rebuilt every run at best.
+          key: ${{ matrix.runner }}
 
       # `cargo test` builds this itself; doing it as its own step is what gives the copy below
       # somewhere to copy *to*.
@@ -154,6 +176,12 @@ jobs:
       # of the four stands down. Both images do carry the Debugging Tools, so the half that is
       # missing is already on the runner's disk.
       #
+      # It runs on **both** ARM64 entries, and what `windows-11-vs2026-arm`'s System32 holds was
+      # never measured — deliberately. Copying makes the entry not depend on the answer, which is
+      # the property worth having across an image migration: the one thing that must stay the
+      # runner's own is `dbgeng.dll`, and that is what the next paragraph is about. If the new
+      # image turns out to ship a `symsrv.dll` of its own, this step costs it two file copies.
+      #
       # `dbgeng.dll` is deliberately **not** copied. The entry goes on loading the image's own
       # engine, which is the claim it was matrixed for (issue #134) and the one this repo wants to
       # hear about breaking; what it gains is the symbol half, which was measured on this
@@ -163,6 +191,11 @@ jobs:
       - name: Give the ARM64 engine its symbol half (issue #153)
         if: matrix.arch == 'arm64'
         shell: pwsh
+        env:
+          # Through the environment rather than interpolated into the script: the value is a
+          # literal from the matrix above, but a step that reads workflow expressions as PowerShell
+          # source is a habit worth not having.
+          RUNNER_IMAGE: ${{ matrix.runner }}
         run: |
           $kit = 'C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64'
           foreach ($dll in 'dbghelp.dll', 'symsrv.dll') {
@@ -170,7 +203,7 @@ jobs:
             if (-not (Test-Path $from)) {
               # A red build is the point: the runner image stopped shipping the Debugging Tools,
               # and this entry is back to asserting nothing about reading a target.
-              throw "$from is missing - the ARM64 image no longer carries the Debugging Tools"
+              throw "$from is missing - the $env:RUNNER_IMAGE image no longer carries the Debugging Tools"
             }
             Copy-Item $from 'target\debug' -Force
             Write-Host "copied $dll beside the binary under test"

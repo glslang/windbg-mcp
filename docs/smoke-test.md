@@ -38,10 +38,20 @@ all.
 The protocol tier rides `cargo test`, so CI already runs it. The debugger tier is opt-in
 *locally* but runs on every push and PR in CI, as the **Smoke test (debugger tier)** job — it is
 the only automated check of the properties process-per-session exists for, and it needs no symbols
-and no network. It runs **twice, on x64 and on ARM64** (`windows-11-arm`), because the thing it
+and no network. It runs **three times: on x64 and on both ARM64 images**, because the thing it
 exercises that nothing else does is a real `dbgeng.dll`, and there is a different one on each
-([#134](https://github.com/glslang/windbg-mcp/issues/134)). The two entries do not share a cargo
-cache, and an ARM64 failure does not cancel the x64 run.
+([#134](https://github.com/glslang/windbg-mcp/issues/134)). No two entries share a cargo
+cache — the key is the runner label, not the architecture — and no entry's failure cancels
+another's.
+
+The two ARM64 entries are `windows-11-arm` and `windows-11-vs2026-arm`, and the pair is temporary.
+The Visual Studio 2026 ARM64 image went generally available on 2026-08-20, and GitHub migrates the
+`windows-11-arm` label onto it between 21 and 30 September 2026 — so for now the two labels are two
+*OS builds*, which for this job means two inbox `dbgeng.dll`s, and running both is what makes a
+break attributable to the image rather than to the change under review. Once the migration
+completes they are one image and the older entry should go (`FOLLOWUPS.md` item 32). The x64 entry
+needs no such pairing: `windows-latest` has been the Visual Studio 2026 Windows Server 2025 image
+since its own migration.
 
 **Four of its assertions read the target's memory rather than the dump's structure, and they stand
 down on a host whose engine cannot.** A kernel dump's virtual addresses are translated through
@@ -75,8 +85,10 @@ an inbox component, which is why its stock engine resolves symbols with `_NT_SYM
 images do carry the Debugging Tools, `symsrv.dll` included, so on the ARM64 entry the missing half
 was already on disk — the job copies the kit's `dbghelp.dll` and `symsrv.dll` beside the binary
 under test and leaves `dbgeng.dll` stock, so what that entry exercises is still the image's own
-engine. Read any blanket statement about what "Windows ships" in this repo with that measurement
-in mind.
+engine. The copy runs on the `windows-11-vs2026-arm` entry too, without that image's System32
+having been probed: copying is what makes the entry independent of the answer, which is worth more
+across an image migration than a measurement a migration can invalidate. Read any blanket statement
+about what "Windows ships" in this repo with that measurement in mind.
 
 So they **ask the host** instead of guessing from `cfg!(target_arch)`, and each asks for the
 premise it actually has. `walk_memory` and the batch work on numeric addresses, so they need only
