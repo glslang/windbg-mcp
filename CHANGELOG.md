@@ -40,9 +40,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   client is refused: a listener with no credentials will not start, and `--uninstall-service` is the
   command that means "stop serving".
 
-  A reload that cannot read the file **changes nothing** — the set is only ever replaced by one that
-  would have started this listener from cold, so a typo is a loud log line and a service still
-  serving, rather than every client locked out of a live kernel target.
+  The command **waits for the reload**, so the set in force when it returns is the set it wrote — the
+  control handler blocks on the reload task's answer and reports a failed re-read as a failed
+  control code. A reload that cannot read the file **changes nothing**: the set is only ever
+  replaced by one that would have started this listener from cold, so a typo is a loud log line and
+  a service still serving, rather than every client locked out of a live kernel target. That failure
+  is reported as an **error** for a `--remove` or `--rotate`, whose whole point is that a credential
+  stops being accepted, and as a warning for an `--add`.
+
+  Two of these commands cannot run at once (a `token.lock` in the state directory, opened with no
+  sharing): both would compute a whole file from their own snapshot and the later write would
+  silently discard the earlier.
 
 ### Changed
 

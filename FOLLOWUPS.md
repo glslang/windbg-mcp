@@ -1293,6 +1293,18 @@ bench` → `401` again, and the credential file back **byte-for-byte** to its pr
 token untouched and the file returned from the JSON shape to the bare one. Removing `local` (the
 only remaining client) was refused.
 
+**What review then corrected** (both bots, on the first commit). The reload was asynchronous while
+the command said it was not, so the printed claim is now backed by an acknowledgement the control
+handler blocks on — and a re-read that failed comes back as a failed control code, which is an
+*error* for the two commands that revoke a credential. A revoked client kept half its state:
+`reloaded` released the debug sessions where the sweep does three things, so its MCP sessions stayed
+resident and — lease state being keyed by name — a re-added name inherited the ids of whoever held
+it before (`Lease::revoked_for` and `Lease::forget`). The `--token-out` ACL went on *after* the
+secret, and a DACL change does not revoke access through an already-open handle. Two elevated shells
+could each write a whole file from its own snapshot (`token.lock`, `share_mode(0)`). And
+`--add-listen-client --token-out C:\x` took `--token-out` as the client *name*, which passes the
+name rule since a name may contain `-`.
+
 **What was left alone deliberately.** The ACL, and the refusal to write through a file it did not
 create. The environment is still read only by `--install-service`. And the second foreground
 listener stays a development workflow — the bar in this item ("if someone running a deployed
