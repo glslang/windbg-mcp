@@ -93,6 +93,13 @@ win-kexp = { path = "../win-kexp" }
 ```
 `git checkout -- Cargo.toml Cargo.lock` afterwards.
 
+**A green win-kexp PR says nothing about Miri**, since 2026-08-22: it is by far the longest job
+there (9 minutes median against `ci.yml`'s 1) and had never failed in a hundred runs, so it runs on
+the merge to `main`, weekly for nightly-toolchain drift, and on `workflow_dispatch` — **not** on
+pull requests. Dispatch it against the branch when a change touches unsafe code; the alternative is
+`main` going red after your merge. A path filter was measured and rejected there, and the workflow's
+own header says why, so it is not worth re-proposing.
+
 **Both repos require an approving review**, and a solo maintainer cannot self-approve, so a green
 PR still needs `gh pr merge --admin`. In this harness that call is refused by the permission
 classifier — so **the human merges**, and an agent's job ends at "green and waiting". Plan the two
@@ -559,6 +566,14 @@ Two things worth knowing when using it here:
   exists only inside a worker reaches the transcript only if it crosses the pipe as a value — which
   is the same rule as everything else in `src/structured.rs`, and the reason `debug_batch` grew a
   typed report.
+- **It is also how you measure what an answer is *made of*.** With
+  `WINDBG_MCP_TRANSCRIPT_MAX_FIELD=0` the whole structured payload is kept, so one debugger-tier run
+  leaves every tool's `data` on disk to be counted field by field — no probe to write, no code to
+  add. Do that before optimising a result, because reading the source predicts the wrong half:
+  `registers` was blamed in `docs/token-budget.md` for `"kind":"int"` and `"subregister":false`
+  scaffolding, which is real and is 41% of it, while the actual bulk was 64 rows of the vector bank
+  that the default filter was written to exclude and did not (2026-08-22). One run of the tier
+  answered both questions in a form nothing else in this repo can produce.
 - **`windbg-mcp --render-cast <transcript.jsonl>`** turns one into an asciicast. That is the
   supported way to produce the recordings under `examples/` and `docs/` — the older ones are
   hand-reconstructed and say so, and a new walkthrough should not add another.

@@ -9,17 +9,16 @@ from transactional batches (#82, 2026-08-09/10 — item 17 is what validating th
 session's own transcript turned up, and item 18 what reviewing it did), item 19 from
 `walk_memory` (#103, 2026-08-13), items 20–22 from standing the server up on an ARM64 guest
 (#131, #132, #134, 2026-08-16), item 23 from making the listener usable rather than merely
-working (2026-08-17), item 24 from first measuring what this server costs the model driving it
-(2026-08-17), items 25–26 from giving the debugger tier an ARM64 *target* (#143, #152,
+working (2026-08-17), items 24 and 35 from measuring what this server costs the model driving it —
+the surface and the results first (2026-08-17), and then what a `registers` answer is actually made
+of (2026-08-22) — items 25–26 from giving the debugger tier an ARM64 *target* (#143, #152,
 2026-08-18), item 27 from completing the coordinate work (#156–#158, 2026-08-18), items 28–29
 from giving each client its own sessions (#162, #164–#166, 2026-08-19), item 30 from serving
 the stateless revision concurrently (#168 / #169, 2026-08-19), item 31 from giving a service-hosted
 listener more than one client (2026-08-20), item 32 from running the debugger tier on the
-ARM64 runner image that replaces `windows-11-arm` in September 2026, and item 33 from driving the
-server with a **local model** and finding the lease grace measured against the wrong slow party,
-item 34 from the same run finding a service's clients fixed at install time, and item 35 from
-measuring what a `registers` answer is actually made of and finding the engine could not say (all
-2026-08-22). Each item notes its repo,
+ARM64 runner image that replaces `windows-11-arm` in September 2026, and items 33–34 from driving
+the server with a **local model** — the lease grace measured against the wrong slow party, and a
+service's clients fixed at install time (both 2026-08-22). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 

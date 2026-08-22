@@ -112,7 +112,7 @@ The worry that a symbol condition silences assertions passing today is settled r
 the x64 entry reads `mm_exploit_v5.exe` out of `SeAuditProcessCreationInfo`, a walk through `nt`'s
 types that cannot happen without its PDB, and its run shows all four *running* rather than skipping.
 
-**The sample they open follows the host.** Three dumps are checked in (below), and the two crashes
+**The sample they open follows the host.** Four dumps are checked in (below), and the two crashes
 a *memory* read is asserted against are paired with the architecture the tests are running on — so
 an ARM64 run reads an ARM64 target, which is coverage this suite has nowhere else
 ([#143](https://github.com/glslang/windbg-mcp/issues/143)). That pairing is a choice about what to
@@ -252,6 +252,22 @@ figures under `--nocapture`, which on this sample reads `12268 B model / 16871 B
 default page, against 53933 B / 74052 B for all 227 modules` — the same dump
 [`token-budget.md`](./token-budget.md) records its baseline against, so the two can be read
 together.
+
+**`registers` gets the same treatment, and its test runs against this host's own architecture.** A
+default answer is documented as the integer registers, excluding the x87 and vector ones — and it
+carried 64 of them, because DbgEng exposes `xmm0` twice and leaves the subregister flag clear on the
+four 32-bit lanes it calls `xmm0/0` … `xmm0/3`. The tier asserts no default row's name carries the
+`/` that names a lane, that no row spends bytes on `"subregister":false`, and that the default is a
+**subset of `all`** — the last because a rule that dropped a register from both answers would
+satisfy every size check here while losing a caller the register they asked for.
+
+It opens the crash paired with this host's architecture — *The sample they open follows the host*,
+above — rather than the shared x64 dump, on purpose: the rule is a naming
+convention, and a convention that held on one architecture and not the other would cost the saving
+silently on half the runners. That is not hypothetical — running it that way is what found ARM64
+carrying `w0`–`w30` for the same reason and under a different name, which is
+[`FOLLOWUPS.md`](../FOLLOWUPS.md) item 35, measured and declined. The test deliberately asserts
+nothing about the ARM64 shape: it is a measured cost, not a settled contract.
 
 It also triages the dump's bug check (`crash_triage`), which is the one place the tier depends on
 the sample being a *crash* dump rather than any dump: the `0x9F` code and its four parameters read
