@@ -53,6 +53,40 @@ argument, the same rule the listener's own token follows:
 WINDBG_MCP_TOKEN="<the driver's token>" python3 tools/local_model_drive.py [tasks.json]
 ```
 
+### Give the run its own listener, not a share of yours
+
+**A credential of its own is the requirement; a listener of its own is how to get one.** The script
+refuses to run on the token your editor is registered with, because a shared credential is a shared
+namespace: the run would see, route to, and at the four-session cap cause the reclamation of your
+targets. And a *service*-hosted listener cannot be given a second client without an uninstall and a
+reinstall, which drops every session it is holding ([`remote-listener.md`](./remote-listener.md#adding-or-rotating-a-client-afterwards-costs-a-reinstall)).
+Neither of those is a thing to do for a measurement.
+
+A foreground listener on a second port costs nothing and disappears when you close it. Generate the
+token on the machine that will *use* it, and pass it over **stdin** — never on a command line, where
+every process on the box can read it:
+
+```pwsh
+# on the debug host, from a script run over ssh with the token on stdin:
+$token = [Console]::In.ReadToEnd().Trim()
+Remove-Item Env:WINDBG_MCP_LISTEN_TOKEN -ErrorAction SilentlyContinue  # no second `local`
+$env:WINDBG_MCP_LISTEN_TOKEN_DRIVER = $token
+& <path>\windbg-mcp.exe --listen 127.0.0.1:8766
+```
+
+```console
+# on your machine
+python3 -c "import secrets;print(secrets.token_urlsafe(32))" > driver.token   # mode 600
+cat driver.token | ssh <vm> 'powershell -NoProfile -File C:\path\start-driver-listener.ps1' &
+ssh -N -L 8766:127.0.0.1:8766 <vm> &
+WINDBG_MCP_URL=http://127.0.0.1:8766/ WINDBG_MCP_TOKEN="$(cat driver.token)" \
+  python3 tools/local_model_drive.py tasks.json
+```
+
+The listener's startup line names the clients it holds — `clients: driver` and nothing else is the
+check that the recipe worked. Sessions belong to the listener process that opened them, so this run
+and your editor's cannot reach each other's even by accident.
+
 It executes only a **read-only allow-list**, and reports anything else back to the model as refused.
 That is deliberate: the surface includes `execute` and `launch`, and a debug host is the wrong place
 to discover unattended what a model does with them — but a wrong pick is still *measured*, which is

@@ -16,8 +16,8 @@ from giving each client its own sessions (#162, #164–#166, 2026-08-19), item 3
 the stateless revision concurrently (#168 / #169, 2026-08-19), item 31 from giving a service-hosted
 listener more than one client (2026-08-20), item 32 from running the debugger tier on the
 ARM64 runner image that replaces `windows-11-arm` in September 2026, and item 33 from driving the
-server with a **local model** and finding the lease grace measured against the wrong slow party
-(2026-08-22). Each item notes its repo,
+server with a **local model** and finding the lease grace measured against the wrong slow party,
+and item 34 from the same run finding a service's clients fixed at install time (both 2026-08-22). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -1212,3 +1212,32 @@ does not know to ping is exactly the client this bites.
 - **What it is not:** a reason to raise the default grace. 390s is derived from the call timeout for
   a reason, and a client that thinks for seven minutes is a fact about local models rather than
   about this server.
+
+## 34. [windbg-mcp] A service-hosted listener's clients are fixed at install time
+
+`--install-service` is the **only** writer of `%ProgramData%\windbg-mcp\token`, and it leaves the
+file granting `SYSTEM` and `Administrators` *read* — deliberately, since the token is the one thing
+between an unprivileged local process and `launch` running its command line as `LocalSystem`. The
+SCM then refuses a second registration under the same name. So adding or rotating a client means
+`--uninstall-service`, set every credential variable again, `--install-service`, `Start-Service` —
+which **drops every session the service holds**, a parked kernel attach included.
+
+Found the hard way (2026-08-22): giving a local-model bench a credential of its own turned into an
+attempt to edit that file, which failed on the ACL — correctly. The fallback that worked, and is now
+the documented one, is a second *foreground* listener on another port with its own token
+([`docs/local-model.md`](./docs/local-model.md)); this item is about the case where the service is
+the listener you have.
+
+- **What to build:** `--add-listen-client <name>` and `--rotate-listen-client <name>`, writing the
+  file the way `finish_install` does — remove, `create_new`, re-apply the ACL — and **generating the
+  token itself**, printing only a fingerprint (`sha256:701E4CF3…`). Three things fall out of that:
+  no reinstall, no secret through a shell history or an agent's transcript, and an operation narrow
+  enough to allow-list in a permission rule, where "let this write `%ProgramData%` over ssh" is not.
+- **The awkward part, and the reason this is not trivial:** `Credentials` is built once at startup
+  (`client::Credentials::from_entries`), so a client added while the service runs would not be
+  admitted until the next start. Either the command says so plainly, or the service grows a control
+  code that re-reads the file — and *that* wants care, because re-reading a credential store at
+  runtime is a way to lose the property that the file was created by the installer and never reused.
+- **What not to do:** relax the ACL, or teach the installer to update in place. The refusal to write
+  through a file it did not create is what stops an unprivileged user pre-creating the path and
+  ending up owning the credential.

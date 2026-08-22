@@ -409,6 +409,35 @@ because the SCM registers a service once and a bad credential then fails it at e
 `windbg-mcp.exe --uninstall-service` removes it, stopping it first and waiting for it — a delete
 issued against a running service only marks it, and this one has debug targets to let go of.
 
+### Adding or rotating a client afterwards costs a reinstall
+
+**There is no command for it, and the file is not yours to edit.** The install is the only writer of
+`%ProgramData%\windbg-mcp\token`, and it leaves the file granting `SYSTEM` and `Administrators`
+**read** — so an administrator who tries to add a client by editing it is told `Access to the path
+is denied`, which is the ACL working rather than something to route around. Taking ownership to
+write it anyway leaves a credential owned by whoever did that, which is the reason the installer
+refuses to reuse a file it did not create.
+
+The SCM refuses a second registration under the same name, so the whole procedure is:
+
+```pwsh
+windbg-mcp.exe --uninstall-service                        # stops it; every session goes
+$env:WINDBG_MCP_LISTEN_TOKEN = "<the existing one>"       # keep it, or clients stop working
+$env:WINDBG_MCP_LISTEN_TOKEN_CI = "<the new one>"
+windbg-mcp.exe --install-service --listen 127.0.0.1:8765
+Start-Service windbg-mcp
+```
+
+**That drops every session the service holds** — a parked kernel attach included — so it is a
+planned outage rather than an incremental change, and it is worth knowing before the moment you
+need a second client. [`FOLLOWUPS.md`](../FOLLOWUPS.md) item 34 is the CLI that would make it one.
+
+**For a short-lived credential, do not touch the service at all.** A bench, a driver script, a
+one-off measurement: run a *second, foreground* listener on another port with its own token, which
+needs no privileged write and disappears when you close it — [Driving it with a local model](#driving-it-with-a-local-model)
+has the recipe. Two listeners on one host is a normal arrangement; sessions belong to a listener's
+own process, so the two cannot see each other's.
+
 **Stopping is graceful, and that is the point.** `Stop-Service` takes the same path a client
 disconnect takes: every session is asked to release its target before the process exits, and the SCM
 is given a wait hint that covers it rather than being left to assume the default and kill us
