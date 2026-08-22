@@ -448,8 +448,8 @@ Four things decide whether that works, and each fails in a way that reads as som
   are the ones that load. Note `LocalSystem` does not read *your* `%USERPROFILE%`, so kernel
   profiles have to be configured machine-wide for a service to see them. Giving it a **second
   client** later costs neither a reinstall nor the sessions it is holding —
-  `--add-listen-client <name> --token-out <path>`, elevated, which generates the token and prints
-  only a fingerprint.
+  `--add-listen-client <name>`, elevated, which generates the token, leaves it beside the
+  credential file and prints only a fingerprint.
 
 Two behaviours differ from stdio and are worth knowing before they surprise you.
 

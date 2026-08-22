@@ -1300,7 +1300,12 @@ handler blocks on — and a re-read that failed comes back as a failed control c
 `reloaded` released the debug sessions where the sweep does three things, so its MCP sessions stayed
 resident and — lease state being keyed by name — a re-added name inherited the ids of whoever held
 it before (`Lease::revoked_for` and `Lease::forget`). The `--token-out` ACL went on *after* the
-secret, and a DACL change does not revoke access through an already-open handle. Two elevated shells
+secret; moving it earlier then exposed a close-and-reopen race, so the flag is **gone** — the token
+is written into the state directory, which is already `SYSTEM`-and-`Administrators`-only with no
+traverse for anyone else, and the choice that generated both findings is deleted rather than patched
+a third time. A revocation also had a window a lease expiry does not (`Sessions::revoke`): the token
+stops being accepted at the swap, but an opener that authenticated a moment earlier can be seconds
+from registering, and a one-pass release cannot see it. Two elevated shells
 could each write a whole file from its own snapshot (`token.lock`, `share_mode(0)`). And
 `--add-listen-client --token-out C:\x` took `--token-out` as the client *name*, which passes the
 name rule since a name may contain `-`.

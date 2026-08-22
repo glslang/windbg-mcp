@@ -415,8 +415,8 @@ issued against a running service only marks it, and this one has debug targets t
 Three commands, from an **elevated** shell, and none of them costs you a session:
 
 ```pwsh
-windbg-mcp.exe --add-listen-client    ci --token-out C:\Users\you\ci.token
-windbg-mcp.exe --rotate-listen-client ci --token-out C:\Users\you\ci-new.token
+windbg-mcp.exe --add-listen-client    ci
+windbg-mcp.exe --rotate-listen-client ci
 windbg-mcp.exe --remove-listen-client ci
 ```
 
@@ -444,17 +444,25 @@ added the client `ci` (sha256:076C14953E1DE5EF) — it gets the whole tool surfa
 here does — a token separates clients from each other, it does not limit one.
 `windbg-mcp` now holds: `ci` (sha256:076C14953E1DE5EF), `local` (sha256:701E4CF334890225).
 
-Its token is in C:\Users\you\ci.token — readable by SYSTEM and Administrators only, like the
-credential file it came from. …
+Its token is in C:\ProgramData\windbg-mcp\ci.token — the same SYSTEM-and-Administrators
+directory the credential file is in, which is why it goes there and not somewhere you name. …
 
 `windbg-mcp` re-read its clients; nothing was stopped.
 ```
 
-`--token-out` is required for the two that mint a token, and the file it names is created fresh
-(never overwritten) and locked down the same way. Move it to the client machine, set it there as
-`WINDBG_MCP_LISTEN_TOKEN`, and delete this copy. The reason for all of that is one property: a token
-you typed has been through a shell history, and on a machine being driven by an agent, through a
-transcript. One this server generated has been through neither.
+Move that file to the client machine, set it there as `WINDBG_MCP_LISTEN_TOKEN`, and delete this
+copy. The reason for all of it is one property: a token you typed has been through a shell history,
+and on a machine being driven by an agent, through a transcript. One this server generated has been
+through neither.
+
+**You do not choose where it lands, and that is deliberate.** An earlier draft took a
+`--token-out <path>`, which meant writing a live credential into a directory this program does not
+control the protection of — so the file had to be created, ACL'd and reopened by name, and anyone
+who could write that directory had a window to substitute a file of their own and keep a read handle
+to it (a DACL change does not revoke access through a handle already open). The state directory is
+already SYSTEM and Administrators only, with no traverse for anyone else, so there is no window to
+race and nothing to substitute. An existing `<name>.token` there is never overwritten: it is a
+credential an earlier command wrote and nobody has moved yet.
 
 Four behaviours worth knowing before you need them:
 

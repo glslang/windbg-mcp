@@ -97,7 +97,7 @@ fn main() -> Result<()> {
             // Touches the SCM and one file, like installing — and like installing, it must not
             // build a runtime: the reload it asks for happens in the *service's* process, not
             // this one.
-            service::Role::Client(edit, name) => service::edit_client(edit, &name, &args),
+            service::Role::Client(edit, name) => service::edit_client(edit, &name),
         };
     }
 
