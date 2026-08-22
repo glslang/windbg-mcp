@@ -626,6 +626,19 @@ pub fn edit_client(edit: ClientEdit, name: &str) -> Result<()> {
     // the bottom — and it is the one thing this command cannot know until it has asked. Saying
     // "once the service has re-read its file" here and "it re-read them" three lines later is one
     // command contradicting itself about the property it exists to provide.
+    // **A removal takes the token copy with it.** That file holds a credential this command has
+    // just made worthless, so keeping it protects nothing and costs two things: a dead secret left
+    // on disk, and a `create_new` that refuses the next `--add-listen-client` of the same name for
+    // a reason the operator has to go and look up. The credential file is written by then, so this
+    // cannot leave a client that can authenticate with no copy of its token.
+    let dropped_token = match edit {
+        ClientEdit::Remove => {
+            let stale = state_dir().join(format!("{name}.token"));
+            matches!(std::fs::remove_file(&stale), Ok(()))
+        }
+        _ => false,
+    };
+
     let (past, changed) = match edit {
         ClientEdit::Add => (
             "added",
@@ -650,6 +663,12 @@ pub fn edit_client(edit: ClientEdit, name: &str) -> Result<()> {
         },
         roster(&credentials)
     );
+    if dropped_token {
+        println!(
+            "\nIts token file went with it: that copy authenticated nothing from the moment this \
+             returned."
+        );
+    }
     if started_empty {
         println!(
             "\nNote: {} did not exist, so `{name}` is now the only client `{NAME}` has. Anything \
