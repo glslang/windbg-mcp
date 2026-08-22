@@ -494,12 +494,14 @@ Four behaviours worth knowing before you need them:
   simply cannot connect until the next start, and nothing that worked has stopped working.
 
 If the service is not running, the file is written anyway and the command says it will be read at
-the next start. A service that is still **starting** is the one case in between, and it is reported
-as a failure rather than a note: it read its clients before it began binding, so the start under way
-is serving the set from before your change — and the SCM will not carry a control code to a service
-in that state, so it cannot be told. `Restart-Service` is the fix, and for a `--remove` or
-`--rotate` the command exits non-zero to say so. You will only meet this at boot on a non-loopback
-address, which is the one bind that can take a while. If it is not *installed*, the commands refuse — a foreground listener takes its
+the next start. A service that is still **starting** is the one case in between, and it is
+reported as a failure rather than a note: the SCM will not carry a control code to a service in that
+state, so the change is not handed to it, and whether the start under way picked the file up by
+itself cannot be told from outside — it reads its clients moments after starting and then binds, and
+binding is the slow part. When it comes up it logs the clients it is serving (`clients: …`); if the
+one you changed is not as you left it, `Restart-Service`. A `--remove` or `--rotate` exits non-zero
+here, because "may still authenticate" is the same thing to act on as "does". You will only meet
+this at boot on a non-loopback address, which is the one bind that can take a while. If it is not *installed*, the commands refuse — a foreground listener takes its
 clients from the environment it was started with, which is a set that cannot change without the
 process changing too.
 

@@ -187,8 +187,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can hold it there for `BIND_PATIENCE`, a minute and a half — while "it will read this at its next
   start" was true only of a start that had not happened. It cannot be told either: the SCM refuses a
   control code to a service in that state (`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`, measured against a
-  real service held there by an address not on the host). So the command says that, and for a
-  `--remove` or `--rotate` it exits non-zero — a restart is the only thing that applies it.
+  real service held there by an address not on the host). So the command says the change was not
+  handed over, says that whether the start picked it up by itself cannot be told from outside, and
+  points at the `clients: …` line the listener logs when it comes up. A `--remove` or `--rotate`
+  exits non-zero, because "may still authenticate" is the same thing to act on as "does".
 
 - **`tools/ioctl_harness.ps1` could not run under Windows PowerShell 5.1**, which is the only
   PowerShell a stock debuggee has. Three faults, each fatal before an IOCTL was sent: em dashes in

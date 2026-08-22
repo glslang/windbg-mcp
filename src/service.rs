@@ -699,11 +699,16 @@ pub fn edit_client(edit: ClientEdit, name: &str) -> Result<()> {
         // being accepted** — which is exactly the thing you ran the command to stop, so it has to
         // be an error the shell can see.
         Err(e) if edit.revokes_a_token() => {
+            // **"was not handed to" rather than "is still running with"**, because one of the two
+            // ways this fails cannot know the latter — a service caught starting may have read the
+            // file on its own. Asserting it would have this message contradict the cause printed
+            // directly beneath it. The urgency is unchanged: for a revocation, "may still
+            // authenticate" is the same thing to act on as "does".
             return Err(e.context(format!(
-                "the client `{name}` was {past} in {}, but `{NAME}` is still running with the \
-                 credential you took out of service. Restart it (`Restart-Service {NAME}`, which \
-                 does drop the sessions it holds) and check its log — until then that token still \
-                 authenticates",
+                "the client `{name}` was {past} in {}, but the change was not handed to `{NAME}` — \
+                 so the credential you took out of service may still be authenticating. Restart it \
+                 (`Restart-Service {NAME}`, which does drop the sessions it holds) and check its \
+                 log",
                 at.display()
             )));
         }
@@ -894,24 +899,38 @@ fn write_credentials(credentials: &[(String, String)]) -> Result<()> {
 fn ask_to_reload(service: &windows_service::service::Service) -> Result<bool> {
     let state = service.query_status()?.current_state;
     // **A starting service is neither of the two easy answers, and it used to be given the wrong
-    // one.** It has already read its credentials — that happens before the bind — so it is serving
-    // the *old* set, and a non-loopback bind at boot can hold it here for
-    // [`crate::listen::BIND_PATIENCE`], a minute and a half. Reporting "it will read this at its
-    // next start" was false of the start already under way, and for a revocation that is a
-    // credential the operator believes is gone.
+    // one.** Reporting "it will read this at its next start" was false of the start already under
+    // way, and for a revocation that is a credential the operator has been told is gone.
     //
     // It cannot be told, either: the SCM refuses a control code to a service in this state with
     // `ERROR_SERVICE_CANNOT_ACCEPT_CTRL`, which was measured rather than assumed — binding an
     // address that is not on the host holds a real service here, and `notify` comes back
-    // `os error 1061`. So this says the true thing instead, and says it *without* going through
-    // `notify`, whose refusal at this point would otherwise be reported as the service having read
-    // the file and rejected it.
+    // `os error 1061`. So this answers without going through `notify`, whose refusal would
+    // otherwise be reported as the service having read the file and rejected it.
+    //
+    // **What it does not do is claim to know whether this start read the new file**, because it
+    // cannot. Credentials are read a moment after the SCM is told `StartPending` — the runtime is
+    // built in between — and the long part of this state is the *bind* that follows, which is
+    // instant on loopback and up to [`crate::listen::BIND_PATIENCE`] on a non-loopback address at
+    // boot. So an edit landing here is almost always too late for this start and occasionally in
+    // time for it, and the split is milliseconds wide.
+    //
+    // Left as an honest "cannot tell" rather than resolved, which was a deliberate call when review
+    // raised it. Resolving it means the service publishing *which* it has done — overloading the
+    // status checkpoint, which means progress, or adding a channel — to distinguish two outcomes
+    // whose costs are a restart of a service that has just started and is therefore holding
+    // nothing, against a credential believed revoked that is not. The wrong answer here is already
+    // the safe one; what it owed the operator was the truth and a way to settle it, which is the
+    // line the listener logs when it comes up.
     if state == ServiceState::StartPending {
         bail!(
             "`{NAME}` is still starting, and the Service Control Manager will not deliver a \
-             control code to a service in that state. It has already read its clients, though — \
-             that happens before it binds — so the start now under way is serving the set from \
-             *before* this change, and will go on doing so until it is restarted."
+             control code to a service in that state — so this change has not been handed to it. \
+             Whether the start now under way picked the file up on its own cannot be told from \
+             here: it reads its clients moments after starting and then binds, and binding is the \
+             part that can take a while. When it comes up it logs the clients it is serving \
+             (`clients: …`, in {}); if the one you changed is not as you left it, restart it.",
+            log_path().display()
         );
     }
     if state != ServiceState::Running {
