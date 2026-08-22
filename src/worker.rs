@@ -1473,8 +1473,8 @@ fn registers(e: &DebugEngine, all: bool) -> Result<Output, Failed> {
 /// reports as bytes.
 ///
 /// **The third is measured rather than obvious, and it is where the weight was.** DbgEng exposes a
-/// vector register *twice*: `xmm0` as the 128-bit register, and `xmm0/0` … `xmm0/3` as four int64
-/// pseudo-registers — and those slices are **not** flagged as subregisters, so they passed both
+/// vector register *twice*: `xmm0` as the 128-bit register, and `xmm0/0` … `xmm0/3` as four 32-bit
+/// pseudo-registers — and those lanes are **not** flagged as subregisters, so they passed both
 /// rules above. A default answer whose own argument documents it as "not the x87 and vector
 /// registers" was carrying sixty-four of them: 64 of the 123 rows on this repo's x64 sample, and
 /// 44% of the bytes of the largest typed answer this server gives after `modules`.
