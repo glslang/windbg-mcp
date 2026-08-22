@@ -727,22 +727,6 @@ pub async fn serve(
         ))
     };
 
-    // **Started before the bind, not after the listener is up.** Credentials are read above, so
-    // from this point the process is already serving a *set* even though it has no socket yet — and
-    // a non-loopback bind at boot can sit below for [`BIND_PATIENCE`]. A client command issued in
-    // that window has to be answered by this task or it times out, and a `--remove-listen-client`
-    // that times out reports a revocation that did not happen while this start goes on accepting
-    // the credential it revoked (#189 review). Only under the service, which is the only role with
-    // a control channel to be asked on.
-    if let Some(asked) = reload {
-        tokio::spawn(reloaded(
-            asked,
-            Arc::clone(&credentials),
-            sessions.clone(),
-            lease.clone(),
-        ));
-    }
-
     // Pinned here rather than at the accept loop, because the bind is raced against it: a stop
     // arriving while a not-yet-assigned address is being waited for must be answered now, not in
     // ninety seconds' time. Without this the service would sit `Running` with no endpoint and no
@@ -766,6 +750,24 @@ pub async fn serve(
         },
         credentials.names().join(", ")
     );
+
+    // Only under the service, which is the only role with a control channel to be asked on.
+    //
+    // **After the bind, and it was briefly moved before it on a premise that turned out to be
+    // false.** The idea was to have something ready to answer a command issued while a slow
+    // non-loopback bind held the service in `StartPending` — but the SCM will not deliver a control
+    // code to a service in that state at all (`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`, measured), so
+    // there was never a request to answer. The only gap left is between the service reporting
+    // itself started and this line, which is a `spawn` away and covered anyway: the channel is
+    // unbounded, so the handler's send lands and its wait is answered as soon as this task runs.
+    if let Some(asked) = reload {
+        tokio::spawn(reloaded(
+            asked,
+            Arc::clone(&credentials),
+            sessions.clone(),
+            lease.clone(),
+        ));
+    }
 
     tokio::spawn(sweep(
         sessions.clone(),
