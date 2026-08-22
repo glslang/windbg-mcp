@@ -4,6 +4,13 @@
 serves over standard handles. It exists so the client and the model can run somewhere other than
 the machine DbgEng needs — a Mac driving a Windows VM, say.
 
+**`--tools` works here exactly as it does on stdio**, and matters more: the client at the far end
+may be a local model whose window is bought in RAM. `--listen 127.0.0.1:8765 --tools
+session,inspect,crash` serves 20 tools and 25,265 B of model context instead of 51 and 67,658 — the
+README has the table, and [`local-model.md`](./local-model.md) is the runbook it was measured for.
+It is server-wide, so every client on this listener sees the same surface; per-caller is
+`FOLLOWUPS.md` item 36.
+
 If you only need that once, [`remote-phase0.md`](./remote-phase0.md) does it with no listener at
 all: register the MCP server as an `ssh` command and stdio tunnels for you. The listener is for
 what that arrangement cannot do — sessions that survive a client restart, several connections in
@@ -383,6 +390,11 @@ $env:WINDBG_MCP_LISTEN_TOKEN = "<a long random string>"   # this shell only
 windbg-mcp.exe --install-service --listen 127.0.0.1:8765
 Start-Service windbg-mcp        # or reboot; it is configured to start automatically
 ```
+
+Add `--tools <spec>` to that install line to register a narrowed surface. It is written into the
+command line the SCM stores — the only place an install's choice survives to — and parsed again at
+every start by the same code that validated it here, so a spec the service would refuse cannot be
+registered. Changing it later means a reinstall, unlike a client credential.
 
 **Install from a protected directory.** The SCM stores an exact path for a `LocalSystem` auto-start
 service, so whoever can write that directory — or drop an engine DLL beside the exe — gets their

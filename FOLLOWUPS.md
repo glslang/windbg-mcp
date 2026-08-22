@@ -714,7 +714,7 @@ revisiting only if that tier's runtime starts to matter.
 
 Picks up at `src/listen.rs` and the tiers in `tests/mcp_smoke.rs`.
 
-## 24. [windbg-mcp] Spend fewer of the caller's tokens
+## 24. [windbg-mcp] Spend fewer of the caller's tokens — **done** (2026-08-22)
 
 `docs/token-budget.md` and the two budget tests in `tests/mcp_smoke.rs` measured what this server
 costs the model driving it. Nothing had, and the numbers were larger than a careful reading of the
@@ -782,19 +782,38 @@ landed on their own so that each of the items below can be argued, and measured,
   claim that the text "says the same thing better" was wrong too: `r` prints 17 registers and the
   values carried 123, so the ratio compared two different sets. `modules` is the other half of this
   bullet and is done above.
-- **Five tools are a third of the model-visible surface**, and it is their input schemas:
-  `debug_batch` 9,746 B (7,980 of it the `StepAction`/`Check` vocabulary), `walk_memory` 4,076,
-  `crash_triage` 2,912, `reachable_from_dispatch` 2,628, `server_log` 2,599 — 21,961 B against a
-  median tool of 900 B. This is where the weight actually is, and unlike the items above it is not
-  waste but one tool honestly describing a rich argument. The levers are design choices: a smaller
-  step vocabulary, a `$ref` the client resolves, or a surface that does not offer every tool to
-  every caller.
+- **Five tools are a third of the model-visible surface**, and it is their input schemas — **done**
+  (2026-08-22) by serving fewer tools rather than smaller ones. `debug_batch` 9,746 B (7,980 of it
+  the `StepAction`/`Check` vocabulary), `walk_memory` 4,076, `crash_triage` 2,912,
+  `reachable_from_dispatch` 2,628, `server_log` 2,599 — 21,961 B against a median tool of 900 B.
+  Unlike the items above this is not waste but one tool honestly describing a rich argument, and
+  the levers were design choices: a smaller step vocabulary, a `$ref` the client resolves, or a
+  surface that does not offer every tool to every caller.
 
-  **The first bullet's answer does not transfer**, which is worth saying now that it has landed:
-  prose came out of the output schemas because nothing read it, and prose in an *input* schema is
-  most of what tells a model how to drive the tool. `debug_batch` is the one where getting that
-  wrong leaves a patched byte in a running kernel. This bullet is still the whole of what remains
-  in this item, and it stays a design question rather than a strip.
+  **The first bullet's answer does not transfer, and measuring that is what chose between them.**
+  Prose came out of the output schemas because nothing read it; prose in an *input* schema is most
+  of what tells a model how to drive the tool, and `debug_batch` is where getting that wrong leaves
+  a patched byte in a running kernel. Across all 51 tools **74% of the model-visible surface is
+  prose** — 24,794 B of tool descriptions, 25,333 B inside the input schemas. The structural
+  remainder does not pay for the risk: `"default": null` is 1,744 B (2.6%) and is the only free one,
+  since `$schema` is how a client picks a validator dialect and `minimum`/`format` are constraints.
+  **~1.7 KB of 67,658** was the whole honest total for trimming, so trimming was not done.
+
+  So the third lever: **`--tools`** (`src/toolset.rs`), a named subset advertised at startup. No
+  description loses a word; a caller reading a crash dump stops paying for nine TTD tools and ten
+  allocator ones. `session,inspect,crash` is 20 tools / 25,265 B; `crash` is 11 / 15,073 B against
+  51 / 67,658 B. A spec names groups, individual tools, or `all`, and anything else is refused at
+  startup rather than quietly serving something different.
+
+  Three things it settled that the bullet did not anticipate. **`session` has to be in every
+  surface** — every other tool routes by a `session_id` this server is the only issuer of, so a
+  surface with `registers` and no opener is not a smaller surface but a broken one; 12,161 B is the
+  floor and `--tools crash` is eleven tools. **A tool that exists and is not served needs its own
+  refusal**: rmcp answers `tool not found`, which is what a typo gets, while this is an operator's
+  flag the caller cannot see. And **the group table needs joining to the live surface**, because a
+  tool added to `src/server.rs` and not put in a group vanishes from every *narrowed* surface while
+  the default still carries it — `every_tool_belongs_to_exactly_one_group` is that join, and it
+  found `set_symbol_path` missing from the README's tool table on the way in.
 - **`modules` had neither a `limit` nor a cap**, alone among the high-volume tools — **done**
   (2026-08-21). Everything else uncapped is raw debugger text — `ttd_calls`, `ttd_memory`,
   `threads`, `execute`, `dx`, `ioctl_trace`, `reachable_from_dispatch` — and `read_memory` returns
@@ -813,8 +832,9 @@ landed on their own so that each of the items below can be argued, and measured,
   each restart the budget quietly double the ceiling it was chosen to be. Reaching for a cap
   per half was the first thing tried here, and this repo had already argued it down one tool over.
 
-**What is left of this item is the bullet above**, the five input schemas. Everything else in it
-is done or measured-and-declined; the wire half closed with the first bullet.
+**This item is done.** Every bullet is fixed, measured-and-declined, or answered; what came out of
+it that is still open is one *new* item — a per-caller tool surface, item 36 — rather than anything
+left over here.
 
 **Where this bites first is a local model**, whose window is bought in RAM rather than rented:
 [`docs/local-model.md`](./docs/local-model.md) is the runbook, and it names the three client-side
@@ -1420,3 +1440,40 @@ asserted against whatever architecture the host is
 - **What it is worth if reopened:** ~1.8 KB of a ~6.3 KB answer, on ARM64 only. Real, and smaller
   than the 6.3 KB item 24 already took off the same tool.
 
+## 36. [windbg-mcp] The tool surface is server-wide, not per caller
+
+`--tools` (item 24's last bullet) narrows what a run advertises, and it narrows it for *everybody*
+on that run. That is the right answer for stdio, which has one client by construction, and it is
+the right answer for a listener serving one purpose. It is the wrong shape for the case the
+listener was built for: a local model that can hold twenty tools and a hosted client that can hold
+fifty-one, pointed at the same Windows box and the same debug sessions, told apart by their bearer
+tokens already.
+
+**What it would take.** The identity is already there — `client::Client`, one credential per client
+(`WINDBG_MCP_LISTEN_TOKEN_<NAME>`), captured in the listener's service factory and carried by the
+`WindbgServer` instance. `Toolset` is already an instance field beside it, and `listen.rs`'s factory
+is the single line that sets it. So the work is not plumbing, it is:
+
+- **A per-client spec, from a source that already exists.** `WINDBG_MCP_TOOLS_<NAME>` beside the
+  token variable is the obvious spelling, which means it also belongs in the credential *file* the
+  service reads — and that file is the thing `--add-listen-client` writes, so a client's surface
+  becomes something an operator changes without a reinstall, the same way its token is.
+  `Credentials::from_entries` is where the parsing goes, and its two collision refusals are the
+  precedent for what to do with a spec naming a client that has no token.
+- **Two-client coverage**, which is the half that has bitten before. `FOLLOWUPS.md` item 29 was
+  filed as call-site coverage and its first assertion failed for real: every call ran as the default
+  `local`, because a task-local does not cross rmcp's `initialize` spawn. A per-client surface has
+  exactly that shape — right in every unit test, wrong on the wire — so the assertion that matters
+  is two clients on one listener seeing two different `tools/list` answers.
+- **A decision about `tools/list_changed`.** rmcp's router can notify, and a reload
+  (`--add-listen-client`, `--rotate-listen-client`) can now change a client's set while it is
+  connected. Whether a surface change is announced or only seen on reconnect is a real choice, and
+  the reload path is where it would go.
+
+**Depends on** item 24's `--tools`, which is what defines a spec and a group. **Worth doing when**
+there is a second client with a different budget — the measurement that motivates it is in
+[`docs/local-model.md`](./docs/local-model.md), and until then one server-wide flag is the same
+thing with less to get wrong.
+
+Picks up at [`src/toolset.rs`](./src/toolset.rs), `listen.rs`'s service factory, and
+[`src/client.rs`](./src/client.rs).

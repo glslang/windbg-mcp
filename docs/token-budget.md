@@ -257,22 +257,58 @@ None of these is a bug. They are recorded because they were invisible, and
    that identifies them, while the obvious second name rule needs a table of exceptions before it
    even covers `w29`.
 8. **Five tools are a third of the model-visible surface**, and it is their *input* schemas rather
-   than their prose. `debug_batch` alone is 9,746 B — 15% of everything a model is given before it
-   asks anything — of which 7,980 B is the `StepAction`/`Check` vocabulary its schema pulls out of
-   `src/batch.rs`. Then `walk_memory` 4,076, `crash_triage` 2,912, `reachable_from_dispatch` 2,628,
-   `server_log` 2,599: **21,961 B, 33%**, against a median tool of 900 B.
+   than their prose — **answered** (2026-08-22) by serving fewer tools rather than smaller ones.
+   `debug_batch` alone is 9,746 B — 14% of everything a model is given before it asks anything — of
+   which 7,980 B is the `StepAction`/`Check` vocabulary its schema pulls out of `src/batch.rs`.
+   Then `walk_memory` 4,076, `crash_triage` 2,912, `reachable_from_dispatch` 2,628, `server_log`
+   2,599: **21,961 B, 33%**, against a median tool of 900 B.
 
    This is where the weight is, and it is a different kind of problem from findings 1–4. Those were
    duplication and waste — the same string paid for repeatedly, or a tail nobody reads. This is one
-   tool honestly describing a rich argument, and the levers are real design choices: a smaller step
+   tool honestly describing a rich argument, and the levers were real design choices: a smaller step
    vocabulary, a `$ref` the client resolves, or a tool surface that does not offer every tool to
-   every caller. Worth measuring before choosing, which is what this table is for.
+   every caller.
 
-   **Finding 1's answer does not transfer here, and it is worth saying why.** Prose came out of the
+   **Finding 1's answer does not transfer here, and that is what settled it.** Prose came out of the
    output schemas because nothing read it. Prose in an *input* schema is the opposite: it is most of
    what tells a model how to drive the tool, and `debug_batch` is the tool where getting that wrong
-   leaves a patched byte in a running kernel. Cutting bytes there costs correctness, so the 21,961 B
-   below is a design question and not a strip.
+   leaves a patched byte in a running kernel. Measured across all 51 tools, **74% of the
+   model-visible surface is prose** — 24,794 B of tool descriptions and 25,333 B inside the input
+   schemas — so a strip here buys context by making the tools harder to drive correctly.
+
+   The structural remainder does not pay for the risk either. Dropping `"default": null`, which
+   schemars emits 109 times and which tells a model nothing an absent field does not, is 1,744 B —
+   2.6%. The other candidates are not free: `$schema` is 2,850 B but is how a client picks a
+   validator dialect (and `tool_schemas_declare_one_dialect_and_are_self_contained` pins it), and
+   `minimum`/`format` are constraints. **Roughly 1.7 KB of 67,658 is the whole honest total** for
+   trimming the schemas.
+
+   So the third lever is the one taken: `--tools` (`src/toolset.rs`) advertises a named subset. No
+   description gets a word shorter; a caller that is reading a crash dump stops paying for nine TTD
+   tools and ten allocator ones. Where the bytes sit, and what each profile costs:
+
+   | group | tools | bytes | share |
+   |---|---:|---:|---:|
+   | `allocator` | 10 | 15,914 | 23.5% |
+   | `session` | 10 | 12,161 | 18.0% |
+   | `inspect` | 9 | 10,192 | 15.1% |
+   | `batch` | 1 | 9,746 | 14.4% |
+   | `ttd` | 9 | 6,833 | 10.1% |
+   | `ioctl` | 6 | 6,494 | 9.6% |
+   | `exec` | 5 | 3,406 | 5.0% |
+   | `crash` | 1 | 2,912 | 4.3% |
+
+   | `--tools` | tools | model |
+   |---|---:|---:|
+   | *(absent)* | 51 | 67,658 |
+   | `session,inspect,exec,crash` | 25 | 28,671 |
+   | `session,inspect,crash` | 20 | 25,265 |
+   | `crash` | 11 | 15,073 |
+
+   `session` is in every surface because every other tool routes by a `session_id` this server is
+   the only issuer of — 12,161 B is the floor, and `crash` is eleven tools rather than one. The
+   choice is **server-wide**; a per-caller surface on the listener, where clients are already named,
+   is item 36.
 
 One interaction worth flagging before acting on any of it: `FOLLOWUPS.md` item 11 proposes *adding*
 `structuredContent` to `ttd_calls`, `ttd_memory` and `driver_object` — three of the highest-volume
@@ -287,7 +323,15 @@ The surface budget needs no debugger and rides the ordinary test run:
 cargo test --test mcp_smoke -- --nocapture tool_surface_stays_within_its_token_budget
 ```
 
-Beside it, and needing no debugger either, `output_schemas_carry_constraints_not_prose` is the
+Two more ride it, both needing no debugger. `every_tool_belongs_to_exactly_one_group` joins
+`src/toolset.rs`'s table to the live `tools/list`, because a tool added to `src/server.rs` and not
+put in a group would vanish from every narrowed surface without a word — the default surface would
+still carry it, so nothing else would notice. And
+`a_narrowed_tool_surface_serves_only_what_it_was_asked_for` starts a server with `--tools crash` and
+checks the three things that makes true: eleven tools, a refusal by name for a tool that exists and
+is not served, and a figure under half the whole surface (it prints 15,073 B).
+
+Beside them, `output_schemas_carry_constraints_not_prose` is the
 assertion that finding 1 stays fixed. It reads `tools/list` off the wire, so it catches the way that
 change comes undone — one tool declaring its schema with rmcp's `schema_for_output` instead of
 `schema::constraints_of` — which is an import line nothing else would report.

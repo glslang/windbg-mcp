@@ -157,6 +157,8 @@ decide whether a local model can hold this surface at all. Bytes of minified JSO
 | | bytes | ≈tokens |
 |---|---|---|
 | The tool surface, paid once per conversation | 67,076 (51 tools) | ~17k |
+| — the same surface as `--tools session,inspect,crash` | 25,265 (20 tools) | ~6k |
+| — as `--tools crash` | 15,073 (11 tools) | ~4k |
 | Its worst single tool (`debug_batch`) | 9,746 | ~2.4k |
 | The largest answer this server gives (`modules`) | 53,875 | ~13k |
 | `read_memory` at its design limit | ~4 MiB of hex | ~1M |
@@ -299,10 +301,24 @@ written down rather than remembered:
   characters, a model asked for a total pays none at all, and a model asked for the whole table
   still asks for the whole table.
 
-If a model does not cope, the remaining knobs are all **client-side** — a tool-surface profile, a
-per-call response budget, a text-or-data content switch. This server has none of them: every caller
-gets all 51 tools, and there is no way to ask for fewer. What it does have is one per-tool answer
-to the second of the three, which is `modules`' `limit`.
+If a model does not cope, the plan named three knobs — a tool-surface profile, a per-call response
+budget, a text-or-data content switch. **Two of the three now exist, and neither turned out to be
+client-side.**
+
+- **The tool-surface profile is `--tools`** (2026-08-22). Start the listener with
+  `--tools session,inspect,crash` and the surface is 20 tools and 25,265 B instead of 51 and
+  67,658 — `--tools crash` is 11 and 15,073 B, which is the difference between "roughly twice an 8k
+  window" and "half of one". Nothing is reworded: the tools that remain are the tools they were.
+  The whole table is in [`token-budget.md`](./token-budget.md) under finding 8, and the README has
+  the operator's half. It is server-wide rather than per client, which for the arrangement on this
+  page — one listener, one local model — is the same thing.
+- **The response budget arrived per tool**, not caller-wide: `modules`' `limit`, above.
+- **The text-or-data switch is still unbuilt**, and is the one that needs a client rather than a
+  server change: which half of a result reaches the model is the client's forwarding policy.
+
+The measurement that decided the first one is worth carrying: **74% of the model-visible surface is
+prose**, and it is the prose that tells a model how to drive a tool. There was no strip available
+here — only the choice to offer fewer tools.
 
 ## Picking this up after a break
 

@@ -26,6 +26,7 @@ mod schema;
 mod server;
 mod service;
 mod structured;
+mod toolset;
 mod triage;
 mod ttd;
 mod walk;
@@ -91,6 +92,9 @@ fn main() -> Result<()> {
         return match role {
             service::Role::Install => service::install(
                 listen_address(&args)?,
+                // Validated here, by the same parser the service will use at every start, so a
+                // spec the running service would reject cannot be written into its command line.
+                installed_tools(&args)?.as_deref(),
                 args.iter().any(|a| a == service::ALLOW_UNPROTECTED_FLAG),
             ),
             service::Role::Uninstall => service::uninstall(),
@@ -109,6 +113,13 @@ fn main() -> Result<()> {
         None => None,
     };
 
+    // Same reason, and the same shape: a spec naming a group this server does not have is a usage
+    // error, not a surface that quietly serves something else.
+    let tools = match toolset::Toolset::requested(&args) {
+        Some(surface) => surface.map_err(|e| anyhow::anyhow!(e))?,
+        None => toolset::Toolset::all(),
+    };
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?
@@ -121,8 +132,8 @@ fn main() -> Result<()> {
                 // is a service control code, and a foreground listener has no SCM to receive one
                 // from. Its clients come from the environment it was started with, which is a set
                 // that cannot change without the process changing too.
-                Some(addr) => serve_http(addr, None, std::future::pending(), || {}).await,
-                None => serve().await,
+                Some(addr) => serve_http(addr, tools, None, std::future::pending(), || {}).await,
+                None => serve(tools).await,
             }
         })
 }
@@ -134,6 +145,7 @@ fn main() -> Result<()> {
 /// a client going away is handled by its lease instead.
 pub(crate) async fn serve_http(
     addr: std::net::SocketAddr,
+    tools: toolset::Toolset,
     reload: Option<tokio::sync::mpsc::UnboundedReceiver<std::sync::mpsc::SyncSender<bool>>>,
     shutdown: impl std::future::Future<Output = ()>,
     ready: impl FnOnce(),
@@ -143,6 +155,7 @@ pub(crate) async fn serve_http(
         sessions.clone(),
         addr,
         call_timeout(),
+        tools,
         reload,
         shutdown,
         ready,
@@ -153,6 +166,19 @@ pub(crate) async fn serve_http(
     // kernel frozen — see [`service`].
     sessions.shutdown().await;
     outcome
+}
+
+/// The `--tools` spec an install was told to register, checked before it is stored.
+///
+/// The same reason [`listen_address`] exists, pointed at the other half of the stored command
+/// line: the SCM keeps that line and nothing re-derives it, so a spec that the service would
+/// refuse at start is a service that installs cleanly and never runs.
+fn installed_tools(args: &[String]) -> Result<Option<String>> {
+    match toolset::Toolset::requested(args) {
+        Some(Err(e)) => Err(anyhow::anyhow!(e)),
+        Some(Ok(_)) => Ok(toolset::Toolset::spec_in(args).map(str::to_string)),
+        None => Ok(None),
+    }
 }
 
 /// The address an install was told to bind, with the same parsing the listener itself uses.
@@ -266,13 +292,14 @@ fn init_logging(is_worker: bool, to_file: Option<std::path::PathBuf>) {
     }
 }
 
-async fn serve() -> Result<()> {
+async fn serve(tools: toolset::Toolset) -> Result<()> {
     // Opened before anything is served, so the transcript's first record is this run starting
     // rather than whatever the first tool call happened to be.
     let sessions = Sessions::new(call_timeout()).recording(record::Recorder::from_env());
-    let server = WindbgServer::new(sessions.clone());
+    let surface = tools.summary();
+    let server = WindbgServer::new(sessions.clone()).with_tools(tools);
 
-    tracing::info!("windbg-mcp starting on stdio");
+    tracing::info!("windbg-mcp starting on stdio, serving {surface}");
     let service = server.serve(stdio()).await?;
     let outcome = service.waiting().await;
 

@@ -238,12 +238,20 @@ fn state_dir() -> PathBuf {
 ///
 /// Built here and asserted on in tests, because the failure it prevents is a service that installs
 /// cleanly and then fails at every start: the SCM stores this once, and nothing re-derives it.
-fn launch_arguments(addr: SocketAddr) -> Vec<OsString> {
-    vec![
+fn launch_arguments(addr: SocketAddr, tools: Option<&str>) -> Vec<OsString> {
+    let mut args = vec![
         OsString::from(SERVICE_FLAG),
         OsString::from(crate::listen::LISTEN_FLAG),
         OsString::from(addr.to_string()),
-    ]
+    ];
+    // Written through only when the install asked for one, so a service installed without it has
+    // the same command line it always had — and `--tools all` is not spelled out, because the
+    // absence already means it.
+    if let Some(spec) = tools {
+        args.push(OsString::from(crate::toolset::FLAG));
+        args.push(OsString::from(spec));
+    }
+    args
 }
 
 /// Where the service reads its bearer token from.
@@ -951,7 +959,7 @@ fn ask_to_reload(service: &windows_service::service::Service) -> Result<bool> {
 }
 
 /// Registers the service to run this exe with `--service --listen <addr>`.
-pub fn install(addr: SocketAddr, allow_unprotected: bool) -> Result<()> {
+pub fn install(addr: SocketAddr, tools: Option<&str>, allow_unprotected: bool) -> Result<()> {
     // Refused rather than warned about, and this changed once the token moved into a file: an
     // install has to *have* a credential to write it down, and a service registered without one is
     // a service that fails at every start. Validated here too, by the listener's own rules, so a
@@ -1005,7 +1013,7 @@ pub fn install(addr: SocketAddr, allow_unprotected: bool) -> Result<()> {
                 start_type: ServiceStartType::AutoStart,
                 error_control: ServiceErrorControl::Normal,
                 executable_path: exe,
-                launch_arguments: launch_arguments(addr),
+                launch_arguments: launch_arguments(addr, tools),
                 dependencies: vec![],
                 // `LocalSystem`. A kernel debugger needs privileges an ordinary service account
                 // does not have, and this endpoint is already gated by its bearer token rather
@@ -1230,13 +1238,23 @@ fn serve_as_service() -> Result<()> {
         );
     }
 
-    let addr = match crate::listen::requested(&std::env::args().collect::<Vec<_>>()) {
+    let args: Vec<String> = std::env::args().collect();
+    let addr = match crate::listen::requested(&args) {
         Some(addr) => addr?,
         None => bail!(
             "the service was installed without `{} <addr>`, so there is nothing to bind. Reinstall \
              it: `--uninstall-service` then `--install-service --listen <addr>`.",
             crate::listen::LISTEN_FLAG
         ),
+    };
+
+    // Off the same stored command line as the address, because that is the only place an install's
+    // `--tools` survives to: the SCM stores this line once and nothing re-derives it, so an
+    // installer that accepted the flag and did not write it through would serve every tool at every
+    // start and never say why.
+    let tools = match crate::toolset::Toolset::requested(&args) {
+        Some(surface) => surface.map_err(|e| anyhow::anyhow!(e))?,
+        None => crate::toolset::Toolset::all(),
     };
 
     // The stop signal, and the acknowledgement that it has been acted on. A `oneshot` rather than a
@@ -1344,6 +1362,7 @@ fn serve_as_service() -> Result<()> {
             let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let served = crate::serve_http(
                 addr,
+                tools,
                 Some(reload_rx),
                 {
                     let finished = finished.clone();
@@ -1562,15 +1581,40 @@ mod tests {
     /// registers cleanly and then fails at every start is the shape this guards against.
     #[test]
     fn the_installed_command_line_starts_the_service_on_the_address_it_was_given() {
-        let args = launch_arguments("127.0.0.1:8765".parse().expect("a literal address"));
-        let rendered: Vec<String> = args
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
+        let addr = "127.0.0.1:8765".parse().expect("a literal address");
+        let render = |args: Vec<OsString>| -> Vec<String> {
+            args.iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect()
+        };
+
+        let rendered = render(launch_arguments(addr, None));
         assert_eq!(rendered, vec![SERVICE_FLAG, "--listen", "127.0.0.1:8765"]);
         // And the flag the SCM passes is the one `requested` answers `Run` to, which is the join
         // between installing and starting that nothing else checks.
         assert_eq!(requested(&rendered), Some(Role::Run));
+
+        // The other half of the same join: an install told to narrow the surface has to write that
+        // through, because this line is the *only* place the choice survives to. The service reads
+        // it back with `Toolset::requested`, so that is what this asserts against rather than the
+        // spelling.
+        let narrowed = render(launch_arguments(addr, Some("crash,inspect")));
+        assert_eq!(
+            narrowed,
+            vec![
+                SERVICE_FLAG,
+                "--listen",
+                "127.0.0.1:8765",
+                crate::toolset::FLAG,
+                "crash,inspect"
+            ]
+        );
+        let surface = crate::toolset::Toolset::requested(&narrowed)
+            .expect("the stored line carries the flag")
+            .expect("and a spec the service will accept");
+        assert!(surface.includes("crash_triage"));
+        assert!(surface.includes("open_dump"));
+        assert!(!surface.includes("ttd_calls"));
     }
 
     /// The file the installer writes is the file the listener reads — asserted end to end, because

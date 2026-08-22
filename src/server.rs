@@ -59,6 +59,12 @@ pub struct WindbgServer {
     /// moment the caller is knowable, so the identity is captured there and re-entered around
     /// every call.
     client: crate::client::Client,
+    /// Which of the tools this run advertises — every one of them unless `--tools` said otherwise.
+    ///
+    /// Carried rather than read from a global, for the reason `Credentials::from_entries` is: a
+    /// process-wide cell set once from `argv` is state the whole test binary shares, and this is
+    /// decided at startup precisely so that a test can build two servers with different surfaces.
+    surface: crate::toolset::Toolset,
 }
 
 fn text_result(s: String) -> Result<CallToolResult, ErrorData> {
@@ -2527,7 +2533,28 @@ impl WindbgServer {
             rec: sessions.recorder(),
             sessions,
             client,
+            surface: crate::toolset::Toolset::all(),
         }
+    }
+
+    /// The same server, advertising only the tools `--tools` asked for.
+    ///
+    /// Separate from the constructors rather than a parameter on both, so every existing caller —
+    /// the unit tests included — keeps the whole surface by construction and only a run that was
+    /// told to narrow it does.
+    pub fn with_tools(mut self, surface: crate::toolset::Toolset) -> Self {
+        self.surface = surface;
+        self
+    }
+
+    /// The router this instance answers from: rmcp's, minus whatever the surface excludes.
+    ///
+    /// Built per call, which is what `Self::tool_router()` already was — the schemas underneath it
+    /// are cached by type, so this is a map of fifty-one `Arc` clones and a `retain`.
+    fn router(&self) -> rmcp::handler::server::tool::ToolRouter<Self> {
+        let mut router = Self::tool_router();
+        self.surface.narrow(&mut router);
+        router
     }
 
     /// Open a crash dump (.dmp) or a Time Travel Debugging trace (.run) and wait for it to load.
@@ -4368,6 +4395,11 @@ impl WindbgServer {
 // half-applied mutation. Kept ASCII so the count cannot differ between characters and bytes, and
 // `the_instructions_fit_what_the_client_reads` fails if it grows back.
 #[rmcp::tool_handler(
+    // `list_tools` and `get_tool` come from the macro; what they list is this instance's router
+    // rather than the crate-wide one, which is what makes `--tools` visible on the wire. The
+    // default here is `Self::tool_router()`, and leaving it would have narrowed the calls a tool
+    // may make (`dispatch`) while still advertising all fifty-one.
+    router = self.router(),
     name = "windbg-mcp",
     instructions = "Drive WinDbg/DbgEng for live user-mode, kernel, crash-dump and Time Travel Debugging (TTD) work: open a \
 dump or .run trace, attach to a process or the kernel, inspect registers/memory/stacks/modules, set \
@@ -4430,6 +4462,22 @@ impl WindbgServer {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
+        // A tool this build has and this *surface* does not. rmcp would answer the router's own
+        // `tool not found`, which is the right status and the wrong sentence: it is what a typo
+        // gets, and this is not a typo — the tool exists, the operator narrowed the surface, and
+        // the remedy is a flag on a command line the caller cannot see. Said here rather than in
+        // the router because only this server knows the difference.
+        if !self.surface.includes(tcc.name()) && crate::toolset::Toolset::exists(tcc.name()) {
+            return Err(ErrorData::invalid_params(
+                format!(
+                    "`{}` is a tool this server has, but it is not on the surface this run                      advertises ({}). It was started with `{}`; widen that spec, or drop it to                      serve every tool.",
+                    tcc.name(),
+                    self.surface.summary(),
+                    crate::toolset::FLAG,
+                ),
+                None,
+            ));
+        }
         // Read before the router takes the context, and wrapped around the whole call rather than
         // around the engine work inside it: an opener spends up to `WORKER_READY_TIMEOUT` bringing
         // a worker up before there is any engine call to report on.
@@ -4440,12 +4488,12 @@ impl WindbgServer {
         // or a pool census is megabytes, and paying for it on every call of a server that is not
         // recording is the kind of overhead nobody would ever see and everybody would pay.
         if !self.rec.enabled() {
-            return watch.run(Self::tool_router().call(tcc)).await;
+            return watch.run(self.router().call(tcc)).await;
         }
         let args = tcc.arguments.clone().map(serde_json::Value::Object);
         let mut call = self.rec.tool_request(tcc.name(), args.as_ref());
         let (outcome, routed) =
-            crate::record::tracking_route(watch.run(Self::tool_router().call(tcc))).await;
+            crate::record::tracking_route(watch.run(self.router().call(tcc))).await;
         // Where it actually went, which for a call that named no session is the only record of
         // which target it read or changed.
         call.routed_to(routed);

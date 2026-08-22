@@ -343,20 +343,62 @@ gh attestation verify <zip> --repo glslang/windbg-mcp `
 
 ## Tools
 
-| Group | Tools |
-|-------|-------|
-| Session | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `interrupt`, `end_session`, `session_status` |
-| Server   | `server_log` — the server's own log: the supervisor's records, plus those of the sessions you opened, tagged with the session each belongs to |
-| State   | `registers`, `read_memory`, `walk_memory`, `backtrace` (the stack as typed frames, each carrying `module`+`RVA` where the engine can place it, as well as its symbol), `modules`, `threads`, `disassemble` (instructions as records, each with its encoding and, where the engine can place it, its `RVA`), `dx` |
-| Crash   | `crash_triage` — a bug check as fields: code and parameters, crashing process, the stack as `module+RVA`, and the faulting driver frame |
-| Control | `go`, `step_over`, `step_into`, `set_breakpoint`, `run_to_address` |
-| Transaction | `debug_batch` — an ordered sequence with assertions and a rollback the engine process runs on every path |
-| TTD nav | `step_back` (`t-`), `step_over_back` (`p-`), `reverse_go` (`g-`), `goto_position` (`!tt`) |
-| TTD analysis | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
-| Driver IOCTL | `decode_ioctl`, `driver_object`, `device_object`, `irp_stack`, `ioctl_trace`, `reachable_from_dispatch` |
-| Kernel pool | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics` |
-| User Segment Heap | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` |
-| Raw     | `execute` — run any debugger command, returns full text output |
+The `--tools` column is the name that selects a group — see
+[Serving fewer tools](#serving-fewer-tools---tools) below.
+
+| Group | `--tools` | Tools |
+|-------|-----------|-------|
+| Session | `session` | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `interrupt`, `end_session`, `session_status` |
+| Server   | `session` | `server_log` — the server's own log: the supervisor's records, plus those of the sessions you opened, tagged with the session each belongs to |
+| State   | `inspect` | `registers`, `read_memory`, `backtrace` (the stack as typed frames, each carrying `module`+`RVA` where the engine can place it, as well as its symbol), `modules`, `threads`, `disassemble` (instructions as records, each with its encoding and, where the engine can place it, its `RVA`), `dx`, `set_symbol_path` |
+| Crash   | `crash` | `crash_triage` — a bug check as fields: code and parameters, crashing process, the stack as `module+RVA`, and the faulting driver frame |
+| Control | `exec` | `go`, `step_over`, `step_into`, `set_breakpoint`, `run_to_address` |
+| Transaction | `batch` | `debug_batch` — an ordered sequence with assertions and a rollback the engine process runs on every path |
+| TTD nav | `ttd` | `step_back` (`t-`), `step_over_back` (`p-`), `reverse_go` (`g-`), `goto_position` (`!tt`) |
+| TTD analysis | `ttd` | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
+| Driver IOCTL | `ioctl` | `decode_ioctl`, `driver_object`, `device_object`, `irp_stack`, `ioctl_trace`, `reachable_from_dispatch` |
+| Kernel pool | `allocator` | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics` |
+| User Segment Heap | `allocator` | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` |
+| Structure walk | `allocator` | `walk_memory` |
+| Raw     | `inspect` | `execute` — run any debugger command, returns full text output |
+
+### Serving fewer tools (`--tools`)
+
+All fifty-one tools are served unless you say otherwise, and their definitions cost the model
+**67,658 bytes — about 17k tokens — before it has asked anything**, once per conversation. Three
+quarters of that is the prose that tells a model how to drive them, so it cannot be trimmed without
+making the tools harder to use correctly (see
+[`docs/token-budget.md`](docs/token-budget.md)). What *can* change is how many of them a given run
+offers:
+
+```pwsh
+windbg-mcp.exe --tools session,inspect,crash
+```
+
+| `--tools` | Tools | Model context |
+|---|---:|---:|
+| *(absent)* — every tool | 51 | 67,658 B |
+| `session,inspect,exec,crash` | 25 | 28,671 B |
+| `session,inspect,crash` | 20 | 25,265 B |
+| `crash` | 11 | 15,073 B |
+
+The spec is a comma-separated list of the group names above, of individual tool names, or `all`.
+Anything else is refused at startup, with the valid names — a surface that quietly serves something
+other than what was asked for is worse than one that will not start.
+
+Two things worth knowing:
+
+- **`session` is always included**, whatever the spec says. Every other tool routes by a
+  `session_id`, and this server is the only thing that issues one, so a surface with `registers`
+  and no opener cannot be used at all. That is why `--tools crash` is eleven tools rather than one.
+  The startup log line names the surface it ended up with.
+- **Calling a tool that exists but is not served** is refused by name — "not on the surface this
+  run advertises" — rather than as an unknown tool, because the remedy is a flag on a command line
+  the caller cannot see.
+
+It is a **server-wide** choice: `--tools` on the stdio command line, on a `--listen` one, or on
+`--install-service` (where it is written into the command line the SCM stores, and read back at
+every start).
 
 ### Sessions and session handles
 
