@@ -4376,7 +4376,10 @@ fn tool_results_stay_within_their_budget() {
         ("open_dump", json!({ "path": dump }), 2_000, 3_200),
         ("session_status", json!({}), 600, 1_200),
         ("crash_triage", json!({}), 6_000, 9_000),
-        ("registers", json!({}), 13_500, 14_500),
+        // The default set stopped carrying the vector bank's 64-bit slices, which were 44% of it:
+        // 9,804 -> 3,480 B model, and the ceiling 13,500 -> 5,000 with them, since a ceiling left
+        // at the old figure is what would let them come back unnoticed.
+        ("registers", json!({}), 5_000, 6_000),
         ("backtrace", json!({}), 3_000, 4_000),
         ("disassemble", json!({}), 4_000, 6_000),
         // One page of rows rather than the whole table since the row cap landed — the ceiling
@@ -4778,6 +4781,90 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
     // The session is still the dump it was — nothing above reached a command.
     let after = server.tool_data("modules", json!({ "session_id": session_id }), TARGET_STEP);
     assert_eq!(after["loaded"].as_u64(), Some(loaded), "{after}");
+}
+
+/// **A default register set is the integer registers, on whatever architecture this host is.**
+///
+/// The `all` argument documents the default as excluding the x87 and vector registers, and it did
+/// not: DbgEng exposes a vector register twice — `xmm0` as 128 bits of `bytes`, and `xmm0/0` …
+/// `xmm0/3` as four int64 pseudo-registers that carry no subregister flag — so 64 of the x64
+/// sample's 123 default rows were the vector bank, and 44% of the answer's bytes with them.
+///
+/// The rule that excludes them tests the **name** for the `/` DbgEng puts in a slice's name, which
+/// is the only signal the register description offers. That makes it worth an assertion against a
+/// real engine rather than a unit test alone, and worth making it against **this host's own**
+/// architecture.
+///
+/// **What that turned up, and why this test asserts less than it might.** On ARM64 the convention
+/// does not exist — no register name carries a `/` — but the same *class* of row does: the default
+/// set there carries `w0`–`w30`, the 32-bit views of `x0`–`x28`/`fp`/`lr`, which are subregister
+/// views by any reading of the argument's own documentation and which DbgEng does not flag as such
+/// either (it flags nine `cpsr` bits and nothing else). So the engine's `DEBUG_REGISTER_SUB_REGISTER`
+/// is unreliable on both architectures in different ways, this fix addresses the x64 half, and the
+/// ARM64 half is `FOLLOWUPS.md` item 35 because a second invented name rule is not the way to it.
+/// Asserting the current ARM64 shape here would freeze what that item exists to change.
+#[test]
+fn a_default_register_set_leaves_out_the_vector_bank_on_this_architecture() {
+    let Some(sample) = native_sample_tier() else {
+        return;
+    };
+    let mut server = Server::started();
+    let session_id = server.open_session("open_dump", json!({ "path": sample.path }), TARGET_STEP);
+
+    let names = |listing: &Value| -> Vec<String> {
+        listing["registers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r["name"].as_str().map(str::to_string))
+            .collect()
+    };
+
+    let default = server.tool_data(
+        "registers",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
+    let plain = names(&default);
+    assert!(
+        !plain.is_empty(),
+        "a stopped target has registers: {default}"
+    );
+    assert_eq!(default["all_registers"], false, "{default}");
+    let slices: Vec<_> = plain.iter().filter(|name| name.contains('/')).collect();
+    assert!(
+        slices.is_empty(),
+        "the default set is the integer registers; these are pieces of wider ones: {slices:?}"
+    );
+    assert!(
+        default["registers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .all(|r| r["subregister"].is_null()),
+        "and no row spends bytes saying it is not a view of another: {default}"
+    );
+
+    let every = server.tool_data(
+        "registers",
+        json!({ "session_id": session_id, "all": true }),
+        TARGET_STEP,
+    );
+    let all = names(&every);
+    assert!(
+        all.len() > plain.len(),
+        "`all` returns everything the engine knows, which is more: {} against {}",
+        all.len(),
+        plain.len()
+    );
+    // The property that makes the default a *narrowing* rather than a different answer: everything
+    // in it is in `all` too. A rule that excluded a register from both would satisfy every size
+    // check here and quietly lose a caller the register they asked for by name.
+    let missing: Vec<_> = plain.iter().filter(|name| !all.contains(name)).collect();
+    assert!(
+        missing.is_empty(),
+        "the default has to be a subset of `all`; these are in one and not the other: {missing:?}"
+    );
 }
 
 /// **What one `modules` call costs the caller, and what a cut listing still tells them.**

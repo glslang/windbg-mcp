@@ -17,7 +17,8 @@ the stateless revision concurrently (#168 / #169, 2026-08-19), item 31 from givi
 listener more than one client (2026-08-20), item 32 from running the debugger tier on the
 ARM64 runner image that replaces `windows-11-arm` in September 2026, and item 33 from driving the
 server with a **local model** and finding the lease grace measured against the wrong slow party,
-and item 34 from the same run finding a service's clients fixed at install time (both 2026-08-22). Each item notes its repo,
+item 34 from the same run finding a service's clients fixed at install time, and item 35 from
+measuring what a `registers` answer is actually made of (all 2026-08-22). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -751,10 +752,15 @@ landed on their own so that each of the items below can be argued, and measured,
   half-applied — was charged for on every connection and discarded. Now 1,990 chars with that
   guidance inside the budget, ASCII so characters and bytes cannot diverge, and asserted in the
   protocol tier.
-- **`registers` returns 15.9x more JSON than its own text** (9,804 B vs 618 B), because every row
-  carries `"kind":"int"` and `"subregister":false`. `modules` is 2.7x and is the largest single
-  answer this server gives at 53,875 B. The ratio rule in `tool_results_stay_within_their_budget`
-  stops this spreading; it does not fix these two.
+- **`registers` returned 15.9x more JSON than its own text** (9,804 B vs 618 B) — **done**
+  (2026-08-22), and the bullet's diagnosis was half of it. `"kind":"int"` and `"subregister":false`
+  were 41% of the payload, but measuring it rather than reasoning about it found **64 of the 123
+  rows were the vector bank**: DbgEng reports `xmm0/0` … `xmm0/3` as int64 pseudo-registers without
+  the subregister flag, so they passed a filter meaning "integer, not a view" and sat in an answer
+  documented as excluding the vector registers. Now 3,480 B and 5.6x, ceiling 13,500 → 5,000. The
+  claim that the text "says the same thing better" was wrong too: `r` prints 17 registers and the
+  values carried 123, so the ratio compared two different sets. `modules` is the other half of this
+  bullet and is done above.
 - **Five tools are a third of the model-visible surface**, and it is their input schemas:
   `debug_batch` 9,746 B (7,980 of it the `StepAction`/`Check` vocabulary), `walk_memory` 4,076,
   `crash_triage` 2,912, `reachable_from_dispatch` 2,628, `server_log` 2,599 — 21,961 B against a
@@ -1265,3 +1271,32 @@ document the dance.
   **if someone running a deployed listener ever has to start a second one to add a client, these
   commands are incomplete.** That is the bar to build against, and the reason the reload above is
   not optional.
+
+## 35. [windbg-mcp + win-kexp] The engine's subregister flag misses the views that matter
+
+`registers` narrows its default set with `DEBUG_REGISTER_SUB_REGISTER`, and that flag does not mean
+what the filter needs it to mean. Measured 2026-08-22 on both architectures:
+
+- **x64**: the flag catches `eax`/`ax`/`al` (67 rows in a full set) and misses the vector bank's
+  64-bit slices — `xmm0/0` … `xmm15/3`, 64 rows, reported as plain int64s. Fixed here by excluding
+  names carrying the `/` DbgEng puts in a slice's name (item 24, `plain_integer` in `src/worker.rs`).
+- **ARM64**: the flag catches **nine** rows, all of them `cpsr` bits — and misses `w0`–`w30`
+  entirely, which are the 32-bit views of `x0`–`x30` and are subregister views by any reading of the
+  `all` argument's own documentation. 31 of the 109 default rows, ~28% of that answer.
+
+So the x64 half is fixed by a name rule and the ARM64 half is not, deliberately: a second invented
+name rule (`^w\d+$`, unless the target is 32-bit ARM, unless…) is a table of architectures growing
+inside a filter, and the first one only earns its place because `/` is a naming *convention for
+slices* rather than a list of registers.
+
+- **What to find out first, and it is a win-kexp question:** `DEBUG_REGISTER_DESCRIPTION` carries
+  `Type`, `Flags`, `SubregMaster`, `SubregLength`, `SubregShift`, and win-kexp keeps only the one
+  flag (`register_values`, `src/dbgeng.rs`). Does the engine populate `SubregMaster` for `w0` on
+  ARM64 — or a narrower `SubregLength` — even where it leaves the flag clear? If it does, the
+  filter becomes "a register that is a piece of another", typed and architecture-free, and the `/`
+  rule goes away with it. If it does not, the honest answer may be that the default set is defined
+  by this server rather than derived, which is a different item and a bigger one.
+- **Why it is worth doing rather than leaving:** the default answer is what a model reads, and on
+  ARM64 nearly a third of it is a second copy of registers already in the same answer. It is also
+  the second time this flag has been trusted and found wanting; a typed accessor would settle it
+  once for both.
