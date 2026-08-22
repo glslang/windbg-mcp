@@ -18,7 +18,8 @@ listener more than one client (2026-08-20), item 32 from running the debugger ti
 ARM64 runner image that replaces `windows-11-arm` in September 2026, and item 33 from driving the
 server with a **local model** and finding the lease grace measured against the wrong slow party,
 item 34 from the same run finding a service's clients fixed at install time, and item 35 from
-measuring what a `registers` answer is actually made of (all 2026-08-22). Each item notes its repo,
+measuring what a `registers` answer is actually made of and finding the engine could not say (all
+2026-08-22). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -1272,31 +1273,44 @@ document the dance.
   commands are incomplete.** That is the bar to build against, and the reason the reload above is
   not optional.
 
-## 35. [windbg-mcp + win-kexp] The engine's subregister flag misses the views that matter
+## 35. [windbg-mcp + win-kexp] The engine's subregister flag misses the views that matter — **measured and declined** (2026-08-22)
 
 `registers` narrows its default set with `DEBUG_REGISTER_SUB_REGISTER`, and that flag does not mean
-what the filter needs it to mean. Measured 2026-08-22 on both architectures:
+what the filter needs it to mean:
 
-- **x64**: the flag catches `eax`/`ax`/`al` (67 rows in a full set) and misses the vector bank's
-  64-bit slices — `xmm0/0` … `xmm15/3`, 64 rows, reported as plain int64s. Fixed here by excluding
-  names carrying the `/` DbgEng puts in a slice's name (item 24, `plain_integer` in `src/worker.rs`).
-- **ARM64**: the flag catches **nine** rows, all of them `cpsr` bits — and misses `w0`–`w30`
-  entirely, which are the 32-bit views of `x0`–`x30` and are subregister views by any reading of the
-  `all` argument's own documentation. 31 of the 109 default rows, ~28% of that answer.
+- **x64**: it catches `eax`/`ax`/`al` (67 rows of a full set) and misses the vector bank's slices —
+  `xmm0/0` … `xmm15/3`, 64 rows, four 32-bit pieces of each 128-bit register. Excluded since item 24
+  by the `/` DbgEng puts in a slice's name (`plain_integer`, `src/worker.rs`).
+- **ARM64**: it catches **nine** rows, all `cpsr` bits, and misses `w0`–`w30` — the 32-bit views of
+  `x0`–`x28`/`fp`/`lr`, 31 of the 109 default rows, ~28% of that answer.
 
-So the x64 half is fixed by a name rule and the ARM64 half is not, deliberately: a second invented
-name rule (`^w\d+$`, unless the target is 32-bit ARM, unless…) is a table of architectures growing
-inside a filter, and the first one only earns its place because `/` is a naming *convention for
-slices* rather than a list of registers.
+**The question this item existed to ask has been asked**, with a win-kexp branch exposing the whole
+`DEBUG_REGISTER_DESCRIPTION` and an example printing it for a dump (`register-descriptions`,
+unmerged). The answer is that the engine offers nothing better:
 
-- **What to find out first, and it is a win-kexp question:** `DEBUG_REGISTER_DESCRIPTION` carries
-  `Type`, `Flags`, `SubregMaster`, `SubregLength`, `SubregShift`, and win-kexp keeps only the one
-  flag (`register_values`, `src/dbgeng.rs`). Does the engine populate `SubregMaster` for `w0` on
-  ARM64 — or a narrower `SubregLength` — even where it leaves the flag clear? If it does, the
-  filter becomes "a register that is a piece of another", typed and architecture-free, and the `/`
-  rule goes away with it. If it does not, the honest answer may be that the default set is defined
-  by this server rather than derived, which is a different item and a bigger one.
-- **Why it is worth doing rather than leaving:** the default answer is what a model reads, and on
-  ARM64 nearly a third of it is a second copy of registers already in the same answer. It is also
-  the second time this flag has been trusted and found wanting; a typed accessor would settle it
-  once for both.
+| | x64 | ARM64 |
+| --- | --- | --- |
+| unflagged `int32` rows | `efl`, `mxcsr`, **and all 64 `xmm` slices** | `cpsr`, `spsr`, `fpsr`, `fpcr`, `bcr*`, **and all 31 `w` views** |
+| `SubregMaster` where the flag is clear | `0`, for every row | `0`, for every row |
+| where the flag is set | master and `SubregLength` are populated (`eax`: master `rax`, length 32) | the same, for the nine `cpsr` bits |
+
+So `Type` puts a view in the same bucket as a register that is simply narrow — `w0` beside `cpsr`,
+`xmm0/0` beside `efl` — and the master field says nothing unless the flag already did. There is no
+derived rule to be had from the description.
+
+**Declined rather than solved**, and the reasoning is worth keeping because it is what a future
+attempt will re-derive. The remaining option is a second name rule, and the obvious one does not
+survive contact with the register set: "exclude `w<N>` where `x<N>` exists" leaves `w29` and `w30`
+in, because ARM64 enumerates `x0`–`x28` and then `fp`, `lr`, `sp`, `pc` — so the rule immediately
+needs the table of exceptions this item was filed to avoid. The `/` rule stands as the one exception
+because it tests a *convention for slices* rather than pairing two registers by name, and it is
+asserted against whatever architecture the host is
+(`a_default_register_set_leaves_out_the_vector_bank_on_this_architecture`).
+
+- **What would reopen it:** a DbgEng build that sets the flag for these registers, or populates
+  `SubregMaster` without it. The example above is how to check in one command, and is the reason the
+  win-kexp branch is worth landing even though nothing consumes it yet — that is a judgement call
+  left open rather than made here.
+- **What it is worth if reopened:** ~1.8 KB of a ~6.3 KB answer, on ARM64 only. Real, and smaller
+  than the 6.3 KB item 24 already took off the same tool.
+

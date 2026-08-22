@@ -210,9 +210,11 @@ None of these is a bug. They are recorded because they were invisible, and
    described different sets, so the ratio was never a like-for-like comparison of one answer in two
    renderings. It is much closer to one now, at 59 rows against 17.
 
-   The ARM64 half is not fixed: there the same class of row is `w0`–`w30`, the 32-bit views of
-   `x0`–`x30`, which DbgEng also declines to flag — `FOLLOWUPS.md` item 35, because a second
-   invented name rule is not the way to it.
+   The ARM64 half is **measured and declined** (`FOLLOWUPS.md` item 35): there the same class of row
+   is `w0`–`w30`, the 32-bit views DbgEng also declines to flag, worth ~1.8 KB of a ~6.3 KB answer —
+   and reading every field of the engine's register description on both architectures found nothing
+   that identifies them, while the obvious second name rule needs a table of exceptions before it
+   even covers `w29`.
 8. **Five tools are a third of the model-visible surface**, and it is their *input* schemas rather
    than their prose. `debug_batch` alone is 9,746 B — 15% of everything a model is given before it
    asks anything — of which 7,980 B is the `StepAction`/`Check` vocabulary its schema pulls out of

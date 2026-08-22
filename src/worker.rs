@@ -1480,10 +1480,13 @@ fn registers(e: &DebugEngine, all: bool) -> Result<Output, Failed> {
 /// 44% of the bytes of the largest typed answer this server gives after `modules`.
 ///
 /// It is a test on the *name* because the description the engine hands back has nothing better to
-/// offer: `DEBUG_REGISTER_DESCRIPTION::SubregMaster` means something only when the flag above is
-/// set, and for these it is not. The `/` is DbgEng's own convention for "a piece of a wider
-/// register" and appears in no register's real name, so the test is narrow — and it decides only
-/// what the *default* carries, since `all` still returns everything the engine knows.
+/// offer, which is **measured rather than assumed** (`FOLLOWUPS.md` item 35): every field of
+/// `DEBUG_REGISTER_DESCRIPTION` was read for both architectures, and `SubregMaster` is `0` for
+/// every row whose flag is clear, while `Type` puts a view in the same bucket as a register that is
+/// simply narrow — `xmm0/0` beside `efl`, `w0` beside `cpsr`. The `/` is DbgEng's own convention for
+/// "a piece of a wider register" and appears in no register's real name, so the test is narrow — and
+/// it decides only what the *default* carries, since `all` still returns everything the engine
+/// knows.
 fn plain_integer(register: &win_kexp::dbgeng::Register) -> bool {
     !register.subregister
         && matches!(register.value, win_kexp::dbgeng::RegisterValue::Int(_))
