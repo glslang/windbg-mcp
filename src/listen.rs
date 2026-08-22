@@ -281,6 +281,13 @@ struct Presence {
     /// Tracked rather than inferred from `deadline`, so the adoption line says something true: it
     /// is the difference between "you picked up what you left" and "you are the first one here".
     left_open: bool,
+    /// This credential has been **taken out of the configuration**, rather than merely gone quiet.
+    ///
+    /// The difference is what the sweeper does when it finishes: a client that timed out keeps its
+    /// entry and may come back to it, while a revoked one is [forgotten](Lease::forget) — lease
+    /// state is keyed by client *name*, and an entry left behind is one a client re-added under
+    /// that name would inherit, session ids and all.
+    revoked: bool,
 }
 
 /// What a swept lease left behind.
@@ -293,6 +300,8 @@ struct Expired {
     /// alone would leave those MCP sessions resident and their ids still accepted, and every
     /// disconnect-and-reconnect cycle would add another that no lease will ever sweep again.
     mcp: Vec<String>,
+    /// Whether this was a revocation rather than a client going quiet — see [`Presence::revoked`].
+    revoked: bool,
 }
 
 /// What this listener decided about one request before the MCP service saw it.
@@ -521,7 +530,10 @@ impl Lease {
                 state.deadline = None;
                 state.left_open = false;
                 state.releasing = true;
-                Some(Expired { mcp })
+                Some(Expired {
+                    mcp,
+                    revoked: state.revoked,
+                })
             }
             _ => None,
         }
@@ -538,19 +550,26 @@ impl Lease {
         self.state_of(client).releasing = false;
     }
 
-    /// A client is **no longer configured**: take everything it holds, whatever its clock says.
+    /// A client is **no longer configured**: expire its lease now.
     ///
-    /// [`Self::expired_for`] with the deadline removed from the question, because a revocation is
-    /// not a client that went quiet — it is a credential that has stopped existing, and waiting out
-    /// a grace for one would leave its MCP sessions resident and its ids accepted for as long as
-    /// the grace lasts.
-    fn revoked_for(&self, client: &crate::client::Client) -> Expired {
+    /// **A revocation is an expiry that does not wait**, and saying it that way is the whole design.
+    /// The sweeper already releases an expired client's debug sessions, closes the MCP sessions it
+    /// left resident and clears its state — the three steps a revocation needs, in that order, on a
+    /// path that has been carrying live kernel targets since before this existed. So a revocation
+    /// sets the clock to now instead of growing a second teardown beside it, and the sweeper picks
+    /// it up on its next pass (at most [`SWEEP`] away).
+    ///
+    /// What the grace bought is not lost by skipping it, because it was never about this: a lease
+    /// waits so that a client which merely went quiet can come back to what it left. A credential
+    /// that has been taken out of the configuration is not coming back — the next request carrying
+    /// it is a `401` — so there is nothing for a grace to protect.
+    ///
+    /// The teardown that follows is the sweeper's, not this command's, so nothing an operator waits
+    /// on is behind a live kernel letting go.
+    fn revoke(&self, client: &crate::client::Client) {
         let mut state = self.state_of(client);
-        let mcp = std::mem::take(&mut state.mcp).into_iter().collect();
-        state.deadline = None;
-        state.left_open = false;
-        state.releasing = true;
-        Expired { mcp }
+        state.revoked = true;
+        state.deadline = Some(Instant::now());
     }
 
     /// Drops a revoked client's entry entirely, once its teardown is done.
@@ -716,21 +735,11 @@ pub async fn serve(
     // Only under the service, which is the only role with a control channel to be asked on. See
     // [`reloaded`] for what the answer is when there is no such channel.
     if let Some(asked) = reload {
-        // Two tasks, because they answer to different clocks: the first is what a client command
-        // waits on and must never be slow, the second releases targets and may take as long as a
-        // live kernel does. See [`reloaded`].
-        let (work, queued) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(torn_down(
-            queued,
-            sessions.clone(),
-            lease.clone(),
-            manager.clone(),
-        ));
         tokio::spawn(reloaded(
             asked,
             Arc::clone(&credentials),
             sessions.clone(),
-            work,
+            lease.clone(),
         ));
     }
 
@@ -929,18 +938,20 @@ fn refuse(status: StatusCode, why: &str) -> Response<BoxBody<Bytes, Infallible>>
 /// rather than every client locked out of a live kernel target. The set is only ever replaced by
 /// one that would have started this listener from cold.
 ///
-/// **Everything slow happens somewhere else** ([`torn_down`]), and this loop does only what the
-/// asking command is waiting on: read, swap, close the gate on revoked clients, answer. Releasing a
-/// revoked client's targets takes as long as a live kernel takes to let go, and doing it here would
-/// block the *next* command's reload behind it — which for a `--remove` or `--rotate` is reported
-/// as a failure, since those cannot tell "not applied yet" from "not applied" (review on #189).
+/// **Everything here is instant, and that is deliberate.** Reading a file, swapping a pointer and
+/// setting two flags — no `await` between the request and the answer. The command that asked is
+/// holding the SCM's control handler open until this replies, and releasing a revoked client's
+/// targets takes as long as a live kernel takes to let go: doing it here would time that
+/// acknowledgement out, and for a `--remove` or `--rotate` that reads as a *failed revocation*,
+/// since neither can tell "not applied yet" from "not applied" (review on #189). The teardown is
+/// [`sweep`]'s, which was already releasing expired clients' targets before this existed.
 ///
 /// Ends when the sender is dropped, which is the service's runtime going away.
 async fn reloaded(
     mut asked: tokio::sync::mpsc::UnboundedReceiver<std::sync::mpsc::SyncSender<bool>>,
     accepted: Arc<crate::client::Accepted>,
     sessions: Sessions,
-    work: tokio::sync::mpsc::UnboundedSender<crate::client::Change>,
+    lease: Arc<Lease>,
 ) {
     while let Some(answer) = asked.recv().await {
         // The same function that decided whether this listener could start at all, and
@@ -961,19 +972,22 @@ async fn reloaded(
             }
         };
         let change = accepted.replace(fresh);
-        // **The gate closes here, not in the teardown.** A revocation has a window a lease expiry
-        // does not: the token stops being accepted at the swap above, but a call that got past
-        // authentication a moment earlier is still running, and an opener can be seconds from
-        // registering. So this has to be shut before anything else is allowed to happen — and it
-        // can be, because it is a flag under the registry lock rather than work. What it is *not*
-        // is something to leave until the teardown reaches this client, which may be a live kernel
-        // release away.
         for name in &change.removed {
-            sessions.revoke(&crate::client::Client::new(name));
+            let gone = crate::client::Client::new(name);
+            // **The gate closes before the answer goes out**, because a revocation has a window a
+            // lease expiry does not. An expiry only fires after the client has been silent for
+            // longer than any call can keep it quiet, so nothing of that credential's can still be
+            // in flight; here the token stops being accepted at the swap above, but a call that got
+            // past authentication a moment earlier is still running and an opener can be seconds
+            // from registering. A session admitted behind the sweep would belong to a client
+            // nothing can authenticate as and nothing will ever come back for. Taken off again by
+            // the sweep, once that client's sessions are gone.
+            sessions.revoke(&gone);
+            // And the clock to now, which is all a revocation is: the sweeper does the rest.
+            lease.revoke(&gone);
         }
-        // **Answered once the swap and the gate are both done**, which is exactly what the asking
-        // command claims when it returns. Everything after this point is cleanup the operator is
-        // not waiting on.
+        // **Answered once the swap and the gates are done** — which is exactly what the asking
+        // command claims when it returns, and all of it is memory.
         let _ = answer.send(true);
         tracing::info!(
             "re-read the clients: {}",
@@ -990,58 +1004,6 @@ async fn reloaded(
                 ),
             }
         );
-        // Dropped only when the runtime is going away, in which case there is nothing to tear down.
-        let _ = work.send(change);
-    }
-}
-
-/// Releases what a revoked client left behind, one reload at a time.
-///
-/// **A queue rather than a task per client**, and the ordering is the whole reason. Spawning the
-/// teardown freely would let a client re-added under a revoked name have its fresh lease state
-/// wiped by the `forget` of the incarnation before it — remove `ci`, add `ci` again while the first
-/// release is still running, and the late `forget` takes the new one's sessions with it. Draining
-/// in the order the reloads happened makes that unreachable rather than unlikely.
-///
-/// Which is also why `unrevoke` is *here* and not in [`reloaded`]: it has to land after the
-/// `forget` of the previous holder, not before it. For an ordinary new client it is a no-op —
-/// nothing revoked that name — so the common case waits for nothing.
-async fn torn_down(
-    mut work: tokio::sync::mpsc::UnboundedReceiver<crate::client::Change>,
-    sessions: Sessions,
-    lease: Arc<Lease>,
-    manager: Arc<LocalSessionManager>,
-) {
-    while let Some(change) = work.recv().await {
-        for name in change.removed {
-            let gone = crate::client::Client::new(&name);
-            // Claimed as an expiry does: this marks the client `releasing` and takes its MCP ids
-            // under the same lock, so nothing can be admitted to what is being torn down.
-            // Unconditional, because the credential is gone rather than quiet.
-            let held = lease.revoked_for(&gone);
-            if sessions.live_count_for(&gone) > 0 {
-                tracing::info!(
-                    "client `{name}` is no longer configured; releasing the sessions it left open"
-                );
-                sessions.release_leased(&gone).await;
-            }
-            // The debug sessions are the expensive half and not the whole of it — the same three
-            // steps the sweep takes, for the same reasons. A revoked client sent no `DELETE`s, so
-            // without this its MCP sessions stay resident in the service for ever.
-            for id in held.mcp {
-                if let Err(e) = manager.close_session(&id.into()).await {
-                    tracing::warn!("could not close a revoked client's MCP session: {e}");
-                }
-            }
-            // And then the entry itself, which is what an expiry does *not* do: a name that may be
-            // re-added must not inherit the ids of whoever held it before.
-            lease.forget(&gone);
-        }
-        // After the removals above, so a name given back is ungated only once its predecessor has
-        // been forgotten.
-        for name in &change.added {
-            sessions.unrevoke(&crate::client::Client::new(name));
-        }
     }
 }
 
@@ -1085,9 +1047,20 @@ async fn sweep(
                     );
                 }
             }
-            // Only now may this client be admitted again: until here, an arriving request would be
-            // let in to sessions this release is closing.
-            lease.released_leases(&client);
+            if expired.revoked {
+                // **A revocation ends differently, and this is the only place that has to know.**
+                // The entry goes rather than being cleared, because lease state is keyed by name: a
+                // client re-added under this one must not inherit the ids of whoever held it
+                // before. And the admission gate `reloaded` closed comes off last of all — a name
+                // given back is ungated only once its predecessor's sessions are gone, which is
+                // what makes "re-added during a teardown" safe without anything sequencing it.
+                lease.forget(&client);
+                sessions.unrevoke(&client);
+            } else {
+                // Only now may this client be admitted again: until here, an arriving request would
+                // be let in to sessions this release is closing.
+                lease.released_leases(&client);
+            }
         }
     }
 }
@@ -1136,8 +1109,8 @@ mod tests {
             self.lease.released_leases(&self.client);
         }
 
-        fn revoked(&self) -> Expired {
-            self.lease.revoked_for(&self.client)
+        fn revoke(&self) {
+            self.lease.revoke(&self.client);
         }
 
         fn forget(&self) {
@@ -1669,40 +1642,46 @@ mod tests {
         assert!(lease.state().mcp.is_empty());
     }
 
-    /// A revoked client's MCP sessions come back whatever its clock says, and its entry then goes.
+    /// A revocation is an expiry that does not wait, and the sweeper is told which one it swept.
     ///
-    /// Two failures, and neither one shows up as anything until much later. Waiting for the
-    /// deadline would leave a removed credential's MCP sessions resident in the service for a whole
-    /// grace, since nothing else will ever close them — a revocation is not a client that went
-    /// quiet. And lease state is keyed by client *name*, so leaving the entry behind means a client
-    /// re-added under that name inherits the session ids of whoever held it before.
+    /// Three things, and each one is a failure that shows up only much later. Waiting out the grace
+    /// would leave a removed credential's sessions live for as long as it lasts — a grace is there
+    /// so a client that went *quiet* can come back to what it left, and a revoked one is never
+    /// coming back. The sessions have to come back from the sweep, or nothing ever closes them. And
+    /// the `revoked` flag has to travel with them, because it is what tells the sweeper to forget
+    /// the entry rather than clear it: lease state is keyed by client *name*, so an entry left
+    /// behind is one a client re-added under that name would inherit, session ids and all.
     #[test]
-    fn revoking_a_client_takes_its_sessions_now_and_leaves_no_entry_behind() {
+    fn revoking_a_client_expires_it_now_and_says_so_to_the_sweeper() {
         let lease = For::new(unchecked(Duration::from_secs(300)), "ci");
         request(&lease, None, Some("session-a"), true);
         request(&lease, None, Some("session-b"), true);
         // Deliberately *not* expired: the grace is the full one and no time has passed.
         assert!(
             lease.expired().is_none(),
-            "this client's lease has not run out; the point is that revocation does not care"
+            "this client's lease has not run out — the point is that a revocation does not wait"
         );
 
-        let held = lease.revoked();
+        lease.revoke();
+        let swept = lease
+            .expired()
+            .expect("a revoked client is expired now, not one grace later");
         assert_eq!(
-            held.mcp,
+            swept.mcp,
             vec!["session-a".to_string(), "session-b".to_string()],
             "a revoked client's MCP sessions have to come back, or nothing ever closes them"
         );
         assert!(
-            lease.state().releasing,
-            "the teardown has to be claimed under the same lock that took the sessions"
+            swept.revoked,
+            "the sweeper cannot tell which ending to use unless the expiry says which kind it was"
         );
 
         lease.forget();
         // Asking for the state again is exactly what a client re-added under this name does:
         // `state_of` creates the entry it does not find. It has to find nothing.
+        let state = lease.state();
         assert!(
-            lease.state().mcp.is_empty() && !lease.state().releasing,
+            state.mcp.is_empty() && !state.releasing && !state.revoked,
             "a name re-added after a revocation inherited the entry of whoever held it before"
         );
     }

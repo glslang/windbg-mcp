@@ -1305,7 +1305,18 @@ is written into the state directory, which is already `SYSTEM`-and-`Administrato
 traverse for anyone else, and the choice that generated both findings is deleted rather than patched
 a third time. A revocation also had a window a lease expiry does not (`Sessions::revoke`): the token
 stops being accepted at the swap, but an opener that authenticated a moment earlier can be seconds
-from registering, and a one-pass release cannot see it. Two elevated shells
+from registering, and a one-pass release cannot see it.
+
+**And then the shape changed rather than growing again.** Three rounds of findings had clustered on
+two things — how the secret reaches the operator, which the `--token-out` deletion settled, and
+revocation, which by then had four mechanisms of its own and a task with an ordering rule. The
+second cluster is gone the same way: a revocation is now **an expiry that does not wait**, so it
+sets the lease clock to now and the sweeper does the teardown it was already doing for expired
+clients. Deleted with it: the teardown task, its channel, the ordering rule between `forget` and
+`unrevoke`, and `Lease::revoked_for`. What is left is a flag on `Presence`, a branch in the sweep,
+and the admission gate — which stays, because it is the one thing an expiry genuinely does not need.
+A grace is there so a client that went *quiet* can come back to what it left; a revoked credential
+is never coming back, so skipping it costs nothing. Two elevated shells
 could each write a whole file from its own snapshot (`token.lock`, `share_mode(0)`). And
 `--add-listen-client --token-out C:\x` took `--token-out` as the client *name*, which passes the
 name rule since a name may contain `-`.

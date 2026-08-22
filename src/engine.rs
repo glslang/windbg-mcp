@@ -3403,6 +3403,61 @@ mod tests {
 
     // ---- the registry (no workers involved) ---------------------------------------
 
+    /// A revoked credential cannot register a session, and a name given back can again.
+    ///
+    /// **The window this closes is the one a lease expiry does not have.** An expiry fires only
+    /// after the client has been silent for longer than any call can keep it quiet, so nothing of
+    /// that credential's can still be in flight. A revocation has no quiet period: the token stops
+    /// being accepted the moment the set is swapped, but a call that got past authentication an
+    /// instant earlier is still running, and an opener can be *seconds* from registering — an
+    /// `attach_kernel` is. Without this gate the sweep is one pass over a snapshot, and a session
+    /// admitted behind it belongs to a client nothing can authenticate as and nothing will ever
+    /// come back for: a live kernel target held by nobody.
+    ///
+    /// The lifting is the sweeper's, once that client's sessions are gone, which is what makes a
+    /// name re-added mid-teardown safe without anything sequencing the two.
+    #[test]
+    fn a_revoked_credential_cannot_register_a_session_until_the_sweep_lifts_it() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let gone = crate::client::Client::new("ci");
+        let mine = |id: &str| {
+            let session = dormant(id, SessionState::Open);
+            // `dormant` takes the ambient client, which in a test is `local`; these have to be
+            // owned by the client being revoked for the gate to be about anything.
+            Arc::new(Session {
+                owner: gone.clone(),
+                ..Arc::into_inner(session).expect("`dormant` hands back the only reference")
+            })
+        };
+
+        assert!(
+            sessions.admit(&mine("sess-before")).is_ok(),
+            "nothing is revoked yet"
+        );
+
+        sessions.revoke(&gone);
+        let refused = sessions
+            .admit(&mine("sess-behind-the-sweep"))
+            .expect_err("a revoked credential registered a session");
+        assert!(
+            refused.contains("revoked"),
+            "the refusal has to say why, or it reads as a capacity problem: {refused}"
+        );
+        // Another client is untouched: a revocation is about one credential, not the registry.
+        assert!(
+            sessions
+                .admit(&dormant("sess-someone-else", SessionState::Open))
+                .is_ok(),
+            "revoking one client refused another one's session"
+        );
+
+        sessions.unrevoke(&gone);
+        assert!(
+            sessions.admit(&mine("sess-after")).is_ok(),
+            "a name given back has to be able to open sessions again"
+        );
+    }
+
     /// A `Session` with no worker behind it, for the routing tests. Its queue has no consumer,
     /// which is all these need: they never submit a call.
     fn dormant(id: &str, state: SessionState) -> Arc<Session> {
