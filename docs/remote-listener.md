@@ -421,9 +421,13 @@ windbg-mcp.exe --remove-listen-client ci
 ```
 
 Each one rewrites `%ProgramData%\windbg-mcp\token` and then tells the running service to re-read
-it, so the change is in force before the command returns. Nothing is stopped and nothing is
-restarted — which is the whole point, since a restart drops every session the service holds, a
-parked kernel attach included.
+it — **waiting for it to have done so**, so the set in force when the command returns is the set it
+wrote. Nothing is stopped and nothing is restarted, which is the whole point: a restart drops every
+session the service holds, a parked kernel attach included.
+
+Two commands cannot run at once. The second is refused rather than queued, because both would
+compute a whole file from their own snapshot of it and the later write would silently discard the
+earlier — an add and a revocation run together, both reporting success, and the revocation gone.
 
 **The file is still not yours to edit.** It grants `SYSTEM` and `Administrators` *read*, so an
 administrator who opens it in an editor is told `Access to the path is denied` — that is the ACL
@@ -466,7 +470,11 @@ Four behaviours worth knowing before you need them:
   takes the file with it rather than leaving a service that fails at every start.
 - **A reload that cannot read the file changes nothing.** The set is only ever replaced by one that
   would have started this listener from cold, so a mangled file is a loud line in the service log
-  and a service still serving the clients it had.
+  and a service still serving the clients it had. The command that asked is told, and for a
+  **revocation** it is told as a *failure*: a `--remove` or `--rotate` whose reload did not land
+  means the credential you were taking out of service is still being accepted, which is not
+  something to mention in passing. An `--add` in the same position is a warning — the new client
+  simply cannot connect until the next start, and nothing that worked has stopped working.
 
 If the service is not running, the file is written anyway and the command says it will be read at
 the next start. If it is not *installed*, the commands refuse — a foreground listener takes its
