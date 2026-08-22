@@ -1228,16 +1228,40 @@ the documented one, is a second *foreground* listener on another port with its o
 ([`docs/local-model.md`](./docs/local-model.md)); this item is about the case where the service is
 the listener you have.
 
-- **What to build:** `--add-listen-client <name>` and `--rotate-listen-client <name>`, writing the
-  file the way `finish_install` does — remove, `create_new`, re-apply the ACL — and **generating the
-  token itself**, printing only a fingerprint (`sha256:701E4CF3…`). Three things fall out of that:
-  no reinstall, no secret through a shell history or an agent's transcript, and an operation narrow
-  enough to allow-list in a permission rule, where "let this write `%ProgramData%` over ssh" is not.
-- **The awkward part, and the reason this is not trivial:** `Credentials` is built once at startup
-  (`client::Credentials::from_entries`), so a client added while the service runs would not be
-  admitted until the next start. Either the command says so plainly, or the service grows a control
-  code that re-reads the file — and *that* wants care, because re-reading a credential store at
-  runtime is a way to lose the property that the file was created by the installer and never reused.
+**The reinstall is not a decision anyone made** — it is what falls out of there being no writer but
+the installer. Two properties *were* chosen deliberately, and neither of them requires it: "only the
+installer writes this file" becomes "only **this program**, running elevated, writes it", since the
+command below is the same binary; and "never write through a file it did not create" survives a
+fresh temp created with `create_new` in the same protected directory and renamed over the old one.
+So the hardening and the fix are compatible, which is the reason to build the fix rather than
+document the dance.
+
+- **What to build, and it is three commands rather than one:** `--add-listen-client <name>`,
+  `--remove-listen-client <name>` and `--rotate-listen-client <name>`. Rotation is the one with a
+  schedule attached — rotating the *only* credential is today's same uninstall/reinstall — and
+  removal is what keeps a bench credential from outliving the bench. Each writes the file the way
+  `finish_install` does (a fresh file, `create_new`, the same ACL re-applied), **generates the token
+  itself**, and prints only a fingerprint (`sha256:701E4CF3…`). Three things fall out: no reinstall,
+  no secret through a shell history or an agent's transcript, and an operation narrow enough to
+  allow-list in a permission rule, where "let this write `%ProgramData%` over ssh" is not.
+- **The reload is the other half, not a footnote.** `Credentials` is built once at startup
+  (`client::Credentials::from_entries`), so a client added under a running service is not admitted
+  until the next start — and a *restart* still drops every session, which is most of what makes the
+  reinstall unfriendly in the first place. Without a live reload this item is an improvement in
+  ergonomics and not in outcome. Preferred mechanism: a **user-defined service control code** the
+  command sends after writing, which is explicit, needs no background watcher, and fits the plumbing
+  that already handles Stop and Preshutdown. A file watcher is the alternative and costs more: it
+  needs the writes to be atomic to be safe, and it mainly serves hand-editing, which the ACL is
+  there to discourage. Removing a client that still holds sessions is its own decision — refuse, or
+  release them down the path the lease sweep already uses.
 - **What not to do:** relax the ACL, or teach the installer to update in place. The refusal to write
   through a file it did not create is what stops an unprivileged user pre-creating the path and
   ending up owning the credential.
+- **The second listener is a development workflow, and stays one.** The recipe in
+  [`docs/local-model.md`](./docs/local-model.md) is right for a bench — a borrowed box with no
+  administrator, a credential that should vanish with the process, a run that must not share a
+  process with the listener an editor depends on, a build that is not the installed one — and every
+  one of those is a *developer's* problem. It is not an operator's answer and must not become one:
+  **if someone running a deployed listener ever has to start a second one to add a client, these
+  commands are incomplete.** That is the bar to build against, and the reason the reload above is
+  not optional.

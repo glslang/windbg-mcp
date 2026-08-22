@@ -430,11 +430,15 @@ Start-Service windbg-mcp
 
 **That drops every session the service holds** — a parked kernel attach included — so it is a
 planned outage rather than an incremental change, and it is worth knowing before the moment you
-need a second client. [`FOLLOWUPS.md`](../FOLLOWUPS.md) item 34 is the CLI that would make it one.
+need a second client. It is also not a design decision: the installer is simply the only thing that
+writes that file, and [`FOLLOWUPS.md`](../FOLLOWUPS.md) item 34 is the `--add-listen-client` /
+`--remove-listen-client` / `--rotate-listen-client` that would make this incremental — together with
+the live reload that has to come with them, since a *restart* would still cost you the sessions.
 
-**For a short-lived credential, do not touch the service at all.** A bench, a driver script, a
-one-off measurement: run a *second, foreground* listener on another port with its own token, which
-needs no privileged write and disappears when you close it — [Driving it with a local model](#driving-it-with-a-local-model)
+**For a short-lived credential, do not touch the service at all** — though this is a *development*
+workflow rather than something to operate a deployment with. A bench, a driver script, a one-off
+measurement: run a *second, foreground* listener on another port with its own token, which needs no
+privileged write and disappears when you close it — [Driving it with a local model](#driving-it-with-a-local-model)
 has the recipe. Two listeners on one host is a normal arrangement; sessions belong to a listener's
 own process, so the two cannot see each other's.
 
