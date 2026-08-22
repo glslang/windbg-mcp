@@ -182,10 +182,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   halves do not exist. An inherited override is ignored with a warning; the variable is unchanged
   for a foreground listener, which is what it is documented for.
 
-  And a **starting** service is now asked to re-read rather than treated as stopped. Credentials are
-  read before the bind, so a `StartPending` listener is already serving the old set — and a
-  non-loopback bind at boot can hold it there for `BIND_PATIENCE`, a minute and a half. The reload
-  task is started before the bind too, so there is something there to answer.
+  And a **starting** service is no longer treated as a stopped one. Credentials are read before the
+  bind, so a `StartPending` listener is already serving the old set — and a non-loopback bind at boot
+  can hold it there for `BIND_PATIENCE`, a minute and a half — while "it will read this at its next
+  start" was true only of a start that had not happened. It cannot be told either: the SCM refuses a
+  control code to a service in that state (`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`, measured against a
+  real service held there by an address not on the host). So the command says that, and for a
+  `--remove` or `--rotate` it exits non-zero — a restart is the only thing that applies it.
 
 - **`tools/ioctl_harness.ps1` could not run under Windows PowerShell 5.1**, which is the only
   PowerShell a stock debuggee has. Three faults, each fatal before an IOCTL was sent: em dashes in

@@ -466,21 +466,6 @@ const RELOAD_ACK_WAIT: Duration = Duration::from_secs(10);
 const ERROR_INVALID_DATA: u32 = 13;
 const ERROR_SERVICE_NOT_ACTIVE: u32 = 1062;
 
-/// Whether a service in this state can be asked to re-read its clients.
-///
-/// **`StartPending` counts, and getting that wrong reported a failed revocation as a success.** A
-/// starting listener has already read its credentials — that happens before the bind — so it is
-/// serving the *old* set even though the SCM has not called it `Running` yet. A non-loopback bind
-/// at boot can hold it there for [`crate::listen::BIND_PATIENCE`], and a `--remove-listen-client`
-/// issued in that window used to print "it will read this at its next start" while this start went
-/// on accepting the credential just revoked (#189 review).
-///
-/// So it is asked, and the reload task is running by then to answer. Everything else is a service
-/// with nothing loaded or on its way out, for which "at its next start" is the truth.
-fn is_askable(state: ServiceState) -> bool {
-    matches!(state, ServiceState::Running | ServiceState::StartPending)
-}
-
 /// Whether a control code the SCM delivered is the reload.
 ///
 /// A predicate rather than a match arm so the [dispatcher](serve_as_service) and the [sender](
@@ -907,14 +892,41 @@ fn write_credentials(credentials: &[(String, String)]) -> Result<()> {
 /// the reload task's answer, and reports a failed re-read as a control-code failure, which arrives
 /// here as an `Err`. So `Ok(true)` means the set in force is the set this command wrote.
 fn ask_to_reload(service: &windows_service::service::Service) -> Result<bool> {
-    if !is_askable(service.query_status()?.current_state) {
+    let state = service.query_status()?.current_state;
+    // **A starting service is neither of the two easy answers, and it used to be given the wrong
+    // one.** It has already read its credentials — that happens before the bind — so it is serving
+    // the *old* set, and a non-loopback bind at boot can hold it here for
+    // [`crate::listen::BIND_PATIENCE`], a minute and a half. Reporting "it will read this at its
+    // next start" was false of the start already under way, and for a revocation that is a
+    // credential the operator believes is gone.
+    //
+    // It cannot be told, either: the SCM refuses a control code to a service in this state with
+    // `ERROR_SERVICE_CANNOT_ACCEPT_CTRL`, which was measured rather than assumed — binding an
+    // address that is not on the host holds a real service here, and `notify` comes back
+    // `os error 1061`. So this says the true thing instead, and says it *without* going through
+    // `notify`, whose refusal at this point would otherwise be reported as the service having read
+    // the file and rejected it.
+    if state == ServiceState::StartPending {
+        bail!(
+            "`{NAME}` is still starting, and the Service Control Manager will not deliver a \
+             control code to a service in that state. It has already read its clients, though — \
+             that happens before it binds — so the start now under way is serving the set from \
+             *before* this change, and will go on doing so until it is restarted."
+        );
+    }
+    if state != ServiceState::Running {
         return Ok(false);
     }
     let code = windows_service::service::UserEventCode::from_raw(RELOAD_CODE)
         .map_err(|e| anyhow::anyhow!("{RELOAD_CODE} is not a user-defined control code: {e}"))?;
+    // **The context says what a failure here does and does not mean.** It used to assert the
+    // service "could not read or accept the file this command just wrote", which is only one of the
+    // ways this fails and sends an operator to a log that has nothing in it — the SCM refusing to
+    // deliver the code at all is the other, and the service never saw the file in that case.
     service.notify(code).context(
-        "the service did not re-read its clients — the control code came back a failure, which \
-         means it could not read or accept the file this command just wrote (its log says why)",
+        "the service did not re-read its clients: the control code came back a failure. Either it \
+         read the file and would not have it — its log says so — or the Service Control Manager \
+         would not deliver the code, which it does not say anything about",
     )?;
     Ok(true)
 }
@@ -1164,24 +1176,28 @@ fn serve_as_service() -> Result<()> {
     //
     // SAFETY: this runs on the SCM's dispatcher thread before the async runtime exists and before
     // any thread of ours has been started, so there is no concurrent reader of the environment.
+    // **Set whether or not the file is there**, which is the half review caught: guarding on
+    // `exists()` left an inherited override standing whenever the canonical file was missing —
+    // exactly the split-brain this is here to remove, and the case where it does most damage, since
+    // an `--add-listen-client` then *creates* the canonical file and the running service goes on
+    // reading the override. A service with no credential file is broken either way; the difference
+    // is whether it says so at startup or serves somebody else's clients.
     let file = token_file();
-    if file.exists() {
-        if let Some(overridden) = std::env::var_os(crate::listen::TOKEN_FILE_ENV)
-            && overridden != file
-        {
-            // Said out loud, because it is the one case where an operator's configuration is being
-            // disregarded, and they would otherwise be left wondering why their clients are not the
-            // ones being served.
-            tracing::warn!(
-                "{} names {} in this service's environment, and is being ignored: a service reads \
+    if let Some(overridden) = std::env::var_os(crate::listen::TOKEN_FILE_ENV)
+        && overridden != file
+    {
+        // Said out loud, because it is the one case where an operator's configuration is being
+        // disregarded, and they would otherwise be left wondering why their clients are not the
+        // ones being served.
+        tracing::warn!(
+            "{} names {} in this service's environment, and is being ignored: a service reads \
                  the credential file its own installer wrote and its own client commands edit ({}).",
-                crate::listen::TOKEN_FILE_ENV,
-                std::path::Path::new(&overridden).display(),
-                file.display()
-            );
-        }
-        unsafe { std::env::set_var(crate::listen::TOKEN_FILE_ENV, &file) };
+            crate::listen::TOKEN_FILE_ENV,
+            std::path::Path::new(&overridden).display(),
+            file.display()
+        );
     }
+    unsafe { std::env::set_var(crate::listen::TOKEN_FILE_ENV, &file) };
 
     // **Re-applied at every start, not just at install.** The bound is derived from
     // `WINDBG_MCP_CALL_TIMEOUT_SECS`, which an operator can raise long after installing — and the
@@ -1450,37 +1466,40 @@ mod tests {
         );
     }
 
-    /// A starting service is asked to re-read, because it has already read.
+    /// A revocation the service could not be told about is an **error**, not a note.
     ///
-    /// The bug this pins reported a **failed revocation as a success**: credentials are read before
-    /// the bind, so a `StartPending` listener is already serving the old set, and a non-loopback
-    /// bind at boot can hold it there for `BIND_PATIENCE` — a minute and a half. Treating that as
-    /// "not running" printed "it will read this at its next start" while *this* start went on
-    /// accepting the credential the operator had just revoked.
+    /// Which is the whole of what the `StartPending` handling is for. Three states, three
+    /// truths, and only the middle one is safe to report quietly:
+    ///
+    /// * running and told — the set in force is the set just written;
+    /// * stopped — nothing is serving anything, and the next start reads the new file;
+    /// * **starting** — it read its credentials before it began binding, so it is serving the
+    ///   *old* set, and the SCM will not carry a control code to it
+    ///   (`ERROR_SERVICE_CANNOT_ACCEPT_CTRL`, measured against a real service held there by an
+    ///   address that is not on the host).
+    ///
+    /// The third used to be reported as the second. For an `--add-listen-client` that is merely
+    /// early; for a `--remove-listen-client` it is a credential the operator has been told is gone
+    /// and which still authenticates. So the two commands that revoke turn a reload that did not
+    /// happen into a non-zero exit, and the one that does not stays a warning — asserted here
+    /// because the distinction is the point, and a refactor that lost it would lose it silently.
     #[test]
-    fn a_starting_service_is_asked_to_reload_because_it_has_already_read_its_clients() {
-        assert!(is_askable(ServiceState::Running));
+    fn only_the_commands_that_revoke_a_credential_fail_when_the_reload_does_not_land() {
         assert!(
-            is_askable(ServiceState::StartPending),
-            "a starting listener has read its credentials already — it is serving the old set, so \
-             it is exactly the one that has to be told"
+            ClientEdit::Remove.revokes_a_token(),
+            "a removal whose reload did not land leaves the removed token authenticating"
         );
-        // Nothing is loaded, or it is on the way out: "at its next start" is then the truth.
-        for settled in [
-            ServiceState::Stopped,
-            ServiceState::StopPending,
-            ServiceState::Paused,
-            ServiceState::PausePending,
-            ServiceState::ContinuePending,
-        ] {
-            assert!(
-                !is_askable(settled),
-                "{settled:?} was treated as reloadable"
-            );
-        }
+        assert!(
+            ClientEdit::Rotate.revokes_a_token(),
+            "a rotation is a revocation of the token it replaces"
+        );
+        assert!(
+            !ClientEdit::Add.revokes_a_token(),
+            "an add that has not landed costs nobody anything — nothing that worked has stopped"
+        );
     }
 
-    /// The code the dispatcher answers is the code the command sends, and nothing else is it.
+    /// The code the dispatcher answers is the code the command sends, and nothing else is it.    /// The code the dispatcher answers is the code the command sends, and nothing else is it.
     ///
     /// One number is the whole protocol between the two, and they are in different processes: a
     /// drift here is a client command that reports success and a service that goes on serving the
