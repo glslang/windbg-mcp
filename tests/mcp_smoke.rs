@@ -4800,9 +4800,13 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
 /// set there carries `w0`–`w30`, the 32-bit views of `x0`–`x28`/`fp`/`lr`, which are subregister
 /// views by any reading of the argument's own documentation and which DbgEng does not flag as such
 /// either (it flags nine `cpsr` bits and nothing else). So the engine's `DEBUG_REGISTER_SUB_REGISTER`
-/// is unreliable on both architectures in different ways, this fix addresses the x64 half, and the
-/// ARM64 half is `FOLLOWUPS.md` item 35 because a second invented name rule is not the way to it.
-/// Asserting the current ARM64 shape here would freeze what that item exists to change.
+/// is unreliable on both architectures in different ways, and this fix addresses the x64 half.
+///
+/// The ARM64 half was then measured and declined (`FOLLOWUPS.md` item 35): the rest of the register
+/// description says nothing the flag does not, and the obvious second name rule — "drop `w<N>` where
+/// `x<N>` exists" — leaves `w29` and `w30` behind, because the engine enumerates `x0`–`x28` and then
+/// `fp`, `lr`. So this test deliberately does not assert the ARM64 shape either way: it is a
+/// measured cost, not a settled contract.
 #[test]
 fn a_default_register_set_leaves_out_the_vector_bank_on_this_architecture() {
     let Some(sample) = native_sample_tier() else {
