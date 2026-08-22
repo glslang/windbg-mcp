@@ -1377,10 +1377,11 @@ fn json_bytes(value: &Value) -> usize {
 /// `outputSchema` and `annotations` are not in it: the Anthropic tool spec carries name,
 /// description and input schema, and the rest of a `tools/list` entry is the client's own
 /// business — validation, display — never spent on a context window. That split is why this
-/// report has two totals instead of one, and it is not a detail: ~80% of what this server puts on
+/// report has two totals instead of one, and it is not a detail: ~58% of what this server puts on
 /// the wire is `outputSchema`, and none of it is read by a model. Optimising the two halves means
 /// optimising for different things, so conflating them would point any future work at the wrong
-/// 280 KB.
+/// 100 KB — and the split is what let finding 1 cut that figure from 280 KB without anybody having
+/// to argue about whether the model would miss it.
 fn model_visible_bytes(tool: &Value) -> usize {
     json_bytes(&json!({
         "name": tool["name"],
@@ -1462,20 +1463,24 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 const MODEL_VISIBLE_CEILING: usize = 76_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
-/// the array's own punctuation and every result-level field are inside it. 391,172 bytes today,
-/// ~80% of that `outputSchema` no model reads, which is why this is a separate and much looser
+/// the array's own punctuation and every result-level field are inside it. 177,460 bytes today,
+/// 58% of that `outputSchema` no model reads, which is why this is a separate and much looser
 /// number rather than a scaled version of the one above.
 ///
 /// It is a client-side parse and memory cost, and it is the one that grows silently: `schemars`
-/// inlines `$defs` per tool, so adding one shared type to one more output shape can add tens of
-/// kilobytes here while [`MODEL_VISIBLE_CEILING`] does not move.
+/// inlines `$defs` per tool, so adding one shared type to one more output shape still lands here
+/// several times over while [`MODEL_VISIBLE_CEILING`] does not move.
 ///
-/// **Raised from 412,000 once**, when `PdbInfo` — one optional four-field type on `ModuleInfo` —
-/// cost 15,610 B of wire and nothing at all of model context, because `ModuleInfo` is embedded in
-/// half a dozen output shapes and each inlines its own copy. That is `FOLLOWUPS.md` item 24's
-/// first finding priced, and it is recorded in `docs/token-budget.md` rather than absorbed
-/// quietly: this number moving is the only warning that the duplication is compounding.
-const WIRE_CEILING: usize = 460_000;
+/// **The history is the point.** It was raised 412,000 → 460,000 once, when `PdbInfo` — one
+/// optional four-field type on `ModuleInfo` — cost 15,610 B of wire and nothing at all of model
+/// context, because `ModuleInfo` is embedded in half a dozen output shapes and each inlined its
+/// own copy. Then it came down to 205,000, because `src/schema.rs` stopped putting `description`
+/// in an output schema at all: 68% of every one of those bytes was rustdoc prose that no model is
+/// given and no validator reads, and dropping it took the payload 394,883 → 177,460. The
+/// multiplier is unchanged — the next shared type is still inlined everywhere it can be reached —
+/// but what is multiplied is a handful of keywords rather than a paragraph, which is `FOLLOWUPS.md`
+/// item 24's first finding done rather than priced.
+const WIRE_CEILING: usize = 205_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 9,757
 /// bytes, because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary from
@@ -1536,7 +1541,8 @@ fn tool_surface_stays_within_its_token_budget() {
         "the tools/list payload is now {payload} B, over its {WIRE_CEILING} B ceiling ({} B of \
          that is the tools themselves, the rest result-level fields). This is mostly \
          outputSchema, which no model reads — check whether a shared type just got inlined into \
-         another tool's $defs before raising the ceiling.",
+         another tool's $defs, or whether a tool declared its schema with rmcp's \
+         `schema_for_output` instead of `schema::constraints_of`, before raising the ceiling.",
         totals["wire"],
     );
     assert!(
@@ -1612,6 +1618,86 @@ fn tool_schemas_declare_one_dialect_and_are_self_contained() {
              `{other_tool}` declares {other}"
         );
     }
+}
+
+/// An `outputSchema` carries constraints; the prose stays in the source and the README.
+///
+/// 68% of every `outputSchema` byte this server emitted was a `description` — 217,423 B of
+/// 320,365 B, and 55% of the whole `tools/list` answer — because `schemars` inlines each type into
+/// the `$defs` of every tool that can reach it, so `ErrorCategory`'s doc comment shipped 33 times.
+/// None of it had a reader: no model is given an output schema (the measurement
+/// `docs/token-budget.md` opens with), and `description` is an annotation keyword, so a validator
+/// ignores it. `src/schema.rs` removes them; this is the assertion that they stay removed, because
+/// the change is one import line away from being undone and nothing else would report it.
+///
+/// The **input** schemas are checked in the same pass, as a positive control. They are the half a
+/// model does read, their descriptions are load-bearing, and a strip that reached them would be a
+/// silent regression in how well this server can be driven — not a size win.
+#[test]
+fn output_schemas_carry_constraints_not_prose() {
+    /// Counts `description` **keywords**, which is not the same as `description` keys: the members
+    /// of `properties` and `$defs` are named by the type being described, so a field called
+    /// `description` is a name in that position and not documentation. Kept separate from
+    /// `src/schema.rs`'s own walk on purpose, and **deliberately the blunter of the two**: that one
+    /// descends only where a JSON Schema keyword says a subschema lives, this one descends into
+    /// everything. So a keyword it does not know about is a keyword whose prose survives the strip
+    /// and fails here — which is the direction the pair has to fail in.
+    fn prose(node: &Value, names_not_keywords: bool, found: &mut usize) {
+        const NAME_MAPS: &[&str] = &["properties", "patternProperties", "$defs", "definitions"];
+        match node {
+            Value::Object(members) => {
+                for (key, value) in members {
+                    let keyword = !names_not_keywords;
+                    if keyword && key == "description" {
+                        *found += 1;
+                    }
+                    prose(value, keyword && NAME_MAPS.contains(&key.as_str()), found);
+                }
+            }
+            Value::Array(items) => items.iter().for_each(|item| prose(item, false, found)),
+            _ => {}
+        }
+    }
+
+    let mut server = Server::started();
+    let response = server.request("tools/list", json!({}), STEP);
+    let tools = response["result"]["tools"]
+        .as_array()
+        .expect("tools/list returns an array")
+        .clone();
+
+    let mut with_schema = 0;
+    let mut input_prose = 0;
+    for tool in &tools {
+        let name = tool["name"].as_str().unwrap_or("<unnamed>");
+
+        if let Some(schema) = tool.get("outputSchema").filter(|s| !s.is_null()) {
+            with_schema += 1;
+            let mut found = 0;
+            prose(schema, false, &mut found);
+            assert_eq!(
+                found, 0,
+                "`{name}`'s outputSchema carries {found} description(s). No model reads an \
+                 output schema and no validator reads a description, and every type in it is \
+                 inlined into every other tool that can reach it — so each one is paid for once \
+                 per tool. Declare it with `schema::constraints_of`, not rmcp's \
+                 `schema_for_output`."
+            );
+        }
+
+        prose(&tool["inputSchema"], false, &mut input_prose);
+    }
+
+    assert!(
+        with_schema > 20,
+        "only {with_schema} tools declare an output schema — this test has stopped covering the \
+         surface it is about"
+    );
+    assert!(
+        input_prose > 100,
+        "input schemas carry only {input_prose} descriptions: the strip has reached the half a \
+         model actually reads"
+    );
 }
 
 /// A tool that declares an `outputSchema` must return `structuredContent` — on **both** paths.

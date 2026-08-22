@@ -160,6 +160,12 @@ It deliberately excludes descriptions, so prose edits do not churn it while a `s
 switch, an `rmcp` annotation-casing change, a discriminator that stops being emitted, or an
 accidental tool rename all land as a readable line diff.
 
+Beside it, `output_schemas_carry_constraints_not_prose` asserts that an output schema carries no
+descriptions **at all** — 68% of every `outputSchema` byte used to be rustdoc that no model is given
+and no validator reads, which is `FOLLOWUPS.md` item 24's first finding. It reads `tools/list` off
+the wire because the way that comes undone is one tool declaring its schema with rmcp's
+`schema_for_output` instead of `schema::constraints_of`, and nothing else would report it.
+
 Re-record after an *intended* change, and read the diff before committing:
 
 ```pwsh

@@ -9,7 +9,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 use rmcp::ErrorData;
-use rmcp::handler::server::tool::schema_for_output;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock};
 use schemars::JsonSchema;
@@ -24,6 +23,7 @@ use crate::kdconn;
 use crate::proto::{
     EngineOp, HeapBackendFilter, HeapOp, HeapStateFilter, Output, PoolOp, ReachabilityOp,
 };
+use crate::schema::constraints_of;
 use crate::structured::{self, ErrorCategory, Outcome, TargetCreated};
 use crate::ttd;
 use crate::walk;
@@ -2543,7 +2543,7 @@ impl WindbgServer {
             idempotent_hint = false,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<structured::OpenOutcome>()
+        output_schema = constraints_of::<structured::OpenOutcome>()
     )]
     async fn open_dump(
         &self,
@@ -2568,7 +2568,7 @@ impl WindbgServer {
             idempotent_hint = false,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<structured::OpenOutcome>()
+        output_schema = constraints_of::<structured::OpenOutcome>()
     )]
     async fn open_trace(
         &self,
@@ -2593,7 +2593,7 @@ impl WindbgServer {
             idempotent_hint = false,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<structured::OpenOutcome>()
+        output_schema = constraints_of::<structured::OpenOutcome>()
     )]
     async fn attach_kernel_local(&self) -> Result<CallToolResult, ErrorData> {
         self.opened(
@@ -2626,7 +2626,7 @@ impl WindbgServer {
             idempotent_hint = false,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<structured::OpenOutcome>()
+        output_schema = constraints_of::<structured::OpenOutcome>()
     )]
     async fn attach_kernel(
         &self,
@@ -2699,7 +2699,7 @@ impl WindbgServer {
             idempotent_hint = true,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::PoolTagMatches>>()
+        output_schema = constraints_of::<Outcome<structured::PoolTagMatches>>()
     )]
     async fn pool_find_tag(
         &self,
@@ -2739,7 +2739,7 @@ impl WindbgServer {
             idempotent_hint = true,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::PoolChunkAt>>()
+        output_schema = constraints_of::<Outcome<structured::PoolChunkAt>>()
     )]
     async fn pool_chunk(
         &self,
@@ -2776,7 +2776,7 @@ impl WindbgServer {
             idempotent_hint = true,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::PoolDiagnosticsReport>>()
+        output_schema = constraints_of::<Outcome<structured::PoolDiagnosticsReport>>()
     )]
     async fn pool_diagnostics(
         &self,
@@ -2804,7 +2804,7 @@ impl WindbgServer {
             idempotent_hint = true,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::PoolCensus>>()
+        output_schema = constraints_of::<Outcome<structured::PoolCensus>>()
     )]
     async fn pool_census(
         &self,
@@ -2831,7 +2831,7 @@ impl WindbgServer {
             idempotent_hint = true,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::HeapListResult>>()
+        output_schema = constraints_of::<Outcome<structured::HeapListResult>>()
     )]
     async fn heap_list(
         &self,
@@ -2857,7 +2857,7 @@ impl WindbgServer {
             idempotent_hint = true,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::HeapAllocationsResult>>()
+        output_schema = constraints_of::<Outcome<structured::HeapAllocationsResult>>()
     )]
     async fn heap_allocations(
         &self,
@@ -2915,7 +2915,7 @@ impl WindbgServer {
             idempotent_hint = true,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::HeapChunkResult>>()
+        output_schema = constraints_of::<Outcome<structured::HeapChunkResult>>()
     )]
     async fn heap_chunk(
         &self,
@@ -2941,7 +2941,7 @@ impl WindbgServer {
             idempotent_hint = true,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::HeapCensusResult>>()
+        output_schema = constraints_of::<Outcome<structured::HeapCensusResult>>()
     )]
     async fn heap_census(
         &self,
@@ -2967,7 +2967,7 @@ impl WindbgServer {
             idempotent_hint = true,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::HeapDiagnosticsResult>>()
+        output_schema = constraints_of::<Outcome<structured::HeapDiagnosticsResult>>()
     )]
     async fn heap_diagnostics(
         &self,
@@ -3029,7 +3029,7 @@ impl WindbgServer {
             idempotent_hint = true,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::CrashTriage>>()
+        output_schema = constraints_of::<Outcome<structured::CrashTriage>>()
     )]
     async fn crash_triage(
         &self,
@@ -3063,7 +3063,7 @@ impl WindbgServer {
             idempotent_hint = false,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<structured::OpenOutcome>()
+        output_schema = constraints_of::<structured::OpenOutcome>()
     )]
     async fn attach_process(
         &self,
@@ -3088,7 +3088,7 @@ impl WindbgServer {
             idempotent_hint = false,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<structured::OpenOutcome>()
+        output_schema = constraints_of::<structured::OpenOutcome>()
     )]
     async fn launch(
         &self,
@@ -3125,7 +3125,7 @@ impl WindbgServer {
             read_only_hint = true,
             open_world_hint = false
         ),
-        output_schema = schema_for_output::<Outcome<structured::SessionsReport>>()
+        output_schema = constraints_of::<Outcome<structured::SessionsReport>>()
     )]
     async fn session_status(
         &self,
@@ -3202,7 +3202,7 @@ impl WindbgServer {
             read_only_hint = true,
             open_world_hint = false
         ),
-        output_schema = schema_for_output::<Outcome<structured::LogReport>>()
+        output_schema = constraints_of::<Outcome<structured::LogReport>>()
     )]
     async fn server_log(
         &self,
@@ -3309,7 +3309,7 @@ impl WindbgServer {
             idempotent_hint = true,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::SessionEnded>>()
+        output_schema = constraints_of::<Outcome<structured::SessionEnded>>()
     )]
     async fn end_session(
         &self,
@@ -3383,7 +3383,7 @@ impl WindbgServer {
             idempotent_hint = false,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::BatchReportInfo>>()
+        output_schema = constraints_of::<Outcome<structured::BatchReportInfo>>()
     )]
     async fn debug_batch(
         &self,
@@ -3436,7 +3436,7 @@ impl WindbgServer {
             read_only_hint = true,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::RegisterSet>>()
+        output_schema = constraints_of::<Outcome<structured::RegisterSet>>()
     )]
     async fn registers(
         &self,
@@ -3515,7 +3515,7 @@ impl WindbgServer {
             idempotent_hint = true,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::MemoryWalk>>()
+        output_schema = constraints_of::<Outcome<structured::MemoryWalk>>()
     )]
     async fn walk_memory(
         &self,
@@ -3561,7 +3561,7 @@ impl WindbgServer {
             read_only_hint = true,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::StackTrace>>()
+        output_schema = constraints_of::<Outcome<structured::StackTrace>>()
     )]
     async fn backtrace(
         &self,
@@ -3596,7 +3596,7 @@ impl WindbgServer {
             read_only_hint = true,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::ModuleList>>()
+        output_schema = constraints_of::<Outcome<structured::ModuleList>>()
     )]
     async fn modules(
         &self,
@@ -3668,7 +3668,7 @@ impl WindbgServer {
             read_only_hint = true,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::Disassembly>>()
+        output_schema = constraints_of::<Outcome<structured::Disassembly>>()
     )]
     async fn disassemble(
         &self,
@@ -3840,7 +3840,7 @@ impl WindbgServer {
             idempotent_hint = false,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::BreakpointSet>>()
+        output_schema = constraints_of::<Outcome<structured::BreakpointSet>>()
     )]
     async fn set_breakpoint(
         &self,
@@ -3869,7 +3869,7 @@ impl WindbgServer {
             idempotent_hint = false,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::StopReport>>()
+        output_schema = constraints_of::<Outcome<structured::StopReport>>()
     )]
     async fn go(
         &self,
@@ -3901,7 +3901,7 @@ impl WindbgServer {
             idempotent_hint = false,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::RunToReport>>()
+        output_schema = constraints_of::<Outcome<structured::RunToReport>>()
     )]
     async fn run_to_address(
         &self,
@@ -3931,7 +3931,7 @@ impl WindbgServer {
             idempotent_hint = false,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::StopReport>>()
+        output_schema = constraints_of::<Outcome<structured::StopReport>>()
     )]
     async fn step_over(
         &self,
@@ -3958,7 +3958,7 @@ impl WindbgServer {
             idempotent_hint = false,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::StopReport>>()
+        output_schema = constraints_of::<Outcome<structured::StopReport>>()
     )]
     async fn step_into(
         &self,
@@ -3987,7 +3987,7 @@ impl WindbgServer {
             idempotent_hint = false,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::StopReport>>()
+        output_schema = constraints_of::<Outcome<structured::StopReport>>()
     )]
     async fn step_back(
         &self,
@@ -4014,7 +4014,7 @@ impl WindbgServer {
             idempotent_hint = false,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::StopReport>>()
+        output_schema = constraints_of::<Outcome<structured::StopReport>>()
     )]
     async fn step_over_back(
         &self,
@@ -4041,7 +4041,7 @@ impl WindbgServer {
             idempotent_hint = false,
             open_world_hint = true
         ),
-        output_schema = schema_for_output::<Outcome<structured::StopReport>>()
+        output_schema = constraints_of::<Outcome<structured::StopReport>>()
     )]
     async fn reverse_go(
         &self,
