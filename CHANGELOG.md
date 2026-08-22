@@ -54,6 +54,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sharing): both would compute a whole file from their own snapshot and the later write would
   silently discard the earlier.
 
+  A removal also **deletes that client's token copy** if it is still sitting there: the credential
+  file is written by then, so the file authenticates nothing from the moment the command returns.
+
   A revocation **closes the gate before it walks anything** (`Sessions::revoke`). A lease expiry does
   not need to — it only fires after the client has been silent for longer than any call can keep it
   quiet, so nothing of that credential's can still be in flight — but a revocation has no quiet

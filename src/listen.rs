@@ -716,12 +716,21 @@ pub async fn serve(
     // Only under the service, which is the only role with a control channel to be asked on. See
     // [`reloaded`] for what the answer is when there is no such channel.
     if let Some(asked) = reload {
+        // Two tasks, because they answer to different clocks: the first is what a client command
+        // waits on and must never be slow, the second releases targets and may take as long as a
+        // live kernel does. See [`reloaded`].
+        let (work, queued) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(torn_down(
+            queued,
+            sessions.clone(),
+            lease.clone(),
+            manager.clone(),
+        ));
         tokio::spawn(reloaded(
             asked,
             Arc::clone(&credentials),
             sessions.clone(),
-            lease.clone(),
-            manager.clone(),
+            work,
         ));
     }
 
@@ -907,7 +916,7 @@ fn refuse(status: StatusCode, why: &str) -> Response<BoxBody<Bytes, Infallible>>
         .expect("a constant response is well-formed")
 }
 
-/// Re-reads the credential file whenever the service is asked to, and acts on what changed.
+/// Re-reads the credential file whenever the service is asked to, and says what changed.
 ///
 /// **The other half of the client commands** (`FOLLOWUPS.md` item 34). Without it,
 /// `--add-listen-client` writes a file nothing reads until the next start — and a *restart* drops
@@ -920,19 +929,18 @@ fn refuse(status: StatusCode, why: &str) -> Response<BoxBody<Bytes, Infallible>>
 /// rather than every client locked out of a live kernel target. The set is only ever replaced by
 /// one that would have started this listener from cold.
 ///
-/// **A removed client's sessions are released, not refused.** The command that removed it could
-/// not have refused on their account — it runs in another process and cannot see them — and
-/// blocking a revocation on the sessions it is trying to revoke is the wrong way round anyway. So
-/// they go down the path a lease expiry already uses, which for a live kernel is the orderly
-/// release rather than a worker killed and a guest left frozen.
+/// **Everything slow happens somewhere else** ([`torn_down`]), and this loop does only what the
+/// asking command is waiting on: read, swap, close the gate on revoked clients, answer. Releasing a
+/// revoked client's targets takes as long as a live kernel takes to let go, and doing it here would
+/// block the *next* command's reload behind it — which for a `--remove` or `--rotate` is reported
+/// as a failure, since those cannot tell "not applied yet" from "not applied" (review on #189).
 ///
 /// Ends when the sender is dropped, which is the service's runtime going away.
 async fn reloaded(
     mut asked: tokio::sync::mpsc::UnboundedReceiver<std::sync::mpsc::SyncSender<bool>>,
     accepted: Arc<crate::client::Accepted>,
     sessions: Sessions,
-    lease: Arc<Lease>,
-    manager: Arc<LocalSessionManager>,
+    work: tokio::sync::mpsc::UnboundedSender<crate::client::Change>,
 ) {
     while let Some(answer) = asked.recv().await {
         // The same function that decided whether this listener could start at all, and
@@ -953,10 +961,19 @@ async fn reloaded(
             }
         };
         let change = accepted.replace(fresh);
-        // **Answered here, before the releases below.** The swap is what the asking command is
-        // waiting to be true, and it now is; releasing a revoked client's targets can take as long
-        // as a live kernel takes to let go, and holding the SCM's control handler for that would
-        // make a routine command look like a hung service.
+        // **The gate closes here, not in the teardown.** A revocation has a window a lease expiry
+        // does not: the token stops being accepted at the swap above, but a call that got past
+        // authentication a moment earlier is still running, and an opener can be seconds from
+        // registering. So this has to be shut before anything else is allowed to happen — and it
+        // can be, because it is a flag under the registry lock rather than work. What it is *not*
+        // is something to leave until the teardown reaches this client, which may be a live kernel
+        // release away.
+        for name in &change.removed {
+            sessions.revoke(&crate::client::Client::new(name));
+        }
+        // **Answered once the swap and the gate are both done**, which is exactly what the asking
+        // command claims when it returns. Everything after this point is cleanup the operator is
+        // not waiting on.
         let _ = answer.send(true);
         tracing::info!(
             "re-read the clients: {}",
@@ -973,25 +990,34 @@ async fn reloaded(
                 ),
             }
         );
-        // **Before the removals**, so a name being given back does not stay gated by the mark its
-        // previous holder left. A single reload cannot both add and remove one name — `Change` is a
-        // diff — but two reloads can, and the second must be able to open sessions.
-        for name in &change.added {
-            sessions.unrevoke(&crate::client::Client::new(name));
-        }
+        // Dropped only when the runtime is going away, in which case there is nothing to tear down.
+        let _ = work.send(change);
+    }
+}
+
+/// Releases what a revoked client left behind, one reload at a time.
+///
+/// **A queue rather than a task per client**, and the ordering is the whole reason. Spawning the
+/// teardown freely would let a client re-added under a revoked name have its fresh lease state
+/// wiped by the `forget` of the incarnation before it — remove `ci`, add `ci` again while the first
+/// release is still running, and the late `forget` takes the new one's sessions with it. Draining
+/// in the order the reloads happened makes that unreachable rather than unlikely.
+///
+/// Which is also why `unrevoke` is *here* and not in [`reloaded`]: it has to land after the
+/// `forget` of the previous holder, not before it. For an ordinary new client it is a no-op —
+/// nothing revoked that name — so the common case waits for nothing.
+async fn torn_down(
+    mut work: tokio::sync::mpsc::UnboundedReceiver<crate::client::Change>,
+    sessions: Sessions,
+    lease: Arc<Lease>,
+    manager: Arc<LocalSessionManager>,
+) {
+    while let Some(change) = work.recv().await {
         for name in change.removed {
             let gone = crate::client::Client::new(&name);
-            // **The gate closes before anything is walked.** A revocation has a window a lease
-            // expiry does not: the token stops being accepted at the swap above, but a call that
-            // got past authentication a moment earlier is still running, and an opener can be
-            // seconds from registering. Without this the release below is one pass over a
-            // snapshot, and a session registered behind it belongs to a client nothing can
-            // authenticate as and nothing will ever come back for — a live kernel target held by
-            // nobody (review on #189).
-            sessions.revoke(&gone);
-            // Claimed next, exactly as an expiry does: this marks the client `releasing` and takes
-            // its MCP ids under the same lock, so nothing can be admitted to what is being torn
-            // down. Unconditional, because the credential is gone rather than quiet.
+            // Claimed as an expiry does: this marks the client `releasing` and takes its MCP ids
+            // under the same lock, so nothing can be admitted to what is being torn down.
+            // Unconditional, because the credential is gone rather than quiet.
             let held = lease.revoked_for(&gone);
             if sessions.live_count_for(&gone) > 0 {
                 tracing::info!(
@@ -1010,6 +1036,11 @@ async fn reloaded(
             // And then the entry itself, which is what an expiry does *not* do: a name that may be
             // re-added must not inherit the ids of whoever held it before.
             lease.forget(&gone);
+        }
+        // After the removals above, so a name given back is ungated only once its predecessor has
+        // been forgotten.
+        for name in &change.added {
+            sessions.unrevoke(&crate::client::Client::new(name));
         }
     }
 }
