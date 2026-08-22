@@ -3414,8 +3414,13 @@ mod tests {
     /// admitted behind it belongs to a client nothing can authenticate as and nothing will ever
     /// come back for: a live kernel target held by nobody.
     ///
-    /// The lifting is the sweeper's, once that client's sessions are gone, which is what makes a
-    /// name re-added mid-teardown safe without anything sequencing the two.
+    /// **What lifts it is the name being configured again**, and nothing else. Hanging it on the
+    /// teardown finishing lifts it on a timing coincidence: that release is one pass over a
+    /// snapshot, so an opener which authenticated before the revocation but has not registered yet
+    /// — an `attach_kernel` is seconds of worker spawn and link wait away from doing so — is
+    /// invisible to it, and would then register a target owned by a credential nothing can
+    /// authenticate as. A name revoked and never given back keeps its gate for the life of the
+    /// process, which is the answer wanted rather than a leak to tidy.
     #[test]
     fn a_revoked_credential_cannot_register_a_session_until_the_sweep_lifts_it() {
         let sessions = Sessions::new(Duration::from_secs(300));

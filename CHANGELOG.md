@@ -77,6 +77,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   out and the sweep that was to run on its next pass would not. Changing a token *without* losing
   the sessions is what `--rotate-listen-client` is for.
 
+  The registry gate a revocation closes is lifted **when the name is configured again**, not when
+  the teardown finishes. That release is one pass over the sessions that exist, so an opener which
+  authenticated before the revocation and has not registered yet — an `attach_kernel` is a worker
+  spawn away — is invisible to it, and lifting on "nothing left to release" let that opener register
+  a target owned by a credential nothing can authenticate as. A name revoked and never given back
+  keeps its gate for the life of the process, which is the answer wanted.
+
 ### Changed
 
 - **A default `registers` answer stopped carrying the vector bank** (`FOLLOWUPS.md` item 24's

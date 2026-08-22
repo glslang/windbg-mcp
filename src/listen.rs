@@ -991,6 +991,19 @@ async fn reloaded(
             }
         };
         let change = accepted.replace(fresh);
+        // **Lifted by a name being given back, not by a teardown finishing.** This is the only
+        // event that requires the gate off, and hanging it on anything else — the release running
+        // out of sessions to release, say — lifts it while a revoked credential's opener may still
+        // be seconds from registering. A name that is revoked and never configured again keeps its
+        // gate for the life of the process, which is a client name held in a set and exactly the
+        // behaviour wanted: nothing that credential started may ever register.
+        //
+        // It needs no sequencing against the teardown below, because `Lease::admit` refuses a
+        // revoked presence until the sweep forgets it: a name given back inside that window is held
+        // at a `409` by the lease, not by this.
+        for name in &change.added {
+            sessions.unrevoke(&crate::client::Client::new(name));
+        }
         for name in &change.removed {
             let gone = crate::client::Client::new(name);
             // **The gate closes before the answer goes out**, because a revocation has a window a
@@ -1070,11 +1083,18 @@ async fn sweep(
                 // **A revocation ends differently, and this is the only place that has to know.**
                 // The entry goes rather than being cleared, because lease state is keyed by name: a
                 // client re-added under this one must not inherit the ids of whoever held it
-                // before. And the admission gate `reloaded` closed comes off last of all — a name
-                // given back is ungated only once its predecessor's sessions are gone, which is
-                // what makes "re-added during a teardown" safe without anything sequencing it.
+                // before.
+                //
+                // The admission gate is **not** lifted here, and that is the point of it. This
+                // release is one pass over a snapshot, so a revoked credential's opener that had
+                // authenticated but not yet registered is invisible to it — an `attach_kernel` is
+                // seconds of worker spawn and link wait away from registering — and lifting on
+                // "nothing left to release" would let that opener register a target owned by a
+                // credential nothing can authenticate as, stranded until the process ends
+                // ([#189](https://github.com/glslang/windbg-mcp/pull/189) review). The gate comes
+                // off when the *name is given back*, in [`reloaded`], because that is the event
+                // that needs it off; until then it stays shut however long the opener takes.
                 lease.forget(&client);
-                sessions.unrevoke(&client);
             } else {
                 // Only now may this client be admitted again: until here, an arriving request would
                 // be let in to sessions this release is closing.
