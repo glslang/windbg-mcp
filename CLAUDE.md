@@ -168,6 +168,56 @@ previous round. Before calling a review done, re-check with the head SHA:
 select(.original_commit_id=="<sha>")'` — with `--paginate`, since a busy PR's comments span pages
 and the first page is exactly where the older rounds are.
 
+**They also circle the same topic, and contradict each other and themselves across rounds.** A bot
+reviews *this diff* without the argument that produced it, so the same seam comes back round after
+round from a different angle — and a finding framed as "fresh evidence relative to the prior
+comment" may be the same claim, or may be genuinely new. Three shapes seen across the four PRs
+behind `FOLLOWUPS.md` item 34 (#189 to #192), all from the same reviewer:
+
+- **Against code that no longer exists.** One round argued about a teardown task the *previous*
+  commit had deleted. Check which commit a comment is anchored to before acting on it.
+- **Round-tripping a decision.** Successive rounds drove a check out of `Lease::admit` and then
+  asked for it back. Both were right about different properties, and only reading the code settled
+  which — the review text alone could not.
+- **Right about the fact, wrong about the remedy.** "The SCM will not deliver a control code to a
+  `StartPending` service" was correct (`ERROR_SERVICE_CANNOT_ACCEPT_CTRL` — measured, by holding a
+  real service there with an address not on the host). Its proposed fix was a new IPC channel; the
+  right fix was a message that stopped claiming otherwise.
+
+So: **verify the fact against the current code, then decide the remedy yourself.** A correct finding
+does not make its suggested fix correct, and a confident one is not evidence of anything. Declining
+with a stated reason is a normal outcome — put it in the commit message, or the next round will
+raise it again and nothing will record why it was not taken. Measuring beats arguing whenever the
+claim is about behaviour: most of these were settled in one experiment.
+
+**When findings keep landing on one mechanism, delete the choice generating them rather than fixing
+them one at a time.** Each finding is locally real and each fix is locally correct, which is exactly
+what makes the pattern hard to see from inside it: the count of mechanisms goes up every round and
+nothing looks wrong. The signal is *accumulation on one seam*, not any individual finding. Item 34
+produced it twice in one PR ([#189](https://github.com/glslang/windbg-mcp/pull/189)):
+
+- **`--token-out`** let the operator name where a generated token was written. Round one moved the
+  ACL before the write; round two found the close-and-reopen race that opened. Every fix was
+  another turn of the same screw, and what generated all of them was writing a secret into a
+  directory this program does not control the protection of. Deleting the flag — the token goes
+  beside the credential file, in the directory already `SYSTEM`-and-`Administrators`-only — ended
+  the class outright.
+- **Revocation** produced findings in five consecutive rounds, all of them consumers of one
+  ambiguity: a `Client` was a *name*, so a name given back was indistinguishable from its
+  predecessor to session ownership, routing, lease state and the registry gate. Making identity
+  `(name, incarnation)` ([#192](https://github.com/glslang/windbg-mcp/pull/192)) deleted the `409`
+  a re-added name waited out, `Sessions::unrevoke`, and the whole question of *when* to lift a
+  gate — where two of the five findings had lived.
+
+**And then check what the deleted thing was also load-bearing for**, because this repo has now got
+that wrong twice in one PR. A revocation was simplified into "an expiry that does not wait", which
+silently gave up the `releasing` flag that had been blocking a re-added name; and the `revoked`
+check in `Lease::admit` was removed for a reason that was sound, dropping a *second* property it
+also provided (refusing the revoked incarnation's own in-flight request). Both times the full suite
+stayed green — a passing test is not evidence that a deleted check was doing nothing, only that
+nothing covered it. Before deleting, name every property the code provides; after deleting, assert
+the ones you meant to keep.
+
 `cargo test` includes `tests/mcp_smoke.rs`, which spawns the **dev** binary (via
 `CARGO_BIN_EXE_windbg-mcp`) and drives it over stdio — so it is also clear of the release lock.
 After a dependency bump (`rmcp`, `schemars`, `tokio`, `cargo update -p win-kexp`) or an MCP spec
