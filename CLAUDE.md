@@ -483,6 +483,26 @@ this repo believed for a while: Visual Studio Build Tools ships it, including an
 — because the first fetch takes minutes and everything around it times out, which reads convincingly
 as the parser having made things worse.
 
+## Adding a tool (`src/toolset.rs`)
+
+Two files, not one. A tool is declared in `src/server.rs` as always, and its name also goes in a
+**group** in `src/toolset.rs` — the table behind `--tools`, which advertises a named subset of the
+surface because 74% of the 67,658-byte tool surface is prose a model needs and cannot be trimmed
+(`docs/token-budget.md` finding 8).
+
+Forgetting the second half fails in the one direction nothing would notice: the *default* surface
+is every tool, so the new tool works everywhere you would try it, and it is missing only from a
+**narrowed** surface. `mcp_smoke::every_tool_belongs_to_exactly_one_group` is the join that catches
+it — it starts a server with all eight group names and asserts that equals the whole `tools/list`.
+There is no such thing as a tool in two groups, and a group named after a tool is refused by a unit
+test, because `Toolset::parse` resolves group names first and would decide it silently.
+
+Two rules worth knowing before touching it. **`session` is in every surface** whatever the spec
+says, because every other tool routes by a `session_id` this server alone issues — so `--tools
+crash` is eleven tools and 12,161 B is the floor. And **output schemas carry no prose at all**
+(`src/schema.rs`): declare one with `schema::constraints_of`, never rmcp's `schema_for_output`, or
+the tool ships every doc comment in its `$defs` closure and the wire ceiling notices.
+
 ## Several clients on one listener (`src/client.rs`)
 
 A `--listen` server holds **one bearer token per client**: `WINDBG_MCP_LISTEN_TOKEN_<NAME>` names

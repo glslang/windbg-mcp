@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`--tools` serves a named subset of the tool surface** (`FOLLOWUPS.md` item 24's last finding,
+  which closes that item). All 51 tools cost a model **67,658 B — about 17k tokens — once per
+  conversation, before it has asked anything**. `--tools session,inspect,crash` makes that 20 tools
+  and 25,265 B; `--tools crash` is 11 and 15,073 B. Nothing is reworded: the tools that remain are
+  the tools they were.
+
+  Fewer tools rather than smaller ones, because measuring settled it: **74% of the model-visible
+  surface is prose** - 24,794 B of tool descriptions and 25,333 B inside the input schemas - and
+  input-schema prose is most of what tells a model how to drive a tool. `debug_batch` is where
+  getting that wrong leaves a patched byte in a running kernel. The structural remainder is
+  ~1,744 B, 2.6%, since `$schema` is how a client picks a validator dialect and `minimum`/`format`
+  are constraints. There was no strip here worth the risk.
+
+  A spec names groups (`session`, `inspect`, `exec`, `ttd`, `ioctl`, `allocator`, `crash`, `batch`),
+  individual tools, or `all`; anything else is refused at startup with the valid names. **`session`
+  is always included** - every other tool routes by a `session_id` this server is the only issuer
+  of, so a surface with `registers` and no opener is not a smaller surface but a broken one, and
+  `--tools crash` is eleven tools rather than one. A tool that exists and is *not* served is refused
+  by name ("not on the surface this run advertises") rather than as an unknown tool, because the
+  remedy is a flag on a command line the caller cannot see.
+
+  Server-wide: on the stdio command line, on a `--listen` one, or on `--install-service`, where it
+  is written into the command line the SCM stores and read back at every start - the only place an
+  install's choice survives to. Per-caller, on a listener whose clients are already named, is filed
+  as item 36.
+
 - **A service-hosted listener's clients can be changed without a reinstall**
   (`FOLLOWUPS.md` item 34). `--add-listen-client <name>`, `--remove-listen-client <name>` and
   `--rotate-listen-client <name>`, from an elevated shell, edit the credential file the service

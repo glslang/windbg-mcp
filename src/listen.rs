@@ -684,6 +684,7 @@ pub async fn serve(
     sessions: Sessions,
     addr: SocketAddr,
     call_timeout: Duration,
+    tools: crate::toolset::Toolset,
     reload: Option<tokio::sync::mpsc::UnboundedReceiver<std::sync::mpsc::SyncSender<bool>>>,
     shutdown: impl Future<Output = ()>,
     ready: impl FnOnce(),
@@ -713,6 +714,7 @@ pub async fn serve(
     let manager = Arc::new(LocalSessionManager::default());
     let mcp = {
         let sessions = sessions.clone();
+        let tools = tools.clone();
         Arc::new(StreamableHttpService::new(
             // **The one moment the caller is knowable.** rmcp builds a service instance per MCP
             // session — here, on the task handling that session's `initialize`, which
@@ -722,10 +724,12 @@ pub async fn serve(
             // `WindbgServer::client`. On the stateless revision there is no session and no spawn,
             // and this runs per request, which reaches the same answer by the shorter route.
             move || {
-                Ok(WindbgServer::for_client(
-                    sessions.clone(),
-                    crate::client::current(),
-                ))
+                Ok(
+                    WindbgServer::for_client(sessions.clone(), crate::client::current())
+                        // Server-wide, so every client on this listener sees the same surface.
+                        // Per-caller is `FOLLOWUPS.md` item 36, and this is the line it changes.
+                        .with_tools(tools.clone()),
+                )
             },
             manager.clone(),
             // A tool call can be quiet for minutes; without a keep-alive the stream looks idle to
@@ -750,12 +754,15 @@ pub async fn serve(
     // *now*. See [`crate::service`], where "started" is a thing the SCM and its dependants act on.
     ready();
     tracing::info!(
-        "windbg-mcp listening on http://{addr} (lease grace {grace:?}, {}, clients: {})",
+        "windbg-mcp listening on http://{addr} (lease grace {grace:?}, {}, clients: {}, serving {})",
         match idle_after {
             Some(after) => format!("idle sessions released after {}m", after.as_secs() / 60),
             None => "idle sessions never released".to_string(),
         },
-        credentials.names().join(", ")
+        credentials.names().join(", "),
+        // Named here for the same reason the client list is: `--tools` adds the `session` group
+        // whatever the spec said, so the surface a run ends up with is not always the one typed.
+        tools.summary()
     );
 
     // Only under the service, which is the only role with a control channel to be asked on.
