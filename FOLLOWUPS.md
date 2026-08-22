@@ -1316,7 +1316,18 @@ clients. Deleted with it: the teardown task, its channel, the ordering rule betw
 `unrevoke`, and `Lease::revoked_for`. What is left is a flag on `Presence`, a branch in the sweep,
 and the admission gate — which stays, because it is the one thing an expiry genuinely does not need.
 A grace is there so a client that went *quiet* can come back to what it left; a revoked credential
-is never coming back, so skipping it costs nothing. Two elevated shells
+is never coming back, so skipping it costs nothing.
+
+**What it did not settle, and is now [#190](https://github.com/glslang/windbg-mcp/issues/190).** A
+`Client` is a name, so `--remove-listen-client ci` then `--add-listen-client ci` makes two
+credentials that everything keyed on identity — session ownership, routing, lease state, the
+revocation gate — treats as one. Four of #189's findings were different consumers of that one
+ambiguity, and the four fixes that shipped (a `409` on a revoked presence, a lease that does not
+renew for one, an admission gate on the owner name, and lifting that gate on re-add rather than on
+an empty release) each narrow the window without closing it: at the moment a session registers there
+is nothing in it that says *which* `ci` opened it. Giving `Client` an incarnation would delete all
+four rather than add a fifth. Not urgent — the residual needs two elevated commands issued during
+one open, and nothing a client can do reaches it. Two elevated shells
 could each write a whole file from its own snapshot (`token.lock`, `share_mode(0)`). And
 `--add-listen-client --token-out C:\x` took `--token-out` as the client *name*, which passes the
 name rule since a name may contain `-`.
