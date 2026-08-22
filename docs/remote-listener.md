@@ -399,9 +399,10 @@ as `LocalSystem`. The token is the only thing in the way, so it has to stay unre
 unprivileged process, which is the one property the foreground listener gets for free.
 
 **Every credential in the installing shell is copied, not just the unnamed one.** A service reads
-its file and nothing else, so this is the only way it can hold more than one client — set
+its file and nothing else, so the environment is only ever consulted *here*, at install — set
 `WINDBG_MCP_LISTEN_TOKEN_CI` beside `WINDBG_MCP_LISTEN_TOKEN` before installing and the file it
-writes names both. One client called `local` is written as a bare token, as it always was; anything
+writes names both. Afterwards the [client commands](#adding-revoking-and-rotating-a-client-without-stopping-anything)
+are how that set changes, and they neither read the environment nor need a reinstall. One client called `local` is written as a bare token, as it always was; anything
 else is the JSON object above. The install validates them the way the listener would, so a shell
 that could not start a foreground listener cannot register a service either — which matters here,
 because the SCM registers a service once and a bad credential then fails it at every start.
@@ -409,35 +410,74 @@ because the SCM registers a service once and a bad credential then fails it at e
 `windbg-mcp.exe --uninstall-service` removes it, stopping it first and waiting for it — a delete
 issued against a running service only marks it, and this one has debug targets to let go of.
 
-### Adding or rotating a client afterwards costs a reinstall
+### Adding, revoking and rotating a client, without stopping anything
 
-**There is no command for it, and the file is not yours to edit.** The install is the only writer of
-`%ProgramData%\windbg-mcp\token`, and it leaves the file granting `SYSTEM` and `Administrators`
-**read** — so an administrator who tries to add a client by editing it is told `Access to the path
-is denied`, which is the ACL working rather than something to route around. Taking ownership to
-write it anyway leaves a credential owned by whoever did that, which is the reason the installer
-refuses to reuse a file it did not create.
-
-The SCM refuses a second registration under the same name, so the whole procedure is:
+Three commands, from an **elevated** shell, and none of them costs you a session:
 
 ```pwsh
-windbg-mcp.exe --uninstall-service                        # stops it; every session goes
-$env:WINDBG_MCP_LISTEN_TOKEN = "<the existing one>"       # keep it, or clients stop working
-$env:WINDBG_MCP_LISTEN_TOKEN_CI = "<the new one>"
-windbg-mcp.exe --install-service --listen 127.0.0.1:8765
-Start-Service windbg-mcp
+windbg-mcp.exe --add-listen-client    ci --token-out C:\Users\you\ci.token
+windbg-mcp.exe --rotate-listen-client ci --token-out C:\Users\you\ci-new.token
+windbg-mcp.exe --remove-listen-client ci
 ```
 
-**That drops every session the service holds** — a parked kernel attach included — so it is a
-planned outage rather than an incremental change, and it is worth knowing before the moment you
-need a second client. It is also not a design decision: the installer is simply the only thing that
-writes that file, and [`FOLLOWUPS.md`](../FOLLOWUPS.md) item 34 is the `--add-listen-client` /
-`--remove-listen-client` / `--rotate-listen-client` that would make this incremental — together with
-the live reload that has to come with them, since a *restart* would still cost you the sessions.
+Each one rewrites `%ProgramData%\windbg-mcp\token` and then tells the running service to re-read
+it, so the change is in force before the command returns. Nothing is stopped and nothing is
+restarted — which is the whole point, since a restart drops every session the service holds, a
+parked kernel attach included.
 
-**For a short-lived credential, do not touch the service at all** — though this is a *development*
-workflow rather than something to operate a deployment with. A bench, a driver script, a one-off
-measurement: run a *second, foreground* listener on another port with its own token, which needs no
+**The file is still not yours to edit.** It grants `SYSTEM` and `Administrators` *read*, so an
+administrator who opens it in an editor is told `Access to the path is denied` — that is the ACL
+working rather than something to route around, and taking ownership to write it anyway leaves a
+credential owned by whoever did that. These commands are the writer instead: the same program,
+running elevated, writing a fresh file with `create_new` in that protected directory, ACL'ing it
+there, and renaming it over the old name. Never through a file it did not create, and atomic for a
+service reading it at the same moment.
+
+**They generate the token, and they will not print it.** What reaches your console is a fingerprint:
+
+```text
+added the client `ci` (sha256:076C14953E1DE5EF) — it gets the whole tool surface, as every client
+here does — a token separates clients from each other, it does not limit one.
+`windbg-mcp` now holds: `ci` (sha256:076C14953E1DE5EF), `local` (sha256:701E4CF334890225).
+
+Its token is in C:\Users\you\ci.token — readable by SYSTEM and Administrators only, like the
+credential file it came from. …
+
+`windbg-mcp` re-read its clients; nothing was stopped.
+```
+
+`--token-out` is required for the two that mint a token, and the file it names is created fresh
+(never overwritten) and locked down the same way. Move it to the client machine, set it there as
+`WINDBG_MCP_LISTEN_TOKEN`, and delete this copy. The reason for all of that is one property: a token
+you typed has been through a shell history, and on a machine being driven by an agent, through a
+transcript. One this server generated has been through neither.
+
+Four behaviours worth knowing before you need them:
+
+- **A rotation keeps the client's name, and so keeps its sessions.** Only the token moves: the old
+  one starts answering `401` and the new one reaches the same debug sessions, because it is the same
+  client. Rotating is the cheap operation — a lost token costs a rotation and nothing else.
+- **A removal releases what that client still held**, down the path a lease expiry already uses, so
+  a live kernel is let go rather than left frozen. It is not refused on their account: the command
+  runs in another process and cannot see them, and blocking a revocation on the sessions it is
+  revoking would be exactly backwards.
+- **Removing the last client is refused.** A listener with no credentials will not start, so that is
+  not an incremental change but a decision to stop serving — which is `--uninstall-service`, and it
+  takes the file with it rather than leaving a service that fails at every start.
+- **A reload that cannot read the file changes nothing.** The set is only ever replaced by one that
+  would have started this listener from cold, so a mangled file is a loud line in the service log
+  and a service still serving the clients it had.
+
+If the service is not running, the file is written anyway and the command says it will be read at
+the next start. If it is not *installed*, the commands refuse — a foreground listener takes its
+clients from the environment it was started with, which is a set that cannot change without the
+process changing too.
+
+**A second foreground listener is still the right answer for a bench**, and it is a *development*
+workflow rather than a way to operate a deployment — the commands above are what an operator uses.
+A borrowed box with no administrator, a credential that should vanish with the process, a run that
+must not share a process with the listener an editor depends on, a build that is not the installed
+one: run a *second, foreground* listener on another port with its own token, which needs no
 privileged write and disappears when you close it — [Driving it with a local model](#driving-it-with-a-local-model)
 has the recipe. Two listeners on one host is a normal arrangement; sessions belong to a listener's
 own process, so the two cannot see each other's.

@@ -84,6 +84,15 @@ pub const UNINSTALL_FLAG: &str = "--uninstall-service";
 /// Acknowledges installing from a directory Windows does not protect. See [`under_protected_root`].
 pub const ALLOW_UNPROTECTED_FLAG: &str = "--allow-unprotected-path";
 
+/// Gives the installed service a client it did not have. Takes the client's name.
+pub const ADD_CLIENT_FLAG: &str = "--add-listen-client";
+/// Takes a client away again, releasing whatever it still held.
+pub const REMOVE_CLIENT_FLAG: &str = "--remove-listen-client";
+/// Replaces a client's token, keeping its name — and so its sessions.
+pub const ROTATE_CLIENT_FLAG: &str = "--rotate-listen-client";
+/// Where a generated token is written, since it is the one thing these commands will not print.
+pub const TOKEN_OUT_FLAG: &str = "--token-out";
+
 /// Overrides where the service writes its log.
 pub const LOG_ENV: &str = "WINDBG_MCP_SERVICE_LOG";
 
@@ -119,12 +128,37 @@ fn stop_bound() -> Duration {
 }
 
 /// Which service role, if any, this command line asks for.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Role {
     /// The SCM started us.
     Run,
     Install,
     Uninstall,
+    /// One of the client commands, and which client it names.
+    Client(ClientEdit, String),
+}
+
+/// What a client command does to the service's credential file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientEdit {
+    Add,
+    Remove,
+    Rotate,
+}
+
+impl ClientEdit {
+    fn flag(self) -> &'static str {
+        match self {
+            Self::Add => ADD_CLIENT_FLAG,
+            Self::Remove => REMOVE_CLIENT_FLAG,
+            Self::Rotate => ROTATE_CLIENT_FLAG,
+        }
+    }
+
+    /// Whether this command mints a token, and so needs somewhere to put it.
+    fn mints_a_token(self) -> bool {
+        matches!(self, Self::Add | Self::Rotate)
+    }
 }
 
 /// Reads the role off the command line. `None` for every ordinary invocation.
@@ -132,13 +166,35 @@ pub enum Role {
 /// A free function over the arguments, like [`crate::listen::requested`], so the role can be
 /// decided before a runtime exists — installing touches the SCM and nothing else, and the service
 /// role has to build its runtime *inside* the SCM's own thread rather than around it.
+///
+/// **A client flag with nothing after it still yields its role**, with an empty name, rather than
+/// `None`. Falling through would run the ordinary stdio server instead, which for a typo on an
+/// administrative command line is the least helpful thing that could happen; the empty name is
+/// refused by the same rule that refuses any other name that is not one, and says so.
 pub fn requested(args: &[String]) -> Option<Role> {
-    args.iter().find_map(|arg| match arg.as_str() {
-        SERVICE_FLAG => Some(Role::Run),
-        INSTALL_FLAG => Some(Role::Install),
-        UNINSTALL_FLAG => Some(Role::Uninstall),
-        _ => None,
+    let edits = [
+        (ADD_CLIENT_FLAG, ClientEdit::Add),
+        (REMOVE_CLIENT_FLAG, ClientEdit::Remove),
+        (ROTATE_CLIENT_FLAG, ClientEdit::Rotate),
+    ];
+    args.iter().enumerate().find_map(|(at, arg)| {
+        match arg.as_str() {
+            SERVICE_FLAG => return Some(Role::Run),
+            INSTALL_FLAG => return Some(Role::Install),
+            UNINSTALL_FLAG => return Some(Role::Uninstall),
+            _ => {}
+        }
+        edits
+            .iter()
+            .find(|(flag, _)| *flag == arg)
+            .map(|(_, edit)| Role::Client(*edit, args.get(at + 1).cloned().unwrap_or_default()))
     })
+}
+
+/// The value following `flag`, if the command line carries one.
+fn valued(args: &[String], flag: &str) -> Option<String> {
+    let at = args.iter().position(|arg| arg == flag)?;
+    args.get(at + 1).cloned()
 }
 
 /// Where the service logs, since it has no console to log to.
@@ -372,29 +428,357 @@ fn finish_install(
         .set_preshutdown_timeout(stop_bound())
         .context("the service's preshutdown timeout could not be set")?;
 
-    let token_at = token_file();
-    secured_state_dir()?;
-    // Never reuse an object we did not create: a pre-existing file at this path is an unprivileged
-    // user's to own, and writing into it would leave them owning the credential. Removed and
-    // created fresh, with `create_new`, so losing a race is a refusal rather than a silent reuse.
-    let _ = std::fs::remove_file(&token_at);
+    // The same writer the client commands use, so the file an install leaves and the file an
+    // `--add-listen-client` leaves are written to one standard: a fresh file created with
+    // `create_new` in the protected directory, ACL'd there, and renamed over whatever was at the
+    // real path. Never through an object we did not create — a pre-existing file there is an
+    // unprivileged user's to own, and writing into it would leave them owning the credential.
+    write_credentials(credentials)
+}
+
+/// The control code that tells a running service to re-read its token file.
+///
+/// **A user-defined code (128–255) rather than `SERVICE_CONTROL_PARAMCHANGE`**, which is the one
+/// that *means* this: the SCM wrapper this crate uses can only send user-defined codes, and a
+/// hand-rolled `ControlService` call to gain the canonical name would be FFI written for
+/// vocabulary. Nothing else sends this service anything, so the number is the whole protocol.
+const RELOAD_CODE: u32 = 128;
+
+/// Whether a control code the SCM delivered is the reload.
+///
+/// A predicate rather than a match arm so the [dispatcher](serve_as_service) and the [sender](
+/// ask_to_reload) cannot drift apart on the number.
+fn is_reload(control: &ServiceControl) -> bool {
+    matches!(control, ServiceControl::UserEvent(code) if code.to_raw() == RELOAD_CODE)
+}
+
+/// Adds, removes or rotates one of the installed service's clients, without a reinstall.
+///
+/// **The problem this replaces.** `--install-service` was the only writer of [`token_file`], and
+/// the SCM refuses a second registration under the same name — so giving a service-hosted listener
+/// a client of its own meant `--uninstall-service`, setting every credential variable again,
+/// installing, and starting. That drops every session the service holds, a parked kernel attach
+/// included (`FOLLOWUPS.md` item 34). Nobody chose that; it fell out of there being no other
+/// writer.
+///
+/// **The two properties that were chosen stay exactly as they are.** "Only the installer writes
+/// this file" becomes "only *this program*, running elevated, writes it" — the command below is
+/// the same binary. And "never write through a file it did not create" survives, because
+/// [`write_credentials`] creates a fresh file with `create_new` in the same protected directory
+/// and renames it over the old one, which is also what makes the replacement atomic for a service
+/// that may be reading it.
+///
+/// **The token is generated here and never printed.** What reaches standard output is a
+/// [fingerprint](crate::client::fingerprint); the secret goes to the file
+/// [`TOKEN_OUT_FLAG`] names, created fresh and ACL'd like the credential file it came from. That
+/// is what keeps a working token out of a shell history and out of an agent's transcript, and it
+/// is why these commands are narrow enough to allow-list in a permission rule where "let this
+/// write `%ProgramData%`" would not be.
+pub fn edit_client(edit: ClientEdit, name: &str, args: &[String]) -> Result<()> {
+    let name = crate::client::client_name(name).with_context(|| {
+        format!(
+            "`{}` needs the name of a client — `{} bench`",
+            edit.flag(),
+            edit.flag()
+        )
+    })?;
+    // Read before anything is touched, so a command missing half its arguments fails as a usage
+    // error rather than after the credential file has been rewritten.
+    let token_out = match edit.mints_a_token() {
+        true => Some(PathBuf::from(valued(args, TOKEN_OUT_FLAG).ok_or_else(|| {
+            anyhow::anyhow!(
+                "`{} {name}` needs `{TOKEN_OUT_FLAG} <path>`: it generates the token itself and \
+                 will not print one, so there has to be somewhere to put it.\n    {} {name} \
+                 {TOKEN_OUT_FLAG} C:\\Users\\you\\{name}.token\n\nMove that file to the client \
+                 machine and delete it here. The token is never shown on this console, which is \
+                 the point — a console is a shell history, and on this host frequently an agent's \
+                 transcript too.",
+                edit.flag(),
+                edit.flag()
+            )
+        })?)),
+        false => None,
+    };
+
+    // **This handle does not prove elevation**, and it is worth being clear about that rather than
+    // implying it: a service's default DACL grants `SERVICE_USER_DEFINED_CONTROL` to Authenticated
+    // Users, so an ordinary account opens it fine. What refuses an unelevated caller is the
+    // credential file's own ACL, a few lines down — which is the check that matters, since it is
+    // the object being protected. Opening the service first only buys a better error for the more
+    // common mistake: running this where no service is installed at all.
+    let manager = ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT)
+        .context("cannot open the service manager")?;
+    let service = manager
+        .open_service(
+            NAME,
+            ServiceAccess::QUERY_STATUS | ServiceAccess::USER_DEFINED_CONTROL,
+        )
+        .with_context(|| {
+            format!(
+                "no service named `{NAME}` is installed, so there is no client list to change. \
+                 These commands edit the credential file a *service* reads ({}); a foreground \
+                 listener takes its clients from the environment instead.",
+                token_file().display()
+            )
+        })?;
+
+    let at = token_file();
+    let existing = match std::fs::read_to_string(&at) {
+        Ok(text) => Some(crate::client::TokenFile::parse(&text, &at)?.credentials()?),
+        // **Add repairs this; the other two cannot.** A missing file is a service that will not
+        // start, and writing one client into it is a working listener again — whereas removing
+        // from nothing, or rotating a client that is not there, is a command whose premise is
+        // already false.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        // The refusal an unelevated shell gets, since that file grants read to `SYSTEM` and
+        // `Administrators` only — so this is where "run as administrator" belongs, rather than on
+        // the service handle above, which any account may open.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "cannot read {} — it grants read to SYSTEM and Administrators only, so changing \
+                 a client needs an elevated shell (\"Run as administrator\")",
+                at.display()
+            )));
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!("cannot read {}", at.display())));
+        }
+    };
+    let mut credentials = match (existing, edit) {
+        (Some(credentials), _) => credentials,
+        (None, ClientEdit::Add) => Vec::new(),
+        (None, _) => bail!(
+            "{} does not exist, so `{NAME}` has no clients to change — and will not start until \
+             it does. `{ADD_CLIENT_FLAG} <name>` writes a new file with one client in it, or \
+             reinstall the service.",
+            at.display()
+        ),
+    };
+    let started_empty = credentials.is_empty();
+
+    let held = credentials.iter().position(|(held, _)| *held == name);
+    let mut minted = None;
+    match (edit, held) {
+        (ClientEdit::Add, Some(_)) => bail!(
+            "`{NAME}` already has a client called `{name}`. To give it a new token without \
+             disturbing what it has open, `{ROTATE_CLIENT_FLAG} {name}`; to take it away, \
+             `{REMOVE_CLIENT_FLAG} {name}`."
+        ),
+        (ClientEdit::Add, None) => {
+            let token = crate::client::generate_token()?;
+            minted = Some(token.clone());
+            credentials.push((name.clone(), token));
+        }
+        (ClientEdit::Remove, None) | (ClientEdit::Rotate, None) => bail!(
+            "`{NAME}` has no client called `{name}`. It holds: {}.",
+            roster(&credentials)
+        ),
+        (ClientEdit::Remove, Some(at)) => {
+            credentials.remove(at);
+            // **Refused, because a listener with no credentials will not start.** Revoking the
+            // last one is not an incremental change; it is a decision to stop serving, and
+            // `--uninstall-service` is the command that says so — and takes the file with it
+            // rather than leaving a service registered that fails at every start.
+            if credentials.is_empty() {
+                bail!(
+                    "`{name}` is the only client `{NAME}` has, and a listener with no credentials \
+                     refuses to start — it exposes every tool this server has, including the ones \
+                     that write to a live kernel. Add the replacement first \
+                     (`{ADD_CLIENT_FLAG} <name>`), or `{UNINSTALL_FLAG}` if the service is done."
+                );
+            }
+        }
+        (ClientEdit::Rotate, Some(at)) => {
+            let token = crate::client::generate_token()?;
+            minted = Some(token.clone());
+            credentials[at].1 = token;
+        }
+    }
+    credentials.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // **Written before the credential file, and removed again if that write fails.** The order is
+    // what keeps the two from disagreeing: a token accepted by the service that the operator has
+    // no copy of is unrecoverable without another rotation, while a token file naming a credential
+    // nothing accepts is inert. `create_new` refuses an existing path rather than overwriting it,
+    // for the same reason the credential file does.
+    if let (Some(path), Some(token)) = (token_out.as_deref(), minted.as_deref()) {
+        write_token_out(path, token)?;
+    }
+    if let Err(e) = write_credentials(&credentials) {
+        if let Some(path) = token_out.as_deref() {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(e.context(format!(
+            "nothing was changed — `{NAME}` still holds the clients it did"
+        )));
+    }
+
+    // **None of these says when it takes effect**, because that is the reload's line to write at
+    // the bottom — and it is the one thing this command cannot know until it has asked. Saying
+    // "once the service has re-read its file" here and "it re-read them" three lines later is one
+    // command contradicting itself about the property it exists to provide.
+    let (past, changed) = match edit {
+        ClientEdit::Add => (
+            "added",
+            "it gets the whole tool surface, as every client here does — a token separates \
+             clients from each other, it does not limit one",
+        ),
+        ClientEdit::Remove => (
+            "removed",
+            "it can no longer connect, and the sessions it still held go with it",
+        ),
+        ClientEdit::Rotate => (
+            "rotated",
+            "it keeps its name, and so keeps the sessions it has open — it just presents the new \
+             token",
+        ),
+    };
+    println!(
+        "{past} the client `{name}` ({}) — {changed}.\n`{NAME}` now holds: {}.",
+        match minted.as_deref() {
+            Some(token) => crate::client::fingerprint(token),
+            None => "no longer configured".to_string(),
+        },
+        roster(&credentials)
+    );
+    if started_empty {
+        println!(
+            "\nNote: {} did not exist, so `{name}` is now the only client `{NAME}` has. Anything \
+             that used to connect to it does not any more.",
+            at.display()
+        );
+    }
+    if let Some(path) = token_out.as_deref() {
+        println!(
+            "\nIts token is in {} — readable by SYSTEM and Administrators only, like the \
+             credential file it came from. Move it to the client machine, set it there as `{}`, \
+             and delete this copy. It is not printed here and cannot be read back out of the \
+             service; a lost token costs a `{ROTATE_CLIENT_FLAG} {name}` and nothing else.",
+            path.display(),
+            crate::listen::TOKEN_ENV,
+        );
+    }
+    match ask_to_reload(&service) {
+        Ok(true) => println!("\n`{NAME}` re-read its clients; nothing was stopped."),
+        Ok(false) => println!("\n`{NAME}` is not running, so it will read this at its next start."),
+        // Not an error: the file is written and correct, and a restart applies it. Saying so
+        // beats failing a command that did what it was asked.
+        Err(e) => println!(
+            "\nwarning: `{NAME}` could not be told to re-read its clients ({e:#}). The file is \
+             written; restart the service to apply it — which does drop the sessions it holds."
+        ),
+    }
+    Ok(())
+}
+
+/// Every configured client, by name and fingerprint — what these commands print instead of a file.
+fn roster(credentials: &[(String, String)]) -> String {
+    if credentials.is_empty() {
+        return "no clients".to_string();
+    }
+    credentials
+        .iter()
+        .map(|(name, token)| format!("`{name}` ({})", crate::client::fingerprint(token)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Writes a generated token where the operator asked for it, and locks it down.
+///
+/// Given the same ACL as the credential file, which is not ceremony: this is a working credential
+/// for a listener that has `launch` on it, and the obvious place to ask for it is a profile
+/// directory other local accounts can read. `create_new` rather than a truncating create, so a
+/// mistyped path that happens to name something is a refusal rather than a file destroyed.
+fn write_token_out(path: &std::path::Path, token: &str) -> Result<()> {
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| {
+            format!(
+                "cannot create {} — it will not write through a file that already exists, since \
+                 the one it would overwrite may be a credential something still uses",
+                path.display()
+            )
+        })?;
+    file.write_all(token.as_bytes())
+        .and_then(|()| file.write_all(b"\n"))
+        .with_context(|| format!("cannot write {}", path.display()))?;
+    drop(file);
+    // Best-effort *after* the write, and reported rather than fatal: the token is already where
+    // the operator asked for it, and failing here would leave them a file they were told did not
+    // get written. What they need to know is that it is not protected.
+    if let Err(e) = restrict_to_administrators(path, "R") {
+        println!(
+            "warning: {} was written but could not be locked down to SYSTEM and Administrators \
+             ({e:#}). Treat it as readable by anyone who can reach that directory — move it and \
+             delete it now, or rotate the client again.",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+/// Writes [`token_file`] from a set of credentials: a fresh file, renamed over whatever was there.
+///
+/// **Never through a file it did not create**, which is the rule the installer's ACL exists to
+/// support — an unprivileged user who pre-creates that path owns the credential. So the content is
+/// written to a fresh sibling with `create_new`, given the ACL there, and moved over the old name.
+/// Two things fall out of doing it that way rather than truncating in place: the replacement is
+/// atomic, so a service reading the file concurrently sees one version or the other and never a
+/// half-written one; and the protective ACL is on the file before it is ever reachable under its
+/// real name.
+///
+/// Shared with [`finish_install`] rather than restated, so the client commands and the installer
+/// cannot end up writing that file to two different standards.
+fn write_credentials(credentials: &[(String, String)]) -> Result<()> {
+    use std::io::Write;
+
+    let dir = secured_state_dir()?;
+    let at = token_file();
+    let staged = dir.join("token.new");
+    // A leftover from a command that died between creating this and renaming it. Removing it is
+    // safe in a directory only Administrators can write, and `create_new` below still refuses if
+    // anything wins a race to recreate it.
+    let _ = std::fs::remove_file(&staged);
     {
-        use std::io::Write;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&token_at)
+            .open(&staged)
             .with_context(|| {
                 format!(
-                    "cannot create {} — something else created it first, which for a credential is \
-                     a refusal rather than something to write through",
-                    token_at.display()
+                    "cannot create {} — something else created it first, which for a credential \
+                     is a refusal rather than something to write through",
+                    staged.display()
                 )
             })?;
         file.write_all(token_file_contents(credentials).as_bytes())
-            .with_context(|| format!("cannot write {}", token_at.display()))?;
+            .with_context(|| format!("cannot write {}", staged.display()))?;
     }
-    restrict_to_administrators(&token_at, "R")
+    restrict_to_administrators(&staged, "R")?;
+    std::fs::rename(&staged, &at)
+        .with_context(|| format!("cannot move {} over {}", staged.display(), at.display()))
+}
+
+/// Asks a running service to re-read its clients. `false` if it is not running to be asked.
+///
+/// A control code rather than a restart, because a restart is the thing item 34 exists to avoid:
+/// it drops every session the service holds. Rather than a file watcher, because this is explicit,
+/// needs nothing running in the background, and fits the plumbing that already handles Stop and
+/// Preshutdown.
+fn ask_to_reload(service: &windows_service::service::Service) -> Result<bool> {
+    if service.query_status()?.current_state != ServiceState::Running {
+        return Ok(false);
+    }
+    let code = windows_service::service::UserEventCode::from_raw(RELOAD_CODE)
+        .map_err(|e| anyhow::anyhow!("{RELOAD_CODE} is not a user-defined control code: {e}"))?;
+    service
+        .notify(code)
+        .context("the service refused the reload control code")?;
+    Ok(true)
 }
 
 /// Registers the service to run this exe with `--service --listen <addr>`.
@@ -661,6 +1045,11 @@ fn serve_as_service() -> Result<()> {
     // *ask*, and the runtime below does the releasing.
     let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
     let mut stop_tx = Some(stop_tx);
+    // Unbounded, and sent to from the SCM's own thread: the handler may only *ask*, and must
+    // return promptly, so it cannot be one that waits for room. Nothing bounds how often an
+    // administrator may run a client command, but each one is a file read on a task, so a flood is
+    // slow rather than unsafe.
+    let (reload_tx, reload_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let status_handle = service_control_handler::register(NAME, move |control| match control {
         // Answering this is not optional: a service that does not is reported as not responding.
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -668,6 +1057,15 @@ fn serve_as_service() -> Result<()> {
             if let Some(tx) = stop_tx.take() {
                 let _ = tx.send(());
             }
+            ServiceControlHandlerResult::NoError
+        }
+        // A client command has rewritten the token file and is telling us to pick it up — which is
+        // the half of `FOLLOWUPS.md` item 34 that makes the other half worth having, since a
+        // restart would still cost every session this service holds. The send is fire-and-forget:
+        // the reload happens on the runtime, and reporting `NoError` here says the request was
+        // accepted rather than that it succeeded. What it did lands in the log.
+        control if is_reload(&control) => {
+            let _ = reload_tx.send(());
             ServiceControlHandlerResult::NoError
         }
         _ => ServiceControlHandlerResult::NotImplemented,
@@ -727,6 +1125,7 @@ fn serve_as_service() -> Result<()> {
             let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let served = crate::serve_http(
                 addr,
+                Some(reload_rx),
                 {
                     let finished = finished.clone();
                     async move {
@@ -810,6 +1209,101 @@ mod tests {
             requested(&argv(&["windbg-mcp", UNINSTALL_FLAG])),
             Some(Role::Uninstall)
         );
+    }
+
+    /// A client command carries the name that follows it, and takes its role even without one.
+    ///
+    /// The second half is the one worth asserting. A flag with nothing after it that yielded
+    /// `None` would fall through to the *stdio server*, so a typo on an administrative command
+    /// line would leave a debugger sitting on standard input rather than saying what was missing.
+    #[test]
+    fn a_client_command_carries_its_name_and_claims_its_role_without_one() {
+        let argv = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            requested(&argv(&["windbg-mcp", ADD_CLIENT_FLAG, "bench"])),
+            Some(Role::Client(ClientEdit::Add, "bench".into()))
+        );
+        assert_eq!(
+            requested(&argv(&[
+                "windbg-mcp",
+                ROTATE_CLIENT_FLAG,
+                "ci",
+                TOKEN_OUT_FLAG,
+                r"C:\out\ci.token"
+            ])),
+            Some(Role::Client(ClientEdit::Rotate, "ci".into()))
+        );
+        assert_eq!(
+            requested(&argv(&["windbg-mcp", REMOVE_CLIENT_FLAG])),
+            Some(Role::Client(ClientEdit::Remove, String::new())),
+            "a client flag with no name has to keep its role, or it runs the stdio server instead"
+        );
+    }
+
+    /// The value behind `--token-out`, and nothing when it is not there to have one.
+    #[test]
+    fn a_flags_value_is_the_argument_after_it() {
+        let argv = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            valued(
+                &argv(&["windbg-mcp", ADD_CLIENT_FLAG, "bench", TOKEN_OUT_FLAG, "t"]),
+                TOKEN_OUT_FLAG
+            )
+            .as_deref(),
+            Some("t")
+        );
+        assert_eq!(
+            valued(
+                &argv(&["windbg-mcp", ADD_CLIENT_FLAG, "bench"]),
+                TOKEN_OUT_FLAG
+            ),
+            None
+        );
+        assert_eq!(
+            valued(&argv(&["windbg-mcp", TOKEN_OUT_FLAG]), TOKEN_OUT_FLAG),
+            None,
+            "a trailing flag has no value, and must not borrow one from nowhere"
+        );
+    }
+
+    /// The code the dispatcher answers is the code the command sends, and nothing else is it.
+    ///
+    /// One number is the whole protocol between the two, and they are in different processes: a
+    /// drift here is a client command that reports success and a service that goes on serving the
+    /// clients it had, which is exactly the silent half-failure the reload exists to remove.
+    #[test]
+    fn the_reload_control_code_is_one_number_both_sides_agree_on() {
+        let sent = windows_service::service::UserEventCode::from_raw(RELOAD_CODE)
+            .expect("the reload code is a user-defined control code");
+        assert!(is_reload(&ServiceControl::UserEvent(sent)));
+        // A neighbouring user event is not it, and neither is anything the SCM sends of its own
+        // accord — a reload that answered `Stop` would be a service that stopped when asked to
+        // re-read a file.
+        let other = windows_service::service::UserEventCode::from_raw(RELOAD_CODE + 1)
+            .expect("129 is also a user-defined control code");
+        assert!(!is_reload(&ServiceControl::UserEvent(other)));
+        assert!(!is_reload(&ServiceControl::Stop));
+        assert!(!is_reload(&ServiceControl::Preshutdown));
+        assert!(!is_reload(&ServiceControl::Interrogate));
+    }
+
+    /// The roster a client command prints names every client and quotes no token.
+    ///
+    /// This string is the whole of what these commands say about the credential file, and it goes
+    /// to a console — which on this host is frequently an agent's transcript. A roster that
+    /// carried a token would put every one of them there on any change to any of them.
+    #[test]
+    fn the_roster_names_clients_and_quotes_no_token() {
+        let credentials = [
+            ("ci".to_string(), "ci-token-value".to_string()),
+            ("local".to_string(), "local-token-value".to_string()),
+        ];
+        let said = roster(&credentials);
+        assert!(said.contains("`ci`") && said.contains("`local`"), "{said}");
+        for (_, token) in &credentials {
+            assert!(!said.contains(token), "the roster quotes a token: {said}");
+        }
+        assert_eq!(roster(&[]), "no clients");
     }
 
     /// The SCM stores this once, at install time, and nothing re-derives it — so a service that

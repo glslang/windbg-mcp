@@ -613,10 +613,11 @@ pub async fn serve(
     sessions: Sessions,
     addr: SocketAddr,
     call_timeout: Duration,
+    reload: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
     shutdown: impl Future<Output = ()>,
     ready: impl FnOnce(),
 ) -> Result<()> {
-    let credentials = Arc::new(credentials()?);
+    let credentials = Arc::new(crate::client::Accepted::new(credentials()?));
 
     let grace = match std::env::var(GRACE_ENV).ok().and_then(|v| v.parse().ok()) {
         Some(secs) if secs > 0 => Duration::from_secs(secs),
@@ -686,6 +687,12 @@ pub async fn serve(
         credentials.names().join(", ")
     );
 
+    // Only under the service, which is the only role with a control channel to be asked on. See
+    // [`reloaded`] for what the answer is when there is no such channel.
+    if let Some(asked) = reload {
+        tokio::spawn(reloaded(asked, Arc::clone(&credentials), sessions.clone()));
+    }
+
     tokio::spawn(sweep(
         sessions.clone(),
         lease.clone(),
@@ -739,7 +746,7 @@ async fn gate(
     req: Request<Incoming>,
     mcp: Arc<StreamableHttpService<WindbgServer, LocalSessionManager>>,
     lease: Arc<Lease>,
-    credentials: Arc<crate::client::Credentials>,
+    credentials: Arc<crate::client::Accepted>,
     peer: SocketAddr,
 ) -> Result<Response<BoxBody<Bytes, Infallible>>, Infallible> {
     let Some(caller) = authorised(&req, &credentials) else {
@@ -851,14 +858,13 @@ fn is_departure(method: &hyper::Method, status: StatusCode) -> bool {
 /// transport whose protocol no longer has sessions in it.
 fn authorised(
     req: &Request<Incoming>,
-    credentials: &crate::client::Credentials,
+    credentials: &crate::client::Accepted,
 ) -> Option<crate::client::Client> {
     req.headers()
         .get(AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .and_then(|presented| credentials.client_for(presented))
-        .cloned()
 }
 
 fn refuse(status: StatusCode, why: &str) -> Response<BoxBody<Bytes, Infallible>> {
@@ -867,6 +873,74 @@ fn refuse(status: StatusCode, why: &str) -> Response<BoxBody<Bytes, Infallible>>
         .body(Full::new(Bytes::from(why.to_string())).boxed())
         // The builder only fails on a malformed status or header, and both are literals here.
         .expect("a constant response is well-formed")
+}
+
+/// Re-reads the credential file whenever the service is asked to, and acts on what changed.
+///
+/// **The other half of the client commands** (`FOLLOWUPS.md` item 34). Without it,
+/// `--add-listen-client` writes a file nothing reads until the next start — and a *restart* drops
+/// every session the service holds, which is most of what made the reinstall it replaces
+/// unfriendly. So the commands would be an improvement in ergonomics and not in outcome.
+///
+/// **A failed read changes nothing.** [`credentials`] refuses a file it cannot parse and one that
+/// names nobody, and neither of those may become a listener that has forgotten who may connect: an
+/// operator with a typo in a file gets a loud log line and a service still serving its old set,
+/// rather than every client locked out of a live kernel target. The set is only ever replaced by
+/// one that would have started this listener from cold.
+///
+/// **A removed client's sessions are released, not refused.** The command that removed it could
+/// not have refused on their account — it runs in another process and cannot see them — and
+/// blocking a revocation on the sessions it is trying to revoke is the wrong way round anyway. So
+/// they go down the path a lease expiry already uses, which for a live kernel is the orderly
+/// release rather than a worker killed and a guest left frozen.
+///
+/// Ends when the sender is dropped, which is the service's runtime going away.
+async fn reloaded(
+    mut asked: tokio::sync::mpsc::UnboundedReceiver<()>,
+    accepted: Arc<crate::client::Accepted>,
+    sessions: Sessions,
+) {
+    while asked.recv().await.is_some() {
+        // The same function that decided whether this listener could start at all, and
+        // deliberately so: a set that would not have started it does not get to replace the one
+        // that did.
+        let fresh = match credentials() {
+            Ok(fresh) => fresh,
+            Err(e) => {
+                tracing::error!(
+                    "asked to re-read the clients, and could not ({e:#}) — still serving the {} \
+                     configured at startup",
+                    accepted.names().len()
+                );
+                continue;
+            }
+        };
+        let change = accepted.replace(fresh);
+        tracing::info!(
+            "re-read the clients: {}",
+            match change.is_empty() {
+                // A rotation, which changes a token and no name. Worth a line of its own: from
+                // out here it looks like nothing happened, and the client whose token moved is
+                // about to start failing to authenticate with the old one.
+                true => "the same clients, one or more of which may now present a different token"
+                    .to_string(),
+                false => format!(
+                    "added [{}], removed [{}]",
+                    change.added.join(", "),
+                    change.removed.join(", ")
+                ),
+            }
+        );
+        for name in change.removed {
+            let gone = crate::client::Client::new(&name);
+            if sessions.live_count_for(&gone) > 0 {
+                tracing::info!(
+                    "client `{name}` is no longer configured; releasing the sessions it left open"
+                );
+                sessions.release_leased(&gone).await;
+            }
+        }
+    }
 }
 
 /// Releases what an absent client left behind, once its lease runs out.

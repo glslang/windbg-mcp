@@ -35,9 +35,15 @@ schemars = "1"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-# Only for the handle plumbing behind the supervisor↔worker channel (see `engine::spawn_worker`):
-# marking a pipe end inheritable is the one thing std cannot express.
-windows-sys = { version = "0.61", features = ["Win32_Foundation"] }
+# Two things std cannot express. The handle plumbing behind the supervisor↔worker channel (see
+# `engine::spawn_worker`): marking a pipe end inheritable. And CNG (`Win32_Security_Cryptography`),
+# for the two credential primitives in `src/client.rs` — a token generated from the system RNG, and
+# the SHA-256 fingerprint that is the only thing a client command may print about one. Both are
+# one-shot calls against pseudo-handles, which is why this pulls in no crypto crate.
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }
 # The Windows service role (`src/service.rs`). A wrapper rather than hand-rolled SCM FFI because
 # that lifecycle is the one part of this which must not be subtly wrong: a service that mishandles
 # its stop is a service that cannot be stopped, and for this server that means a live kernel target

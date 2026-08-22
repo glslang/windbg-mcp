@@ -1219,7 +1219,7 @@ does not know to ping is exactly the client this bites.
   a reason, and a client that thinks for seven minutes is a fact about local models rather than
   about this server.
 
-## 34. [windbg-mcp] A service-hosted listener's clients are fixed at install time
+## 34. [windbg-mcp] A service-hosted listener's clients are fixed at install time — **done** (2026-08-22)
 
 `--install-service` is the **only** writer of `%ProgramData%\windbg-mcp\token`, and it leaves the
 file granting `SYSTEM` and `Administrators` *read* — deliberately, since the token is the one thing
@@ -1271,6 +1271,34 @@ document the dance.
   **if someone running a deployed listener ever has to start a second one to add a client, these
   commands are incomplete.** That is the bar to build against, and the reason the reload above is
   not optional.
+
+**Built as described.** `--add-listen-client <name>`, `--remove-listen-client <name>` and
+`--rotate-listen-client <name>` (`src/service.rs`), each generating the token, writing it to the
+`--token-out <path>` it requires, and printing only a fingerprint. The write is
+`service::write_credentials` — a fresh sibling created with `create_new` in the protected
+directory, ACL'd there, renamed over the old name — and `finish_install` now shares it, so the
+installer and the commands write that file to one standard and the replacement is atomic for a
+service reading it. The reload is user-defined control code **128**, sent by the command and
+answered in `serve_as_service`'s handler; it reaches `listen::reloaded`, which re-reads through the
+same `credentials()` that decides whether the listener may start at all — so a set that would not
+have started it cannot replace the one that did — swaps it into `client::Accepted`, and releases a
+departed client's sessions down the lease-sweep path. A removal of the *last* client is refused,
+since a listener with no credentials will not start.
+
+**Verified on the ARM64 bench against the installed service** (2026-08-22), one process throughout
+(pid 9108, never restarted): `--add-listen-client bench` → the log says `re-read the clients: added
+[bench], removed []` and that token completes an MCP `initialize` (`200`, `mcp-session-id`);
+`--rotate-listen-client bench` → the old token `401`, the new one `200`; `--remove-listen-client
+bench` → `401` again, and the credential file back **byte-for-byte** to its pre-test hash, `local`'s
+token untouched and the file returned from the JSON shape to the bare one. Removing `local` (the
+only remaining client) was refused.
+
+**What was left alone deliberately.** The ACL, and the refusal to write through a file it did not
+create. The environment is still read only by `--install-service`. And the second foreground
+listener stays a development workflow — the bar in this item ("if someone running a deployed
+listener ever has to start a second one to add a client, these commands are incomplete") is met:
+add, revoke and rotate are all in place, and all three take effect without stopping anything.
+
 
 ## 35. [windbg-mcp + win-kexp] The engine's subregister flag misses the views that matter — **measured and declined** (2026-08-22)
 

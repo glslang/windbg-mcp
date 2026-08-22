@@ -3077,6 +3077,70 @@ fn installing_the_service_without_an_address_is_refused_before_anything_is_regis
     );
 }
 
+/// A client command that is missing something is refused *before* it opens the SCM or the file.
+///
+/// The ordering is the assertion, and it is what makes this test run the same on a host that has
+/// the service installed and one that does not: both refusals below are usage errors, so neither
+/// reaches the credential file — and a run on a developer's own host cannot disturb the clients
+/// their listener is serving.
+///
+/// The `--token-out` half is the one with a property behind it rather than a convention. These
+/// commands generate the token and will not print it, so a command with nowhere to put one would
+/// otherwise mint a credential, write it into the service's file, and leave the operator no way to
+/// learn it short of rotating again.
+#[test]
+fn a_client_command_says_what_is_missing_before_it_touches_anything() {
+    let registered = service_is_registered();
+    let refusal = |args: &[&str]| {
+        let out = Command::new(EXE)
+            .args(args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn {EXE}: {e}"));
+        assert!(
+            !out.status.success(),
+            "`{args:?}` should have been refused, and was not"
+        );
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+
+    let no_name = refusal(&["--add-listen-client"]);
+    assert!(
+        no_name.contains("--add-listen-client"),
+        "a client command with no name has to name the flag it belongs to: {no_name}"
+    );
+    let no_out = refusal(&["--add-listen-client", "smoke-test-client"]);
+    assert!(
+        no_out.contains("--token-out"),
+        "a command that mints a token has to say where it wanted to put it: {no_out}"
+    );
+    assert!(
+        !no_out.contains("no service named"),
+        "the SCM was consulted before the command line was checked, which makes a usage error \
+         depend on whether the service happens to be installed: {no_out}"
+    );
+    let bad_name = refusal(&[
+        "--rotate-listen-client",
+        "two words",
+        "--token-out",
+        "unreachable.token",
+    ]);
+    assert!(
+        bad_name.contains("not a client name"),
+        "a name that is not one has to be refused as that: {bad_name}"
+    );
+    // A refusal must not have written a token to a path the command never got as far as using.
+    assert!(
+        !std::path::Path::new("unreachable.token").exists(),
+        "a refused command left a generated token behind"
+    );
+    assert_eq!(
+        registered,
+        service_is_registered(),
+        "a refused client command changed whether `windbg-mcp` is registered with the SCM"
+    );
+}
+
 /// Whether the SCM has a service by this name, for the assertion above to compare against itself.
 fn service_is_registered() -> bool {
     Command::new("sc.exe")

@@ -210,6 +210,102 @@ impl Credentials {
     }
 }
 
+/// The credentials a listener is serving *right now*, replaceable while it runs.
+///
+/// [`Credentials`] is what a configuration says; this is what the running listener accepts, and
+/// the difference is a whole feature. Built once at startup, a service-hosted listener's client
+/// list is fixed until the next start — and a restart drops every session it holds, which for a
+/// parked kernel attach is the outage that made adding a client a planned one (`FOLLOWUPS.md`
+/// item 34). So the set lives behind a lock that [`crate::service::reload`] can swap under the
+/// accept loop, and a client added to the token file is admitted without anything being stopped.
+///
+/// **A read lock on the authentication path**, which is the cheapest thing that is also correct: a
+/// request takes it uncontended, and the one writer runs once per administrative command. And it
+/// is [recovered from poisoning](Self::current) rather than unwrapped — a panic anywhere near the
+/// swap must not turn into a listener that refuses every caller for the rest of its life.
+pub struct Accepted {
+    current: std::sync::RwLock<Arc<Credentials>>,
+}
+
+/// What a [reload](Accepted::replace) changed, by name.
+///
+/// **Names, not tokens**, so the caller can log it: this is what the listener says out loud when a
+/// client appears or goes. A rotation shows up as neither — the name is unchanged, so nothing this
+/// describes moved, and the sessions that client holds are untouched by design.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Change {
+    pub added: Vec<String>,
+    pub removed: Vec<String>,
+}
+
+impl Change {
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.removed.is_empty()
+    }
+}
+
+impl Accepted {
+    pub fn new(credentials: Credentials) -> Self {
+        Self {
+            current: std::sync::RwLock::new(Arc::new(credentials)),
+        }
+    }
+
+    /// The set in force, past a poisoned lock.
+    ///
+    /// `into_inner` rather than `unwrap`, because of what the two do on the request path. The lock
+    /// guards an `Arc` that is only ever read or replaced wholesale, so a panic while it was held
+    /// cannot have left a half-written set behind — there is no invariant to protect. Propagating
+    /// the poison would instead take a listener holding live kernel targets and have it refuse
+    /// every caller, its own operator included, until someone restarted it.
+    fn current(&self) -> Arc<Credentials> {
+        match self.current.read() {
+            Ok(guard) => Arc::clone(&guard),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
+    }
+
+    /// The client presenting `token`, or `None` if nothing here accepts it.
+    pub fn client_for(&self, token: &str) -> Option<Client> {
+        self.current().client_for(token).cloned()
+    }
+
+    /// Every configured name, sorted — for the lines that say who may connect.
+    pub fn names(&self) -> Vec<String> {
+        self.current()
+            .names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Swaps in a freshly read set, and says which clients appeared and which went.
+    ///
+    /// The *caller* acts on the removals, because what to do about them is not this type's
+    /// business: a client whose credential is gone cannot reach the sessions it opened, so the
+    /// listener releases them down the path the lease sweep already uses. See
+    /// [`crate::listen::reloaded`].
+    pub fn replace(&self, credentials: Credentials) -> Change {
+        let before = self.names();
+        let after: Vec<String> = credentials.names().into_iter().map(str::to_owned).collect();
+        match self.current.write() {
+            Ok(mut guard) => *guard = Arc::new(credentials),
+            Err(poisoned) => *poisoned.into_inner() = Arc::new(credentials),
+        }
+        Change {
+            added: after
+                .iter()
+                .filter(|name| !before.contains(name))
+                .cloned()
+                .collect(),
+            removed: before
+                .into_iter()
+                .filter(|name| !after.contains(name))
+                .collect(),
+        }
+    }
+}
+
 /// One configured credential: the client it names, the token, and where it came from.
 ///
 /// The third field is what a refusal quotes, and it is deliberately never the token — a variable
@@ -432,6 +528,119 @@ impl TokenFile {
         }
         Ok(Self { entries })
     }
+
+    /// The clients this file names, as `(name, token)` pairs, validated the way the listener
+    /// validates them.
+    ///
+    /// For the [client commands](crate::service), which read the file to change one entry and
+    /// write the rest back. It validates rather than merely handing over what parsed, for the
+    /// same reason [`env_credentials`] does: what comes out of here is written straight back to
+    /// the file the service reads, and a set that would not start a listener must not be written
+    /// down as if it would.
+    ///
+    /// **Sorted by name**, so the file a command writes does not depend on the order the previous
+    /// one happened to be in — an operator diffing two of these should see only what changed.
+    pub fn credentials(self) -> Result<Vec<(String, String)>> {
+        Credentials::build(&self.entries)?;
+        let mut pairs: Vec<(String, String)> = self
+            .entries
+            .into_iter()
+            .map(|c| (c.name, c.token))
+            .collect();
+        pairs.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(pairs)
+    }
+}
+
+/// How many random bytes a generated token carries.
+///
+/// 256 bits, hex-encoded to 64 characters. Hex rather than base64 because the only thing this
+/// string has to survive is an `Authorization` header and a JSON string, and the encoding that is
+/// obviously safe in both without a moment's thought is the one to pick for a credential.
+const TOKEN_BYTES: usize = 32;
+
+/// A token nobody has typed, from the system's own generator.
+///
+/// **The point of generating rather than accepting one** is where the secret is *not*: a token the
+/// operator supplies has been through a shell (and its history), and on this host frequently
+/// through an agent's transcript as well. One made here reaches the token file directly, and what
+/// the command prints is a [fingerprint](fingerprint).
+///
+/// `BCryptGenRandom` with the system-preferred RNG, which is Windows' answer for exactly this and
+/// needs no algorithm handle to be opened or closed. A failure is returned rather than fallen back
+/// from: the fallback for a credential's randomness is a credential that is not random.
+pub fn generate_token() -> Result<String> {
+    use windows_sys::Win32::Security::Cryptography::{
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
+    };
+
+    let mut bytes = [0u8; TOKEN_BYTES];
+    // SAFETY: a null algorithm handle is what `BCRYPT_USE_SYSTEM_PREFERRED_RNG` requires, and the
+    // buffer and its length describe the same local array.
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            bytes.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status < 0 {
+        bail!("the system random number generator refused (NTSTATUS {status:#010x})");
+    }
+    Ok(hex(&bytes, false))
+}
+
+/// What may be said about a token out loud: `sha256:` and the first eight bytes of its digest.
+///
+/// A credential-shaped value that a command can print, a log line can carry and an operator can
+/// compare against what they installed on the client — without any of those becoming somewhere a
+/// working token is written down. Truncated because its job is comparison by eye; it is not a
+/// security boundary, and nothing here is ever checked against it.
+pub fn fingerprint(token: &str) -> String {
+    format!("sha256:{}", hex(&sha256(token.as_bytes())[..8], true))
+}
+
+/// SHA-256, via CNG's one-shot hash — no handle to open, nothing to free.
+///
+/// A `panic` on failure rather than a `Result`, which is the one place in this module that is not
+/// a refusal: `BCryptHash` against the SHA-256 pseudo-handle with a correctly sized output buffer
+/// has no failure that is not a bug here, and threading an error out of it would spread a
+/// `Result` through every line that prints a fingerprint.
+fn sha256(data: &[u8]) -> [u8; 32] {
+    use windows_sys::Win32::Security::Cryptography::{BCRYPT_SHA256_ALG_HANDLE, BCryptHash};
+
+    let mut digest = [0u8; 32];
+    // SAFETY: `BCRYPT_SHA256_ALG_HANDLE` is a pseudo-handle the API takes in place of an opened
+    // algorithm; the two pointer/length pairs each describe one slice, and no secret is passed.
+    let status = unsafe {
+        BCryptHash(
+            BCRYPT_SHA256_ALG_HANDLE,
+            std::ptr::null(),
+            0,
+            data.as_ptr(),
+            data.len() as u32,
+            digest.as_mut_ptr(),
+            digest.len() as u32,
+        )
+    };
+    assert!(status >= 0, "BCryptHash(SHA-256) failed: {status:#010x}");
+    digest
+}
+
+/// Bytes as hex — lower case for a token, upper for a fingerprint, which is the difference between
+/// a thing to paste and a thing to compare by eye.
+fn hex(bytes: &[u8], upper: bool) -> String {
+    bytes
+        .iter()
+        .map(|b| {
+            if upper {
+                format!("{b:02X}")
+            } else {
+                format!("{b:02x}")
+            }
+        })
+        .collect()
 }
 
 /// Whether a token could be presented at all.
@@ -514,6 +723,25 @@ fn is_client_name(name: &str) -> bool {
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// A client name an operator typed, normalised and held to the same rule as a configured one.
+///
+/// For the [client commands](crate::service::edit_client), which take a name on a command line and
+/// write it into the token file. Lowercased, because that is what both configured sources do — a
+/// `WINDBG_MCP_LISTEN_TOKEN_CI` names `ci`, and a key in the file is folded on the way in — so
+/// `--add-listen-client CI` has to mean the same client `CI` would have named, or the command
+/// could add a second entry the listener then refuses to start on.
+pub fn client_name(raw: &str) -> Result<String> {
+    let name = raw.trim().to_ascii_lowercase();
+    if !is_client_name(&name) {
+        bail!(
+            "`{raw}` is not a client name. A name is letters, digits, `-`, `_` or `.`, up to \
+             {NAME_LIMIT} characters — it is what the listener logs as who may connect, and what \
+             a refusal names."
+        );
+    }
+    Ok(name)
 }
 
 /// The part of a credential variable's name after the prefix, if it is one.
@@ -1006,5 +1234,186 @@ mod tests {
             Some("local")
         );
         assert_eq!(creds.client_for(r"C:\somewhere\token"), None);
+    }
+
+    /// A generated token is one a client could actually present, and is not the same twice.
+    ///
+    /// The first half is the check every configured credential is held to, asked of the one source
+    /// nobody proof-reads: a token this server minted and wrote into its own file must not be one
+    /// [`Credentials::build`] would then refuse at startup. The second is a sanity check on the
+    /// generator being wired to the system RNG rather than to a constant.
+    #[test]
+    fn a_generated_token_is_one_that_could_be_presented() {
+        let first = generate_token().expect("the system RNG answers");
+        let second = generate_token().expect("the system RNG answers");
+        assert_ne!(first, second, "two tokens in a row were identical");
+        assert!(
+            is_presentable(&first),
+            "`{first}` cannot travel in a header"
+        );
+        let creds = Credentials::from_entries(vars(&[(TOKEN_ENV, &first)]), None).expect("valid");
+        assert_eq!(creds.client_for(&first).map(Client::name), Some("local"));
+    }
+
+    /// A fingerprint is stable, distinguishing, and says nothing about the token it describes.
+    ///
+    /// The last clause is the one with a cost attached: this string is printed to a console and
+    /// written into log lines precisely so a *token* never has to be, so a fingerprint that
+    /// carried any of one would defeat the whole arrangement.
+    #[test]
+    fn a_fingerprint_identifies_a_token_without_carrying_it() {
+        let token = "a-long-random-string";
+        let print = fingerprint(token);
+        assert_eq!(
+            print,
+            fingerprint(token),
+            "the same token printed differently"
+        );
+        assert_ne!(print, fingerprint("a-long-random-strinh"));
+        assert!(print.starts_with("sha256:"), "{print}");
+        assert!(
+            !print.contains(token) && !print.contains("random"),
+            "the fingerprint quotes the token it is standing in for: {print}"
+        );
+    }
+
+    /// The known-answer test for the digest behind it, since nothing else here would catch a
+    /// fingerprint that was consistently and wrongly computed.
+    #[test]
+    fn the_digest_is_sha256() {
+        assert_eq!(
+            hex(&sha256(b"abc"), false),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
+
+    /// A name typed on a command line means the same client a configured one would.
+    ///
+    /// Both configured sources fold case — `WINDBG_MCP_LISTEN_TOKEN_CI` names `ci`, and a key in
+    /// the token file is lowercased on the way in — so a command that did not would happily add a
+    /// second entry for a client that already exists, and the listener would then refuse to start
+    /// on the two-tokens-one-name rule.
+    #[test]
+    fn a_typed_client_name_is_folded_like_a_configured_one() {
+        assert_eq!(client_name("  CI  ").expect("a name"), "ci");
+        assert_eq!(client_name("bench.1").expect("a name"), "bench.1");
+        for not_a_name in [
+            "",
+            "   ",
+            "two words",
+            "a\"quote",
+            &"x".repeat(NAME_LIMIT + 1),
+        ] {
+            assert!(
+                client_name(not_a_name).is_err(),
+                "`{not_a_name}` was accepted as a client name"
+            );
+        }
+    }
+
+    /// A token file's credentials come back validated and in a stable order.
+    ///
+    /// The order matters because a client command writes them straight back: without it, adding
+    /// one client would reshuffle the file, and an operator diffing two of them could not see what
+    /// changed.
+    #[test]
+    fn a_files_credentials_come_back_sorted() {
+        let parsed = file(r#"{"laptop": "l", "ci": "c", "local": "s"}"#)
+            .credentials()
+            .expect("a valid file");
+        assert_eq!(
+            parsed,
+            vec![
+                ("ci".to_string(), "c".to_string()),
+                ("laptop".to_string(), "l".to_string()),
+                ("local".to_string(), "s".to_string()),
+            ]
+        );
+    }
+
+    /// A set that would not start a listener is refused on the way out, not just on the way in.
+    ///
+    /// [`TokenFile::parse`] catches what one *file* can say twice; this is the other refusal —
+    /// two names sharing a token — which is [`Credentials::build`]'s and would otherwise be
+    /// discovered by the service failing to start after a command reported success.
+    #[test]
+    fn a_files_credentials_are_held_to_the_startup_rules() {
+        let shared = file(r#"{"ci": "same", "laptop": "same"}"#).credentials();
+        assert!(
+            shared.is_err(),
+            "one token naming two clients came back as a usable set"
+        );
+    }
+
+    /// Swapping the set in says which clients appeared and which went, and takes effect at once.
+    #[test]
+    fn replacing_the_set_reports_what_moved() {
+        let accepted = Accepted::new(
+            Credentials::from_entries(
+                vars(&[
+                    ("WINDBG_MCP_LISTEN_TOKEN", "s"),
+                    ("WINDBG_MCP_LISTEN_TOKEN_CI", "c"),
+                ]),
+                None,
+            )
+            .expect("valid"),
+        );
+        assert_eq!(
+            accepted.client_for("c").map(|c| c.name().to_string()),
+            Some("ci".into())
+        );
+
+        let change = accepted.replace(
+            Credentials::from_entries(
+                vars(&[
+                    ("WINDBG_MCP_LISTEN_TOKEN", "s"),
+                    ("WINDBG_MCP_LISTEN_TOKEN_BENCH", "b"),
+                ]),
+                None,
+            )
+            .expect("valid"),
+        );
+        assert_eq!(change.added, vec!["bench"]);
+        assert_eq!(change.removed, vec!["ci"]);
+        assert_eq!(accepted.names(), vec!["bench", "local"]);
+        assert_eq!(
+            accepted.client_for("c"),
+            None,
+            "a removed client's token still authenticated"
+        );
+        assert_eq!(
+            accepted.client_for("b").map(|c| c.name().to_string()),
+            Some("bench".into())
+        );
+    }
+
+    /// A rotation moves a token and no names — which is what lets the client keep its sessions.
+    ///
+    /// The reload acts on [`Change`] to release a departed client's targets, so a rotation
+    /// reporting a removal and an addition of the same name would tear down exactly the sessions
+    /// rotation exists to preserve.
+    #[test]
+    fn rotating_a_token_moves_no_names() {
+        let accepted = Accepted::new(
+            Credentials::from_entries(vars(&[("WINDBG_MCP_LISTEN_TOKEN_CI", "old")]), None)
+                .expect("valid"),
+        );
+        let change = accepted.replace(
+            Credentials::from_entries(vars(&[("WINDBG_MCP_LISTEN_TOKEN_CI", "new")]), None)
+                .expect("valid"),
+        );
+        assert!(
+            change.is_empty(),
+            "a rotation was reported as a client coming or going: {change:?}"
+        );
+        assert_eq!(
+            accepted.client_for("old"),
+            None,
+            "the old token still worked"
+        );
+        assert_eq!(
+            accepted.client_for("new").map(|c| c.name().to_string()),
+            Some("ci".into())
+        );
     }
 }
