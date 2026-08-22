@@ -7,26 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **Two ways a client command could report a revocation that had not happened** (found reviewing
-  [#189](https://github.com/glslang/windbg-mcp/pull/189), after it merged). Both ended the same way:
-  `--remove-listen-client` or `--rotate-listen-client` printing success while the credential it took
-  out of service went on being accepted, which is the worst thing these commands can do.
-
-  A service now reads **the credential file its own commands write**, unconditionally. It used to
-  defer to a `WINDBG_MCP_LISTEN_TOKEN_FILE` already in its environment, which left it serving one
-  file while the commands edited another — and the reload then succeeded, re-reading the unchanged
-  override. `%ProgramData%\windbg-mcp\token` is what the installer writes, the commands edit and
-  `--uninstall-service` deletes, so a service reading elsewhere is a configuration whose other three
-  halves do not exist. An inherited override is ignored with a warning; the variable is unchanged
-  for a foreground listener, which is what it is documented for.
-
-  And a **starting** service is now asked to re-read rather than treated as stopped. Credentials are
-  read before the bind, so a `StartPending` listener is already serving the old set — and a
-  non-loopback bind at boot can hold it there for `BIND_PATIENCE`, a minute and a half. The reload
-  task is started before the bind too, so there is something there to answer.
-
 ### Added
 
 - **A service-hosted listener's clients can be changed without a reinstall**
@@ -188,6 +168,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   holds on ARM64 and does not hold on the x64 runner image.
 
 ### Fixed
+
+- **Two ways a client command could report a revocation that had not happened** (found reviewing
+  [#189](https://github.com/glslang/windbg-mcp/pull/189), after it merged). Both ended the same way:
+  `--remove-listen-client` or `--rotate-listen-client` printing success while the credential it took
+  out of service went on being accepted, which is the worst thing these commands can do.
+
+  A service now reads **the credential file its own commands write**, unconditionally. It used to
+  defer to a `WINDBG_MCP_LISTEN_TOKEN_FILE` already in its environment, which left it serving one
+  file while the commands edited another — and the reload then succeeded, re-reading the unchanged
+  override. `%ProgramData%\windbg-mcp\token` is what the installer writes, the commands edit and
+  `--uninstall-service` deletes, so a service reading elsewhere is a configuration whose other three
+  halves do not exist. An inherited override is ignored with a warning; the variable is unchanged
+  for a foreground listener, which is what it is documented for.
+
+  And a **starting** service is now asked to re-read rather than treated as stopped. Credentials are
+  read before the bind, so a `StartPending` listener is already serving the old set — and a
+  non-loopback bind at boot can hold it there for `BIND_PATIENCE`, a minute and a half. The reload
+  task is started before the bind too, so there is something there to answer.
 
 - **`tools/ioctl_harness.ps1` could not run under Windows PowerShell 5.1**, which is the only
   PowerShell a stock debuggee has. Three faults, each fatal before an IOCTL was sent: em dashes in
