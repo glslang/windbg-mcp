@@ -3119,11 +3119,16 @@ fn a_client_command_says_what_is_missing_before_it_touches_anything() {
         "the SCM was consulted before the command line was checked, which makes a usage error \
          depend on whether the service happens to be installed: {no_out}"
     );
+    // Under the temp directory rather than the crate root: nothing should be written there, and
+    // this test asserts exactly that — but a path that names the working tree turns a regression
+    // into a stray credential in somebody's checkout rather than a failed assertion.
+    let unreachable = std::env::temp_dir().join("windbg-mcp-smoke-unreachable.token");
+    let _ = std::fs::remove_file(&unreachable);
     let bad_name = refusal(&[
         "--rotate-listen-client",
         "two words",
         "--token-out",
-        "unreachable.token",
+        &unreachable.display().to_string(),
     ]);
     assert!(
         bad_name.contains("not a client name"),
@@ -3131,8 +3136,18 @@ fn a_client_command_says_what_is_missing_before_it_touches_anything() {
     );
     // A refusal must not have written a token to a path the command never got as far as using.
     assert!(
-        !std::path::Path::new("unreachable.token").exists(),
-        "a refused command left a generated token behind"
+        !unreachable.exists(),
+        "a refused command left a generated token behind at {}",
+        unreachable.display()
+    );
+
+    // **A flag is never a value.** Without this, the name would be `--token-out` — which passes the
+    // client-name rule, since a name may contain `-` — and the command would mint a credential for
+    // a client nobody asked for.
+    let flag_as_name = refusal(&["--add-listen-client", "--token-out", "/dev/null"]);
+    assert!(
+        flag_as_name.contains("--add-listen-client"),
+        "a flag standing where a name belongs has to be refused as a missing name: {flag_as_name}"
     );
     assert_eq!(
         registered,

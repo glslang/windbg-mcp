@@ -159,6 +159,16 @@ impl ClientEdit {
     fn mints_a_token(self) -> bool {
         matches!(self, Self::Add | Self::Rotate)
     }
+
+    /// Whether this command takes a working credential *out* of service.
+    ///
+    /// The two are not the same set, and the difference decides whether a reload that could not be
+    /// delivered is a warning or an error: an add that has not landed yet costs nobody anything,
+    /// while a removal or a rotation that has not landed means the token you were revoking is
+    /// still being accepted.
+    fn revokes_a_token(self) -> bool {
+        matches!(self, Self::Remove | Self::Rotate)
+    }
 }
 
 /// Reads the role off the command line. `None` for every ordinary invocation.
@@ -187,14 +197,26 @@ pub fn requested(args: &[String]) -> Option<Role> {
         edits
             .iter()
             .find(|(flag, _)| *flag == arg)
-            .map(|(_, edit)| Role::Client(*edit, args.get(at + 1).cloned().unwrap_or_default()))
+            .map(|(_, edit)| Role::Client(*edit, value_at(args, at).unwrap_or_default()))
     })
 }
 
 /// The value following `flag`, if the command line carries one.
 fn valued(args: &[String], flag: &str) -> Option<String> {
-    let at = args.iter().position(|arg| arg == flag)?;
-    args.get(at + 1).cloned()
+    value_at(args, args.iter().position(|arg| arg == flag)?)
+}
+
+/// The argument after position `at`, **unless it is itself a flag**.
+///
+/// Without the second half, `--add-listen-client --token-out C:\x` takes `--token-out` as the
+/// client's *name* — and `--token-out` passes [`crate::client::client_name`], since a name may
+/// contain `-`. So the command would succeed, mint a credential for a client called
+/// `--token-out`, and leave the operator's actual intent nowhere. A leading `-` is the one thing
+/// a value here can never legitimately start with: neither a client name nor a path does.
+fn value_at(args: &[String], at: usize) -> Option<String> {
+    args.get(at + 1)
+        .filter(|value| !value.starts_with('-'))
+        .cloned()
 }
 
 /// Where the service logs, since it has no console to log to.
@@ -444,6 +466,18 @@ fn finish_install(
 /// vocabulary. Nothing else sends this service anything, so the number is the whole protocol.
 const RELOAD_CODE: u32 = 128;
 
+/// The longest the SCM's own thread will wait for the reload to have happened.
+///
+/// It is waiting on a file read and a pointer swap, so this is not a budget — it is the point past
+/// which the runtime is wedged and hanging the control handler has stopped being useful. Well
+/// inside the 30 seconds the SCM allows a handler.
+const RELOAD_ACK_WAIT: Duration = Duration::from_secs(10);
+
+/// What the handler reports when the reload could not put the file's clients into force, and when
+/// there is no longer a runtime to ask. Both reach the command as a failed control code.
+const ERROR_INVALID_DATA: u32 = 13;
+const ERROR_SERVICE_NOT_ACTIVE: u32 = 1062;
+
 /// Whether a control code the SCM delivered is the reload.
 ///
 /// A predicate rather than a match arm so the [dispatcher](serve_as_service) and the [sender](
@@ -522,6 +556,10 @@ pub fn edit_client(edit: ClientEdit, name: &str, args: &[String]) -> Result<()> 
             )
         })?;
 
+    // Held until this function returns, which is what makes the read, the edit, the write and the
+    // reload below one transaction rather than four steps two shells can interleave.
+    let _lock = lock_credentials()?;
+
     let at = token_file();
     let existing = match std::fs::read_to_string(&at) {
         Ok(text) => Some(crate::client::TokenFile::parse(&text, &at)?.credentials()?),
@@ -556,9 +594,9 @@ pub fn edit_client(edit: ClientEdit, name: &str, args: &[String]) -> Result<()> 
     };
     let started_empty = credentials.is_empty();
 
-    let held = credentials.iter().position(|(held, _)| *held == name);
+    let held_at = credentials.iter().position(|(held, _)| *held == name);
     let mut minted = None;
-    match (edit, held) {
+    match (edit, held_at) {
         (ClientEdit::Add, Some(_)) => bail!(
             "`{NAME}` already has a client called `{name}`. To give it a new token without \
              disturbing what it has open, `{ROTATE_CLIENT_FLAG} {name}`; to take it away, \
@@ -573,8 +611,8 @@ pub fn edit_client(edit: ClientEdit, name: &str, args: &[String]) -> Result<()> 
             "`{NAME}` has no client called `{name}`. It holds: {}.",
             roster(&credentials)
         ),
-        (ClientEdit::Remove, Some(at)) => {
-            credentials.remove(at);
+        (ClientEdit::Remove, Some(index)) => {
+            credentials.remove(index);
             // **Refused, because a listener with no credentials will not start.** Revoking the
             // last one is not an incremental change; it is a decision to stop serving, and
             // `--uninstall-service` is the command that says so — and takes the file with it
@@ -588,10 +626,10 @@ pub fn edit_client(edit: ClientEdit, name: &str, args: &[String]) -> Result<()> 
                 );
             }
         }
-        (ClientEdit::Rotate, Some(at)) => {
+        (ClientEdit::Rotate, Some(index)) => {
             let token = crate::client::generate_token()?;
             minted = Some(token.clone());
-            credentials[at].1 = token;
+            credentials[index].1 = token;
         }
     }
     credentials.sort_by(|a, b| a.0.cmp(&b.0));
@@ -660,12 +698,28 @@ pub fn edit_client(edit: ClientEdit, name: &str, args: &[String]) -> Result<()> 
     }
     match ask_to_reload(&service) {
         Ok(true) => println!("\n`{NAME}` re-read its clients; nothing was stopped."),
+        // Not running is not a failure even for a revocation: nothing is accepting that credential
+        // either, and the file it will read at its next start is the one this command wrote.
         Ok(false) => println!("\n`{NAME}` is not running, so it will read this at its next start."),
-        // Not an error: the file is written and correct, and a restart applies it. Saying so
-        // beats failing a command that did what it was asked.
+        // **A revocation that could not be delivered is a failed revocation**, and this used to
+        // exit 0 on it (review on #189). For an add, a reload that did not happen means the new
+        // client cannot connect yet, which the next start fixes and nothing depends on. For a
+        // removal or a rotation it means the credential you were taking out of service **is still
+        // being accepted** — which is exactly the thing you ran the command to stop, so it has to
+        // be an error the shell can see.
+        Err(e) if edit.revokes_a_token() => {
+            return Err(e.context(format!(
+                "the client `{name}` was {past} in {}, but `{NAME}` is still running with the \
+                 credential you took out of service. Restart it (`Restart-Service {NAME}`, which \
+                 does drop the sessions it holds) and check its log — until then that token still \
+                 authenticates",
+                at.display()
+            )));
+        }
         Err(e) => println!(
             "\nwarning: `{NAME}` could not be told to re-read its clients ({e:#}). The file is \
-             written; restart the service to apply it — which does drop the sessions it holds."
+             written, and `{name}` can connect from the service's next start; nothing that works \
+             today has stopped working."
         ),
     }
     Ok(())
@@ -683,16 +737,28 @@ fn roster(credentials: &[(String, String)]) -> String {
         .join(", ")
 }
 
-/// Writes a generated token where the operator asked for it, and locks it down.
+/// Writes a generated token where the operator asked for it, and locks it down *first*.
 ///
 /// Given the same ACL as the credential file, which is not ceremony: this is a working credential
 /// for a listener that has `launch` on it, and the obvious place to ask for it is a profile
 /// directory other local accounts can read. `create_new` rather than a truncating create, so a
 /// mistyped path that happens to name something is a refusal rather than a file destroyed.
+///
+/// **The ACL goes on before the secret does**, and the file is created empty to make that possible.
+/// Writing first leaves an interval in which the token sits in a file still carrying whatever the
+/// parent directory grants — and changing a DACL does not revoke access through a handle already
+/// opened, so anything that got in during that interval keeps reading. Locked down as `F` for the
+/// write and re-applied as `R` afterwards: at no point is a principal outside `SYSTEM` and
+/// `Administrators` on that ACL.
+///
+/// **And a failure here is fatal**, where it used to warn. The alternative is this command
+/// activating a credential and then telling the operator, in passing, that the copy it just wrote
+/// is readable by the machine — which is a thing to refuse, not to mention. The half-written file
+/// is removed, so a retry is not blocked by the `create_new` it would hit.
 fn write_token_out(path: &std::path::Path, token: &str) -> Result<()> {
     use std::io::Write;
 
-    let mut file = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)
@@ -703,22 +769,71 @@ fn write_token_out(path: &std::path::Path, token: &str) -> Result<()> {
                 path.display()
             )
         })?;
-    file.write_all(token.as_bytes())
-        .and_then(|()| file.write_all(b"\n"))
-        .with_context(|| format!("cannot write {}", path.display()))?;
-    drop(file);
-    // Best-effort *after* the write, and reported rather than fatal: the token is already where
-    // the operator asked for it, and failing here would leave them a file they were told did not
-    // get written. What they need to know is that it is not protected.
-    if let Err(e) = restrict_to_administrators(path, "R") {
-        println!(
-            "warning: {} was written but could not be locked down to SYSTEM and Administrators \
-             ({e:#}). Treat it as readable by anyone who can reach that directory — move it and \
-             delete it now, or rotate the client again.",
+    // From here anything that fails takes the file with it: an empty file at a path the operator
+    // named would otherwise block the retry, and a locked-down one they cannot read is worse.
+    let guarded = (|| -> Result<()> {
+        restrict_to_administrators(path, "F")?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .with_context(|| format!("cannot open {} to write the token", path.display()))?;
+        file.write_all(token.as_bytes())
+            .and_then(|()| file.write_all(b"\n"))
+            .with_context(|| format!("cannot write {}", path.display()))?;
+        drop(file);
+        restrict_to_administrators(path, "R")
+    })();
+    if let Err(e) = guarded {
+        let _ = std::fs::remove_file(path);
+        return Err(e.context(format!(
+            "{} could not be given an ACL of SYSTEM and Administrators only, so no token was \
+             written there — a credential for a listener that runs `launch` as LocalSystem is not \
+             something to leave in a file the machine can read",
             path.display()
-        );
+        )));
     }
     Ok(())
+}
+
+/// Holds the credential file against another copy of this command, for one read-modify-write.
+///
+/// **Two elevated shells editing clients at once is the failure this closes.** Each reads the same
+/// file, each computes a complete replacement from that snapshot, and the second write silently
+/// discards the first — so an `--add-listen-client` and a `--remove-listen-client` run together can
+/// report success while the revocation never happened. Not a likely accident, and not one anything
+/// would notice afterwards, which is what makes it worth a lock rather than a note.
+///
+/// A file of its own rather than the credential file itself, because the transaction *ends* by
+/// renaming a new file over that one: a handle held open on the old name would block the rename,
+/// so the lock has to be on something the write does not touch. `share_mode(0)` is the whole
+/// mechanism — a second holder cannot open it at all, and Windows drops it when the process ends,
+/// including if it is killed, so there is no stale lock to clear by hand.
+///
+/// It lives in the state directory, which is already `Administrators`-only, so this is also where
+/// an unelevated caller is turned away: it needs write access to a directory it cannot write.
+fn lock_credentials() -> Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let at = state_dir().join("token.lock");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .share_mode(0)
+        .open(&at)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::PermissionDenied => anyhow::Error::new(e).context(format!(
+                "cannot open {} — that directory is SYSTEM and Administrators only, so changing a \
+                 client needs an elevated shell (\"Run as administrator\")",
+                at.display()
+            )),
+            _ => anyhow::Error::new(e).context(format!(
+                "cannot take {} — another `--add`/`--remove`/`--rotate-listen-client` is running. \
+                 Two of them editing at once would each write a whole file from its own snapshot, \
+                 and the second would discard the first. Wait for it and try again.",
+                at.display()
+            )),
+        })
 }
 
 /// Writes [`token_file`] from a set of credentials: a fresh file, renamed over whatever was there.
@@ -763,21 +878,30 @@ fn write_credentials(credentials: &[(String, String)]) -> Result<()> {
         .with_context(|| format!("cannot move {} over {}", staged.display(), at.display()))
 }
 
-/// Asks a running service to re-read its clients. `false` if it is not running to be asked.
+/// Asks a running service to re-read its clients, **and waits for it to have done so**. `false` if
+/// it is not running to be asked.
 ///
 /// A control code rather than a restart, because a restart is the thing item 34 exists to avoid:
 /// it drops every session the service holds. Rather than a file watcher, because this is explicit,
 /// needs nothing running in the background, and fits the plumbing that already handles Stop and
 /// Preshutdown.
+///
+/// **The waiting is not incidental.** `ControlService` returns once the handler does, and the first
+/// version of that handler only *enqueued* the reload — so this command printed "re-read its
+/// clients" while the swap had not happened, and a caller acting on that could find a removed token
+/// still authenticating or an added one still refused (review on #189). The handler now blocks on
+/// the reload task's answer, and reports a failed re-read as a control-code failure, which arrives
+/// here as an `Err`. So `Ok(true)` means the set in force is the set this command wrote.
 fn ask_to_reload(service: &windows_service::service::Service) -> Result<bool> {
     if service.query_status()?.current_state != ServiceState::Running {
         return Ok(false);
     }
     let code = windows_service::service::UserEventCode::from_raw(RELOAD_CODE)
         .map_err(|e| anyhow::anyhow!("{RELOAD_CODE} is not a user-defined control code: {e}"))?;
-    service
-        .notify(code)
-        .context("the service refused the reload control code")?;
+    service.notify(code).context(
+        "the service did not re-read its clients — the control code came back a failure, which \
+         means it could not read or accept the file this command just wrote (its log says why)",
+    )?;
     Ok(true)
 }
 
@@ -1049,7 +1173,13 @@ fn serve_as_service() -> Result<()> {
     // return promptly, so it cannot be one that waits for room. Nothing bounds how often an
     // administrator may run a client command, but each one is a file read on a task, so a flood is
     // slow rather than unsafe.
-    let (reload_tx, reload_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    //
+    // **Each request carries a channel to answer on**, which is what lets the command that sent it
+    // report the truth. A synchronous `SyncSender` because the receiving end of it is the SCM's own
+    // thread, which has no runtime to await on; capacity 1 so the task never blocks handing an
+    // answer back, including to a handler that has already given up waiting.
+    let (reload_tx, reload_rx) =
+        tokio::sync::mpsc::unbounded_channel::<std::sync::mpsc::SyncSender<bool>>();
     let status_handle = service_control_handler::register(NAME, move |control| match control {
         // Answering this is not optional: a service that does not is reported as not responding.
         ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
@@ -1065,8 +1195,22 @@ fn serve_as_service() -> Result<()> {
         // the reload happens on the runtime, and reporting `NoError` here says the request was
         // accepted rather than that it succeeded. What it did lands in the log.
         control if is_reload(&control) => {
-            let _ = reload_tx.send(());
-            ServiceControlHandlerResult::NoError
+            let (answer, wait) = std::sync::mpsc::sync_channel::<bool>(1);
+            if reload_tx.send(answer).is_err() {
+                // The runtime is gone, which means we are stopping. Nothing will re-read anything.
+                return ServiceControlHandlerResult::Other(ERROR_SERVICE_NOT_ACTIVE);
+            }
+            // **Bounded**, because a control handler that never returns is a service the SCM will
+            // call hung. The work being waited on is a file read and a pointer swap — the session
+            // releases a removal triggers happen *after* the answer — so a wait this long means
+            // the runtime is wedged, and reporting that beats hanging on it.
+            match wait.recv_timeout(RELOAD_ACK_WAIT) {
+                Ok(true) => ServiceControlHandlerResult::NoError,
+                // It read the file and would not have it, or it never answered. Either way the set
+                // in force is not the one the command wrote, and the command has to say so rather
+                // than print that the service re-read its clients.
+                Ok(false) | Err(_) => ServiceControlHandlerResult::Other(ERROR_INVALID_DATA),
+            }
         }
         _ => ServiceControlHandlerResult::NotImplemented,
     })
