@@ -433,7 +433,16 @@ impl Lease {
         let mut state = self.state_of(client);
         // Nothing is served while a teardown is in flight. Briefly refusing a client that could
         // have been served costs it a reconnect; serving one costs it the session mid-call.
-        if state.releasing {
+        //
+        // **`revoked` counts as in flight**, and it is the sharper of the two. A revocation decides
+        // the teardown and the sweep runs it, so in between this presence is a credential that has
+        // gone — and the *name* may already have been handed to a different one, since a client is
+        // identified by its name and `--add-listen-client ci` after `--remove-listen-client ci`
+        // names the same one. Serving that request would let the new credential renew the
+        // revocation's deadline and route to its predecessor's debug sessions, which is the
+        // isolation this whole ownership boundary exists to provide. Refusing costs it a `409` and
+        // one retry, until the sweep forgets the entry.
+        if state.releasing || state.revoked {
             return Admission::Releasing;
         }
         // **Renewed if there is one; never created.** "Any request renews the lease" is what keeps a
@@ -492,8 +501,18 @@ impl Lease {
         };
         let mut state = self.state_of(client);
         let adopted = state.left_open;
+        // Recorded whatever else is true, so the sweep closes it: an MCP session minted for a
+        // credential that has since been revoked is one nothing else will ever close.
         state.mcp.insert(session.to_string());
-        state.deadline = Some(Instant::now() + self.grace);
+        // **But a revoked lease is never renewed.** [`Self::admit`] refuses this credential, so the
+        // only request that reaches here after a revocation is one that was already inside the MCP
+        // service when the set was swapped — and renewing on its way out would push the deadline a
+        // whole grace into the future, so the sweep that was to run on its next pass does not, and
+        // the revoked client's debug sessions stay live for as long as the client kept talking. The
+        // clock a revocation set is the one that has to fire.
+        if !state.revoked {
+            state.deadline = Some(Instant::now() + self.grace);
+        }
         state.left_open = false;
         adopted
     }
@@ -1683,6 +1702,59 @@ mod tests {
         assert!(
             state.mcp.is_empty() && !state.releasing && !state.revoked,
             "a name re-added after a revocation inherited the entry of whoever held it before"
+        );
+    }
+
+    /// A name handed to a new credential before the sweep runs reaches none of its predecessor.
+    ///
+    /// **A client is identified by its name**, so `--remove-listen-client ci` followed by
+    /// `--add-listen-client ci` produces two different credentials that every mechanism keyed on
+    /// identity — session ownership, routing, lease state — cannot tell apart. Between the
+    /// revocation and the sweep that acts on it, the entry still holds the *previous* holder's
+    /// sessions, so serving the new one would hand it debug sessions opened by a credential that
+    /// has been revoked. That is the isolation this ownership boundary exists to provide, and it is
+    /// the one thing a rotation deliberately does *not* do — `--rotate-listen-client` keeps the
+    /// name and so keeps the sessions, which is the supported way to change a token.
+    ///
+    /// The second half is what makes the refusal load-bearing rather than tidy: a request that
+    /// renewed would push the revocation's deadline a whole grace out, so the sweep that was to run
+    /// on its next pass would not, and the revoked client's targets would stay live for as long as
+    /// somebody kept talking to that name.
+    #[test]
+    fn a_revoked_name_serves_nobody_until_the_sweep_has_forgotten_it() {
+        let lease = For::new(unchecked(Duration::from_secs(300)), "ci");
+        request(&lease, None, Some("session-a"), true);
+        lease.revoke();
+
+        assert_eq!(
+            lease.admit(None),
+            Admission::Releasing,
+            "a name whose revocation has not been swept was served — to whoever holds it now"
+        );
+
+        // The in-flight request of the *old* credential: it passed `admit` before the revocation
+        // and settles afterwards. It may record its MCP session, so the sweep closes that too, but
+        // it must not move the clock.
+        let deadline = lease.state().deadline;
+        lease.settle(None, Some("session-b"), true);
+        assert_eq!(
+            lease.state().deadline,
+            deadline,
+            "a request settling after the revocation renewed its lease, so the sweep never fires"
+        );
+        assert!(
+            lease.state().mcp.contains("session-b"),
+            "an MCP session minted for a revoked credential is one nothing else will ever close"
+        );
+
+        // And the sweep's ending is what lets the name be used again.
+        let swept = lease.expired().expect("revoked, so expired now");
+        assert!(swept.revoked);
+        lease.forget();
+        assert_eq!(
+            lease.admit(None),
+            Admission::Serve,
+            "once the predecessor is forgotten the name is an ordinary client again"
         );
     }
 

@@ -68,6 +68,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registering — and a session admitted behind the sweep would belong to a client nothing can
   authenticate as and nothing will ever come back for.
 
+  **A name is not reusable until the sweep has forgotten it.** A client is identified by its name,
+  so `--remove-listen-client ci` followed by `--add-listen-client ci` makes two credentials that
+  nothing keyed on identity can tell apart; in between, the lease entry still holds the previous
+  holder's sessions. Requests on a revoked name are refused with a `409` ("ask again in a moment")
+  rather than served, and a request already inside the MCP service when the set was swapped records
+  its MCP session but does not renew the clock — a renewal would push the revocation a whole grace
+  out and the sweep that was to run on its next pass would not. Changing a token *without* losing
+  the sessions is what `--rotate-listen-client` is for.
+
 ### Changed
 
 - **A default `registers` answer stopped carrying the vector bank** (`FOLLOWUPS.md` item 24's
