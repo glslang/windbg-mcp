@@ -19,10 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attach included.
 
   Each command **generates the token itself** and never prints one: standard output carries a
-  fingerprint (`sha256:701E4CF334890225`) and the token goes to the file `--token-out <path>` names,
-  created fresh and given the same SYSTEM-and-Administrators ACL as the credential file it came
-  from. That keeps a working credential out of a shell history and out of an agent's transcript, and
-  it is what makes these commands narrow enough to allow-list in a permission rule where "let this
+  fingerprint (`sha256:701E4CF334890225`) and the token goes to `<name>.token` beside the credential
+  file, in the same SYSTEM-and-Administrators directory — not to a path the operator names, because
+  writing a live credential into a directory this program does not control the protection of means
+  creating, ACL'ing and reopening it by name, which is a window to substitute a file and keep a read
+  handle to it. Keeping a working credential out of a shell history and out of an agent's transcript
+  is what makes these commands narrow enough to allow-list in a permission rule where "let this
   write `%ProgramData%`" would not be.
 
   The two properties the installer was hardened for are unchanged: only *this program*, running
@@ -51,6 +53,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Two of these commands cannot run at once (a `token.lock` in the state directory, opened with no
   sharing): both would compute a whole file from their own snapshot and the later write would
   silently discard the earlier.
+
+  A revocation **closes the gate before it walks anything** (`Sessions::revoke`). A lease expiry does
+  not need to — it only fires after the client has been silent for longer than any call can keep it
+  quiet, so nothing of that credential's can still be in flight — but a revocation has no quiet
+  period: an opener that authenticated a moment earlier can be seconds from registering, and a
+  session admitted behind a one-pass release would belong to a client nothing can authenticate as
+  and nothing will ever come back for.
 
 ### Changed
 

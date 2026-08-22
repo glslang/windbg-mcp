@@ -3080,14 +3080,9 @@ fn installing_the_service_without_an_address_is_refused_before_anything_is_regis
 /// A client command that is missing something is refused *before* it opens the SCM or the file.
 ///
 /// The ordering is the assertion, and it is what makes this test run the same on a host that has
-/// the service installed and one that does not: both refusals below are usage errors, so neither
-/// reaches the credential file — and a run on a developer's own host cannot disturb the clients
-/// their listener is serving.
-///
-/// The `--token-out` half is the one with a property behind it rather than a convention. These
-/// commands generate the token and will not print it, so a command with nowhere to put one would
-/// otherwise mint a credential, write it into the service's file, and leave the operator no way to
-/// learn it short of rotating again.
+/// the service installed and one that does not: every refusal below is a usage error, so none of
+/// them reaches the credential file — and a run on a developer's own host cannot disturb the
+/// clients their listener is serving.
 #[test]
 fn a_client_command_says_what_is_missing_before_it_touches_anything() {
     let registered = service_is_registered();
@@ -3109,42 +3104,21 @@ fn a_client_command_says_what_is_missing_before_it_touches_anything() {
         no_name.contains("--add-listen-client"),
         "a client command with no name has to name the flag it belongs to: {no_name}"
     );
-    let no_out = refusal(&["--add-listen-client", "smoke-test-client"]);
-    assert!(
-        no_out.contains("--token-out"),
-        "a command that mints a token has to say where it wanted to put it: {no_out}"
-    );
-    assert!(
-        !no_out.contains("no service named"),
-        "the SCM was consulted before the command line was checked, which makes a usage error \
-         depend on whether the service happens to be installed: {no_out}"
-    );
-    // Under the temp directory rather than the crate root: nothing should be written there, and
-    // this test asserts exactly that — but a path that names the working tree turns a regression
-    // into a stray credential in somebody's checkout rather than a failed assertion.
-    let unreachable = std::env::temp_dir().join("windbg-mcp-smoke-unreachable.token");
-    let _ = std::fs::remove_file(&unreachable);
-    let bad_name = refusal(&[
-        "--rotate-listen-client",
-        "two words",
-        "--token-out",
-        &unreachable.display().to_string(),
-    ]);
+    let bad_name = refusal(&["--rotate-listen-client", "two words"]);
     assert!(
         bad_name.contains("not a client name"),
         "a name that is not one has to be refused as that: {bad_name}"
     );
-    // A refusal must not have written a token to a path the command never got as far as using.
     assert!(
-        !unreachable.exists(),
-        "a refused command left a generated token behind at {}",
-        unreachable.display()
+        !bad_name.contains("no service named"),
+        "the SCM was consulted before the command line was checked, which makes a usage error \
+         depend on whether the service happens to be installed: {bad_name}"
     );
 
-    // **A flag is never a value.** Without this, the name would be `--token-out` — which passes the
-    // client-name rule, since a name may contain `-` — and the command would mint a credential for
-    // a client nobody asked for.
-    let flag_as_name = refusal(&["--add-listen-client", "--token-out", "/dev/null"]);
+    // **A flag is never a name.** Without this the name would be `--force`, which passes the
+    // client-name rule since a name may contain `-`, and the command would mint a credential for a
+    // client nobody asked for.
+    let flag_as_name = refusal(&["--add-listen-client", "--force"]);
     assert!(
         flag_as_name.contains("--add-listen-client"),
         "a flag standing where a name belongs has to be refused as a missing name: {flag_as_name}"

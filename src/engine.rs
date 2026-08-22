@@ -875,6 +875,9 @@ struct Registry {
     /// Set once the client has disconnected. Refuses new opens, so the set of workers to release
     /// stops growing while shutdown is walking it.
     closing: bool,
+    /// Credentials that have been **revoked**, whose sessions must stop growing for the same
+    /// reason `closing` exists — see [`Sessions::revoke`].
+    revoked: std::collections::HashSet<crate::client::Client>,
 }
 
 impl Registry {
@@ -1081,6 +1084,36 @@ impl Sessions {
     /// caller of this method is the only thing that still knows.
     pub fn live_count_for(&self, owner: &crate::client::Client) -> usize {
         self.registry().live_for(owner).len()
+    }
+
+    /// A credential is gone: refuse it any *new* session from here.
+    ///
+    /// The counterpart of `closing`, for one client rather than the server, and it exists for the
+    /// window a revocation has and a lease expiry does not. An expiry only fires after the client
+    /// has been silent for a whole grace, and the grace is longer than the longest a call can keep
+    /// it quiet — so no request of that credential's can still be in flight when its sessions are
+    /// released. A revocation has no such quiet period: the token stops being accepted the moment
+    /// the set is swapped, but a call that got past authentication a moment earlier is still
+    /// running, and an opener may be seconds from registering.
+    ///
+    /// So the release cannot be a single pass over a snapshot. This closes the gate first, under
+    /// the registry lock, and the release then walks a set that cannot grow — the same shape
+    /// `closing` gives shutdown. The in-flight call fails, which is the right answer: its
+    /// credential was revoked while it ran.
+    ///
+    /// Marked rather than cleared on its own, because a name may be configured again later —
+    /// [`Self::unrevoke`] is what a re-added client gets, and it is a different client with the
+    /// same name.
+    pub fn revoke(&self, owner: &crate::client::Client) {
+        self.registry().revoked.insert(owner.clone());
+    }
+
+    /// A name is configured again: it may open sessions.
+    ///
+    /// Not the same client — the credential is new — but the registry keys on the name, so the
+    /// mark has to be lifted or a re-added client could never open anything.
+    pub fn unrevoke(&self, owner: &crate::client::Client) {
+        self.registry().revoked.remove(owner);
     }
 
     pub fn snapshot(&self) -> Vec<SessionSnapshot> {
@@ -1935,6 +1968,15 @@ impl Sessions {
         if registry.closing {
             return Err(shutting_down());
         }
+        // **The credential was revoked while this open was in flight.** Refused here rather than
+        // released afterwards, because "afterwards" has no end: an opener that authenticated a
+        // moment before the revocation can be seconds from registering — an `attach_kernel` is —
+        // so a one-pass release cannot see it, and the session it registers behind that pass is
+        // owned by a client nothing can authenticate as and nothing will ever come back for. See
+        // [`Self::revoke`].
+        if registry.revoked.contains(&session.owner) {
+            return Err(revoked(&session.owner));
+        }
         registry.all.push_back(Arc::clone(session));
         registry.trim();
         Ok(())
@@ -2265,6 +2307,19 @@ fn shutdown_note(outcome: &Release, released: bool) -> ShutdownNote<'_> {
 ///
 /// Shared by the two gates that refuse it — before a worker is spawned, and again after it comes
 /// up — so the answer cannot drift depending on which one the caller raced.
+/// What an opener is told when the credential it authenticated with was revoked while it ran.
+///
+/// Names the cause rather than reporting a generic refusal, because the caller's own token is
+/// about to stop working for a *different* reason (a `401` on its next request) and one message
+/// that explains both saves an operator guessing which of the two they are looking at.
+fn revoked(owner: &crate::client::Client) -> String {
+    format!(
+        "the credential for client `{owner}` was revoked while this was opening, so the session \
+         was not registered — nothing was left running. Whoever administers this listener removed \
+         or rotated that client; the next request with the old token is refused outright."
+    )
+}
+
 fn shutting_down() -> String {
     "this server is shutting down — the client disconnected, and every session is being released. \
      Nothing more can be opened on this connection."

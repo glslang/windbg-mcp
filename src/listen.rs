@@ -973,9 +973,23 @@ async fn reloaded(
                 ),
             }
         );
+        // **Before the removals**, so a name being given back does not stay gated by the mark its
+        // previous holder left. A single reload cannot both add and remove one name — `Change` is a
+        // diff — but two reloads can, and the second must be able to open sessions.
+        for name in &change.added {
+            sessions.unrevoke(&crate::client::Client::new(name));
+        }
         for name in change.removed {
             let gone = crate::client::Client::new(&name);
-            // Claimed first, exactly as an expiry does: this marks the client `releasing` and takes
+            // **The gate closes before anything is walked.** A revocation has a window a lease
+            // expiry does not: the token stops being accepted at the swap above, but a call that
+            // got past authentication a moment earlier is still running, and an opener can be
+            // seconds from registering. Without this the release below is one pass over a
+            // snapshot, and a session registered behind it belongs to a client nothing can
+            // authenticate as and nothing will ever come back for — a live kernel target held by
+            // nobody (review on #189).
+            sessions.revoke(&gone);
+            // Claimed next, exactly as an expiry does: this marks the client `releasing` and takes
             // its MCP ids under the same lock, so nothing can be admitted to what is being torn
             // down. Unconditional, because the credential is gone rather than quiet.
             let held = lease.revoked_for(&gone);

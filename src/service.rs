@@ -90,8 +90,6 @@ pub const ADD_CLIENT_FLAG: &str = "--add-listen-client";
 pub const REMOVE_CLIENT_FLAG: &str = "--remove-listen-client";
 /// Replaces a client's token, keeping its name — and so its sessions.
 pub const ROTATE_CLIENT_FLAG: &str = "--rotate-listen-client";
-/// Where a generated token is written, since it is the one thing these commands will not print.
-pub const TOKEN_OUT_FLAG: &str = "--token-out";
 
 /// Overrides where the service writes its log.
 pub const LOG_ENV: &str = "WINDBG_MCP_SERVICE_LOG";
@@ -155,11 +153,6 @@ impl ClientEdit {
         }
     }
 
-    /// Whether this command mints a token, and so needs somewhere to put it.
-    fn mints_a_token(self) -> bool {
-        matches!(self, Self::Add | Self::Rotate)
-    }
-
     /// Whether this command takes a working credential *out* of service.
     ///
     /// The two are not the same set, and the difference decides whether a reload that could not be
@@ -201,18 +194,13 @@ pub fn requested(args: &[String]) -> Option<Role> {
     })
 }
 
-/// The value following `flag`, if the command line carries one.
-fn valued(args: &[String], flag: &str) -> Option<String> {
-    value_at(args, args.iter().position(|arg| arg == flag)?)
-}
-
 /// The argument after position `at`, **unless it is itself a flag**.
 ///
-/// Without the second half, `--add-listen-client --token-out C:\x` takes `--token-out` as the
-/// client's *name* — and `--token-out` passes [`crate::client::client_name`], since a name may
-/// contain `-`. So the command would succeed, mint a credential for a client called
-/// `--token-out`, and leave the operator's actual intent nowhere. A leading `-` is the one thing
-/// a value here can never legitimately start with: neither a client name nor a path does.
+/// Without the second half, a mistyped `--add-listen-client --whatever` takes `--whatever` as the
+/// client's *name* — and it passes [`crate::client::client_name`], since a name may contain `-`. So
+/// the command would succeed, mint a credential for a client nobody asked for, and leave the
+/// operator's actual intent nowhere. A leading `-` is the one thing a value here can never
+/// legitimately start with, so it is the one thing worth refusing.
 fn value_at(args: &[String], at: usize) -> Option<String> {
     args.get(at + 1)
         .filter(|value| !value.starts_with('-'))
@@ -503,12 +491,13 @@ fn is_reload(control: &ServiceControl) -> bool {
 /// that may be reading it.
 ///
 /// **The token is generated here and never printed.** What reaches standard output is a
-/// [fingerprint](crate::client::fingerprint); the secret goes to the file
-/// [`TOKEN_OUT_FLAG`] names, created fresh and ACL'd like the credential file it came from. That
-/// is what keeps a working token out of a shell history and out of an agent's transcript, and it
-/// is why these commands are narrow enough to allow-list in a permission rule where "let this
-/// write `%ProgramData%`" would not be.
-pub fn edit_client(edit: ClientEdit, name: &str, args: &[String]) -> Result<()> {
+/// [fingerprint](crate::client::fingerprint); the secret goes
+/// beside the credential file, in the same `SYSTEM`-and-`Administrators` directory
+/// ([`write_token_out`], which says why the operator does not get to name that path). That is what
+/// keeps a working token out of a shell history and out of an agent's transcript, and it is why
+/// these commands are narrow enough to allow-list in a permission rule where "let this write
+/// `%ProgramData%`" would not be.
+pub fn edit_client(edit: ClientEdit, name: &str) -> Result<()> {
     let name = crate::client::client_name(name).with_context(|| {
         format!(
             "`{}` needs the name of a client — `{} bench`",
@@ -516,24 +505,6 @@ pub fn edit_client(edit: ClientEdit, name: &str, args: &[String]) -> Result<()> 
             edit.flag()
         )
     })?;
-    // Read before anything is touched, so a command missing half its arguments fails as a usage
-    // error rather than after the credential file has been rewritten.
-    let token_out = match edit.mints_a_token() {
-        true => Some(PathBuf::from(valued(args, TOKEN_OUT_FLAG).ok_or_else(|| {
-            anyhow::anyhow!(
-                "`{} {name}` needs `{TOKEN_OUT_FLAG} <path>`: it generates the token itself and \
-                 will not print one, so there has to be somewhere to put it.\n    {} {name} \
-                 {TOKEN_OUT_FLAG} C:\\Users\\you\\{name}.token\n\nMove that file to the client \
-                 machine and delete it here. The token is never shown on this console, which is \
-                 the point — a console is a shell history, and on this host frequently an agent's \
-                 transcript too.",
-                edit.flag(),
-                edit.flag()
-            )
-        })?)),
-        false => None,
-    };
-
     // **This handle does not prove elevation**, and it is worth being clear about that rather than
     // implying it: a service's default DACL grants `SERVICE_USER_DEFINED_CONTROL` to Authenticated
     // Users, so an ordinary account opens it fine. What refuses an unelevated caller is the
@@ -636,14 +607,14 @@ pub fn edit_client(edit: ClientEdit, name: &str, args: &[String]) -> Result<()> 
 
     // **Written before the credential file, and removed again if that write fails.** The order is
     // what keeps the two from disagreeing: a token accepted by the service that the operator has
-    // no copy of is unrecoverable without another rotation, while a token file naming a credential
-    // nothing accepts is inert. `create_new` refuses an existing path rather than overwriting it,
-    // for the same reason the credential file does.
-    if let (Some(path), Some(token)) = (token_out.as_deref(), minted.as_deref()) {
-        write_token_out(path, token)?;
-    }
+    // no copy of is unrecoverable without another rotation, while a token beside the credential
+    // file that nothing accepts is inert.
+    let token_at = match minted.as_deref() {
+        Some(token) => Some(write_token_out(&name, token)?),
+        None => None,
+    };
     if let Err(e) = write_credentials(&credentials) {
-        if let Some(path) = token_out.as_deref() {
+        if let Some(path) = token_at.as_deref() {
             let _ = std::fs::remove_file(path);
         }
         return Err(e.context(format!(
@@ -686,12 +657,13 @@ pub fn edit_client(edit: ClientEdit, name: &str, args: &[String]) -> Result<()> 
             at.display()
         );
     }
-    if let Some(path) = token_out.as_deref() {
+    if let Some(path) = token_at.as_deref() {
         println!(
-            "\nIts token is in {} — readable by SYSTEM and Administrators only, like the \
-             credential file it came from. Move it to the client machine, set it there as `{}`, \
-             and delete this copy. It is not printed here and cannot be read back out of the \
-             service; a lost token costs a `{ROTATE_CLIENT_FLAG} {name}` and nothing else.",
+            "\nIts token is in {} — the same SYSTEM-and-Administrators directory the credential \
+             file is in, which is why it goes there and not somewhere you name. Move it to the \
+             client machine, set it there as `{}`, and delete this copy. It is not printed here \
+             and cannot be read back out of the service; a lost token costs a \
+             `{ROTATE_CLIENT_FLAG} {name}` and nothing else.",
             path.display(),
             crate::listen::TOKEN_ENV,
         );
@@ -737,62 +709,59 @@ fn roster(credentials: &[(String, String)]) -> String {
         .join(", ")
 }
 
-/// Writes a generated token where the operator asked for it, and locks it down *first*.
+/// Writes a generated token beside the credential file, and says where it went.
 ///
-/// Given the same ACL as the credential file, which is not ceremony: this is a working credential
-/// for a listener that has `launch` on it, and the obvious place to ask for it is a profile
-/// directory other local accounts can read. `create_new` rather than a truncating create, so a
-/// mistyped path that happens to name something is a refusal rather than a file destroyed.
+/// **The operator does not choose the path, and that is the fix rather than a limitation.** This
+/// took a `--token-out <path>` and wrote the secret there, which review took two rounds to get
+/// right and was not right yet: the ACL had to go on before the write, since a DACL change does not
+/// revoke access through a handle already opened — and doing that by path means creating the file,
+/// closing it, ACL'ing it and reopening it, which hands anyone who can write that directory a
+/// window to substitute a file of their own and keep a read handle to it. Every fix for that is
+/// another turn of the same screw. What generates all of them is the choice: a secret written into
+/// a directory whose protection this program does not control.
 ///
-/// **The ACL goes on before the secret does**, and the file is created empty to make that possible.
-/// Writing first leaves an interval in which the token sits in a file still carrying whatever the
-/// parent directory grants — and changing a DACL does not revoke access through a handle already
-/// opened, so anything that got in during that interval keeps reading. Locked down as `F` for the
-/// write and re-applied as `R` afterwards: at no point is a principal outside `SYSTEM` and
-/// `Administrators` on that ACL.
+/// So it goes in the state directory, which [`secured_state_dir`] has already made `SYSTEM` and
+/// `Administrators` only — no traverse for anyone else, so there is no window to race and nothing
+/// to substitute, because an unprivileged process cannot name a path inside it, let alone create
+/// one. `create_new` still refuses an existing file: a token already sitting there is one an
+/// earlier command wrote and nobody has moved yet, and overwriting it would destroy the only copy
+/// of a credential that may still be in service.
 ///
-/// **And a failure here is fatal**, where it used to warn. The alternative is this command
-/// activating a credential and then telling the operator, in passing, that the copy it just wrote
-/// is readable by the machine — which is a thing to refuse, not to mention. The half-written file
-/// is removed, so a retry is not blocked by the `create_new` it would hit.
-fn write_token_out(path: &std::path::Path, token: &str) -> Result<()> {
+/// The file is ACL'd afterwards anyway. It is belt and braces — the directory is what protects it —
+/// and cheap enough to keep for the case where somebody widens that directory later.
+fn write_token_out(name: &str, token: &str) -> Result<PathBuf> {
     use std::io::Write;
 
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| {
-            format!(
-                "cannot create {} — it will not write through a file that already exists, since \
-                 the one it would overwrite may be a credential something still uses",
-                path.display()
-            )
-        })?;
-    // From here anything that fails takes the file with it: an empty file at a path the operator
-    // named would otherwise block the retry, and a locked-down one they cannot read is worse.
-    let guarded = (|| -> Result<()> {
-        restrict_to_administrators(path, "F")?;
+    let dir = secured_state_dir()?;
+    let at = dir.join(format!("{name}.token"));
+    {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .open(path)
-            .with_context(|| format!("cannot open {} to write the token", path.display()))?;
+            .create_new(true)
+            .open(&at)
+            .with_context(|| {
+                format!(
+                    "cannot create {} — a token for `{name}` is already sitting there from an \
+                     earlier command. Move it to the client machine and delete it, then run this \
+                     again: overwriting it would destroy the only copy of a credential that may \
+                     still be the one in service.",
+                    at.display()
+                )
+            })?;
         file.write_all(token.as_bytes())
             .and_then(|()| file.write_all(b"\n"))
-            .with_context(|| format!("cannot write {}", path.display()))?;
-        drop(file);
-        restrict_to_administrators(path, "R")
-    })();
-    if let Err(e) = guarded {
-        let _ = std::fs::remove_file(path);
+            .with_context(|| format!("cannot write {}", at.display()))?;
+    }
+    // From here anything that fails takes the file with it, so a retry is not blocked by the
+    // `create_new` above and no half-protected credential is left behind.
+    if let Err(e) = restrict_to_administrators(&at, "R") {
+        let _ = std::fs::remove_file(&at);
         return Err(e.context(format!(
-            "{} could not be given an ACL of SYSTEM and Administrators only, so no token was \
-             written there — a credential for a listener that runs `launch` as LocalSystem is not \
-             something to leave in a file the machine can read",
-            path.display()
+            "{} could not be given an ACL of its own, so no token was written there",
+            at.display()
         )));
     }
-    Ok(())
+    Ok(at)
 }
 
 /// Holds the credential file against another copy of this command, for one read-modify-write.
@@ -1368,13 +1337,7 @@ mod tests {
             Some(Role::Client(ClientEdit::Add, "bench".into()))
         );
         assert_eq!(
-            requested(&argv(&[
-                "windbg-mcp",
-                ROTATE_CLIENT_FLAG,
-                "ci",
-                TOKEN_OUT_FLAG,
-                r"C:\out\ci.token"
-            ])),
+            requested(&argv(&["windbg-mcp", ROTATE_CLIENT_FLAG, "ci"])),
             Some(Role::Client(ClientEdit::Rotate, "ci".into()))
         );
         assert_eq!(
@@ -1384,29 +1347,35 @@ mod tests {
         );
     }
 
-    /// The value behind `--token-out`, and nothing when it is not there to have one.
+    /// A flag's value is the argument after it — and never another flag.
+    ///
+    /// The last cases are the ones with a bug behind them: a mistyped `--add-listen-client --flag`
+    /// took `--flag` as the client's *name*, which passes the name rule since a name may contain
+    /// `-`, so the command would have minted a credential for a client nobody asked for.
     #[test]
-    fn a_flags_value_is_the_argument_after_it() {
+    fn a_flags_value_is_the_argument_after_it_and_never_another_flag() {
         let argv = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
         assert_eq!(
-            valued(
-                &argv(&["windbg-mcp", ADD_CLIENT_FLAG, "bench", TOKEN_OUT_FLAG, "t"]),
-                TOKEN_OUT_FLAG
-            )
-            .as_deref(),
-            Some("t")
+            value_at(&argv(&["windbg-mcp", ADD_CLIENT_FLAG, "bench"]), 1).as_deref(),
+            Some("bench")
         );
         assert_eq!(
-            valued(
-                &argv(&["windbg-mcp", ADD_CLIENT_FLAG, "bench"]),
-                TOKEN_OUT_FLAG
-            ),
-            None
-        );
-        assert_eq!(
-            valued(&argv(&["windbg-mcp", TOKEN_OUT_FLAG]), TOKEN_OUT_FLAG),
+            value_at(&argv(&["windbg-mcp", ADD_CLIENT_FLAG]), 1),
             None,
             "a trailing flag has no value, and must not borrow one from nowhere"
+        );
+        assert_eq!(
+            value_at(
+                &argv(&["windbg-mcp", ADD_CLIENT_FLAG, "--something-else"]),
+                1
+            ),
+            None,
+            "a flag is never another flag's value"
+        );
+        assert_eq!(
+            requested(&argv(&["windbg-mcp", ADD_CLIENT_FLAG, "--else"])),
+            Some(Role::Client(ClientEdit::Add, String::new())),
+            "a flag standing where a name belongs is a missing name, not a client called `--else`"
         );
     }
 
