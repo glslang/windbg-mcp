@@ -753,30 +753,41 @@ fn write_token_out(name: &str, token: &str) -> Result<PathBuf> {
 
     let dir = secured_state_dir()?;
     let at = dir.join(format!("{name}.token"));
-    {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&at)
+        .with_context(|| {
+            format!(
+                "cannot create {} — a token for `{name}` is already sitting there from an earlier \
+                 command. Move it to the client machine and delete it, then run this again: \
+                 overwriting it would destroy the only copy of a credential that may still be the \
+                 one in service.",
+                at.display()
+            )
+        })?;
+    // **From the moment the file exists, anything that fails takes it with it.** Including the
+    // write itself, which review found returning early past the cleanup: a `write_all` that fails
+    // part-way — a full disk is the plausible one — used to leave a truncated `<name>.token` that
+    // no credential matches, and every retry then failed at the `create_new` above claiming a token
+    // from an earlier command was present. An operator would have to work out for themselves that
+    // the file in the way is inert.
+    let guarded = (|| -> Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create_new(true)
             .open(&at)
-            .with_context(|| {
-                format!(
-                    "cannot create {} — a token for `{name}` is already sitting there from an \
-                     earlier command. Move it to the client machine and delete it, then run this \
-                     again: overwriting it would destroy the only copy of a credential that may \
-                     still be the one in service.",
-                    at.display()
-                )
-            })?;
+            .with_context(|| format!("cannot open {} to write the token", at.display()))?;
         file.write_all(token.as_bytes())
             .and_then(|()| file.write_all(b"\n"))
             .with_context(|| format!("cannot write {}", at.display()))?;
-    }
-    // From here anything that fails takes the file with it, so a retry is not blocked by the
-    // `create_new` above and no half-protected credential is left behind.
-    if let Err(e) = restrict_to_administrators(&at, "R") {
+        drop(file);
+        restrict_to_administrators(&at, "R")
+    })();
+    if let Err(e) = guarded {
         let _ = std::fs::remove_file(&at);
         return Err(e.context(format!(
-            "{} could not be given an ACL of its own, so no token was written there",
+            "no token was written to {} — it was removed, so running this again is not blocked by \
+             a file that matches no credential",
             at.display()
         )));
     }
