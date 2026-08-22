@@ -82,7 +82,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A request already inside the MCP service when the set was swapped still settles against the client
   that is going, and records its MCP session so the sweep closes it — but does not renew the clock,
   since a renewal would push the revocation a whole grace out and the sweep that was to run on its
-  next pass would not.
+  next pass would not. A request of that credential's which authenticated a moment before the swap
+  and reaches the lease after it is refused, so a revoked client cannot route to its sessions once
+  more; one already *inside* the service runs to completion, as it must, because a call against a
+  live kernel cannot be abandoned half way.
 
   The registry gate a revocation closes is **never lifted**, and no longer needs to be. It marks the
   incarnation rather than the name, so a client configured under that name afterwards is simply not

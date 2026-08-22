@@ -434,12 +434,22 @@ impl Lease {
         // Nothing is served while a teardown is in flight. Briefly refusing a client that could
         // have been served costs it a reconnect; serving one costs it the session mid-call.
         //
-        // **A revoked credential does not need refusing here**, and used to. While a client was
-        // identified by its name alone, a name given back reached this same `Presence` and had to
-        // be held at a `409` until the sweep forgot it. It is a different [`Client`] now
-        // ([#190](https://github.com/glslang/windbg-mcp/issues/190)), so it arrives at a `Presence`
-        // of its own and is served at once — there is nothing of its predecessor's for it to reach.
-        if state.releasing {
+        // **`revoked` is refused too, and for a different reason than it used to be.** It once
+        // stood in for identity: a client was its name, so a name given back reached this same
+        // `Presence` and had to be held at a `409` until the sweep forgot it. That is not what it
+        // is doing any more — a name given back is a different [`Client`]
+        // ([#190](https://github.com/glslang/windbg-mcp/issues/190)) arriving at a `Presence` of its
+        // own, and it is served at once.
+        //
+        // What is left is the *revoked incarnation's own* request: one that authenticated in the
+        // moment before its credential was swapped out, and reaches here after. Serving it lets a
+        // credential the operator has been told is gone route to its sessions once more.
+        //
+        // **It narrows the window rather than closing it**, and the comment should say so: a
+        // request already inside the MCP service when the swap happened is past every check here
+        // and runs to completion, as it must — a call against a live kernel cannot be abandoned
+        // half way. Revocation stops what has not started, and the sweep releases the rest.
+        if state.releasing || state.revoked {
             return Admission::Releasing;
         }
         // **Renewed if there is one; never created.** "Any request renews the lease" is what keeps a
@@ -1755,25 +1765,31 @@ mod tests {
             "an MCP session minted for a revoked credential is one nothing else will ever close"
         );
 
-        // The name, given back. Same `Lease`, same name, different client.
-        let given_back = For {
-            lease: lease.lease,
-            client: crate::client::Client::incarnate("ci", 2),
-        };
+        // The name, given back: same `Lease`, same name, different client.
+        let given_back = crate::client::Client::incarnate("ci", 2);
         assert_eq!(
-            given_back.admit(None),
+            lease.lease.admit(&given_back, None),
             Admission::Serve,
             "a client configured under a revoked name was made to wait for a teardown that is not \
              its own"
         );
         assert!(
-            given_back.state().mcp.is_empty(),
+            lease.lease.state_of(&given_back).mcp.is_empty(),
             "it inherited the MCP session ids of whoever held that name before"
         );
         assert_eq!(
-            given_back.state().deadline,
+            lease.lease.state_of(&given_back).deadline,
             None,
             "it inherited a clock that was set for its predecessor's revocation"
+        );
+
+        // And the incarnation that *was* revoked is still refused — a separate property from the
+        // one above, and one briefly lost in gaining it: a request of its own that authenticated in
+        // the moment before the swap must not be served afterwards.
+        assert_eq!(
+            lease.admit(None),
+            Admission::Releasing,
+            "the revoked credential was served after its removal had been reported complete"
         );
     }
 
