@@ -205,11 +205,17 @@ impl Toolset {
     pub fn parse(spec: &str) -> Result<Self, String> {
         let mut included = BTreeSet::new();
         let mut named_anything = false;
+        let mut everything = false;
 
         for entry in spec.split(',').map(str::trim).filter(|e| !e.is_empty()) {
             named_anything = true;
             if entry == ALL {
-                return Ok(Self::all());
+                // Noted and carried on with, not returned on. Returning here would stop validating
+                // the rest, so `all,ttdd` served all 51 tools while `ttdd,all` was refused — the
+                // same spec, judged by where the typo happened to sit. A refusal that depends on
+                // entry order is worse than no refusal, because it is the one nobody reproduces.
+                everything = true;
+                continue;
             }
             if let Some(group) = GROUPS.iter().find(|g| g.name == entry) {
                 included.extend(group.tools.iter().copied());
@@ -237,6 +243,13 @@ impl Toolset {
                 "`{FLAG} {spec}` selects nothing. {}",
                 Self::vocabulary()
             ));
+        }
+
+        // After the loop, so every name in the spec has been checked first. `all` beside a group is
+        // not an error — it is a wider request that happens to name a subset of itself — but a name
+        // this server does not have is one whatever else the spec says.
+        if everything {
+            return Ok(Self::all());
         }
 
         // Every other tool routes by a `session_id` that only these can issue — see the module
@@ -409,6 +422,21 @@ mod tests {
             Toolset::parse("crash,all").expect("`all` wins"),
             Toolset::all()
         );
+    }
+
+    /// `all` is not an escape from validation, and it is not one *whichever side of the typo it
+    /// sits on*. Both spellings were not always refused: `all` used to return the moment it was
+    /// read, so `all,ttdd` served every tool and `ttdd,all` failed — the same spec, decided by
+    /// entry order (#195 review).
+    #[test]
+    fn a_typo_beside_all_is_still_a_typo() {
+        for spec in ["all,ttdd", "ttdd,all"] {
+            let error = Toolset::parse(spec).expect_err("`ttdd` is not a group");
+            assert!(
+                error.contains("`ttdd` is neither a group nor a tool"),
+                "`{spec}`: {error}"
+            );
+        }
     }
 
     #[test]
