@@ -134,6 +134,9 @@ SESSION = None
 WIRE = threading.Lock()
 LAST_REQUEST = time.monotonic()
 KEEPALIVE_AFTER = float(os.environ.get("WINDBG_MCP_KEEPALIVE", "120"))
+# Set before the MCP session is deleted. Read *inside* `WIRE`, which is what makes the
+# ping and the `DELETE` a total order rather than two racing requests on one id.
+STOP = threading.Event()
 
 
 def parse(body, ctype):
@@ -147,7 +150,15 @@ def parse(body, ctype):
 
 
 def mcp(method, params=None, notify=False):
-    global SESSION
+    """One request, with the wire to itself."""
+    with WIRE:
+        return request(method, params, notify)
+
+
+def request(method, params=None, notify=False):
+    """The request itself. **The caller holds [`WIRE`]** — which the keepalive needs, because
+    its decision to ping and the ping itself have to be one atomic thing against teardown."""
+    global SESSION, LAST_REQUEST
     payload = {"jsonrpc": "2.0", "method": method}
     if not notify:
         payload["id"] = int(time.time() * 1000) % 100000
@@ -159,16 +170,14 @@ def mcp(method, params=None, notify=False):
     req.add_header("Accept", "application/json, text/event-stream")
     if SESSION:
         req.add_header("Mcp-Session-Id", SESSION)
-    global LAST_REQUEST
-    with WIRE:
-        with urllib.request.urlopen(req, timeout=600) as response:
-            if response.headers.get("Mcp-Session-Id"):
-                SESSION = response.headers["Mcp-Session-Id"]
-            body = parse(
-                response.read().decode("utf-8", "replace"), response.headers.get("Content-Type")
-            )
-        LAST_REQUEST = time.monotonic()
-        return body
+    with urllib.request.urlopen(req, timeout=600) as response:
+        if response.headers.get("Mcp-Session-Id"):
+            SESSION = response.headers["Mcp-Session-Id"]
+        body = parse(
+            response.read().decode("utf-8", "replace"), response.headers.get("Content-Type")
+        )
+    LAST_REQUEST = time.monotonic()
+    return body
 
 
 def keepalive():
@@ -179,15 +188,29 @@ def keepalive():
     renewed the lease all the same. It reports the first failure and then stays quiet:
     the run's own calls are what matter, and a keepalive that spammed the transcript
     would be worse than one that stopped.
+
+    **It must not outlive the session it is keeping alive.** A ping that is decided while
+    `close_transport_session` is deleting the id lands *after* the `DELETE`, and an id the
+    server has stopped recording is one any credential may present — so the listener takes
+    it back into this client's set and renews the lease around a session that no longer
+    exists, which is the pile-up the `DELETE` is there to prevent. Reading [`STOP`] and
+    [`SESSION`] inside [`WIRE`], and sending inside the same lock, is what stops that: the
+    ping either finished before teardown took the lock, or it never starts. Joining this
+    thread would do the same job and block on a request that may take as long as the call
+    timeout, for no more safety.
+
+    Reported by chatgpt-codex-connector on #184.
     """
     complained = False
-    while KEEPALIVE_AFTER > 0:
-        time.sleep(min(30.0, KEEPALIVE_AFTER / 2))
-        idle = time.monotonic() - LAST_REQUEST
-        if idle < KEEPALIVE_AFTER or SESSION is None:
-            continue
+    while KEEPALIVE_AFTER > 0 and not STOP.is_set():
+        if STOP.wait(min(30.0, KEEPALIVE_AFTER / 2)):
+            return
         try:
-            mcp("ping")
+            with WIRE:
+                idle = time.monotonic() - LAST_REQUEST
+                if STOP.is_set() or SESSION is None or idle < KEEPALIVE_AFTER:
+                    continue
+                request("ping")
             print(f"  keepalive: pinged the listener after {idle:.0f}s of thinking")
         except Exception as e:  # noqa: BLE001 - a keepalive must not end the run
             if not complained:
@@ -392,17 +415,21 @@ def close_transport_session():
     the lease that would have swept them. A `DELETE` is what the protocol provides.
     """
     global SESSION
-    if not SESSION:
-        return
-    req = urllib.request.Request(MCP_URL, method="DELETE")
-    req.add_header("Authorization", AUTH)
-    req.add_header("Mcp-Session-Id", SESSION)
-    try:
-        with urllib.request.urlopen(req, timeout=60) as response:
-            print(f"  closed the MCP session ({response.status})")
-    except Exception as e:
-        print(f"  could not close the MCP session: {e}")
-    SESSION = None
+    # Told before the lock is taken, so a keepalive already waiting for it re-reads this and
+    # stands down rather than pinging an id that is about to stop existing.
+    STOP.set()
+    with WIRE:
+        if not SESSION:
+            return
+        req = urllib.request.Request(MCP_URL, method="DELETE")
+        req.add_header("Authorization", AUTH)
+        req.add_header("Mcp-Session-Id", SESSION)
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                print(f"  closed the MCP session ({response.status})")
+        except Exception as e:
+            print(f"  could not close the MCP session: {e}")
+        SESSION = None
 
 
 def release_what_this_run_opened():
