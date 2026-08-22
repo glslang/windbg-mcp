@@ -195,7 +195,7 @@ None of these is a bug. They are recorded because they were invisible, and
    scaffolding it blamed is real: `"kind":"int"` and `"subregister":false` were 1,599 B and 2,460 B
    of the 9,804, 41% between them. But measuring the payload rather than reasoning about it found
    something larger. **64 of the 123 rows were the vector bank**: DbgEng exposes `xmm0` twice, as
-   128 bits of `bytes` *and* as `xmm0/0` … `xmm0/3`, four int64 pseudo-registers that carry no
+   128 bits of `bytes` *and* as `xmm0/0` … `xmm0/3`, four 32-bit pseudo-registers that carry no
    subregister flag — so they passed a filter meaning "integer registers, not subregisters" and sat
    in an answer whose own argument documents it as excluding the vector registers.
 

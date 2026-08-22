@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **A default `registers` answer stopped carrying the vector bank** (`FOLLOWUPS.md` item 24's
   finding 7). The `all` argument documents the default as excluding the x87 and vector registers,
   and it did not: DbgEng exposes `xmm0` twice - as 128 bits of `bytes`, and as `xmm0/0` … `xmm0/3`,
-  four int64 pseudo-registers that carry no subregister flag - so 64 of the x64 sample's 123 rows
+  four 32-bit pseudo-registers that carry no subregister flag - so 64 of the x64 sample's 123 rows
   were the vector bank. Excluding them, and skipping `"subregister":false` on the rows that remain,
   takes the answer from **9,804 B to 3,480 B** and its ratio against its own text from 15.9x to
   5.6x; the result ceiling moved 13,500 -> 5,000 with it. `kind` was left alone - it earns its place

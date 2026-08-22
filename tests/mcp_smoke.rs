@@ -4376,7 +4376,7 @@ fn tool_results_stay_within_their_budget() {
         ("open_dump", json!({ "path": dump }), 2_000, 3_200),
         ("session_status", json!({}), 600, 1_200),
         ("crash_triage", json!({}), 6_000, 9_000),
-        // The default set stopped carrying the vector bank's 64-bit slices, which were 44% of it:
+        // The default set stopped carrying the vector bank's 32-bit lanes, which were 44% of it:
         // 9,804 -> 3,480 B model, and the ceiling 13,500 -> 5,000 with them, since a ceiling left
         // at the old figure is what would let them come back unnoticed.
         ("registers", json!({}), 5_000, 6_000),
@@ -4787,7 +4787,7 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
 ///
 /// The `all` argument documents the default as excluding the x87 and vector registers, and it did
 /// not: DbgEng exposes a vector register twice — `xmm0` as 128 bits of `bytes`, and `xmm0/0` …
-/// `xmm0/3` as four int64 pseudo-registers that carry no subregister flag — so 64 of the x64
+/// `xmm0/3` as four 32-bit pseudo-registers that carry no subregister flag — so 64 of the x64
 /// sample's 123 default rows were the vector bank, and 44% of the answer's bytes with them.
 ///
 /// The rule that excludes them tests the **name** for the `/` DbgEng puts in a slice's name, which
