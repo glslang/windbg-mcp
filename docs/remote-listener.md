@@ -474,9 +474,15 @@ belongs to a client you are done with, to remove that client, which deletes it.
 
 Four behaviours worth knowing before you need them:
 
-- **A rotation keeps the client's name, and so keeps its sessions.** Only the token moves: the old
-  one starts answering `401` and the new one reaches the same debug sessions, because it is the same
+- **A rotation keeps the client, and so keeps its sessions.** Only the token moves: the old one
+  starts answering `401` and the new one reaches the same debug sessions, because it *is* the same
   client. Rotating is the cheap operation — a lost token costs a rotation and nothing else.
+- **A name given back is not the client that had it.** `--remove-listen-client ci` then
+  `--add-listen-client ci` leaves a client called `ci`, and that is all the two share: the second
+  cannot reach the first's debug sessions, its MCP session ids or its lease. A client's identity is
+  its name *and* which holder of that name it is; only the name is ever shown, so nothing you read
+  changes. Use `--rotate-listen-client` when you want the sessions kept — that is the difference
+  between the two commands.
 - **A removal releases what that client still held**, down the path a lease expiry already uses, so
   a live kernel is let go rather than left frozen. It is not refused on their account: the command
   runs in another process and cannot see them, and blocking a revocation on the sessions it is

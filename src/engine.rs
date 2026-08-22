@@ -1101,19 +1101,14 @@ impl Sessions {
     /// `closing` gives shutdown. The in-flight call fails, which is the right answer: its
     /// credential was revoked while it ran.
     ///
-    /// Marked rather than cleared on its own, because a name may be configured again later —
-    /// [`Self::unrevoke`] is what a re-added client gets, and it is a different client with the
-    /// same name.
+    /// **Never lifted**, and it used to need lifting. A [`crate::client::Client`] is an incarnation
+    /// rather than a name ([#190](https://github.com/glslang/windbg-mcp/issues/190)), so a client
+    /// configured under the same name afterwards is simply not this one and is not gated by this
+    /// mark — which deleted the question of *when* to take it off, and with it two findings that
+    /// lived there. What it leaves behind is a name and a `u64` per revocation, for the life of the
+    /// process.
     pub fn revoke(&self, owner: &crate::client::Client) {
         self.registry().revoked.insert(owner.clone());
-    }
-
-    /// A name is configured again: it may open sessions.
-    ///
-    /// Not the same client — the credential is new — but the registry keys on the name, so the
-    /// mark has to be lifted or a re-added client could never open anything.
-    pub fn unrevoke(&self, owner: &crate::client::Client) {
-        self.registry().revoked.remove(owner);
     }
 
     pub fn snapshot(&self) -> Vec<SessionSnapshot> {
@@ -3456,10 +3451,22 @@ mod tests {
             "revoking one client refused another one's session"
         );
 
-        sessions.unrevoke(&gone);
+        // **A name given back is a different client, and is not gated by its predecessor's mark.**
+        // Nothing lifts the mark — nothing has to, which is the whole of what an incarnation buys
+        // here: the question of *when* to take a gate off is where two separate findings lived
+        // ([#190](https://github.com/glslang/windbg-mcp/issues/190)).
+        let again = crate::client::Client::incarnate("ci", 2);
+        assert_ne!(again, gone, "a re-added name has to be a different client");
+        assert_eq!(again.name(), gone.name(), "and has to still be called `ci`");
+        let session = dormant("sess-after", SessionState::Open);
         assert!(
-            sessions.admit(&mine("sess-after")).is_ok(),
-            "a name given back has to be able to open sessions again"
+            sessions
+                .admit(&Arc::new(Session {
+                    owner: again,
+                    ..Arc::into_inner(session).expect("`dormant` hands back the only reference")
+                }))
+                .is_ok(),
+            "a client configured under a revoked name could not open a session"
         );
     }
 

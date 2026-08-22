@@ -434,15 +434,12 @@ impl Lease {
         // Nothing is served while a teardown is in flight. Briefly refusing a client that could
         // have been served costs it a reconnect; serving one costs it the session mid-call.
         //
-        // **`revoked` counts as in flight**, and it is the sharper of the two. A revocation decides
-        // the teardown and the sweep runs it, so in between this presence is a credential that has
-        // gone — and the *name* may already have been handed to a different one, since a client is
-        // identified by its name and `--add-listen-client ci` after `--remove-listen-client ci`
-        // names the same one. Serving that request would let the new credential renew the
-        // revocation's deadline and route to its predecessor's debug sessions, which is the
-        // isolation this whole ownership boundary exists to provide. Refusing costs it a `409` and
-        // one retry, until the sweep forgets the entry.
-        if state.releasing || state.revoked {
+        // **A revoked credential does not need refusing here**, and used to. While a client was
+        // identified by its name alone, a name given back reached this same `Presence` and had to
+        // be held at a `409` until the sweep forgot it. It is a different [`Client`] now
+        // ([#190](https://github.com/glslang/windbg-mcp/issues/190)), so it arrives at a `Presence`
+        // of its own and is served at once — there is nothing of its predecessor's for it to reach.
+        if state.releasing {
             return Admission::Releasing;
         }
         // **Renewed if there is one; never created.** "Any request renews the lease" is what keeps a
@@ -998,32 +995,22 @@ async fn reloaded(
             }
         };
         let change = accepted.replace(fresh);
-        // **Lifted by a name being given back, not by a teardown finishing.** This is the only
-        // event that requires the gate off, and hanging it on anything else — the release running
-        // out of sessions to release, say — lifts it while a revoked credential's opener may still
-        // be seconds from registering. A name that is revoked and never configured again keeps its
-        // gate for the life of the process, which is a client name held in a set and exactly the
-        // behaviour wanted: nothing that credential started may ever register.
-        //
-        // It needs no sequencing against the teardown below, because `Lease::admit` refuses a
-        // revoked presence until the sweep forgets it: a name given back inside that window is held
-        // at a `409` by the lease, not by this.
-        for name in &change.added {
-            sessions.unrevoke(&crate::client::Client::new(name));
-        }
-        for name in &change.removed {
-            let gone = crate::client::Client::new(name);
+        for gone in &change.removed {
             // **The gate closes before the answer goes out**, because a revocation has a window a
             // lease expiry does not. An expiry only fires after the client has been silent for
             // longer than any call can keep it quiet, so nothing of that credential's can still be
             // in flight; here the token stops being accepted at the swap above, but a call that got
             // past authentication a moment earlier is still running and an opener can be seconds
-            // from registering. A session admitted behind the sweep would belong to a client
-            // nothing can authenticate as and nothing will ever come back for. Taken off again by
-            // the sweep, once that client's sessions are gone.
-            sessions.revoke(&gone);
+            // from registering, so the sweep below cannot see it.
+            //
+            // **Never lifted, and it no longer needs to be.** It marks this incarnation, not this
+            // name, so a client configured under the same name later is not gated by it — which is
+            // what the whole of [#190](https://github.com/glslang/windbg-mcp/issues/190) bought,
+            // and it deleted the question of when to take a gate off, which was where two separate
+            // findings lived. What is left behind is one name and a `u64` per revocation.
+            sessions.revoke(gone);
             // And the clock to now, which is all a revocation is: the sweeper does the rest.
-            lease.revoke(&gone);
+            lease.revoke(gone);
         }
         // **Answered once the swap and the gates are done** — which is exactly what the asking
         // command claims when it returns, and all of it is memory.
@@ -1038,8 +1025,8 @@ async fn reloaded(
                     .to_string(),
                 false => format!(
                     "added [{}], removed [{}]",
-                    change.added.join(", "),
-                    change.removed.join(", ")
+                    crate::client::Change::names(&change.added),
+                    crate::client::Change::names(&change.removed)
                 ),
             }
         );
@@ -1732,36 +1719,30 @@ mod tests {
         );
     }
 
-    /// A name handed to a new credential before the sweep runs reaches none of its predecessor.
+    /// A name given back reaches none of its predecessor's lease, and does not wait to be served.
     ///
-    /// **A client is identified by its name**, so `--remove-listen-client ci` followed by
-    /// `--add-listen-client ci` produces two different credentials that every mechanism keyed on
-    /// identity — session ownership, routing, lease state — cannot tell apart. Between the
-    /// revocation and the sweep that acts on it, the entry still holds the *previous* holder's
-    /// sessions, so serving the new one would hand it debug sessions opened by a credential that
-    /// has been revoked. That is the isolation this ownership boundary exists to provide, and it is
-    /// the one thing a rotation deliberately does *not* do — `--rotate-listen-client` keeps the
-    /// name and so keeps the sessions, which is the supported way to change a token.
+    /// **Both halves changed when a client stopped being a name**
+    /// ([#190](https://github.com/glslang/windbg-mcp/issues/190)). While it was one,
+    /// `--remove-listen-client ci` then `--add-listen-client ci` produced two credentials that this
+    /// map could not tell apart, so the new one had to be held at a `409` until the sweep forgot the
+    /// entry — a refusal that existed only because the key was ambiguous. It is a different
+    /// [`crate::client::Client`] now, so it arrives at a `Presence` of its own: served at once, and
+    /// with nothing of its predecessor's in reach.
     ///
-    /// The second half is what makes the refusal load-bearing rather than tidy: a request that
-    /// renewed would push the revocation's deadline a whole grace out, so the sweep that was to run
-    /// on its next pass would not, and the revoked client's targets would stay live for as long as
-    /// somebody kept talking to that name.
+    /// What has *not* changed is the second half, and it is the one with teeth. A request already
+    /// inside the MCP service when the set was swapped still settles against the **old** client, and
+    /// renewing there would push the revocation's deadline a whole grace out — so the sweep that was
+    /// to run on its next pass would not, and that credential's targets would stay live for another
+    /// six minutes. An incarnation does not help with that: it is the same client, arriving late.
     #[test]
-    fn a_revoked_name_serves_nobody_until_the_sweep_has_forgotten_it() {
-        let lease = For::new(unchecked(Duration::from_secs(300)), "ci");
+    fn a_name_given_back_is_a_different_lease_and_waits_for_nothing() {
+        let grace = Duration::from_secs(300);
+        let lease = For::new(unchecked(grace), "ci");
         request(&lease, None, Some("session-a"), true);
         lease.revoke();
 
-        assert_eq!(
-            lease.admit(None),
-            Admission::Releasing,
-            "a name whose revocation has not been swept was served — to whoever holds it now"
-        );
-
-        // The in-flight request of the *old* credential: it passed `admit` before the revocation
-        // and settles afterwards. It may record its MCP session, so the sweep closes that too, but
-        // it must not move the clock.
+        // The in-flight request of the *revoked* credential. It may record its MCP session, so the
+        // sweep closes that too, but it must not move the clock.
         let deadline = lease.state().deadline;
         lease.settle(None, Some("session-b"), true);
         assert_eq!(
@@ -1774,14 +1755,25 @@ mod tests {
             "an MCP session minted for a revoked credential is one nothing else will ever close"
         );
 
-        // And the sweep's ending is what lets the name be used again.
-        let swept = lease.expired().expect("revoked, so expired now");
-        assert!(swept.revoked);
-        lease.forget();
+        // The name, given back. Same `Lease`, same name, different client.
+        let given_back = For {
+            lease: lease.lease,
+            client: crate::client::Client::incarnate("ci", 2),
+        };
         assert_eq!(
-            lease.admit(None),
+            given_back.admit(None),
             Admission::Serve,
-            "once the predecessor is forgotten the name is an ordinary client again"
+            "a client configured under a revoked name was made to wait for a teardown that is not \
+             its own"
+        );
+        assert!(
+            given_back.state().mcp.is_empty(),
+            "it inherited the MCP session ids of whoever held that name before"
+        );
+        assert_eq!(
+            given_back.state().deadline,
+            None,
+            "it inherited a clock that was set for its predecessor's revocation"
         );
     }
 

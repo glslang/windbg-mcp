@@ -58,8 +58,31 @@ const NAME_LIMIT: usize = 64;
 /// A name rather than an opaque id so it can be said out loud — in a log line, in `session_status`,
 /// in the message a caller gets when it asks for a session that is not its own. It is chosen by
 /// whoever configured the token, never by the client presenting it.
+///
+/// # The name is what you see; the identity is the pair
+///
+/// **A name can be given back**, and until this it was the whole of a client's identity. So
+/// `--remove-listen-client ci` followed by `--add-listen-client ci` produced two credentials that
+/// every structure keyed on identity — session ownership, routing, lease state, the four-session
+/// cap — could not tell apart, and the second reached what the first had opened
+/// ([#190](https://github.com/glslang/windbg-mcp/issues/190)). That is exactly the isolation this
+/// type exists to provide, and exactly what `--rotate-listen-client` exists to do *deliberately*:
+/// rotation keeps the name, so it keeps the sessions, while a removal must not.
+///
+/// So identity is `(name, incarnation)`. The incarnation is invisible — [`Display`](Self::fmt) and
+/// [`name`](Self::name) render the name alone, so every log line, refusal and `session_status` row
+/// says what it always did — and it is minted in exactly one place, [`Accepted::replace`], which is
+/// the only code that knows whether a name is *being given back* or *carrying on*.
+///
+/// [`Self::new`] deliberately does **not** mint one. It builds the sole holder of a name, which is
+/// what stdio has, what every in-process test wants, and what makes `Client::new("ci")` twice mean
+/// one client rather than two.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct Client(Arc<str>);
+pub struct Client {
+    name: Arc<str>,
+    /// Which holder of that name. `0` is "the only one there has ever been" — see [`Self::new`].
+    incarnation: u64,
+}
 
 impl Client {
     /// The client every stdio call belongs to.
@@ -69,29 +92,61 @@ impl Client {
     /// transports rather than one rule and an exception.
     pub const LOCAL: &'static str = "local";
 
+    /// The sole holder of `name`.
+    ///
+    /// Incarnation `0`, which nothing minted and nothing will mint again: under stdio there is one
+    /// client and no configuration to give it back to anybody, and in a test two mentions of a name
+    /// mean one client. A listener's clients are [minted](Accepted::replace) from `1` up, so they
+    /// can never collide with this — and the two never coexist anyway, since a process is one
+    /// transport or the other.
     pub fn new(name: impl AsRef<str>) -> Self {
-        Self(Arc::from(name.as_ref()))
+        Self {
+            name: Arc::from(name.as_ref()),
+            incarnation: 0,
+        }
+    }
+
+    /// The `n`th holder of `name`, for the one caller that knows what `n` is.
+    ///
+    /// Crate-visible only so tests elsewhere can build two clients that share a name — in a running
+    /// server [`Accepted::replace`] is the sole caller, because it is the only code that can tell a
+    /// name carrying on from a name being given back.
+    pub(crate) fn incarnate(name: &str, incarnation: u64) -> Self {
+        Self {
+            name: Arc::from(name),
+            incarnation,
+        }
     }
 
     pub fn local() -> Self {
         Self::new(Self::LOCAL)
     }
 
+    /// **The name alone**, which is the whole of what may be rendered. Two clients that share a
+    /// name are two clients, and nothing outside this module has any use for which is which — a log
+    /// line saying `ci#7` would be noise to an operator who configured one client called `ci`.
     pub fn name(&self) -> &str {
-        &self.0
+        &self.name
     }
 }
 
 impl std::fmt::Display for Client {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.name)
     }
 }
 
-/// The tokens this listener accepts, and the client each one names.
+/// The tokens this listener accepts, and the client each one **names**.
+///
+/// A name rather than a [`Client`], and that is the division of labour behind
+/// [#190](https://github.com/glslang/windbg-mcp/issues/190): a configuration says which names may
+/// connect, and only [`Accepted`] — which can see the set that was in force a moment ago — knows
+/// whether a name appearing here is one carrying on or one being given back. Minting an identity
+/// from a file that cannot answer that question is what let a re-added name inherit its
+/// predecessor's sessions.
 #[derive(Clone, Default)]
 pub struct Credentials {
-    by_token: HashMap<String, Client>,
+    by_token: HashMap<String, String>,
 }
 
 /// **The names, never the tokens** — the same reason [`crate::kdconn::Connection`]'s is redacted.
@@ -106,9 +161,9 @@ impl std::fmt::Debug for Credentials {
 }
 
 impl Credentials {
-    /// The client presenting `token`, or `None` if nothing here accepts it.
-    pub fn client_for(&self, token: &str) -> Option<&Client> {
-        self.by_token.get(token)
+    /// The **name** of the client presenting `token`, or `None` if nothing here accepts it.
+    pub fn client_for(&self, token: &str) -> Option<&str> {
+        self.by_token.get(token).map(String::as_str)
     }
 
     pub fn len(&self) -> usize {
@@ -117,7 +172,7 @@ impl Credentials {
 
     /// Every configured name, sorted — for the one log line that says who may connect.
     pub fn names(&self) -> Vec<&str> {
-        let mut names: Vec<&str> = self.by_token.values().map(Client::name).collect();
+        let mut names: Vec<&str> = self.by_token.values().map(String::as_str).collect();
         names.sort_unstable();
         names
     }
@@ -157,7 +212,7 @@ impl Credentials {
     /// a caller's sessions land under whichever name won a `HashMap` insertion, which is a rule
     /// nobody could predict and a boundary that would move.
     fn build(configured: &[Configured]) -> Result<Self> {
-        let mut by_token: HashMap<String, Client> = HashMap::new();
+        let mut by_token: HashMap<String, String> = HashMap::new();
         // Client name to *what configured it* — never to the token. Both refusals below are
         // printed at startup, to stderr in the foreground and to the service log under the SCM, so
         // a message quoting the credential it is complaining about would write a working listener
@@ -179,7 +234,7 @@ impl Credentials {
                 // One client is one credential (the check below), so whatever configured this
                 // token is what configured that client.
                 let first = named
-                    .get(existing.name())
+                    .get(existing.as_str())
                     .copied()
                     .unwrap_or("another entry");
                 bail!(
@@ -204,61 +259,109 @@ impl Credentials {
                 );
             }
             named.insert(name.as_str(), from.as_str());
-            by_token.insert(token.clone(), Client::new(name));
+            by_token.insert(token.clone(), name.clone());
         }
         Ok(Self { by_token })
     }
 }
 
-/// The credentials a listener is serving *right now*, replaceable while it runs.
+/// The credentials a listener is serving *right now*, replaceable while it runs — and the one
+/// place a client's identity is minted.
 ///
-/// [`Credentials`] is what a configuration says; this is what the running listener accepts, and
-/// the difference is a whole feature. Built once at startup, a service-hosted listener's client
-/// list is fixed until the next start — and a restart drops every session it holds, which for a
-/// parked kernel attach is the outage that made adding a client a planned one (`FOLLOWUPS.md`
-/// item 34). So the set lives behind a lock that [`crate::service::reload`] can swap under the
-/// accept loop, and a client added to the token file is admitted without anything being stopped.
+/// [`Credentials`] is what a configuration says; this is what the running listener accepts, and the
+/// difference is two whole features. Built once at startup, a service-hosted listener's client list
+/// would be fixed until the next start, and a restart drops every session it holds — which for a
+/// parked kernel attach is the outage that made adding a client a planned one (`FOLLOWUPS.md` item
+/// 34). So the set lives behind a lock that [`crate::service::edit_client`] can swap under the
+/// accept loop.
+///
+/// **And swapping is the only moment anyone can tell a name carrying on from a name being given
+/// back**, which is why incarnations are minted here and nowhere else
+/// ([#190](https://github.com/glslang/windbg-mcp/issues/190)). A name in the new set that was in
+/// the old one keeps its identity — that is a `--rotate-listen-client`, which changes a token and
+/// deliberately keeps the sessions. A name that was absent gets a fresh one, so a
+/// `--remove-listen-client` followed by an `--add-listen-client` yields a client that shares a name
+/// with its predecessor and *nothing else*: it cannot route to its sessions, inherit its MCP session
+/// ids, or renew its lease, because none of those match on a name.
 ///
 /// **A read lock on the authentication path**, which is the cheapest thing that is also correct: a
 /// request takes it uncontended, and the one writer runs once per administrative command. And it
-/// is [recovered from poisoning](Self::current) rather than unwrapped — a panic anywhere near the
+/// is [recovered from poisoning](Self::state) rather than unwrapped — a panic anywhere near the
 /// swap must not turn into a listener that refuses every caller for the rest of its life.
 pub struct Accepted {
-    current: std::sync::RwLock<Arc<Credentials>>,
+    current: std::sync::RwLock<Arc<State>>,
+    /// The next incarnation to hand out. Never reset, so a name given back is never confused with
+    /// the holder before it however many times it changes hands.
+    next: std::sync::atomic::AtomicU64,
 }
 
-/// What a [reload](Accepted::replace) changed, by name.
+/// One generation of the configuration: the tokens, and which holder of each name is current.
+struct State {
+    credentials: Credentials,
+    /// Name to incarnation, for every name [`State::credentials`] accepts.
+    incarnations: HashMap<String, u64>,
+}
+
+impl State {
+    fn client_for(&self, token: &str) -> Option<Client> {
+        let name = self.credentials.client_for(token)?;
+        // A name the credentials accept always has an incarnation: they are built together in
+        // `Accepted::replace`, which is the only writer of either.
+        let incarnation = *self.incarnations.get(name)?;
+        Some(Client::incarnate(name, incarnation))
+    }
+}
+
+/// What a [reload](Accepted::replace) changed.
 ///
-/// **Names, not tokens**, so the caller can log it: this is what the listener says out loud when a
-/// client appears or goes. A rotation shows up as neither — the name is unchanged, so nothing this
-/// describes moved, and the sessions that client holds are untouched by design.
+/// **Clients, not names**, because the caller acts on them: a removal has to release the sessions
+/// of the incarnation that is going, and a name is no longer enough to say which that is. A
+/// rotation shows up as neither — the name is unchanged and so is its identity, which is what makes
+/// rotation keep the sessions it is documented to keep.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Change {
-    pub added: Vec<String>,
-    pub removed: Vec<String>,
+    pub added: Vec<Client>,
+    pub removed: Vec<Client>,
 }
 
 impl Change {
     pub fn is_empty(&self) -> bool {
         self.added.is_empty() && self.removed.is_empty()
     }
+
+    /// The names on one side of the change, for a log line.
+    pub fn names(clients: &[Client]) -> String {
+        clients
+            .iter()
+            .map(Client::name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
 }
 
 impl Accepted {
     pub fn new(credentials: Credentials) -> Self {
-        Self {
-            current: std::sync::RwLock::new(Arc::new(credentials)),
-        }
+        let accepted = Self {
+            current: std::sync::RwLock::new(Arc::new(State {
+                credentials: Credentials::default(),
+                incarnations: HashMap::new(),
+            })),
+            // From 1, so nothing a listener mints can collide with the `0` [`Client::new`] gives
+            // the sole holder of a name.
+            next: std::sync::atomic::AtomicU64::new(1),
+        };
+        accepted.replace(credentials);
+        accepted
     }
 
-    /// The set in force, past a poisoned lock.
+    /// The generation in force, past a poisoned lock.
     ///
     /// `into_inner` rather than `unwrap`, because of what the two do on the request path. The lock
     /// guards an `Arc` that is only ever read or replaced wholesale, so a panic while it was held
     /// cannot have left a half-written set behind — there is no invariant to protect. Propagating
     /// the poison would instead take a listener holding live kernel targets and have it refuse
     /// every caller, its own operator included, until someone restarted it.
-    fn current(&self) -> Arc<Credentials> {
+    fn state(&self) -> Arc<State> {
         match self.current.read() {
             Ok(guard) => Arc::clone(&guard),
             Err(poisoned) => Arc::clone(&poisoned.into_inner()),
@@ -267,12 +370,13 @@ impl Accepted {
 
     /// The client presenting `token`, or `None` if nothing here accepts it.
     pub fn client_for(&self, token: &str) -> Option<Client> {
-        self.current().client_for(token).cloned()
+        self.state().client_for(token)
     }
 
     /// Every configured name, sorted — for the lines that say who may connect.
     pub fn names(&self) -> Vec<String> {
-        self.current()
+        self.state()
+            .credentials
             .names()
             .into_iter()
             .map(str::to_owned)
@@ -286,23 +390,39 @@ impl Accepted {
     /// listener releases them down the path the lease sweep already uses. See
     /// [`crate::listen::reloaded`].
     pub fn replace(&self, credentials: Credentials) -> Change {
-        let before = self.names();
-        let after: Vec<String> = credentials.names().into_iter().map(str::to_owned).collect();
+        let before = self.state();
+        let mut incarnations = HashMap::new();
+        let mut added = Vec::new();
+        for name in credentials.names() {
+            // **Carrying on, or being given back.** The only question this function exists to
+            // answer, and the only place in the program that can.
+            match before.incarnations.get(name) {
+                Some(&existing) => {
+                    incarnations.insert(name.to_string(), existing);
+                }
+                None => {
+                    let minted = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    incarnations.insert(name.to_string(), minted);
+                    added.push(Client::incarnate(name, minted));
+                }
+            }
+        }
+        let removed = before
+            .incarnations
+            .iter()
+            .filter(|(name, _)| !incarnations.contains_key(name.as_str()))
+            .map(|(name, &incarnation)| Client::incarnate(name, incarnation))
+            .collect();
+
+        let fresh = Arc::new(State {
+            credentials,
+            incarnations,
+        });
         match self.current.write() {
-            Ok(mut guard) => *guard = Arc::new(credentials),
-            Err(poisoned) => *poisoned.into_inner() = Arc::new(credentials),
+            Ok(mut guard) => *guard = fresh,
+            Err(poisoned) => *poisoned.into_inner() = fresh,
         }
-        Change {
-            added: after
-                .iter()
-                .filter(|name| !before.contains(name))
-                .cloned()
-                .collect(),
-            removed: before
-                .into_iter()
-                .filter(|name| !after.contains(name))
-                .collect(),
-        }
+        Change { added, removed }
     }
 }
 
@@ -850,7 +970,7 @@ mod tests {
     #[test]
     fn the_unnamed_token_names_the_local_client() {
         let creds = Credentials::from_entries(vars(&[(TOKEN_ENV, "s3cret")]), None).expect("valid");
-        assert_eq!(creds.client_for("s3cret").map(Client::name), Some("local"));
+        assert_eq!(creds.client_for("s3cret"), Some("local"));
         assert_eq!(creds.client_for("wrong"), None);
     }
 
@@ -865,11 +985,8 @@ mod tests {
             None,
         )
         .expect("valid");
-        assert_eq!(creds.client_for("ci-token").map(Client::name), Some("ci"));
-        assert_eq!(
-            creds.client_for("laptop-token").map(Client::name),
-            Some("laptop")
-        );
+        assert_eq!(creds.client_for("ci-token"), Some("ci"));
+        assert_eq!(creds.client_for("laptop-token"), Some("laptop"));
         assert_eq!(creds.names(), vec!["ci", "laptop"]);
     }
 
@@ -960,8 +1077,8 @@ mod tests {
             None,
         )
         .expect("valid");
-        assert_eq!(creds.client_for("unnamed").map(Client::name), Some("local"));
-        assert_eq!(creds.client_for("for-ci").map(Client::name), Some("ci"));
+        assert_eq!(creds.client_for("unnamed"), Some("local"));
+        assert_eq!(creds.client_for("for-ci"), Some("ci"));
         // And the file variable is still not a token, whatever its casing.
         assert!(is_token_file("Windbg_Mcp_Listen_Token_File"));
         assert!(credential_suffix("Windbg_Mcp_Listen_Token_File").is_some());
@@ -982,10 +1099,7 @@ mod tests {
             Some(file("from-the-file")),
         )
         .expect("valid");
-        assert_eq!(
-            creds.client_for("from-the-file").map(Client::name),
-            Some("local")
-        );
+        assert_eq!(creds.client_for("from-the-file"), Some("local"));
         assert_eq!(creds.len(), 1, "the environment must not add credentials");
         assert_eq!(creds.client_for("from-the-environment"), None);
         assert_eq!(creds.client_for("also-from-the-environment"), None);
@@ -1015,7 +1129,7 @@ mod tests {
             Some(file(&format!(r#"{{"local": "{legacy}"}}"#))),
         )
         .expect("the same token, in the shape this file now takes");
-        assert_eq!(creds.client_for(legacy).map(Client::name), Some("local"));
+        assert_eq!(creds.client_for(legacy), Some("local"));
     }
 
     /// **And because it is the only credential, it has to be able to name more than one.** A
@@ -1032,11 +1146,8 @@ mod tests {
         )
         .expect("valid");
         assert_eq!(creds.names(), vec!["ci", "laptop", "local"]);
-        assert_eq!(creds.client_for("for-ci").map(Client::name), Some("ci"));
-        assert_eq!(
-            creds.client_for("for-laptop").map(Client::name),
-            Some("laptop")
-        );
+        assert_eq!(creds.client_for("for-ci"), Some("ci"));
+        assert_eq!(creds.client_for("for-laptop"), Some("laptop"));
         // Still the only credential: naming several clients does not let the environment back in.
         assert_eq!(creds.client_for("from-the-environment"), None);
     }
@@ -1059,11 +1170,7 @@ mod tests {
         ] {
             let creds = Credentials::from_entries(vars(&[]), Some(file(text)))
                 .unwrap_or_else(|e| panic!("{text:?} is a token file: {e}"));
-            assert_eq!(
-                creds.client_for("plain-token").map(Client::name),
-                Some(whose),
-                "{text:?}"
-            );
+            assert_eq!(creds.client_for("plain-token"), Some(whose), "{text:?}");
         }
     }
 
@@ -1229,10 +1336,7 @@ mod tests {
             Some(file("from-the-file")),
         )
         .expect("valid");
-        assert_eq!(
-            creds.client_for("from-the-file").map(Client::name),
-            Some("local")
-        );
+        assert_eq!(creds.client_for("from-the-file"), Some("local"));
         assert_eq!(creds.client_for(r"C:\somewhere\token"), None);
     }
 
@@ -1252,7 +1356,7 @@ mod tests {
             "`{first}` cannot travel in a header"
         );
         let creds = Credentials::from_entries(vars(&[(TOKEN_ENV, &first)]), None).expect("valid");
-        assert_eq!(creds.client_for(&first).map(Client::name), Some("local"));
+        assert_eq!(creds.client_for(&first), Some("local"));
     }
 
     /// A fingerprint is stable, distinguishing, and says nothing about the token it describes.
@@ -1373,8 +1477,8 @@ mod tests {
             )
             .expect("valid"),
         );
-        assert_eq!(change.added, vec!["bench"]);
-        assert_eq!(change.removed, vec!["ci"]);
+        assert_eq!(crate::client::Change::names(&change.added), "bench");
+        assert_eq!(crate::client::Change::names(&change.removed), "ci");
         assert_eq!(accepted.names(), vec!["bench", "local"]);
         assert_eq!(
             accepted.client_for("c"),
@@ -1384,6 +1488,65 @@ mod tests {
         assert_eq!(
             accepted.client_for("b").map(|c| c.name().to_string()),
             Some("bench".into())
+        );
+    }
+
+    /// **The distinction the whole of #190 exists to make**: a rotation is the same client, a
+    /// removal-and-re-add is not.
+    ///
+    /// Both leave a set holding a client called `ci`, and until identity was a pair nothing could
+    /// tell them apart — so a name given back reached the debug sessions, MCP session ids and lease
+    /// of the credential it replaced. Which is precisely what `--rotate-listen-client` is *for*, and
+    /// precisely what `--remove-listen-client` must not do.
+    ///
+    /// Asserted on identity rather than on any downstream effect, because identity is what every
+    /// downstream structure keys on: session ownership, routing, the lease map, the four-session
+    /// cap. Get this right and they are all right; get it wrong and they are all wrong in the same
+    /// way, which is how one ambiguity produced four separate findings.
+    #[test]
+    fn a_rotation_is_the_same_client_and_a_name_given_back_is_not() {
+        let set = |token: &str| {
+            Credentials::from_entries(vars(&[("WINDBG_MCP_LISTEN_TOKEN_CI", token)]), None)
+                .expect("valid")
+        };
+        let accepted = Accepted::new(set("first"));
+        let original = accepted.client_for("first").expect("configured");
+
+        // A rotation: the name never leaves the set, so the client never changes.
+        let rotated = accepted.replace(set("second"));
+        assert!(
+            rotated.is_empty(),
+            "a rotation reported a client coming or going: {rotated:?}"
+        );
+        assert_eq!(
+            accepted.client_for("second"),
+            Some(original.clone()),
+            "a rotation minted a new identity, which would strand the sessions it must keep"
+        );
+        assert_eq!(
+            accepted.client_for("first"),
+            None,
+            "the old token still worked"
+        );
+
+        // A removal and an add. Same name, and that is all they share.
+        let removal = accepted.replace(
+            Credentials::from_entries(vars(&[("WINDBG_MCP_LISTEN_TOKEN_OTHER", "o")]), None)
+                .expect("valid"),
+        );
+        assert_eq!(removal.removed, vec![original.clone()]);
+        accepted.replace(set("third"));
+        let given_back = accepted.client_for("third").expect("configured again");
+
+        assert_eq!(
+            given_back.name(),
+            original.name(),
+            "the operator configured a client called `ci`, and that is what it must be called"
+        );
+        assert_ne!(
+            given_back, original,
+            "a name given back is the same client as the one it replaced, so it reaches its \
+             sessions — which is the isolation this boundary exists to provide"
         );
     }
 

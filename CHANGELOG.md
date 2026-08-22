@@ -68,21 +68,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   registering — and a session admitted behind the sweep would belong to a client nothing can
   authenticate as and nothing will ever come back for.
 
-  **A name is not reusable until the sweep has forgotten it.** A client is identified by its name,
-  so `--remove-listen-client ci` followed by `--add-listen-client ci` makes two credentials that
-  nothing keyed on identity can tell apart; in between, the lease entry still holds the previous
-  holder's sessions. Requests on a revoked name are refused with a `409` ("ask again in a moment")
-  rather than served, and a request already inside the MCP service when the set was swapped records
-  its MCP session but does not renew the clock — a renewal would push the revocation a whole grace
-  out and the sweep that was to run on its next pass would not. Changing a token *without* losing
-  the sessions is what `--rotate-listen-client` is for.
+  **A name given back is a different client**
+  ([#190](https://github.com/glslang/windbg-mcp/issues/190)). A client used to *be* its name, so
+  `--remove-listen-client ci` followed by `--add-listen-client ci` produced two credentials that
+  nothing keyed on identity could tell apart, and the second reached the debug sessions, MCP session
+  ids and lease of the first. Identity is now `(name, incarnation)`: the name is still the whole of
+  what is rendered — log lines, refusals and `session_status` say exactly what they did — and the
+  incarnation is minted in one place, when a set of credentials is swapped in, which is the only
+  code that can tell a name *carrying on* from a name *being given back*. So a
+  `--rotate-listen-client` keeps the client and therefore its sessions, which is what it is for, and
+  a removal-and-re-add keeps only the name.
 
-  The registry gate a revocation closes is lifted **when the name is configured again**, not when
-  the teardown finishes. That release is one pass over the sessions that exist, so an opener which
-  authenticated before the revocation and has not registered yet — an `attach_kernel` is a worker
-  spawn away — is invisible to it, and lifting on "nothing left to release" let that opener register
-  a target owned by a credential nothing can authenticate as. A name revoked and never given back
-  keeps its gate for the life of the process, which is the answer wanted.
+  A request already inside the MCP service when the set was swapped still settles against the client
+  that is going, and records its MCP session so the sweep closes it — but does not renew the clock,
+  since a renewal would push the revocation a whole grace out and the sweep that was to run on its
+  next pass would not.
+
+  The registry gate a revocation closes is **never lifted**, and no longer needs to be. It marks the
+  incarnation rather than the name, so a client configured under that name afterwards is simply not
+  the one it gates — which deleted the question of *when* to take a gate off, where two separate
+  findings had lived. It exists because the release is one pass over the sessions that exist, so an
+  opener which authenticated before the revocation and has not registered yet — an `attach_kernel`
+  is a worker spawn away — is invisible to it. What it leaves behind is a name and a `u64` per
+  revocation.
 
 ### Changed
 
