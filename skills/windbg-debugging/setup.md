@@ -446,7 +446,10 @@ Four things decide whether that works, and each fails in a way that reads as som
   and there is nothing listening after it. Once running it survives logout, comes back at boot, and
   has a defined working directory — which is what decides whether the engine DLLs beside the exe
   are the ones that load. Note `LocalSystem` does not read *your* `%USERPROFILE%`, so kernel
-  profiles have to be configured machine-wide for a service to see them.
+  profiles have to be configured machine-wide for a service to see them. Giving it a **second
+  client** later costs neither a reinstall nor the sessions it is holding —
+  `--add-listen-client <name> --token-out <path>`, elevated, which generates the token and prints
+  only a fingerprint.
 
 Two behaviours differ from stdio and are worth knowing before they surprise you.
 
@@ -478,4 +481,5 @@ one is *unknown* to the other rather than refused. If a handle has "vanished", c
 request carried.
 
 `docs/remote-listener.md` in the repository is the operator's reference for the rest — the grace
-and how to change it, what a `409` means, and running behind a service.
+and how to change it, what a `409` means, running behind a service, and adding, revoking or
+rotating a client while it runs.
