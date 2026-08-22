@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in sixteen clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in seventeen clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/win-kexp#71, 2026-08-01), items 13–14 from the bounded-command coverage review
@@ -14,8 +14,10 @@ working (2026-08-17), item 24 from first measuring what this server costs the mo
 2026-08-18), item 27 from completing the coordinate work (#156–#158, 2026-08-18), items 28–29
 from giving each client its own sessions (#162, #164–#166, 2026-08-19), item 30 from serving
 the stateless revision concurrently (#168 / #169, 2026-08-19), item 31 from giving a service-hosted
-listener more than one client (2026-08-20), and item 32 from running the debugger tier on the
-ARM64 runner image that replaces `windows-11-arm` in September 2026. Each item notes its repo,
+listener more than one client (2026-08-20), item 32 from running the debugger tier on the
+ARM64 runner image that replaces `windows-11-arm` in September 2026, and item 33 from driving the
+server with a **local model** and finding the lease grace measured against the wrong slow party
+(2026-08-22). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -1180,3 +1182,33 @@ to the change under review, and what gives the repo notice before every PR meets
   `C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64`, which both images carry today (the
   same WDK build, 10.1.26100.6584). It throws by name if that stops being true, which is the
   failure this pair is here to catch early rather than on the migration date.
+
+## 33. [windbg-mcp] The lease grace assumes the server is the slow party
+
+A client's lease is renewed by its requests, and the grace is derived from how long a *call* may
+take — which is the right bound when the thing that goes quiet is the server working. Driving a
+**local model** inverts it: a turn is the model thinking, with no request in flight, and one
+measured on this repo's own bench took **440s against a 390s grace** (2026-08-22,
+[`docs/local-model.md`](./docs/local-model.md)). The sweep released the client's sessions
+mid-investigation, and every later call came back `404 Session not found` — indistinguishable, from
+the caller's side, from a server that had fallen over.
+
+The client half is fixed: `tools/local_model_drive.py` pings after 120s of silence. That is the
+right layer for a *known* slow client, and it is not an answer for any other one — a client that
+does not know to ping is exactly the client this bites.
+
+- **The question:** should a lease be renewed by something other than a request — an MCP session
+  that is still connected, say? The pieces are already there: rmcp knows whether a session's stream
+  is live, and `Lease::admit` already refuses on two grounds before renewing. The risk is the
+  reason the lease exists at all: a client that vanished with a live kernel target open must not
+  hold it for ever, and "still connected" is exactly what a half-open TCP connection claims to be
+  ([`split-plane` phase 1's own argument](./docs/remote-listener.md)). So a connection is evidence,
+  not proof, and the shape that survives that is probably *a longer grace for a connected client*
+  rather than an exemption.
+- **Where it picks up:** `Lease` in `src/listen.rs`, and the startup floor in `Lease::new` that
+  makes "no request of that credential's can still be in flight when its lease expires" true. Any
+  change here has to keep that property — it is what lets the sweep zero nothing and wait for
+  nothing.
+- **What it is not:** a reason to raise the default grace. 390s is derived from the call timeout for
+  a reason, and a client that thinks for seven minutes is a fact about local models rather than
+  about this server.

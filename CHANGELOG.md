@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A `modules` page names the `limit` that would return everything.** Driving the capped tool with
+  a local model found the trap the cap had introduced: the obvious value to raise `limit` to is the
+  count the note above the rows just gave (`227 module(s) loaded`), and that one is *guaranteed* to
+  fall short, because the budget is shared with the unloaded half - the model asked for 227, got 177
+  loaded rows and 50 unloaded ones, and had to fetch the table a second time. The note now reads
+  ``Showing the first 64 loaded row(s) - `limit: 277` returns all of them, or narrow with `filter`
+  to ask about one driver.`` Both halves' match counts are known where the note is built, so the sum
+  is too. Above the 2000-row ceiling there is no such value and the note says so rather than naming
+  one that would still be short. A re-run halved that task's cost, 146,359 characters to 70,929.
+
+- **`tools/local_model_drive.py` keeps its lease alive while the model thinks.** The same run found
+  something that is not about tokens at all: a lease is renewed by requests and its grace is derived
+  from how long a *call* may take, so it assumes the server is the slow party. A local model
+  inverts that - one turn took 440s against a 390s grace - and the sweep released the client's
+  sessions mid-investigation, after which every call returned `404 Session not found`, which reads
+  exactly like a broken server. The script now pings after 120s of silence
+  (`WINDBG_MCP_KEEPALIVE`, `0` disables). Whether the listener should also be more patient with a
+  still-connected client is [`FOLLOWUPS.md`](./FOLLOWUPS.md) item 33.
+
 - **`modules` answers with a page of the table rather than all of it** ([`FOLLOWUPS.md`](./FOLLOWUPS.md)
   item 24). It was the largest single answer this server gives - 53,933 B of model-visible JSON for
   227 modules, a fifth of a whole tool surface for one question, and on a local model a turn of

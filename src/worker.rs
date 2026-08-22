@@ -1689,6 +1689,14 @@ fn listing_note(list: &structured::ModuleList) -> String {
 /// `filter`. It names `limit` rather than saying rows are missing, for the same reason
 /// `backtrace`'s truncation line names `frames` — an answer that stops short has to name the
 /// argument that undoes it.
+///
+/// **And it names the number**, which is the difference between one more call and two. The obvious
+/// value to reach for is the count the note above just gave — `227 module(s) loaded` — and that one
+/// is *guaranteed* to fall short, because the budget it goes into is shared with the unloaded half:
+/// a local model measured driving this asked for `limit: 227`, was given 177 loaded rows and 50
+/// unloaded ones, and had to ask a third time for the rest. Both halves are known here, so their
+/// sum is known here, and a caller who wants all of it should have to read it rather than derive
+/// it.
 fn truncation_note(list: &structured::ModuleList) -> Option<String> {
     let cut = (
         list.modules.len() < list.matched,
@@ -1696,7 +1704,7 @@ fn truncation_note(list: &structured::ModuleList) -> Option<String> {
     );
     let rows = match cut {
         (false, false) => return None,
-        (true, false) => format!("the first {} row(s)", list.modules.len()),
+        (true, false) => format!("the first {} loaded row(s)", list.modules.len()),
         (false, true) => format!("the first {} unloaded row(s)", list.unloaded.len()),
         (true, true) => format!(
             "the first {} loaded and {} unloaded row(s)",
@@ -1704,10 +1712,20 @@ fn truncation_note(list: &structured::ModuleList) -> Option<String> {
             list.unloaded.len()
         ),
     };
-    Some(format!(
-        "Showing {rows} — raise `limit` (up to {MAX_MODULE_ROWS}) to see the rest, or narrow with \
-         `filter`."
-    ))
+    // What it would take to see everything that matched. Past the ceiling there is no such value,
+    // and saying one would be worse than saying none: `filter` is the only way through from there.
+    let all = list.matched + list.unloaded_matched;
+    let rest = if all <= MAX_MODULE_ROWS as usize {
+        format!(
+            "`limit: {all}` returns all of them, or narrow with `filter` to ask about one driver"
+        )
+    } else {
+        format!(
+            "`limit` stops at {MAX_MODULE_ROWS}, short of the {all} that matched — narrow with \
+             `filter` to ask about one driver"
+        )
+    };
+    Some(format!("Showing {rows} — {rest}."))
 }
 
 /// Where the unloaded rows are, said wherever any of them are in the answer: above under their own
@@ -6079,12 +6097,14 @@ mod tests {
             "the inventory is what it always was:\n{text}"
         );
         assert!(
-            text.contains("Showing the first 2 row(s)"),
-            "and the listing says it is a part of it:\n{text}"
+            text.contains("Showing the first 2 loaded row(s)"),
+            "and the listing says it is a part of it, naming the half it counted — the unloaded \
+             row beside them is in the listing too:\n{text}"
         );
         assert!(
-            text.contains("raise `limit`"),
-            "an answer that stops short names the argument that undoes it:\n{text}"
+            text.contains("`limit: 4` returns all of them"),
+            "…and names the value that would: three loaded rows and one unloaded, so four — not \
+             the `3` a reader would take from the count above it:\n{text}"
         );
 
         // Nothing was cut, so nothing is said about a cut: the note a caller reads on every
@@ -6147,6 +6167,65 @@ mod tests {
         assert!(
             text.contains("Showing the first 1 loaded and 1 unloaded row(s)"),
             "both halves cut is one sentence naming both:\n{text}"
+        );
+        assert!(
+            text.contains("`limit: 253` returns all of them"),
+            "and the value that returns everything is both halves' matches, not either one's:\n{text}"
+        );
+    }
+
+    /// **The number a caller reaches for is the one that falls short**, which is why the note names
+    /// the other one. `227 module(s) loaded` is what the line above says, so `limit: 227` is what
+    /// gets asked for — and it buys 177 loaded rows and 50 unloaded ones, because the budget is
+    /// shared. A local model driving this server did exactly that and had to ask a third time
+    /// (`docs/local-model.md`).
+    #[test]
+    fn the_note_names_the_limit_that_returns_everything_not_the_one_that_falls_short() {
+        let listing = |limit: usize| {
+            let (for_loaded, for_unloaded) = split_row_budget(limit, 227, 50);
+            structured::ModuleList {
+                loaded: 227,
+                matched: 227,
+                unloaded_matched: 50,
+                filter: None,
+                modules: (0..for_loaded)
+                    .map(|i| structured::ModuleInfo::from(&module("drv", 0x1000 + i as u64 * 0x10)))
+                    .collect(),
+                unloaded: (0..for_unloaded)
+                    .map(|i| {
+                        structured::ModuleInfo::from(&unloaded_module(
+                            "gone.sys",
+                            0x9000 + i as u64 * 0x10,
+                        ))
+                    })
+                    .collect(),
+            }
+        };
+
+        // The default page, and the guess it invites.
+        let text = render_modules(&listing(64));
+        assert!(text.contains("227 module(s) loaded"), "{text}");
+        assert!(
+            text.contains("`limit: 277` returns all of them"),
+            "the whole listing is both halves, so the value is 227 + 50:\n{text}"
+        );
+
+        // The guess itself: still short, and still told what would not be.
+        let text = render_modules(&listing(227));
+        assert!(
+            text.contains("Showing the first 177 loaded row(s)"),
+            "the count from the line above does not buy the whole table — it buys 177 of the 227 \
+             loaded rows, the other 50 of the budget having gone to the unloaded half:\n{text}"
+        );
+        assert!(text.contains("`limit: 277` returns all of them"), "{text}");
+
+        // And that value does.
+        let whole = listing(277);
+        assert_eq!(whole.modules.len(), 227);
+        assert_eq!(whole.unloaded.len(), 50);
+        assert!(
+            truncation_note(&whole).is_none(),
+            "nothing was cut, so nothing is said about a cut"
         );
     }
 
