@@ -321,8 +321,8 @@
       "inputSchema": 630,
       "modelVisible": 1008,
       "name": "registers",
-      "outputSchema": 6379,
-      "wire": 7485
+      "outputSchema": 6683,
+      "wire": 7789
     },
     {
       "annotations": 123,
@@ -466,10 +466,10 @@
     "inputSchema": 40207,
     "instructions": 1990,
     "modelVisible": 67658,
-    "outputSchema": 320061,
-    "payload": 394579,
+    "outputSchema": 320365,
+    "payload": 394883,
     "tools": 51,
-    "wire": 394461,
+    "wire": 394765,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 9746
   }

@@ -470,7 +470,13 @@ pub struct RegisterInfo {
     #[serde(flatten)]
     pub value: RegisterValue,
     /// Whether this register is a view of another (`eax` within `rax`) rather than storage of
-    /// its own. Only ever true when the whole set was asked for.
+    /// its own. Only ever true when the whole set was asked for — and **absent from the JSON when
+    /// false**, which is every row of a default answer.
+    ///
+    /// Skipped rather than written out because it was 25% of this answer while saying nothing: the
+    /// same reason [`ModuleInfo::unloaded`] and [`PdbInfo::unmatched`] are skipped. A row without
+    /// it is a register that is storage of its own.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub subregister: bool,
 }
 

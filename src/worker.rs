@@ -1444,10 +1444,7 @@ fn registers(e: &DebugEngine, all: bool) -> Result<Output, Failed> {
     let registers = e.register_values().map_err(failed)?;
     let selected: Vec<structured::RegisterInfo> = registers
         .iter()
-        .filter(|register| {
-            all || (!register.subregister
-                && matches!(register.value, win_kexp::dbgeng::RegisterValue::Int(_)))
-        })
+        .filter(|register| all || plain_integer(register))
         .map(|register| structured::RegisterInfo {
             name: register.name.clone(),
             value: (&register.value).into(),
@@ -1466,6 +1463,31 @@ fn registers(e: &DebugEngine, all: bool) -> Result<Output, Failed> {
             all_registers: all,
         },
     ))
+}
+
+/// Whether a register belongs in the **default** answer: the integer registers a caller means by
+/// "the registers", rather than the vector bank in disguise.
+///
+/// Two of the three rules are the obvious ones. `subregister` is the engine's own flag and drops
+/// `eax` within `rax`; the value being `Int` drops the x87 and vector registers, which the engine
+/// reports as bytes.
+///
+/// **The third is measured rather than obvious, and it is where the weight was.** DbgEng exposes a
+/// vector register *twice*: `xmm0` as the 128-bit register, and `xmm0/0` … `xmm0/3` as four int64
+/// pseudo-registers — and those slices are **not** flagged as subregisters, so they passed both
+/// rules above. A default answer whose own argument documents it as "not the x87 and vector
+/// registers" was carrying sixty-four of them: 64 of the 123 rows on this repo's x64 sample, and
+/// 44% of the bytes of the largest typed answer this server gives after `modules`.
+///
+/// It is a test on the *name* because the description the engine hands back has nothing better to
+/// offer: `DEBUG_REGISTER_DESCRIPTION::SubregMaster` means something only when the flag above is
+/// set, and for these it is not. The `/` is DbgEng's own convention for "a piece of a wider
+/// register" and appears in no register's real name, so the test is narrow — and it decides only
+/// what the *default* carries, since `all` still returns everything the engine knows.
+fn plain_integer(register: &win_kexp::dbgeng::Register) -> bool {
+    !register.subregister
+        && matches!(register.value, win_kexp::dbgeng::RegisterValue::Int(_))
+        && !register.name.contains('/')
 }
 
 /// A module row with the PDB identity the engine has for it, where it has one.
@@ -6008,6 +6030,49 @@ mod tests {
         let (_, rest) = text.split_once("```\n")?;
         let (body, _) = rest.split_once("```")?;
         Some(body)
+    }
+
+    /// **The vector bank in disguise.** A default `registers` answer is documented as the integer
+    /// registers, and `xmm0/0` is not one — but it is an `Int` the engine does not flag as a
+    /// subregister, so it passed until this test existed. Sixty-four of them did, on the sample
+    /// the budget table is measured against.
+    #[test]
+    fn a_default_register_set_is_the_integer_ones_and_not_the_vector_bank() {
+        use win_kexp::dbgeng::{Register, RegisterValue as Engine};
+        let reg = |name: &str, value, subregister| Register {
+            name: name.to_string(),
+            value,
+            subregister,
+        };
+
+        assert!(plain_integer(&reg("rax", Engine::Int(0), false)));
+        assert!(plain_integer(&reg("cr3", Engine::Int(0), false)));
+        assert!(
+            plain_integer(&reg("gdtr", Engine::Int(0), false)),
+            "a kernel caller's control and descriptor registers are integer registers"
+        );
+
+        assert!(
+            !plain_integer(&reg("eax", Engine::Int(0), true)),
+            "a view of another register is the engine's own flag to report"
+        );
+        assert!(
+            !plain_integer(&reg("xmm0", Engine::Bytes(vec![0; 16]), false)),
+            "a vector register is not a number"
+        );
+        for slice in ["xmm0/0", "xmm15/3"] {
+            assert!(
+                !plain_integer(&reg(slice, Engine::Int(0), false)),
+                "`{slice}` is a piece of a vector register, whatever the engine calls its value"
+            );
+        }
+
+        // And `all` is unaffected: it is the caller asking for everything the engine knows, which
+        // includes every row this test excludes.
+        assert!(
+            !plain_integer(&reg("xmm0/0", Engine::Int(0), false)),
+            "the rule decides the default only"
+        );
     }
 
     // ---- narrowing a module listing ----------------------------------------

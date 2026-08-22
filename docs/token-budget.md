@@ -95,7 +95,7 @@ records both, so the gap stays visible.
 |---|---:|---:|---:|---:|---:|
 | `modules` (the whole table, which was the default then) | 53,897 | 74,016 | 19,732 | 53,897 | 2.7x |
 | `execute` (`lm`) | 19,420 | 19,788 | 19,420 | — | — |
-| `registers` | 9,804 | 10,534 | 618 | 9,804 | **15.9x** |
+| `registers` (before finding 7 was fixed; 3,480 / 4,210 / 5.6x now) | 9,804 | 10,534 | 618 | 9,804 | **15.9x** |
 | `crash_triage` | 1,855 | 3,133 | 1,159 | 1,855 | 1.6x |
 | `open_dump` | 1,347 | 2,277 | 814 | 1,347 | 1.7x |
 | `disassemble` | 2,018 | 3,429 | 1,291 | 2,018 | 1.6x |
@@ -117,9 +117,10 @@ all, having had no budget). What is comparable is the shape: the model now reads
 listing. `modules` moved by ~100 B for one module's `pdb` object, which is the whole of what that
 field costs a caller — against the 15,610 B it costs the wire in schema, which is finding 1 above.
 
-`registers` is the shape of the problem in miniature: the model reads 9,804 bytes of JSON carrying
-`"kind":"int"` and `"subregister":false` on every row, and never sees the 618-byte `r` output that
-says the same thing better. `modules` **was** the largest single answer this server gives — roughly
+`registers` was the shape of the problem in miniature — the model read 9,804 bytes of JSON and never
+saw the 618-byte `r` output beside it — though not for the reason written here at the time: see
+finding 7, where measuring the payload found most of the weight in rows that should not have been in
+a default answer at all, and found this sentence's "says the same thing" to be untrue. `modules` **was** the largest single answer this server gives — roughly
 13k tokens, a fifth of a whole tool surface, for one question — which is what finding 5 is, and
 what it has since done about it.
 
@@ -189,10 +190,29 @@ None of these is a bug. They are recorded because they were invisible, and
    nothing here had ever had the caller's context window as its constraint. `DEFAULT_MODULE_ROWS`
    (finding 5) is the first one that does, and it says so where it is defined — the rest of this
    list is still bounded by what the target happens to hold.
-7. **A typed answer can be much larger than the rendering it replaces.** `registers` is 15.9x its
-   own text, because every row carries `"kind":"int"` and `"subregister":false`. This is the one
-   finding that is purely model-visible and purely this server's to fix, and it is what the ratio
-   rule below exists to stop spreading.
+7. **A typed answer can be much larger than the rendering it replaces.** `registers` was 15.9x its
+   own text — **fixed** (2026-08-22), and the fix was not the one this finding named. The
+   scaffolding it blamed is real: `"kind":"int"` and `"subregister":false` were 1,599 B and 2,460 B
+   of the 9,804, 41% between them. But measuring the payload rather than reasoning about it found
+   something larger. **64 of the 123 rows were the vector bank**: DbgEng exposes `xmm0` twice, as
+   128 bits of `bytes` *and* as `xmm0/0` … `xmm0/3`, four int64 pseudo-registers that carry no
+   subregister flag — so they passed a filter meaning "integer registers, not subregisters" and sat
+   in an answer whose own argument documents it as excluding the vector registers.
+
+   Excluding them and skipping the empty flag takes the default from **9,804 B to 3,480 B** and the
+   ratio from 15.9x to **5.6x**; the result ceiling moved 13,500 → 5,000 with it. `kind` was left
+   alone: it earns its place on the `float`, `non_finite` and `unavailable` rows, and dropping it
+   only for `int` would be an absent field meaning a default — the trap `docs/coordinates.md`
+   records paying for.
+
+   **And the sentence under the table was wrong**, which is the more useful correction: the text was
+   never "the same thing better". `r` prints 17 registers; the structured half carried 123. They
+   described different sets, so the ratio was never a like-for-like comparison of one answer in two
+   renderings. It is much closer to one now, at 59 rows against 17.
+
+   The ARM64 half is not fixed: there the same class of row is `w0`–`w30`, the 32-bit views of
+   `x0`–`x30`, which DbgEng also declines to flag — `FOLLOWUPS.md` item 35, because a second
+   invented name rule is not the way to it.
 8. **Five tools are a third of the model-visible surface**, and it is their *input* schemas rather
    than their prose. `debug_batch` alone is 9,746 B — 15% of everything a model is given before it
    asks anything — of which 7,980 B is the `StepAction`/`Check` vocabulary its schema pulls out of
@@ -282,8 +302,8 @@ code.
 
 One rule is asserted rather than a number: a tool's `structuredContent` may not exceed its own text
 rendering by more than 20x. A typed answer is meant to be the facts behind a rendering, so a large
-multiple means it is carrying scaffolding instead. `registers` is at 15.9x and is finding 7 above,
-not a failure — the rule is there to catch the next one. Being a ratio, it is only safe to read
+multiple means it is carrying scaffolding instead. `registers` was at 15.9x — the case the rule was
+written around — and is 5.6x since finding 7 was fixed; the rule is there to catch the next one. Being a ratio, it is only safe to read
 alongside the `wire` ceiling below: on its own, a rendering that grows satisfies it *more*.
 
 ### Why each call has two ceilings
