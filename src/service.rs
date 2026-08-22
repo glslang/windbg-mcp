@@ -311,7 +311,7 @@ fn reads_back_bare(token: &str) -> bool {
             creds.len() == 1
                 && creds
                     .client_for(token)
-                    .is_some_and(|client| client.name() == crate::client::Client::LOCAL)
+                    .is_some_and(|name| name == crate::client::Client::LOCAL)
         })
 }
 
@@ -1600,10 +1600,7 @@ mod tests {
         )];
         let written = token_file_contents(&one);
         assert_eq!(written, "s3cret", "a single local token is written bare");
-        assert_eq!(
-            read_back(&written).client_for("s3cret").map(|c| c.name()),
-            Some("local")
-        );
+        assert_eq!(read_back(&written).client_for("s3cret"), Some("local"));
 
         // Anything else is the JSON object, which is the only shape that can carry more than one —
         // and under a service the only way to have a second client at all.
@@ -1631,11 +1628,7 @@ mod tests {
             let creds = read_back(&written);
             assert_eq!(creds.len(), credentials.len());
             for (name, token) in &credentials {
-                assert_eq!(
-                    creds.client_for(token).map(|c| c.name()),
-                    Some(name.as_str()),
-                    "{written}"
-                );
+                assert_eq!(creds.client_for(token), Some(name.as_str()), "{written}");
             }
         }
     }

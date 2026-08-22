@@ -1326,8 +1326,12 @@ ambiguity, and the four fixes that shipped (a `409` on a revoked presence, a lea
 renew for one, an admission gate on the owner name, and lifting that gate on re-add rather than on
 an empty release) each narrow the window without closing it: at the moment a session registers there
 is nothing in it that says *which* `ci` opened it. Giving `Client` an incarnation would delete all
-four rather than add a fifth. Not urgent — the residual needs two elevated commands issued during
-one open, and nothing a client can do reaches it. Two elevated shells
+four rather than add a fifth. **Done** (2026-08-22): identity is `(name, incarnation)`, minted only
+where a set of credentials is swapped in — the one place that can tell a name carrying on from a
+name being given back — and the name stays the whole of what is rendered. That deleted the `409` a
+re-added name used to wait out, `Sessions::unrevoke` and the question of when to lift a gate, and it
+closed the residual: an in-flight opener of the revoked credential registers against an identity no
+live client shares. Two elevated shells
 could each write a whole file from its own snapshot (`token.lock`, `share_mode(0)`). And
 `--add-listen-client --token-out C:\x` took `--token-out` as the client *name*, which passes the
 name rule since a name may contain `-`.
