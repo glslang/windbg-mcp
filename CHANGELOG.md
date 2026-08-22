@@ -57,12 +57,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A removal also **deletes that client's token copy** if it is still sitting there: the credential
   file is written by then, so the file authenticates nothing from the moment the command returns.
 
-  A revocation **closes the gate before it walks anything** (`Sessions::revoke`). A lease expiry does
-  not need to — it only fires after the client has been silent for longer than any call can keep it
-  quiet, so nothing of that credential's can still be in flight — but a revocation has no quiet
-  period: an opener that authenticated a moment earlier can be seconds from registering, and a
-  session admitted behind a one-pass release would belong to a client nothing can authenticate as
-  and nothing will ever come back for.
+  **A revocation is an expiry that does not wait.** It sets that client's lease clock to now and
+  closes an admission gate (`Sessions::revoke`); the sweeper — which already releases an expired
+  client's debug sessions, closes the MCP sessions it left resident and clears its state — does the
+  teardown on its next pass, and lifts the gate when it is done. So nothing an operator waits on is
+  behind a live kernel letting go, and there is no second teardown path to keep in step with the
+  first. The gate is what a lease expiry does not need: an expiry fires only after the client has
+  been silent for longer than any call can keep it quiet, so nothing of that credential's can still
+  be in flight, whereas here an opener that authenticated a moment earlier can be seconds from
+  registering — and a session admitted behind the sweep would belong to a client nothing can
+  authenticate as and nothing will ever come back for.
 
 ### Changed
 
