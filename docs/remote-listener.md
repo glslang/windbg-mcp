@@ -462,7 +462,8 @@ who could write that directory had a window to substitute a file of their own an
 to it (a DACL change does not revoke access through a handle already open). The state directory is
 already SYSTEM and Administrators only, with no traverse for anyone else, so there is no window to
 race and nothing to substitute. An existing `<name>.token` there is never overwritten: it is a
-credential an earlier command wrote and nobody has moved yet.
+credential an earlier command wrote and nobody has moved yet, and the fix is to move it — or, if it
+belongs to a client you are done with, to remove that client, which deletes it.
 
 Four behaviours worth knowing before you need them:
 
@@ -472,7 +473,8 @@ Four behaviours worth knowing before you need them:
 - **A removal releases what that client still held**, down the path a lease expiry already uses, so
   a live kernel is let go rather than left frozen. It is not refused on their account: the command
   runs in another process and cannot see them, and blocking a revocation on the sessions it is
-  revoking would be exactly backwards.
+  revoking would be exactly backwards. It also deletes that client's `<name>.token` if the copy is
+  still sitting there — from the moment the command returns, that file authenticates nothing.
 - **Removing the last client is refused.** A listener with no credentials will not start, so that is
   not an incremental change but a decision to stop serving — which is `--uninstall-service`, and it
   takes the file with it rather than leaving a service that fails at every start.
