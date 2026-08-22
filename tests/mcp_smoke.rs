@@ -4865,8 +4865,12 @@ fn a_module_listing_is_a_page_of_the_table_and_says_so() {
         text.contains(&format!(
             "Showing the first {}",
             first["modules"].as_array().map_or(0, Vec::len)
-        )) && text.contains("raise `limit`"),
-        "a listing that stops short says so, and says how to get the rest:\n{text}"
+        )) && text.contains(&format!(
+            "`limit: {}` returns all of them",
+            loaded + table["unloaded_matched"].as_u64().unwrap_or_default()
+        )),
+        "a listing that stops short says so, and names the value that returns everything — the \
+         count above it is the one that would fall short:\n{text}"
     );
     assert_eq!(
         listed_rows(&text),

@@ -29,10 +29,21 @@ Configuration:
     WINDBG_MCP_SCENARIO treat the task list as one continuing investigation: one
                         transcript and one set of sessions across every task, rather
                         than a conversation and a target apiece
+    WINDBG_MCP_KEEPALIVE  seconds of silence after which this run pings the listener to
+                        keep its lease alive (default 120; `0` disables) — see below
+
+**Why the keepalive exists.** The listener releases a client's sessions when its lease
+runs out, and the grace is derived from how long a *call* may take, on the assumption
+that the server is the slow party. Driving a local model inverts that: a turn is the
+model thinking, with no request in flight, and one measured here took **440s against a
+390s grace** — so the sweep released the session mid-investigation and every later call
+came back `404 Session not found`, which reads exactly like a broken server. A ping
+during a long turn costs nothing and removes the whole class.
 """
 import json
 import os
 import sys
+import threading
 import time
 import urllib.request
 
@@ -118,6 +129,12 @@ AUTH = bearer()
 SCENARIO = bool(os.environ.get("WINDBG_MCP_SCENARIO"))
 SESSION = None
 
+# One request at a time on this MCP session: the keepalive below runs on its own thread,
+# and two requests sharing `SESSION` would race over the header it may hand back.
+WIRE = threading.Lock()
+LAST_REQUEST = time.monotonic()
+KEEPALIVE_AFTER = float(os.environ.get("WINDBG_MCP_KEEPALIVE", "120"))
+
 
 def parse(body, ctype):
     if "text/event-stream" in (ctype or ""):
@@ -142,10 +159,40 @@ def mcp(method, params=None, notify=False):
     req.add_header("Accept", "application/json, text/event-stream")
     if SESSION:
         req.add_header("Mcp-Session-Id", SESSION)
-    with urllib.request.urlopen(req, timeout=600) as response:
-        if response.headers.get("Mcp-Session-Id"):
-            SESSION = response.headers["Mcp-Session-Id"]
-        return parse(response.read().decode("utf-8", "replace"), response.headers.get("Content-Type"))
+    global LAST_REQUEST
+    with WIRE:
+        with urllib.request.urlopen(req, timeout=600) as response:
+            if response.headers.get("Mcp-Session-Id"):
+                SESSION = response.headers["Mcp-Session-Id"]
+            body = parse(
+                response.read().decode("utf-8", "replace"), response.headers.get("Content-Type")
+            )
+        LAST_REQUEST = time.monotonic()
+        return body
+
+
+def keepalive():
+    """Renews this client's lease while the model is thinking.
+
+    An **admitted** request is what renews a lease, and the JSON-RPC body does not enter
+    into it — so this pings, and a server that answered the ping with an error would have
+    renewed the lease all the same. It reports the first failure and then stays quiet:
+    the run's own calls are what matter, and a keepalive that spammed the transcript
+    would be worse than one that stopped.
+    """
+    complained = False
+    while KEEPALIVE_AFTER > 0:
+        time.sleep(min(30.0, KEEPALIVE_AFTER / 2))
+        idle = time.monotonic() - LAST_REQUEST
+        if idle < KEEPALIVE_AFTER or SESSION is None:
+            continue
+        try:
+            mcp("ping")
+            print(f"  keepalive: pinged the listener after {idle:.0f}s of thinking")
+        except Exception as e:  # noqa: BLE001 - a keepalive must not end the run
+            if not complained:
+                complained = True
+                print(f"  keepalive: could not ping ({e}); the lease is on its own now")
 
 
 def handshake():
@@ -394,6 +441,7 @@ def main():
     MODEL = pick_model()
     print(f"model: {MODEL}")
     print("MCP revision negotiated:", handshake())
+    threading.Thread(target=keepalive, daemon=True).start()
     tools = mcp("tools/list")["result"]["tools"]
     offered = as_ollama(tools)
     surface = len(json.dumps(offered, separators=(",", ":")))

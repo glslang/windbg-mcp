@@ -197,6 +197,56 @@ What this run does **not** cover: a long investigation where the transcript grow
 anything behind the allow-list (`execute`, `debug_batch`, `launch`), a smaller box where the served
 context is 4k or 32k, and any model but this one.
 
+## What the second run showed, after `modules` was capped
+
+Measured 22 August 2026, same model and bench, six tasks aimed at the row cap rather than at the
+surface: three about the module table and three of the first run's questions for comparison. Read
+the two runs' figures side by side with care — the first run's 53,772-character `modules` answer was
+a **different dump** (the ARM64 one, 177 modules) from this run's x64 sample (227 loaded, 50
+unloaded), so the honest like-for-like page-against-table pair is the smoke tier's, in
+[`token-budget.md`](./token-budget.md).
+
+| | |
+| --- | --- |
+| Prompt tokens, first turn of every task | 17,254–17,294 (surface now 69,552 B, the `limit` argument included) |
+| Tool picks | **10 calls across 6 tasks, all correct first try**, nothing refused |
+| Tool results, whole run | **94,758 characters** (~23.7k tokens), of which one module page is 68,571 |
+| "How many modules are loaded?" | answered **227**, from the opener's summary, with **no `modules` call at all** — 2,358 characters, 8.1s |
+| "Is `nvhda64v` present, and where?" | `modules { "filter": "nvhda64v" }` — **7,597 characters**, and the right answer: not loaded, 26 unload records |
+
+**The model never mistook a page for the inventory**, which was the risk the cap introduced. Asked
+for the whole table it called its own answer "the first page of loaded modules" and reported
+`227 loaded / 50 unloaded` from the counts; asked for a total it read the opener's summary and did
+not list anything at all.
+
+**But a guessed `limit` is still short, and that is the cap's own doing.** The model asked for
+`limit: 240` — a round number above the 227 it had been told — and got 190 loaded rows and 50
+unloaded ones, because the budget is shared between the halves. It did not need to ask again here,
+having the counts; a caller that did would have paid a third call. That is what the note's
+`` `limit: 277` returns all of them `` sentence is for, added the same day: **the number a reader
+takes from the line above the rows is guaranteed to fall short, so the note names the one that is
+not**.
+
+**The pre-fix run of the same tasks cost 146,359 characters on task 1 alone**, against 70,929 here,
+because the model fetched the table twice — once at a guessed limit and once with
+`filter: "*", limit: 2000`. A cap the caller has to negotiate is worse than no cap; a cap that says
+what to ask for next is not.
+
+### The failure that run found first, which was not about tokens at all
+
+The first attempt never reached task 2. The model spent **440.6s** composing an answer, the
+listener's lease grace is **390s**, and a lease is renewed by *requests* — so with nothing in
+flight the sweep released the client's sessions, and every later call came back
+`404 Session not found`, which reads exactly like a broken server.
+
+The grace is derived from how long a *call* may take: it assumes the **server** is the slow party.
+Driving a local model inverts that assumption, and nothing before this had met a client that goes
+quiet for seven minutes while still working. `tools/local_model_drive.py` now pings the listener
+after 120 seconds of silence (`WINDBG_MCP_KEEPALIVE`, `0` disables) — two pings carried that turn in
+the re-run, and every session was released cleanly at the end. Whether the *listener* should also
+be more patient with a client whose MCP session is still connected is
+[`FOLLOWUPS.md`](../FOLLOWUPS.md) item 33.
+
 ## What to measure
 
 The claims worth testing are about the *client's* budget, not this server's correctness, and the
@@ -210,8 +260,10 @@ written down rather than remembered:
   reachable in one careless call. `modules` was the other half of that and is **fixed** since
   2026-08-21: it answers with 64 rows unless a `limit` says otherwise, which on the checked-in
   kernel sample is 12,268 B of model context rather than 53,933 B, with `loaded` / `matched` still
-  reporting the whole inventory. The 169-second turn above was that call, and it should now cost
-  roughly a quarter of it — a measurement this page wants and does not have yet.
+  reporting the whole inventory. What that is worth in practice is the second run above, and it is
+  not the flat saving this bullet first predicted: a model asked for one driver pays 7,597
+  characters, a model asked for a total pays none at all, and a model asked for the whole table
+  still asks for the whole table.
 
 If a model does not cope, the remaining knobs are all **client-side** — a tool-surface profile, a
 per-call response budget, a text-or-data content switch. This server has none of them: every caller
