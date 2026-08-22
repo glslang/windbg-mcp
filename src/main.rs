@@ -133,7 +133,7 @@ fn main() -> Result<()> {
 /// a client going away is handled by its lease instead.
 pub(crate) async fn serve_http(
     addr: std::net::SocketAddr,
-    reload: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
+    reload: Option<tokio::sync::mpsc::UnboundedReceiver<std::sync::mpsc::SyncSender<bool>>>,
     shutdown: impl std::future::Future<Output = ()>,
     ready: impl FnOnce(),
 ) -> Result<()> {
