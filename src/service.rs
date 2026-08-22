@@ -466,6 +466,21 @@ const RELOAD_ACK_WAIT: Duration = Duration::from_secs(10);
 const ERROR_INVALID_DATA: u32 = 13;
 const ERROR_SERVICE_NOT_ACTIVE: u32 = 1062;
 
+/// Whether a service in this state can be asked to re-read its clients.
+///
+/// **`StartPending` counts, and getting that wrong reported a failed revocation as a success.** A
+/// starting listener has already read its credentials — that happens before the bind — so it is
+/// serving the *old* set even though the SCM has not called it `Running` yet. A non-loopback bind
+/// at boot can hold it there for [`crate::listen::BIND_PATIENCE`], and a `--remove-listen-client`
+/// issued in that window used to print "it will read this at its next start" while this start went
+/// on accepting the credential just revoked (#189 review).
+///
+/// So it is asked, and the reload task is running by then to answer. Everything else is a service
+/// with nothing loaded or on its way out, for which "at its next start" is the truth.
+fn is_askable(state: ServiceState) -> bool {
+    matches!(state, ServiceState::Running | ServiceState::StartPending)
+}
+
 /// Whether a control code the SCM delivered is the reload.
 ///
 /// A predicate rather than a match arm so the [dispatcher](serve_as_service) and the [sender](
@@ -892,7 +907,7 @@ fn write_credentials(credentials: &[(String, String)]) -> Result<()> {
 /// the reload task's answer, and reports a failed re-read as a control-code failure, which arrives
 /// here as an `Err`. So `Ok(true)` means the set in force is the set this command wrote.
 fn ask_to_reload(service: &windows_service::service::Service) -> Result<bool> {
-    if service.query_status()?.current_state != ServiceState::Running {
+    if !is_askable(service.query_status()?.current_state) {
         return Ok(false);
     }
     let code = windows_service::service::UserEventCode::from_raw(RELOAD_CODE)
@@ -1133,13 +1148,39 @@ fn serve_as_service() -> Result<()> {
     // command line the SCM stores, because that line is readable by every process on the machine —
     // which is the exact property the file exists to restore.
     //
+    // **An inherited override is ignored, not honoured**, and that is a deliberate narrowing. This
+    // used to defer to a `WINDBG_MCP_LISTEN_TOKEN_FILE` already in the environment, which left the
+    // service reading one file while [`edit_client`] wrote another: an `--add-listen-client` then
+    // produced a token nothing accepted, and — far worse — a `--remove-listen-client` reported
+    // success while the credential it revoked went on being accepted, because the reload
+    // successfully re-read the unchanged override (#189 review). A silent failed revocation is the
+    // worst thing this feature can do.
+    //
+    // The fix is to make the mismatch impossible rather than detected. `token_file()` is the file
+    // the installer writes, the client commands edit, and `--uninstall-service` deletes; a service
+    // reading anywhere else is a configuration whose other three halves do not exist. The variable
+    // keeps working exactly as before for a **foreground** listener, which is what it is documented
+    // for.
+    //
     // SAFETY: this runs on the SCM's dispatcher thread before the async runtime exists and before
     // any thread of ours has been started, so there is no concurrent reader of the environment.
-    if std::env::var_os(crate::listen::TOKEN_FILE_ENV).is_none() {
-        let file = token_file();
-        if file.exists() {
-            unsafe { std::env::set_var(crate::listen::TOKEN_FILE_ENV, &file) };
+    let file = token_file();
+    if file.exists() {
+        if let Some(overridden) = std::env::var_os(crate::listen::TOKEN_FILE_ENV)
+            && overridden != file
+        {
+            // Said out loud, because it is the one case where an operator's configuration is being
+            // disregarded, and they would otherwise be left wondering why their clients are not the
+            // ones being served.
+            tracing::warn!(
+                "{} names {} in this service's environment, and is being ignored: a service reads \
+                 the credential file its own installer wrote and its own client commands edit ({}).",
+                crate::listen::TOKEN_FILE_ENV,
+                std::path::Path::new(&overridden).display(),
+                file.display()
+            );
         }
+        unsafe { std::env::set_var(crate::listen::TOKEN_FILE_ENV, &file) };
     }
 
     // **Re-applied at every start, not just at install.** The bound is derived from
@@ -1407,6 +1448,36 @@ mod tests {
             Some(Role::Client(ClientEdit::Add, String::new())),
             "a flag standing where a name belongs is a missing name, not a client called `--else`"
         );
+    }
+
+    /// A starting service is asked to re-read, because it has already read.
+    ///
+    /// The bug this pins reported a **failed revocation as a success**: credentials are read before
+    /// the bind, so a `StartPending` listener is already serving the old set, and a non-loopback
+    /// bind at boot can hold it there for `BIND_PATIENCE` — a minute and a half. Treating that as
+    /// "not running" printed "it will read this at its next start" while *this* start went on
+    /// accepting the credential the operator had just revoked.
+    #[test]
+    fn a_starting_service_is_asked_to_reload_because_it_has_already_read_its_clients() {
+        assert!(is_askable(ServiceState::Running));
+        assert!(
+            is_askable(ServiceState::StartPending),
+            "a starting listener has read its credentials already — it is serving the old set, so \
+             it is exactly the one that has to be told"
+        );
+        // Nothing is loaded, or it is on the way out: "at its next start" is then the truth.
+        for settled in [
+            ServiceState::Stopped,
+            ServiceState::StopPending,
+            ServiceState::Paused,
+            ServiceState::PausePending,
+            ServiceState::ContinuePending,
+        ] {
+            assert!(
+                !is_askable(settled),
+                "{settled:?} was treated as reloadable"
+            );
+        }
     }
 
     /// The code the dispatcher answers is the code the command sends, and nothing else is it.
