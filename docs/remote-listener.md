@@ -429,6 +429,13 @@ Two commands cannot run at once. The second is refused rather than queued, becau
 compute a whole file from their own snapshot of it and the later write would silently discard the
 earlier — an add and a revocation run together, both reporting success, and the revocation gone.
 
+**A service reads the file its own commands write**, and nothing else. Setting
+`WINDBG_MCP_LISTEN_TOKEN_FILE` in a service's environment does not repoint it: the installer writes
+`%ProgramData%\windbg-mcp\token`, these commands edit it and `--uninstall-service` deletes it, so
+a service reading somewhere else would be a configuration whose other three halves do not exist —
+and the failure was silent, a revocation reporting success while the credential went on being
+accepted. The variable is unchanged for a **foreground** listener, which is what it is for.
+
 **The file is still not yours to edit.** It grants `SYSTEM` and `Administrators` *read*, so an
 administrator who opens it in an editor is told `Access to the path is denied` — that is the ACL
 working rather than something to route around, and taking ownership to write it anyway leaves a
@@ -487,7 +494,8 @@ Four behaviours worth knowing before you need them:
   simply cannot connect until the next start, and nothing that worked has stopped working.
 
 If the service is not running, the file is written anyway and the command says it will be read at
-the next start. If it is not *installed*, the commands refuse — a foreground listener takes its
+the next start — a service that is still *starting* is asked all the same, because it has read its
+credentials by then and is already serving the old set. If it is not *installed*, the commands refuse — a foreground listener takes its
 clients from the environment it was started with, which is a set that cannot change without the
 process changing too.
 
