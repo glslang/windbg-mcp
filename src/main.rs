@@ -94,6 +94,10 @@ fn main() -> Result<()> {
             ),
             service::Role::Uninstall => service::uninstall(),
             service::Role::Run => service::run(),
+            // Touches the SCM and one file, like installing — and like installing, it must not
+            // build a runtime: the reload it asks for happens in the *service's* process, not
+            // this one.
+            service::Role::Client(edit, name) => service::edit_client(edit, &name, &args),
         };
     }
 
@@ -112,7 +116,11 @@ fn main() -> Result<()> {
                 // A foreground listener has nobody to ask it to stop — Ctrl+C ends the process and
                 // each worker releases its target when its pipe closes — so the shutdown it hands
                 // over is one that never fires. Only the service role has a stop to deliver.
-                Some(addr) => serve_http(addr, std::future::pending(), || {}).await,
+                // No reload either, and for the same reason as the shutdown above: the signal
+                // is a service control code, and a foreground listener has no SCM to receive one
+                // from. Its clients come from the environment it was started with, which is a set
+                // that cannot change without the process changing too.
+                Some(addr) => serve_http(addr, None, std::future::pending(), || {}).await,
                 None => serve().await,
             }
         })
@@ -125,11 +133,20 @@ fn main() -> Result<()> {
 /// a client going away is handled by its lease instead.
 pub(crate) async fn serve_http(
     addr: std::net::SocketAddr,
+    reload: Option<tokio::sync::mpsc::UnboundedReceiver<()>>,
     shutdown: impl std::future::Future<Output = ()>,
     ready: impl FnOnce(),
 ) -> Result<()> {
     let sessions = Sessions::new(call_timeout()).recording(record::Recorder::from_env());
-    let outcome = listen::serve(sessions.clone(), addr, call_timeout(), shutdown, ready).await;
+    let outcome = listen::serve(
+        sessions.clone(),
+        addr,
+        call_timeout(),
+        reload,
+        shutdown,
+        ready,
+    )
+    .await;
     // Runs on every route out of `serve`, which is why the shutdown future ends the accept loop
     // rather than the process: a service asked to stop has to reach this line, or it leaves a live
     // kernel frozen — see [`service`].

@@ -229,7 +229,10 @@ claude mcp add windbg-vm --transport http http://127.0.0.1:8765/ \
 Install it as a **Windows service** (`--install-service --listen <addr>`, elevated) and it survives
 logout, starts at boot, and gets a defined `PATH` and working directory — which is what decides
 whether the engine DLLs beside the exe are the ones that load. `Stop-Service` releases every debug
-target before exiting, because a live kernel that is merely killed is left frozen.
+target before exiting, because a live kernel that is merely killed is left frozen. Its clients are
+changed in place — `--add-listen-client`, `--remove-listen-client`, `--rotate-listen-client`, each
+generating the token itself and printing only a fingerprint — so adding or revoking one costs
+neither a reinstall nor the sessions the service is holding.
 
 **Bind loopback and forward over SSH.** This endpoint runs `execute`, `debug_batch` and `launch`
 against a live kernel, and the token is sent in clear — a hypervisor's guest network is not private

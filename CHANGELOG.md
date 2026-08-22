@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A service-hosted listener's clients can be changed without a reinstall**
+  (`FOLLOWUPS.md` item 34). `--add-listen-client <name>`, `--remove-listen-client <name>` and
+  `--rotate-listen-client <name>`, from an elevated shell, edit the credential file the service
+  reads and then tell the running service to re-read it — so a client is added, revoked or rotated
+  **without stopping anything**. Before this, `--install-service` was the file's only writer and the
+  SCM refuses a second registration, so adding a client meant uninstall, set every credential
+  variable again, install, start — which drops every session the service holds, a parked kernel
+  attach included.
+
+  Each command **generates the token itself** and never prints one: standard output carries a
+  fingerprint (`sha256:701E4CF334890225`) and the token goes to the file `--token-out <path>` names,
+  created fresh and given the same SYSTEM-and-Administrators ACL as the credential file it came
+  from. That keeps a working credential out of a shell history and out of an agent's transcript, and
+  it is what makes these commands narrow enough to allow-list in a permission rule where "let this
+  write `%ProgramData%`" would not be.
+
+  The two properties the installer was hardened for are unchanged: only *this program*, running
+  elevated, writes that file, and it still never writes through a file it did not create — the
+  content goes to a fresh sibling created with `create_new` in the protected directory, is ACL'd
+  there, and is renamed over the old name, which also makes the replacement atomic for a service
+  reading it concurrently. `--install-service` now shares that writer, so an install and an
+  `--add-listen-client` leave the file to one standard.
+
+  A **rotation keeps the client's name**, and so keeps the debug sessions it has open — only the
+  token moves. A **removal releases** what that client still held, down the path a lease expiry
+  already uses (an orderly release, not a worker killed and a live kernel left frozen); the command
+  could not have refused on their account, since it runs in another process and cannot see them, and
+  blocking a revocation on the sessions it is revoking is the wrong way round. Removing the *last*
+  client is refused: a listener with no credentials will not start, and `--uninstall-service` is the
+  command that means "stop serving".
+
+  A reload that cannot read the file **changes nothing** — the set is only ever replaced by one that
+  would have started this listener from cold, so a typo is a loud log line and a service still
+  serving, rather than every client locked out of a live kernel target.
+
 ### Changed
 
 - **A default `registers` answer stopped carrying the vector bank** (`FOLLOWUPS.md` item 24's
