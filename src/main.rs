@@ -22,6 +22,7 @@ mod logbridge;
 mod progress;
 mod proto;
 mod record;
+mod schema;
 mod server;
 mod service;
 mod structured;

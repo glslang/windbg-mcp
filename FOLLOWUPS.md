@@ -725,20 +725,41 @@ measurement found. None of them is a bug; all of them were invisible.
 later fix would be a diff against a number somebody had already tidied. The tests and the golden
 landed on their own so that each of the items below can be argued, and measured, separately.
 
-- **`$defs` are inlined per tool** — `schemars` emits each output schema self-contained, so
-  `ErrorCategory` (2,089 B) ships 31 times and the allocator/pool subtree nine. **200,571 B, 70% of
-  all `outputSchema`.** Wire and client-parse cost only; no model reads it. The lever is
-  `output_schema = schema_for_output::<T>()` on each `#[rmcp::tool]`, or a `list_tools` that emits
-  shared definitions.
+- **`$defs` are inlined per tool** — **done** (2026-08-22), and neither lever this bullet named
+  was the one. `schemars` emits each output schema self-contained, so `ErrorCategory` (2,089 B)
+  shipped 33 times and the allocator/pool subtree nine: **222,579 B, 69% of all `outputSchema`**,
+  duplicated beyond its first copy. Wire and client-parse cost only; no model reads it.
 
-  **This one has a price now** (2026-08-18): adding `PdbInfo`, one optional four-field type on one
+  **The duplication cannot be removed.** MCP gives each tool one `outputSchema` and no document
+  above it, and `#/$defs/…` resolves against the schema it appears in, so there is nowhere a client
+  could look up a definition another tool declared — "a `list_tools` that emits shared definitions"
+  has no reader. And `output_schema = schema_for_output::<T>()` was already on every tool; it names
+  the type, not where the type is written.
+
+  What moved was **what gets multiplied**. Measuring the payload found **68% of every `outputSchema`
+  byte was a `description`** — 217,423 B of 320,365 B, 55% of the whole answer — so the schemas now
+  carry constraints and nothing else (`src/schema.rs`): **394,883 → 177,460 B, model-visible
+  unmoved.** `WIRE_CEILING` 460,000 → 205,000. The prose is not lost; it stays in the rustdoc it is
+  generated from and in `README.md`'s structured-results table, which is where it is read. Nothing
+  reads it in a schema — no model is given one, and `description` is an annotation keyword, so an
+  instance that validated before validates now.
+
+  Two things worth carrying. The strip is **structural, not textual**: a field named `description`
+  is a property *name*, and dropping every `"description"` key would delete the field rather than
+  its documentation — no structured type has such a field today, which is exactly why nothing would
+  have reported it. And the same answer does **not** transfer to the input schemas below: there the
+  prose is most of what tells a model how to drive the tool.
+
+  **This one had a price** (2026-08-18): adding `PdbInfo`, one optional four-field type on one
   field of `ModuleInfo`, grew the wire by **15,610 B** and model context by **zero**, because
   `ModuleInfo` is embedded in the openers' summary, in `modules` and in the allocator shapes. That
-  is the compounding this finding predicts, measured on a change small enough that nobody would
-  have thought to look. `WIRE_CEILING` moved 412,000 → 460,000 to record it; the next such type
-  costs the same again, and fixing this item is what stops that.
-- **Six openers carry a byte-identical 11,093 B output schema**, six step tools a byte-identical
-  4,418 B one. 77,555 B of the above, and the cheapest to collapse.
+  is the compounding this finding predicted, measured on a change small enough that nobody would
+  have thought to look. The multiplier is still there — it is the protocol's — but the same type
+  costs roughly a seventh of that now.
+- **Six openers carry a byte-identical 13,386 B output schema**, six step tools a byte-identical
+  4,433 B one. 89,095 B of the above, and it looked like the cheapest to collapse. It is the same
+  protocol fact as the bullet above with the same answer: those schemas are 3,838 B and 1,185 B
+  each now, and there is still nowhere to say either of them once.
 - **`session_id` was documented in three wordings** — **done**, and the figure in this bullet was
   wrong. It counted the copies inside `outputSchema`, which no model reads; the model-visible total
   was 4,695 B across 32 fields, not 9,514 across 43. One shared wording — plus documenting the five
@@ -768,6 +789,12 @@ landed on their own so that each of the items below can be argued, and measured,
   waste but one tool honestly describing a rich argument. The levers are design choices: a smaller
   step vocabulary, a `$ref` the client resolves, or a surface that does not offer every tool to
   every caller.
+
+  **The first bullet's answer does not transfer**, which is worth saying now that it has landed:
+  prose came out of the output schemas because nothing read it, and prose in an *input* schema is
+  most of what tells a model how to drive the tool. `debug_batch` is the one where getting that
+  wrong leaves a patched byte in a running kernel. This bullet is still the whole of what remains
+  in this item, and it stays a design question rather than a strip.
 - **`modules` had neither a `limit` nor a cap**, alone among the high-volume tools — **done**
   (2026-08-21). Everything else uncapped is raw debugger text — `ttd_calls`, `ttd_memory`,
   `threads`, `execute`, `dx`, `ioctl_trace`, `reachable_from_dispatch` — and `read_memory` returns
@@ -785,6 +812,9 @@ landed on their own so that each of the items below can be argued, and measured,
   `split_row_budget` the heap diagnostics already used, whose own test says why: two sections that
   each restart the budget quietly double the ceiling it was chosen to be. Reaching for a cap
   per half was the first thing tried here, and this repo had already argued it down one tool over.
+
+**What is left of this item is the bullet above**, the five input schemas. Everything else in it
+is done or measured-and-declined; the wire half closed with the first bullet.
 
 **Where this bites first is a local model**, whose window is bought in RAM rather than rented:
 [`docs/local-model.md`](./docs/local-model.md) is the runbook, and it names the three client-side

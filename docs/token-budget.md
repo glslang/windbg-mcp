@@ -7,7 +7,8 @@ answer this server returns. That makes payload size a correctness-adjacent prope
 call that spends 13k tokens has not failed, but it has taken the space the investigation needed.
 Nothing measured this until [`tests/mcp_smoke.rs`](../tests/mcp_smoke.rs) grew the two tests below,
 and the numbers turned out to be larger than anyone had guessed — a careful reading of the source
-put the tool surface at 90–130 KB, and the wire is 391 KB.
+put the tool surface at 90–130 KB, and the wire was 391 KB. It is 177 KB now, and finding 1 below
+is where the other 217 KB went.
 
 ## Two costs, and they are not the same
 
@@ -27,8 +28,10 @@ There is a second split inside the first, and it is the one that matters most:
 Both rows in the second half were measured against a real client rather than assumed:
 
 - A tool definition reaching the model carries name, description and input schema only. The
-  Anthropic tool spec has no field for an output schema, so the 286 KB of `outputSchema` this
-  server emits is a client-side parse, validation and memory cost — never a context cost.
+  Anthropic tool spec has no field for an output schema, so the `outputSchema` this server emits is
+  a client-side parse, validation and memory cost — never a context cost. It was 286 KB when that
+  was measured, and finding 1 is what followed from the measurement: if nothing reads it, the
+  documentation inside it is being paid for and never delivered.
 - `structuredContent` **replaces** the text block rather than accompanying it. A `session_status`
   call arrives as `{"max_sessions":4,…}` with the human summary dropped; `decode_ioctl`, which
   emits no structured content, arrives as text.
@@ -36,7 +39,7 @@ Both rows in the second half were measured against a real client rather than ass
 The second point reverses an assumption in [`DECISIONS.md`](../DECISIONS.md) ("A typed result is a
 second channel, not a replacement", 2026-08-12, #84). That decision was argued for machine
 parseability, against a Python client scraping prose, and it is still right for that reader. What
-it did not consider is that a *model* client picks one — so for the 31 tools with an output schema,
+it did not consider is that a *model* client picks one — so for the 33 tools with an output schema,
 the rendering is paid for on the wire and read by nobody, and the half the model does read is the
 larger one. `src/structured.rs:1651` already made the other call for `debug_batch`, and states the
 reason: carrying both "would make the typed answer the larger of the two channels while adding no
@@ -59,19 +62,26 @@ authority — the tables below are a reading of it at the time of writing.
 
 ### Tool surface (51 tools)
 
-| Component | Bytes | Reaches the model |
-|---|---:|---|
-| **Whole `tools/list` payload** | **391,172** | partly |
-| — the 51 tools themselves | 391,054 | partly |
-| — result-level fields (`resultType`, `ttlMs`, `cacheScope`) | 118 | no |
-| `outputSchema` (the 33 tools that have one) | 317,236 | no |
-| `inputSchema` (all 51) | 39,667 | yes |
-| `description` (all 51) | 24,752 | yes |
-| `annotations` | 5,449 | no |
-| **Model-visible total** | **67,076** (~16k tokens) | — |
-| `initialize` instructions | 1,996 | yes, **all of it** |
+The first column is the baseline this page was written from; the second is today, and the only
+thing between them is finding 1 — the prose taken out of every `outputSchema`.
 
-Worst single tool: `debug_batch` at 9,757 model-visible bytes, because its `inputSchema` pulls the
+| Component | Baseline | Today | Reaches the model |
+|---|---:|---:|---|
+| **Whole `tools/list` payload** | **391,172** | **177,460** | partly |
+| — the 51 tools themselves | 391,054 | 177,342 | partly |
+| — result-level fields (`resultType`, `ttlMs`, `cacheScope`) | 118 | 118 | no |
+| `outputSchema` (the 33 tools that have one) | 317,236 | 102,942 | no |
+| `inputSchema` (all 51) | 39,667 | 40,207 | yes |
+| `description` (all 51) | 24,752 | 24,794 | yes |
+| `annotations` | 5,449 | 5,449 | no |
+| **Model-visible total** | **67,076** | **67,658** (~17k tokens) | — |
+| `initialize` instructions | 1,996 | 1,990 | yes, **all of it** |
+
+The two halves moved independently, which is the whole argument for measuring them apart: the wire
+fell by 55% and the model-visible column did not move at all except for what the tools themselves
+have accumulated since.
+
+Worst single tool: `debug_batch` at 9,746 model-visible bytes, because its `inputSchema` pulls the
 whole `StepAction`/`Check` vocabulary out of `src/batch.rs`.
 
 The payload is measured as the **serialized result**, not as the sum of its tools, and the 118-byte
@@ -81,8 +91,8 @@ server at two revisions shows what a sum would miss:
 
 | Revision | payload | sum of tools | result-level |
 |---|---:|---:|---|
-| `2026-07-28` | 391,172 | 391,054 | `resultType`, `ttlMs`, `cacheScope` |
-| `2025-06-18` | 391,116 | 391,054 | none |
+| `2026-07-28` | 177,460 | 177,342 | `resultType`, `ttlMs`, `cacheScope` |
+| `2025-06-18` | 177,404 | 177,342 | none |
 
 The sum is **identical** across the two; only the payload figure can tell them apart. The golden
 records both, so the gap stays visible.
@@ -129,19 +139,50 @@ what it has since done about it.
 None of these is a bug. They are recorded because they were invisible, and
 [`FOLLOWUPS.md`](../FOLLOWUPS.md) item 24 tracks them.
 
-1. **`$defs` are inlined per tool.** `schemars` emits each output schema self-contained, so
-   `ErrorCategory` (2,089 B) ships **31 times**, `WalkGaps` (2,886 B) and the whole
-   allocator/pool subtree nine times each. **200,571 bytes — 70% of all `outputSchema`** — is
-   duplicated beyond its first copy.
-1b. **And finding 1 has a price tag now.** Adding `PdbInfo` — one optional four-field type, on one
+1. **`$defs` are inlined per tool** — **fixed** (2026-08-22), though not by removing the
+   duplication, which cannot be done. `schemars` emits each output schema self-contained, so
+   `ErrorCategory` (2,089 B) shipped **33 times**, `ModuleInfo` (3,524 B) seven and the
+   allocator/pool subtree nine: **222,579 bytes, 69% of all `outputSchema`**, duplicated beyond its
+   first copy.
+
+   The lever this finding named — hoisting the shared definitions — is not available. MCP gives
+   each tool one `outputSchema` and no document above it, and `#/$defs/…` resolves against the
+   schema it appears in, so a client has nowhere to look up a definition another tool declared. The
+   multiplier is the protocol's, and it stays.
+
+   What is available is **what gets multiplied**. Measuring the payload found that **68% of every
+   `outputSchema` byte was a `description`** — 217,423 B of 320,365 B, and 55% of the whole answer.
+   `ErrorCategory` is 2,089 B with its doc comment and **324 B** without. So the schemas now carry
+   constraints and nothing else (`src/schema.rs`), and the payload is **394,883 → 177,460 B** with
+   the model-visible column unmoved.
+
+   That trade is one-sided because `description` had no reader in this position. No model is given
+   an output schema — the measurement at the top of this page. No validator reads one either:
+   `description` is an annotation keyword, so every instance that validated before validates now.
+   And a human has three better copies — the rustdoc these strings are generated from, the
+   structured-results table in `README.md`, and the tool's own model-visible `description`.
+
+   The strip is **structural, not textual**, which is the one place it could have gone wrong
+   quietly: a field named `description` renders as `properties: { "description": … }`, and dropping
+   every `"description"` key would delete the field rather than its documentation. `src/schema.rs`
+   descends only where a JSON Schema keyword says a subschema lives, and has a unit test for
+   exactly that case — no structured type has such a field today, and the one that does is the one
+   this would have broken.
+
+1b. **And finding 1 had a price tag.** Adding `PdbInfo` — one optional four-field type, on one
    field of `ModuleInfo` — grew the wire by **15,610 B**, because `ModuleInfo` is embedded in the
    openers' `TargetSummary`, in `modules`, and in the allocator shapes, and `schemars` inlines the
    new type into every one of them. Model-visible cost: **zero**, since no model reads an
-   `outputSchema`. That ratio — 15 KB of wire for 0 B of context — is the whole of finding 1 in a
-   single change, and it is why the ceiling below moved rather than the type being argued about.
+   `outputSchema`. That ratio — 15 KB of wire for 0 B of context — was the whole of finding 1 in a
+   single change, and it is why the ceiling moved 412,000 → 460,000 rather than the type being
+   argued about. The same type costs roughly a seventh of that now, and the ceiling has come back
+   down to 205,000: what changed is not how many times a type is copied but how much of it there is
+   to copy.
 
-2. **Whole schemas repeat.** The six openers carry a byte-identical 11,093 B output schema; the six
-   step tools a byte-identical 4,418 B one. 77,555 B of the above.
+2. **Whole schemas repeat.** The six openers carried a byte-identical 13,386 B output schema; the
+   six step tools a byte-identical 4,433 B one — 89,095 B of the above. This is the same protocol
+   fact as finding 1 and has the same answer: there is nowhere to say it once. Those schemas are
+   3,838 B and 1,185 B each now.
 3. **`session_id` was documented in three different wordings** — **fixed**, and the original figure
    here was wrong in an instructive way. It said 9,514 B across 43 sites; the model-visible total was
    **4,695 B across 32**, because the count had included the copies inside `outputSchema`, which the
@@ -227,6 +268,12 @@ None of these is a bug. They are recorded because they were invisible, and
    vocabulary, a `$ref` the client resolves, or a tool surface that does not offer every tool to
    every caller. Worth measuring before choosing, which is what this table is for.
 
+   **Finding 1's answer does not transfer here, and it is worth saying why.** Prose came out of the
+   output schemas because nothing read it. Prose in an *input* schema is the opposite: it is most of
+   what tells a model how to drive the tool, and `debug_batch` is the tool where getting that wrong
+   leaves a patched byte in a running kernel. Cutting bytes there costs correctness, so the 21,961 B
+   below is a design question and not a strip.
+
 One interaction worth flagging before acting on any of it: `FOLLOWUPS.md` item 11 proposes *adding*
 `structuredContent` to `ttd_calls`, `ttd_memory` and `driver_object` — three of the highest-volume
 text-only tools. Under the rule measured above that replaces their text rather than supplementing
@@ -239,6 +286,11 @@ The surface budget needs no debugger and rides the ordinary test run:
 ```pwsh
 cargo test --test mcp_smoke -- --nocapture tool_surface_stays_within_its_token_budget
 ```
+
+Beside it, and needing no debugger either, `output_schemas_carry_constraints_not_prose` is the
+assertion that finding 1 stays fixed. It reads `tools/list` off the wire, so it catches the way that
+change comes undone — one tool declaring its schema with rmcp's `schema_for_output` instead of
+`schema::constraints_of` — which is an import line nothing else would report.
 
 The result budget needs the debugger tier:
 
@@ -290,7 +342,10 @@ The **ceilings** (`MODEL_VISIBLE_CEILING`, `WIRE_CEILING`, `WORST_TOOL_CEILING` 
 `tests/mcp_smoke.rs`) stop what the golden cannot: a golden re-recorded on every diff is a rubber
 stamp, and thirty accepted 2% growths are a doubling nobody voted for. They sit ~15% over today's
 figures. Raising one is a normal thing to do — a new tool has to fit somewhere — but do it in its
-own commit, with the reason, and update the tables here.
+own commit, with the reason, and update the tables here. **Lowering one is the same act**, and
+`WIRE_CEILING` has now been both: 412,000 → 460,000 for `PdbInfo`, then → 205,000 when finding 1
+landed. A ceiling left where a fix found it is a ceiling that would have absorbed the next
+regression in silence.
 
 Result budgets are **not** goldened. Their sizes move with what the runner can resolve: a symbol
 server that answers turns `deferred` into paths and grows `lm` a column, and the debugger tier runs

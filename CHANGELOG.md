@@ -97,6 +97,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **An `outputSchema` carries constraints now, not prose** (`FOLLOWUPS.md` item 24's finding 1).
+  The whole `tools/list` payload went **394,883 B -> 177,460 B, a 55% cut**, and what a model reads
+  did not move by a byte. `schemars` emits each output schema self-contained, so every type
+  reachable from a tool's answer is inlined into that tool's `$defs`: `ErrorCategory`'s doc comment
+  shipped 33 times, `ModuleInfo`'s seven, the allocator subtree's nine - 222,579 B of duplication.
+  That duplication cannot be removed, because MCP gives each tool one schema and no document above
+  it for a `$ref` to reach. What could be removed is what was being multiplied: **68% of every
+  `outputSchema` byte was a `description`**, and `ErrorCategory` is 2,089 B with its prose and 324 B
+  without.
+
+  Nothing read it there. No model is given an output schema - the measurement
+  `docs/token-budget.md` opens with - and `description` is an annotation keyword, so every instance
+  that validated before validates now. The prose stays where it is read: the rustdoc it is generated
+  from, `README.md`'s structured-results table, and each tool's own model-visible `description`.
+
+  The strip is **structural, not textual** (`src/schema.rs`): a field named `description` is a
+  property name, so removing every `"description"` key would delete the field rather than its
+  documentation. No structured type has such a field, which is precisely why nothing would have
+  reported it - there is a unit test for the case, and a smoke assertion reading `tools/list` off
+  the wire, because the change comes undone by one import line. `WIRE_CEILING` 460,000 -> 205,000.
+
 - **A default `registers` answer stopped carrying the vector bank** (`FOLLOWUPS.md` item 24's
   finding 7). The `all` argument documents the default as excluding the x87 and vector registers,
   and it did not: DbgEng exposes `xmm0` twice - as 128 bits of `bytes`, and as `xmm0/0` … `xmm0/3`,
