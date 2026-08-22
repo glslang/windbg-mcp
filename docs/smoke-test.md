@@ -258,8 +258,11 @@ default answer is documented as the integer registers, excluding the x87 and vec
 carried 64 of them, because DbgEng exposes `xmm0` twice and leaves the subregister flag clear on the
 four 32-bit lanes it calls `xmm0/0` … `xmm0/3`. The tier asserts no default row's name carries the
 `/` that names a lane, that no row spends bytes on `"subregister":false`, and that the default is a
-**subset of `all`** — the last because a rule that dropped a register from both answers would
-satisfy every size check here while losing a caller the register they asked for.
+**subset of `all`** — the last catching the two answers being computed by rules that have drifted
+apart, a row the default has and `all` does not. It does **not** catch a register dropped from
+both, which leaves the subset relation intact; that needs an oracle from outside the pair, and it
+is a separate assertion that the instruction and stack pointers are still there under whichever
+names this architecture gives them.
 
 It opens the crash paired with this host's architecture — *The sample they open follows the host*,
 above — rather than the shared x64 dump, on purpose: the rule is a naming

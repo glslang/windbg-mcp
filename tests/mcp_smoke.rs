@@ -4862,13 +4862,29 @@ fn a_default_register_set_leaves_out_the_vector_bank_on_this_architecture() {
         plain.len()
     );
     // The property that makes the default a *narrowing* rather than a different answer: everything
-    // in it is in `all` too. A rule that excluded a register from both would satisfy every size
-    // check here and quietly lose a caller the register they asked for by name.
+    // in it is in `all` too. This catches the two answers being computed by rules that have drifted
+    // apart — a row the default has and `all` does not — and **not** a register dropped from both,
+    // which leaves the subset relation intact. That case needs an oracle from outside the pair, and
+    // it is the assertion below (reported by chatgpt-codex-connector on #188).
     let missing: Vec<_> = plain.iter().filter(|name| !all.contains(name)).collect();
     assert!(
         missing.is_empty(),
         "the default has to be a subset of `all`; these are in one and not the other: {missing:?}"
     );
+
+    // The oracle: whatever else a filter drops, it may not drop the two registers every caller of
+    // this tool came for. Named per architecture rather than derived, because deriving them from
+    // the answer is what a broken filter would break — and both names are checked so this test
+    // stays honest on whichever host runs it.
+    for wanted in [["rip", "pc"], ["rsp", "sp"]] {
+        assert!(
+            wanted
+                .iter()
+                .any(|name| plain.iter().any(|got| got == name)),
+            "a default register set that has lost {wanted:?} is not a narrowing, it is a hole — \
+             and `all` would still be a superset of it. Got: {plain:?}"
+        );
+    }
 }
 
 /// **What one `modules` call costs the caller, and what a cut listing still tells them.**
