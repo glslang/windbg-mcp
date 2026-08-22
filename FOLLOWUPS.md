@@ -756,7 +756,7 @@ landed on their own so that each of the items below can be argued, and measured,
 - **`registers` returned 15.9x more JSON than its own text** (9,804 B vs 618 B) — **done**
   (2026-08-22), and the bullet's diagnosis was half of it. `"kind":"int"` and `"subregister":false`
   were 41% of the payload, but measuring it rather than reasoning about it found **64 of the 123
-  rows were the vector bank**: DbgEng reports `xmm0/0` … `xmm0/3` as int64 pseudo-registers without
+  rows were the vector bank**: DbgEng reports `xmm0/0` … `xmm0/3` as 32-bit pseudo-registers without
   the subregister flag, so they passed a filter meaning "integer, not a view" and sat in an answer
   documented as excluding the vector registers. Now 3,480 B and 5.6x, ceiling 13,500 → 5,000. The
   claim that the text "says the same thing better" was wrong too: `r` prints 17 registers and the
@@ -1291,12 +1291,18 @@ unmerged). The answer is that the engine offers nothing better:
 | | x64 | ARM64 |
 | --- | --- | --- |
 | unflagged `int32` rows | `efl`, `mxcsr`, **and all 64 `xmm` slices** | `cpsr`, `spsr`, `fpsr`, `fpcr`, `bcr*`, **and all 31 `w` views** |
-| `SubregMaster` where the flag is clear | `0`, for every row | `0`, for every row |
+| any sub-register field set where the flag is clear (master, length, mask or shift) | none, of 355 rows | none, of 205 rows |
 | where the flag is set | master and `SubregLength` are populated (`eax`: master `rax`, length 32) | the same, for the nine `cpsr` bits |
 
 So `Type` puts a view in the same bucket as a register that is simply narrow — `w0` beside `cpsr`,
-`xmm0/0` beside `efl` — and the master field says nothing unless the flag already did. There is no
-derived rule to be had from the description.
+`xmm0/0` beside `efl` — and the sub-register group is untouched unless the flag already said so.
+There is no derived rule to be had from the description.
+
+The test behind that middle row is deliberately *not* `SubregMaster != 0`: index 0 is a real
+register (`rax`, `x0`) and is precisely the master these rows would name if they named one, so
+treating zero as "unset" throws away the case the probe exists to find — reported by
+chatgpt-codex-connector on glslang/win-kexp#115. What the row counts is any of the four fields being
+non-zero, and none of them is, on either architecture.
 
 **Declined rather than solved**, and the reasoning is worth keeping because it is what a future
 attempt will re-derive. The remaining option is a second name rule, and the obvious one does not
