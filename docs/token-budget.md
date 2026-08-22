@@ -169,15 +169,15 @@ None of these is a bug. They are recorded because they were invisible, and
    exactly that case — no structured type has such a field today, and the one that does is the one
    this would have broken.
 
-1b. **And finding 1 had a price tag.** Adding `PdbInfo` — one optional four-field type, on one
-   field of `ModuleInfo` — grew the wire by **15,610 B**, because `ModuleInfo` is embedded in the
-   openers' `TargetSummary`, in `modules`, and in the allocator shapes, and `schemars` inlines the
-   new type into every one of them. Model-visible cost: **zero**, since no model reads an
-   `outputSchema`. That ratio — 15 KB of wire for 0 B of context — was the whole of finding 1 in a
-   single change, and it is why the ceiling moved 412,000 → 460,000 rather than the type being
-   argued about. The same type costs roughly a seventh of that now, and the ceiling has come back
-   down to 205,000: what changed is not how many times a type is copied but how much of it there is
-   to copy.
+   **And this finding had a price tag before it was fixed.** Adding `PdbInfo` — one optional
+   four-field type, on one field of `ModuleInfo` — grew the wire by **15,610 B**, because
+   `ModuleInfo` is embedded in the openers' `TargetSummary`, in `modules`, and in the allocator
+   shapes, and `schemars` inlines the new type into every one of them. Model-visible cost:
+   **zero**, since no model reads an `outputSchema`. That ratio — 15 KB of wire for 0 B of context
+   — was the whole of this finding in a single change, and it is why the ceiling moved
+   412,000 → 460,000 rather than the type being argued about. The same type costs roughly a seventh
+   of that now, and the ceiling has come back down to 205,000: what changed is not how many times a
+   type is copied but how much of it there is to copy.
 
 2. **Whole schemas repeat.** The six openers carried a byte-identical 13,386 B output schema; the
    six step tools a byte-identical 4,433 B one — 89,095 B of the above. This is the same protocol
