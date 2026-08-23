@@ -674,11 +674,20 @@ fn credentials() -> Result<crate::client::Credentials> {
 }
 
 /// The credentials in the file [`TOKEN_FILE_ENV`] names, if it names one.
+fn token_file() -> Result<Option<crate::client::TokenFile>> {
+    Ok(named_token_file()?.map(|(_, file)| file))
+}
+
+/// The same file, with the path it was read from.
 ///
 /// The read is here and the parse is in [`crate::client`], which is the same split every other
 /// rule about who may connect follows — and it lets the file's two shapes be asserted without a
 /// filesystem.
-fn token_file() -> Result<Option<crate::client::TokenFile>> {
+///
+/// **The path comes back because [`crate::service::list_clients`] has to say where a roster it
+/// prints was read from**, and deriving that separately would be a second reading of
+/// [`TOKEN_FILE_ENV`] that could name a different file from the one this opened.
+pub(crate) fn named_token_file() -> Result<Option<(std::path::PathBuf, crate::client::TokenFile)>> {
     let Some(path) = std::env::var_os(TOKEN_FILE_ENV) else {
         return Ok(None);
     };
@@ -689,7 +698,8 @@ fn token_file() -> Result<Option<crate::client::TokenFile>> {
             path.display()
         )
     })?;
-    crate::client::TokenFile::parse(&text, &path).map(Some)
+    let file = crate::client::TokenFile::parse(&text, &path)?;
+    Ok(Some((path, file)))
 }
 
 pub async fn serve(

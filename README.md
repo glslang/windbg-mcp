@@ -234,6 +234,8 @@ changed in place — `--add-listen-client`, `--remove-listen-client`, `--rotate-
 generating the token itself, writing it beside the credential file and printing only a fingerprint,
 and `--set-listen-client-tools` for which tools one of them is served — so adding, revoking or
 re-toolling one costs neither a reinstall nor the sessions the service is holding.
+`--list-listen-clients` asks who may connect and what each is served **without changing anything**,
+and answers for the environment instead where no service is installed.
 
 **Bind loopback and forward over SSH.** This endpoint runs `execute`, `debug_batch` and `launch`
 against a live kernel, and the token is sent in clear — a hypervisor's guest network is not private
@@ -414,7 +416,8 @@ setx WINDBG_MCP_TOOLS_BENCH        "session,inspect,crash"
 A client with no spec of its own is served the run's, so the flag above is a **default rather than
 a ceiling** — a client's own spec replaces it, wider or narrower. Under a Windows service the same
 thing lives in the credential file, and `--set-listen-client-tools <name> --tools <spec>` changes it
-without a reinstall or a restart. [`docs/remote-listener.md`](docs/remote-listener.md#a-tool-surface-per-client)
+without a reinstall or a restart; `--list-listen-clients` prints the whole set, name, fingerprint
+and surface, and changes nothing. [`docs/remote-listener.md`](docs/remote-listener.md#a-tool-surface-per-client)
 is the operator's half, including when a change reaches a client (the next time it is identified —
 its next handshake, or its next request if it holds no session) and why nothing announces one.
 

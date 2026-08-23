@@ -3497,6 +3497,53 @@ fn a_client_command_says_what_is_missing_before_it_touches_anything() {
     );
 }
 
+/// The command that only reads answers on any host, says which source it answered for, and never
+/// prints a token.
+///
+/// **Host-independent by construction**, which is what lets it live in the tier everyone runs.
+/// The three outcomes are a service host with an elevated shell (the credential file's roster), a
+/// service host without one (a refusal naming the ACL), and a host with no service (this shell's
+/// own credentials) — and the two claims asserted here hold in all three: it names the source it
+/// is answering for, and the token handed to it in the environment appears nowhere in what it
+/// wrote. The second is the trap this command was built around (`FOLLOWUPS.md` item 37): a
+/// fingerprint is the only comparable thing a roster may carry, and this is the one command in
+/// the family an operator would run *because* it is safe to run in a transcript.
+#[test]
+fn listing_the_clients_names_its_source_and_prints_no_token() {
+    let registered = service_is_registered();
+    // A token this test can look for. It is also a real one: on a host with no service installed
+    // this is the credential the command reports, so the run exercises the roster rather than
+    // only the refusal.
+    let secret = "this-token-must-not-be-printed-anywhere";
+    let out = Command::new(EXE)
+        .arg("--list-listen-clients")
+        .stdin(Stdio::null())
+        .env("WINDBG_MCP_LISTEN_TOKEN", secret)
+        .env_remove("WINDBG_MCP_LISTEN_TOKEN_FILE")
+        .output()
+        .unwrap_or_else(|e| panic!("failed to spawn {EXE}: {e}"));
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !said.contains(secret),
+        "the client list printed a token: {said}"
+    );
+    // Whichever of the two sources it answered for, it has to say which — a roster with no source
+    // beside it is one an operator cannot act on, and on this host either answer is legitimate.
+    assert!(
+        said.contains("WINDBG_MCP_LISTEN_TOKEN") || said.contains(r"windbg-mcp\token"),
+        "the client list has to name the source it answered for: {said}"
+    );
+    assert_eq!(
+        registered,
+        service_is_registered(),
+        "a command that only reads changed whether `windbg-mcp` is registered with the SCM"
+    );
+}
+
 /// Whether the SCM has a service by this name, for the assertion above to compare against itself.
 fn service_is_registered() -> bool {
     Command::new("sc.exe")

@@ -108,6 +108,10 @@ fn main() -> Result<()> {
             service::Role::Client(edit, name) => {
                 service::edit_client(edit, &name, tools_spec(&args)?.as_deref())
             }
+            // Reads the same file and touches nothing else, so it needs a runtime no more than
+            // the edits do. The `--tools` is passed for the same reason: it means nothing here
+            // either, and `list_clients` refuses it rather than accepting a flag it would ignore.
+            service::Role::ListClients => service::list_clients(tools_spec(&args)?.as_deref()),
         };
     }
 
@@ -211,9 +215,9 @@ fn listen_address(args: &[String]) -> Result<std::net::SocketAddr> {
 
 /// The renderer role: a transcript in, an asciicast out.
 ///
-/// The one place in this binary that prints to standard output, and it is safe to: this role
-/// never speaks MCP, so there is no JSON-RPC transport to corrupt. It exits before `serve` is ever
-/// reached.
+/// One of the roles that prints to standard output, and it is safe to for the reason they all
+/// are: none of them speaks MCP, so there is no JSON-RPC transport to corrupt. It exits before
+/// `serve` is ever reached, as the service and client roles do.
 fn render_cast(args: &[String]) -> Result<()> {
     let options = match cast::Options::parse(args) {
         Ok(options) => options,

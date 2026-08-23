@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`--list-listen-clients`, the one client command that changes nothing** (`FOLLOWUPS.md` item 37,
+  which closes it). The four commands that edit a service's credential file each print the whole
+  roster afterwards — name, token fingerprint, and the `--tools` spec where one is set — and until
+  now that roster could only be had by making a change you may not have wanted. That was survivable
+  while every client was served the same surface, because "who may connect" had one other answer in
+  the listener's startup line; a client's own spec has no such second answer.
+
+  It takes the same lock the edits take, reads the same file through the same parser and prints the
+  same fingerprints, and it writes nothing: no token minted, no reload asked for. **A file it
+  cannot read in full refuses rather than printing a shorter roster** — one entry this server would
+  refuse at startup is a file that will not start the service, and a list that quietly dropped the
+  client it could not parse would be the most misleading thing this command could print.
+
+  **It says which of the two sources it answered for.** A service's clients are in the credential
+  file; a foreground listener's are the environment it was started with, and no command edits
+  those — so where no service is installed this answers for the environment instead of refusing,
+  and where both are configured it prints both. A `--tools` beside it is refused rather than
+  ignored, on the same rule as `--rotate-` and `--remove-listen-client`: it reads exactly like a
+  filter over the list it is about to print.
+
 ## [0.11.0] - 2026-08-23
 
 ### Added

@@ -594,7 +594,9 @@ one you changed is not as you left it, `Restart-Service`. A `--remove` or `--rot
 here, because "may still authenticate" is the same thing to act on as "does". You will only meet
 this at boot on a non-loopback address, which is the one bind that can take a while. If it is not *installed*, the commands refuse — a foreground listener takes its
 clients from the environment it was started with, which is a set that cannot change without the
-process changing too.
+process changing too. The one exception is `--list-listen-clients`
+([below](#asking-who-may-connect-without-changing-anything)), which answers for that environment
+instead of refusing, because there is something to answer.
 
 **A second foreground listener is still the right answer for a bench**, and it is a *development*
 workflow rather than a way to operate a deployment — the commands above are what an operator uses.
@@ -604,6 +606,51 @@ one: run a *second, foreground* listener on another port with its own token, whi
 privileged write and disappears when you close it — [Driving it with a local model](#driving-it-with-a-local-model)
 has the recipe. Two listeners on one host is a normal arrangement; sessions belong to a listener's
 own process, so the two cannot see each other's.
+
+### Asking who may connect, without changing anything
+
+```pwsh
+windbg-mcp.exe --list-listen-clients
+```
+
+```text
+`windbg-mcp` holds: `bench` (sha256:2F1A9C0B7D4E5A83, --tools session,inspect,crash),
+`local` (sha256:701E4CF334890225).
+
+Read from C:\ProgramData\windbg-mcp\token, and nothing was changed — this is the one command
+here that only reads.
+
+A client with no `--tools` of its own is served whatever `windbg-mcp` serves — `--tools` on the
+command line the SCM stores, or every tool if that has none.
+
+This shell configures no listener credentials of its own (nothing in the
+`WINDBG_MCP_LISTEN_TOKEN` variables), so the list above is the whole of what this host has.
+```
+
+The other four all print that roster, and until this one there was no way to ask for it **without
+changing something**. That was survivable while every client was served the same surface, because
+"who may connect" had one other answer — the listener's own startup line. A client's own `--tools`
+spec has no such second answer, so the question grew a half that only a change could show you. It
+takes the same
+lock the edits take, reads the same file through the same parser, prints the same fingerprints, and
+writes nothing: no token is minted, no reload is asked for, and the roster is the state of the file
+as it stood. That makes it the one command in the family worth allow-listing.
+
+Three things about it:
+
+- **It says which of the two sources it answered for.** A service's clients are in the credential
+  file; a foreground listener's are the environment it was started with. Where a service is
+  installed this reads the file, and where none is it reads this shell — and it names the file or
+  the variables either way, because a roster with no source beside it is one you cannot act on. If
+  both are configured it prints both, the shell's clearly marked as what a listener started *from
+  here* would accept, which is not necessarily what one already running elsewhere does.
+- **A file it cannot read in full is reported as that, not as a shorter list.** One entry this
+  server would refuse at startup is a file that will not start the service, so the whole read
+  refuses and names the entry. A roster that quietly dropped the client it could not parse would
+  be the most misleading thing this command could print.
+- **It needs the same elevated shell.** The credential file grants read to `SYSTEM` and
+  `Administrators` only, which is what makes it worth having; an unelevated run is told so rather
+  than shown a partial answer. On a host with no service there is no file and no elevation needed.
 
 **Stopping is graceful, and that is the point.** `Stop-Service` takes the same path a client
 disconnect takes: every session is asked to release its target before the process exits, and the SCM

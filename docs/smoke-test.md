@@ -652,6 +652,31 @@ passed, because each supplies the identity itself.
   counted here as well because it is the third of the three: under a service that file is the whole
   of what is read, so it is the only place a second client can come from at all.
 
+### The commands that install a service and edit its clients
+
+Three tests drive the exe as an **administrative command line** rather than as a server, so none of
+them starts a listener. They run in the protocol tier because every claim below is settled before
+the SCM is opened or the credential file is touched, which is also what makes them safe on a
+developer's own host: none can disturb the clients a service is serving, and each captures whether
+`windbg-mcp` is registered either side and asserts it did not move.
+
+- *An install with no address is refused **before anything is registered**.* The SCM stores the
+  command line once and nothing re-derives it, so a service registered without `--listen` is one
+  that installs cleanly and then fails at every start.
+- *A client command says what is missing before it touches anything.* A missing name, a name that
+  is not one, and a flag standing where a name belongs — the last because a name may contain `-`,
+  so `--add-listen-client --force` would otherwise mint a credential for a client nobody asked for.
+  It also asserts the refusal does **not** mention the service, since consulting the SCM first
+  would make a usage error depend on whether one happens to be installed.
+- *Listing the clients names its source and prints no token.* The one command that only reads
+  (item 37), and the only one of the three whose outcome depends on the host — a service host with
+  an elevated shell answers with the file's roster, one without answers with the ACL refusal, and a
+  host with no service answers for this shell's own credentials. So it asserts what holds in all
+  three: it names the source it answered for, and the token handed to it in the environment appears
+  nowhere in what it wrote. That second half is the trap the command was built around — a roster may
+  carry a fingerprint and nothing else, which is what makes this the one client command that is safe
+  to run in an agent's transcript.
+
 **Progress notifications.** The policy — what is reported, when a silence becomes a heartbeat, that
 a send never delays the call — has unit tests in [`progress.rs`](../src/progress.rs) against a
 collector. What those cannot reach is whether any of it leaves the process, so three assertions do:

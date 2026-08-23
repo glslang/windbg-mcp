@@ -1491,7 +1491,7 @@ this makes false; it says what the client is actually served.
 Landed in [`src/toolset.rs`](./src/toolset.rs), [`src/client.rs`](./src/client.rs),
 [`src/listen.rs`](./src/listen.rs) and [`src/service.rs`](./src/service.rs).
 
-## 37. [windbg-mcp] The credential file has four writers and no reader
+## 37. [windbg-mcp] The credential file has four writers and no reader — **done** (2026-08-23)
 
 `--add-listen-client`, `--remove-listen-client`, `--rotate-listen-client` and now
 `--set-listen-client-tools` all edit `%ProgramData%\windbg-mcp\token`, and each prints the whole
@@ -1525,5 +1525,26 @@ to read the service's log file and hope the line has not aged out. The file itse
 the arrangement item 36 exists for — until then the startup line names everything there is to know.
 **Not blocked on anything.**
 
-Picks up at [`src/service.rs`](./src/service.rs) (`roster`, `requested`, `edit_client`'s read half)
-and [`src/client.rs`](./src/client.rs) (`ClientEntry`, `TokenFile::credentials`).
+**Built as `--list-listen-clients`** (2026-08-23), and the third bullet is the one that cost more
+than a line to get right. The other two fell out as written: the roster is `roster`, so no token
+can reach the output, and the parse is the listener's own, so a file with one bad entry refuses
+whole rather than printing a shorter list. The source question did not fall out. "Read whichever
+applies" is wrong on the host both apply to — a service *and* a developer's foreground bench, which
+`docs/remote-listener.md` recommends in the same breath — so the answer is **both, each saying what
+it is**: the file where a service is installed, this shell's credentials where none is or where it
+carries some anyway, and the shell's half labelled as what a listener started *from here* would
+accept rather than what one already running elsewhere does. It reads the environment through
+`listen::named_token_file` and not `client::env_credentials` alone, because a shell naming
+`WINDBG_MCP_LISTEN_TOKEN_FILE` has its variables ignored by the listener — listing them would be a
+roster of credentials nothing accepts.
+
+Two things the entry did not anticipate. The **lock message** was written for writers only
+("another `--add`/`--remove`/`--rotate-listen-client` is running", which item 36 had already made
+wrong by adding a fourth), so `lock_credentials` now takes what its caller came to do; a reader
+holds the same lock for the reader's half of the same hazard, since a list taken mid-edit reports
+the set that is about to replace it. And **`--tools` beside it is refused** rather than ignored, on
+the rule `--rotate-` and `--remove-listen-client` already follow: it reads exactly like a filter
+over the list it is about to print.
+
+Landed in [`src/service.rs`](./src/service.rs) (`list_clients`, `service_clients`, `shell_clients`),
+[`src/listen.rs`](./src/listen.rs) and [`src/main.rs`](./src/main.rs).

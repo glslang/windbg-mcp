@@ -137,12 +137,13 @@ It checks *same-file* fragments only, so a cross-file `../README.md#some-heading
 verify by hand.
 
 **The pass count does not say which tiers ran.** Each gate is inside its test, so the `mcp_smoke`
-harness reports the same **75 passed** with the debugger tier off as with it on — that harness's own
+harness reports the same **76 passed** with the debugger tier off as with it on — that harness's own
 result line, since a plain `cargo test` runs the crate's several hundred unit tests beside it and
 prints a result line per binary. What differs between the two runs is the runtime (measured on the
 ARM64 bench 2026-08-23: **1.6s against 61s** for `cargo test --test mcp_smoke`) and the `SKIPPED`
 lines, which only `--nocapture` prints. Read one of those two before believing a run covered a
-debugger claim. The count moves whenever a test is added — it was 69 until #195 and #196 — so
+debugger claim. The count moves whenever a test is added — it was 69 until #195 and #196, and 75
+until item 37 — so
 re-derive it rather than trusting this sentence.
 
 **The dev exe can be locked too, and the failure is quiet.** A worker left running — a driver
@@ -581,6 +582,18 @@ follows the same precedence — a configured file is the whole configuration, so
 read on a host that has one — for a reason that is not secrecy but arithmetic: one file answering
 who may connect and another answering what they get is two files to keep in step and a precedence
 rule to remember.
+
+**Five client commands, and the fifth only reads.** `--list-listen-clients` (item 37) prints the
+same `roster` the four editors print, under the same lock, with no write and no reload. Two things
+bite when touching it. It answers for **both** sources — a service's clients are in the credential
+file, a foreground listener's are the environment it was started with — and the environment half
+goes through `listen::named_token_file`, *not* `client::env_credentials` alone: a shell naming
+`WINDBG_MCP_LISTEN_TOKEN_FILE` has its token variables ignored by the listener, so listing them
+would be a roster of credentials nothing accepts. And a file it cannot read in full has to refuse
+rather than print a shorter list — a dropped entry is a service that will not start, reported as a
+service serving fewer people. `lock_credentials` takes what its caller came to do, because "changing
+a client needs an elevated shell" is the wrong sentence for a reader; adding a sixth command means
+that argument, this listing, and the message naming the family.
 
 **Identity is ambient inside a call, carried by the instance, and by name outside both.**
 `crate::client::current()` reads a task-local, which is why no tool signature carries a caller. What
