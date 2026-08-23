@@ -33,9 +33,11 @@ a (model, context, surface, task) already in the log is not run again.
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -129,10 +131,15 @@ def run_cell(plan, tokens, backend, model, context, surface, subset, budget_s, l
         raise SystemExit(f"unknown backend `{backend}`")
 
     os.makedirs(logs_dir, exist_ok=True)
-    # Claude Code reads the project it is started in - `CLAUDE.md`, settings, the checkout
-    # itself. Started in this repository it would answer questions about the sample dumps from
-    # the documentation beside them, so its cells run somewhere with nothing in it.
-    cwd = logs_dir if backend == "claude-code" else None
+    # **Claude Code reads the project it is started in, and walks *up* to find it.** `CLAUDE.md`,
+    # settings, the checkout itself - and this repository's `CLAUDE.md` now quotes two of the six
+    # answers, in the section explaining how the grader was fixed. So a cell started anywhere
+    # under the checkout is handed part of the answer key before it calls a tool.
+    #
+    # `logs_dir` looked neutral and is not: the checked-in plan keeps logs in `eval-out/`, inside
+    # the tree. An empty directory of this process's own is the only one that is neutral wherever
+    # a plan puts its output.
+    cwd = tempfile.mkdtemp(prefix="windbg-eval-cwd-") if backend == "claude-code" else None
     stdout_path = os.path.join(
         logs_dir, f"{backend}_{model.replace(':', '-').replace('/', '-')}_"
                   f"{context or 'default'}_{surface}.log")
@@ -162,7 +169,22 @@ def run_cell(plan, tokens, backend, model, context, surface, subset, budget_s, l
                     "task": None, "error": f"cell exceeded its {budget_s}s budget"}
             with open(log_path, "a", encoding="utf-8") as log:
                 log.write(json.dumps(note) + "\n")
+    if cwd:
+        # `rmtree`, not `rmdir`: Claude Code may leave state of its own in the directory it ran
+        # in, and a cell must not fail on the way out because its scratch was not empty.
+        shutil.rmtree(cwd, ignore_errors=True)
     print(f"    {round(time.time() - started)}s, exit {proc.returncode}")
+    if proc.returncode:
+        # **A cell that failed is not a cell with fewer tasks.** A driver that dies on a bad
+        # credential, an MCP handshake or a missing model writes some records or none, and
+        # without this the summary shows a short row or no row at all - an incomplete grid
+        # reading as a finished one. The note gives the cell a row that says what happened.
+        note = {"run": plan["run"], "backend": backend, "model": model,
+                "num_ctx": context or None, "surface": {"client": surface},
+                "task": None,
+                "error": f"driver exited {proc.returncode}; see {os.path.basename(stdout_path)}"}
+        with open(log_path, "a", encoding="utf-8") as log:
+            log.write(json.dumps(note) + "\n")
     return proc.returncode
 
 
@@ -344,12 +366,13 @@ def print_table(cells):
         # seeing, so they travel beside the score as `+n` rather than inside it.
         extra = c["correct"] - c["correct_of_possible"]
         score = f"{c['correct_of_possible']}/{c['possible']}" + (f"+{extra}" if extra else "")
+        failed = " FAILED" if c.get("cell_error") else ""
         print(f"{c['backend']:<12} {(c['model'] or '')[:28]:<28} "
               f"{str(c['num_ctx'] or 'dflt'):>7} {str(c['surface'] or '')[:6]:<6} "
               f"{str(c['tools'] or '-'):>5} "
               f"{score} of {c['n']:<5} {tokens:>13} "
               f"{c['useful']}/{c['wasted']}/{c['hallucinated']}/{c['errors']:<8} "
-              f"{c['wall_s']:>5}s")
+              f"{c['wall_s']:>5}s{failed}")
 
 
 def matrix(log_path, tasks_file):
