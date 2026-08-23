@@ -116,8 +116,8 @@ Mechanical, and stated so it can be argued with:
   `useful` (a tool the task needs, and it worked), `wasted` (worked, but nothing to do with the
   question), `off_surface` (the server refused it — on a narrowed surface, the tool is not served),
   `refused` (the harness's read-only fence), and `errored`.
-- **`hallucinated`** — a call naming a tool the surface never offered. The model was handed a tool
-  list; asking for something outside it is invention.
+- **`unserved`** — a call naming a tool this client is not served. It was called `hallucinated`
+  until the run was read properly; see below, because the server is where those names came from.
 
 Nothing is graded by a model. A substring check accepts an answer a reader would not in exactly one
 direction — a model that lists every bug check code including the right one — and every cell's raw
@@ -270,9 +270,9 @@ because `crash_triage`'s frame 0 is the `pc` that `registers` reports. Facts her
 more than one route, and the narrow surface keeps the routes that matter.
 
 What the cut *does* produce, in every row including the control, is **calls to tools that are not
-there**:
+there** — and the reason is this server, not the models:
 
-| Cell | Off-surface calls | What it asked for |
+| Cell | Unserved calls | What it asked for |
 | --- | --- | --- |
 | gemma4 `min` | 9 | `debug_batch`, every one of them — five on one task, four on another |
 | Opus `min` | 4 | `execute` twice, `modules`, `decode_ioctl` |
@@ -280,10 +280,23 @@ there**:
 | nemotron `min` | 2 | `modules`, twice |
 | every `full` and `lean` cell | 0 | — |
 
-Nobody invents a tool when the surface is wide. Everybody does when it is narrow, and the server's
-refusal (`#196`, which names the client's own surface) is what turns that into a recoverable
-mistake rather than a wrong answer. Opus and qwen recover by declining honestly; gemma spends its
-whole turn budget re-asking and returns an **empty answer**.
+**The models were told about those tools by the server.** `#196` narrows `tools/list` per client;
+it does not narrow the `instructions` string the server sends at `initialize`, which is a compile-
+time constant naming twenty-one tools by name — `modules`, `execute`, `decode_ioctl` and
+`debug_batch` among them. Measured against this bench: the `min` client is served **11** tools and
+told about **21**, of which **17 it cannot call**. Every off-surface call in the table above is one
+of those seventeen.
+
+So this is not invention, and the column that used to be called `hallucinated` is now `unserved`.
+It is a real cost — wasted turns, and gemma's whole turn budget on one task — but it is the cost of
+the server advertising what it will then refuse. The refusal (`#196` again, which names the client's
+own surface) is what makes it recoverable: Opus and qwen decline honestly after it, gemma re-asks
+until it runs out.
+
+The same string is also **1,990 characters (~497 tokens) charged to every client identically**, of
+which **59% is sentences naming only tools the `min` client cannot call** — about 12% of that
+client's entire prompt. A narrowed surface drops 54,000 bytes of schemas and keeps every word of
+the prose advertising what was dropped. That is `FOLLOWUPS.md` item 40.
 
 ### Same surface, same tool output, three different outcomes
 

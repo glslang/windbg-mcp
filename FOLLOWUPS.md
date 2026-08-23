@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in nineteen clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/win-kexp#71, 2026-08-01), items 13–14 from the bounded-command coverage review
@@ -21,8 +21,9 @@ ARM64 runner image that replaces `windows-11-arm` in September 2026, and items 3
 the server with a **local model** — the lease grace measured against the wrong slow party, and a
 service's clients fixed at install time (both 2026-08-22), and items 37–38 from the credential
 file gaining a fourth writer while still having no reader, and from exercising what that reader
-says against a real service (both 2026-08-23), and item 39 from running the surface, the window
-and the model as a **grid** rather than as a sighting (2026-08-23). Each item notes its repo,
+says against a real service (both 2026-08-23), and items 39–40 from running the surface, the window
+and the model as a **grid** rather than as a sighting, and from what that grid found leaking
+through the one thing `--tools` does not narrow (both 2026-08-23). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -1711,3 +1712,41 @@ Two smaller things the same run left open:
 - **One bench, one architecture, for the timings.** Every wall-clock number in that document is an
   ARM64 Mac serving MLX builds. The correctness columns should travel; the timings should not be
   quoted anywhere else.
+
+## 40. [windbg-mcp] `--tools` narrows the tool list and not the instructions
+
+A client's surface is per credential since [#196](https://github.com/glslang/windbg-mcp/pull/196),
+and what that narrows is the **router**: `tools/list` answers with the client's own set, and a call
+for anything else is refused by name. The `instructions` string sent at `initialize` is not
+narrowed. It is a compile-time constant on `#[rmcp::tool_handler]` in `src/server.rs`, it names
+**twenty-one tools**, and every client gets all of it.
+
+Measured on the eval bench (2026-08-23,
+[`docs/local-model-eval.md`](./docs/local-model-eval.md)): the `min` client is served **11** tools
+and told about **21**, of which **17 it cannot call** — `modules`, `execute`, `decode_ioctl`,
+`debug_batch`, the whole TTD family and the whole IOCTL family. Both halves of that are a cost:
+
+- **Wasted turns, and the eval measured them.** Every off-surface call in the grid is one of those
+  seventeen — gemma spent a task's entire turn budget re-asking for `debug_batch`, and both control
+  rows asked for `modules` and `execute`. The eval first recorded this as models *inventing* tool
+  names; they were reading this server's own advertising. The metric is now called `unserved`.
+- **Context, on the surface least able to pay it.** 1,990 characters, ~497 tokens, identical for
+  every client — of which **59% is sentences naming only tools a `min` client cannot call**, and
+  the whole string is ~12% of that client's prompt. `--tools crash` drops 54,000 bytes of schemas
+  and keeps every word of the prose selling what it dropped.
+
+**Why it was deferred rather than fixed with the eval.** The fix is not a filter over the existing
+text: the prose is sentences, each naming several tools, and cutting by keyword would leave
+mangled English in the one string a model reads before anything else. The shape that works is the
+same one the tool table already has — a base paragraph plus a fragment per **group**, assembled for
+the client's own `Toolset`, so `crash` gets the base and the crash sentence and nothing about TTD.
+That is a rewrite of the instructions as data rather than a constant, and it moves a string three
+tests assert on (`the_instructions_fit_what_the_client_reads`, the discovery assertion in
+`src/server.rs`, and the tool-budget golden).
+
+**Where it picks up.** `#[rmcp::tool_handler]` supplies `get_info` only when the impl does not —
+the same rule `call_tool` already relies on — so the override point is a hand-written `get_info`
+that assembles the text from the client the instance carries (`crate::client::current()` is not
+right here: the surface is captured in the listener's factory, and `WindbgServer` already holds
+it). The measurement to keep is the one above: instructions bytes against tools actually served,
+per client.

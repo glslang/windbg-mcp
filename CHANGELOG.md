@@ -26,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   listener that serves all three surfaces — which is 0.11.0's per-client `--tools` doing the
   narrowing, rather than a test double.
 
+  It also found a defect in this server, filed as `FOLLOWUPS.md` item 40: **`--tools` narrows
+  `tools/list` and not the `instructions` string**, which is one compile-time constant naming
+  twenty-one tools and is sent to every client whatever its surface. A `crash`-surface client is
+  served 11 tools and told about 21, of which 17 it cannot call - which is where every "invented"
+  tool call in the grid came from, and 59% of a 497-token string that client pays for in full.
+
   Three findings worth the run. **The window was not the binding constraint**: at a *served*
   8,192-token window a 17,300-token surface answered all six tasks correctly, multi-turn tasks with
   10,000-character results included, so the "will it fit" arithmetic in `docs/local-model.md`

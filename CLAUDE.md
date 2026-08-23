@@ -824,6 +824,14 @@ directory**, since Claude Code reads the project it is started in. Its prompt-to
 not comparable with the ollama rows — its own system prompt is most of it — and the document says
 so rather than quoting it.
 
+**`--tools` narrows the router and not the `instructions`, and that shows up as a model
+"inventing" tools.** The string on `#[rmcp::tool_handler]` is a compile-time constant naming
+twenty-one tools, sent identically to every client: a `crash`-surface client is served 11 tools and
+told about 21, of which 17 it cannot call. Every off-surface call the grid recorded is one of those
+seventeen, so a count of them measures this server's advertising rather than any model's
+imagination - the metric is `unserved` for that reason, and `FOLLOWUPS.md` item 40 is the fix.
+Worth knowing before reading any tool-selection result from a narrowed surface.
+
 **The bench listener is the shipped per-client feature in anger.** `tools/bench_listener.ps1`
 serves `full`, `lean` and `min` from one foreground process, tokens arriving on **stdin**; its
 startup line naming the three clients and their surfaces is the check that the run is measuring
