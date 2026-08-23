@@ -212,6 +212,32 @@ with a stated reason is a normal outcome — put it in the commit message, or th
 raise it again and nothing will record why it was not taken. Measuring beats arguing whenever the
 claim is about behaviour: most of these were settled in one experiment.
 
+**A finding about *prose* is acted on only if the prose is wrong, or inconsistent with the code.**
+Everything else — rewording, hedging, "consider splitting this rule across the three files that
+state it" — is declined. A decline needs no commit and no reply to the bot, but **say it to whoever
+is driving the work**, in one line, so the count of what was waved through stays visible to them
+rather than only to you.
+The rule exists because the review pressure here is almost entirely on sentences: across #196, #198
+and #199, **every** bot finding was about one, and none was about the code those PRs changed. Most
+of that pressure pushes toward making correct sentences longer, which is churn and costs a CI round
+each time. What the rule still catches, all from those three PRs:
+
+- **Wrong.** A config documented as `.markdownlint-cli2.jsonc`; the file is `.markdownlint.jsonc`.
+  And a skill saying `--set-listen-client-tools <name>` changes a client's surface, when with no
+  `--tools` beside it that command *clears* the spec — an operator following it removes the
+  restriction they meant to change.
+- **Inconsistent with the code.** A refusal telling every caller to run a service-only command,
+  when a foreground listener's clients come from the environment. And "a change reaches a client
+  when it next connects", which describes one MCP revision while the listener's factory identifies
+  a sessionless client on *every request*. Neither sentence is false on its face; both produce the
+  wrong action.
+- **Inconsistent with its own cited source.** A list of the three handoff files, contradicted by
+  one of the PRs named as its origin.
+
+When a sentence does have to change, prefer **making the one rule true** over splitting it into two
+— that is what the last of those became, and it kept a single summary line that is now correct for
+both revisions rather than two rules in three files.
+
 **When findings keep landing on one mechanism, delete the choice generating them rather than fixing
 them one at a time.** Each finding is locally real and each fix is locally correct, which is exactly
 what makes the pattern hard to see from inside it: the count of mechanisms goes up every round and
