@@ -75,7 +75,7 @@ thing between them is finding 1 — the prose taken out of every `outputSchema`.
 | `description` (all 51) | 24,752 | 24,794 | yes |
 | `annotations` | 5,449 | 5,449 | no |
 | **Model-visible total** | **67,076** | **67,658** (~17k tokens) | — |
-| `initialize` instructions | 1,996 | 1,990 | yes, **all of it** |
+| `initialize` instructions | 1,996 | 1,983 | yes, **all of it** |
 
 The two halves moved independently, which is the whole argument for measuring them apart: the wire
 fell by 55% and the model-visible column did not move at all except for what the tools themselves
@@ -205,9 +205,16 @@ None of these is a bug. They are recorded because they were invisible, and
 4. **The instructions overran what the client reads** — **fixed**. 3,147 chars were sent and 2,048
    read, so 1,099 were paid for on every connection and discarded, and what fell off the end was the
    `debug_batch` paragraph: the one instruction there that stops a mutation being left half-applied.
-   Rewritten to 1,990 characters with the batch guidance inside the budget, kept ASCII so the
-   character and byte counts cannot diverge, and pinned by an assertion in the protocol tier so it
-   cannot grow back unnoticed.
+   Rewritten with the batch guidance inside the budget, kept ASCII so the character and byte counts
+   cannot diverge, and pinned by an assertion in the protocol tier so it cannot grow back unnoticed.
+
+   **And since then, narrowed per client** (`FOLLOWUPS.md` item 40): it was one constant naming
+   twenty-one tools sent to everybody, so a `--tools crash` client reading eleven tools was told
+   about all twenty-one and would ask for what it could not call. It is now a base plus a fragment
+   per group, assembled for the client's own surface — 1,983 characters for the whole surface,
+   1,220 for `session,inspect,crash`, **927 for `crash`**. The number in the table above is the
+   whole-surface one, which is the only one a golden can pin; the other two are asserted by two
+   credentials on one listener.
 5. **`modules` had neither a `limit` nor a cap**, alone among the high-volume tools — **fixed**.
    53,875 B here; more on a live kernel. It now takes a `limit` (default 64 rows, maximum 2000)
    that bounds the **whole** listing, the loaded and unloaded halves sharing it through the same

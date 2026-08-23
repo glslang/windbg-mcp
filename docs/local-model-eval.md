@@ -303,7 +303,13 @@ until it runs out.
 The same string is also **1,990 characters (~497 tokens) charged to every client identically**, of
 which **59% is sentences naming only tools the `min` client cannot call** — about 12% of that
 client's entire prompt. A narrowed surface drops 54,000 bytes of schemas and keeps every word of
-the prose advertising what was dropped. That is `FOLLOWUPS.md` item 40.
+the prose advertising what was dropped.
+
+**Fixed after this run, in the follow-up that `FOLLOWUPS.md` item 40 describes**: the instructions
+are now a base plus a fragment per group, assembled for the client's own surface, so the `min`
+client reads 927 characters naming only what it is served. Every number on this page was measured
+against the behaviour above, which is the behaviour every model here met; a re-run would find fewer
+unserved calls, and that is the point of having measured it.
 
 ### Same surface, same tool output, three different outcomes
 
