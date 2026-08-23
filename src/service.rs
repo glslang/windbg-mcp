@@ -94,6 +94,8 @@ pub const ROTATE_CLIENT_FLAG: &str = "--rotate-listen-client";
 /// [`crate::toolset::FLAG`] beside it — with no `--tools` at all, the client goes back to being
 /// served whatever the run serves.
 pub const SET_CLIENT_TOOLS_FLAG: &str = "--set-listen-client-tools";
+/// Prints who may connect and what each is served. Takes no name, and changes nothing.
+pub const LIST_CLIENTS_FLAG: &str = "--list-listen-clients";
 
 /// Overrides where the service writes its log.
 pub const LOG_ENV: &str = "WINDBG_MCP_SERVICE_LOG";
@@ -138,6 +140,8 @@ pub enum Role {
     Uninstall,
     /// One of the client commands, and which client it names.
     Client(ClientEdit, String),
+    /// The one that only reads. It names no client, because it answers for all of them.
+    ListClients,
 }
 
 /// What a client command does to the service's credential file.
@@ -202,6 +206,7 @@ pub fn requested(args: &[String]) -> Option<Role> {
             SERVICE_FLAG => return Some(Role::Run),
             INSTALL_FLAG => return Some(Role::Install),
             UNINSTALL_FLAG => return Some(Role::Uninstall),
+            LIST_CLIENTS_FLAG => return Some(Role::ListClients),
             _ => {}
         }
         edits
@@ -604,7 +609,7 @@ pub fn edit_client(edit: ClientEdit, name: &str, tools: Option<&str>) -> Result<
 
     // Held until this function returns, which is what makes the read, the edit, the write and the
     // reload below one transaction rather than four steps two shells can interleave.
-    let _lock = lock_credentials()?;
+    let _lock = lock_credentials("changing a client")?;
 
     let at = token_file();
     let existing = match std::fs::read_to_string(&at) {
@@ -889,6 +894,198 @@ fn roster(credentials: &[crate::client::ClientEntry]) -> String {
         .join(", ")
 }
 
+/// What the SCM answers when nothing by that name is registered — the one failure of
+/// `open_service` that [`list_clients`] treats as half an answer rather than as an error.
+const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
+
+/// Prints who may connect and what each is served, and changes nothing.
+///
+/// **The question had no command until item 36 gave it a second half.** While every client was
+/// served the same surface, "who may connect" had another answer — the listener's own startup
+/// line — and a client either connected or did not. A client's own `--tools` spec is not visible
+/// from outside it, so once there was one, the only routes to it were to run a command that
+/// *changes* something and read the roster it prints afterwards, or to read the service's log and
+/// hope the line had not aged out of it.
+///
+/// **It says which source it answered for, and answers for both where both apply.** A service's
+/// clients are in [`token_file`]; a foreground listener's are the environment it was started with,
+/// and no command edits those. So this reads the file where a service is installed and the
+/// environment where none is — the asymmetry that made a refusal wrong in
+/// [#196](https://github.com/glslang/windbg-mcp/pull/196), where the message for a tool off a
+/// client's own surface named the service command alone and a foreground listener's operator could
+/// not take that advice. Where a service is installed *and* this shell carries credentials of its
+/// own, both are printed: that is two answers to one question, and printing one of them alone is
+/// what would make a roster read as the whole of it. A file half that *fails* still ends the
+/// command, deliberately — on a host with a service the question was about the service, and an
+/// answer for the environment printed beneath a refusal is not the one that was asked for.
+///
+/// **What it must not print is a token — and what it must not print more quietly is a roster it
+/// could not read in full.** The first is [`roster`]'s rule, which every command in this family
+/// already follows. The second is this one's: a file with an entry this server cannot parse is a
+/// file that will not start the service, and it has to read as *that* rather than as a shorter
+/// list. So the parse and the validation here are the ones the listener runs, and either failing
+/// refuses rather than dropping a client from the output.
+pub fn list_clients(tools: Option<&str>) -> Result<()> {
+    // Refused rather than ignored, by the rule the other client commands are held to: this
+    // command has no use for a surface, and `--list-listen-clients --tools crash` reads exactly
+    // like a filter over the list it is about to print.
+    if let Some(spec) = tools {
+        bail!(
+            "`{LIST_CLIENTS_FLAG}` reads the client list and changes nothing, so the `{}` beside \
+             it would do nothing — and it reads exactly like a filter over what it prints. Every \
+             client's surface is in that list already; `{SET_CLIENT_TOOLS_FLAG} <name> {} {spec}` \
+             is the command that sets one.",
+            crate::toolset::FLAG,
+            crate::toolset::FLAG,
+        );
+    }
+
+    // Opened for the reason [`edit_client`] opens it and answered differently. There, no service
+    // is a refusal: there is nothing to edit. Here it is half the answer — a host with no service
+    // still has clients, in the environment a foreground listener was started with.
+    let manager = ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT)
+        .context("cannot open the service manager")?;
+    let installed = match manager.open_service(NAME, ServiceAccess::QUERY_STATUS) {
+        Ok(_) => true,
+        Err(windows_service::Error::Winapi(e))
+            if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
+        {
+            false
+        }
+        // **Anything else is a failure, not a "no".** A service that is registered and cannot be
+        // opened, reported as one that is not, would put this host's environment on screen under
+        // a heading saying there was nothing else to see.
+        Err(e) => {
+            return Err(anyhow::Error::new(e).context(format!(
+                "cannot ask the SCM whether `{NAME}` is installed, so which clients this host has \
+                 is not known"
+            )));
+        }
+    };
+
+    if installed {
+        let at = token_file();
+        let held = service_clients(&at)?;
+        println!("`{NAME}` holds: {}.", roster(&held));
+        println!(
+            "\nRead from {}, and nothing was changed — this is the one command here that only \
+             reads.",
+            at.display()
+        );
+        // Said only where there is a client it is about, which is what keeps it off the line on a
+        // host where every client carries its own spec.
+        if held.iter().any(|client| client.tools.is_none()) {
+            println!(
+                "\nA client with no `{}` of its own is served whatever `{NAME}` serves — `{}` on \
+                 the command line the SCM stores, or every tool if that has none.",
+                crate::toolset::FLAG,
+                crate::toolset::FLAG,
+            );
+        }
+    } else {
+        println!(
+            "No service named `{NAME}` is installed, so this host has no client list in a file. A \
+             foreground listener takes its clients from the environment it was started with, and \
+             no command changes those."
+        );
+    }
+
+    // The other source. Where the file answered above, this is a *second* answer to the same
+    // question and is introduced as one; where no service is installed, it is the answer. Either
+    // way the claim is about a listener started from **this** shell — not about one already
+    // running elsewhere, whose clients are the environment it was started with.
+    match (shell_clients(), installed) {
+        (Ok((source, clients)), true) if clients.is_empty() => println!(
+            "\nThis shell configures no listener credentials of its own (nothing in {source}), so \
+             the list above is the whole of what this host has."
+        ),
+        (Ok((source, clients)), false) if clients.is_empty() => println!(
+            "\nAnd a foreground listener started from this shell would refuse to start: there are \
+             no clients in {source} either, and a listener without one exposes every tool this \
+             server has."
+        ),
+        (Ok((source, clients)), _) => println!(
+            "\n{}A foreground listener started from this shell would accept: {} — from {source}. \
+             One already running elsewhere may accept something else: its clients are the \
+             environment *it* was started with, and nothing changes them without restarting it.",
+            if installed {
+                "This shell also carries listener credentials, which a service never reads. "
+            } else {
+                ""
+            },
+            roster(&clients)
+        ),
+        // **Reported rather than returned where the file half already answered**, because the
+        // question was about the service and this is a second, unasked-for source: failing the
+        // command on it would withhold the answer it did have. Where there is no service it is
+        // the whole answer, so it is the command's failure.
+        (Err(e), true) => println!(
+            "\nThis shell also carries listener configuration of its own, which a service never \
+             reads — and it is not a set a listener would start on: {e:#}"
+        ),
+        (Err(e), false) => {
+            return Err(e.context(
+                "no service is installed, so this host's clients are the ones this shell \
+                 configures — and it does not configure a set a listener would start on",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The installed service's clients, read the way its own listener reads them.
+///
+/// **Under the lock the edits take**, so a roster is never a snapshot from the middle of one: an
+/// edit computes a whole file from what it read, and a list taken while that is in flight would
+/// report the set it is about to replace as the set in force.
+fn service_clients(at: &std::path::Path) -> Result<Vec<crate::client::ClientEntry>> {
+    let _lock = lock_credentials("reading the client list")?;
+    match std::fs::read_to_string(at) {
+        Ok(text) => crate::client::TokenFile::parse(&text, at)?.credentials(),
+        // A service registered against a file that is not there. Said as what it costs rather than
+        // as an empty roster, which would read as a service serving nobody instead of one that
+        // will not run.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
+            "`{NAME}` is installed and {} does not exist, so it has no clients and will not start \
+             until it does. `{ADD_CLIENT_FLAG} <name>` writes a new file with one client in it, or \
+             reinstall the service.",
+            at.display()
+        ),
+        // The refusal an unelevated shell gets, since that file grants read to `SYSTEM` and
+        // `Administrators` only.
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Err(anyhow::Error::new(e)
+            .context(format!(
+                "cannot read {} — it grants read to SYSTEM and Administrators only, so listing \
+                 the clients needs an elevated shell (\"Run as administrator\")",
+                at.display()
+            ))),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("cannot read {}", at.display()))),
+    }
+}
+
+/// What a foreground listener started from *this* shell would accept, and where it read it from.
+///
+/// **The listener's own precedence, not a second copy of it**: a configured
+/// `WINDBG_MCP_LISTEN_TOKEN_FILE` is the whole configuration, and the token variables are not read
+/// at all beside one ([`crate::client::Credentials::from_entries`]). Listing the variables on a
+/// host that names a file would be a roster of credentials nothing accepts.
+fn shell_clients() -> Result<(String, Vec<crate::client::ClientEntry>)> {
+    match crate::listen::named_token_file()? {
+        Some((path, file)) => Ok((
+            format!(
+                "the credential file `{}` names ({})",
+                crate::listen::TOKEN_FILE_ENV,
+                path.display()
+            ),
+            file.credentials()?,
+        )),
+        None => Ok((
+            format!("the `{}` variables", crate::listen::TOKEN_ENV),
+            crate::client::env_credentials(std::env::vars())?,
+        )),
+    }
+}
+
 /// Writes a generated token beside the credential file, and says where it went.
 ///
 /// **The operator does not choose the path, and that is the fix rather than a limitation.** This
@@ -971,7 +1168,12 @@ fn write_token_out(name: &str, token: &str) -> Result<PathBuf> {
 ///
 /// It lives in the state directory, which is already `Administrators`-only, so this is also where
 /// an unelevated caller is turned away: it needs write access to a directory it cannot write.
-fn lock_credentials() -> Result<std::fs::File> {
+///
+/// **`doing` is what this caller came to do**, because [`list_clients`] holds the same lock
+/// without writing anything and "changing a client needs an elevated shell" is the wrong sentence
+/// for it. The contention message is one both are held to: a read taken from the middle of an edit
+/// reports a set that is about to be replaced, which is the reader's half of the same hazard.
+fn lock_credentials(doing: &str) -> Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
 
     let at = state_dir().join("token.lock");
@@ -983,14 +1185,15 @@ fn lock_credentials() -> Result<std::fs::File> {
         .open(&at)
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::PermissionDenied => anyhow::Error::new(e).context(format!(
-                "cannot open {} — that directory is SYSTEM and Administrators only, so changing a \
-                 client needs an elevated shell (\"Run as administrator\")",
+                "cannot open {} — that directory is SYSTEM and Administrators only, so {doing} \
+                 needs an elevated shell (\"Run as administrator\")",
                 at.display()
             )),
             _ => anyhow::Error::new(e).context(format!(
-                "cannot take {} — another `--add`/`--remove`/`--rotate-listen-client` is running. \
-                 Two of them editing at once would each write a whole file from its own snapshot, \
-                 and the second would discard the first. Wait for it and try again.",
+                "cannot take {} — another client command is holding it. Two of them at once would \
+                 each work from its own snapshot of the credential file: the second write would \
+                 discard the first, and a list read from the middle of an edit would report a set \
+                 that is about to be replaced. Wait for it and try again.",
                 at.display()
             )),
         })
@@ -1596,6 +1799,11 @@ mod tests {
             requested(&argv(&["windbg-mcp", UNINSTALL_FLAG])),
             Some(Role::Uninstall)
         );
+        // The one that names no client, because it answers for all of them.
+        assert_eq!(
+            requested(&argv(&["windbg-mcp", LIST_CLIENTS_FLAG])),
+            Some(Role::ListClients)
+        );
     }
 
     /// A client command carries the name that follows it, and takes its role even without one.
@@ -1760,6 +1968,54 @@ mod tests {
             why.contains("`ttdd` is neither a group nor a tool"),
             "{why}"
         );
+    }
+
+    /// The command that only reads takes no surface either, and refuses one rather than ignoring
+    /// it.
+    ///
+    /// `--list-listen-clients --tools crash` reads as a filter over the list it is about to
+    /// print, and every client's surface is in that list already. Refused before the SCM is
+    /// opened, which is what makes it a unit test — and what keeps the refusal identical on a
+    /// host that has the service installed and one that does not.
+    #[test]
+    fn the_command_that_only_reads_refuses_a_surface_it_would_have_ignored() {
+        let why = list_clients(Some("crash"))
+            .expect_err("a surface on the command that changes nothing is a usage error")
+            .to_string();
+        assert!(why.contains(LIST_CLIENTS_FLAG), "{why}");
+        // And it names the command that *does* set one — with its `--tools`, since
+        // `--set-listen-client-tools <name>` on its own takes a client's surface away.
+        assert!(
+            why.contains(SET_CLIENT_TOOLS_FLAG) && why.contains(crate::toolset::FLAG),
+            "{why}"
+        );
+    }
+
+    /// A service that is not registered has to be a **no**, not a failure.
+    ///
+    /// [`list_clients`] answers for the environment where none is installed, so it must tell
+    /// "there is none" from "one is there and cannot be opened" — and the only thing between them
+    /// is an error code the SCM returns and this crate hands back untouched. Drift here would turn
+    /// a legitimate answer into a refusal on every host without the service, which is most of them,
+    /// and the refusal would name the SCM rather than anything an operator could act on.
+    #[test]
+    fn a_service_that_is_not_registered_is_a_no_and_not_a_failure() {
+        let manager = ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT)
+            .expect("every Windows host has an SCM, and connecting to it needs no elevation");
+        // A name nothing could plausibly have registered, since the point is to be told it is not
+        // there rather than to depend on this host not running the real one.
+        match manager.open_service(
+            "windbg-mcp-no-such-service-9f3c",
+            ServiceAccess::QUERY_STATUS,
+        ) {
+            Ok(_) => panic!("something is registered under the name this test picked to be absent"),
+            Err(windows_service::Error::Winapi(e)) => assert_eq!(
+                e.raw_os_error(),
+                Some(ERROR_SERVICE_DOES_NOT_EXIST as i32),
+                "the SCM reports an absent service some other way now: {e}"
+            ),
+            Err(e) => panic!("an absent service came back as {e:?}"),
+        }
     }
 
     fn entry(name: &str, token: &str, tools: Option<&str>) -> crate::client::ClientEntry {

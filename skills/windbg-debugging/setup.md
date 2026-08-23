@@ -454,6 +454,8 @@ Four things decide whether that works, and each fails in a way that reads as som
   narrowing it, so a wider one is served too. `--set-listen-client-tools <name> --tools <spec>`
   changes it afterwards, and the same command with **no** `--tools` puts the client back on the
   run's surface. That is how a local model shares a listener with a full client.
+  `--list-listen-clients` prints who may connect and what each is served without changing
+  anything — the only one of the five that is safe to run when you just want to look.
 
 Two behaviours differ from stdio and are worth knowing before they surprise you.
 
