@@ -619,14 +619,11 @@ windbg-mcp.exe --list-listen-clients
 
 Read from C:\ProgramData\windbg-mcp\token, and nothing was changed — this is the one command
 here that only reads. It is the *file*, though, not a question put to the running service:
-`windbg-mcp` is running and re-reads this file whenever a client command changes it, and a
-command whose re-read did not land says so and exits non-zero — so a revocation that reported
-*that* is the one way a token this list no longer names can still be authenticating.
-
-A client's own `--tools` reaches it the next time it is identified, so this says what a client
-is *configured* with rather than what it is being served this minute: one holding an MCP session
-goes on listing the tools it listed at the time, until it reconnects. One on the sessionless
-revision is identified on every request and has no such gap.
+`windbg-mcp` is running, and it re-reads this file whenever a client command changes it — a
+command whose re-read did not land says so and exits non-zero. What a *client* is served is a
+step further behind: a surface is fixed when the client is identified, so one holding an MCP
+session goes on being served what it had when it connected, whatever this file says now. One on
+the sessionless revision is identified on every request and is never behind.
 
 A client with no `--tools` of its own is served whatever `windbg-mcp` serves — `--tools` on the
 command line the SCM stores, or every tool if that has none.
@@ -665,13 +662,14 @@ Three things about it:
 - **It reads the file, not the service**, and the two can differ in two unrelated ways. A
   credential's: a `--remove` or `--rotate` whose reload failed leaves a token authenticating that
   the file no longer names — exactly the case you would run this to check. A surface's: a reload
-  that *succeeded* still does not reach a client holding an MCP session, which goes on listing the
-  tools it listed when it connected. There is no way to ask the running service what it has in
-  force (its only channel carries a status code and no data), so the command reports the state it
-  *is* in — running, starting, **stopping** or stopped — and names the second gap wherever a client
-  carries a spec of its own. Stopping is not stopped: a stop ends the accept loop and then releases
-  every target, which on a host holding a live kernel is minutes, and the connections already
-  accepted are served until the process exits.
+  that *succeeded* still does not reach a client holding an MCP session, which goes on being served
+  what it had when it connected — including when the change was to *clear* the last spec, so a file
+  with no surfaces in it at all proves nothing about a connected client. There is no way to ask the
+  running service what it has in force (its only channel carries a status code and no data), so the
+  command reports the state it *is* in — running, starting, **stopping** or stopped — and says both
+  gaps in the running one, unconditionally. Stopping is not stopped: a stop ends the accept loop and
+  then releases every target, which on a host holding a live kernel is minutes, and the connections
+  already accepted are served until the process exits.
 
 **Stopping is graceful, and that is the point.** `Stop-Service` takes the same path a client
 disconnect takes: every session is asked to release its target before the process exits, and the SCM

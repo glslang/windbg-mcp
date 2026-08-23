@@ -970,8 +970,6 @@ pub fn list_clients(tools: Option<&str>) -> Result<()> {
         let at = token_file();
         let held = service_clients(&at)?;
         println!("`{NAME}` is configured with: {}.", roster(&held));
-        // Read once and used twice — the caveat below turns on it as well, and asking the SCM
-        // twice could answer differently between two lines of one report.
         let state = service.query_status().map(|status| status.current_state);
         println!(
             "\nRead from {}, and nothing was changed — this is the one command here that only \
@@ -979,33 +977,6 @@ pub fn list_clients(tools: Option<&str>) -> Result<()> {
             at.display(),
             in_force(&state),
         );
-        // **A client's own surface lags the file in a way its credential does not** (review on
-        // #201, second round). A credential is in force at the reload every editing command waits
-        // for; a surface is fixed when the client is *identified*, so one holding an MCP session
-        // goes on listing what it listed then. Said only where a client carries a spec of its own
-        // and only while the service is running, because those are the two things that have to be
-        // true for the gap to exist — and the arm above has just said nothing is being served at
-        // all where the second is false.
-        if matches!(state, Ok(ServiceState::Running)) && held.iter().any(|c| c.tools.is_some()) {
-            println!(
-                "\nA client's own `{}` reaches it the next time it is identified, so this says \
-                 what a client is *configured* with rather than what it is being served this \
-                 minute: one holding an MCP session goes on listing the tools it listed at the \
-                 time, until it reconnects. One on the sessionless revision is identified on every \
-                 request and has no such gap.",
-                crate::toolset::FLAG,
-            );
-        }
-        // Said only where there is a client it is about, which is what keeps it off the line on a
-        // host where every client carries its own spec.
-        if held.iter().any(|client| client.tools.is_none()) {
-            println!(
-                "\nA client with no `{}` of its own is served whatever `{NAME}` serves — `{}` on \
-                 the command line the SCM stores, or every tool if that has none.",
-                crate::toolset::FLAG,
-                crate::toolset::FLAG,
-            );
-        }
     } else {
         println!(
             "No service named `{NAME}` is installed, so this host has no client list in a file. A \
@@ -1063,8 +1034,15 @@ pub fn list_clients(tools: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Whether the file just printed is the set the service is actually accepting — as a clause to
-/// finish the line that says where it was read from.
+/// Whether the file just printed is what the running service is actually doing with it — as a
+/// clause to finish the line that says where it was read from.
+///
+/// **One clause, not one per way they can differ.** Gating a second sentence on "some client has a
+/// spec of its own" was wrong for the case that clears the last one (review on #201, sixth round):
+/// the file then has no spec anywhere, and a client connected under the old one is still being
+/// served it. Three of six review rounds landed on this line, and every one of them was a
+/// condition that turned out to have a state it was wrong in — so the conditions are gone and the
+/// sentence is simply true whenever the service is running.
 ///
 /// **The reason this clause exists is a window [`edit_client`] deliberately leaves open** (review
 /// on #201). A `--remove-` or `--rotate-listen-client` whose reload could not be delivered writes
@@ -1081,7 +1059,11 @@ fn in_force(state: &Result<ServiceState, windows_service::Error>) -> String {
     match state {
         Ok(ServiceState::Running) => format!(
             "`{NAME}` is running, and it re-reads this file whenever a client command changes it — \
-             a command whose re-read did not land says so and exits non-zero."
+             a command whose re-read did not land says so and exits non-zero. What a *client* is \
+             served is a step further behind: a surface is fixed when the client is identified, so \
+             one holding an MCP session goes on being served what it had when it connected, \
+             whatever this file says now. One on the sessionless revision is identified on every \
+             request and is never behind."
         ),
         // The state `ask_to_reload` refuses to guess about, for the same reason: the SCM will not
         // carry a control code to a starting service, and it reads its clients moments after

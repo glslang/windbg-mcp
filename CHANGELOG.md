@@ -34,8 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   beside it, because the two differ in two unrelated ways. A credential's: a `--remove` or
   `--rotate` whose reload failed leaves a token authenticating that the file no longer names, which
   is the case an operator would run this to check. A surface's: a reload that *succeeded* still
-  does not reach a client holding an MCP session, which goes on listing the tools it listed when it
-  connected — so that gap is named wherever a client carries a spec of its own. The running service
+  does not reach a client holding an MCP session, which goes on being served what it had when it
+  connected — including when the change was to *clear* the last spec, so the caveat is
+  unconditional rather than gated on the file still holding one. The running service
   cannot be asked what it holds: its only channel carries a status code and no data, so what is
   reported beside the roster is the state that service is in, across every state it can reach —
   including **stopping**, which is not stopped: a stop ends the accept loop and then releases every
