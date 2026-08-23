@@ -1588,7 +1588,7 @@ qualified correctly.
 Landed in [`src/service.rs`](./src/service.rs) (`list_clients`, `in_force`, `service_clients`,
 `shell_clients`), [`src/listen.rs`](./src/listen.rs) and [`src/main.rs`](./src/main.rs).
 
-## 38. [windbg-mcp] A client command can write a file the installed service cannot read
+## 38. [windbg-mcp] A client command can write a file the installed service cannot read — **done** (2026-08-23)
 
 Item 36 (0.11.0) let a credential file entry be an **object** — `{"bench": {"token": "…", "tools":
 "crash"}}` — beside the bare tokens it always held. A service installed from an earlier build
@@ -1624,3 +1624,49 @@ restart, and run the client commands from the binary the service runs.
 
 Picks up at [`src/service.rs`](./src/service.rs) (`edit_client`, where the SCM handle is already
 open) and [`docs/remote-listener.md`](./docs/remote-listener.md).
+
+**Built as a warning printed by all five client commands** (2026-08-23), and
+verified against the real service on the ARM64 bench — installed from `target\release`, told about
+by `target\debug`, which is the arrangement the entry was measured in. Four things the entry did not
+anticipate, one of which would have shipped a warning that was wrong on every host.
+
+**`query_config()` does not return a path.** The entry says it "returns the `executable_path` the
+SCM stores", and the field is called that, but `QueryServiceConfigW` hands back `lpBinaryPathName` —
+the whole line the SCM starts, the exe *and* the `--service --listen 127.0.0.1:8765` after it.
+Compared against `current_exe()` as it comes, it differs from the running image on **every** host
+including every correct one, so the feature would have been a warning that is always wrong: worse
+than the silence it replaces, since it trains an operator to ignore the one time it is right. The
+image is read back out of the line (`image_in`), which is exact rather than approximate for a
+reason worth writing down — `windows-service` escapes the line the way `CommandLineToArgvW` reads
+it, and the only characters escaping introduces are `\"` and a doubled trailing `\`, neither of
+which a Windows path can hold. So there are two shapes and they are the two the SCM shows: quoted
+when the path has a space in it (`WinDefend` on this bench), bare when it does not (this service).
+
+**"`edit_client` already holds the service handle" is a trap rather than a shortcut.** That handle
+is opened with `QUERY_STATUS | USER_DEFINED_CONTROL`, the rights the command needs; adding
+`QUERY_CONFIG` to it means a host that has narrowed the service's security descriptor cannot run
+`--remove-listen-client` at all, because a *warning* wanted a right. The default descriptor grants
+that right to Authenticated Users so it would almost always work, which is exactly what makes it
+the wrong shape. The config is read on a handle of its own, and a refusal there costs the warning
+rather than the command.
+
+**It belongs on the reader too, and the entry scopes it to the writer.** `edit_client` is where the
+divergence is *created*, but `--list-listen-clients` (item 37) is where an operator goes when a
+service did not come back after a reboot — and the roster it prints is **this** build's reading of
+a file **that** build has to read, under a clause (`in_force`) saying the running service re-reads
+that file whenever a client command changes it, which on a divergent host it may not be able to do
+at all. Silence there is the shape item 37's fourth review round ruled on: it may not assert
+anything about a process it cannot see. Both print the warning, each naming its own stake in one
+clause; everything after that clause is one string.
+
+**Where it prints is decided by the path that fails.** Beside the notes at the bottom of
+`edit_client` it would be skipped exactly when it explains most: a revocation whose reload did not
+land returns an error before reaching them, and a service that cannot read the new file is one of
+the two ways that reload fails. So it is printed before the change, which also settles the gate the
+entry did not raise — a reload that lands *is* proof the other copy read what this one wrote, and
+a warning printed first cannot be conditioned on it. It says what was compared rather than what it
+concluded, which stays true whatever the reload goes on to do.
+
+Landed in [`src/service.rs`](./src/service.rs) (`image_in`, `same_image`, `foreign_image`, and one
+call in each of `edit_client` and `list_clients`) and
+[`docs/remote-listener.md`](./docs/remote-listener.md).

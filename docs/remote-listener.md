@@ -493,6 +493,19 @@ cause. Windows will not overwrite a running image, so an ordinary upgrade cannot
 you have already stopped the service to replace the file. A *development* tree with two builds in
 it can, and did (`FOLLOWUPS.md` item 38).
 
+**All five client commands say so now.** Each compares the image the SCM is registered to start
+against the copy you ran, and prints both paths when they differ. It is a warning and never a
+refusal, because a path is all there is to compare: running a client command from a second copy of
+the *same* build is legitimate and looks identical from here, and nothing carries a version between
+the two — the only channel to a running service is a control code, which comes back as a status and
+no data.
+
+```text
+warning: `windbg-mcp` is registered to run a different copy of this program than this one.
+    the SCM starts  C:\workspace\windbg-mcp\target\release\windbg-mcp.exe
+    this command is C:\workspace\windbg-mcp\target\debug\windbg-mcp.exe
+```
+
 ### Adding, revoking, rotating and re-toolling a client, without stopping anything
 
 Four commands, from an **elevated** shell, and none of them costs you a session:
@@ -655,7 +668,7 @@ does not even take the credential lock, because that lock is a file this program
 creating one is a write. The roster is the state of the file as it stood. That is what makes it the
 one command in the family worth allow-listing.
 
-Three things about it:
+Five things about it:
 
 - **It says which of the two sources it answered for.** A service's clients are in the credential
   file; a foreground listener's are the environment it was started with. Where a service is
@@ -681,6 +694,11 @@ Three things about it:
   gaps in the running one, unconditionally. Stopping is not stopped: a stop ends the accept loop and
   then releases every target, which on a host holding a live kernel is minutes, and the connections
   already accepted are served until the process exits.
+- **And it names a third difference, which is about *which program* reads the file rather than
+  when.** Where the SCM is registered to start a copy of this program other than the one you ran,
+  the roster above it is one build's reading of a file another build has to read — so the command
+  prints both paths and says so. This is the command an operator reaches for when a service did not
+  come back after a reboot, and that divergence is the reason it did not.
 
 **Stopping is graceful, and that is the point.** `Stop-Service` takes the same path a client
 disconnect takes: every session is asked to release its target before the process exits, and the SCM

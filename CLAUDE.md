@@ -600,6 +600,19 @@ rather than print a shorter list — a dropped entry is a service that will not 
 service serving fewer people. And an unelevated caller is turned away by the *credential file's* own ACL rather
 than by the lock, which is the object being protected rather than a thing beside it.
 
+**All five warn when the SCM's image is not the one running the command** (item 38), and two things
+about that bite. **`Service::query_config()` does not return a path**: the field is called
+`executable_path` and `QueryServiceConfigW` fills it from `lpBinaryPathName`, which is the whole
+line the SCM starts — exe *and* `--service --listen <addr>`. Compared as it comes it differs from
+`current_exe()` on every host, correct ones included, so the warning would be a warning that is
+always wrong. `image_in` reads the image back out of the line; a real service on this bench shows
+both shapes it has to handle (`WinDefend`'s path is quoted, this service's is not). And the config
+is read on a **handle of its own** rather than on the one `edit_client` already holds: adding
+`QUERY_CONFIG` there would let a host with a narrowed service descriptor fail
+`--remove-listen-client` because a warning wanted a right. It is a warning and never a refusal, for
+the reason that is easy to try to "fix" — nothing carries a version between the two, so a second
+copy of the *same* build is indistinguishable from a stale one.
+
 **Identity is ambient inside a call, carried by the instance, and by name outside both.**
 `crate::client::current()` reads a task-local, which is why no tool signature carries a caller. What
 sets it around a tool call is **`call_tool`**, from the client its `WindbgServer` was built with —
