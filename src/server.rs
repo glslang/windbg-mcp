@@ -4458,34 +4458,56 @@ interrupted - it waits indefinitely, and `end_session` reclaims that session alo
 /// client reads, so a fragment added here is paid for by every client that group is served to.
 const GROUP_INSTRUCTIONS: &[(&[&str], &str)] = &[
     (
-        "crash",
+        &["crash_triage"],
         "`crash_triage` reads a bug check as fields, with the crashing stack and the module each frame \
      belongs to.",
     ),
     (
-        "inspect",
+        &["modules", "dx", "execute"],
         "`modules` lists the module table and carries each image's identity - the coordinate that \
      survives a reboot and joins a disassembler; frames and instructions carry `module`+`rva` beside \
      their address. `dx` runs any data-model expression, and `execute` any raw command without a \
      dedicated tool.",
     ),
     (
-        "exec",
+        &[
+            "go",
+            "step_over",
+            "step_into",
+            "set_breakpoint",
+            "run_to_address",
+        ],
         "`go`, `step_over` and `step_into` drive a stopped target, `set_breakpoint` arms one, and \
      `run_to_address` needs a KDNET/VM kernel target, not a local one.",
     ),
     (
-        "ttd",
+        &[
+            "reverse_go",
+            "step_back",
+            "step_over_back",
+            "goto_position",
+            "ttd_calls",
+            "ttd_memory",
+            "ttd_events",
+            "record_trace",
+        ],
         "TTD: `reverse_go`, `step_back` and `step_over_back` run backward, `goto_position` jumps, \
      `ttd_calls`/`ttd_memory`/`ttd_events` query a trace and `record_trace` makes one.",
     ),
     (
-        "ioctl",
+        &[
+            "decode_ioctl",
+            "driver_object",
+            "device_object",
+            "irp_stack",
+            "ioctl_trace",
+            "reachable_from_dispatch",
+        ],
         "Driver IOCTL: `decode_ioctl`, `driver_object`, `device_object`, `irp_stack`, `ioctl_trace`, and \
      `reachable_from_dispatch` - is a block reachable from the dispatch routine.",
     ),
     (
-        "batch",
+        &["debug_batch"],
         "When a sequence *mutates* the target - a patched byte, an armed breakpoint, a resumed thread - \
      run it as one `debug_batch`: its `always` block runs on every path, including a failed \
      assertion, an expired deadline and a client disconnect, so cleanup cannot be lost.",
