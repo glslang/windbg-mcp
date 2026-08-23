@@ -37,10 +37,24 @@ foreach ($client in 'full', 'lean', 'min') {
     }
 }
 
-# No unnamed token: that one would name a client called `local`, which is what the *editor*
-# connects as on the other listener. Two clients of one name on two ports is a confusion this
-# run does not need.
+# **Three inherited variables, each of which breaks this run in a different way.** The account
+# this lands in is whatever the ssh session gives you, and it may already be configured to run
+# this server.
+#
+#   WINDBG_MCP_LISTEN_TOKEN       would name a client called `local`, which is what the *editor*
+#                                 connects as on the other listener - two clients of one name on
+#                                 two ports is a confusion this run does not need.
+#   WINDBG_MCP_LISTEN_TOKEN_FILE  is worse than it looks: a configured file is the *whole*
+#                                 configuration and shuts the environment out entirely, named
+#                                 tokens included, so the three below would create no clients at
+#                                 all and every cell would fail authentication.
+#   WINDBG_MCP_TOOLS_FULL         would pair an inherited spec with the token minted below, so the
+#                                 51-tool control would be silently narrowed while this script
+#                                 still announces `full (all)` - a benchmark measuring a surface
+#                                 nobody chose.
 Remove-Item Env:WINDBG_MCP_LISTEN_TOKEN -ErrorAction SilentlyContinue
+Remove-Item Env:WINDBG_MCP_LISTEN_TOKEN_FILE -ErrorAction SilentlyContinue
+Remove-Item Env:WINDBG_MCP_TOOLS_FULL -ErrorAction SilentlyContinue
 
 $env:WINDBG_MCP_LISTEN_TOKEN_FULL = $cfg.full
 $env:WINDBG_MCP_LISTEN_TOKEN_LEAN = $cfg.lean
