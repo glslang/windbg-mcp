@@ -9,6 +9,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A tool surface per client, not just per server** (`FOLLOWUPS.md` item 36, which closes it). A
+  `--listen` server names its clients already, and they do not have one budget between them: the
+  arrangement this listener exists for is a local model that can hold twenty tools beside a hosted
+  client that can hold fifty-one, on the same box and against the same debug sessions. So a client
+  may be configured with a `--tools` spec of its own — `WINDBG_MCP_TOOLS_<NAME>` beside its token,
+  or a `tools` field in the credential file — and two credentials on one port get two `tools/list`
+  answers.
+
+  **The run's `--tools` is the default rather than a ceiling.** A client with no spec of its own is
+  served whatever the run serves; a client with one is served that instead, wider or narrower,
+  because an intersection would produce a surface neither the operator nor the client ever named.
+  `session` is added to a client's spec exactly as it is to a run's.
+
+  The credential file's entries may now be objects — `{"bench": {"token": "…", "tools": "crash"}}` —
+  beside the bare tokens they always were, which keep meaning what they meant. A spec naming a
+  client nothing configures a token for is **refused at startup**, on the precedent of the two
+  collisions that file already refuses: a surface no credential can reach is a setting that would
+  never take effect, and the way to write one is the typo that makes the two variables disagree.
+
+  **`--set-listen-client-tools <name> --tools <spec>`** changes a service-hosted listener's client
+  surface without a reinstall or a restart, the way item 34's three commands change a token; with
+  no `--tools` at all it puts the client back on the service's own surface. It mints no credential
+  and revokes none. A `--tools` beside `--rotate-` or `--remove-listen-client` is refused rather
+  than ignored, because it reads exactly like a command that had narrowed that client.
+
+  **A surface change reaches a client on its next connection**, and nothing announces one. The
+  surface is fixed where the caller is identified — `initialize` for a client holding an MCP
+  session, every request for one on `2026-07-28` — and no `notifications/tools/list_changed` is
+  sent: this server keeps no handle to notify a session through, and the sessionless revision has
+  no session to notify, so it would be a guarantee on one revision and silence on the other. The
+  command that changes a surface says so.
+
+  A tool that exists and is not served is still refused by name rather than as an unknown tool, and
+  the message now names **which** configuration to widen — the run's flag, or that client's own
+  entry — since the caller can see neither.
+
 - **`--tools` serves a named subset of the tool surface** (`FOLLOWUPS.md` item 24's last finding,
   which closes that item). All 51 tools cost a model **67,658 B — about 17k tokens — once per
   conversation, before it has asked anything**. `--tools session,inspect,crash` makes that 20 tools
@@ -30,10 +66,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by name ("not on the surface this run advertises") rather than as an unknown tool, because the
   remedy is a flag on a command line the caller cannot see.
 
-  Server-wide: on the stdio command line, on a `--listen` one, or on `--install-service`, where it
-  is written into the command line the SCM stores and read back at every start - the only place an
-  install's choice survives to. Per-caller, on a listener whose clients are already named, is filed
-  as item 36.
+  On the stdio command line, on a `--listen` one, or on `--install-service`, where it is written
+  into the command line the SCM stores and read back at every start - the only place an install's
+  choice survives to. It was server-wide when it landed; the entry above makes it a run's default
+  that a named client may replace.
 
 - **A service-hosted listener's clients can be changed without a reinstall**
   (`FOLLOWUPS.md` item 34). `--add-listen-client <name>`, `--remove-listen-client <name>` and

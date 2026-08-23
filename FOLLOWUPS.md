@@ -833,8 +833,8 @@ landed on their own so that each of the items below can be argued, and measured,
   per half was the first thing tried here, and this repo had already argued it down one tool over.
 
 **This item is done.** Every bullet is fixed, measured-and-declined, or answered; what came out of
-it that is still open is one *new* item — a per-caller tool surface, item 36 — rather than anything
-left over here.
+it was one *new* item — a per-caller tool surface, item 36, itself since closed — rather than
+anything left over here.
 
 **Where this bites first is a local model**, whose window is bought in RAM rather than rented:
 [`docs/local-model.md`](./docs/local-model.md) is the runbook, and it names the three client-side
@@ -1440,7 +1440,7 @@ asserted against whatever architecture the host is
 - **What it is worth if reopened:** ~1.8 KB of a ~6.3 KB answer, on ARM64 only. Real, and smaller
   than the 6.3 KB item 24 already took off the same tool.
 
-## 36. [windbg-mcp] The tool surface is server-wide, not per caller
+## 36. [windbg-mcp] The tool surface is server-wide, not per caller — **done** (2026-08-22)
 
 `--tools` (item 24's last bullet) narrows what a run advertises, and it narrows it for *everybody*
 on that run. That is the right answer for stdio, which has one client by construction, and it is
@@ -1449,31 +1449,42 @@ listener was built for: a local model that can hold twenty tools and a hosted cl
 fifty-one, pointed at the same Windows box and the same debug sessions, told apart by their bearer
 tokens already.
 
-**What it would take.** The identity is already there — `client::Client`, one credential per client
-(`WINDBG_MCP_LISTEN_TOKEN_<NAME>`), captured in the listener's service factory and carried by the
-`WindbgServer` instance. `Toolset` is already an instance field beside it, and `listen.rs`'s factory
-is the single line that sets it. So the work is not plumbing, it is:
+**It was three lines of plumbing and three decisions**, which is what the item predicted: the
+identity was already there, `Toolset` was already an instance field beside it, and `listen.rs`'s
+factory is the line that sets both. What the work actually was:
 
-- **A per-client spec, from a source that already exists.** `WINDBG_MCP_TOOLS_<NAME>` beside the
-  token variable is the obvious spelling, which means it also belongs in the credential *file* the
-  service reads — and that file is the thing `--add-listen-client` writes, so a client's surface
-  becomes something an operator changes without a reinstall, the same way its token is.
-  `Credentials::from_entries` is where the parsing goes, and its two collision refusals are the
-  precedent for what to do with a spec naming a client that has no token.
-- **Two-client coverage**, which is the half that has bitten before. `FOLLOWUPS.md` item 29 was
-  filed as call-site coverage and its first assertion failed for real: every call ran as the default
-  `local`, because a task-local does not cross rmcp's `initialize` spawn. A per-client surface has
-  exactly that shape — right in every unit test, wrong on the wire — so the assertion that matters
-  is two clients on one listener seeing two different `tools/list` answers.
-- **A decision about `tools/list_changed`.** rmcp's router can notify, and a reload
-  (`--add-listen-client`, `--rotate-listen-client`) can now change a client's set while it is
-  connected. Whether a surface change is announced or only seen on reconnect is a real choice, and
-  the reload path is where it would go.
+- **A per-client spec, from the source that already existed.** `WINDBG_MCP_TOOLS_<NAME>` beside the
+  token variable, and a `tools` field in the credential file — where an entry may now be
+  `{"token": "…", "tools": "session,crash"}` as well as the bare token it always was.
+  `Credentials::build` parses it with the flag's own parser, so a spec the listener would refuse is
+  refused at startup rather than served as an empty tool list; `Toolset::parse_from` takes the
+  source's rendered name, because the vocabulary is written down in three places now and a refusal
+  that always said `--tools` would send an operator to a command line they never typed. A spec
+  naming a client with no token is refused on the precedent the item pointed at — the collision
+  refusals — since it is a setting that could never take effect.
 
-**Depends on** item 24's `--tools`, which is what defines a spec and a group. **Worth doing when**
-there is a second client with a different budget — the measurement that motivates it is in
-[`docs/local-model.md`](./docs/local-model.md), and until then one server-wide flag is the same
-thing with less to get wrong.
+- **Two-client coverage**, which is the half the item said had bitten before, and it is
+  `mcp_smoke::two_clients_on_one_listener_are_served_two_surfaces`: two tokens on one port, two
+  `tools/list` answers, on the session-bearing route *and* the stateless one. Protocol tier — a
+  tool list and a surface refusal need no target, and the tier's contract is that they must not.
 
-Picks up at [`src/toolset.rs`](./src/toolset.rs), `listen.rs`'s service factory, and
-[`src/client.rs`](./src/client.rs).
+- **`tools/list_changed` is not sent**, and that is the decision rather than a gap. This server
+  keeps no peer handle to notify an MCP session through, and `2026-07-28` has no session to notify
+  at all, so it would be a guarantee on one revision and silence on the other. A surface is instead
+  fixed where the caller is identified — `initialize`, or every request on the stateless
+  revision — so a change reaches a client when it next connects, one sentence for both.
+  `--set-listen-client-tools` says so where an operator reads it.
+
+**The run's flag became a default rather than a ceiling.** A client's own spec replaces it, wider or
+narrower: intersecting the two can produce a surface neither the operator nor the client ever named,
+and "which of these two is in force" is a question with an answer either way, while "what is the
+overlap of these two" is not one anybody would predict.
+
+**Two things the change had to correct rather than add.** The refusal for a tool off the surface
+told every caller to widen `--tools`, which is the wrong command for a client with an entry of its
+own — it now names whichever configuration chose the surface (`Toolset::refusal`, `Chosen`). And
+`--add-listen-client` printed "it gets the whole tool surface, as every client here does", which
+this makes false; it says what the client is actually served.
+
+Landed in [`src/toolset.rs`](./src/toolset.rs), [`src/client.rs`](./src/client.rs),
+[`src/listen.rs`](./src/listen.rs) and [`src/service.rs`](./src/service.rs).

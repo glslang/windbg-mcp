@@ -307,8 +307,10 @@ None of these is a bug. They are recorded because they were invisible, and
 
    `session` is in every surface because every other tool routes by a `session_id` this server is
    the only issuer of — 12,161 B is the floor, and `crash` is eleven tools rather than one. The
-   choice is **server-wide**; a per-caller surface on the listener, where clients are already named,
-   is item 36.
+   flag is a **run's** choice, and on a listener it is the *default*: a named client may be
+   configured with a spec of its own (`WINDBG_MCP_TOOLS_<NAME>`), so the figures above are per
+   client rather than per server — which is what lets a local model and a hosted client share one
+   listener. Item 36.
 
 One interaction worth flagging before acting on any of it: `FOLLOWUPS.md` item 11 proposes *adding*
 `structuredContent` to `ttd_calls`, `ttd_memory` and `driver_object` — three of the highest-volume

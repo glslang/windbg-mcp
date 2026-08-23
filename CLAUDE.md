@@ -497,11 +497,17 @@ it — it starts a server with all eight group names and asserts that equals the
 There is no such thing as a tool in two groups, and a group named after a tool is refused by a unit
 test, because `Toolset::parse` resolves group names first and would decide it silently.
 
-Two rules worth knowing before touching it. **`session` is in every surface** whatever the spec
+Three rules worth knowing before touching it. **`session` is in every surface** whatever the spec
 says, because every other tool routes by a `session_id` this server alone issues — so `--tools
-crash` is eleven tools and 12,161 B is the floor. And **output schemas carry no prose at all**
+crash` is eleven tools and 12,161 B is the floor. **Output schemas carry no prose at all**
 (`src/schema.rs`): declare one with `schema::constraints_of`, never rmcp's `schema_for_output`, or
-the tool ships every doc comment in its `$defs` closure and the wire ceiling notices.
+the tool ships every doc comment in its `$defs` closure and the wire ceiling notices. And **a
+surface is per client, not per run** (item 36): `--tools` is the run's *default*, and a listener's
+client may be configured with a spec of its own (`WINDBG_MCP_TOOLS_<NAME>`, or a `tools` field in
+the credential file) that replaces it. So a change to a group is a change to what several
+differently-budgeted callers see, and the assertion that catches a per-client mistake is two
+credentials on one port — `two_clients_on_one_listener_are_served_two_surfaces`, not a unit test,
+for the reason the next section gives.
 
 ## Several clients on one listener (`src/client.rs`)
 
@@ -513,6 +519,13 @@ a service-hosted listener holds more than one, and `--install-service` copies ev
 variable in the shell rather than the unnamed one alone. Under stdio everything runs as `local`,
 so there is one set of rules and no transport exception. `docs/remote-listener.md` is the operator's
 half; what follows is what bites while editing.
+
+**A credential also carries a tool surface**, since item 36: `WINDBG_MCP_TOOLS_<NAME>` beside the
+token, or a `tools` field in a file entry that is then an object rather than a string. That
+follows the same precedence — a configured file is the whole configuration, so the variable is not
+read on a host that has one — for a reason that is not secrecy but arithmetic: one file answering
+who may connect and another answering what they get is two files to keep in step and a precedence
+rule to remember.
 
 **Identity is ambient inside a call, carried by the instance, and by name outside both.**
 `crate::client::current()` reads a task-local, which is why no tool signature carries a caller. What
@@ -528,6 +541,16 @@ the two-client smoke tier found it (`FOLLOWUPS.md` item 29): every call ran as t
 so both clients' sessions were owned by `local` and each could see, route to and end the other's,
 while every unit test passed — each sets the identity itself, and the tier ran one client, for whom
 `local` is the right answer.
+
+**The factory now decides a second thing on that line, with the same failure mode**: which tools
+this client is served (item 36). A client may carry a `Toolset` beside its name, so
+`credentials.surface_for(&client)` is read there and nowhere later — a surface resolved after the
+factory would be resolved for whichever task rmcp happened to serve the call from, which is exactly
+the bug above wearing a different hat. It is covered the only way that shape can be:
+`two_clients_on_one_listener_are_served_two_surfaces` puts two tokens on one port and asserts two
+different `tools/list` answers, on the session-bearing route and the stateless one. One client
+cannot state the claim — with one credential, "this client's spec" and "the run's spec" are the same
+answer.
 
 Anything running *outside* a call — the listener's own diagnostics, a sweep, a shutdown — gets the
 default `local` instead of an error, so it must take the client as a parameter

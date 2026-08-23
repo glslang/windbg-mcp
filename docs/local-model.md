@@ -58,13 +58,17 @@ WINDBG_MCP_TOKEN="<the driver's token>" python3 tools/local_model_drive.py [task
 **A credential of its own is the requirement; a listener of its own is how to get one.** The script
 refuses to run on the token your editor is registered with, because a shared credential is a shared
 namespace: the run would see, route to, and at the four-session cap cause the reclamation of your
-targets. And a *service*-hosted listener cannot be given a second client without an uninstall and a
-reinstall, which drops every session it is holding ([`remote-listener.md`](./remote-listener.md#adding-or-rotating-a-client-afterwards-costs-a-reinstall)).
-Neither of those is a thing to do for a measurement.
+targets. A surface of its own is *not* the reason — `WINDBG_MCP_TOOLS_<NAME>` gives one client a
+smaller surface on a listener it shares, so the budget alone no longer argues for a second process.
 
-A foreground listener on a second port costs nothing and disappears when you close it. Generate the
-token on the machine that will *use* it, and pass it over **stdin** — never on a command line, where
-every process on the box can read it:
+A foreground listener on a second port costs nothing and disappears when you close it, which is
+still the right shape for a bench: no privileged write, nothing to clean up, and a build that is
+not the installed one. (A service-hosted listener can be given a client without a reinstall these
+days — `--add-listen-client` — so that is an option rather than the obstacle it was; see
+[`remote-listener.md`](./remote-listener.md#adding-revoking-rotating-and-re-toolling-a-client-without-stopping-anything).)
+
+Generate the token on the machine that will *use* it, and pass it over **stdin** — never on a
+command line, where every process on the box can read it:
 
 ```pwsh
 # on the debug host, from a script run over ssh with the token on stdin:
@@ -97,13 +101,19 @@ uses:
 
 ```console
 setx WINDBG_MCP_LISTEN_TOKEN_DRIVER "<another long random string>"
+setx WINDBG_MCP_TOOLS_DRIVER        "session,inspect,crash"
 ```
 
-That is not a nicety. A shared credential is a shared **namespace**: the driver would see and route
-to the editor's sessions, and — the part no fence in a script can prevent — a client over the
-four-session cap has its oldest *idle* session reclaimed by the server, so a dump the driver opens
-can evict the editor's target without any tool call naming it. The script therefore refuses to run
-without a token rather than borrowing one; it cannot tell one token from another, so supplying a
+The second line is what makes this work on a listener the editor also uses: the driver is served 20
+tools and 25,265 B while every other client on that listener keeps all 51. Leave it out and the
+driver is served whatever the listener was started with, which is the older behaviour and is the
+right one when the listener is the driver's own.
+
+The first line is not a nicety. A shared credential is a shared **namespace**: the driver would see
+and route to the editor's sessions, and — the part no fence in a script can prevent — a client over
+the four-session cap has its oldest *idle* session reclaimed by the server, so a dump the driver
+opens can evict the editor's target without any tool call naming it. The script therefore refuses to
+run without a token rather than borrowing one; it cannot tell one token from another, so supplying a
 credential that really is its own is yours to get right.
 
 **Under the service, that variable is not where the token goes.** The installer points the service
@@ -310,8 +320,11 @@ client-side.**
   67,658 — `--tools crash` is 11 and 15,073 B, which is the difference between "roughly twice an 8k
   window" and "half of one". Nothing is reworded: the tools that remain are the tools they were.
   The whole table is in [`token-budget.md`](./token-budget.md) under finding 8, and the README has
-  the operator's half. It is server-wide rather than per client, which for the arrangement on this
-  page — one listener, one local model — is the same thing.
+  the operator's half. **And it is per client as well as per run** (2026-08-22): a listener's
+  clients are named already, so `WINDBG_MCP_TOOLS_<NAME>` beside the token gives one of them its
+  own surface — which is what lets the bench below share a listener with a hosted client rather
+  than needing one of its own for the budget's sake. The credential is still the reason to run a
+  second one; see the next section.
 - **The response budget arrived per tool**, not caller-wide: `modules`' `limit`, above.
 - **The text-or-data switch is still unbuilt**, and is the one that needs a client rather than a
   server change: which half of a result reaches the model is the client's forwarding policy.

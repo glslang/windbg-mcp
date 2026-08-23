@@ -59,12 +59,18 @@ pub struct WindbgServer {
     /// moment the caller is knowable, so the identity is captured there and re-entered around
     /// every call.
     client: crate::client::Client,
-    /// Which of the tools this run advertises — every one of them unless `--tools` said otherwise.
+    /// Which of the tools this instance advertises — every one of them unless something narrowed
+    /// it.
     ///
     /// Carried rather than read from a global, for the reason `Credentials::from_entries` is: a
-    /// process-wide cell set once from `argv` is state the whole test binary shares, and this is
-    /// decided at startup precisely so that a test can build two servers with different surfaces.
+    /// process-wide cell set once from `argv` is state the whole test binary shares. It is also
+    /// what makes the surface **per client** rather than per run: the listener builds an instance
+    /// where the caller is knowable and can pass that client's own spec, and two credentials on
+    /// one port therefore get two `tools/list` answers.
     surface: crate::toolset::Toolset,
+    /// Whether that was this run's choice or this client's, which is the only half of a refusal a
+    /// caller can act on — see [`crate::toolset::Chosen`].
+    chosen: crate::toolset::Chosen,
 }
 
 fn text_result(s: String) -> Result<CallToolResult, ErrorData> {
@@ -2534,16 +2540,23 @@ impl WindbgServer {
             sessions,
             client,
             surface: crate::toolset::Toolset::all(),
+            chosen: crate::toolset::Chosen::ForTheRun,
         }
     }
 
-    /// The same server, advertising only the tools `--tools` asked for.
+    /// The same server, advertising only the tools it was narrowed to — and knowing **whose
+    /// choice that was**, because that is what the refusal for a tool off the surface has to say.
     ///
     /// Separate from the constructors rather than a parameter on both, so every existing caller —
     /// the unit tests included — keeps the whole surface by construction and only a run that was
     /// told to narrow it does.
-    pub fn with_tools(mut self, surface: crate::toolset::Toolset) -> Self {
+    pub fn with_tools(
+        mut self,
+        surface: crate::toolset::Toolset,
+        chosen: crate::toolset::Chosen,
+    ) -> Self {
         self.surface = surface;
+        self.chosen = chosen;
         self
     }
 
@@ -4462,19 +4475,14 @@ impl WindbgServer {
         context: rmcp::service::RequestContext<rmcp::RoleServer>,
     ) -> Result<rmcp::model::CallToolResponse, ErrorData> {
         let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
-        // A tool this build has and this *surface* does not. rmcp would answer the router's own
-        // `tool not found`, which is the right status and the wrong sentence: it is what a typo
-        // gets, and this is not a typo — the tool exists, the operator narrowed the surface, and
-        // the remedy is a flag on a command line the caller cannot see. Said here rather than in
-        // the router because only this server knows the difference.
+        // A tool this build has and this *surface* does not. Said here rather than in the router
+        // because only this server knows the difference between that and a typo — and the message
+        // is [`Toolset::refusal`]'s because only the surface knows which of two configurations the
+        // caller's operator has to go and widen.
         if !self.surface.includes(tcc.name()) && crate::toolset::Toolset::exists(tcc.name()) {
             return Err(ErrorData::invalid_params(
-                format!(
-                    "`{}` is a tool this server has, but it is not on the surface this run                      advertises ({}). It was started with `{}`; widen that spec, or drop it to                      serve every tool.",
-                    tcc.name(),
-                    self.surface.summary(),
-                    crate::toolset::FLAG,
-                ),
+                self.surface
+                    .refusal(tcc.name(), self.client.name(), self.chosen),
                 None,
             ));
         }

@@ -35,14 +35,29 @@
 //! is the floor of any usable surface — `--tools crash` is eleven tools, not one, and the startup
 //! line says so rather than leaving the addition to be discovered.
 //!
-//! # Where this stops
+//! # Who a surface belongs to
 //!
-//! **Server-wide**, decided from `argv` before anything is built. The listener names its clients
-//! already ([`crate::client`]), so a per-caller surface — a local model getting twenty tools and a
-//! full client fifty-one on the same server — is the obvious next step and is `FOLLOWUPS.md` item
-//! 36. It is deliberately not this change: the router is `WindbgServer::tool_router()`, a
-//! static, and making it per-instance is a separate argument with its own two-client coverage to
-//! write.
+//! **A run has one, and a client may have its own.** `--tools` is the run's, decided from `argv`
+//! before anything is built, and it is the whole story under stdio — one process, one client, and
+//! the flag is right there on the command line that started it.
+//!
+//! A listener names its clients already ([`crate::client`]), and they do not have one budget
+//! between them: the arrangement this exists for is a local model that can hold twenty tools and a
+//! hosted client that can hold fifty-one, pointed at the same Windows box and the same debug
+//! sessions and told apart by their bearer tokens. So a client may be configured with a spec of
+//! its own — `WINDBG_MCP_TOOLS_<NAME>`, or a `tools` field in the credential file — and is served
+//! that instead of the run's. The run's `--tools` is the **default**, not a ceiling: a client's
+//! own spec replaces it rather than intersecting with it, because an intersection can produce a
+//! surface neither the operator nor the client ever named.
+//!
+//! **When a change takes effect is a decision, and the answer is "when the client next connects".**
+//! A surface is fixed on the line that captures the caller's identity — the listener's service
+//! factory, which rmcp runs once per MCP session and once per request on `2026-07-28`. Nothing
+//! sends `notifications/tools/list_changed` after a reload: this server keeps no peer handle to
+//! notify through, and the stateless revision has no session to notify at all, so it would be a
+//! guarantee on one revision and silence on the other. A client that reconnects sees the new
+//! surface; one that does not keeps the surface it listed. See [`Chosen`] for the other half of
+//! that — what a caller is told when it calls a tool the surface does not have.
 
 use std::collections::BTreeSet;
 
@@ -203,6 +218,18 @@ impl Toolset {
     /// tools I actually call" is a real answer. They are resolved against [`GROUPS`], so a spec can
     /// only ever name a tool this server has.
     pub fn parse(spec: &str) -> Result<Self, String> {
+        Self::parse_from(spec, &format!("`{FLAG} {spec}`"))
+    }
+
+    /// The same, told what to call the thing it is reading.
+    ///
+    /// The vocabulary is written down in three places now — this flag, a `WINDBG_MCP_TOOLS_<NAME>`
+    /// variable, and a client's entry in the credential file — and a refusal that named the wrong
+    /// one would send an operator to edit a command line they never typed. So the source arrives
+    /// already rendered, for the same reason a credential's source is in [`crate::client`]: how a
+    /// source is referred to is the source's business, and one template cannot render a flag, a
+    /// variable and a file entry.
+    pub fn parse_from(spec: &str, source: &str) -> Result<Self, String> {
         let mut included = BTreeSet::new();
         let mut named_anything = false;
         let mut everything = false;
@@ -231,7 +258,7 @@ impl Toolset {
                 }
                 None => {
                     return Err(format!(
-                        "`{FLAG} {spec}`: `{entry}` is neither a group nor a tool. {}",
+                        "{source}: `{entry}` is neither a group nor a tool. {}",
                         Self::vocabulary()
                     ));
                 }
@@ -239,10 +266,7 @@ impl Toolset {
         }
 
         if !named_anything {
-            return Err(format!(
-                "`{FLAG} {spec}` selects nothing. {}",
-                Self::vocabulary()
-            ));
+            return Err(format!("{source} selects nothing. {}", Self::vocabulary()));
         }
 
         // After the loop, so every name in the spec has been checked first. `all` beside a group is
@@ -352,6 +376,52 @@ impl Toolset {
     fn total() -> usize {
         GROUPS.iter().map(|g| g.tools.len()).sum()
     }
+
+    /// What a caller gets when it calls a tool this build has and this surface does not.
+    ///
+    /// rmcp would answer the router's own `tool not found`, which is the right status and the
+    /// wrong sentence: it is what a typo gets, and this is not a typo — the tool exists and an
+    /// operator narrowed the surface. The only part of that a caller can act on is **which of two
+    /// configurations to ask about**, since it can see neither this server's command line nor its
+    /// client list; that is [`Chosen`], and it is why this message is built here rather than
+    /// where the refusal is returned.
+    pub fn refusal(&self, tool: &str, client: &str, chosen: Chosen) -> String {
+        format!(
+            "`{tool}` is a tool this server has, but it is not on the surface {} ({}). {}",
+            match chosen {
+                Chosen::ForTheRun => "this run advertises".to_string(),
+                Chosen::ForThisClient => format!("it serves `{client}`"),
+            },
+            self.summary(),
+            match chosen {
+                Chosen::ForTheRun => format!(
+                    "It was started with `{FLAG}`; widen that spec, or drop it to serve every \
+                     tool."
+                ),
+                Chosen::ForThisClient => format!(
+                    "That is `{client}`'s own surface rather than this run's: \
+                     `{} {client} {FLAG} <spec>` widens it, and needs no restart.",
+                    crate::service::SET_CLIENT_TOOLS_FLAG
+                ),
+            }
+        )
+    }
+}
+
+/// Whose choice a surface was.
+///
+/// The only part of a [refusal](Toolset::refusal) a caller can act on. It can see neither this
+/// server's command line nor its client list, so a message that named the wrong one of the two
+/// would send its operator to widen a spec that is not the one in force — and the two are changed
+/// by different commands, on different machines' worth of privilege.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Chosen {
+    /// [`FLAG`] on this run's command line, or its absence. Every stdio run, and every client of a
+    /// listener that was not given a surface of its own.
+    ForTheRun,
+    /// This client's own entry in the listener's configuration — a `WINDBG_MCP_TOOLS_<NAME>`
+    /// variable, or a `tools` field in the credential file.
+    ForThisClient,
 }
 
 #[cfg(test)]
@@ -466,6 +536,58 @@ mod tests {
             .expect("the flag was given")
             .expect_err("with nothing after it");
         assert!(error.contains("needs a spec"), "{error}");
+    }
+
+    /// A refusal names the thing the operator has to go and edit, which is not always the flag.
+    ///
+    /// The vocabulary is written down in three places now — this flag, a `WINDBG_MCP_TOOLS_<NAME>`
+    /// variable, and a client's entry in the credential file — and a message that always said
+    /// `--tools` would send an operator to a command line that has nothing to do with the spec
+    /// they wrote.
+    #[test]
+    fn a_refusal_names_the_source_the_spec_was_written_in() {
+        let error = Toolset::parse_from("crash,ttdd", "`WINDBG_MCP_TOOLS_CI`")
+            .expect_err("`ttdd` is not a group");
+        assert!(error.starts_with("`WINDBG_MCP_TOOLS_CI`: "), "{error}");
+        assert!(
+            error.contains("`ttdd` is neither a group nor a tool"),
+            "{error}"
+        );
+        assert!(!error.contains(FLAG), "{error}");
+        // And the flag's own spelling of the same refusal is unchanged, which is what `parse`
+        // exists for.
+        assert!(
+            Toolset::parse("crash,ttdd")
+                .expect_err("`ttdd` is not a group")
+                .starts_with("`--tools crash,ttdd`: "),
+        );
+    }
+
+    /// The surface a client is refused from is described by whoever chose it.
+    ///
+    /// A caller can see neither this server's command line nor its client list, so the only part
+    /// of this message worth anything is which of the two its operator has to widen — and naming
+    /// the wrong one sends them to a spec that is not in force.
+    #[test]
+    fn a_refusal_points_at_whichever_configuration_chose_the_surface() {
+        let surface = Toolset::parse("crash").expect("`crash` is a group");
+
+        let run = surface.refusal("debug_batch", "bench", Chosen::ForTheRun);
+        assert!(run.contains("this run advertises"), "{run}");
+        assert!(run.contains("It was started with `--tools`"), "{run}");
+        assert!(!run.contains("bench"), "a run's surface is nobody's: {run}");
+
+        let own = surface.refusal("debug_batch", "bench", Chosen::ForThisClient);
+        assert!(own.contains("it serves `bench`"), "{own}");
+        assert!(
+            own.contains("--set-listen-client-tools bench --tools <spec>"),
+            "the remedy has to be the command that changes *this* surface: {own}"
+        );
+        // Both name the tool and what is served, because those do not depend on who chose it.
+        for said in [&run, &own] {
+            assert!(said.contains("`debug_batch`"), "{said}");
+            assert!(said.contains("11 of 51 tools (session, crash)"), "{said}");
+        }
     }
 
     #[test]
