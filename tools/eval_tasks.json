@@ -1,6 +1,6 @@
 {
   "suite": "windbg-mcp local-model eval v1",
-  "note": "Six tasks with a mechanical answer key, read off the checked-in sample dumps with this server's own tools before any model saw them (2026-08-23). `needs` names the tool group a task cannot be answered without, which is what makes the surface axis predictive rather than decorative: `session` is in every surface, `crash` is in two of the three, `ioctl` only in the whole one. `expect` is a list of groups, all of which must appear in the final answer, any alternative within a group counting; `bonus` is recorded but never decides pass/fail. `possible_on` names the surfaces on which the answer key is reachable at all, which is what keeps a narrowed surface from being scored as a stupid model: on `min` three of the six tasks have no tool that can answer them. Two tasks are reachable on every surface because `open_dump`'s own summary carries the bug check and the module count - the opener is doing more work than the tool table suggests.",
+  "note": "Six tasks with a mechanical answer key, read off the checked-in sample dumps with this server's own tools before any model saw them (2026-08-23). `needs` names the tool group a task cannot be answered without, which is what makes the surface axis predictive rather than decorative: `session` is in every surface whatever a spec says, `crash` is in all three of these, `inspect` in two of them, and `ioctl` only in the whole one. `expect` is a list of groups, all of which must appear in the final answer, any alternative within a group counting; `bonus` is recorded but never decides pass/fail. `possible_on` names the surfaces on which the answer key is reachable at all, which is what keeps a narrowed surface from being scored as a stupid model: on `min` three of the six tasks have no tool that can answer them. Two tasks are reachable on every surface because `open_dump`'s own summary carries the bug check and the module count - the opener is doing more work than the tool table suggests.",
   "tasks": [
     {
       "id": "bugcheck",
@@ -83,7 +83,7 @@
         "full",
         "lean"
       ],
-      "prompt": "In the kernel crash dump C:\\workspace\\windbg-mcp\\docs\\samples\\052126-34312-01.dmp, is the driver nvhda64v.sys loaded? If it is not, is there any record of it having been loaded earlier?",
+      "prompt": "In the kernel crash dump C:\\workspace\\windbg-mcp\\docs\\samples\\052126-34312-01.dmp, is the driver nvhda64v.sys loaded? If it is not, how many records of it having been loaded earlier does the dump still carry?",
       "expect": [
         [
           "not loaded",
@@ -166,6 +166,9 @@
       "bugcheck",
       "module_count",
       "ioctl_decode"
+    ],
+    "unloaded": [
+      "unloaded_driver"
     ]
   },
   "answer_key": {

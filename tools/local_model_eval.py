@@ -33,6 +33,7 @@ a (model, context, surface, task) already in the log is not run again.
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -138,7 +139,11 @@ def run_cell(plan, tokens, backend, model, context, surface, subset, budget_s, l
     print(f"\n=== cell {label} -> {os.path.basename(stdout_path)}")
     started = time.time()
     with open(stdout_path, "w", encoding="utf-8") as out:
-        proc = subprocess.Popen(argv, env=env, stdout=out, stderr=subprocess.STDOUT, cwd=cwd)
+        # Its own process group, so the budget below can take the *cell* down rather than only
+        # the driver: a Claude cell's driver has `claude` as a child, and killing the parent
+        # alone leaves that running against the listener the next cell is about to use.
+        proc = subprocess.Popen(argv, env=env, stdout=out, stderr=subprocess.STDOUT, cwd=cwd,
+                                start_new_session=True)
         try:
             proc.wait(timeout=budget_s)
         except subprocess.TimeoutExpired:
@@ -146,7 +151,10 @@ def run_cell(plan, tokens, backend, model, context, surface, subset, budget_s, l
             # inside a generous wall clock has told us something; a grid that waits for it
             # has not. The kill is recorded as the cell's outcome rather than as an error of
             # the harness.
-            proc.kill()
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
             proc.wait()
             print(f"    budget of {budget_s}s exceeded; cell killed")
             note = {"run": plan["run"], "backend": backend, "model": model,
@@ -295,7 +303,13 @@ def summarise(log_path, tasks_file):
             # A cell-level note - a killed cell - rather than a task record.
             cell["cell_error"] = record.get("error")
             continue
-        cell["tasks"].append(grade_record(record, key[record["task"]], surface.get("names")))
+        task = key.get(record["task"])
+        if task is None:
+            # A log outlives the suite: a task renamed or dropped since the run should cost its
+            # own row, not every row in the file.
+            print(f"  skipping unknown task `{record['task']}` in the log")
+            continue
+        cell["tasks"].append(grade_record(record, task, surface.get("names")))
     for cell in cells.values():
         graded = cell["tasks"]
         cell["n"] = len(graded)
@@ -356,7 +370,10 @@ def matrix(log_path, tasks_file):
         surface = record.get("surface") or {}
         row = rows.setdefault((record.get("backend"), record.get("model"), record.get("num_ctx"),
                                surface.get("client")), {})
-        graded = grade_record(record, key[record["task"]], surface.get("names"))
+        task = key.get(record["task"])
+        if task is None:
+            continue
+        graded = grade_record(record, task, surface.get("names"))
         served, asked = record.get("served_context"), record.get("num_ctx")
         if asked and served and asked != served:
             mark = "?"

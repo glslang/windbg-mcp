@@ -33,3 +33,7 @@ package-lock.json
 
 # Local Claude Code config
 .claude/
+
+# Output of the local-model eval (`tools/local_model_eval.py`), which the checked-in plan
+# writes here: run logs and one JSON record per task. Measurements, not sources.
+eval-out/
