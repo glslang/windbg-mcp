@@ -74,6 +74,13 @@ left running when you are done:
 ssh -L 8765:127.0.0.1:8765 windbg-vm 'windbg-mcp.exe --listen 127.0.0.1:8765'
 ```
 
+**"As long as the tunnel" means as long as the ssh *command*, not as long as the client process.**
+End it normally — Ctrl-C, or the command returning — and the listener goes with it. Kill the ssh
+client instead and sshd is never told the connection ended, so the listener stays up and keeps the
+port; the next start fails to bind and reads like something else is using it. It is then stopped by
+the PID owning that port, and **not** by image name, since an installed service is the same
+executable and stopping it drops whatever sessions it is holding.
+
 The token comes from the environment `setx` put it in, which an ssh session inherits.
 
 **Know what that protects and what it does not.** This server strips `WINDBG_MCP_LISTEN_TOKEN` from

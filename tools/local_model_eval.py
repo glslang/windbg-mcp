@@ -318,16 +318,22 @@ def summarise(log_path, tasks_file):
 
 def print_table(cells):
     head = (f"{'backend':<12} {'model':<28} {'ctx':>7} {'surface':<6} {'tools':>5} "
-            f"{'ok/possible':>12} {'tokens':>13} {'calls u/w/h/x':>14} {'wall':>6}")
+            f"{'ok/possible':>13} {'tokens':>13} {'calls u/w/h/x':>14} {'wall':>6}")
     print("\n" + head)
     print("-" * len(head))
     for c in sorted(cells, key=lambda c: (c["backend"], c["model"], -(c["num_ctx"] or 0),
                                           c["surface"] or "")):
         tokens = f"{c['prompt_tokens'][0]}-{c['prompt_tokens'][1]}" if c["prompt_tokens"] else "-"
+        # **The numerator is the answerable ones.** A task this surface cannot answer, answered
+        # anyway from the model's own knowledge, is counted in `correct` and not in `possible` -
+        # so printing one over the other reads `6/5`. The false positives are real and are worth
+        # seeing, so they travel beside the score as `+n` rather than inside it.
+        extra = c["correct"] - c["correct_of_possible"]
+        score = f"{c['correct_of_possible']}/{c['possible']}" + (f"+{extra}" if extra else "")
         print(f"{c['backend']:<12} {(c['model'] or '')[:28]:<28} "
               f"{str(c['num_ctx'] or 'dflt'):>7} {str(c['surface'] or '')[:6]:<6} "
               f"{str(c['tools'] or '-'):>5} "
-              f"{c['correct']}/{c['possible']} of {c['n']:<5} {tokens:>13} "
+              f"{score} of {c['n']:<5} {tokens:>13} "
               f"{c['useful']}/{c['wasted']}/{c['hallucinated']}/{c['errors']:<8} "
               f"{c['wall_s']:>5}s")
 
@@ -413,6 +419,15 @@ def main():
         return
 
     plan = load(sys.argv[1])
+    # **Resolved before anything runs, because one backend does not share this cwd.** The Claude
+    # cells are started in a neutral directory (see `run_cell`), so a plan naming
+    # `tools/eval_tasks.json` relative to where the runner was invoked would have that child
+    # looking for it under the log directory - and writing its records to a different
+    # `results.jsonl` than the grader later reads. Absolute paths make the two agree whatever
+    # directory a cell runs in.
+    for field in ("tasks", "out", "logs"):
+        if plan.get(field):
+            plan[field] = os.path.abspath(plan[field])
     tokens = tokens_for(plan)
     log_path = plan["out"]
     logs_dir = plan.get("logs", os.path.join(os.path.dirname(log_path), "logs"))
