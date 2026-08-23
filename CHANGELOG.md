@@ -50,6 +50,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including **stopping**, which is not stopped: a stop ends the accept loop and then releases every
   target, and the connections already accepted are served until the process exits.
 
+### Documentation
+
+- **`README.md` is now a map rather than the manual.** It had grown to 986 lines carrying twelve
+  topics end to end, so a reader looking for one of them scrolled past the other eleven, and every
+  topic's prose was in the one file a newcomer opens first. Each topic is now its own document
+  under `docs/` — [`architecture.md`](docs/architecture.md), [`install.md`](docs/install.md),
+  [`mcp-clients.md`](docs/mcp-clients.md), [`releasing.md`](docs/releasing.md),
+  [`tool-surface.md`](docs/tool-surface.md), [`sessions.md`](docs/sessions.md),
+  [`kernel-profiles.md`](docs/kernel-profiles.md), [`structured-results.md`](docs/structured-results.md),
+  [`debug-batch.md`](docs/debug-batch.md), [`walk-memory.md`](docs/walk-memory.md),
+  [`transcripts.md`](docs/transcripts.md), [`limitations.md`](docs/limitations.md) and
+  [`walkthroughs.md`](docs/walkthroughs.md) — and the README keeps an index, a quick start, the
+  tool table, and a summary of each topic that links to it. **The prose moved verbatim**; what
+  changed is where it lives.
+
+  The **`## Tools` table stays in the README**, because `docs/messagemanager-walkthrough.md` and
+  two of the new documents link to `README.md#tools`, and because it is the one thing a reader
+  wants before deciding to read anything else.
+
+  Three references were wrong before the move and are fixed rather than carried over: the
+  *Requirements* section pointed at a *"TTD engine"* section that has never existed (it meant
+  *Bundling the WinDbg engine*), the platform badge linked to `#requirements` on a README that no
+  longer has that heading, and `crash_triage`'s "no `!analyze`" error told the reader to see "the
+  README's engine setup". Source comments in `src/schema.rs`, `src/structured.rs`, `src/worker.rs`
+  and `tests/mcp_smoke.rs` that cited a README section now cite the document holding it.
+
 ## [0.11.0] - 2026-08-23
 
 ### Added

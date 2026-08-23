@@ -2158,7 +2158,8 @@ fn render_backtrace(trace: &structured::StackTrace, asked: usize) -> String {
 /// and an instruction's operands are full of them: `bl nt!Foo (fffff801`3c677ef0)`.
 ///
 /// Removed here for two reasons that happen to agree. This server spells an address one way
-/// ([`structured::addr`]), and the README says the debugger's form appears only in raw text; and
+/// ([`structured::addr`]), and `docs/structured-results.md` says the debugger's form appears only
+/// in raw text; and
 /// that tick is the delimiter of the code span this text is printed in, so leaving it means every
 /// operand carrying an address renders as `\u{60}` once [`renderable`] has made it safe.
 ///
@@ -2456,7 +2457,7 @@ fn run_analyze(e: &DebugEngine, patience: Duration, before: Duration) -> Analysi
     } else {
         format!(
             "neither `!analyze -v` nor `!ext.analyze -v` resolved — the engine most likely has no \
-             `winext\\ext.dll` beside it (see the README's engine setup). Last attempt: {}",
+             `winext\\ext.dll` beside it (see `docs/install.md`). Last attempt: {}",
             last.unwrap_or_else(|| "no output".to_string())
         )
     };

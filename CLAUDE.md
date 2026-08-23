@@ -1,7 +1,9 @@
 # CLAUDE.md
 
-Guidance for Claude Code working in this repo. See `README.md` for architecture and the full tool
-surface; this file covers the non-obvious operational workflows.
+Guidance for Claude Code working in this repo. `README.md` is the map — it carries the tool table
+and links out to one document per topic under `docs/` (`architecture.md`, `sessions.md`,
+`tool-surface.md`, `structured-results.md`, …); this file covers the non-obvious operational
+workflows.
 
 ## What this is
 

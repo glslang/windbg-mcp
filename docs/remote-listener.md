@@ -273,7 +273,7 @@ client that can authenticate as holding the whole thing, including `launch`.
 
 ### A tool surface per client
 
-The [`--tools` spec](../README.md#serving-fewer-tools---tools) narrows what a run advertises, and a
+The [`--tools` spec](./tool-surface.md#serving-fewer-tools---tools) narrows what a run advertises, and a
 client may be given one of its own — configured beside its token, under the same rule for the name:
 
 ```console
