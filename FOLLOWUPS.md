@@ -1713,7 +1713,7 @@ Two smaller things the same run left open:
   ARM64 Mac serving MLX builds. The correctness columns should travel; the timings should not be
   quoted anywhere else.
 
-## 40. [windbg-mcp] `--tools` narrows the tool list and not the instructions
+## 40. [windbg-mcp] `--tools` narrows the tool list and not the instructions — **done** (2026-08-23)
 
 A client's surface is per credential since [#196](https://github.com/glslang/windbg-mcp/pull/196),
 and what that narrows is the **router**: `tools/list` answers with the client's own set, and a call
@@ -1744,9 +1744,17 @@ That is a rewrite of the instructions as data rather than a constant, and it mov
 tests assert on (`the_instructions_fit_what_the_client_reads`, the discovery assertion in
 `src/server.rs`, and the tool-budget golden).
 
-**Where it picks up.** `#[rmcp::tool_handler]` supplies `get_info` only when the impl does not —
-the same rule `call_tool` already relies on — so the override point is a hand-written `get_info`
-that assembles the text from the client the instance carries (`crate::client::current()` is not
-right here: the surface is captured in the listener's factory, and `WindbgServer` already holds
-it). The measurement to keep is the one above: instructions bytes against tools actually served,
-per client.
+**Where it picks up — and it did.** `#[rmcp::tool_handler]` supplies `get_info` only when the impl
+does not, the same rule `call_tool` already relies on, so the override is a hand-written `get_info`
+assembling the text from the surface `WindbgServer` already holds (`crate::client::current()` is
+not right here: the surface is captured in the listener's factory). Done that way, with
+`Toolset::serves_group` as the question each fragment asks.
+
+Two things the entry did not anticipate. **`name` had to move with `instructions`**, because both
+are literals on the same attribute and the macro reads them only while generating the `get_info`
+that is now hand-written — left behind, the server would introduce itself as `rmcp` at the SDK's
+version, which a protocol-tier assertion catches. And **the budget golden moves by seven
+characters**: the whole-surface assembly is 1,983 against the constant's 1,990, which is the only
+part of this a golden can see. What it cannot see is the direction that mattered — `crash` reading
+927 characters instead of 1,990 — so that is asserted with two credentials on one listener, which
+is the same shape every other per-client property here needs.
