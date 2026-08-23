@@ -524,10 +524,11 @@ reach is the wiring, which is what these assert against a real listener on a loo
 hand-written HTTP client (a library that normalised a `409` into an exception, or hid the session
 header, would be asserting on this server's behalf).
 
-Six of them need no debugger, because none of them needs a session to be open. All six
-run a listener holding a **single, unnamed** token, so what they prove they prove for the `local`
-client alone; the per-client rules are unit-tested where they are decided, and closing that
-end-to-end gap is [`FOLLOWUPS.md`](../FOLLOWUPS.md) item 29:
+Six of them need no debugger, because none of them needs a session to be open, and all six run a
+listener holding a **single, unnamed** token — so what they prove, they prove for the `local`
+client alone. That was once the whole listener tier, and the gap it left was
+[`FOLLOWUPS.md`](../FOLLOWUPS.md) item 29; the three tests under [Two clients, two of
+everything](#two-clients-two-of-everything) below are what closed it:
 
 - *It will not start without a token*, and says which variable is missing. The listener exposes
   every tool here, including the ones that write to a live kernel; a quiet default would be a
@@ -543,7 +544,7 @@ end-to-end gap is [`FOLLOWUPS.md`](../FOLLOWUPS.md) item 29:
   owned per client, a credential opening a second MCP session contests nothing — both reach the same
   debug sessions, because they are the same client. Both are exercised, and the assertion underneath
   is that an id **this server never issued** is still not served. An id *another client* holds is
-  refused too; that needs two tokens, so it is unit-tested and is part of item 29's gap.
+  refused too; that needs two tokens, so it is asserted below rather than here.
 - *Going quiet is not leaving; saying goodbye is.* Every request is its own connection — which is
   what a client behind a tunnel looks like — so silence is the resting state, and a server that read
   it as departure would release a working client's targets between two of its calls. Returning with
@@ -564,7 +565,33 @@ end-to-end gap is [`FOLLOWUPS.md`](../FOLLOWUPS.md) item 29:
   refused. Both shapes the probe sent are pinned here, so the same `400` cannot be read as a broken
   listener a second time.
 
-Two more are in the debugger tier, because each needs a real engine worker.
+Three more of the six's neighbours also need no debugger, and none of them is about the lease:
+
+- *A **token file** names its own clients, and shuts the environment out.* Both halves pull against
+  each other, so both are asserted on one listener: a file naming `local` and `ci` serves both, and
+  the unnamed `WINDBG_MCP_LISTEN_TOKEN` the harness always sets — which is the environment half,
+  needing no arranging — authenticates nobody. The precedence is
+  load-bearing — the installer ACLs that file precisely because the machine environment is readable
+  by unprivileged processes — while a file that could name only one client made the per-client
+  boundary unreachable in the deployment `docs/remote-listener.md` recommends (item 31). The parse
+  and precedence rules are unit-tested in [`client.rs`](../src/client.rs); what this reaches is the
+  call site, a real listener reading a real file.
+- *A `2026-07-28` handshake may **omit** `MCP-Protocol-Version`, and the client is ordinary
+  afterwards.* It is the one request of that revision which may — `initialize` *establishes* the
+  revision — and it was the likeliest shape a real client sends and the only one nothing drove:
+  stdio has no headers to omit, and the harness's own stateless opener sends one. The hazard it
+  used to carry is deleted rather than covered (a headerless handshake was classified as an opener
+  and armed a deadline that would release the client's own targets one grace later), so what this
+  pins is that the shape is served at all (item 30).
+- *A run started with `--tools` advertises the narrowed surface **over HTTP**.* stdio builds one
+  `WindbgServer` in `main` and the listener builds one per MCP session in its service factory, so
+  the narrowing is applied on two different lines and only one of them is the one that has been
+  wrong before. `--tools crash` is asserted as the eleven tools it is — `crash_triage` and the
+  openers present, `debug_batch` absent — and the startup line as the surface it ended up with,
+  which is not the spec that was typed.
+
+Two more of the lease's own assertions are in the debugger tier, because each needs a real engine
+worker.
 
 The first is the contention half of #168 at its sharpest: *a stateless client can work while one of
 its own calls is parked*. The park is a **kernel attach nothing will answer**, and what
@@ -588,6 +615,37 @@ come up, so the budget is shrunk to a second) and watches **stderr**, not HTTP �
 request renews the lease, so a test that polled would hold open the very thing it is waiting to
 expire. It asserts the worker process is gone, the swept session id is no longer served, and the
 next client gets a server with nothing left over. Budget ~40s.
+
+### Two clients, two of everything
+
+Three tests put **two credentials on one listener**, which is the only way to state a per-client
+rule at all: with one credential, "this client's" and "the run's" are the same answer, so every
+assertion passes whether or not the identity ever reached the call. That is not hypothetical — the
+first of these failed for real when it was written (item 29). `listen::gate` scopes the caller
+around the HTTP task, rmcp serves a legacy MCP session from a task it spawns at `initialize`, and a
+task-local does not cross a spawn, so **every tool call ran as the default `local`**: both clients'
+sessions were owned by `local`, each could see, route to and end the other's, and every unit test
+passed, because each supplies the identity itself.
+
+- *Two clients keep their sessions to themselves.* **Debugger tier**, and not by preference: a
+  handle another client cannot use has to be a handle, and an adoption counts debug sessions rather
+  than the MCP ones the protocol tier can mint on its own. Two clients open a dump each and are
+  shown their own and no other's; another client's handle is reported **unknown** rather than
+  refused, so the answer cannot confirm a session the caller may not touch. Asserted on the
+  session-bearing route *and* the stateless one, because the bug was one of them losing the
+  identity, and a fix that held for only one would make the boundary depend on the revision a
+  client negotiated.
+- *Two clients are served two **surfaces**.* Protocol tier — a tool list needs no target, and
+  neither does a refusal for a tool that is off the surface, which is answered before anything is
+  routed. The listener runs `--tools session,inspect` with `WINDBG_MCP_TOOLS_BENCH=crash` beside a
+  second token, so the two answers are 19 tools and 11 and neither is a subset of the other: the
+  run's flag is a **default**, not a ceiling (item 36). It also pins both halves of the refusal —
+  `local` is told to widen the run's `--tools`, `bench` is told about its own entry — since naming
+  the wrong one sends an operator to a spec that is not in force. Both routes again, for the reason
+  above.
+- *A **token file** naming two clients serves both* — the item-31 test in the list further up,
+  counted here as well because it is the third of the three: under a service that file is the whole
+  of what is read, so it is the only place a second client can come from at all.
 
 **Progress notifications.** The policy — what is reported, when a silence becomes a heartbeat, that
 a send never delays the call — has unit tests in [`progress.rs`](../src/progress.rs) against a
