@@ -132,6 +132,11 @@ const ARM64_DRIVER_CRASH_DUMP: &str = concat!(
 /// an ARM64 image's headers and an ARM64 stack's frames. Nothing else in this suite does
 /// ([#143](https://github.com/glslang/windbg-mcp/issues/143)); its provenance is in
 /// `docs/smoke-test.md`.
+///
+/// Gated to match its only use: [`NATIVE_SAMPLE`] below, whose other arm an x64 build takes
+/// instead. Ungated it is dead code on x64 - which is every run of this suite bar the ARM64
+/// leg of the matrix, so the warning was the common case rather than the rare one.
+#[cfg(target_arch = "aarch64")]
 const ARM64_SAMPLE_DUMP: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/docs/samples/121524-4703-01.dmp"
