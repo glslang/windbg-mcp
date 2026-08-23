@@ -632,7 +632,9 @@ A client with no `--tools` of its own is served whatever `windbg-mcp` serves —
 command line the SCM stores, or every tool if that has none.
 
 This shell configures no listener credentials of its own (nothing in the
-`WINDBG_MCP_LISTEN_TOKEN` variables), so the list above is the whole of what this host has.
+`WINDBG_MCP_LISTEN_TOKEN` variables), so there is no second set here to list — though a
+foreground listener started from *another* shell carries whatever that one configured, which
+nothing here can see.
 ```
 
 The other four all print that roster, and until this one there was no way to ask for it **without
