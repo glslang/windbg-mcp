@@ -245,7 +245,7 @@ def grade_record(record, task, surface_names):
     calls = record.get("calls") or []
     useful = set(task.get("useful_tools", []))
     verdicts = {"useful": 0, "wasted": 0, "off_surface": 0, "refused": 0, "errored": 0,
-                "hallucinated": 0, "harness_tool": 0}
+                "unserved": 0, "harness_tool": 0}
     for call in calls:
         name = call.get("name")
         verdict = call.get("verdict")
@@ -253,11 +253,15 @@ def grade_record(record, task, surface_names):
             # The client's own machinery, not a pick out of this server's surface.
             verdicts["harness_tool"] += 1
             continue
-        # **A name the surface never offered is the finding this axis exists for.** The model
-        # was handed a tool list; asking for something outside it is invention, whether the
-        # server then refuses it or the harness does.
+        # **A call for a tool this client is not served.** Named `unserved` rather than
+        # `hallucinated`, which is what it was called until the run was read properly: the
+        # server sends the same `instructions` string to every client, and that string names
+        # `modules`, `execute`, `decode_ioctl` and `debug_batch` whether or not the client is
+        # served them. A model asking for one of those was told about it by this server. The
+        # count is still worth having - it measures a real cost in wasted turns - but it is a
+        # measure of the server's advertising, not of the model's imagination.
         if surface_names and name not in surface_names:
-            verdicts["hallucinated"] += 1
+            verdicts["unserved"] += 1
         if verdict == "ok":
             verdicts["useful" if name in useful else "wasted"] += 1
         elif verdict == "refused_by_harness":
@@ -340,7 +344,7 @@ def summarise(log_path, tasks_file):
         cell["correct_of_possible"] = sum(1 for g in graded if g["correct"] and g["possible"])
         cell["false_positive"] = sum(1 for g in graded if g["correct"] and not g["possible"])
         cell["errors"] = sum(1 for g in graded if g["error"])
-        cell["hallucinated"] = sum(g["hallucinated"] for g in graded)
+        cell["unserved"] = sum(g["unserved"] for g in graded)
         cell["harness_tool"] = sum(g["harness_tool"] for g in graded)
         cell["off_surface"] = sum(g["off_surface"] for g in graded)
         cell["wasted"] = sum(g["wasted"] for g in graded)
@@ -371,7 +375,7 @@ def print_table(cells):
               f"{str(c['num_ctx'] or 'dflt'):>7} {str(c['surface'] or '')[:6]:<6} "
               f"{str(c['tools'] or '-'):>5} "
               f"{score} of {c['n']:<5} {tokens:>13} "
-              f"{c['useful']}/{c['wasted']}/{c['hallucinated']}/{c['errors']:<8} "
+              f"{c['useful']}/{c['wasted']}/{c['unserved']}/{c['errors']:<8} "
               f"{c['wall_s']:>5}s{failed}")
 
 
