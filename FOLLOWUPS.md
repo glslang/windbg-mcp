@@ -1569,5 +1569,12 @@ being served by tasks nothing awaits or aborts. The comment in [`src/listen.rs`]
 that said those connections "are dropped" is what produced the wrong sentence, and it is now
 exact — the shutdown ends the *accepting*, not the serving.
 
+A fourth round found the same shape one sentence over, and it is worth recording as the rule this
+command is really under: **it may not assert anything about a process it cannot see.** The empty
+environment branch said the service's roster was "the whole of what this host has", which a second
+foreground listener on another port — recommended two paragraphs earlier in
+`docs/remote-listener.md` — makes false, and which the non-empty branch beside it had always
+qualified correctly.
+
 Landed in [`src/service.rs`](./src/service.rs) (`list_clients`, `in_force`, `service_clients`,
 `shell_clients`), [`src/listen.rs`](./src/listen.rs) and [`src/main.rs`](./src/main.rs).

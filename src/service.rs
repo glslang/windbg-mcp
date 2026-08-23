@@ -1019,9 +1019,15 @@ pub fn list_clients(tools: Option<&str>) -> Result<()> {
     // way the claim is about a listener started from **this** shell — not about one already
     // running elsewhere, whose clients are the environment it was started with.
     match (shell_clients(), installed.is_some()) {
+        // **"No second set *here*", not "no second set at all"** (review on #201, fourth round).
+        // A second foreground listener on another port is a normal arrangement — this page's own
+        // docs recommend it for a bench — and it carries whatever the shell that started it
+        // configured, which nothing in this process can see. The non-empty arm below has always
+        // said so; this one claimed the roster above was the whole of the host.
         (Ok((source, clients)), true) if clients.is_empty() => println!(
             "\nThis shell configures no listener credentials of its own (nothing in {source}), so \
-             the list above is the whole of what this host has."
+             there is no second set here to list — though a foreground listener started from \
+             *another* shell carries whatever that one configured, which nothing here can see."
         ),
         (Ok((source, clients)), false) if clients.is_empty() => println!(
             "\nAnd a foreground listener started from this shell would refuse to start: there are \
