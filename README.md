@@ -3,7 +3,7 @@
 [![CI](https://github.com/glslang/windbg-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/glslang/windbg-mcp/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![CodeRabbit Pull Request Reviews](https://img.shields.io/coderabbit/prs/github/glslang/windbg-mcp?utm_source=oss&utm_medium=github&utm_campaign=glslang%2Fwindbg-mcp&labelColor=171717&color=FF570A&label=CodeRabbit+Reviews)](https://coderabbit.ai)
-[![Latest release](https://img.shields.io/badge/release-v0.10.0-blue)](https://github.com/glslang/windbg-mcp/releases/latest)
+[![Latest release](https://img.shields.io/badge/release-v0.11.0-blue)](https://github.com/glslang/windbg-mcp/releases/latest)
 [![Platform: Windows x64](https://img.shields.io/badge/platform-Windows%20x64-0078D6)](https://github.com/glslang/windbg-mcp#requirements)
 
 An [MCP](https://modelcontextprotocol.io) server that exposes **WinDbg/DbgEng** to AI agents
