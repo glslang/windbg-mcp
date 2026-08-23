@@ -1,0 +1,180 @@
+{
+  "suite": "windbg-mcp local-model eval v1",
+  "note": "Six tasks with a mechanical answer key, read off the checked-in sample dumps with this server's own tools before any model saw them (2026-08-23). `needs` names the tool group a task cannot be answered without, which is what makes the surface axis predictive rather than decorative: `session` is in every surface, `crash` is in two of the three, `ioctl` only in the whole one. `expect` is a list of groups, all of which must appear in the final answer, any alternative within a group counting; `bonus` is recorded but never decides pass/fail. `possible_on` names the surfaces on which the answer key is reachable at all, which is what keeps a narrowed surface from being scored as a stupid model: on `min` three of the six tasks have no tool that can answer them. Two tasks are reachable on every surface because `open_dump`'s own summary carries the bug check and the module count - the opener is doing more work than the tool table suggests.",
+  "tasks": [
+    {
+      "id": "bugcheck",
+      "needs": "crash",
+      "possible_on": [
+        "full",
+        "lean",
+        "min"
+      ],
+      "prompt": "There is a Windows kernel crash dump on the debug host at C:\\workspace\\windbg-mcp\\docs\\samples\\081226-2187-01.dmp. What bug check did this machine stop on? Give the code and its name.",
+      "expect": [
+        [
+          "0x13a",
+          "13a"
+        ],
+        [
+          "heap corruption",
+          "heap_corruption"
+        ]
+      ],
+      "useful_tools": [
+        "open_dump",
+        "crash_triage",
+        "session_status",
+        "end_session"
+      ]
+    },
+    {
+      "id": "driver_blame",
+      "needs": "crash",
+      "possible_on": [
+        "full",
+        "lean",
+        "min"
+      ],
+      "prompt": "In the kernel crash dump C:\\workspace\\windbg-mcp\\docs\\samples\\081226-2187-01.dmp, which third-party driver is responsible for the crash, and at what offset into that driver did it fault?",
+      "expect": [
+        [
+          "messagemanager"
+        ]
+      ],
+      "bonus": [
+        [
+          "0x1654",
+          "1654"
+        ]
+      ],
+      "useful_tools": [
+        "open_dump",
+        "crash_triage",
+        "backtrace",
+        "modules",
+        "session_status",
+        "end_session"
+      ]
+    },
+    {
+      "id": "module_count",
+      "needs": "session",
+      "possible_on": [
+        "full",
+        "lean",
+        "min"
+      ],
+      "prompt": "How many modules are loaded in the kernel crash dump C:\\workspace\\windbg-mcp\\docs\\samples\\052126-34312-01.dmp?",
+      "expect": [
+        [
+          "227"
+        ]
+      ],
+      "useful_tools": [
+        "open_dump",
+        "modules",
+        "session_status",
+        "end_session"
+      ]
+    },
+    {
+      "id": "unloaded_driver",
+      "needs": "inspect",
+      "possible_on": [
+        "full",
+        "lean"
+      ],
+      "prompt": "In the kernel crash dump C:\\workspace\\windbg-mcp\\docs\\samples\\052126-34312-01.dmp, is the driver nvhda64v.sys loaded? If it is not, is there any record of it having been loaded earlier?",
+      "expect": [
+        [
+          "not loaded",
+          "no longer loaded",
+          "not currently",
+          "isn't loaded",
+          "is not loaded",
+          "unloaded"
+        ],
+        [
+          "unload"
+        ],
+        [
+          "26"
+        ]
+      ],
+      "useful_tools": [
+        "open_dump",
+        "modules",
+        "session_status",
+        "end_session"
+      ]
+    },
+    {
+      "id": "arm64_pc",
+      "needs": "inspect",
+      "possible_on": [
+        "full",
+        "lean",
+        "min"
+      ],
+      "prompt": "Open the ARM64 kernel crash dump C:\\workspace\\windbg-mcp\\docs\\samples\\121524-4703-01.dmp and tell me the value of the pc register at the point of the crash.",
+      "expect": [
+        [
+          "0xfffff8013c65bca8",
+          "fffff8013c65bca8",
+          "fffff801`3c65bca8"
+        ]
+      ],
+      "useful_tools": [
+        "open_dump",
+        "registers",
+        "backtrace",
+        "session_status",
+        "end_session"
+      ],
+      "note": "`registers` is the direct route; `crash_triage` frame 0 carries the same address on this dump, which is why every surface can reach it."
+    },
+    {
+      "id": "ioctl_decode",
+      "needs": "ioctl",
+      "possible_on": [
+        "full"
+      ],
+      "prompt": "Decode the Windows IOCTL control code 0x22200B: device type, function code, transfer method and required access.",
+      "expect": [
+        [
+          "0x22",
+          "0x0022"
+        ],
+        [
+          "0x802",
+          "802"
+        ],
+        [
+          "neither"
+        ],
+        [
+          "any access",
+          "any_access"
+        ]
+      ],
+      "useful_tools": [
+        "decode_ioctl"
+      ]
+    }
+  ],
+  "subsets": {
+    "short": [
+      "bugcheck",
+      "module_count",
+      "ioctl_decode"
+    ]
+  },
+  "answer_key": {
+    "081226-2187-01.dmp": "x64, 0x13a KERNEL_MODE_HEAP_CORRUPTION, 158 modules, faulting frame MessageManager+0x1654, process mm_exploit_v5.exe, pool tag TNf_",
+    "052126-34312-01.dmp": "x64, 0x9f DRIVER_POWER_STATE_FAILURE, 227 modules loaded, nvhda64v.sys not loaded with 26 unload records",
+    "121524-4703-01.dmp": "ARM64, 0xfc ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY, 177 modules, pc 0xfffff8013c65bca8",
+    "082126-7015-01.dmp": "ARM64, 0x139 KERNEL_SECURITY_CHECK_FAILURE, 181 modules, faulting frame HEVD+0x10dc, process powershell.exe",
+    "0x22200B": "DeviceType 0x0022, FunctionCode 0x802, METHOD_NEITHER, FILE_ANY_ACCESS"
+  }
+}

@@ -31,6 +31,17 @@ Configuration:
                         than a conversation and a target apiece
     WINDBG_MCP_KEEPALIVE  seconds of silence after which this run pings the listener to
                         keep its lease alive (default 120; `0` disables) — see below
+    NUM_CTX             context window to serve this run at, in tokens; empty means
+                        whatever `OLLAMA_CONTEXT_LENGTH` already decides. This is the
+                        eval's context axis — see `chat`
+    OLLAMA_KEEP_ALIVE   how long the runtime keeps the model resident after a request
+                        (default `10m`); `0` evicts it, which is what frees the box
+                        between one model's cells and the next
+    WINDBG_MCP_EVAL_OUT a file to append one JSON record per task to, for
+                        `local_model_eval.py` to grade. Without it this script prints
+                        and keeps nothing, which is what it did before the eval existed
+    MAX_STEPS           tool-calling turns a task may take before it is given up on
+                        (default 6)
 
 **Why the keepalive exists.** The listener releases a client's sessions when its lease
 runs out, and the grace is derived from how long a *call* may take, on the assumption
@@ -45,11 +56,15 @@ import os
 import sys
 import threading
 import time
+import urllib.error
 import urllib.request
 
 MCP_URL = os.environ.get("WINDBG_MCP_URL", "http://127.0.0.1:8765/")
 OLLAMA = os.environ.get("OLLAMA_URL", "http://localhost:11434/api/chat")
 MODEL = os.environ.get("LOCAL_MODEL", "")
+NUM_CTX = int(os.environ.get("NUM_CTX", "0") or 0)
+KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "10m")
+EVAL_OUT = os.environ.get("WINDBG_MCP_EVAL_OUT", "")
 REVISION = "2025-06-18"
 
 # Tool calls this harness will actually execute. Everything else is reported back
@@ -66,7 +81,7 @@ ALLOWED = {
     "read_memory", "server_log",
 }
 
-MAX_STEPS = 6
+MAX_STEPS = int(os.environ.get("MAX_STEPS", "6"))
 
 # The debug sessions this run opened, which are the only ones it may end — and the
 # ones it ends on the way out, so a run does not leave a worker holding a target for
@@ -268,24 +283,60 @@ def as_ollama(tools):
     }} for tool in tools]
 
 
+class ChatFailed(Exception):
+    """The runtime refused the request, which for this harness is a result rather than a crash.
+
+    A surface that does not fit the served window is the whole point of the context axis, and
+    the way it presents is an HTTP error carrying a sentence about tokens — so a run that let
+    `urlopen` raise would lose the one fact the cell was measuring. The body travels with the
+    exception and into the record.
+    """
+
+
 def chat(messages, tools):
-    body = {"model": MODEL, "messages": messages, "tools": tools, "stream": False, "think": False}
+    body = {"model": MODEL, "messages": messages, "tools": tools, "stream": False,
+            "think": False, "keep_alive": KEEP_ALIVE}
+    if NUM_CTX:
+        # **The window is a property of the runtime, not of the model.** `ollama show` reports
+        # what the weights could take; what a request is actually served is
+        # `OLLAMA_CONTEXT_LENGTH` unless a request says otherwise, and this is that override —
+        # the eval's context axis is this number moving. Setting it *reloads* the model, so the
+        # matrix runs every surface at one context before it moves to the next.
+        body["options"] = {"num_ctx": NUM_CTX}
     req = urllib.request.Request(OLLAMA, data=json.dumps(body).encode(), method="POST")
     req.add_header("Content-Type", "application/json")
-    with urllib.request.urlopen(req, timeout=1800) as response:
-        return json.load(response)
+    try:
+        with urllib.request.urlopen(req, timeout=1800) as response:
+            return json.load(response)
+    except urllib.error.HTTPError as e:
+        raise ChatFailed(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:400]}") from e
 
 
 def call_tool(name, args):
-    """Run one tool call. Returns (text for the model, ok, full size in characters)."""
+    """Run one tool call, and hand back a record of it whose `text` is what the model sees.
+
+    A record rather than a bare answer because the eval grades *how* a call went, and the
+    three ways it can fail are not the same finding: `refused_by_harness` is this script's
+    read-only fence, `error` is the server saying no — which on a narrowed surface is the
+    tool not being served at all — and `transport_error` is the link. Counting them together
+    would report a model that invented a tool and a model that asked for a bad address as
+    having made the same mistake.
+    """
+    started = time.time()
+    def record(text, ok, chars, verdict):
+        return {"name": name, "args": args, "ok": ok, "chars": chars, "verdict": verdict,
+                "took_s": round(time.time() - started, 1), "text": text,
+                "excerpt": text[:300]}
     if name not in ALLOWED:
-        return f"refused: `{name}` is not permitted in this harness", None, 0
+        return record(f"refused: `{name}` is not permitted in this harness",
+                      None, 0, "refused_by_harness")
     if name == "end_session" and args.get("session_id") not in OPENED:
         # One rule, and it covers the call that names nothing: without a `session_id`
         # the server ends this credential's *current* session, which may be a
         # predecessor's leftover rather than anything this run opened.
-        return (f"refused: `{args.get('session_id') or 'the current session'}` was not opened by "
-                "this run, so it is not this harness's to end"), None, 0
+        return record(
+            f"refused: `{args.get('session_id') or 'the current session'}` was not opened by "
+            "this run, so it is not this harness's to end", None, 0, "refused_by_harness")
     try:
         out = mcp("tools/call", {"name": name, "arguments": args})
     except Exception as e:  # a transport failure is a result the model can react to
@@ -295,7 +346,7 @@ def call_tool(name, args):
             # ever name that handle: the model retries and gets a second target, and
             # the cleanup has nothing to release. Ask what exists instead of assuming.
             reconcile_opened()
-        return f"transport error: {e}", False, 0
+        return record(f"transport error: {e}", False, 0, "transport_error")
     result = out.get("result", {})
     # **Both kinds of failure.** A protocol error arrives as a top-level `error`; an
     # ordinary tool failure — a bad address, a stale handle — arrives as a perfectly
@@ -316,7 +367,7 @@ def call_tool(name, args):
         OPENED[:] = [s for s in OPENED if s != args.get("session_id")]
     if RESULT_LIMIT and size > RESULT_LIMIT:
         text = text[:RESULT_LIMIT] + f"\n[truncated by the harness: {size} characters in full]"
-    return text, ok, size
+    return record(text, ok, size, "ok" if ok else "error")
 
 
 def run(task, tools, transcript=None):
@@ -327,38 +378,74 @@ def run(task, tools, transcript=None):
     means something. Keeping the *session* and dropping the *messages* would be a
     continuing investigation the model cannot remember — target reuse dressed up as
     one, which is what the flag would then be lying about.
+
+    Beside the transcript it hands back a **record** of the task — turns, tokens, every
+    tool call and what became of it — which is what `WINDBG_MCP_EVAL_OUT` writes and
+    `local_model_eval.py` grades. Nothing here decides whether an answer is right: this
+    script drives, and grading against the answer key happens where the key is.
     """
+    prompt = task["prompt"] if isinstance(task, dict) else task
+    report = {
+        "task": task.get("id") if isinstance(task, dict) else None,
+        "prompt": prompt, "turns": [], "calls": [], "answer": None,
+        "steps": 0, "gave_up": False, "error": None,
+    }
+    started_task = time.time()
     messages = transcript or [
         {"role": "system", "content":
          "You are a Windows kernel debugging assistant. Use the provided tools to answer. "
          "Call one tool at a time and use its result. Be concise."},
     ]
-    messages.append({"role": "user", "content": task})
+    messages.append({"role": "user", "content": prompt})
     first_prompt_tokens = None
     for step in range(MAX_STEPS):
         started = time.time()
-        out = chat(messages, tools)
+        try:
+            out = chat(messages, tools)
+        except ChatFailed as e:
+            # The cell's answer, not its accident: a window too small for the surface, a
+            # runtime that would not load the model. Recorded and the task ends here.
+            report["error"] = str(e)
+            report["wall_s"] = round(time.time() - started_task, 1)
+            print(f"  chat failed: {e}")
+            return messages, report
         took = round(time.time() - started, 1)
         message = out.get("message", {})
+        report["steps"] = step + 1
+        report["turns"].append({
+            "took_s": took,
+            "prompt_tokens": out.get("prompt_eval_count"),
+            "eval_tokens": out.get("eval_count"),
+            "load_ms": round((out.get("load_duration") or 0) / 1e6),
+        })
         if first_prompt_tokens is None:
             first_prompt_tokens = out.get("prompt_eval_count")
+            report["first_prompt_tokens"] = first_prompt_tokens
             print(f"  prompt tokens: {first_prompt_tokens}")
         messages.append(message)
         calls = message.get("tool_calls") or []
         if not calls:
-            print(f"  [{took:>6}s] answer: {(message.get('content') or '')[:400]}")
-            return messages
+            answer = message.get("content") or ""
+            report["answer"] = answer
+            report["wall_s"] = round(time.time() - started_task, 1)
+            print(f"  [{took:>6}s] answer: {answer[:400]}")
+            return messages, report
         for call in calls:
             name = call["function"]["name"]
             args = call["function"].get("arguments") or {}
             if isinstance(args, str):
                 args = json.loads(args or "{}")
-            text, ok, size = call_tool(name, args)
-            print(f"  [{took:>6}s] -> {name}({json.dumps(args)[:120]}) ok={ok} result={size} chars")
+            call_record = call_tool(name, args)
+            text = call_record.pop("text")
+            report["calls"].append(call_record)
+            print(f"  [{took:>6}s] -> {name}({json.dumps(args)[:120]}) "
+                  f"{call_record['verdict']} result={call_record['chars']} chars")
             print(f"           {text[:200]}")
             messages.append({"role": "tool", "tool_name": name, "content": text})
+    report["gave_up"] = True
+    report["wall_s"] = round(time.time() - started_task, 1)
     print(f"  gave up after {MAX_STEPS} steps")
-    return messages
+    return messages, report
 
 
 def live_sessions():
@@ -463,6 +550,62 @@ def release_what_this_run_opened():
     OPENED[:] = kept
 
 
+def load_tasks(path):
+    """A task list, in either shape this harness accepts.
+
+    A bare JSON list of strings is what the first two runs used and still works. The eval
+    suite is an object — `{"tasks": [{"id", "prompt", "expect", ...}]}` — because a task
+    that is graded needs a name to be graded under and an answer key to be graded against.
+    Everything but `prompt` travels through this script untouched, into the record: the
+    driver's job is to drive, and nothing here reads `expect`.
+
+    `EVAL_SUBSET` names one of the file's own `subsets`, which is how the reduced-context
+    cells run three tasks rather than six without a second file to keep in step.
+    """
+    loaded = json.load(open(path))
+    if isinstance(loaded, list):
+        return loaded
+    tasks = loaded["tasks"]
+    subset = os.environ.get("EVAL_SUBSET", "")
+    if subset:
+        wanted = loaded.get("subsets", {}).get(subset)
+        if wanted is None:
+            raise SystemExit(f"{path} has no subset `{subset}`")
+        tasks = [t for t in tasks if t.get("id") in wanted]
+    return tasks
+
+
+def served_context():
+    """What the runtime is actually serving this model, which is not what it could serve.
+
+    Asked rather than assumed for the reason `docs/local-model.md` gives: the default
+    `OLLAMA_CONTEXT_LENGTH` picks 4k, 32k or 256k from the box's memory, so a model whose
+    card says 262144 is routinely served far less. Best effort — a runtime that does not
+    report it leaves the field null rather than failing a run over telemetry.
+    """
+    try:
+        for loaded in ollama("/api/ps").get("models", []):
+            if loaded.get("name") == MODEL or loaded.get("model") == MODEL:
+                return loaded.get("context_length")
+    except Exception:  # noqa: BLE001 - a missing figure must not end a run
+        return None
+    return None
+
+
+def write_record(record):
+    """Append one task's record to the eval log, if this run is part of an eval.
+
+    **Appended, one JSON object per line, flushed per task.** A matrix run is hours long
+    and its cells are separate processes; a run that died in the middle should still leave
+    every cell before it on disk, and a reader should be able to grade what is there while
+    the rest is still going.
+    """
+    if not EVAL_OUT:
+        return
+    with open(EVAL_OUT, "a", encoding="utf-8") as log:
+        log.write(json.dumps(record, default=str) + "\n")
+
+
 def main():
     global MODEL
     MODEL = pick_model()
@@ -473,17 +616,38 @@ def main():
     offered = as_ollama(tools)
     surface = len(json.dumps(offered, separators=(",", ":")))
     print(f"tools offered: {len(tools)} ({surface} B of minified JSON)")
+    if NUM_CTX:
+        print(f"context requested: {NUM_CTX}")
     if SCENARIO:
         print("scenario: sessions are kept between tasks")
     snapshot_existing()
-    tasks = json.load(open(sys.argv[1])) if len(sys.argv) > 1 else [
+    tasks = load_tasks(sys.argv[1]) if len(sys.argv) > 1 else [
         "What debug sessions do I currently have open on this server?"
     ]
+    cell = {
+        "run": os.environ.get("EVAL_RUN", time.strftime("%Y%m%dT%H%M%S")),
+        "backend": "ollama",
+        "model": MODEL,
+        "num_ctx": NUM_CTX or None,
+        "surface": {"client": os.environ.get("EVAL_SURFACE", ""),
+                    "tools": len(tools), "bytes": surface,
+                    "names": sorted(t["name"] for t in tools)},
+    }
     transcript = None
     try:
         for i, task in enumerate(tasks, 1):
-            print(f"\n=== task {i}: {task[:110]}")
-            transcript = run(task, offered, transcript)
+            prompt = task["prompt"] if isinstance(task, dict) else task
+            print(f"\n=== task {i}: {prompt[:110]}")
+            transcript, report = run(task, offered, transcript)
+            # Read *after* the first turn: nothing is loaded before one, so asking earlier
+            # reports the previous model's window or nothing at all.
+            record = dict(cell, served_context=served_context(), **report)
+            if NUM_CTX and record["served_context"] and record["served_context"] != NUM_CTX:
+                # Loudly, because it is invisible otherwise and it invalidates the cell: a
+                # request's `num_ctx` does not shrink an instance the runtime already holds.
+                print(f"  WARNING: asked for {NUM_CTX} tokens of context and was served "
+                      f"{record['served_context']} - evict the model before changing the window")
+            write_record(record)
             # Each task is its own conversation, so it gets its own targets: a session
             # left open would be routed to by the next task's `session_id`-less call,
             # which makes that task's measurement depend on the one before it. A task
