@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ignored, on the same rule as `--rotate-` and `--remove-listen-client`: it reads exactly like a
   filter over the list it is about to print.
 
+  **And it says it is reading the file rather than the service**, with the state that service is in
+  beside it. The two normally agree, since every editing command waits for the re-read and exits
+  non-zero if it did not land — but a `--remove` or `--rotate` in exactly that failure leaves a
+  token authenticating that the file no longer names, which is the case an operator would run this
+  to check. The running service cannot be asked what it holds: its only channel carries a status
+  code and no data.
+
 ## [0.11.0] - 2026-08-23
 
 ### Added

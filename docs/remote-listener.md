@@ -614,11 +614,14 @@ windbg-mcp.exe --list-listen-clients
 ```
 
 ```text
-`windbg-mcp` holds: `bench` (sha256:2F1A9C0B7D4E5A83, --tools session,inspect,crash),
+`windbg-mcp` is configured with: `bench` (sha256:2F1A9C0B7D4E5A83, --tools session,inspect,crash),
 `local` (sha256:701E4CF334890225).
 
 Read from C:\ProgramData\windbg-mcp\token, and nothing was changed — this is the one command
-here that only reads.
+here that only reads. It is the *file*, though, not a question put to the running service:
+`windbg-mcp` is running and re-reads this file whenever a client command changes it, and a
+command whose re-read did not land says so and exits non-zero — so a revocation that reported
+*that* is the one way a token this list no longer names can still be authenticating.
 
 A client with no `--tools` of its own is served whatever `windbg-mcp` serves — `--tools` on the
 command line the SCM stores, or every tool if that has none.
@@ -651,6 +654,12 @@ Three things about it:
 - **It needs the same elevated shell.** The credential file grants read to `SYSTEM` and
   `Administrators` only, which is what makes it worth having; an unelevated run is told so rather
   than shown a partial answer. On a host with no service there is no file and no elevation needed.
+- **It reads the file, not the service.** Normally those agree — every command above waits for the
+  re-read and exits non-zero if it did not land — but the one case they do not is exactly the case
+  you would run this to check: a `--remove` or `--rotate` whose reload failed leaves a token
+  authenticating that the file no longer names. There is no way to ask the running service what it
+  has in force (its only channel carries a status code and no data), so the command reports the
+  state it *is* in — running, starting, or stopped — and says which of those the roster means.
 
 **Stopping is graceful, and that is the point.** `Stop-Service` takes the same path a client
 disconnect takes: every session is asked to release its target before the process exits, and the SCM
