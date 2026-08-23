@@ -296,11 +296,13 @@ Three things follow from where the surface is decided:
 - **Calling a tool that is not on your surface** is refused as exactly that, rather than as an
   unknown tool — and the message names which configuration to widen, since a caller can see
   neither.
-- **A change reaches a client when it next connects.** The surface is fixed at the moment the
-  caller is identified, which is `initialize` for a client holding an MCP session and every request
-  for one on `2026-07-28`. Nothing sends `notifications/tools/list_changed`: this server keeps no
-  handle to notify a session through, and the sessionless revision has no session to notify, so it
-  would be a guarantee on one revision and silence on the other. Reconnect the client.
+- **A change reaches a client the next time it is identified** — its next handshake, or its next
+  *request* if it makes no session. The surface is fixed at that moment, which is `initialize` for
+  a client holding an MCP session and every request for one on `2026-07-28`; a client on that
+  revision therefore picks a change up with nothing done to it. Nothing sends
+  `notifications/tools/list_changed`: this server keeps no handle to notify a session through, and
+  the sessionless revision has no session to notify, so it would be a guarantee on one revision and
+  silence on the other. Reconnect a client that holds a session.
 
 The startup line says what each client is served, and only mentions the ones that differ:
 
@@ -553,9 +555,10 @@ Seven behaviours worth knowing before you need them:
   nothing else, so it mints no token, writes no `<name>.token`, and is not a revocation. Its
   `--tools` spec is validated before anything is written — a spec this server could not serve is
   refused here rather than becoming a service that will not start.
-- **A client sees its new surface when it next connects.** The reload is delivered and waited for
-  like any other, but a connected client's tool list was decided when it connected and nothing tells
-  it otherwise; the command says so. Reconnect it, or restart whatever is driving it.
+- **A client sees its new surface the next time it is identified.** The reload is delivered and
+  waited for like any other, but a client holding an MCP session had its tool list decided at
+  `initialize` and nothing tells it otherwise; the command says so. Reconnect it, or restart
+  whatever is driving it — a client on `2026-07-28` holds no session and needs nothing.
 - **A rotation keeps the client, and so keeps its sessions.** Only the token moves: the old one
   starts answering `401` and the new one reaches the same debug sessions, because it *is* the same
   client. Rotating is the cheap operation — a lost token costs a rotation and nothing else.

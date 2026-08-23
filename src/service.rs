@@ -842,7 +842,7 @@ pub fn edit_client(edit: ClientEdit, name: &str, tools: Option<&str>) -> Result<
             }
         ),
     }
-    // **A surface reaches a client on its next connection, and a reload is not that.** Said here
+    // **A surface reaches a client the next time it is identified, and a reload is not that.** Said here
     // because the line above claims the service re-read its clients, which is true and is not the
     // same claim: a connected client's tool list was decided when it connected, and nothing sends
     // `notifications/tools/list_changed` to tell it otherwise (see [`crate::toolset`]). A
@@ -855,8 +855,9 @@ pub fn edit_client(edit: ClientEdit, name: &str, tools: Option<&str>) -> Result<
     // would have contradicted them two lines later.
     if in_force && matches!(edit, ClientEdit::SetTools) {
         println!(
-            "\n`{name}` sees this when it next connects. A client connected now goes on listing \
-             the tools it listed at the time — reconnect it, or restart whatever is driving it."
+            "\n`{name}` sees this the next time it is identified. A client that holds an MCP \
+             session goes on listing the tools it listed at the time — reconnect it, or restart \
+             whatever is driving it; one on the sessionless revision needs nothing."
         );
     }
     Ok(())

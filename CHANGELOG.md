@@ -34,9 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and revokes none. A `--tools` beside `--rotate-` or `--remove-listen-client` is refused rather
   than ignored, because it reads exactly like a command that had narrowed that client.
 
-  **A surface change reaches a client on its next connection**, and nothing announces one. The
-  surface is fixed where the caller is identified — `initialize` for a client holding an MCP
-  session, every request for one on `2026-07-28` — and no `notifications/tools/list_changed` is
+  **A surface change reaches a client the next time it is identified**, and nothing announces one.
+  The surface is fixed at that moment — `initialize` for a client holding an MCP session, every
+  request for one on `2026-07-28`, which therefore picks the change up with nothing done to it —
+  and no `notifications/tools/list_changed` is
   sent: this server keeps no handle to notify a session through, and the sessionless revision has
   no session to notify, so it would be a guarantee on one revision and silence on the other. The
   command that changes a surface says so.

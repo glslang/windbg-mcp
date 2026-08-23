@@ -742,7 +742,7 @@ pub async fn serve(
                 // configured with a spec of its own is served that; every other client is served
                 // whatever this run serves, which is `--tools` or all fifty-one. The run's flag is
                 // the default rather than a ceiling — see [`crate::toolset`], which also says why
-                // a change here reaches a client on its next connection and not before.
+                // a change here reaches a client the next time it is identified and not before.
                 let (surface, chosen) = match credentials.surface_for(&client) {
                     Some(own) => (own, crate::toolset::Chosen::ForThisClient),
                     None => (tools.clone(), crate::toolset::Chosen::ForTheRun),

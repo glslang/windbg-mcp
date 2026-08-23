@@ -1472,7 +1472,7 @@ factory is the line that sets both. What the work actually was:
   keeps no peer handle to notify an MCP session through, and `2026-07-28` has no session to notify
   at all, so it would be a guarantee on one revision and silence on the other. A surface is instead
   fixed where the caller is identified — `initialize`, or every request on the stateless
-  revision — so a change reaches a client when it next connects, one sentence for both.
+  revision — so a change reaches a client the next time it is identified, one rule for both.
   `--set-listen-client-tools` says so where an operator reads it.
 
 **The run's flag became a default rather than a ceiling.** A client's own spec replaces it, wider or
