@@ -104,10 +104,27 @@ def one_task(task, config_path):
         "--output-format", "stream-json", "--verbose",
     ]
     started = time.time()
-    proc = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=1800)
+    except subprocess.TimeoutExpired:
+        # **The task's result, not the run's accident.** Letting this escape would end the whole
+        # cell at whichever task hit it, leaving the ones after it with no record and the log with
+        # no reason - and the runner's own budget cannot be relied on to fire first, since a cell
+        # may be given a longer one than this.
+        report["error"] = "claude did not answer within 1800s"
+        report["wall_s"] = round(time.time() - started, 1)
+        return report
     report["wall_s"] = round(time.time() - started, 1)
     if proc.returncode != 0:
-        report["error"] = f"claude exited {proc.returncode}: {proc.stderr[:400]}"
+        # **The reason, not the first 400 bytes.** Claude Code prints a schema warning per
+        # `format` keyword this server's output schemas use, which is harmless and long enough to
+        # fill any prefix - the first cut of this reported `unknown format "uint" ignored` as the
+        # cause of every failure. Drop the known noise and keep the tail, which is where a real
+        # reason lands.
+        noise = [line for line in proc.stderr.splitlines()
+                 if "unknown format" not in line and line.strip()]
+        report["error"] = (f"claude exited {proc.returncode}: "
+                           + (" | ".join(noise[-4:])[:400] or "(no stderr but schema warnings)"))
         return report
 
     pending = {}

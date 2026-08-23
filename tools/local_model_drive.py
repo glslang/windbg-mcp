@@ -310,6 +310,11 @@ def chat(messages, tools):
             return json.load(response)
     except urllib.error.HTTPError as e:
         raise ChatFailed(f"HTTP {e.code}: {e.read().decode('utf-8', 'replace')[:400]}") from e
+    except urllib.error.URLError as e:
+        # A runtime that died, was restarted, or refused the connection is the same kind of fact
+        # as one that returned 500 - the cell records it and the grid goes on. Ordered after
+        # `HTTPError`, which is a subclass of this.
+        raise ChatFailed(f"no answer from the runtime: {e.reason}") from e
 
 
 def call_tool(name, args):
@@ -562,7 +567,8 @@ def load_tasks(path):
     `EVAL_SUBSET` names one of the file's own `subsets`, which is how the reduced-context
     cells run three tasks rather than six without a second file to keep in step.
     """
-    loaded = json.load(open(path))
+    with open(path, encoding="utf-8") as f:
+        loaded = json.load(f)
     if isinstance(loaded, list):
         return loaded
     tasks = loaded["tasks"]

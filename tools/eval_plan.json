@@ -1,0 +1,31 @@
+{
+  "run": "2026-08-23",
+  "tasks": "tools/eval_tasks.json",
+  "url": "http://127.0.0.1:8766/",
+  "out": "eval-out/results.jsonl",
+  "logs": "eval-out/logs",
+  "max_steps": 6,
+  "keep_alive": "10m",
+  "surfaces": [
+    { "client": "full", "spec": "all",                   "tools": 51 },
+    { "client": "lean", "spec": "session,inspect,crash", "tools": 20 },
+    { "client": "min",  "spec": "crash",                 "tools": 11 }
+  ],
+  "cells": [
+    { "backend": "ollama",
+      "models": ["qwen3.8:27b-mlx", "gemma4:31b-mlx", "nemotron-3.5-lightning:30b-mlx"],
+      "contexts": [262144],
+      "surfaces": ["full", "lean", "min"],
+      "budget_s": 2400 },
+    { "backend": "ollama",
+      "models": ["qwen3.8:27b-mlx", "gemma4:31b-mlx", "nemotron-3.5-lightning:30b-mlx"],
+      "contexts": [32768, 8192],
+      "surfaces": ["full", "lean", "min"],
+      "subset": "short",
+      "budget_s": 1200 },
+    { "backend": "claude-code",
+      "models": ["opus", "sonnet"],
+      "surfaces": ["full", "lean", "min"],
+      "budget_s": 1200 }
+  ]
+}

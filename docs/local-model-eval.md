@@ -136,12 +136,15 @@ arithmetic in prose, miscounted twice in full view, and presented a confident ta
 `FILE_DEVICE_KEYBOARD` and `FILE_READ_DATA` — both wrong — and scored correct. Numeric
 expectations now match only between hex boundaries.
 
-**`unloaded_driver` requires the count, which used to be a bonus.** On the 11-tool surface a model
-with no `modules` answered honestly that it could not check, added that "a kernel-mode dump does
-not retain a history of drivers that loaded-then-unloaded" — which is false, and is exactly what
-the tool would have told it — and scored correct on the words *not loaded* and *unloaded*. The 26
-unload records are the half of the question only the tool can answer, and every model that had the
-tool quoted the number, so requiring it separates reading from guessing.
+**`unloaded_driver` requires the count, and the prompt now asks for it.** On the 11-tool surface a
+model with no `modules` answered honestly that it could not check, added that "a kernel-mode dump
+does not retain a history of drivers that loaded-then-unloaded" — which is false, and is exactly
+what the tool would have told it — and scored correct on the words *not loaded* and *unloaded*. The
+26 unload records are the half of the question only the tool can answer, so requiring them
+separates reading from guessing. That first went in as a stricter key over an unchanged question,
+which review rightly called a key asking for a fact the prompt did not request; the question now
+asks *how many* records the dump still carries, and **every cell of that task was re-run under it**
+— no score moved, because every model that had the tool had already volunteered the number.
 
 One prediction in the key was simply wrong, and the run found it: **`arm64_pc` is answerable on
 every surface**, not only where `registers` is served. `crash_triage`'s frame 0 on that dump is
@@ -186,10 +189,32 @@ if ($own -and $own -ne $svc) { Stop-Process -Id $own -Force }
 ```
 
 **A plan**, naming the models, the surfaces, the contexts and the per-cell wall-clock budget. The
-tokens are *not* in it: a plan is checked in, a credential is not.
+one this page's run used is checked in as [`tools/eval_plan.json`](../tools/eval_plan.json), so the
+grid is re-runnable rather than described:
+
+```json
+{
+  "run": "2026-08-23",
+  "tasks": "tools/eval_tasks.json",
+  "url": "http://127.0.0.1:8766/",
+  "out": "eval-out/results.jsonl",
+  "surfaces": [{ "client": "full" }, { "client": "lean" }, { "client": "min" }],
+  "cells": [
+    { "backend": "ollama", "models": ["qwen3.8:27b-mlx"],
+      "contexts": [262144], "surfaces": ["full", "lean", "min"], "budget_s": 2400 }
+  ]
+}
+```
+
+`surfaces` at the top level names every client the run may present — each entry an object with a
+`client`, which is the name the token file uses. Inside a cell group, `surfaces` is a list of those
+same names as plain strings. Paths are resolved when the plan is read, so they may be relative to
+wherever you run it from.
+
+The tokens are *not* in the plan: a plan is checked in, a credential is not.
 
 ```console
-EVAL_TOKENS=bench-tokens.json python3 tools/local_model_eval.py plan.json
+EVAL_TOKENS=bench-tokens.json python3 tools/local_model_eval.py tools/eval_plan.json
 ```
 
 Cells are subprocesses and the log is append-only, so a run that dies in the middle leaves every
@@ -247,13 +272,13 @@ more than one route, and the narrow surface keeps the routes that matter.
 What the cut *does* produce, in every row including the control, is **calls to tools that are not
 there**:
 
-| Cell | Off-surface calls |
-| --- | --- |
-| gemma4 `min` | 8 — `debug_batch` four times on one task, plus `modules` |
-| Opus `min` | 4 |
-| Sonnet `min` | 2 |
-| nemotron `min` | 1 |
-| every `full` and `lean` cell | 0 |
+| Cell | Off-surface calls | What it asked for |
+| --- | --- | --- |
+| gemma4 `min` | 9 | `debug_batch`, every one of them — five on one task, four on another |
+| Opus `min` | 4 | `execute` twice, `modules`, `decode_ioctl` |
+| Sonnet `min` | 2 | `modules`, `execute` |
+| nemotron `min` | 2 | `modules`, twice |
+| every `full` and `lean` cell | 0 | — |
 
 Nobody invents a tool when the surface is wide. Everybody does when it is narrow, and the server's
 refusal (`#196`, which names the client's own surface) is what turns that into a recoverable
