@@ -171,10 +171,17 @@ def run_cell(plan, tokens, backend, model, context, surface, subset, budget_s, l
             # attached under this cell's credential - and the next cell on the same surface would
             # inherit it, or meet the four-session cap because of it. Released here, with that
             # credential, before anything else runs.
-            release = subprocess.run([sys.executable, "-u", DRIVER, "--release"], env=env,
-                                     capture_output=True, text=True, timeout=120)
-            for line in release.stdout.splitlines():
-                print(f"    {line.strip()}")
+            try:
+                release = subprocess.run([sys.executable, "-u", DRIVER, "--release"], env=env,
+                                         capture_output=True, text=True, timeout=120)
+                for line in release.stdout.splitlines():
+                    print(f"    {line.strip()}")
+            except (subprocess.TimeoutExpired, OSError) as e:
+                # The listener is unreachable, or the release is slower than the whole budget it
+                # was given. Both leave sessions behind, and neither is a reason to abandon the
+                # cells after this one - which is the entire point of killing a cell rather than
+                # waiting for it.
+                print(f"    could not release this cell's sessions: {e}")
             note = {"run": plan["run"], "backend": backend, "model": model,
                     "num_ctx": context or None, "surface": {"client": surface},
                     "task": None, "error": f"cell exceeded its {budget_s}s budget"}
@@ -310,15 +317,28 @@ def records(log_path):
     both would inflate a cell's task count and average two runs that were never meant to be
     averaged.
     """
-    latest = {}
-    for line in open(log_path, encoding="utf-8"):
+    latest, seen_at = {}, {}
+    for at, line in enumerate(open(log_path, encoding="utf-8")):
         line = line.strip()
         if not line:
             continue
         record = json.loads(line)
         surface = (record.get("surface") or {})
-        latest[(record.get("backend"), record.get("model"), record.get("num_ctx"),
-                surface.get("client"), record.get("task"))] = record
+        cell = (record.get("backend"), record.get("model"), record.get("num_ctx"),
+                surface.get("client"))
+        latest[(*cell, record.get("task"))] = record
+        seen_at[(*cell, record.get("task"))] = at
+    # **A cell-level note is superseded by anything that cell recorded afterwards.** The note says
+    # "this cell failed"; it is keyed on `task: null`, so a successful resume - which writes only
+    # task records - leaves it in place and the summary goes on printing a finished cell as
+    # FAILED for ever.
+    for key in list(latest):
+        if key[-1] is not None:
+            continue
+        note_at = seen_at[key]
+        if any(other[:-1] == key[:-1] and other[-1] is not None and at > note_at
+               for other, at in seen_at.items()):
+            del latest[key]
     return list(latest.values())
 
 
