@@ -8,8 +8,9 @@ the machine DbgEng needs — a Mac driving a Windows VM, say.
 may be a local model whose window is bought in RAM. `--listen 127.0.0.1:8765 --tools
 session,inspect,crash` serves 20 tools and 25,265 B of model context instead of 51 and 67,658 — the
 README has the table, and [`local-model.md`](./local-model.md) is the runbook it was measured for.
-It is server-wide, so every client on this listener sees the same surface; per-caller is
-`FOLLOWUPS.md` item 36.
+It is this listener's **default**: a client may be given a surface of its own, which is what lets
+one server hold a local model and a hosted client at once — see [A tool surface per
+client](#a-tool-surface-per-client).
 
 If you only need that once, [`remote-phase0.md`](./remote-phase0.md) does it with no listener at
 all: register the MCP server as an `ssh` command and stdio tunnels for you. The listener is for
@@ -264,9 +265,49 @@ could never become the holder, and the classification behind it is gone with the
 Such a client also never installs a lease at all, which is why abandonment on this revision is the
 idle release's job rather than the grace's — see *A session nobody is using is released*, above.
 
-**This does not authorise anything beyond separation.** Every client that can authenticate has the
-whole tool surface, including `execute` and `launch`. Tokens separate clients from each other; they
-do not rank them.
+**This does not authorise anything beyond separation.** A token separates clients from each other;
+it does not rank them. A client may be served a smaller *tool surface* than another (below), and
+that is a budget rather than a privilege: it is enforced on the call, but any surface holds the
+openers, and `execute` — which is in `inspect` — runs any debugger command there is. Treat every
+client that can authenticate as holding the whole thing, including `launch`.
+
+### A tool surface per client
+
+The [`--tools` spec](../README.md#serving-fewer-tools---tools) narrows what a run advertises, and a
+client may be given one of its own — configured beside its token, under the same rule for the name:
+
+```console
+setx WINDBG_MCP_LISTEN_TOKEN_BENCH "<a long random string>"   # the client named `bench`
+setx WINDBG_MCP_TOOLS_BENCH        "session,inspect,crash"    # …and what it is served
+```
+
+This is what lets one listener serve a local model that can hold twenty tools beside a hosted client
+that can hold fifty-one, against the same debug sessions on the same box. A client with no spec of
+its own is served whatever the run serves — `--tools` on the listener's command line, or every tool
+if it has none — so **the run's flag is the default rather than a ceiling**: a client's own spec
+replaces it, wider or narrower, because an intersection would produce a surface neither of you
+named. `session` is added to every spec, here as on the command line.
+
+Three things follow from where the surface is decided:
+
+- **A spec for a client that has no token is refused at startup**, by name. A surface no credential
+  can reach is a setting that would never take effect, and the way to write one is the typo that
+  makes `WINDBG_MCP_TOOLS_BENCH` and `WINDBG_MCP_LISTEN_TOKEN_BENCH` disagree.
+- **Calling a tool that is not on your surface** is refused as exactly that, rather than as an
+  unknown tool — and the message names which configuration to widen, since a caller can see
+  neither.
+- **A change reaches a client when it next connects.** The surface is fixed at the moment the
+  caller is identified, which is `initialize` for a client holding an MCP session and every request
+  for one on `2026-07-28`. Nothing sends `notifications/tools/list_changed`: this server keeps no
+  handle to notify a session through, and the sessionless revision has no session to notify, so it
+  would be a guarantee on one revision and silence on the other. Reconnect the client.
+
+The startup line says what each client is served, and only mentions the ones that differ:
+
+```text
+windbg-mcp listening on http://127.0.0.1:8765 (… clients: bench, local, serving all 51 tools
+— except bench serves 20 of 51 tools (session, inspect, crash))
+```
 
 **One thing a client can still infer: that another one is busy.** `server_log`'s sequence numbers
 are assigned across the whole server, and that is what makes a `since` cursor exact under eviction —
@@ -301,6 +342,20 @@ profiles:
   "laptop": "<another>"
 }
 ```
+
+An entry may also be an **object**, which is how a client in this file gets a surface of its own —
+the file is the whole configuration when one is set, so `WINDBG_MCP_TOOLS_<NAME>` is not read on a
+host that has one:
+
+```json
+{
+  "local": "<a long random string>",
+  "bench": { "token": "<another>", "tools": "session,inspect,crash" }
+}
+```
+
+A bare string is the same entry it always was and means the client takes whatever the run serves,
+so a file written before any of this keeps meaning exactly what it meant.
 
 A leading `{` is what tells them apart, so a bare token may not begin with one — a file that does is
 refused at startup, by name, rather than read as the other thing. Keys are client names, values are
@@ -422,14 +477,19 @@ because the SCM registers a service once and a bad credential then fails it at e
 `windbg-mcp.exe --uninstall-service` removes it, stopping it first and waiting for it — a delete
 issued against a running service only marks it, and this one has debug targets to let go of.
 
-### Adding, revoking and rotating a client, without stopping anything
+### Adding, revoking, rotating and re-toolling a client, without stopping anything
 
-Three commands, from an **elevated** shell, and none of them costs you a session:
+Four commands, from an **elevated** shell, and none of them costs you a session:
 
 ```pwsh
 windbg-mcp.exe --add-listen-client    ci
 windbg-mcp.exe --rotate-listen-client ci
 windbg-mcp.exe --remove-listen-client ci
+
+# what a client is served — at creation, or afterwards
+windbg-mcp.exe --add-listen-client       bench --tools session,inspect,crash
+windbg-mcp.exe --set-listen-client-tools bench --tools crash
+windbg-mcp.exe --set-listen-client-tools bench            # back to the service's own surface
 ```
 
 Each one rewrites `%ProgramData%\windbg-mcp\token` and then tells the running service to re-read
@@ -459,8 +519,8 @@ service reading it at the same moment.
 **They generate the token, and they will not print it.** What reaches your console is a fingerprint:
 
 ```text
-added the client `ci` (sha256:076C14953E1DE5EF) — it gets the whole tool surface, as every client
-here does — a token separates clients from each other, it does not limit one.
+added the client `ci` (sha256:076C14953E1DE5EF) — it is served whatever `windbg-mcp` serves —
+`--tools` on the command line the SCM stores, or every tool if that has none.
 `windbg-mcp` now holds: `ci` (sha256:076C14953E1DE5EF), `local` (sha256:701E4CF334890225).
 
 Its token is in C:\ProgramData\windbg-mcp\ci.token — the same SYSTEM-and-Administrators
@@ -484,8 +544,15 @@ race and nothing to substitute. An existing `<name>.token` there is never overwr
 credential an earlier command wrote and nobody has moved yet, and the fix is to move it — or, if it
 belongs to a client you are done with, to remove that client, which deletes it.
 
-Four behaviours worth knowing before you need them:
+Seven behaviours worth knowing before you need them:
 
+- **Re-toolling touches no credential.** `--set-listen-client-tools` changes one entry's surface and
+  nothing else, so it mints no token, writes no `<name>.token`, and is not a revocation. Its
+  `--tools` spec is validated before anything is written — a spec this server could not serve is
+  refused here rather than becoming a service that will not start.
+- **A client sees its new surface when it next connects.** The reload is delivered and waited for
+  like any other, but a connected client's tool list was decided when it connected and nothing tells
+  it otherwise; the command says so. Reconnect it, or restart whatever is driving it.
 - **A rotation keeps the client, and so keeps its sessions.** Only the token moves: the old one
   starts answering `401` and the new one reaches the same debug sessions, because it *is* the same
   client. Rotating is the cheap operation — a lost token costs a rotation and nothing else.

@@ -32,6 +32,16 @@
 //! Under stdio there is nothing to authenticate and nothing to separate — one process, one client,
 //! by construction — so calls there run as [`Client::LOCAL`] and every lookup behaves as it always
 //! has.
+//!
+//! # What a name buys besides isolation
+//!
+//! A **tool surface of its own**. A client is a budget as much as it is a boundary: the
+//! arrangement this listener was built for is a local model that can hold twenty tools beside a
+//! hosted client that can hold fifty-one, on the same box and against the same debug sessions. So
+//! a credential may carry a [`crate::toolset::Toolset`] as well as a name — configured beside the
+//! token, under the same variable prefix or in the same file entry — and a client that names none
+//! is served whatever the run serves. That is `FOLLOWUPS.md` item 36, and the identity above is
+//! what made it a field rather than a feature.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -41,6 +51,16 @@ use anyhow::{Result, anyhow, bail};
 
 /// The unnamed token, and the prefix of a named one.
 const TOKEN_ENV: &str = "WINDBG_MCP_LISTEN_TOKEN";
+
+/// The unnamed tool-surface spec, and the prefix of a named one.
+///
+/// **Beside the token variable, and read by the same scan**, because a client's surface and a
+/// client's credential are configured by the same person in the same place — see
+/// [`crate::toolset`] for what a spec is and why one client's is not another's. It carries no
+/// secret, so it is not held to [`is_presentable`] and is not stripped from a child process; what
+/// it *is* held to is naming a client this listener actually accepts, which is
+/// [`from_env`]'s last refusal.
+pub const TOOLS_ENV: &str = "WINDBG_MCP_TOOLS";
 
 /// The variable naming a *file* to read credentials from, which shares that prefix and is not one.
 ///
@@ -147,6 +167,12 @@ impl std::fmt::Display for Client {
 #[derive(Clone, Default)]
 pub struct Credentials {
     by_token: HashMap<String, String>,
+    /// Name to the surface that client is served, for the clients configured with one of their
+    /// own. **Absent is not "every tool"** — it is "whatever this run serves", which is the run's
+    /// `--tools` and usually every tool. Keeping the two apart is what lets a listener started
+    /// with a narrow `--tools` still have a client that was given a wider spec, and what makes an
+    /// entry with no `tools` field mean exactly what it meant before there was one.
+    surfaces: HashMap<String, crate::toolset::Toolset>,
 }
 
 /// **The names, never the tokens** — the same reason [`crate::kdconn::Connection`]'s is redacted.
@@ -177,6 +203,23 @@ impl Credentials {
         names
     }
 
+    /// The surface configured for this client, or `None` for one that takes the run's.
+    pub fn surface_for(&self, name: &str) -> Option<&crate::toolset::Toolset> {
+        self.surfaces.get(name)
+    }
+
+    /// Every client with a surface of its own, as `(name, summary)`, sorted — for the startup and
+    /// reload lines. Empty on the configuration everyone has, where it costs those lines nothing.
+    pub fn surfaces(&self) -> Vec<(&str, String)> {
+        let mut rows: Vec<(&str, String)> = self
+            .surfaces
+            .iter()
+            .map(|(name, surface)| (name.as_str(), surface.summary()))
+            .collect();
+        rows.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        rows
+    }
+
     /// Builds the set from `(variable, value)` pairs, or from the token file if there is one.
     ///
     /// Takes the variables rather than reading the environment for the reason
@@ -192,6 +235,12 @@ impl Credentials {
     /// file shuts the environment out entirely rather than merely outranking the unnamed variable,
     /// and names its own clients ([`TokenFile`]) rather than leaving the deployment that needs it
     /// most with room for one.
+    ///
+    /// **A tool surface follows its credential**, so a configured file is the only source of those
+    /// too and [`TOOLS_ENV`] is not read at all on a host that has one. Not because a spec is a
+    /// secret — it is a list of group names — but because one configuration answering "who may
+    /// connect" and another answering "what do they get" is two files to keep in step and a
+    /// precedence rule to remember. A client's surface is written where its token is.
     pub fn from_entries(
         vars: impl Iterator<Item = (String, String)>,
         file: Option<TokenFile>,
@@ -211,15 +260,26 @@ impl Credentials {
     /// A token appearing twice is refused rather than resolved. Two names for one credential means
     /// a caller's sessions land under whichever name won a `HashMap` insertion, which is a rule
     /// nobody could predict and a boundary that would move.
+    ///
+    /// A spec is parsed here too, and by the same call the listener's `--tools` goes through, so a
+    /// surface an operator writes down is one this server can actually serve — refused at startup
+    /// rather than discovered by a caller whose tool list came back empty.
     fn build(configured: &[Configured]) -> Result<Self> {
         let mut by_token: HashMap<String, String> = HashMap::new();
+        let mut surfaces: HashMap<String, crate::toolset::Toolset> = HashMap::new();
         // Client name to *what configured it* — never to the token. Both refusals below are
         // printed at startup, to stderr in the foreground and to the service log under the SCM, so
         // a message quoting the credential it is complaining about would write a working listener
         // token into whatever collects those. The source is also the more useful half: it is what
         // the operator has to go and change.
         let mut named: HashMap<&str, &str> = HashMap::new();
-        for Configured { name, token, from } in configured {
+        for Configured {
+            name,
+            token,
+            tools,
+            from,
+        } in configured
+        {
             if !is_presentable(token) {
                 bail!(
                     "the token in {from} cannot travel in an `Authorization` header, so nothing \
@@ -258,10 +318,20 @@ impl Credentials {
                      is the isolation this is for, silently absent."
                 );
             }
+            if let Some(spec) = tools {
+                // Held to the flag's own parser, so `session,inspect` means here what it means on
+                // a command line — and so `session` is added to a client's surface for the same
+                // reason it is added to a run's. The source is named rather than the flag: this
+                // spec was written in a variable or a file, and telling its operator to edit
+                // `--tools` would send them to a command line that has nothing to do with it.
+                let surface = crate::toolset::Toolset::parse_from(&spec.text, &spec.from)
+                    .map_err(|e| anyhow!("{e}"))?;
+                surfaces.insert(name.clone(), surface);
+            }
             named.insert(name.as_str(), from.as_str());
             by_token.insert(token.clone(), name.clone());
         }
-        Ok(Self { by_token })
+        Ok(Self { by_token, surfaces })
     }
 }
 
@@ -373,6 +443,27 @@ impl Accepted {
         self.state().client_for(token)
     }
 
+    /// The surface this client is served, or `None` for one that takes the run's.
+    ///
+    /// **Read where the identity is**, in the listener's service factory: that is the one moment
+    /// the caller is knowable, and a surface decided anywhere later would be decided for whichever
+    /// task rmcp happened to serve the call from. It is also what fixes when a reload takes
+    /// effect — see [`crate::toolset`].
+    pub fn surface_for(&self, client: &Client) -> Option<crate::toolset::Toolset> {
+        self.state().credentials.surface_for(client.name()).cloned()
+    }
+
+    /// Every client with a surface of its own, as `<name> serves <summary>`, for a log line.
+    /// Empty on the configuration everyone has.
+    pub fn surfaces(&self) -> Vec<String> {
+        self.state()
+            .credentials
+            .surfaces()
+            .into_iter()
+            .map(|(name, summary)| format!("{name} serves {summary}"))
+            .collect()
+    }
+
     /// Every configured name, sorted — for the lines that say who may connect.
     pub fn names(&self) -> Vec<String> {
         self.state()
@@ -436,7 +527,74 @@ impl Accepted {
 struct Configured {
     name: String,
     token: String,
+    /// The tool surface this client is served, or `None` for one that takes the run's. See
+    /// [`Credentials::surfaces`] for why those two are not the same answer.
+    tools: Option<Spec>,
     from: String,
+}
+
+/// A tool-surface spec as it was written down, and where that was.
+///
+/// **Two fields rather than one because the second is not the token's.** Configured from the
+/// environment a client's surface and its credential are two variables, so a refusal about the
+/// spec has to name the variable holding the spec — and [`Configured::from`] names the other one.
+/// In the credential file they are one entry, and this still renders as the field within it.
+struct Spec {
+    text: String,
+    from: String,
+}
+
+/// One client as a configuration writes it down.
+///
+/// What the [client commands](crate::service::edit_client) read out of the credential file, change
+/// one of, and write back — so it carries everything that file holds about a client and nothing
+/// about where it came from, which is [`Configured`]'s business and stays private.
+///
+/// **No `Debug`**, for the reason [`Credentials`]'s is hand-written: it holds a token, and the
+/// things that format a value like this are a log line and a test's panic message.
+pub struct ClientEntry {
+    pub name: String,
+    pub token: String,
+    /// The `--tools` spec this client is served, as text. `None` takes whatever the run serves,
+    /// which is what every client had before one could be set.
+    pub tools: Option<String>,
+}
+
+impl Configured {
+    /// The entry as a configuration to be validated, named after the client itself.
+    ///
+    /// For the writers — [`env_credentials`] and [`TokenFile::credentials`] hand their result
+    /// straight back to a caller that writes it to the file the service reads, and a set that
+    /// would not start a listener must not be written down as if it would.
+    fn of(entry: &ClientEntry, from: String) -> Self {
+        Self {
+            name: entry.name.clone(),
+            token: entry.token.clone(),
+            tools: entry.tools.as_ref().map(|text| Spec {
+                text: text.clone(),
+                from: from.clone(),
+            }),
+            from,
+        }
+    }
+
+    fn entry(self) -> ClientEntry {
+        ClientEntry {
+            name: self.name,
+            token: self.token,
+            tools: self.tools.map(|spec| spec.text),
+        }
+    }
+}
+
+/// Every [`ClientEntry`] a command is about to write, held to the rules a listener would hold it
+/// to — including that each spec is a surface this server can serve.
+pub fn check(entries: &[ClientEntry]) -> Result<()> {
+    let configured: Vec<Configured> = entries
+        .iter()
+        .map(|entry| Configured::of(entry, format!("`{}`", entry.name)))
+        .collect();
+    Credentials::build(&configured).map(|_| ())
 }
 
 /// The credentials a set of environment variables configures — names derived, nothing validated.
@@ -445,18 +603,55 @@ struct Configured {
 /// configuration to exactly one standard.
 fn from_env(vars: impl Iterator<Item = (String, String)>) -> Result<Vec<Configured>> {
     let mut configured = Vec::new();
+    // Collected rather than attached as they are read, because an iterator over the environment is
+    // in no order: `WINDBG_MCP_TOOLS_CI` may arrive before the token that names `ci` exists here.
+    let mut specs: HashMap<String, Spec> = HashMap::new();
     for (key, value) in vars {
-        let token = value.trim().to_string();
-        // An empty value is not a token — it is a variable somebody exported and never set.
-        if token.is_empty() || is_token_file(&key) {
+        let value = value.trim().to_string();
+        // An empty value is not a token — it is a variable somebody exported and never set. The
+        // same reading for a spec: an empty one is not "serve nothing", which is a surface with no
+        // opener in it and cannot be used at all.
+        if value.is_empty() || is_token_file(&key) {
             continue;
         }
+        if let Some(suffix) = tools_suffix(&key) {
+            let name = client_named_by(suffix);
+            if !is_client_name(&name) {
+                bail!(
+                    "`{key}` does not name a client. What follows `{TOOLS_ENV}_` is the name, and \
+                     a name is letters, digits, `-`, `_` or `.`, up to {NAME_LIMIT} characters — \
+                     `{TOOLS_ENV}_CI` is the tool surface served to `ci`."
+                );
+            }
+            // **Two spellings of one name are refused, not merged**, the same as two tokens for
+            // one client and for the same reason: names are folded, so `…_TOOLS_CI` and
+            // `…_TOOLS__CI` both name `ci`, and which surface won would be a `HashMap` ordering
+            // detail. Unlike a token this is not a boundary, so nothing leaks — but an operator
+            // reading two specs in their own shell and getting one of them silently is the shape
+            // this module refuses everywhere.
+            if let Some(other) = specs.get(&name) {
+                bail!(
+                    "`{key}` and {} both name the tool surface of the client `{name}`. Give it \
+                     one: which of the two took effect would be whichever the scan happened to \
+                     read last.",
+                    other.from
+                );
+            }
+            specs.insert(
+                name,
+                Spec {
+                    text: value,
+                    from: format!("`{key}`"),
+                },
+            );
+            continue;
+        }
+        let token = value;
         let name = match credential_suffix(&key) {
-            // The unnamed variable, which is what every existing setup uses.
-            Some("") => Client::LOCAL.to_string(),
-            // `WINDBG_MCP_LISTEN_TOKEN_CI` names the client `ci`, the same lowercasing a kernel
+            // `WINDBG_MCP_LISTEN_TOKEN` names `local` — the unnamed variable every existing setup
+            // uses — and `WINDBG_MCP_LISTEN_TOKEN_CI` names `ci`, the same lowercasing a kernel
             // profile's variable gets.
-            Some(suffix) => suffix.trim_start_matches('_').to_ascii_lowercase(),
+            Some(suffix) => client_named_by(suffix),
             None => continue,
         };
         // **Held to the same rule as a key in the file**, rather than skipped as it used to be.
@@ -477,23 +672,65 @@ fn from_env(vars: impl Iterator<Item = (String, String)>) -> Result<Vec<Configur
             from: format!("`{key}`"),
             name,
             token,
+            tools: None,
         });
+    }
+    for entry in &mut configured {
+        entry.tools = specs.remove(&entry.name);
+    }
+    // **What is left over is a surface for a client nothing can authenticate as**, which is a
+    // setting that would never take effect. Refused rather than ignored, on the precedent of the
+    // two collisions above: a spec the operator wrote, silently not configured, is the failure
+    // nobody sees — and the likeliest cause of it is the typo that makes `WINDBG_MCP_TOOLS_BENCH`
+    // and `WINDBG_MCP_LISTEN_TOKEN_BENCH` disagree about the name.
+    // Sorted, so two orphans do not produce a refusal that names a different one on every run —
+    // the same reason `Toolset::parse` validates a whole spec before returning on `all`. A message
+    // nobody can reproduce is worse than the one it replaced.
+    if let Some((name, spec)) = specs.into_iter().min_by(|a, b| a.0.cmp(&b.0)) {
+        bail!(
+            "{} is the tool surface of a client called `{name}`, and nothing here configures a \
+             token for it (`{}`). A surface no credential can reach is a setting that would never \
+             take effect.",
+            spec.from,
+            match name.as_str() {
+                // The unnamed variable is what configures `local`, and naming `…_TOKEN_LOCAL`
+                // instead would be advice to write the one variable that collides with it.
+                Client::LOCAL => TOKEN_ENV.to_string(),
+                named => format!("{TOKEN_ENV}_{}", named.to_ascii_uppercase()),
+            }
+        );
     }
     Ok(configured)
 }
 
-/// What this process's environment configures, as `(client, token)` pairs.
+/// The client a credential variable's suffix names: `local` for the unnamed one, the folded suffix
+/// otherwise.
+///
+/// One function because [`TOKEN_ENV`] and [`TOOLS_ENV`] have to agree about it exactly — a client
+/// whose token variable named `ci` and whose spec variable named `_ci` would be two clients, one
+/// of which has no token, and the refusal for that is at the bottom of [`from_env`] rather than
+/// anywhere an operator would look.
+fn client_named_by(suffix: &str) -> String {
+    match suffix {
+        "" => Client::LOCAL.to_string(),
+        suffix => suffix.trim_start_matches('_').to_ascii_lowercase(),
+    }
+}
+
+/// What this process's environment configures, one [`ClientEntry`] per client.
 ///
 /// For [`crate::service::install`], which copies the installing shell's credentials into the file
 /// the service reads. It validates by building the same [`Credentials`] the listener would, so an
 /// install cannot write a file the service then refuses to start on — which is the worst shape
 /// this can take, since the SCM registers a service once and it fails at every start afterwards.
-pub fn env_credentials(
-    vars: impl Iterator<Item = (String, String)>,
-) -> Result<Vec<(String, String)>> {
+///
+/// **Surfaces travel with the tokens**, because the file is the whole of what a service reads: a
+/// `WINDBG_MCP_TOOLS_CI` left behind in the installing shell would otherwise be a surface that
+/// worked in the foreground and vanished the moment the same setup was installed.
+pub fn env_credentials(vars: impl Iterator<Item = (String, String)>) -> Result<Vec<ClientEntry>> {
     let configured = from_env(vars)?;
     Credentials::build(&configured)?;
-    Ok(configured.into_iter().map(|c| (c.name, c.token)).collect())
+    Ok(configured.into_iter().map(Configured::entry).collect())
 }
 
 /// The credentials a token file holds.
@@ -582,6 +819,10 @@ impl TokenFile {
                 entries: vec![Configured {
                     name: Client::LOCAL.to_string(),
                     token: text.to_string(),
+                    // A bare token cannot carry one, which is not a gap: it is the file of a
+                    // single-client host, where the run's `--tools` and the client's surface are
+                    // the same choice. Setting one rewrites the file into the object shape.
+                    tools: None,
                     from: path.display().to_string(),
                 }],
             });
@@ -607,12 +848,7 @@ impl TokenFile {
                     path.display()
                 );
             }
-            let Some(token) = value.as_str() else {
-                bail!(
-                    "`{name}` in {} must be a string: the bearer token that client presents.",
-                    path.display()
-                );
-            };
+            let (token, tools) = Self::entry_of(&name, value, path)?;
             let token = token.trim();
             if token.is_empty() {
                 bail!(
@@ -635,6 +871,10 @@ impl TokenFile {
             }
             entries.push(Configured {
                 from: format!("`{name}` in {}", path.display()),
+                tools: tools.map(|text| Spec {
+                    text,
+                    from: format!("`{name}`'s `tools` in {}", path.display()),
+                }),
                 name,
                 token: token.to_string(),
             });
@@ -649,8 +889,67 @@ impl TokenFile {
         Ok(Self { entries })
     }
 
-    /// The clients this file names, as `(name, token)` pairs, validated the way the listener
-    /// validates them.
+    /// One client's entry: the bearer token, and the tool surface if it names one.
+    ///
+    /// **Two shapes here as well**, and for the same reason the file itself has two: a string is
+    /// the token and is what every entry written before this is, so a file nobody has touched
+    /// keeps meaning what it meant. An object is the entry that has something to say beyond the
+    /// token — today `tools`, which is the only reason it exists.
+    ///
+    /// **No refusal here quotes a value either.** The unknown-field one is the case worth naming:
+    /// a file written back to front puts a credential where a key goes, at every level, so the
+    /// message lists the two fields an entry may have rather than the one it found. An operator
+    /// can read their own file; a startup log going to a service's log file is not the place to
+    /// find out what is in it.
+    fn entry_of(
+        name: &str,
+        value: serde_json::Value,
+        path: &Path,
+    ) -> Result<(String, Option<String>)> {
+        match value {
+            serde_json::Value::String(token) => Ok((token, None)),
+            serde_json::Value::Object(fields) => {
+                let mut token = None;
+                let mut tools = None;
+                for (field, value) in fields {
+                    let slot = match field.trim().to_ascii_lowercase().as_str() {
+                        "token" => &mut token,
+                        "tools" => &mut tools,
+                        _ => bail!(
+                            "`{name}` in {} is an object with a field this does not know. An \
+                             entry names `token`, and optionally `tools` — the surface that \
+                             client is served, in the spelling `--tools` takes. The field is not \
+                             quoted here: a file written back to front makes a credential one.",
+                            path.display()
+                        ),
+                    };
+                    let Some(text) = value.as_str() else {
+                        bail!(
+                            "`{name}`'s `{field}` in {} must be a string.",
+                            path.display()
+                        );
+                    };
+                    *slot = Some(text.trim().to_string());
+                }
+                let Some(token) = token else {
+                    bail!(
+                        "`{name}` in {} is an object, so it needs a `token` field holding the \
+                         bearer token that client presents — `{{\"token\": \"<token>\", \
+                         \"tools\": \"session,crash\"}}`.",
+                        path.display()
+                    );
+                };
+                Ok((token, tools.filter(|spec| !spec.is_empty())))
+            }
+            _ => bail!(
+                "`{name}` in {} must be the bearer token that client presents, or an object \
+                 naming it — `{{\"token\": \"<token>\", \"tools\": \"session,crash\"}}`.",
+                path.display()
+            ),
+        }
+    }
+
+    /// The clients this file names, validated the way the listener validates them.
     ///
     /// For the [client commands](crate::service), which read the file to change one entry and
     /// write the rest back. It validates rather than merely handing over what parsed, for the
@@ -660,15 +959,12 @@ impl TokenFile {
     ///
     /// **Sorted by name**, so the file a command writes does not depend on the order the previous
     /// one happened to be in — an operator diffing two of these should see only what changed.
-    pub fn credentials(self) -> Result<Vec<(String, String)>> {
+    pub fn credentials(self) -> Result<Vec<ClientEntry>> {
         Credentials::build(&self.entries)?;
-        let mut pairs: Vec<(String, String)> = self
-            .entries
-            .into_iter()
-            .map(|c| (c.name, c.token))
-            .collect();
-        pairs.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(pairs)
+        let mut entries: Vec<ClientEntry> =
+            self.entries.into_iter().map(Configured::entry).collect();
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(entries)
     }
 }
 
@@ -881,6 +1177,17 @@ fn credential_suffix(name: &str) -> Option<&str> {
         .then(|| &name[TOKEN_ENV.len()..])
 }
 
+/// The part of a tool-surface variable's name after the prefix, if it is one.
+///
+/// Case-insensitive for the same reason [`credential_suffix`] is. The two prefixes cannot overlap
+/// — `WINDBG_MCP_TOOLS` is not a prefix of `WINDBG_MCP_LISTEN_TOKEN` nor the other way round — so
+/// a variable is one kind or the other and never both.
+fn tools_suffix(name: &str) -> Option<&str> {
+    name.to_ascii_uppercase()
+        .starts_with(TOOLS_ENV)
+        .then(|| &name[TOOLS_ENV.len()..])
+}
+
 /// Whether this variable names the token *file* rather than carrying a token.
 fn is_token_file(name: &str) -> bool {
     name.eq_ignore_ascii_case(TOKEN_FILE_ENV)
@@ -894,6 +1201,11 @@ fn is_token_file(name: &str) -> bool {
 /// named token through — and the failure would be silent, a debuggee holding a credential nobody
 /// meant to hand it. The path in `…_TOKEN_FILE` is stripped for the same reason: a target that
 /// knows where the token lives can read it if the file is reachable at all.
+///
+/// **[`TOOLS_ENV`] is deliberately not stripped**, and sits right beside these, so it is worth
+/// saying rather than leaving to be tidied up: it holds a list of this server's own group names,
+/// not a credential. What it would leak is that a client called `bench` exists, which a debuggee
+/// learns from nothing it can act on.
 pub fn strip_credentials(command: &mut impl EnvRemove) {
     for (name, _) in std::env::vars() {
         if credential_suffix(&name).is_some() {
@@ -1190,8 +1502,22 @@ mod tests {
             ),
             ("{}", "names no clients"),
             (r#"{"ci": }"#, "not valid JSON"),
-            (r#"{"ci": 5}"#, "must be a string"),
+            (r#"{"ci": 5}"#, "or an object naming it"),
             (r#"{"ci": "  "}"#, "has no token"),
+            // The object shape's own three. A `tools` with no `token` beside it is the shape an
+            // operator reaches for when adding a surface to an entry and deleting the wrong line.
+            (r#"{"ci": {"tools": "crash"}}"#, "needs a `token` field"),
+            (r#"{"ci": {"token": 5}}"#, "must be a string"),
+            (
+                r#"{"ci": {"token": "t", "surface": "crash"}}"#,
+                "a field this does not know",
+            ),
+            // And a spec that names nothing this server has, which is the same refusal `--tools`
+            // gives — named after the entry it is in rather than after a flag nobody typed.
+            (
+                r#"{"ci": {"token": "t", "tools": "crash,ttdd"}}"#,
+                "`ttdd` is neither a group nor a tool",
+            ),
             // Written back to front, with a token no name could be — the detectable half of that
             // mistake. The other half is not: see `is_client_name`.
             (
@@ -1219,6 +1545,10 @@ mod tests {
             assert!(
                 why.contains(FILE),
                 "a refusal has to name the file it is about: {why}"
+            );
+            assert!(
+                !why.contains("\"t\"") && !why.contains("`t`"),
+                "a refusal quotes a value out of the file: {why}"
             );
         }
     }
@@ -1426,13 +1756,179 @@ mod tests {
             .credentials()
             .expect("a valid file");
         assert_eq!(
-            parsed,
+            rows(&parsed),
             vec![
-                ("ci".to_string(), "c".to_string()),
-                ("laptop".to_string(), "l".to_string()),
-                ("local".to_string(), "s".to_string()),
+                ("ci", "c", None),
+                ("laptop", "l", None),
+                ("local", "s", None)
             ]
         );
+    }
+
+    /// The surface a set of variables configures for one client, as its summary.
+    fn surface(vars_of: &[(&str, &str)], client: &str) -> Option<String> {
+        Credentials::from_entries(vars(vars_of), None)
+            .expect("a usable configuration")
+            .surface_for(client)
+            .map(crate::toolset::Toolset::summary)
+    }
+
+    /// A client's surface is configured beside its token, and a client that names none is served
+    /// whatever the run serves.
+    ///
+    /// **`None` rather than every tool** is the half worth asserting: a listener started with
+    /// `--tools crash` and one client given `inspect` serves that client `inspect` and everybody
+    /// else `crash`, which only works if "no surface configured" stays distinguishable from "all
+    /// fifty-one".
+    #[test]
+    fn a_client_may_be_configured_with_a_surface_of_its_own() {
+        let configured = &[
+            ("WINDBG_MCP_LISTEN_TOKEN", "for-local"),
+            ("WINDBG_MCP_LISTEN_TOKEN_BENCH", "for-bench"),
+            ("WINDBG_MCP_TOOLS_BENCH", "crash"),
+        ][..];
+        assert_eq!(
+            surface(configured, "bench").as_deref(),
+            Some("11 of 51 tools (session, crash)"),
+            "`bench` is served the surface its own variable names"
+        );
+        assert_eq!(
+            surface(configured, "local"),
+            None,
+            "a client with no spec takes the run's surface rather than every tool"
+        );
+        // And the unnamed variable names `local`'s, exactly as the unnamed token names `local`.
+        assert_eq!(
+            surface(
+                &[
+                    ("WINDBG_MCP_LISTEN_TOKEN", "for-local"),
+                    ("WINDBG_MCP_TOOLS", "inspect"),
+                ],
+                "local"
+            )
+            .as_deref(),
+            Some("19 of 51 tools (session, inspect)")
+        );
+    }
+
+    /// Every way a tool-surface variable can be configured wrong, refused at startup.
+    ///
+    /// The orphan is the one this is really for. A surface for a client no credential names is a
+    /// setting that would never take effect, and the likeliest way to write one is the typo that
+    /// makes the two variables disagree about the name — so it is refused on the precedent of the
+    /// two collisions [`Credentials::build`] already refuses, rather than ignored.
+    #[test]
+    fn a_surface_that_would_never_take_effect_is_refused() {
+        for (configured, expected) in [
+            (
+                &[
+                    ("WINDBG_MCP_LISTEN_TOKEN_CI", "for-ci"),
+                    ("WINDBG_MCP_TOOLS_BENCH", "crash"),
+                ][..],
+                "nothing here configures a token for it",
+            ),
+            // Two spellings of one name, which fold together — the same collision two tokens for
+            // one client are, decided by whichever the scan read last.
+            (
+                &[
+                    ("WINDBG_MCP_LISTEN_TOKEN_CI", "for-ci"),
+                    ("WINDBG_MCP_TOOLS_CI", "crash"),
+                    ("WINDBG_MCP_TOOLS__CI", "inspect"),
+                ][..],
+                "both name the tool surface of the client `ci`",
+            ),
+            // A spec naming something this server does not have, refused where a `--tools` spec
+            // is — and named after the variable, not after a flag nobody typed.
+            (
+                &[
+                    ("WINDBG_MCP_LISTEN_TOKEN_CI", "for-ci"),
+                    ("WINDBG_MCP_TOOLS_CI", "crash,ttdd"),
+                ][..],
+                "`ttdd` is neither a group nor a tool",
+            ),
+            (
+                &[
+                    ("WINDBG_MCP_LISTEN_TOKEN_CI", "for-ci"),
+                    ("WINDBG_MCP_TOOLS_two words", "crash"),
+                ][..],
+                "does not name a client",
+            ),
+        ] {
+            let why = Credentials::from_entries(vars(configured), None)
+                .expect_err(&format!("{configured:?} is not a usable configuration"))
+                .to_string();
+            assert!(
+                why.contains(expected),
+                "{configured:?} was refused with: {why}"
+            );
+            for (_, value) in configured {
+                assert!(
+                    !value.starts_with("for-") || !why.contains(value),
+                    "a refusal quotes a token: {why}"
+                );
+            }
+        }
+    }
+
+    /// A configured file is the whole configuration — surfaces included.
+    ///
+    /// The precedence is [`Credentials::from_entries`]'s and predates this, but a surface is the
+    /// first thing to be configured beside a token that is *not* a secret, so it is the first
+    /// thing anyone would be tempted to let the environment contribute. It does not: one file
+    /// answers who may connect and what they are served, rather than two sources and a rule.
+    #[test]
+    fn a_token_file_shuts_out_the_environments_surfaces_too() {
+        let creds = Credentials::from_entries(
+            vars(&[
+                ("WINDBG_MCP_LISTEN_TOKEN_CI", "ignored"),
+                ("WINDBG_MCP_TOOLS_CI", "inspect"),
+            ]),
+            Some(file(
+                r#"{"ci": {"token": "from-the-file", "tools": "crash"}}"#,
+            )),
+        )
+        .expect("a usable configuration");
+        assert_eq!(creds.client_for("ignored"), None);
+        assert_eq!(creds.client_for("from-the-file"), Some("ci"));
+        assert_eq!(
+            creds
+                .surface_for("ci")
+                .map(crate::toolset::Toolset::summary),
+            Some("11 of 51 tools (session, crash)".to_string()),
+            "the file's surface stands, not the variable's"
+        );
+    }
+
+    /// A file entry may still be a bare token, which is every entry written before there was
+    /// anything else to say — and it means the client takes the run's surface.
+    #[test]
+    fn a_file_entry_without_a_surface_is_the_entry_it_always_was() {
+        let creds = Credentials::from_entries(
+            vars(&[]),
+            Some(file(
+                r#"{"ci": "for-ci", "bench": {"token": "for-bench", "tools": "session"}}"#,
+            )),
+        )
+        .expect("a usable configuration");
+        assert_eq!(creds.client_for("for-ci"), Some("ci"));
+        assert_eq!(creds.surface_for("ci"), None);
+        assert_eq!(
+            creds.surfaces(),
+            vec![("bench", "10 of 51 tools (session)".to_string())],
+            "only the client that named one is listed"
+        );
+    }
+
+    /// [`ClientEntry`] as something a test can compare and print.
+    ///
+    /// It has no `Debug` on purpose — it holds a token, and a panic message is exactly the kind of
+    /// place one should not appear. These assertions are about a triple, and a test that writes
+    /// its own literal tokens is the one place quoting them costs nothing.
+    fn rows(entries: &[ClientEntry]) -> Vec<(&str, &str, Option<&str>)> {
+        entries
+            .iter()
+            .map(|e| (e.name.as_str(), e.token.as_str(), e.tools.as_deref()))
+            .collect()
     }
 
     /// A set that would not start a listener is refused on the way out, not just on the way in.

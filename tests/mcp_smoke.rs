@@ -2706,6 +2706,117 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     );
 }
 
+/// Two clients on one listener get two `tools/list` answers.
+///
+/// **The assertion that matters for a per-client surface**, and it is the one shape unit tests
+/// cannot reach. The surface is chosen on the same line the caller's identity is captured on, and
+/// that line was wrong for two months — every call ran as the default `local`, right in every unit
+/// test and wrong on the wire, because a task-local does not cross the task rmcp spawns at
+/// `initialize` (`FOLLOWUPS.md` item 29). A surface resolved from the wrong client is exactly that
+/// bug again, and one client cannot state it: with one credential, "this client's spec" and "the
+/// run's spec" are the same answer.
+///
+/// Protocol tier, not the debugger one: `tools/list` needs no target, and neither does a refusal
+/// for a tool that is not on the surface — it is answered before anything is routed.
+#[test]
+fn two_clients_on_one_listener_are_served_two_surfaces() {
+    let bench_token = format!("smoke-bench-{}", std::process::id());
+    // The run's own `--tools` is the *default*, not a ceiling: `bench` names `crash` and is served
+    // that instead, which is neither a subset nor a superset of what everybody else gets.
+    let mut server = Listener::start_with_args(
+        &[
+            ("WINDBG_MCP_LISTEN_TOKEN_BENCH", &bench_token),
+            ("WINDBG_MCP_TOOLS_BENCH", "crash"),
+        ],
+        &["--tools", "session,inspect"],
+    );
+    let local_token = server.token.clone();
+    assert!(
+        server.wait_for_stderr(
+            "serving 19 of 51 tools (session, inspect) — except bench serves 11 of 51 tools \
+             (session, crash)",
+            Duration::from_secs(30)
+        ),
+        "the startup line does not say what each client is served:\n{}",
+        server.stderr()
+    );
+
+    let local_mcp = server.initialize_as(&local_token);
+    let bench_mcp = server.initialize_as(&bench_token);
+
+    let listed = |server: &mut Listener, token: &str, session: &str| -> Vec<String> {
+        let reply = server.call_as(token, Some(session), "tools/list", json!({}));
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        reply.payload.clone().expect("a JSON-RPC payload")["result"]["tools"]
+            .as_array()
+            .expect("tools/list returns an array")
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+
+    let by_local = listed(&mut server, &local_token, &local_mcp);
+    let by_bench = listed(&mut server, &bench_token, &bench_mcp);
+    assert_eq!(by_local.len(), 19, "{by_local:?}");
+    assert_eq!(by_bench.len(), 11, "{by_bench:?}");
+    assert!(by_local.contains(&"registers".to_string()), "{by_local:?}");
+    assert!(
+        !by_local.contains(&"crash_triage".to_string()),
+        "{by_local:?}"
+    );
+    assert!(
+        by_bench.contains(&"crash_triage".to_string()),
+        "{by_bench:?}"
+    );
+    assert!(!by_bench.contains(&"registers".to_string()), "{by_bench:?}");
+    // Both hold the openers, because every other tool routes by a handle only this server issues.
+    for names in [&by_local, &by_bench] {
+        assert!(names.contains(&"open_dump".to_string()), "{names:?}");
+    }
+
+    // And a tool off the surface is refused by name, with the remedy for *this* caller: `local`
+    // takes the run's, so the flag is the answer; `bench` has one of its own, so the client
+    // command is. Naming the wrong one sends an operator to widen a spec that is not in force.
+    let refused = |server: &mut Listener, token: &str, session: &str, tool: &str| -> String {
+        let reply = server.call_as(
+            token,
+            Some(session),
+            "tools/call",
+            json!({ "name": tool, "arguments": {} }),
+        );
+        let payload = reply.payload.clone().expect("a JSON-RPC payload");
+        payload["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("`{tool}` was not refused: {}", reply.body))
+            .to_string()
+    };
+    let to_local = refused(&mut server, &local_token, &local_mcp, "crash_triage");
+    assert!(to_local.contains("this run advertises"), "{to_local}");
+    assert!(to_local.contains("started with `--tools`"), "{to_local}");
+    let to_bench = refused(&mut server, &bench_token, &bench_mcp, "registers");
+    assert!(to_bench.contains("it serves `bench`"), "{to_bench}");
+    assert!(
+        to_bench.contains("--set-listen-client-tools bench"),
+        "{to_bench}"
+    );
+
+    // The same question on `2026-07-28`, which reaches the surface by the other route: no MCP
+    // session, so no task spawned to serve one, and the identity arrives with the request itself.
+    // Both are asserted because the bug this shape has produced before was one of them losing it.
+    let stateless = server.stateless_as(&bench_token, "tools/list", json!({}));
+    assert_eq!(stateless.status, 200, "{}", stateless.body);
+    let names: Vec<String> = stateless.result("tools/list")["tools"]
+        .as_array()
+        .expect("tools/list returns an array")
+        .iter()
+        .map(|t| t["name"].as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(
+        names, by_bench,
+        "a stateless client is served the same surface its session-bearing self is"
+    );
+}
+
 /// A `--listen` server, and just enough HTTP to drive it.
 struct Listener {
     child: Child,

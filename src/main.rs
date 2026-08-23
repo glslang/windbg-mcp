@@ -94,7 +94,7 @@ fn main() -> Result<()> {
                 listen_address(&args)?,
                 // Validated here, by the same parser the service will use at every start, so a
                 // spec the running service would reject cannot be written into its command line.
-                installed_tools(&args)?.as_deref(),
+                tools_spec(&args)?.as_deref(),
                 args.iter().any(|a| a == service::ALLOW_UNPROTECTED_FLAG),
             ),
             service::Role::Uninstall => service::uninstall(),
@@ -102,7 +102,12 @@ fn main() -> Result<()> {
             // Touches the SCM and one file, like installing — and like installing, it must not
             // build a runtime: the reload it asks for happens in the *service's* process, not
             // this one.
-            service::Role::Client(edit, name) => service::edit_client(edit, &name),
+            // The `--tools` on this command line is the *client's* surface here, not this run's:
+            // this process serves nothing. `edit_client` refuses it on the edits it means nothing
+            // for, rather than accepting a flag it would then ignore.
+            service::Role::Client(edit, name) => {
+                service::edit_client(edit, &name, tools_spec(&args)?.as_deref())
+            }
         };
     }
 
@@ -168,12 +173,18 @@ pub(crate) async fn serve_http(
     outcome
 }
 
-/// The `--tools` spec an install was told to register, checked before it is stored.
+/// The `--tools` spec on this command line, as text, checked before it is written anywhere.
 ///
-/// The same reason [`listen_address`] exists, pointed at the other half of the stored command
-/// line: the SCM keeps that line and nothing re-derives it, so a spec that the service would
-/// refuse at start is a service that installs cleanly and never runs.
-fn installed_tools(args: &[String]) -> Result<Option<String>> {
+/// The same reason [`listen_address`] exists, and it now has two callers whose stored copy nothing
+/// re-derives: the command line the SCM keeps for the service, and a client's entry in the
+/// credential file. A spec the server would refuse at start is, in the first case, a service that
+/// installs cleanly and never runs.
+///
+/// **Text rather than a [`toolset::Toolset`]**, because both of those store what was typed and
+/// parse it again later — and `--tools` with nothing after it has to be the usage error
+/// [`toolset::Toolset::requested`] makes it, rather than the `None` that would silently mean "no
+/// spec given".
+fn tools_spec(args: &[String]) -> Result<Option<String>> {
     match toolset::Toolset::requested(args) {
         Some(Err(e)) => Err(anyhow::anyhow!(e)),
         Some(Ok(_)) => Ok(toolset::Toolset::spec_in(args).map(str::to_string)),
@@ -297,7 +308,9 @@ async fn serve(tools: toolset::Toolset) -> Result<()> {
     // rather than whatever the first tool call happened to be.
     let sessions = Sessions::new(call_timeout()).recording(record::Recorder::from_env());
     let surface = tools.summary();
-    let server = WindbgServer::new(sessions.clone()).with_tools(tools);
+    // `ForTheRun` without a branch: stdio has one client by construction and no configuration to
+    // give it a surface of its own, so `--tools` is the only thing that can have narrowed this.
+    let server = WindbgServer::new(sessions.clone()).with_tools(tools, toolset::Chosen::ForTheRun);
 
     tracing::info!("windbg-mcp starting on stdio, serving {surface}");
     let service = server.serve(stdio()).await?;

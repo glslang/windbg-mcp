@@ -90,6 +90,10 @@ pub const ADD_CLIENT_FLAG: &str = "--add-listen-client";
 pub const REMOVE_CLIENT_FLAG: &str = "--remove-listen-client";
 /// Replaces a client's token, keeping its name — and so its sessions.
 pub const ROTATE_CLIENT_FLAG: &str = "--rotate-listen-client";
+/// Changes which tools one client is served. Takes the client's name, and the surface as
+/// [`crate::toolset::FLAG`] beside it — with no `--tools` at all, the client goes back to being
+/// served whatever the run serves.
+pub const SET_CLIENT_TOOLS_FLAG: &str = "--set-listen-client-tools";
 
 /// Overrides where the service writes its log.
 pub const LOG_ENV: &str = "WINDBG_MCP_SERVICE_LOG";
@@ -142,6 +146,7 @@ pub enum ClientEdit {
     Add,
     Remove,
     Rotate,
+    SetTools,
 }
 
 impl ClientEdit {
@@ -150,7 +155,18 @@ impl ClientEdit {
             Self::Add => ADD_CLIENT_FLAG,
             Self::Remove => REMOVE_CLIENT_FLAG,
             Self::Rotate => ROTATE_CLIENT_FLAG,
+            Self::SetTools => SET_CLIENT_TOOLS_FLAG,
         }
+    }
+
+    /// Whether a [`crate::toolset::FLAG`] beside this command means anything.
+    ///
+    /// Two of the four say what a client is served, and on the other two the flag is refused
+    /// rather than ignored: `--rotate-listen-client bench --tools crash` reads exactly like a
+    /// command that narrows `bench`, and accepting it silently would leave an operator believing
+    /// it had.
+    fn takes_a_surface(self) -> bool {
+        matches!(self, Self::Add | Self::SetTools)
     }
 
     /// Whether this command takes a working credential *out* of service.
@@ -179,6 +195,7 @@ pub fn requested(args: &[String]) -> Option<Role> {
         (ADD_CLIENT_FLAG, ClientEdit::Add),
         (REMOVE_CLIENT_FLAG, ClientEdit::Remove),
         (ROTATE_CLIENT_FLAG, ClientEdit::Rotate),
+        (SET_CLIENT_TOOLS_FLAG, ClientEdit::SetTools),
     ];
     args.iter().enumerate().find_map(|(at, arg)| {
         match arg.as_str() {
@@ -274,16 +291,33 @@ pub fn token_file() -> PathBuf {
 /// Both are read back by [`crate::client::TokenFile`], which is where the shapes are defined; this
 /// only has to pick between them — and picks by [asking it](reads_back_bare) rather than by
 /// restating its rule.
-fn token_file_contents(credentials: &[(String, String)]) -> String {
-    if let [(name, token)] = credentials
-        && name == crate::client::Client::LOCAL
-        && reads_back_bare(token)
+fn token_file_contents(credentials: &[crate::client::ClientEntry]) -> String {
+    if let [only] = credentials
+        && only.name == crate::client::Client::LOCAL
+        // **And nothing to say beyond the token.** A bare token is the whole entry, so a client
+        // with a surface of its own cannot be written as one — setting a spec on the file
+        // everybody has rewrites it into the object shape, which is the only place the spec fits.
+        && only.tools.is_none()
+        && reads_back_bare(&only.token)
     {
-        return token.clone();
+        return only.token.clone();
     }
-    let named: std::collections::BTreeMap<&str, &str> = credentials
+    let named: std::collections::BTreeMap<&str, Entry<'_>> = credentials
         .iter()
-        .map(|(name, token)| (name.as_str(), token.as_str()))
+        .map(|entry| {
+            (
+                entry.name.as_str(),
+                match entry.tools.as_deref() {
+                    // Written back as the string it was, so a file whose clients have no surfaces
+                    // is byte-for-byte the file this wrote before there were any.
+                    None => Entry::Token(entry.token.as_str()),
+                    Some(tools) => Entry::Named {
+                        token: entry.token.as_str(),
+                        tools,
+                    },
+                },
+            )
+        })
         .collect();
     // Pretty, and a trailing newline: this is a file an operator will open when something is wrong,
     // and `Get-Content` on a single long line is not a way to read one.
@@ -293,6 +327,19 @@ fn token_file_contents(credentials: &[(String, String)]) -> String {
     // a service that then refuses every caller — which is the exact outcome this path exists to
     // prevent.
     serde_json::to_string_pretty(&named).expect("a map of strings serializes") + "\n"
+}
+
+/// One client's entry as the file holds it: the token alone, or the object that can also carry a
+/// surface.
+///
+/// Untagged, because the two shapes are the file's own and [`crate::client::TokenFile`] tells them
+/// apart by their JSON types rather than by a discriminant — a `tag` here would write a field that
+/// reader would refuse as one it does not know.
+#[derive(serde::Serialize)]
+#[serde(untagged)]
+enum Entry<'a> {
+    Token(&'a str),
+    Named { token: &'a str, tools: &'a str },
 }
 
 /// Whether `token`, written on its own, reads back as the one `local` credential it is meant to be.
@@ -433,7 +480,7 @@ fn under_protected_root(exe: &std::path::Path) -> bool {
 /// here, so there is no window in which the file exists and something is serving with it.
 fn finish_install(
     service: &windows_service::service::Service,
-    credentials: &[(String, String)],
+    credentials: &[crate::client::ClientEntry],
 ) -> Result<()> {
     service
         .set_description(DESCRIPTION)
@@ -505,7 +552,7 @@ fn is_reload(control: &ServiceControl) -> bool {
 /// keeps a working token out of a shell history and out of an agent's transcript, and it is why
 /// these commands are narrow enough to allow-list in a permission rule where "let this write
 /// `%ProgramData%`" would not be.
-pub fn edit_client(edit: ClientEdit, name: &str) -> Result<()> {
+pub fn edit_client(edit: ClientEdit, name: &str, tools: Option<&str>) -> Result<()> {
     let name = crate::client::client_name(name).with_context(|| {
         format!(
             "`{}` needs the name of a client — `{} bench`",
@@ -513,6 +560,26 @@ pub fn edit_client(edit: ClientEdit, name: &str) -> Result<()> {
             edit.flag()
         )
     })?;
+    // **Checked before the SCM is opened and before the lock is taken**, because it is a fact
+    // about this command line and nothing else — and a usage error that only surfaces after a
+    // transaction has started is one that has to be unwound.
+    if let Some(spec) = tools {
+        if !edit.takes_a_surface() {
+            bail!(
+                "`{}` changes a client's token, not the tools it is served, so the `{}` beside it \
+                 would do nothing — and it reads exactly like a command that had narrowed \
+                 `{name}`. `{SET_CLIENT_TOOLS_FLAG} {name} {} {spec}` is that command.",
+                edit.flag(),
+                crate::toolset::FLAG,
+                crate::toolset::FLAG,
+            );
+        }
+        // By the same parser the service will use at every start, so a spec it would refuse
+        // cannot be written into the file it reads — the same rule the command line the SCM
+        // stores is held to. A second parse: `main` has already validated this, and this is the
+        // function that writes the file, so it does not take that on trust.
+        crate::toolset::Toolset::parse(spec).map_err(|e| anyhow::anyhow!(e))?;
+    }
     // **This handle does not prove elevation**, and it is worth being clear about that rather than
     // implying it: a service's default DACL grants `SERVICE_USER_DEFINED_CONTROL` to Authenticated
     // Users, so an ordinary account opens it fine. What refuses an unelevated caller is the
@@ -561,7 +628,7 @@ pub fn edit_client(edit: ClientEdit, name: &str) -> Result<()> {
             return Err(anyhow::Error::new(e).context(format!("cannot read {}", at.display())));
         }
     };
-    let mut credentials = match (existing, edit) {
+    let mut credentials: Vec<crate::client::ClientEntry> = match (existing, edit) {
         (Some(credentials), _) => credentials,
         (None, ClientEdit::Add) => Vec::new(),
         (None, _) => bail!(
@@ -573,23 +640,37 @@ pub fn edit_client(edit: ClientEdit, name: &str) -> Result<()> {
     };
     let started_empty = credentials.is_empty();
 
-    let held_at = credentials.iter().position(|(held, _)| *held == name);
+    let held_at = credentials.iter().position(|held| held.name == name);
     let mut minted = None;
     match (edit, held_at) {
         (ClientEdit::Add, Some(_)) => bail!(
             "`{NAME}` already has a client called `{name}`. To give it a new token without \
-             disturbing what it has open, `{ROTATE_CLIENT_FLAG} {name}`; to take it away, \
+             disturbing what it has open, `{ROTATE_CLIENT_FLAG} {name}`; to change which tools it \
+             is served, `{SET_CLIENT_TOOLS_FLAG} {name}`; to take it away, \
              `{REMOVE_CLIENT_FLAG} {name}`."
         ),
         (ClientEdit::Add, None) => {
             let token = crate::client::generate_token()?;
             minted = Some(token.clone());
-            credentials.push((name.clone(), token));
+            credentials.push(crate::client::ClientEntry {
+                name: name.clone(),
+                token,
+                tools: tools.map(str::to_string),
+            });
         }
-        (ClientEdit::Remove, None) | (ClientEdit::Rotate, None) => bail!(
-            "`{NAME}` has no client called `{name}`. It holds: {}.",
-            roster(&credentials)
-        ),
+        (ClientEdit::Remove, None) | (ClientEdit::Rotate, None) | (ClientEdit::SetTools, None) => {
+            bail!(
+                "`{NAME}` has no client called `{name}`. It holds: {}.",
+                roster(&credentials)
+            )
+        }
+        // **`None` is not the same as `all`**, and this is the command where the difference is
+        // visible: with no `--tools` at all the entry's spec is taken away, so the client goes
+        // back to being served whatever the service serves — which is what it had before anyone
+        // set one, and follows the service's own `--tools` if that ever changes.
+        (ClientEdit::SetTools, Some(index)) => {
+            credentials[index].tools = tools.map(str::to_string);
+        }
         (ClientEdit::Remove, Some(index)) => {
             credentials.remove(index);
             // **Refused, because a listener with no credentials will not start.** Revoking the
@@ -608,10 +689,15 @@ pub fn edit_client(edit: ClientEdit, name: &str) -> Result<()> {
         (ClientEdit::Rotate, Some(index)) => {
             let token = crate::client::generate_token()?;
             minted = Some(token.clone());
-            credentials[index].1 = token;
+            credentials[index].token = token;
         }
     }
-    credentials.sort_by(|a, b| a.0.cmp(&b.0));
+    credentials.sort_by(|a, b| a.name.cmp(&b.name));
+    // Held to the rules the listener holds a configuration to, before any of it is written down.
+    // The spec above went through the same parser already; what this adds is everything a *set*
+    // has to satisfy — and it is the check that keeps this command from writing a file the service
+    // then refuses to start on.
+    crate::client::check(&credentials)?;
 
     // **Written before the credential file, and removed again if that write fails.** The order is
     // what keeps the two from disagreeing: a token accepted by the service that the operator has
@@ -647,12 +733,19 @@ pub fn edit_client(edit: ClientEdit, name: &str) -> Result<()> {
         _ => false,
     };
 
-    let (past, changed) = match edit {
-        ClientEdit::Add => (
-            "added",
-            "it gets the whole tool surface, as every client here does — a token separates \
-             clients from each other, it does not limit one",
+    let served = match tools {
+        // Named as the *spec*, not as the surface it resolves to: `session` is added to it, so the
+        // two differ, and what an operator has to be able to hand back to this command is the spec
+        // they typed. The resolved surface is in the listener's own startup and reload lines.
+        Some(spec) => format!("it is served `{spec}`"),
+        None => format!(
+            "it is served whatever `{NAME}` serves — `{}` on the command line the SCM stores, or \
+             every tool if that has none",
+            crate::toolset::FLAG
         ),
+    };
+    let (past, changed) = match edit {
+        ClientEdit::Add => ("added", served.as_str()),
         ClientEdit::Remove => (
             "removed",
             "it can no longer connect, and the sessions it still held go with it",
@@ -662,12 +755,19 @@ pub fn edit_client(edit: ClientEdit, name: &str) -> Result<()> {
             "it keeps its name, and so keeps the sessions it has open — it just presents the new \
              token",
         ),
+        // **What it does not change is what it is worth saying**: the token is untouched, so this
+        // is not a revocation and nothing has to be moved to the client machine.
+        ClientEdit::SetTools => ("re-toolled", served.as_str()),
     };
     println!(
         "{past} the client `{name}` ({}) — {changed}.\n`{NAME}` now holds: {}.",
-        match minted.as_deref() {
-            Some(token) => crate::client::fingerprint(token),
-            None => "no longer configured".to_string(),
+        match (minted.as_deref(), edit) {
+            (Some(token), _) => crate::client::fingerprint(token),
+            // **Three answers, not two.** A removal's credential is gone; a re-toolling's is
+            // untouched, and saying "no longer configured" of it would read as a revocation that
+            // did not happen — the one thing an operator must not be told wrongly here.
+            (None, ClientEdit::Remove) => "no longer configured".to_string(),
+            (None, _) => "same token".to_string(),
         },
         roster(&credentials)
     );
@@ -726,17 +826,42 @@ pub fn edit_client(edit: ClientEdit, name: &str) -> Result<()> {
              today has stopped working."
         ),
     }
+    // **A surface reaches a client on its next connection, and a reload is not that.** Said here
+    // because the line above claims the service re-read its clients, which is true and is not the
+    // same claim: a connected client's tool list was decided when it connected, and nothing sends
+    // `notifications/tools/list_changed` to tell it otherwise (see [`crate::toolset`]). A
+    // revocation needs no such note — the credential stops being accepted at the swap.
+    if matches!(edit, ClientEdit::SetTools) {
+        println!(
+            "\n`{name}` sees this when it next connects. A client connected now goes on listing \
+             the tools it listed at the time — reconnect it, or restart whatever is driving it."
+        );
+    }
     Ok(())
 }
 
-/// Every configured client, by name and fingerprint — what these commands print instead of a file.
-fn roster(credentials: &[(String, String)]) -> String {
+/// Every configured client, by name, fingerprint and surface — what these commands print instead
+/// of a file.
+///
+/// The surface is named only where one is set, so the roster of the configuration everyone has is
+/// the line it always was, and a service serving two budgets says so in one line.
+fn roster(credentials: &[crate::client::ClientEntry]) -> String {
     if credentials.is_empty() {
         return "no clients".to_string();
     }
     credentials
         .iter()
-        .map(|(name, token)| format!("`{name}` ({})", crate::client::fingerprint(token)))
+        .map(|entry| {
+            format!(
+                "`{}` ({}{})",
+                entry.name,
+                crate::client::fingerprint(&entry.token),
+                match &entry.tools {
+                    Some(spec) => format!(", {} {spec}", crate::toolset::FLAG),
+                    None => String::new(),
+                }
+            )
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }
@@ -860,7 +985,7 @@ fn lock_credentials() -> Result<std::fs::File> {
 ///
 /// Shared with [`finish_install`] rather than restated, so the client commands and the installer
 /// cannot end up writing that file to two different standards.
-fn write_credentials(credentials: &[(String, String)]) -> Result<()> {
+fn write_credentials(credentials: &[crate::client::ClientEntry]) -> Result<()> {
     use std::io::Write;
 
     let dir = secured_state_dir()?;
@@ -974,10 +1099,11 @@ pub fn install(addr: SocketAddr, tools: Option<&str>, allow_unprotected: bool) -
              LocalSystem.\n    $env:{} = \"<a long random string>\"\n\nEvery {}_<NAME> in this \
              shell is copied too, each naming a client of its own — which under a service is the \
              only way to have more than one, since the file it reads is the whole of what it \
-             accepts.",
+             accepts. So is each client's {}_<NAME>, if it has one.",
             crate::listen::TOKEN_ENV,
             crate::listen::TOKEN_ENV,
-            crate::listen::TOKEN_ENV
+            crate::listen::TOKEN_ENV,
+            crate::client::TOOLS_ENV
         );
     }
 
@@ -1566,15 +1692,59 @@ mod tests {
     #[test]
     fn the_roster_names_clients_and_quotes_no_token() {
         let credentials = [
-            ("ci".to_string(), "ci-token-value".to_string()),
-            ("local".to_string(), "local-token-value".to_string()),
+            entry("ci", "ci-token-value", Some("session,crash")),
+            entry("local", "local-token-value", None),
         ];
         let said = roster(&credentials);
         assert!(said.contains("`ci`") && said.contains("`local`"), "{said}");
-        for (_, token) in &credentials {
-            assert!(!said.contains(token), "the roster quotes a token: {said}");
+        // The surface *is* quoted, on the one client that has one: it is a list of this server's
+        // own group names, and it is what an operator has to see to know the two clients are not
+        // being served the same thing.
+        assert!(said.contains("--tools session,crash"), "{said}");
+        for held in &credentials {
+            assert!(
+                !said.contains(&held.token),
+                "the roster quotes a token: {said}"
+            );
         }
         assert_eq!(roster(&[]), "no clients");
+    }
+
+    /// A `--tools` on a command that does not take one is refused, not ignored.
+    ///
+    /// `--rotate-listen-client bench --tools crash` reads exactly like a command that narrowed
+    /// `bench`, and accepting it silently would leave an operator believing it had. Checked before
+    /// the SCM is opened and before the credential lock is taken, which is also what lets this be
+    /// a unit test: nothing about the machine has been touched by the time it returns.
+    #[test]
+    fn a_surface_on_a_command_that_does_not_take_one_is_refused() {
+        for edit in [ClientEdit::Remove, ClientEdit::Rotate] {
+            let why = edit_client(edit, "bench", Some("crash"))
+                .expect_err("a surface on a token command is a usage error")
+                .to_string();
+            assert!(why.contains(SET_CLIENT_TOOLS_FLAG), "{why}");
+            assert!(
+                why.contains("changes a client's token, not the tools it is served"),
+                "{why}"
+            );
+        }
+        // And a spec this server could not serve is refused on the commands that *do* take one,
+        // before anything is written — the same rule the installed command line is held to.
+        let why = edit_client(ClientEdit::Add, "bench", Some("crash,ttdd"))
+            .expect_err("`ttdd` is not a group")
+            .to_string();
+        assert!(
+            why.contains("`ttdd` is neither a group nor a tool"),
+            "{why}"
+        );
+    }
+
+    fn entry(name: &str, token: &str, tools: Option<&str>) -> crate::client::ClientEntry {
+        crate::client::ClientEntry {
+            name: name.to_string(),
+            token: token.to_string(),
+            tools: tools.map(str::to_string),
+        }
     }
 
     /// The SCM stores this once, at install time, and nothing re-derives it — so a service that
@@ -1638,10 +1808,7 @@ mod tests {
 
         // One client called `local` keeps the shape every existing install has: the token, and
         // nothing around it.
-        let one = [(
-            crate::client::Client::LOCAL.to_string(),
-            "s3cret".to_string(),
-        )];
+        let one = [entry(crate::client::Client::LOCAL, "s3cret", None)];
         let written = token_file_contents(&one);
         assert_eq!(written, "s3cret", "a single local token is written bare");
         assert_eq!(read_back(&written).client_for("s3cret"), Some("local"));
@@ -1650,29 +1817,49 @@ mod tests {
         // and under a service the only way to have a second client at all.
         for credentials in [
             vec![
-                ("local".to_string(), "for-local".to_string()),
-                ("ci".to_string(), "for-ci".to_string()),
+                entry("local", "for-local", None),
+                entry("ci", "for-ci", None),
             ],
             // A shell with only a named token configures no `local`, and that is not a special
             // case: it is one client, which happens not to be that one.
-            vec![("ci".to_string(), "for-ci".to_string())],
+            vec![entry("ci", "for-ci", None)],
             // And a lone `local` whose token begins with `{`, which the bare shape cannot carry:
             // the reader would take it for the JSON one. Nothing is wrong with the token, so it
             // goes in the object rather than being refused.
-            vec![("local".to_string(), "{not-json-just-a-token".to_string())],
+            vec![entry("local", "{not-json-just-a-token", None)],
             // The nastier one: a token that *is* a one-entry object naming `local`. Written bare
             // it parses — to a different token — so this asserts the whole credential survives,
             // not just the client's name.
-            vec![(
-                "local".to_string(),
-                r#"{"local":"replacement"}"#.to_string(),
-            )],
+            vec![entry("local", r#"{"local":"replacement"}"#, None)],
+            // **A surface takes the file out of the bare shape**, which is the one client the
+            // reader would otherwise have written as a token and read back with no spec at all.
+            vec![entry("local", "s3cret", Some("session,crash"))],
+            vec![
+                entry("local", "for-local", None),
+                entry("bench", "for-bench", Some("crash")),
+            ],
         ] {
             let written = token_file_contents(&credentials);
             let creds = read_back(&written);
             assert_eq!(creds.len(), credentials.len());
-            for (name, token) in &credentials {
-                assert_eq!(creds.client_for(token), Some(name.as_str()), "{written}");
+            for held in &credentials {
+                assert_eq!(
+                    creds.client_for(&held.token),
+                    Some(held.name.as_str()),
+                    "{written}"
+                );
+                // And the surface came back beside it, resolved the way the flag resolves one.
+                assert_eq!(
+                    creds
+                        .surface_for(&held.name)
+                        .map(crate::toolset::Toolset::summary),
+                    held.tools
+                        .as_deref()
+                        .map(|spec| crate::toolset::Toolset::parse(spec)
+                            .expect("the test's own spec parses")
+                            .summary()),
+                    "{written}"
+                );
             }
         }
     }

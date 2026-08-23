@@ -231,20 +231,22 @@ logout, starts at boot, and gets a defined `PATH` and working directory — whic
 whether the engine DLLs beside the exe are the ones that load. `Stop-Service` releases every debug
 target before exiting, because a live kernel that is merely killed is left frozen. Its clients are
 changed in place — `--add-listen-client`, `--remove-listen-client`, `--rotate-listen-client`, each
-generating the token itself, writing it beside the credential file and printing only a fingerprint —
-so adding or revoking one costs neither a reinstall nor the sessions the service is holding.
+generating the token itself, writing it beside the credential file and printing only a fingerprint,
+and `--set-listen-client-tools` for which tools one of them is served — so adding, revoking or
+re-toolling one costs neither a reinstall nor the sessions the service is holding.
 
 **Bind loopback and forward over SSH.** This endpoint runs `execute`, `debug_batch` and `launch`
 against a live kernel, and the token is sent in clear — a hypervisor's guest network is not private
 when the machine being debugged shares it. [`docs/remote-listener.md`](./docs/remote-listener.md)
-covers the tokens — **one per client**, each with its own sessions, so two people or two agents on
-one listener cannot reach each other's targets — the session lease and its grace, and the one thing
-a `409` means: this credential's own expired sessions are still being released, so ask again in a
-moment. Nothing else is refused for contention — a credential may hold several MCP sessions, and
-requests of one client never wait on another's. For a one-off, [`docs/remote-phase0.md`](./docs/remote-phase0.md) does the same
-job over plain `ssh` with no listener; for driving it from a **local model** rather than a hosted
-one, [`docs/local-model.md`](./docs/local-model.md) is the runbook and the numbers that decide
-whether it fits.
+covers the tokens — **one per client**, each with its own sessions and, where you want one, its own
+tool surface, so two people or two agents on one listener cannot reach each other's targets and need
+not share a budget — the session lease and its grace, and the one thing a `409` means: this
+credential's own expired sessions are still being released, so ask again in a moment. Nothing else
+is refused for contention — a credential may hold several MCP sessions, and requests of one client
+never wait on another's. For a one-off, [`docs/remote-phase0.md`](./docs/remote-phase0.md) does the
+same job over plain `ssh` with no listener; for driving it from a **local model** rather than a
+hosted one, [`docs/local-model.md`](./docs/local-model.md) is the runbook and the numbers that
+decide whether it fits.
 
 ### As a Claude Code plugin
 
@@ -396,9 +398,25 @@ Two things worth knowing:
   run advertises" — rather than as an unknown tool, because the remedy is a flag on a command line
   the caller cannot see.
 
-It is a **server-wide** choice: `--tools` on the stdio command line, on a `--listen` one, or on
-`--install-service` (where it is written into the command line the SCM stores, and read back at
-every start).
+`--tools` goes on the stdio command line, on a `--listen` one, or on `--install-service` (where it
+is written into the command line the SCM stores, and read back at every start). That is the
+**run's** surface, and under stdio it is the whole story: one process, one client.
+
+A `--listen` server names its clients, and **a client may be served a surface of its own** — which
+is what lets one listener hold a local model that can fit twenty tools beside a hosted client that
+can hold fifty-one, against the same debug sessions:
+
+```pwsh
+setx WINDBG_MCP_LISTEN_TOKEN_BENCH "<a long random string>"
+setx WINDBG_MCP_TOOLS_BENCH        "session,inspect,crash"
+```
+
+A client with no spec of its own is served the run's, so the flag above is a **default rather than
+a ceiling** — a client's own spec replaces it, wider or narrower. Under a Windows service the same
+thing lives in the credential file, and `--set-listen-client-tools <name> --tools <spec>` changes it
+without a reinstall or a restart. [`docs/remote-listener.md`](docs/remote-listener.md#a-tool-surface-per-client)
+is the operator's half, including when a change reaches a client (its next connection) and why
+nothing announces one.
 
 ### Sessions and session handles
 

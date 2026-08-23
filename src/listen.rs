@@ -647,6 +647,18 @@ async fn bind_when_ready(addr: SocketAddr) -> Result<TcpListener> {
     }
 }
 
+/// The clients served something other than the run's own surface, as a clause to hang off a line
+/// that has already said what that is.
+///
+/// Two lines print it — the startup one and the reload one — and they have to agree, because the
+/// only way to see that a reload changed a surface is to compare them.
+fn own_surfaces(credentials: &crate::client::Accepted) -> String {
+    match credentials.surfaces() {
+        rows if rows.is_empty() => String::new(),
+        rows => format!(" — except {}", rows.join(", ")),
+    }
+}
+
 /// The credentials this listener accepts, from a file if one is named and from the environment
 /// otherwise.
 fn credentials() -> Result<crate::client::Credentials> {
@@ -715,6 +727,7 @@ pub async fn serve(
     let mcp = {
         let sessions = sessions.clone();
         let tools = tools.clone();
+        let credentials = Arc::clone(&credentials);
         Arc::new(StreamableHttpService::new(
             // **The one moment the caller is knowable.** rmcp builds a service instance per MCP
             // session — here, on the task handling that session's `initialize`, which
@@ -724,12 +737,17 @@ pub async fn serve(
             // `WindbgServer::client`. On the stateless revision there is no session and no spawn,
             // and this runs per request, which reaches the same answer by the shorter route.
             move || {
-                Ok(
-                    WindbgServer::for_client(sessions.clone(), crate::client::current())
-                        // Server-wide, so every client on this listener sees the same surface.
-                        // Per-caller is `FOLLOWUPS.md` item 36, and this is the line it changes.
-                        .with_tools(tools.clone()),
-                )
+                let client = crate::client::current();
+                // **And the one moment its surface is knowable, for the same reason.** A client
+                // configured with a spec of its own is served that; every other client is served
+                // whatever this run serves, which is `--tools` or all fifty-one. The run's flag is
+                // the default rather than a ceiling — see [`crate::toolset`], which also says why
+                // a change here reaches a client on its next connection and not before.
+                let (surface, chosen) = match credentials.surface_for(&client) {
+                    Some(own) => (own, crate::toolset::Chosen::ForThisClient),
+                    None => (tools.clone(), crate::toolset::Chosen::ForTheRun),
+                };
+                Ok(WindbgServer::for_client(sessions.clone(), client).with_tools(surface, chosen))
             },
             manager.clone(),
             // A tool call can be quiet for minutes; without a keep-alive the stream looks idle to
@@ -754,7 +772,8 @@ pub async fn serve(
     // *now*. See [`crate::service`], where "started" is a thing the SCM and its dependants act on.
     ready();
     tracing::info!(
-        "windbg-mcp listening on http://{addr} (lease grace {grace:?}, {}, clients: {}, serving {})",
+        "windbg-mcp listening on http://{addr} (lease grace {grace:?}, {}, clients: {}, serving \
+         {}{})",
         match idle_after {
             Some(after) => format!("idle sessions released after {}m", after.as_secs() / 60),
             None => "idle sessions never released".to_string(),
@@ -762,7 +781,10 @@ pub async fn serve(
         credentials.names().join(", "),
         // Named here for the same reason the client list is: `--tools` adds the `session` group
         // whatever the spec said, so the surface a run ends up with is not always the one typed.
-        tools.summary()
+        tools.summary(),
+        // And the clients that are not served that one. Empty — and costing this line nothing —
+        // on the configuration everyone has, where no client names a surface of its own.
+        own_surfaces(&credentials)
     );
 
     // Only under the service, which is the only role with a control channel to be asked on.
@@ -1033,19 +1055,27 @@ async fn reloaded(
         // command claims when it returns, and all of it is memory.
         let _ = answer.send(true);
         tracing::info!(
-            "re-read the clients: {}",
+            "re-read the clients: {}{}",
             match change.is_empty() {
                 // A rotation, which changes a token and no name. Worth a line of its own: from
                 // out here it looks like nothing happened, and the client whose token moved is
                 // about to start failing to authenticate with the old one.
-                true => "the same clients, one or more of which may now present a different token"
+                //
+                // **A surface change looks like this too**, and for the same reason — it moves no
+                // name — which is why the clause below is printed on every reload rather than
+                // when something was added or taken away.
+                true => "the same clients, one or more of which may now present a different token \
+                         or tool surface"
                     .to_string(),
                 false => format!(
                     "added [{}], removed [{}]",
                     crate::client::Change::names(&change.added),
                     crate::client::Change::names(&change.removed)
                 ),
-            }
+            },
+            // Absolute rather than a diff: the startup line prints the same clause, so the two
+            // together say what changed without this having to work it out.
+            own_surfaces(&accepted)
         );
     }
 }
