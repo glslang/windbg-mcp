@@ -296,21 +296,13 @@ impl Toolset {
     }
 
     /// Is this tool served?
-    /// Whether any tool of a named group is on this surface.
+    /// Every tool this server has, for the assertions that have to range over all of them.
     ///
-    /// For the server's `instructions`, which are assembled from a fragment per group rather than
-    /// filtered by tool name: the prose names several tools per sentence, so cutting by name
-    /// leaves mangled English in the one string a model reads before anything else. Asking per
-    /// group is what lets a whole sentence be dropped or kept.
-    ///
-    /// *Any* rather than *all*, because a spec may name a single tool out of a group
-    /// (`--tools registers`), and a client served one tool of a family still needs the sentence
-    /// that says what the family is for.
-    pub fn serves_group(&self, group: &str) -> bool {
-        GROUPS
-            .iter()
-            .find(|candidate| candidate.name == group)
-            .is_some_and(|candidate| candidate.tools.iter().any(|tool| self.includes(tool)))
+    /// `GROUPS` is the table and stays private - this is the read-only view of it that
+    /// `src/server.rs` needs to check that no client's `instructions` name a tool it is not
+    /// served.
+    pub fn every_tool() -> impl Iterator<Item = &'static str> {
+        GROUPS.iter().flat_map(|group| group.tools.iter().copied())
     }
 
     pub fn includes(&self, name: &str) -> bool {

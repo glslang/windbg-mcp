@@ -2572,8 +2572,8 @@ impl WindbgServer {
     /// every model on that surface asked for something it would then be refused.
     fn instructions(&self) -> String {
         let mut text = String::from(BASE_INSTRUCTIONS);
-        for (group, fragment) in GROUP_INSTRUCTIONS {
-            if self.surface.serves_group(group) {
+        for (names, fragment) in GROUP_INSTRUCTIONS {
+            if names.iter().all(|tool| self.surface.includes(tool)) {
                 text.push(' ');
                 text.push_str(fragment);
             }
@@ -4438,14 +4438,25 @@ overrunning, `interrupt` its session while it is still outstanding: the interrup
 once, and the partial result comes back on the original call. A live kernel attach cannot be \
 interrupted - it waits indefinitely, and `end_session` reclaims that session alone.";
 
-/// One fragment per group, in the order they are assembled.
+/// One fragment per group, in the order they are assembled, **paired with the tools it names**.
+///
+/// Named tools rather than a group name because a spec may select part of a group
+/// (`--tools registers` is valid), and a fragment is only safe to send when *every* tool it names
+/// is served: the inspect sentence says `modules`, `dx` and `execute` in one breath, so a client
+/// served `registers` alone must not read it. That was this change's own first version - it asked
+/// whether a group was served at all, which reintroduced the leak it exists to remove, for the
+/// partial-surface case.
+///
+/// The consequence is silence rather than a half-sentence: a client served `modules` but not `dx`
+/// reads nothing about either. Splitting that sentence would be the way to fix it, and is a
+/// change to the prose rather than to this rule.
 ///
 /// The allocator family is deliberately absent: it was never in this string, and this change is
 /// about not advertising what a client cannot call rather than advertising more.
 ///
 /// `the_instructions_fit_what_the_client_reads` measures the whole assembly against the 2,048 a
 /// client reads, so a fragment added here is paid for by every client that group is served to.
-const GROUP_INSTRUCTIONS: &[(&str, &str)] = &[
+const GROUP_INSTRUCTIONS: &[(&[&str], &str)] = &[
     (
         "crash",
         "`crash_triage` reads a bug check as fields, with the crashing stack and the module each frame \
@@ -4627,6 +4638,96 @@ fn text_of(result: &CallToolResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- the instructions a client is served ---------------------------
+
+    /// The instructions for one surface, without a `Sessions` to build a whole server from.
+    fn instructions_for(spec: &str) -> String {
+        let surface = crate::toolset::Toolset::parse(spec)
+            .unwrap_or_else(|e| panic!("`{spec}` should be a valid spec: {e}"));
+        let mut text = String::from(BASE_INSTRUCTIONS);
+        for (names, fragment) in GROUP_INSTRUCTIONS {
+            if names.iter().all(|tool| surface.includes(tool)) {
+                text.push(' ');
+                text.push_str(fragment);
+            }
+        }
+        text
+    }
+
+    /// Whether a tool's name appears in prose, as a word rather than inside another word — `go`
+    /// and `dx` are tool names and are also two letters long.
+    fn names_tool(text: &str, tool: &str) -> bool {
+        let boundary = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric() && c != '_');
+        text.match_indices(tool).any(|(at, _)| {
+            boundary(text[..at].chars().next_back())
+                && boundary(text[at + tool.len()..].chars().next())
+        })
+    }
+
+    /// **The property this whole split exists for**: whatever a client is served, its instructions
+    /// never name a tool it cannot call.
+    ///
+    /// The first version of the split asked whether a *group* was served at all, which passes for
+    /// every spec here except the last two — a spec may name a single tool, and the inspect
+    /// sentence names `modules`, `dx` and `execute` together.
+    #[test]
+    fn instructions_never_name_a_tool_the_client_cannot_call() {
+        for spec in [
+            "all",
+            "crash",
+            "session,inspect,crash",
+            "session",
+            "registers",
+            "crash,modules",
+            "ttd",
+            "ioctl,batch",
+        ] {
+            let surface = crate::toolset::Toolset::parse(spec).expect("a valid spec");
+            let text = instructions_for(spec);
+            for tool in crate::toolset::Toolset::every_tool() {
+                if surface.includes(tool) {
+                    continue;
+                }
+                assert!(
+                    !names_tool(&text, tool),
+                    "`--tools {spec}` is not served `{tool}` and its instructions name it:\n{text}"
+                );
+            }
+        }
+    }
+
+    /// The tools beside each fragment are what it actually says, so the two cannot drift: a name
+    /// added to the prose and not to the list is a leak the check above would never see.
+    #[test]
+    fn every_fragment_declares_the_tools_it_names() {
+        for (names, fragment) in GROUP_INSTRUCTIONS {
+            for tool in crate::toolset::Toolset::every_tool() {
+                let declared = names.contains(&tool);
+                let said = names_tool(fragment, tool);
+                assert_eq!(
+                    declared,
+                    said,
+                    "`{tool}` is {} in the fragment and {} beside it:\n{fragment}",
+                    if said { "named" } else { "absent" },
+                    if declared { "declared" } else { "not declared" },
+                );
+            }
+        }
+    }
+
+    /// A fragment naming a tool this server does not have would be advertising nothing.
+    #[test]
+    fn every_fragment_names_real_tools() {
+        for (names, _) in GROUP_INSTRUCTIONS {
+            for tool in *names {
+                assert!(
+                    crate::toolset::Toolset::exists(tool),
+                    "`{tool}` is named in the instructions and is not a tool this server has"
+                );
+            }
+        }
+    }
 
     // ---- MCP protocol surface ------------------------------------------
 
