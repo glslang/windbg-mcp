@@ -711,6 +711,56 @@ everything the debugger printed — stack frames, strings, whatever the guest ho
 secrets is masked, so treat the file like a crash dump: keep it out of the repo, and delete it when
 the investigation is done. It is **appended** to, so a path reused across runs accumulates.
 
+## Handing the work over
+
+"Update the handoff docs" means a specific set, discoverable only from what the handoff PRs touched
+(#155, #159, #170). They are titled *"Hand the `<X>` work over: …"* — the stem is the convention,
+and the clause after the colon says what kind of handoff it is: *"the traps, not just the result"*
+on #159 and #170, *"what is covered, what is not"* on #155.
+
+- **`CLAUDE.md`** — what bites while *editing* a subsystem.
+- **`FOLLOWUPS.md`** — numbered items, each saying what would close it, why it was deferred, and
+  where it picks up. Its header enumerates clusters and needs a line whenever an item is added.
+- **[`docs/smoke-test.md`](./docs/smoke-test.md)** — what each tier claims, per test, with budgets.
+
+Plus `CHANGELOG.md` and whichever `docs/*.md` the behaviour moved in.
+
+**This prose is reviewed as hard as code, and deserves to be.** A docs-only PR (#170) drew six
+findings from the Codex bot, every one a real inaccuracy about the lease — and two of them were
+errors introduced while fixing earlier ones. The worst class is a rule stated without its
+qualifier: *"a request renews the lease"* where the truth is *"a request the lease **admits**"*,
+written on an item that proposed a deletion. Taken at face value it licenses renewal-on-arrival,
+which lets a stream of wrong session ids hold an abandoned live kernel target open for ever — the
+failure the sweep exists to prevent.
+
+**The drift is continuous, not per-PR.** The 2026-08-23 pass found problems in all three files
+accumulated across four merges, none introduced by the change that prompted it: a test count that
+said 69 and is 75, an item missing from the `FOLLOWUPS.md` header, and a section describing six
+listener tests where there are ten. Assume anything countable has moved, and that the sentence
+around it has not.
+
+**So re-derive every number — and distrust the derivation, not just the number.** Four ways this
+has gone wrong here, each of which produced a confident wrong edit or came one step from it:
+
+- **A grep is not an enumeration.** Counting `Listener::start` call sites gives nine protocol-tier
+  listener tests; there are ten, because `the_listener_will_not_start_without_a_token` spawns the
+  exe itself — a listener that will not start cannot be started by the helper. The wrong nine
+  reached a PR description before the source was walked properly.
+- **`cat A 2>/dev/null || cat B` prints contents without saying whose.** That is how the
+  markdownlint config came to be written down as `.markdownlint-cli2.jsonc`, which does not exist
+  here; it is `.markdownlint.jsonc`.
+- **The `FOLLOWUPS.md` header drifts silently, because nothing reads it.** It has claimed "twelve"
+  while enumerating fourteen, and has twice stopped short of items already written. Match its
+  `items N–M` spans against the `## N.` headings mechanically rather than counting by eye.
+- **A number that looks stale may be right.** "The four assertions that read a *target*" survives
+  five tests gating on those conditions, because the four are the ones opening `NATIVE_SAMPLE` and
+  the fifth is deliberately separate — counting `skip` call sites would have "fixed" it wrongly.
+
+**And this file is not linted.** `CLAUDE.md` and `FOLLOWUPS.md` are absent from CI's markdownlint
+globs (see *Local verification* above). Point the linter at them anyway and it reports ten
+pre-existing errors — fence and list spacing, nothing that renders wrongly — so neither a clean run
+nor a dirty one tells you anything about an edit you just made here.
+
 ## Plugin vs. dev build
 
 This project is also installed as a user-scope Claude Code plugin (`windbg-mcp@windbg-mcp`), which is
