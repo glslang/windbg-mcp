@@ -641,10 +641,11 @@ The other four all print that roster, and until this one there was no way to ask
 changing something**. That was survivable while every client was served the same surface, because
 "who may connect" had one other answer — the listener's own startup line. A client's own `--tools`
 spec has no such second answer, so the question grew a half that only a change could show you. It
-takes the same
-lock the edits take, reads the same file through the same parser, prints the same fingerprints, and
-writes nothing: no token is minted, no reload is asked for, and the roster is the state of the file
-as it stood. That makes it the one command in the family worth allow-listing.
+reads the same file through the same parser as the edits and prints the same fingerprints, and it
+**writes nothing at all**: no token is minted, no reload is asked for, and — unlike the four — it
+does not even take the credential lock, because that lock is a file this program creates and
+creating one is a write. The roster is the state of the file as it stood. That is what makes it the
+one command in the family worth allow-listing.
 
 Three things about it:
 

@@ -584,16 +584,19 @@ who may connect and another answering what they get is two files to keep in step
 rule to remember.
 
 **Five client commands, and the fifth only reads.** `--list-listen-clients` (item 37) prints the
-same `roster` the four editors print, under the same lock, with no write and no reload. Two things
-bite when touching it. It answers for **both** sources — a service's clients are in the credential
+same `roster` the four editors print, with no write and no reload — and **not under the credential
+lock**, which is the trap: `lock_credentials` opens its file with `create(true)` and nothing else
+creates it, so a reader that locked would write into `%ProgramData%` on any host where no edit had
+yet run, which is exactly the property this command sells. It buys almost nothing either, since
+`write_credentials` renames a finished file over the old one. Two more things bite when touching
+it. It answers for **both** sources — a service's clients are in the credential
 file, a foreground listener's are the environment it was started with — and the environment half
 goes through `listen::named_token_file`, *not* `client::env_credentials` alone: a shell naming
 `WINDBG_MCP_LISTEN_TOKEN_FILE` has its token variables ignored by the listener, so listing them
 would be a roster of credentials nothing accepts. And a file it cannot read in full has to refuse
 rather than print a shorter list — a dropped entry is a service that will not start, reported as a
-service serving fewer people. `lock_credentials` takes what its caller came to do, because "changing
-a client needs an elevated shell" is the wrong sentence for a reader; adding a sixth command means
-that argument, this listing, and the message naming the family.
+service serving fewer people. And an unelevated caller is turned away by the *credential file's* own ACL rather
+than by the lock, which is the object being protected rather than a thing beside it.
 
 **Identity is ambient inside a call, carried by the instance, and by name outside both.**
 `crate::client::current()` reads a task-local, which is why no tool signature carries a caller. What
