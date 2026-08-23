@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in eighteen clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in nineteen clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/win-kexp#71, 2026-08-01), items 13–14 from the bounded-command coverage review
@@ -21,7 +21,8 @@ ARM64 runner image that replaces `windows-11-arm` in September 2026, and items 3
 the server with a **local model** — the lease grace measured against the wrong slow party, and a
 service's clients fixed at install time (both 2026-08-22), and items 37–38 from the credential
 file gaining a fourth writer while still having no reader, and from exercising what that reader
-says against a real service (both 2026-08-23). Each item notes its repo,
+says against a real service (both 2026-08-23), and item 39 from running the surface, the window
+and the model as a **grid** rather than as a sighting (2026-08-23). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -1670,3 +1671,43 @@ concluded, which stays true whatever the reload goes on to do.
 Landed in [`src/service.rs`](./src/service.rs) (`image_in`, `same_image`, `foreign_image`, and one
 call in each of `edit_client` and `list_clients`) and
 [`docs/remote-listener.md`](./docs/remote-listener.md).
+
+## 39. [windbg-mcp] The eval measures single questions, not an investigation
+
+[`docs/local-model-eval.md`](./docs/local-model-eval.md) runs six tasks across three tool surfaces,
+three context windows and five models, and its strongest finding is a negative one: at a **served**
+8,192-token window a 17,300-token surface was evaluated in full and answered correctly, so the
+window is not the binding constraint the plan expected. That finding is true of the conversations
+the grid runs, and **every one of them is short** - one question, one or two tool calls, an answer.
+
+What is untested is the case where the *transcript* fills the window rather than the surface. The
+surface is paid once per conversation and the runtime caches the prefix (`docs/local-model.md`
+measured 86.5s cold against under 5s warm); a growing investigation is paid in full, every turn,
+and a `modules` page or a `read_memory` answer lands in it whole. So the honest scope of "the
+window did not bite" is *a question at a time*, and the interesting failure - the tenth turn of a
+kernel triage, three large results deep - has not been run.
+
+**Why it was deferred rather than added.** The driver already has the mechanism:
+`WINDBG_MCP_SCENARIO=1` makes a task list one continuing investigation with one transcript and one
+set of sessions. What it does not have is a way to *grade* one. A scenario has no per-task answer
+key - a wrong turn at step 3 makes steps 4 to 8 unanswerable, so per-task scoring reports eight
+failures for one mistake, and the thing worth measuring is the step at which the run stopped being
+recoverable. That is a different unit of measurement and a different key, not a flag on this grid.
+
+**Where it picks up.** A scenario key would want: an ordered list of facts the run must have
+established by the end, the turn index at which each first appears, and the transcript length at
+that point. `local_model_eval.py` grades from records that already carry every turn's prompt token
+count, so the growth curve is in the log this eval already writes - what is missing is the key and
+a `--scenario` mode in the grader that reads it.
+
+Two smaller things the same run left open:
+
+- **Nothing measures the mutating tools.** The harness executes a read-only allow-list, so
+  `debug_batch`, `launch` and `execute` are offered and never run. gemma calling `debug_batch` four
+  times on a surface that does not serve it - and being refused four times - is a hint that this is
+  where a wrong pick would be expensive rather than merely wasted: a batch that *does* run patches
+  the target. Measuring it wants a throwaway target and a rollback assertion, which is the
+  live-kernel tier's shape rather than this one's.
+- **One bench, one architecture, for the timings.** Every wall-clock number in that document is an
+  ARM64 Mac serving MLX builds. The correctness columns should travel; the timings should not be
+  quoted anywhere else.

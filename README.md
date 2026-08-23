@@ -34,9 +34,9 @@ This file is the map. Each topic is one document, and each document is the whole
 | [Walkthroughs](docs/walkthroughs.md) | Worked sessions end to end: crash-dump triage, TTD, a Flare-On solve, driver IOCTL surfaces |
 
 Operator and reference material: [remote listener](docs/remote-listener.md),
-[local model](docs/local-model.md), [disassembler coordinates](docs/coordinates.md),
-[smoke test](docs/smoke-test.md), [token budget](docs/token-budget.md),
-[releasing](docs/releasing.md).
+[local model](docs/local-model.md), [the local-model eval](docs/local-model-eval.md),
+[disassembler coordinates](docs/coordinates.md), [smoke test](docs/smoke-test.md),
+[token budget](docs/token-budget.md), [releasing](docs/releasing.md).
 
 ## Quick start
 

@@ -775,6 +775,60 @@ everything the debugger printed — stack frames, strings, whatever the guest ho
 secrets is masked, so treat the file like a crash dump: keep it out of the repo, and delete it when
 the investigation is done. It is **appended** to, so a path reused across runs accumulates.
 
+## Benchmarking a model against this server (`tools/local_model_eval.py`)
+
+`docs/local-model-eval.md` is the result; this is what bites while running it again. The grid is
+three scripts — the ollama driver, the Claude Code driver, and the matrix runner that spawns either
+one per cell and grades the log afterwards.
+
+**Record what the runtime *served*, not what you asked for.** `num_ctx` on a request does not
+shrink an instance ollama already holds: with a 32,768 instance loaded, cells asking for 8,192 are
+served 32,768 and look perfectly healthy — a 17,300-token prompt "fitting" in 8k, which is the
+result the context axis exists to find and would have been fiction. `/api/ps` is the only place
+the truth appears. Every record carries `served_context`, the grader marks a cell where the two
+disagree with `?`, and the runner evicts the model between windows. The first run of the grid
+recorded five such cells; they were dropped and re-run.
+
+**The grader's three matching rules each came from a real wrong verdict**, and all three are in
+`present()`:
+
+- A number matches only **between hex boundaries** — `0x22` is the device type `ioctl_decode` asks
+  for and `0x22200B` is the code in the question, so plain containment passed for any answer that
+  repeated the question. One model scored correct while saying `FILE_DEVICE_KEYBOARD`.
+- Leading zeros are formatting — the tool prints `0x802` and a model writing `0x0802` agrees with
+  it. That one marked a *correct* control answer wrong.
+- A separator between hex digits is formatting too. WinDbg writes ``fffff801`3c65bca8``; Opus
+  writes `0xfffff801_3c65bca8`. Both name the address the key holds.
+
+Two of those three were found by reading the **control's** answers, which is the argument for
+having a frontier row at all.
+
+**`possible_on` in the task file is a prediction, and predictions about this server are wrong in
+one direction: too pessimistic.** Facts here are reachable by more than one route —
+`open_dump`'s summary carries the bug check *and* the module count, `crash_triage`'s frame 0 is the
+`pc` that `registers` reports — so a task the tool table says needs `inspect` may be answerable
+with `crash` alone. Verify against the dump before scoring a model wrong for finding the other
+route; the `arm64_pc` entry was corrected mid-run for exactly this.
+
+**Resume is per *cell*, so the log legitimately holds a task twice.** An outstanding task re-runs
+its cell's whole list, and the grader keeps the **last** record per (cell, task). Do not "fix" a
+duplicated task id by deleting rows.
+
+**The Claude Code row needs four fences or it measures something else.** `--strict-mcp-config` (or
+it falls back to the editor's registered `windbg-vm`, whose credential is a different client and
+gets the whole 51-tool surface — the surface axis then measures nothing); `--disallowedTools` for
+the built-ins (or it answers a question about a sample dump by grepping this repository);
+`ENABLE_TOOL_SEARCH=false` (or MCP tool schemas are deferred and fetched with `ToolSearch`, so the
+surface costs that row almost nothing while every other row pays in full); and a **neutral working
+directory**, since Claude Code reads the project it is started in. Its prompt-token column is still
+not comparable with the ollama rows — its own system prompt is most of it — and the document says
+so rather than quoting it.
+
+**The bench listener is the shipped per-client feature in anger.** `tools/bench_listener.ps1`
+serves `full`, `lean` and `min` from one foreground process, tokens arriving on **stdin**; its
+startup line naming the three clients and their surfaces is the check that the run is measuring
+what it thinks. A cell changes the bearer token and nothing else.
+
 ## Handing the work over
 
 "Update the handoff docs" means a specific set, discoverable only from what the handoff PRs touched

@@ -17,6 +17,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The local-model eval: a grid where there were two sightings**
+  ([`docs/local-model-eval.md`](./docs/local-model-eval.md), `FOLLOWUPS.md` item 39). Three ~30B
+  local models against three tool surfaces and three context windows, with Claude Code as the
+  control, scored against an answer key read off the checked-in sample dumps with this server's own
+  tools before any model saw them. `tools/local_model_eval.py` runs the grid and grades it,
+  `tools/claude_code_drive.py` is the control row, `tools/bench_listener.ps1` stands up the one
+  listener that serves all three surfaces — which is 0.11.0's per-client `--tools` doing the
+  narrowing, rather than a test double.
+
+  Three findings worth the run. **The window was not the binding constraint**: at a *served*
+  8,192-token window a 17,300-token surface answered all six tasks correctly, multi-turn tasks with
+  10,000-character results included, so the "will it fit" arithmetic in `docs/local-model.md`
+  predicted a failure that does not happen on this runtime. **The surface axis costs fewer answers
+  than tools** — 51 tools down to 11 removes 40 tools and 2 of 6 answers, because `open_dump`'s
+  summary and `crash_triage`'s frames carry facts that `modules` and `registers` also carry. And
+  **a narrowed surface makes every model call tools that are not there**, the control included, so
+  the refusal that names the client's own surface is load-bearing rather than cosmetic.
+
 - **The client commands warn when the SCM starts a different copy of this program than the one you
   ran** (`FOLLOWUPS.md` item 38, which closes it). 0.11.0 gave the credential file a shape earlier
   builds refuse — an entry that is an object, carrying a client's `--tools` beside its token — so
