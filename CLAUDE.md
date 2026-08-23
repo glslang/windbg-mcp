@@ -207,16 +207,23 @@ behind `FOLLOWUPS.md` item 34 (#189 to #192), all from the same reviewer:
   right fix was a message that stopped claiming otherwise.
 
 So: **verify the fact against the current code, then decide the remedy yourself.** A correct finding
-does not make its suggested fix correct, and a confident one is not evidence of anything. Declining
-with a stated reason is a normal outcome — put it in the commit message, or the next round will
-raise it again and nothing will record why it was not taken. Measuring beats arguing whenever the
-claim is about behaviour: most of these were settled in one experiment.
+does not make its suggested fix correct, and a confident one is not evidence of anything. Measuring
+beats arguing whenever the claim is about behaviour: most of these were settled in one experiment.
+
+**Declining is a normal outcome, and where the reason goes depends on whether the decline shaped a
+change.** If you are committing anyway — you took the fact and rejected the remedy — the reason
+belongs in *that* commit message, because the next round will raise it again against code that by
+then looks deliberate, and nothing else will record why it is the way it is. If nothing changed,
+there is nothing to attach a reason to and nothing to protect: repeating the decline next round
+costs a sentence, so tell whoever is driving the work and leave it there. Do not manufacture a
+commit, and do not argue with the bot in a reply — neither is read by the round that follows.
 
 **A finding about *prose* is acted on only if the prose is wrong, or inconsistent with the code.**
 Everything else — rewording, hedging, "consider splitting this rule across the three files that
-state it" — is declined. A decline needs no commit and no reply to the bot, but **say it to whoever
-is driving the work**, in one line, so the count of what was waved through stays visible to them
-rather than only to you.
+state it" — is declined, which by the rule above means no commit and no reply: nothing changed.
+**Say it to whoever is driving the work**, in one line, so the count of what was waved through
+stays visible to them rather than only to you.
+
 The rule exists because the review pressure here is almost entirely on sentences: across #196, #198
 and #199, **every** bot finding was about one, and none was about the code those PRs changed. Most
 of that pressure pushes toward making correct sentences longer, which is churn and costs a CI round
