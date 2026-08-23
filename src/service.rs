@@ -795,7 +795,12 @@ pub fn edit_client(edit: ClientEdit, name: &str, tools: Option<&str>) -> Result<
             crate::listen::TOKEN_ENV,
         );
     }
-    match ask_to_reload(&service) {
+    // **Kept, because one line below depends on which of these arms ran.** A re-tooling's note is
+    // about a client that has to reconnect to see the change — which is only the remaining gap
+    // once the *service* has the change, and in every arm but the first it does not.
+    let outcome = ask_to_reload(&service);
+    let in_force = matches!(outcome, Ok(true));
+    match outcome {
         Ok(true) => println!("\n`{NAME}` re-read its clients; nothing was stopped."),
         // Not running is not a failure even for a revocation: nothing is accepting that credential
         // either, and the file it will read at its next start is the one this command wrote.
@@ -820,10 +825,21 @@ pub fn edit_client(edit: ClientEdit, name: &str, tools: Option<&str>) -> Result<
                 at.display()
             )));
         }
+        // **What has not changed is what this has to say**, and it is not the same sentence for
+        // all three: an add's client cannot connect yet, while a re-tooling's client can — it is
+        // simply still being served the surface it had, which is usually the wider one. Saying
+        // "`bench` can connect from the next start" of a client that is connected right now reads
+        // as a revocation that half-landed.
         Err(e) => println!(
             "\nwarning: `{NAME}` could not be told to re-read its clients ({e:#}). The file is \
-             written, and `{name}` can connect from the service's next start; nothing that works \
-             today has stopped working."
+             written, and {}; nothing that works today has stopped working.",
+            match edit {
+                ClientEdit::SetTools => format!(
+                    "`{name}` goes on being served the surface it had until the service's next \
+                     start"
+                ),
+                _ => format!("`{name}` can connect from the service's next start"),
+            }
         ),
     }
     // **A surface reaches a client on its next connection, and a reload is not that.** Said here
@@ -831,7 +847,13 @@ pub fn edit_client(edit: ClientEdit, name: &str, tools: Option<&str>) -> Result<
     // same claim: a connected client's tool list was decided when it connected, and nothing sends
     // `notifications/tools/list_changed` to tell it otherwise (see [`crate::toolset`]). A
     // revocation needs no such note — the credential stops being accepted at the swap.
-    if matches!(edit, ClientEdit::SetTools) {
+    //
+    // **Only when the reload landed** (review on #196). Printed unconditionally it told an
+    // operator whose reload had just failed that reconnecting would show the new surface, which is
+    // the opposite of true — the running service still holds the old set, so a reconnect gets the
+    // old surface until it re-reads the file. The arms above already say that happened; this line
+    // would have contradicted them two lines later.
+    if in_force && matches!(edit, ClientEdit::SetTools) {
         println!(
             "\n`{name}` sees this when it next connects. A client connected now goes on listing \
              the tools it listed at the time — reconnect it, or restart whatever is driving it."
