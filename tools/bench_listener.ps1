@@ -20,7 +20,22 @@ if (-not $exe) { $exe = 'C:\workspace\windbg-mcp\target\release\windbg-mcp.exe' 
 $listen = $env:WINDBG_MCP_BENCH_ADDR
 if (-not $listen) { $listen = '127.0.0.1:8766' }
 
-$cfg = [Console]::In.ReadToEnd() | ConvertFrom-Json
+$raw = [Console]::In.ReadToEnd()
+if ([string]::IsNullOrWhiteSpace($raw)) {
+    throw 'nothing on stdin: pipe in the JSON token file, e.g. ... < bench-tokens.json'
+}
+$cfg = $raw | ConvertFrom-Json
+
+# Named here rather than discovered later. The server already refuses to start when a *tools*
+# spec names a client it has no token for, so a missing 'lean' or 'min' is caught - but a missing
+# 'full' has no spec beside it, so the listener would start happily with two clients and the
+# eval's whole first column would fail authentication one cell at a time. Say which surface is
+# missing, and never say what any of the values are.
+foreach ($client in 'full', 'lean', 'min') {
+    if ([string]::IsNullOrWhiteSpace($cfg.$client)) {
+        throw "the token file on stdin has no token for the '$client' client"
+    }
+}
 
 # No unnamed token: that one would name a client called `local`, which is what the *editor*
 # connects as on the other listener. Two clients of one name on two ports is a confusion this

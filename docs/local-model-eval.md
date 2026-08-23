@@ -30,9 +30,12 @@ which bearer token the driver presents:
 | `lean` | `session,inspect,crash` | 20 | 26,057 | 5,906 / 6,385 / 6,673 |
 | `min` | `crash` | 11 | 15,544 | 3,447 / 3,838 / 3,926 |
 
-Bytes are the surface as handed to the runtime — minified JSON in ollama's function shape, which
-is a little larger than the same surface as MCP reports it in
-[`token-budget.md`](./token-budget.md), and is what the model is actually served.
+Bytes are the surface **as handed to the runtime** — minified JSON in ollama's function shape,
+which is what the model is actually served. That is not the same measure as
+[`token-budget.md`](./token-budget.md)'s, which counts the surface as MCP reports it: 67,658 B for
+the same 51 tools, 25,265 for the same 20, 15,073 for the same 11. The function-call wrapper is the
+difference and it is a flat ~3% on all three, so either figure supports the arithmetic below —
+quote whichever matches what you are measuring, and do not mix them in one sum.
 
 **The last column is a finding, not a caption.** Identical bytes cost gemma 14,540 tokens, qwen
 17,270 and nemotron 18,501 — a 27% spread on the same surface, entirely tokenizer. So "does the
@@ -151,9 +154,8 @@ answers than the tool table suggests.
 
 Three pieces, and only the first is unusual.
 
-**A listener with three clients**, started in the foreground so it disappears with the ssh channel
-and holds no credential a service would keep. The tokens go in on **stdin**, never on a command
-line:
+**A listener with three clients**, started in the foreground so nothing is installed and no
+credential is written to disk. The tokens go in on **stdin**, never on a command line:
 
 ```console
 python3 -c "import json,secrets;print(json.dumps({n:secrets.token_urlsafe(32) for n in ('full','lean','min')}))" > bench-tokens.json
@@ -167,6 +169,20 @@ Its startup line is the check that it worked — it names the clients and what e
 ```text
 listening on http://127.0.0.1:8766 (… clients: full, lean, min, serving all 51 tools
  — except lean serves 20 of 51 tools (session, inspect, crash), min serves 11 of 51 tools (session, crash))
+```
+
+**Ending the ssh command stops it; *killing* the ssh client does not.** A graceful exit takes the
+listener with it (`remote-listener.md` measured that), but a tunnel that is killed from this side
+leaves sshd with no reason to tear anything down, and the listener keeps running and keeps the
+port — the next run then fails to bind with `Only one usage of each socket address` and looks like
+a busy machine rather than a leftover. Stop it **by the PID that owns the port**, never by image
+name: the installed service is the same executable, and taking that down drops the sessions
+whatever else is connected to this host is holding.
+
+```pwsh
+$svc = (Get-CimInstance Win32_Service -Filter "Name='windbg-mcp'").ProcessId
+$own = (Get-NetTCPConnection -State Listen -LocalPort 8766 -ErrorAction SilentlyContinue)[0].OwningProcess
+if ($own -and $own -ne $svc) { Stop-Process -Id $own -Force }
 ```
 
 **A plan**, naming the models, the surfaces, the contexts and the per-cell wall-clock budget. The
@@ -200,21 +216,25 @@ because two of the six have no tool to answer them on `min`:
 
 | | `full` (51 tools) | `lean` (20) | `min` (11) | answerable, total |
 | --- | --- | --- | --- | --- |
-| **Opus** *(control)* | 6/6 | 5/5 **+1** | 4/4 | **15/15** |
-| **Sonnet** *(control)* | 6/6 | 5/5 **+1** | 4/4 | **15/15** |
+| **Opus** *(control)* | 6/6 | 5/5 **+1** | 3/4 **+1** | **14/15** |
+| **Sonnet** *(control)* | 6/6 | 5/5 **+1** | 3/4 **+1** | **14/15** |
 | qwen3.8:27b | 6/6 | 5/5 | 4/4 | **15/15** |
 | gemma4:31b | 6/6 | 5/5 | 3/4 | **14/15** |
 | nemotron-3.5-lightning:30b | 4/6 | 3/5 | 3/4 | **10/15** |
 
-The **+1** is the trap task answered without the tool that answers it: both control rows decoded
-`0x22200B` correctly from the `CTL_CODE` layout on a surface where `decode_ioctl` is not served.
-gemma does it too at the reduced windows. qwen tries and gets it wrong — twice, in prose, in full
-view.
+The **+1** is the trap task answered without the tool that answers it, and it is kept outside the
+score rather than added to it: both control rows decoded `0x22200B` correctly from the `CTL_CODE`
+layout on a surface where `decode_ioctl` is not served. gemma does it too at the reduced windows.
+qwen tries and gets it wrong — twice, in prose, in full view.
 
-**The headline is the first column against the last.** A 27B local model matched the frontier
-control on every answerable task, at every surface size, on this task set. That is not a claim
-that local models are as good; it is a claim about *these questions*, which are the shape of
-question a debugger MCP server is asked most of the time — open a target, read a field, name a
+**The one clean sweep of answerable tasks belongs to the 27B local model**, because both control
+rows drop `arm64_pc` on the narrowest surface — the cell two sections down. Read that as the task
+set being within reach rather than as a ranking: four of the five models are within one answer of
+each other, the fifth is five behind, and the control's own miss is the most useful single result
+here, since a question the frontier gets wrong is a question worth re-reading.
+
+That is not a claim that local models are as good. It is a claim about *these questions*, which
+are the shape a debugger MCP server is asked most often — open a target, read a field, name a
 module, decode a constant.
 
 ### The surface axis cost less than the tool table predicts

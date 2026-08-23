@@ -40,9 +40,7 @@
       "expect": [
         [
           "messagemanager"
-        ]
-      ],
-      "bonus": [
+        ],
         [
           "0x1654",
           "1654"

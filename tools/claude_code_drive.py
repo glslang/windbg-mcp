@@ -30,6 +30,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -53,20 +54,36 @@ SYSTEM = ("You are a Windows kernel debugging assistant. Use the provided tools 
           "Call one tool at a time and use its result. Be concise.")
 
 
-def mcp_config(path):
+def mcp_config(directory):
     """The one server this run may reach, carrying this cell's credential.
 
-    Written per run into the eval's own scratch directory rather than into the repo: it holds a
-    bearer token, and a config file in a checkout is a token in a checkout.
+    A file rather than an inline argument because `--mcp-config` also takes JSON on the command
+    line, and a token in `argv` is readable by every process on the box - the same rule the rest
+    of this bench follows.
+
+    Three things about *how* it is written, all of them the same lesson from
+    [#189](https://github.com/glslang/windbg-mcp/pull/189): do not write a secret into a
+    directory whose protection this program does not control.
+
+    - The directory is one this process makes (`mkdtemp`, mode 0700), unless `EVAL_SCRATCH`
+      names one. It is never the working directory - a fallback to `.` writes a bearer token
+      into the checkout the moment somebody runs this script by hand.
+    - The file is created **with** mode 0600 rather than chmod'd afterwards. Creating it under
+      the process umask and tightening it later leaves a window where the token is on disk and
+      world-readable.
+    - `O_EXCL`, so this never writes through a symlink somebody left in the directory.
+
+    The caller removes it on the way out.
     """
+    path = os.path.join(directory, f"mcp-{os.getpid()}.json")
     config = {"mcpServers": {SERVER: {
         "type": "http",
         "url": drive.MCP_URL,
         "headers": {"Authorization": drive.AUTH},
     }}}
-    with open(path, "w", encoding="utf-8") as f:
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(config, f)
-    os.chmod(path, 0o600)
     return path
 
 
@@ -198,9 +215,11 @@ def main():
     surface_bytes = len(json.dumps(offered, separators=(",", ":")))
     print(f"tools offered: {len(tools)} ({surface_bytes} B, measured as the ollama rows are)")
 
-    scratch = os.environ.get("EVAL_SCRATCH") or os.path.dirname(
-        os.environ.get("WINDBG_MCP_EVAL_OUT", "") or ".") or "."
-    config_path = mcp_config(os.path.join(scratch, f"mcp-{os.getpid()}.json"))
+    scratch = os.environ.get("EVAL_SCRATCH", "")
+    owned = not scratch
+    if owned:
+        scratch = tempfile.mkdtemp(prefix="windbg-eval-")
+    config_path = mcp_config(scratch)
     cell = {
         "run": os.environ.get("EVAL_RUN", time.strftime("%Y%m%dT%H%M%S")),
         "backend": "claude-code",
@@ -223,6 +242,8 @@ def main():
             release_new_sessions(before)
     finally:
         os.remove(config_path)
+        if owned:
+            os.rmdir(scratch)
         drive.close_transport_session()
 
 
