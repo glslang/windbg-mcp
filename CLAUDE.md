@@ -725,6 +725,13 @@ on #159 and #170, *"what is covered, what is not"* on #155.
 
 Plus `CHANGELOG.md` and whichever `docs/*.md` the behaviour moved in.
 
+**Three places to check, not three files to edit.** A handoff touches the ones its change actually
+moved: #170 updated two of the three and `README.md`, and was right to — the test its
+`docs/smoke-test.md` entry would have described did not exist yet, landing in #176 later the same
+day. Going looking for a third edit with no subject is how a section gets written about nothing.
+The failure this list prevents is the opposite one, and it is the common one: *not knowing the
+third file is there*.
+
 **This prose is reviewed as hard as code, and deserves to be.** A docs-only PR (#170) drew six
 findings from the Codex bot, every one a real inaccuracy about the lease — and two of them were
 errors introduced while fixing earlier ones. The worst class is a rule stated without its
