@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`--list-listen-clients` sorts both halves of what it prints.** A credential file's entries
+  already came back sorted; the environment's arrived in the order the variables were scanned,
+  which on Windows is by *variable* name — so `WINDBG_MCP_LISTEN_TOKEN` came before
+  `…_TOKEN_BENCH` and `local` led a roster whose other half was alphabetical. The same command
+  formatted its two answers differently, and neither could be diffed against the other.
+
 ### Added
 
 - **`--list-listen-clients`, the one client command that changes nothing** (`FOLLOWUPS.md` item 37,

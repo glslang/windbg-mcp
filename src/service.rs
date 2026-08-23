@@ -1145,20 +1145,29 @@ fn service_clients(at: &std::path::Path) -> Result<Vec<crate::client::ClientEntr
 /// at all beside one ([`crate::client::Credentials::from_entries`]). Listing the variables on a
 /// host that names a file would be a roster of credentials nothing accepts.
 fn shell_clients() -> Result<(String, Vec<crate::client::ClientEntry>)> {
-    match crate::listen::named_token_file()? {
-        Some((path, file)) => Ok((
+    let (source, mut clients) = match crate::listen::named_token_file()? {
+        Some((path, file)) => (
             format!(
                 "the credential file `{}` names ({})",
                 crate::listen::TOKEN_FILE_ENV,
                 path.display()
             ),
             file.credentials()?,
-        )),
-        None => Ok((
+        ),
+        None => (
             format!("the `{}` variables", crate::listen::TOKEN_ENV),
             crate::client::env_credentials(std::env::vars())?,
-        )),
-    }
+        ),
+    };
+    // **Sorted here, because the two halves of one report are read against each other.** A file's
+    // entries already arrive sorted ([`crate::client::TokenFile::credentials`], for the reason
+    // this shares: an operator diffing two of these should see only what changed). The
+    // environment's arrive in the order the variables were scanned, which on Windows is by
+    // *variable* name — so `WINDBG_MCP_LISTEN_TOKEN` came before `…_TOKEN_BENCH` and `local` led a
+    // roster whose other half was alphabetical. One order for both, or the same command formats
+    // its two answers differently.
+    clients.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok((source, clients))
 }
 
 /// Writes a generated token beside the credential file, and says where it went.
