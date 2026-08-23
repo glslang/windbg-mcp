@@ -609,7 +609,7 @@ pub fn edit_client(edit: ClientEdit, name: &str, tools: Option<&str>) -> Result<
 
     // Held until this function returns, which is what makes the read, the edit, the write and the
     // reload below one transaction rather than four steps two shells can interleave.
-    let _lock = lock_credentials("changing a client")?;
+    let _lock = lock_credentials()?;
 
     let at = token_file();
     let existing = match std::fs::read_to_string(&at) {
@@ -1120,11 +1120,19 @@ fn in_force(state: &Result<ServiceState, windows_service::Error>) -> String {
 
 /// The installed service's clients, read the way its own listener reads them.
 ///
-/// **Under the lock the edits take**, so a roster is never a snapshot from the middle of one: an
-/// edit computes a whole file from what it read, and a list taken while that is in flight would
-/// report the set it is about to replace as the set in force.
+/// **It does not take the credential lock, and that is a decision rather than an omission**
+/// (review on #201, fifth round). [`lock_credentials`] opens its file with `create(true)`, and
+/// nothing else creates it — not [`install`] — so a reader that took the lock would write into
+/// `%ProgramData%` on every host where no client edit had yet run. That makes "changes nothing"
+/// false of the one command in this family that sells it, which is a worse trade than the lock is
+/// worth: [`write_credentials`] renames a finished file over the old one, so a read racing an edit
+/// sees one complete version or the other and never a torn one. The most the lock could have
+/// prevented is reporting the set an edit is in the middle of replacing — and a roster is stale
+/// the moment it is printed anyway.
+///
+/// The refusal an unelevated caller needs is not lost with it: it comes from the credential file's
+/// own ACL below, which is the object being protected rather than a lock beside it.
 fn service_clients(at: &std::path::Path) -> Result<Vec<crate::client::ClientEntry>> {
-    let _lock = lock_credentials("reading the client list")?;
     match std::fs::read_to_string(at) {
         Ok(text) => crate::client::TokenFile::parse(&text, at)?.credentials(),
         // A service registered against a file that is not there. Said as what it costs rather than
@@ -1254,11 +1262,10 @@ fn write_token_out(name: &str, token: &str) -> Result<PathBuf> {
 /// It lives in the state directory, which is already `Administrators`-only, so this is also where
 /// an unelevated caller is turned away: it needs write access to a directory it cannot write.
 ///
-/// **`doing` is what this caller came to do**, because [`list_clients`] holds the same lock
-/// without writing anything and "changing a client needs an elevated shell" is the wrong sentence
-/// for it. The contention message is one both are held to: a read taken from the middle of an edit
-/// reports a set that is about to be replaced, which is the reader's half of the same hazard.
-fn lock_credentials(doing: &str) -> Result<std::fs::File> {
+/// **Only the commands that write take it.** [`list_clients`] deliberately does not, because this
+/// creates the file it locks and that command's whole claim is that it changes nothing — see
+/// [`service_clients`] for why giving that up buys so little.
+fn lock_credentials() -> Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
 
     let at = state_dir().join("token.lock");
@@ -1270,15 +1277,14 @@ fn lock_credentials(doing: &str) -> Result<std::fs::File> {
         .open(&at)
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::PermissionDenied => anyhow::Error::new(e).context(format!(
-                "cannot open {} — that directory is SYSTEM and Administrators only, so {doing} \
-                 needs an elevated shell (\"Run as administrator\")",
+                "cannot open {} — that directory is SYSTEM and Administrators only, so changing a \
+                 client needs an elevated shell (\"Run as administrator\")",
                 at.display()
             )),
             _ => anyhow::Error::new(e).context(format!(
                 "cannot take {} — another client command is holding it. Two of them at once would \
-                 each work from its own snapshot of the credential file: the second write would \
-                 discard the first, and a list read from the middle of an edit would report a set \
-                 that is about to be replaced. Wait for it and try again.",
+                 each compute a whole file from its own snapshot of this one, and the second write \
+                 would discard the first. Wait for it and try again.",
                 at.display()
             )),
         })

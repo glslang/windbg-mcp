@@ -1538,13 +1538,17 @@ accept rather than what one already running elsewhere does. It reads the environ
 `WINDBG_MCP_LISTEN_TOKEN_FILE` has its variables ignored by the listener — listing them would be a
 roster of credentials nothing accepts.
 
-Two things the entry did not anticipate. The **lock message** was written for writers only
-("another `--add`/`--remove`/`--rotate-listen-client` is running", which item 36 had already made
-wrong by adding a fourth), so `lock_credentials` now takes what its caller came to do; a reader
-holds the same lock for the reader's half of the same hazard, since a list taken mid-edit reports
-the set that is about to replace it. And **`--tools` beside it is refused** rather than ignored, on
-the rule `--rotate-` and `--remove-listen-client` already follow: it reads exactly like a filter
-over the list it is about to print.
+Two things the entry did not anticipate. **The entry's "take the lock" is wrong**, and review
+found it (fifth round): `lock_credentials` opens its file with `create(true)` and nothing else
+creates it — not the installer — so a reader that took the lock would write into `%ProgramData%`
+on any host where no client edit had yet run, which is the one property this command exists to
+have. It buys almost nothing anyway, because `write_credentials` renames a finished file over the
+old one, so a read racing an edit sees one complete version or the other. So the reader does not
+lock, and the unelevated refusal comes from the credential file's own ACL, which is the object
+being protected. (The lock's *message* was stale for a different reason and is fixed with it: it
+named three commands of four, item 36 having added the fourth.) And **`--tools` beside it is
+refused** rather than ignored, on the rule `--rotate-` and `--remove-listen-client` already follow:
+it reads exactly like a filter over the list it is about to print.
 
 A third thing came out of review: the roster is the **file**, and `edit_client` deliberately leaves
 a window where the file and the running service disagree — a `--remove` or `--rotate` whose reload

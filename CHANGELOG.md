@@ -16,9 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   while every client was served the same surface, because "who may connect" had one other answer in
   the listener's startup line; a client's own spec has no such second answer.
 
-  It takes the same lock the edits take, reads the same file through the same parser and prints the
-  same fingerprints, and it writes nothing: no token minted, no reload asked for. **A file it
-  cannot read in full refuses rather than printing a shorter roster** — one entry this server would
+  It reads the same file through the same parser as the edits and prints the same fingerprints,
+  and it writes nothing whatever: no token minted, no reload asked for, and not even the credential
+  lock the four editors take — that lock is a file this program creates, and creating one is a
+  write. **A file it cannot read in full refuses rather than printing a shorter roster** — one entry this server would
   refuse at startup is a file that will not start the service, and a list that quietly dropped the
   client it could not parse would be the most misleading thing this command could print.
 
