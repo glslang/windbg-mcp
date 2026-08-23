@@ -1546,5 +1546,13 @@ the set that is about to replace it. And **`--tools` beside it is refused** rath
 the rule `--rotate-` and `--remove-listen-client` already follow: it reads exactly like a filter
 over the list it is about to print.
 
-Landed in [`src/service.rs`](./src/service.rs) (`list_clients`, `service_clients`, `shell_clients`),
-[`src/listen.rs`](./src/listen.rs) and [`src/main.rs`](./src/main.rs).
+A third thing came out of review: the roster is the **file**, and `edit_client` deliberately leaves
+a window where the file and the running service disagree — a `--remove` or `--rotate` whose reload
+could not be delivered writes the file, exits non-zero, and says the credential may still be
+authenticating. An operator checking *that* with this command would have read "`windbg-mcp` holds"
+as proof the token was gone. There is no live roster to ask for (a service control code carries a
+status back and no data), so the answer is the caveat plus the state the service is in: `in_force`,
+three arms, one sentence each.
+
+Landed in [`src/service.rs`](./src/service.rs) (`list_clients`, `in_force`, `service_clients`,
+`shell_clients`), [`src/listen.rs`](./src/listen.rs) and [`src/main.rs`](./src/main.rs).

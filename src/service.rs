@@ -925,6 +925,9 @@ const ERROR_SERVICE_DOES_NOT_EXIST: u32 = 1060;
 /// file that will not start the service, and it has to read as *that* rather than as a shorter
 /// list. So the parse and the validation here are the ones the listener runs, and either failing
 /// refuses rather than dropping a client from the output.
+///
+/// **And it is the file, not the set the service is accepting** — see [`in_force`], which is the
+/// clause that says so and why the difference is not hypothetical.
 pub fn list_clients(tools: Option<&str>) -> Result<()> {
     // Refused rather than ignored, by the rule the other client commands are held to: this
     // command has no use for a surface, and `--list-listen-clients --tools crash` reads exactly
@@ -946,11 +949,11 @@ pub fn list_clients(tools: Option<&str>) -> Result<()> {
     let manager = ServiceManager::local_computer(None::<&OsStr>, ServiceManagerAccess::CONNECT)
         .context("cannot open the service manager")?;
     let installed = match manager.open_service(NAME, ServiceAccess::QUERY_STATUS) {
-        Ok(_) => true,
+        Ok(service) => Some(service),
         Err(windows_service::Error::Winapi(e))
             if e.raw_os_error() == Some(ERROR_SERVICE_DOES_NOT_EXIST as i32) =>
         {
-            false
+            None
         }
         // **Anything else is a failure, not a "no".** A service that is registered and cannot be
         // opened, reported as one that is not, would put this host's environment on screen under
@@ -963,14 +966,15 @@ pub fn list_clients(tools: Option<&str>) -> Result<()> {
         }
     };
 
-    if installed {
+    if let Some(service) = &installed {
         let at = token_file();
         let held = service_clients(&at)?;
-        println!("`{NAME}` holds: {}.", roster(&held));
+        println!("`{NAME}` is configured with: {}.", roster(&held));
         println!(
             "\nRead from {}, and nothing was changed — this is the one command here that only \
-             reads.",
-            at.display()
+             reads. It is the *file*, though, not a question put to the running service: {}",
+            at.display(),
+            in_force(service),
         );
         // Said only where there is a client it is about, which is what keeps it off the line on a
         // host where every client carries its own spec.
@@ -994,7 +998,7 @@ pub fn list_clients(tools: Option<&str>) -> Result<()> {
     // question and is introduced as one; where no service is installed, it is the answer. Either
     // way the claim is about a listener started from **this** shell — not about one already
     // running elsewhere, whose clients are the environment it was started with.
-    match (shell_clients(), installed) {
+    match (shell_clients(), installed.is_some()) {
         (Ok((source, clients)), true) if clients.is_empty() => println!(
             "\nThis shell configures no listener credentials of its own (nothing in {source}), so \
              the list above is the whole of what this host has."
@@ -1004,7 +1008,7 @@ pub fn list_clients(tools: Option<&str>) -> Result<()> {
              no clients in {source} either, and a listener without one exposes every tool this \
              server has."
         ),
-        (Ok((source, clients)), _) => println!(
+        (Ok((source, clients)), installed) => println!(
             "\n{}A foreground listener started from this shell would accept: {} — from {source}. \
              One already running elsewhere may accept something else: its clients are the \
              environment *it* was started with, and nothing changes them without restarting it.",
@@ -1031,6 +1035,49 @@ pub fn list_clients(tools: Option<&str>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether the file just printed is the set the service is actually accepting — as a clause to
+/// finish the line that says where it was read from.
+///
+/// **The reason this clause exists is a window [`edit_client`] deliberately leaves open** (review
+/// on #201). A `--remove-` or `--rotate-listen-client` whose reload could not be delivered writes
+/// the file, exits non-zero, and says the credential it took out of service may still be
+/// authenticating — so an operator who then runs this command to check is looking at a file that
+/// no longer names a token the service still accepts. "`windbg-mcp` holds" would have told them it
+/// was gone, which is the one thing they must not be told wrongly here.
+///
+/// **The live roster is not askable**, which is why this is a caveat rather than a better answer:
+/// the only channel to the running service is `ControlService`, which carries a status code back
+/// and no data. Reporting the state it *is* in says as much as can be said from outside, and each
+/// of the three says something different about the file underneath it.
+fn in_force(service: &windows_service::service::Service) -> String {
+    match service.query_status().map(|status| status.current_state) {
+        Ok(ServiceState::Running) => format!(
+            "`{NAME}` is running and re-reads this file whenever a client command changes it, and \
+             a command whose re-read did not land says so and exits non-zero — so a revocation \
+             that reported *that* is the one way a token this list no longer names can still be \
+             authenticating."
+        ),
+        // The state `ask_to_reload` refuses to guess about, for the same reason: the SCM will not
+        // carry a control code to a starting service, and it reads its clients moments after
+        // starting, so nothing outside can tell whether the start under way has this file or the
+        // one before it.
+        Ok(ServiceState::StartPending) => format!(
+            "`{NAME}` is starting, and whether the start under way has read this file cannot be \
+             told from outside — when it comes up it logs the clients it is serving."
+        ),
+        Ok(_) => format!(
+            "`{NAME}` is not running, so nothing is accepting anything and this is what it will \
+             read at its next start."
+        ),
+        // Not a failure. The roster above is what was asked for; this clause is the caveat on it,
+        // and a caveat that cannot be given is not a reason to withhold the answer.
+        Err(e) => format!(
+            "`{NAME}`'s own state could not be read ({e}), so whether it has this set in force is \
+             not known from here."
+        ),
+    }
 }
 
 /// The installed service's clients, read the way its own listener reads them.
