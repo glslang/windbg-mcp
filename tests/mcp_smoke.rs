@@ -2779,6 +2779,62 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
         assert!(names.contains(&"open_dump".to_string()), "{names:?}");
     }
 
+    // **The instructions move with the surface too**, which they did not until `FOLLOWUPS.md`
+    // item 40: one constant naming twenty-one tools went to every client, so a client served
+    // eleven was told about `modules`, `execute` and `debug_batch` and would ask for them. The
+    // eval measured that as models inventing tool names; they were reading this server.
+    let instructions = |server: &mut Listener, token: &str| -> String {
+        let reply = server.call_as(token, None, "initialize", Listener::opening());
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        reply.payload.clone().expect("a JSON-RPC payload")["result"]["instructions"]
+            .as_str()
+            .unwrap_or_else(|| panic!("initialize carried no instructions: {}", reply.body))
+            .to_string()
+    };
+    let to_local = instructions(&mut server, &local_token);
+    let to_bench = instructions(&mut server, &bench_token);
+    for text in [&to_local, &to_bench] {
+        // The base half, which every surface includes because every tool routes by a handle.
+        assert!(text.contains("WinDbg"), "{text}");
+        assert!(text.contains("session_id"), "{text}");
+        assert!(text.contains("end_session"), "{text}");
+    }
+    // Each is told about its own groups and no others. `debug_batch` is the one to keep an eye on:
+    // it is a group of one, it is the most destructive tool here, and neither of these clients is
+    // served it.
+    for absent in [
+        "crash_triage",
+        "debug_batch",
+        "decode_ioctl",
+        "ttd_calls",
+        "run_to_address",
+    ] {
+        assert!(
+            !to_local.contains(absent),
+            "`local` is served session,inspect and was told about `{absent}`: {to_local}"
+        );
+    }
+    for absent in [
+        "modules",
+        "execute",
+        "debug_batch",
+        "decode_ioctl",
+        "ttd_calls",
+    ] {
+        assert!(
+            !to_bench.contains(absent),
+            "`bench` is served crash and was told about `{absent}`: {to_bench}"
+        );
+    }
+    assert!(to_local.contains("modules"), "{to_local}");
+    assert!(to_bench.contains("crash_triage"), "{to_bench}");
+    assert!(
+        to_bench.len() < to_local.len(),
+        "the smaller surface should read less prose: bench {} vs local {}",
+        to_bench.len(),
+        to_local.len()
+    );
+
     // And a tool off the surface is refused by name, with the remedy for *this* caller: `local`
     // takes the run's, so the flag is the answer; `bench` has one of its own, so the client
     // command is. Naming the wrong one sends an operator to widen a spec that is not in force.
