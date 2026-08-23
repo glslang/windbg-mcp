@@ -50,13 +50,15 @@
 //! own spec replaces it rather than intersecting with it, because an intersection can produce a
 //! surface neither the operator nor the client ever named.
 //!
-//! **When a change takes effect is a decision, and the answer is "when the client next connects".**
-//! A surface is fixed on the line that captures the caller's identity — the listener's service
-//! factory, which rmcp runs once per MCP session and once per request on `2026-07-28`. Nothing
+//! **When a change takes effect is a decision, and the answer is "the next time the client is
+//! identified".** A surface is fixed on the line that captures the caller's identity — the
+//! listener's service factory, which rmcp runs once per MCP session and once per request on
+//! `2026-07-28`, so a client on that revision picks a change up with nothing done to it. Nothing
 //! sends `notifications/tools/list_changed` after a reload: this server keeps no peer handle to
 //! notify through, and the stateless revision has no session to notify at all, so it would be a
-//! guarantee on one revision and silence on the other. A client that reconnects sees the new
-//! surface; one that does not keeps the surface it listed. See [`Chosen`] for the other half of
+//! guarantee on one revision and silence on the other. A client holding a session sees the new
+//! surface when it reconnects, and keeps the one it listed until then. See [`Chosen`] for the
+//! other half of
 //! that — what a caller is told when it calls a tool the surface does not have.
 
 use std::collections::BTreeSet;
@@ -398,10 +400,18 @@ impl Toolset {
                     "It was started with `{FLAG}`; widen that spec, or drop it to serve every \
                      tool."
                 ),
+                // **Both sources, because only one of them exists on any given host.** The
+                // command edits the credential file a *service* reads and refuses outright where
+                // no service is installed — so naming it alone is advice a foreground listener's
+                // operator cannot take, and that is the deployment a narrowed client is most
+                // likely to be on (review on #196).
                 Chosen::ForThisClient => format!(
-                    "That is `{client}`'s own surface rather than this run's: \
-                     `{} {client} {FLAG} <spec>` widens it, and needs no restart.",
-                    crate::service::SET_CLIENT_TOOLS_FLAG
+                    "That is `{client}`'s own surface rather than this run's, so widening it is a \
+                     change to this listener's client list: `{} {client} {FLAG} <spec>` under a \
+                     service, or `{}_{}` for a foreground one. Neither needs a restart.",
+                    crate::service::SET_CLIENT_TOOLS_FLAG,
+                    crate::client::TOOLS_ENV,
+                    client.to_ascii_uppercase(),
                 ),
             }
         )
@@ -582,6 +592,13 @@ mod tests {
         assert!(
             own.contains("--set-listen-client-tools bench --tools <spec>"),
             "the remedy has to be the command that changes *this* surface: {own}"
+        );
+        // **And the other place that surface can be configured.** That command edits the file a
+        // *service* reads and refuses where none is installed, so naming it alone is advice a
+        // foreground listener's operator cannot take (review on #196).
+        assert!(
+            own.contains("WINDBG_MCP_TOOLS_BENCH"),
+            "a foreground listener's operator has no such command: {own}"
         );
         // Both name the tool and what is served, because those do not depend on who chose it.
         for said in [&run, &own] {

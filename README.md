@@ -415,8 +415,8 @@ A client with no spec of its own is served the run's, so the flag above is a **d
 a ceiling** — a client's own spec replaces it, wider or narrower. Under a Windows service the same
 thing lives in the credential file, and `--set-listen-client-tools <name> --tools <spec>` changes it
 without a reinstall or a restart. [`docs/remote-listener.md`](docs/remote-listener.md#a-tool-surface-per-client)
-is the operator's half, including when a change reaches a client (its next connection) and why
-nothing announces one.
+is the operator's half, including when a change reaches a client (the next time it is identified —
+its next handshake, or its next request if it holds no session) and why nothing announces one.
 
 ### Sessions and session handles
 

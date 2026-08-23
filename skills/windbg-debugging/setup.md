@@ -450,8 +450,10 @@ Four things decide whether that works, and each fails in a way that reads as som
   client** later costs neither a reinstall nor the sessions it is holding —
   `--add-listen-client <name>`, elevated, which generates the token, leaves it beside the
   credential file and prints only a fingerprint. Add `--tools <spec>` to serve that client a
-  smaller surface than the rest (`--set-listen-client-tools <name>` changes it afterwards), which
-  is how a local model shares a listener with a full client.
+  surface of its own — usually a smaller one, though the spec *replaces* the run's rather than
+  narrowing it, so a wider one is served too. `--set-listen-client-tools <name> --tools <spec>`
+  changes it afterwards, and the same command with **no** `--tools` puts the client back on the
+  run's surface. That is how a local model shares a listener with a full client.
 
 Two behaviours differ from stdio and are worth knowing before they surprise you.
 
