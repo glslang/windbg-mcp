@@ -623,6 +623,11 @@ here that only reads. It is the *file*, though, not a question put to the runnin
 command whose re-read did not land says so and exits non-zero — so a revocation that reported
 *that* is the one way a token this list no longer names can still be authenticating.
 
+A client's own `--tools` reaches it the next time it is identified, so this says what a client
+is *configured* with rather than what it is being served this minute: one holding an MCP session
+goes on listing the tools it listed at the time, until it reconnects. One on the sessionless
+revision is identified on every request and has no such gap.
+
 A client with no `--tools` of its own is served whatever `windbg-mcp` serves — `--tools` on the
 command line the SCM stores, or every tool if that has none.
 
@@ -654,12 +659,14 @@ Three things about it:
 - **It needs the same elevated shell.** The credential file grants read to `SYSTEM` and
   `Administrators` only, which is what makes it worth having; an unelevated run is told so rather
   than shown a partial answer. On a host with no service there is no file and no elevation needed.
-- **It reads the file, not the service.** Normally those agree — every command above waits for the
-  re-read and exits non-zero if it did not land — but the one case they do not is exactly the case
-  you would run this to check: a `--remove` or `--rotate` whose reload failed leaves a token
-  authenticating that the file no longer names. There is no way to ask the running service what it
-  has in force (its only channel carries a status code and no data), so the command reports the
-  state it *is* in — running, starting, or stopped — and says which of those the roster means.
+- **It reads the file, not the service**, and the two can differ in two unrelated ways. A
+  credential's: a `--remove` or `--rotate` whose reload failed leaves a token authenticating that
+  the file no longer names — exactly the case you would run this to check. A surface's: a reload
+  that *succeeded* still does not reach a client holding an MCP session, which goes on listing the
+  tools it listed when it connected. There is no way to ask the running service what it has in
+  force (its only channel carries a status code and no data), so the command reports the state it
+  *is* in — running, starting, or stopped — and names the second gap wherever a client carries a
+  spec of its own.
 
 **Stopping is graceful, and that is the point.** `Stop-Service` takes the same path a client
 disconnect takes: every session is asked to release its target before the process exits, and the SCM
