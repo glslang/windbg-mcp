@@ -1560,7 +1560,11 @@ three arms, one sentence each. The next round found the *other* half of the same
 not the same claim: a credential is in force at the reload every editing command waits for, while a
 **surface** is fixed when the client is identified, so a reload that succeeded still leaves a
 connected client listing what it listed then. That one is said wherever a client carries a spec of
-its own and the service is running — the two conditions the gap needs.
+its own and the service is running. That gate was itself wrong, three rounds later: clearing the
+*last* per-client spec leaves a file with no surface in it and a connected client still being
+served the old one. So the gate is gone and the sentence is folded into the one clause that was
+already about file-versus-service — one rule, true whenever the service is running, rather than two
+conditions each with a state it is wrong in.
 
 **Three rounds all landed on that one clause, and they had one cause**: every wrong sentence was a
 claim about what the service was *accepting*, made by a command that reads a file. The seam is
