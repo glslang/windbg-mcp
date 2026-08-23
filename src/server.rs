@@ -2564,6 +2564,23 @@ impl WindbgServer {
     ///
     /// Built per call, which is what `Self::tool_router()` already was — the schemas underneath it
     /// are cached by type, so this is a map of fifty-one `Arc` clones and a `retain`.
+    /// The instructions this client is served: the base, plus a fragment per group it has.
+    ///
+    /// The pair to [`Self::router`] - that decides which tools this client may call, and this
+    /// decides which it is told about. They were out of step from #196 until `FOLLOWUPS.md` item
+    /// 40: a `crash`-surface client could call eleven tools and was told about twenty-one, so
+    /// every model on that surface asked for something it would then be refused.
+    fn instructions(&self) -> String {
+        let mut text = String::from(BASE_INSTRUCTIONS);
+        for (group, fragment) in GROUP_INSTRUCTIONS {
+            if self.surface.serves_group(group) {
+                text.push(' ');
+                text.push_str(fragment);
+            }
+        }
+        text
+    }
+
     fn router(&self) -> rmcp::handler::server::tool::ToolRouter<Self> {
         let mut router = Self::tool_router();
         self.surface.narrow(&mut router);
@@ -4402,40 +4419,105 @@ impl WindbgServer {
 // that expands in this crate. Pass `name` only: the attribute takes a string literal, so
 // `version = env!(...)` would not even parse, and spelling the version out by hand would just be a
 // second place to forget to bump.
-// **Sized to what the client actually reads.** Measured at 2,048 characters, and the previous text
-// was 3,147 — so 1,099 characters were paid for on every connection and never arrived, taking the
-// whole `debug_batch` paragraph with them, which is the one instruction here that prevents a
-// half-applied mutation. Kept ASCII so the count cannot differ between characters and bytes, and
-// `the_instructions_fit_what_the_client_reads` fails if it grows back.
+/// The half of the instructions every client reads, whatever its surface.
+///
+/// Split from the rest because `--tools` narrows the surface **per client** and this string used
+/// not to move with it: one constant naming twenty-one tools went to every client, so a client
+/// served eleven was told about `modules`, `execute`, `decode_ioctl` and `debug_batch` and would
+/// ask for them (`FOLLOWUPS.md` item 40, measured in `docs/local-model-eval.md`).
+///
+/// A fragment per **group** rather than a filter over one text, because the prose names several
+/// tools per sentence and cutting by name leaves mangled English in the first thing a model reads.
+const BASE_INSTRUCTIONS: &str = "Drive WinDbg/DbgEng for live user-mode, kernel, crash-dump and Time Travel Debugging (TTD) work. \
+Each open target is a separate session in its own engine process, so up to 4 coexist \
+independently: pass the `session_id` an opener returns on every later call to route it to that \
+target, and `end_session` when done. An opener answers with a summary of the target rather than \
+its module table. If an open reports a timeout, ask `session_status` rather than running the \
+open again - a second open attaches or launches a second time. To stop a call that is \
+overrunning, `interrupt` its session while it is still outstanding: the interrupt returns at \
+once, and the partial result comes back on the original call. A live kernel attach cannot be \
+interrupted - it waits indefinitely, and `end_session` reclaims that session alone.";
+
+/// One fragment per group, in the order they are assembled.
+///
+/// The allocator family is deliberately absent: it was never in this string, and this change is
+/// about not advertising what a client cannot call rather than advertising more.
+///
+/// `the_instructions_fit_what_the_client_reads` measures the whole assembly against the 2,048 a
+/// client reads, so a fragment added here is paid for by every client that group is served to.
+const GROUP_INSTRUCTIONS: &[(&str, &str)] = &[
+    (
+        "crash",
+        "`crash_triage` reads a bug check as fields, with the crashing stack and the module each frame \
+     belongs to.",
+    ),
+    (
+        "inspect",
+        "`modules` lists the module table and carries each image's identity - the coordinate that \
+     survives a reboot and joins a disassembler; frames and instructions carry `module`+`rva` beside \
+     their address. `dx` runs any data-model expression, and `execute` any raw command without a \
+     dedicated tool.",
+    ),
+    (
+        "exec",
+        "`go`, `step_over` and `step_into` drive a stopped target, `set_breakpoint` arms one, and \
+     `run_to_address` needs a KDNET/VM kernel target, not a local one.",
+    ),
+    (
+        "ttd",
+        "TTD: `reverse_go`, `step_back` and `step_over_back` run backward, `goto_position` jumps, \
+     `ttd_calls`/`ttd_memory`/`ttd_events` query a trace and `record_trace` makes one.",
+    ),
+    (
+        "ioctl",
+        "Driver IOCTL: `decode_ioctl`, `driver_object`, `device_object`, `irp_stack`, `ioctl_trace`, and \
+     `reachable_from_dispatch` - is a block reachable from the dispatch routine.",
+    ),
+    (
+        "batch",
+        "When a sequence *mutates* the target - a patched byte, an armed breakpoint, a resumed thread - \
+     run it as one `debug_batch`: its `always` block runs on every path, including a failed \
+     assertion, an expired deadline and a client disconnect, so cleanup cannot be lost.",
+    ),
+];
+
+// **Sized to what the client actually reads.** Measured at 2,048 characters, and the text this
+// replaced was 3,147 - so 1,099 characters were paid for on every connection and never arrived.
+// Kept ASCII so the count cannot differ between characters and bytes, and
+// `the_instructions_fit_what_the_client_reads` fails if the whole assembly grows back.
 #[rmcp::tool_handler(
     // `list_tools` and `get_tool` come from the macro; what they list is this instance's router
     // rather than the crate-wide one, which is what makes `--tools` visible on the wire. The
     // default here is `Self::tool_router()`, and leaving it would have narrowed the calls a tool
     // may make (`dispatch`) while still advertising all fifty-one.
+    //
+    // `name` and `instructions` used to be here too. They moved into the hand-written `get_info`
+    // below, which the macro yields to - the instructions are now assembled for the client's own
+    // surface, and a constant on this attribute cannot be.
     router = self.router(),
-    name = "windbg-mcp",
-    instructions = "Drive WinDbg/DbgEng for live user-mode, kernel, crash-dump and Time Travel Debugging (TTD) work: open a \
-dump or .run trace, attach to a process or the kernel, inspect registers/memory/stacks/modules, set \
-breakpoints. Each open target is a separate session in its own engine process, so up to 4 coexist \
-independently: pass the `session_id` an opener returns on every later call to route it to that target, \
-and `end_session` when done. An opener answers with a summary rather than the module table; `modules` \
-lists that, and `crash_triage` reads a bug check with its stack. If an open reports a timeout, ask \
-`session_status` rather than running the open again - a second open attaches or launches a second time. \
-To stop a call that is overrunning, `interrupt` its session while the call is still outstanding: the \
-interrupt returns at once, and the partial result comes back on the original call. A live kernel attach \
-cannot be interrupted - it waits indefinitely, and `end_session` reclaims that session alone. Stack \
-frames and instructions carry `module`+`rva` beside their address, and `modules` carries each image's \
-identity - the coordinate that survives a reboot and joins a disassembler. TTD: go/step_over/step_into \
-forward, reverse_go/step_over_back/step_back backward, goto_position to jump; ttd_calls, ttd_memory and \
-ttd_events query a trace, dx runs any data-model expression. Driver IOCTL: decode_ioctl, driver_object, \
-device_object, irp_stack, ioctl_trace, and reachable_from_dispatch - is a block reachable from the \
-dispatch routine. Confirm a verdict live with run_to_address, which needs a KDNET/VM kernel target, not \
-a local one. When a sequence *mutates* the target - a patched byte, an armed breakpoint, a resumed \
-thread - run it as one `debug_batch`: its `always` block runs in the engine process on every path, \
-including a failed assertion, an expired deadline and a client disconnect, so cleanup cannot be lost. \
-Use `execute` for any raw command without a dedicated tool."
 )]
 impl rmcp::ServerHandler for WindbgServer {
+    /// What this server says it is, and what it tells *this* client it can do.
+    ///
+    /// Written out rather than left to `#[rmcp::tool_handler]` for the same reason `call_tool` is:
+    /// the macro supplies it only when the impl does not. Its version takes `name` and
+    /// `instructions` as literals on the attribute, and a literal cannot vary per client - which
+    /// is the whole of `FOLLOWUPS.md` item 40. Everything else here is what the macro would have
+    /// built, including the `name`, which left to the default reads `rmcp` at the SDK's version
+    /// because `Implementation::from_build_env()` resolves its `env!`s inside rmcp.
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        rmcp::model::ServerInfo::new(
+            rmcp::model::ServerCapabilities::builder()
+                .enable_tools()
+                .build(),
+        )
+        .with_server_info(rmcp::model::Implementation::new(
+            "windbg-mcp",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions(self.instructions())
+    }
+
     /// Every tool call, recorded on its way through.
     ///
     /// Written out rather than left to `#[rmcp::tool_handler]` — which supplies it only when the
