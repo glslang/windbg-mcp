@@ -534,6 +534,128 @@ fn is_reload(control: &ServiceControl) -> bool {
     matches!(control, ServiceControl::UserEvent(code) if code.to_raw() == RELOAD_CODE)
 }
 
+/// The image out of a service's stored command line.
+///
+/// **`ServiceConfig::executable_path` is not a path.** `QueryServiceConfigW` hands back
+/// `lpBinaryPathName`, which is the whole line the SCM starts — the exe *and* the
+/// `--service --listen <addr>` [`install`] put after it — and `windows-service` builds that line by
+/// escaping each part the way `CommandLineToArgvW` reads it. So the image is either quoted or holds
+/// no space, and those are the only two shapes to undo.
+///
+/// **No escape can appear inside the quoted form**, which is what makes reading to the next quote
+/// exact rather than approximate: escaping introduces `\"` and a doubled trailing `\`, and a
+/// Windows path can hold neither — `"` is not a legal filename character, and an exe path does not
+/// end in a separator.
+///
+/// Wide units rather than [`std::ffi::OsStr::to_string_lossy`], because two paths that differ can
+/// share a lossy rendering and this exists to tell two paths apart.
+fn image_in(command_line: &OsStr) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+    const QUOTE: u16 = b'"' as u16;
+    const SPACE: u16 = b' ' as u16;
+    let line: Vec<u16> = command_line.encode_wide().collect();
+    let image = if line.first() == Some(&QUOTE) {
+        let rest = &line[1..];
+        &rest[..rest.iter().position(|c| *c == QUOTE).unwrap_or(rest.len())]
+    } else {
+        &line[..line.iter().position(|c| *c == SPACE).unwrap_or(line.len())]
+    };
+    PathBuf::from(OsString::from_wide(image))
+}
+
+/// Whether two paths name the same file, as far as anything outside the SCM can tell.
+///
+/// Canonicalised first: one side is whatever [`install`] handed the SCM that day and the other is
+/// read back out of this running process, so a `..`, an 8.3 short name and a symlinked directory
+/// all have to fold together. Where either canonicalisation fails — the likeliest reason being that
+/// the service's image is not there any more, which is a divergence of its own — the raw paths are
+/// compared without case, because Windows paths are.
+fn same_image(installed: &std::path::Path, running: &std::path::Path) -> bool {
+    match (
+        std::fs::canonicalize(installed),
+        std::fs::canonicalize(running),
+    ) {
+        (Ok(installed), Ok(running)) => installed == running,
+        _ => installed
+            .as_os_str()
+            .eq_ignore_ascii_case(running.as_os_str()),
+    }
+}
+
+/// The caveat to print when the SCM starts a **different copy of this program** than the one
+/// running the command, `stake` naming what that costs the command printing it.
+///
+/// **The failure it is here to name is silent and arrives late** (`FOLLOWUPS.md` item 38). Item 36
+/// gave the credential file a shape earlier builds refuse — an entry that is an object, carrying a
+/// client's surface beside its token — so a `--set-listen-client-tools` run from a newer copy than
+/// the one the SCM starts writes a file that service cannot read. Nothing breaks at the time: a
+/// reload only ever swaps in a set that would have started this listener from cold, so the running
+/// service goes on serving the clients it had and says so in its log. It is the **next start** that
+/// fails, a reboot away from the command that caused it. A fresh install cannot reach this and
+/// neither can an ordinary upgrade, since Windows will not overwrite a running image — a
+/// development tree with two builds in it is the case that does, and did.
+///
+/// **A warning and never a refusal**, because a path is all there is to compare. Nothing carries a
+/// *version* between the two: the only thing that reaches a running service is a control code,
+/// which comes back as a status and no data. Two copies of the same build differ by path and agree
+/// about everything that matters here, and this cannot tell them from two builds — so it says what
+/// it compared rather than what it concluded.
+///
+/// **Opened on a handle of its own** rather than added to the one the caller already holds. A
+/// service's default security descriptor grants `SERVICE_QUERY_CONFIG` to Authenticated Users, so
+/// this ordinarily costs nothing — but on a host that has narrowed it, asking for the right on the
+/// command's own handle would fail the command outright, and a `--remove-listen-client` that will
+/// not run because a warning wanted a right is a worse trade than the warning is worth.
+fn foreign_image(manager: &ServiceManager, stake: &str) -> Option<String> {
+    let installed = manager
+        .open_service(NAME, ServiceAccess::QUERY_CONFIG)
+        .and_then(|service| service.query_config())
+        .map(|config| image_in(config.executable_path.as_os_str()));
+    let (installed, running) = match (installed, std::env::current_exe()) {
+        (Ok(installed), Ok(running)) => (installed, running),
+        // **Said rather than swallowed.** Silence here is indistinguishable from the check having
+        // been made and passed, so a host where it cannot be made would be offered a guarantee
+        // nothing checked. Neither of these fails the command: the divergence is a caveat on what
+        // it did, not a precondition for doing it.
+        (Err(e), _) => {
+            return Some(format!(
+                "note: which copy of this program `{NAME}` is registered to run could not be read \
+                 from the SCM ({e}), so whether it is this one is not known from here."
+            ));
+        }
+        (_, Err(e)) => {
+            return Some(format!(
+                "note: this program's own path could not be read ({e}), so whether it is the copy \
+                 `{NAME}` is registered to run is not known from here."
+            ));
+        }
+    };
+    if same_image(&installed, &running) {
+        return None;
+    }
+    // Built apart from the sentences below so the two indented lines can carry their own leading
+    // spaces: a `\` continuation in a Rust string eats the next line's indentation, which is what
+    // makes the rest of this file's long messages readable and would silently flatten these.
+    let paths = format!(
+        "    the SCM starts  {}\n    this command is {}",
+        installed.display(),
+        running.display()
+    );
+    Some(format!(
+        "warning: `{NAME}` is registered to run a different copy of this program than this \
+         one.\n{paths}\n{stake}, and two builds need not agree on what may be in it — an entry \
+         carrying a client's `{}` beside its token is a shape 0.11.0 introduced, and a service \
+         older than that refuses the whole file rather than that one entry. Such a file leaves the \
+         running service serving the clients it already had — a reload only ever swaps in a set \
+         that would have started it from cold — and stops it starting the next time, which is a \
+         reboot away from here. Only the paths are comparable from here, so this cannot tell a \
+         stale build from a second copy of the same one: run the client commands from the binary \
+         the SCM starts, or replace that binary and restart the service.",
+        crate::toolset::FLAG,
+    ))
+}
+
 /// Adds, removes or rotates one of the installed service's clients, without a reinstall.
 ///
 /// **The problem this replaces.** `--install-service` was the only writer of [`token_file`], and
@@ -606,6 +728,21 @@ pub fn edit_client(edit: ClientEdit, name: &str, tools: Option<&str>) -> Result<
                 token_file().display()
             )
         })?;
+
+    // **Printed before the change rather than beside the notes at the bottom.** This command can
+    // fail before it ever reaches them — a revocation whose reload did not land returns an error —
+    // and a service that cannot read the file this warning is about is one of the two ways that
+    // reload fails, so the note that would explain it must not sit on the path being skipped.
+    //
+    // **Gated on nothing.** A reload that lands is evidence the other copy read what this one
+    // wrote, and the arms at the bottom report it; this says only what was compared, which stays
+    // true whatever the reload goes on to do.
+    if let Some(note) = foreign_image(
+        &manager,
+        "This command writes the credential file that copy reads",
+    ) {
+        println!("{note}\n");
+    }
 
     // Held until this function returns, which is what makes the read, the edit, the write and the
     // reload below one transaction rather than four steps two shells can interleave.
@@ -977,6 +1114,16 @@ pub fn list_clients(tools: Option<&str>) -> Result<()> {
             at.display(),
             in_force(&state),
         );
+        // **The other way the file and the running service can differ**, and the only one that is
+        // about which *program* reads it rather than when. Beneath [`in_force`] because it is the
+        // same caveat one step further out: that clause says the service may not have this file
+        // yet, and this one says it may not be able to read it at all.
+        if let Some(note) = foreign_image(
+            &manager,
+            "The roster above is what this copy makes of the credential file that one reads",
+        ) {
+            println!("\n{note}");
+        }
     } else {
         println!(
             "No service named `{NAME}` is installed, so this host has no client list in a file. A \
@@ -2098,6 +2245,69 @@ mod tests {
             ),
             Err(e) => panic!("an absent service came back as {e:?}"),
         }
+    }
+
+    /// The installed image is read out of the command line the SCM stores *around* it.
+    ///
+    /// `QueryServiceConfigW` hands back `lpBinaryPathName`, which is the exe and the
+    /// `--service --listen <addr>` after it — not a path — and `windows-service` quotes the exe
+    /// only when it has to. Both shapes therefore reach [`foreign_image`] on real hosts: an
+    /// install under `%ProgramFiles%` is quoted and one under `C:\tools` is not. Reading either
+    /// wrongly is a warning about a divergence that is not there, printed on every client command
+    /// on the hosts this feature is *for*.
+    #[test]
+    fn the_installed_image_is_read_out_of_the_line_the_scm_stores() {
+        let image = |line: &str| image_in(OsStr::new(line));
+        assert_eq!(
+            image(
+                r#""C:\Program Files\windbg-mcp\windbg-mcp.exe" --service --listen 127.0.0.1:8765"#
+            ),
+            PathBuf::from(r"C:\Program Files\windbg-mcp\windbg-mcp.exe"),
+            "a quoted image ends at its closing quote, not at the space inside it"
+        );
+        assert_eq!(
+            image(r"C:\tools\windbg-mcp.exe --service --listen 127.0.0.1:8765 --tools crash"),
+            PathBuf::from(r"C:\tools\windbg-mcp.exe"),
+            "an unquoted image ends at the first space, which is where its arguments start"
+        );
+        // Both with nothing after them, which is not how `install` registers this service but is
+        // how a hand-registered one can look — and is the one case with no terminator to find.
+        assert_eq!(
+            image(r"C:\tools\windbg-mcp.exe"),
+            PathBuf::from(r"C:\tools\windbg-mcp.exe")
+        );
+        assert_eq!(
+            image(r#""C:\Program Files\windbg-mcp\windbg-mcp.exe""#),
+            PathBuf::from(r"C:\Program Files\windbg-mcp\windbg-mcp.exe")
+        );
+    }
+
+    /// Two names for one file are the same image; two files are not.
+    ///
+    /// The last pair is the arrangement `FOLLOWUPS.md` item 38 was measured on — a service running
+    /// `target\release` from before item 36 while the client commands were run from `target\debug`
+    /// after it — and it is what the warning has to fire on.
+    ///
+    /// Neither of the first two paths exists, so this exercises the **fallback**: with
+    /// canonicalisation unavailable the raw paths are compared without case, because Windows paths
+    /// are. The pair after it is the canonicalising half, on the one file a test binary is certain
+    /// to have.
+    #[test]
+    fn a_path_that_differs_only_in_case_names_the_same_image() {
+        let path = std::path::Path::new;
+        assert!(same_image(
+            path(r"C:\tools\WinDbg-MCP.exe"),
+            path(r"c:\TOOLS\windbg-mcp.exe")
+        ));
+        let exe = std::env::current_exe().expect("a test binary knows its own path");
+        assert!(
+            same_image(&exe, &exe),
+            "a file that is there has to fold to itself through canonicalisation"
+        );
+        assert!(!same_image(
+            path(r"C:\Program Files\windbg-mcp\windbg-mcp.exe"),
+            path(r"C:\workspace\windbg-mcp\target\debug\windbg-mcp.exe")
+        ));
     }
 
     fn entry(name: &str, token: &str, tools: Option<&str>) -> crate::client::ClientEntry {

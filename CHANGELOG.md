@@ -17,6 +17,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The client commands warn when the SCM starts a different copy of this program than the one you
+  ran** (`FOLLOWUPS.md` item 38, which closes it). 0.11.0 gave the credential file a shape earlier
+  builds refuse — an entry that is an object, carrying a client's `--tools` beside its token — so
+  `--add-listen-client <name> --tools …` or `--set-listen-client-tools`, run from a newer copy than
+  the one the SCM starts, writes a file the running service cannot read. **Nothing breaks at the
+  time, which is the problem**: a reload only ever swaps in a set that would have started this
+  listener from cold, so the service goes on serving the clients it had and says so in its log. It
+  is the *next start* that fails, a reboot away from the cause. A fresh install cannot reach this
+  and neither can an ordinary upgrade, since Windows will not overwrite a running image — a
+  development tree with two builds in it is the case that does.
+
+  All five commands print it, with both paths: the four that edit the file, and
+  `--list-listen-clients`, which is where an operator goes when a service did not come back after a
+  reboot and which was otherwise printing one build's reading of a file another build has to read.
+  **A warning and never a refusal** — a path is all there is to compare, since nothing carries a
+  version between the two, and running a client command from a second copy of the *same* build is
+  legitimate and looks identical from here.
+
 - **`--list-listen-clients`, the one client command that changes nothing** (`FOLLOWUPS.md` item 37,
   which closes it). The four commands that edit a service's credential file each print the whole
   roster afterwards — name, token fingerprint, and the `--tools` spec where one is set — and until
