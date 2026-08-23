@@ -524,10 +524,15 @@ reach is the wiring, which is what these assert against a real listener on a loo
 hand-written HTTP client (a library that normalised a `409` into an exception, or hid the session
 header, would be asserting on this server's behalf).
 
-Six of them need no debugger, because none of them needs a session to be open, and all six run a
-listener holding a **single, unnamed** token — so what they prove, they prove for the `local`
-client alone. That was once the whole listener tier, and the gap it left was
-[`FOLLOWUPS.md`](../FOLLOWUPS.md) item 29; the three tests under [Two clients, two of
+**Ten of them need no debugger**, because none of them needs a session to be open: the six below,
+the three after them, and *Two clients are served two surfaces* from the section after that — whose
+third test, the token file, is already one of the three. Counting them by grepping for
+`Listener::start` gives nine and is wrong: *It will not start without a token* spawns the exe
+itself, because a listener that will not start cannot be started by the helper.
+
+Six are the lease's own, and not one of them presents a **second credential** — so what they prove,
+they prove for the `local` client alone. That was once the whole listener tier, and the gap it left
+was [`FOLLOWUPS.md`](../FOLLOWUPS.md) item 29; the three tests under [Two clients, two of
 everything](#two-clients-two-of-everything) below are what closed it:
 
 - *It will not start without a token*, and says which variable is missing. The listener exposes
@@ -565,7 +570,7 @@ everything](#two-clients-two-of-everything) below are what closed it:
   refused. Both shapes the probe sent are pinned here, so the same `400` cannot be read as a broken
   listener a second time.
 
-Three more of the six's neighbours also need no debugger, and none of them is about the lease:
+Three more need no debugger either, and none of them is about the lease:
 
 - *A **token file** names its own clients, and shuts the environment out.* Both halves pull against
   each other, so both are asserted on one listener: a file naming `local` and `ci` serves both, and
