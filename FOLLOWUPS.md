@@ -1558,5 +1558,16 @@ not the same claim: a credential is in force at the reload every editing command
 connected client listing what it listed then. That one is said wherever a client carries a spec of
 its own and the service is running — the two conditions the gap needs.
 
+**Three rounds all landed on that one clause, and they had one cause**: every wrong sentence was a
+claim about what the service was *accepting*, made by a command that reads a file. The seam is
+bounded rather than open — this service accepts `STOP` and `PRESHUTDOWN` and no pause control, so
+the SCM can only put it in four states — so the answer was to enumerate all four and let no arm
+claim acceptance where it cannot know it. The catch-all had been claiming "nothing is accepting
+anything", which is false of `StopPending`: a stop ends the accept loop and then releases every
+target (minutes, on a host holding a live kernel) while the connections already accepted go on
+being served by tasks nothing awaits or aborts. The comment in [`src/listen.rs`](./src/listen.rs)
+that said those connections "are dropped" is what produced the wrong sentence, and it is now
+exact — the shutdown ends the *accepting*, not the serving.
+
 Landed in [`src/service.rs`](./src/service.rs) (`list_clients`, `in_force`, `service_clients`,
 `shell_clients`), [`src/listen.rs`](./src/listen.rs) and [`src/main.rs`](./src/main.rs).

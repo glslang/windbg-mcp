@@ -35,7 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is the case an operator would run this to check. A surface's: a reload that *succeeded* still
   does not reach a client holding an MCP session, which goes on listing the tools it listed when it
   connected — so that gap is named wherever a client carries a spec of its own. The running service
-  cannot be asked what it holds: its only channel carries a status code and no data.
+  cannot be asked what it holds: its only channel carries a status code and no data, so what is
+  reported beside the roster is the state that service is in, across every state it can reach —
+  including **stopping**, which is not stopped: a stop ends the accept loop and then releases every
+  target, and the connections already accepted are served until the process exits.
 
 ## [0.11.0] - 2026-08-23
 

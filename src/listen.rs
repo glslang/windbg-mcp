@@ -826,8 +826,16 @@ pub async fn serve(
         let (stream, peer) = tokio::select! {
             // Asked to stop. Returning here is the whole mechanism: the caller's `shutdown` on
             // `Sessions` runs next, and that is what releases a live kernel rather than leaving it
-            // frozen. Connections already in flight are dropped — a client mid-call loses that
-            // call, which is the lesser of the two, and its session is being released anyway.
+            // frozen.
+            //
+            // **What this ends is the accepting, not the serving** — worth being exact about,
+            // because the looser reading ("connections in flight are dropped") is wrong and put a
+            // wrong sentence into `service::in_force` (review on #201). Every accepted connection
+            // is served by a task spawned below, and nothing here awaits or aborts those: they go
+            // on authenticating and answering until the runtime is dropped, which is after the
+            // release above has finished. On a host holding a live kernel that is minutes. A
+            // client mid-call at the end loses that call, which is the lesser of the two, and its
+            // session is being released anyway.
             () = &mut shutdown => {
                 tracing::info!("no longer accepting connections on {addr}");
                 return Ok(());

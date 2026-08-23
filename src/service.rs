@@ -1074,10 +1074,8 @@ pub fn list_clients(tools: Option<&str>) -> Result<()> {
 fn in_force(state: &Result<ServiceState, windows_service::Error>) -> String {
     match state {
         Ok(ServiceState::Running) => format!(
-            "`{NAME}` is running and re-reads this file whenever a client command changes it, and \
-             a command whose re-read did not land says so and exits non-zero — so a revocation \
-             that reported *that* is the one way a token this list no longer names can still be \
-             authenticating."
+            "`{NAME}` is running, and it re-reads this file whenever a client command changes it — \
+             a command whose re-read did not land says so and exits non-zero."
         ),
         // The state `ask_to_reload` refuses to guess about, for the same reason: the SCM will not
         // carry a control code to a starting service, and it reads its clients moments after
@@ -1087,10 +1085,24 @@ fn in_force(state: &Result<ServiceState, windows_service::Error>) -> String {
             "`{NAME}` is starting, and whether the start under way has read this file cannot be \
              told from outside — when it comes up it logs the clients it is serving."
         ),
-        Ok(_) => format!(
+        // **Not the same as stopped, and this arm exists because collapsing the two was wrong**
+        // (review on #201, third round). A stop ends the accept loop and then releases every
+        // target, which is the slow part — `stop_bound` is minutes on a host holding a live
+        // kernel — and the connections already accepted are served by tasks that outlive it.
+        Ok(ServiceState::StopPending) => format!(
+            "`{NAME}` is stopping, which can take minutes while it releases the targets it holds. \
+             It goes on serving connections it had already accepted until the process exits, so a \
+             credential in this list may still be authenticating on one of them."
+        ),
+        Ok(ServiceState::Stopped) => format!(
             "`{NAME}` is not running, so nothing is accepting anything and this is what it will \
              read at its next start."
         ),
+        // **Unreachable rather than unhandled**, and it says nothing about what is being accepted
+        // because it cannot: this service accepts `STOP` and `PRESHUTDOWN` and no pause control,
+        // so the SCM has no way to put it in a paused state — and an arm that guessed at one
+        // would be the fourth wrong claim on this line rather than the first right one.
+        Ok(other) => format!("`{NAME}` reports itself {other:?}."),
         // Not a failure. The roster above is what was asked for; this clause is the caveat on it,
         // and a caveat that cannot be given is not a reason to withhold the answer.
         Err(e) => format!(

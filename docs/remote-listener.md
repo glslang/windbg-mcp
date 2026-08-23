@@ -665,8 +665,10 @@ Three things about it:
   that *succeeded* still does not reach a client holding an MCP session, which goes on listing the
   tools it listed when it connected. There is no way to ask the running service what it has in
   force (its only channel carries a status code and no data), so the command reports the state it
-  *is* in — running, starting, or stopped — and names the second gap wherever a client carries a
-  spec of its own.
+  *is* in — running, starting, **stopping** or stopped — and names the second gap wherever a client
+  carries a spec of its own. Stopping is not stopped: a stop ends the accept loop and then releases
+  every target, which on a host holding a live kernel is minutes, and the connections already
+  accepted are served until the process exits.
 
 **Stopping is graceful, and that is the point.** `Stop-Service` takes the same path a client
 disconnect takes: every session is asked to release its target before the process exits, and the SCM
