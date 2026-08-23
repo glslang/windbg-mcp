@@ -970,12 +970,32 @@ pub fn list_clients(tools: Option<&str>) -> Result<()> {
         let at = token_file();
         let held = service_clients(&at)?;
         println!("`{NAME}` is configured with: {}.", roster(&held));
+        // Read once and used twice — the caveat below turns on it as well, and asking the SCM
+        // twice could answer differently between two lines of one report.
+        let state = service.query_status().map(|status| status.current_state);
         println!(
             "\nRead from {}, and nothing was changed — this is the one command here that only \
              reads. It is the *file*, though, not a question put to the running service: {}",
             at.display(),
-            in_force(service),
+            in_force(&state),
         );
+        // **A client's own surface lags the file in a way its credential does not** (review on
+        // #201, second round). A credential is in force at the reload every editing command waits
+        // for; a surface is fixed when the client is *identified*, so one holding an MCP session
+        // goes on listing what it listed then. Said only where a client carries a spec of its own
+        // and only while the service is running, because those are the two things that have to be
+        // true for the gap to exist — and the arm above has just said nothing is being served at
+        // all where the second is false.
+        if matches!(state, Ok(ServiceState::Running)) && held.iter().any(|c| c.tools.is_some()) {
+            println!(
+                "\nA client's own `{}` reaches it the next time it is identified, so this says \
+                 what a client is *configured* with rather than what it is being served this \
+                 minute: one holding an MCP session goes on listing the tools it listed at the \
+                 time, until it reconnects. One on the sessionless revision is identified on every \
+                 request and has no such gap.",
+                crate::toolset::FLAG,
+            );
+        }
         // Said only where there is a client it is about, which is what keeps it off the line on a
         // host where every client carries its own spec.
         if held.iter().any(|client| client.tools.is_none()) {
@@ -1051,8 +1071,8 @@ pub fn list_clients(tools: Option<&str>) -> Result<()> {
 /// the only channel to the running service is `ControlService`, which carries a status code back
 /// and no data. Reporting the state it *is* in says as much as can be said from outside, and each
 /// of the three says something different about the file underneath it.
-fn in_force(service: &windows_service::service::Service) -> String {
-    match service.query_status().map(|status| status.current_state) {
+fn in_force(state: &Result<ServiceState, windows_service::Error>) -> String {
+    match state {
         Ok(ServiceState::Running) => format!(
             "`{NAME}` is running and re-reads this file whenever a client command changes it, and \
              a command whose re-read did not land says so and exits non-zero — so a revocation \

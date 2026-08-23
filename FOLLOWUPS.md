@@ -1552,7 +1552,11 @@ could not be delivered writes the file, exits non-zero, and says the credential 
 authenticating. An operator checking *that* with this command would have read "`windbg-mcp` holds"
 as proof the token was gone. There is no live roster to ask for (a service control code carries a
 status back and no data), so the answer is the caveat plus the state the service is in: `in_force`,
-three arms, one sentence each.
+three arms, one sentence each. The next round found the *other* half of the same gap, and it is
+not the same claim: a credential is in force at the reload every editing command waits for, while a
+**surface** is fixed when the client is identified, so a reload that succeeded still leaves a
+connected client listing what it listed then. That one is said wherever a client carries a spec of
+its own and the service is running — the two conditions the gap needs.
 
 Landed in [`src/service.rs`](./src/service.rs) (`list_clients`, `in_force`, `service_clients`,
 `shell_clients`), [`src/listen.rs`](./src/listen.rs) and [`src/main.rs`](./src/main.rs).
