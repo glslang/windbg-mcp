@@ -84,8 +84,11 @@ def already_done(log_path):
             if not line:
                 continue
             r = json.loads(line)
-            seen.add((r.get("model"), r.get("num_ctx"), (r.get("surface") or {}).get("client"),
-                      r.get("task")))
+            # **Keyed by backend too.** Two groups can name the same model - an ollama tag
+            # aliased `sonnet` beside the Claude Code row - and without this the first one's
+            # records make the second's whole cell look finished.
+            seen.add((r.get("backend"), r.get("model"), r.get("num_ctx"),
+                      (r.get("surface") or {}).get("client"), r.get("task")))
     return seen
 
 
@@ -164,6 +167,14 @@ def run_cell(plan, tokens, backend, model, context, surface, subset, budget_s, l
                 proc.kill()
             proc.wait()
             print(f"    budget of {budget_s}s exceeded; cell killed")
+            # **The kill skipped the driver's own cleanup**, so whatever it had open is still
+            # attached under this cell's credential - and the next cell on the same surface would
+            # inherit it, or meet the four-session cap because of it. Released here, with that
+            # credential, before anything else runs.
+            release = subprocess.run([sys.executable, "-u", DRIVER, "--release"], env=env,
+                                     capture_output=True, text=True, timeout=120)
+            for line in release.stdout.splitlines():
+                print(f"    {line.strip()}")
             note = {"run": plan["run"], "backend": backend, "model": model,
                     "num_ctx": context or None, "surface": {"client": surface},
                     "task": None, "error": f"cell exceeded its {budget_s}s budget"}
@@ -343,10 +354,16 @@ def summarise(log_path, tasks_file):
         cell["correct"] = sum(1 for g in graded if g["correct"])
         cell["correct_of_possible"] = sum(1 for g in graded if g["correct"] and g["possible"])
         cell["false_positive"] = sum(1 for g in graded if g["correct"] and not g["possible"])
+        # Task-level: the driver could not complete the task at all.
         cell["errors"] = sum(1 for g in graded if g["error"])
+        # Call-level, and kept apart from it: a tool call that failed or was fenced says
+        # something about the model's picks, while a task error says the run broke. Folding the
+        # two let a cell whose every call failed report no failures at all.
+        cell["call_errors"] = sum(g["errored"] for g in graded)
+        cell["refused"] = sum(g["refused"] for g in graded)
+        cell["off_surface"] = sum(g["off_surface"] for g in graded)
         cell["unserved"] = sum(g["unserved"] for g in graded)
         cell["harness_tool"] = sum(g["harness_tool"] for g in graded)
-        cell["off_surface"] = sum(g["off_surface"] for g in graded)
         cell["wasted"] = sum(g["wasted"] for g in graded)
         cell["useful"] = sum(g["useful"] for g in graded)
         cell["result_chars"] = sum(g["result_chars"] or 0 for g in graded)
@@ -358,7 +375,7 @@ def summarise(log_path, tasks_file):
 
 def print_table(cells):
     head = (f"{'backend':<12} {'model':<28} {'ctx':>7} {'surface':<6} {'tools':>5} "
-            f"{'ok/possible':>13} {'tokens':>13} {'calls u/w/h/x':>14} {'wall':>6}")
+            f"{'ok/possible':>13} {'tokens':>13} {'calls u/w/n/r/e':>16} {'wall':>6}")
     print("\n" + head)
     print("-" * len(head))
     for c in sorted(cells, key=lambda c: (c["backend"], c["model"], -(c["num_ctx"] or 0),
@@ -375,7 +392,8 @@ def print_table(cells):
               f"{str(c['num_ctx'] or 'dflt'):>7} {str(c['surface'] or '')[:6]:<6} "
               f"{str(c['tools'] or '-'):>5} "
               f"{score} of {c['n']:<5} {tokens:>13} "
-              f"{c['useful']}/{c['wasted']}/{c['unserved']}/{c['errors']:<8} "
+              f"{c['useful']}/{c['wasted']}/{c['unserved']}/{c['refused']}/"
+              f"{c['call_errors']:<8} "
               f"{c['wall_s']:>5}s{failed}")
 
 
@@ -486,7 +504,7 @@ def main():
                     subset = group.get("subset")
                     wanted = cell_tasks(plan["tasks"], subset)
                     outstanding = [t for t in wanted
-                                   if (model, context, surface, t["id"]) not in done]
+                                   if (backend, model, context, surface, t["id"]) not in done]
                     if not outstanding:
                         print(f"  skipping {backend}:{model} ctx={context} {surface}: "
                               f"all {len(wanted)} tasks already recorded")
