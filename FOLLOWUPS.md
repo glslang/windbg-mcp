@@ -19,8 +19,9 @@ the stateless revision concurrently (#168 / #169, 2026-08-19), item 31 from givi
 listener more than one client (2026-08-20), item 32 from running the debugger tier on the
 ARM64 runner image that replaces `windows-11-arm` in September 2026, and items 33–34 from driving
 the server with a **local model** — the lease grace measured against the wrong slow party, and a
-service's clients fixed at install time (both 2026-08-22), and item 37 from the credential file
-gaining a fourth writer while still having no reader (2026-08-23). Each item notes its repo,
+service's clients fixed at install time (both 2026-08-22), and items 37–38 from the credential
+file gaining a fourth writer while still having no reader, and from exercising what that reader
+says against a real service (both 2026-08-23). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -1586,3 +1587,40 @@ qualified correctly.
 
 Landed in [`src/service.rs`](./src/service.rs) (`list_clients`, `in_force`, `service_clients`,
 `shell_clients`), [`src/listen.rs`](./src/listen.rs) and [`src/main.rs`](./src/main.rs).
+
+## 38. [windbg-mcp] A client command can write a file the installed service cannot read
+
+Item 36 (0.11.0) let a credential file entry be an **object** — `{"bench": {"token": "…", "tools":
+"crash"}}` — beside the bare tokens it always held. A service installed from an earlier build
+refuses that shape, so `--add-listen-client x --tools …` or `--set-listen-client-tools`, run from a
+*newer* copy of this program than the one the SCM starts, writes a file the running service cannot
+read.
+
+**Nothing breaks at the time, which is the problem.** The reload only ever swaps in a set that
+would have started this listener from cold, so a file it cannot parse changes nothing, says so in
+the service log, and the command reports it. The failure is the **next start** — a reboot away from
+the cause, and by then the command that caused it is far out of mind.
+
+Measured on the ARM64 bench (2026-08-23) while exercising item 37's listing against a real service:
+the installed service was running `target\release` from before item 36 while the client commands
+were being run from `target\debug` after it. A fresh install cannot reach this, and neither can an
+ordinary upgrade — Windows will not overwrite a running image, so an operator replacing the exe has
+already stopped the service. A development tree with two builds in it is the case that does.
+
+- **What to build:** a warning, not an error. [`edit_client`](./src/service.rs) already holds the
+  service handle, and `Service::query_config()` returns the `executable_path` the SCM stores, so
+  comparing that against `std::env::current_exe()` names the divergence at the moment it matters —
+  no new channel, and the same shape as the other notes that command prints. It must not refuse:
+  running the command from another copy of the *same* version is legitimate, and this cannot tell
+  versions apart, only paths.
+- **Not the version.** There is no channel that carries one: the only thing reaching the running
+  service is a control code, which returns a status and no data (`FOLLOWUPS.md` item 37 settled
+  that). A path comparison is a proxy, and the warning has to be worded as one.
+
+**Worth doing when** a second service-hosted deployment exists, or the next time this tree grows a
+third build. Until then `docs/remote-listener.md` says the operational half: replace the exe *and*
+restart, and run the client commands from the binary the service runs.
+**Not blocked on anything.**
+
+Picks up at [`src/service.rs`](./src/service.rs) (`edit_client`, where the SCM handle is already
+open) and [`docs/remote-listener.md`](./docs/remote-listener.md).
