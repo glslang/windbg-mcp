@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in seventeen clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in eighteen clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/win-kexp#71, 2026-08-01), items 13–14 from the bounded-command coverage review
@@ -9,16 +9,18 @@ from transactional batches (#82, 2026-08-09/10 — item 17 is what validating th
 session's own transcript turned up, and item 18 what reviewing it did), item 19 from
 `walk_memory` (#103, 2026-08-13), items 20–22 from standing the server up on an ARM64 guest
 (#131, #132, #134, 2026-08-16), item 23 from making the listener usable rather than merely
-working (2026-08-17), items 24 and 35 from measuring what this server costs the model driving it —
-the surface and the results first (2026-08-17), and then what a `registers` answer is actually made
-of (2026-08-22) — items 25–26 from giving the debugger tier an ARM64 *target* (#143, #152,
+working (2026-08-17), items 24, 35 and 36 from measuring what this server costs the model driving
+it — the surface and the results first (2026-08-17), then what a `registers` answer is actually
+made of, and then `--tools` landing server-wide on a listener whose clients are already named
+(both 2026-08-22) — items 25–26 from giving the debugger tier an ARM64 *target* (#143, #152,
 2026-08-18), item 27 from completing the coordinate work (#156–#158, 2026-08-18), items 28–29
 from giving each client its own sessions (#162, #164–#166, 2026-08-19), item 30 from serving
 the stateless revision concurrently (#168 / #169, 2026-08-19), item 31 from giving a service-hosted
 listener more than one client (2026-08-20), item 32 from running the debugger tier on the
 ARM64 runner image that replaces `windows-11-arm` in September 2026, and items 33–34 from driving
 the server with a **local model** — the lease grace measured against the wrong slow party, and a
-service's clients fixed at install time (both 2026-08-22). Each item notes its repo,
+service's clients fixed at install time (both 2026-08-22), and item 37 from the credential file
+gaining a fourth writer while still having no reader (2026-08-23). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -1488,3 +1490,40 @@ this makes false; it says what the client is actually served.
 
 Landed in [`src/toolset.rs`](./src/toolset.rs), [`src/client.rs`](./src/client.rs),
 [`src/listen.rs`](./src/listen.rs) and [`src/service.rs`](./src/service.rs).
+
+## 37. [windbg-mcp] The credential file has four writers and no reader
+
+`--add-listen-client`, `--remove-listen-client`, `--rotate-listen-client` and now
+`--set-listen-client-tools` all edit `%ProgramData%\windbg-mcp\token`, and each prints the whole
+roster afterwards — name, token fingerprint, and the `--tools` spec where one is set. There is no
+way to ask for that roster **without changing something**. `roster` is a private function with two
+call sites, both inside `edit_client`.
+
+That was survivable while every client was identical: the question "who may connect" had one other
+answer, the listener's startup line, and a client either connected or did not. Item 36 made it a
+question with a second half — *and what is each of them served?* — that an operator now has to
+answer before changing a spec, and the only routes to it are to make a change they may not want, or
+to read the service's log file and hope the line has not aged out. The file itself grants read to
+`SYSTEM` and `Administrators` and is deliberately not theirs to open.
+
+- **What to build:** `--list-listen-clients`. It is `roster` and the existing read half of
+  `edit_client` — take the lock, read the file, parse, print — with no write and no reload, so it
+  is the one command in the family that changes nothing and could be allow-listed accordingly.
+- **The trap is what it must not print.** Not the tokens: a fingerprint is the only comparable
+  thing, which is the rule the other four already follow and the reason they are safe to run in a
+  transcript. And it must not *invent* one for a client whose entry it could not parse — a file
+  that will not start the service has to read as that, not as a shorter roster.
+- **It has two sources and only one of them has a command.** A service's clients are in the file;
+  a *foreground* listener's are in the environment it was started with, and `edit_client` refuses
+  outright where no service is installed. So either this reads whichever applies — which means it
+  is not a service command at all — or it says which of the two it is answering for. The same
+  asymmetry made a refusal wrong in [#196](https://github.com/glslang/windbg-mcp/pull/196): the
+  message for a tool off a client's own surface named the service command alone, and a foreground
+  listener's operator could not take that advice.
+
+**Worth doing when** a host has more than one client with more than one surface, which is exactly
+the arrangement item 36 exists for — until then the startup line names everything there is to know.
+**Not blocked on anything.**
+
+Picks up at [`src/service.rs`](./src/service.rs) (`roster`, `requested`, `edit_client`'s read half)
+and [`src/client.rs`](./src/client.rs) (`ClientEntry`, `TokenFile::credentials`).

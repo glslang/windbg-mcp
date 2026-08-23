@@ -3614,7 +3614,8 @@ fn a_token_file_names_its_own_clients_and_shuts_the_environment_out() {
 ///
 /// The half underneath still has to hold, and the last assertion is it: an id **this server never
 /// issued** is not served. An id *another client* holds is refused too — that one needs two tokens,
-/// so it is unit-tested in `src/listen.rs` (and is item 29's gap end to end).
+/// so it is unit-tested in `src/listen.rs` and asserted end to end by
+/// [`two_clients_on_one_listener_keep_their_sessions_to_themselves`], which is what closed item 29.
 #[test]
 fn a_second_session_for_one_credential_is_served_alongside_the_first() {
     let mut server = Listener::start(&[]);

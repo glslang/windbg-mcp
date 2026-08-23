@@ -116,12 +116,30 @@ For a compile/behavior check without touching the locked release exe, use the **
 `cargo clippy --all-targets`. The release
 build differs only in optimization and is exercised by CI on a fresh runner.
 
+**Two of CI's gates are not Rust and both run on a Mac in seconds**, which matters because this repo
+is edited from one and compiled on a VM — so the checks that need no Windows are the cheapest ones
+to forget. `cargo fmt --all --check` is the first step of *Build & test*. The other is
+**`Documentation lint`**, a markdownlint over `README.md`, `CHANGELOG.md`, `docs/**` and
+`skills/**` — note `CLAUDE.md` and `FOLLOWUPS.md` are **not** in its globs, so a clean run says
+nothing about them. Line length is disabled (`.markdownlint-cli2.jsonc`), so what it actually
+catches is **MD051, a link fragment with no matching heading** — which is what *renaming a heading*
+does to every in-file link pointing at it, and it cost a red round on #196. Same version as CI:
+
+```console
+npx markdownlint-cli2@0.23.2 README.md CHANGELOG.md "docs/**/*.md" "skills/**/*.md"
+```
+
+It checks *same-file* fragments only, so a cross-file `../README.md#some-heading` is still yours to
+verify by hand.
+
 **The pass count does not say which tiers ran.** Each gate is inside its test, so the `mcp_smoke`
-harness reports the same **69 passed** with the debugger tier off as with it on — that harness's own
+harness reports the same **75 passed** with the debugger tier off as with it on — that harness's own
 result line, since a plain `cargo test` runs the crate's several hundred unit tests beside it and
-prints a result line per binary. What differs between the two runs is the runtime (~1.3s against
-~52s for `cargo test --test mcp_smoke`) and the `SKIPPED` lines, which only `--nocapture` prints.
-Read one of those two before believing a run covered a debugger claim.
+prints a result line per binary. What differs between the two runs is the runtime (measured on the
+ARM64 bench 2026-08-23: **1.6s against 61s** for `cargo test --test mcp_smoke`) and the `SKIPPED`
+lines, which only `--nocapture` prints. Read one of those two before believing a run covered a
+debugger claim. The count moves whenever a test is added — it was 69 until #195 and #196 — so
+re-derive it rather than trusting this sentence.
 
 **The dev exe can be locked too, and the failure is quiet.** A worker left running — a driver
 script that died mid-session, a debugger tier killed partway — holds `target\debug\windbg-mcp.exe`,
@@ -643,6 +661,18 @@ Two collisions are refused at startup rather than resolved, because the winner w
 ordering detail: one token naming two clients, and two tokens naming one (names are folded, so
 `…_TOKEN` and `…_TOKEN_LOCAL` collide, as do `…_CI` and `…__CI`). **Neither refusal may quote a
 token** — they are printed to stderr and, under the service, to a log file.
+
+**That rule reaches inside an entry too, and getting there took two goes.** A file entry may be an
+object (`{"token": …, "tools": …}`), and both ways its fields can be ambiguous were live in #196:
+`serde_json::Map` collapsed an exact repeat before this module saw it — the very thing `Entries`
+exists to stop one level up — and `entry_of` *folded* the field name, so `{"token": …, "TOKEN": …}`
+was two spellings of one field with the later silently winning the credential. The fixes are worth
+knowing apart, because only one of them is a check: the value type is now recursive (`Written`,
+which takes every JSON type into a variant rather than letting serde raise a type error that would
+quote a credential), and **a field name is matched exactly**. A client's *name* is folded because
+the operator chose it and configures it in two places that have to agree; `token` is a keyword in a
+file format, and being lenient about its case is what created the ambiguity rather than what
+tolerated it.
 
 ## Recording a session while debugging this server
 
