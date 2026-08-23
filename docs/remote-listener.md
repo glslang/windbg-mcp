@@ -482,6 +482,17 @@ because the SCM registers a service once and a bad credential then fails it at e
 `windbg-mcp.exe --uninstall-service` removes it, stopping it first and waiting for it — a delete
 issued against a running service only marks it, and this one has debug targets to let go of.
 
+**Upgrading means replacing the exe *and restarting* — and running the client commands from the
+binary the service actually runs.** The credential file gained a shape in 0.11.0 that an earlier
+service refuses (an entry that is an object, carrying a client's `--tools` beside its token), so a
+`--set-listen-client-tools` issued from a newer copy while an older service is installed writes a
+file that service cannot read. Nothing breaks at the time: a reload only ever swaps in a set that
+would have started this listener from cold, so the running service goes on serving the clients it
+had and says so in its log. It is the **next start** that fails, which is a reboot away from the
+cause. Windows will not overwrite a running image, so an ordinary upgrade cannot drift this way —
+you have already stopped the service to replace the file. A *development* tree with two builds in
+it can, and did (`FOLLOWUPS.md` item 38).
+
 ### Adding, revoking, rotating and re-toolling a client, without stopping anything
 
 Four commands, from an **elevated** shell, and none of them costs you a session:
