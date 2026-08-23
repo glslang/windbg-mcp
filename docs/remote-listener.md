@@ -468,9 +468,12 @@ unprivileged process, which is the one property the foreground listener gets for
 **Every credential in the installing shell is copied, not just the unnamed one.** A service reads
 its file and nothing else, so the environment is only ever consulted *here*, at install — set
 `WINDBG_MCP_LISTEN_TOKEN_CI` beside `WINDBG_MCP_LISTEN_TOKEN` before installing and the file it
-writes names both. Afterwards the [client commands](#adding-revoking-and-rotating-a-client-without-stopping-anything)
-are how that set changes, and they neither read the environment nor need a reinstall. One client called `local` is written as a bare token, as it always was; anything
-else is the JSON object above. The install validates them the way the listener would, so a shell
+writes names both — and each client's `WINDBG_MCP_TOOLS_<NAME>` with it, so a surface that worked
+in the foreground does not vanish the moment the same setup is installed. Afterwards the [client
+commands](#adding-revoking-rotating-and-re-toolling-a-client-without-stopping-anything) are how
+that set changes, and they neither read the environment nor need a reinstall. One client called
+`local` with no surface of its own is written as a bare token, as it always was; anything else is
+the JSON object above. The install validates them the way the listener would, so a shell
 that could not start a foreground listener cannot register a service either — which matters here,
 because the SCM registers a service once and a bad credential then fails it at every start.
 
