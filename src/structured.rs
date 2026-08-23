@@ -15,8 +15,8 @@
 //! **The doc comments below do not reach that schema**, and are not meant to: `schemars` inlines
 //! every type into the `$defs` of every tool that can reach it, so one paragraph here was shipping
 //! thirty-three times to a field no model is given and no validator reads. [`crate::schema`] takes
-//! them out and says why. Write them for whoever edits this file; `README.md`'s
-//! structured-results table is where a caller reads the same facts.
+//! them out and says why. Write them for whoever edits this file;
+//! `docs/structured-results.md` is where a caller reads the same facts.
 //!
 //! # Where the values come from
 //!

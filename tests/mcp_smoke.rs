@@ -71,7 +71,7 @@ const STEP: Duration = Duration::from_secs(60);
 /// Debugger work gets its own budget: opening a dump can pull symbols over the network.
 const TARGET_STEP: Duration = Duration::from_secs(240);
 
-/// Revisions the README promises this server speaks, newest first.
+/// Revisions `docs/architecture.md` promises this server speaks, newest first.
 const SUPPORTED_REVISIONS: &[&str] = &[
     "2026-07-28",
     "2025-11-25",
@@ -763,8 +763,8 @@ fn a_malformed_line_does_not_kill_the_server() {
 
 // ---- tier 1: protocol revisions -----------------------------------------------
 
-/// The README names the revisions this server speaks. When the spec revs, this is the list to
-/// extend — and the test that says whether the SDK bump actually delivered it.
+/// `docs/architecture.md` names the revisions this server speaks. When the spec revs, this is the
+/// list to extend — and the test that says whether the SDK bump actually delivered it.
 #[test]
 fn every_documented_protocol_revision_is_served() {
     for revision in SUPPORTED_REVISIONS {
@@ -1639,7 +1639,7 @@ fn tool_schemas_declare_one_dialect_and_are_self_contained() {
     }
 }
 
-/// An `outputSchema` carries constraints; the prose stays in the source and the README.
+/// An `outputSchema` carries constraints; the prose stays in the source and `docs/`.
 ///
 /// 68% of every `outputSchema` byte this server emitted was a `description` — 217,423 B of
 /// 320,365 B, and 55% of the whole `tools/list` answer — because `schemars` inlines each type into

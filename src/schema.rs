@@ -19,7 +19,8 @@
 //! * A validator does not read it either. `description` is an annotation keyword in JSON Schema —
 //!   it constrains nothing, so an instance that validated before validates now.
 //! * A human has three better copies: the rustdoc these strings are generated from, the
-//!   structured-results table in `README.md`, and the tool's own model-visible `description`.
+//!   structured-results table in `docs/structured-results.md`, and the tool's own model-visible
+//!   `description`.
 //!
 //! So the prose stays where it is written and is charged for where it is read. What the schema
 //! keeps is the part that is *load-bearing* — the `status` discriminator, the `const` vocabularies,
