@@ -7,6 +7,14 @@ listener you already have, a tunnel, and a client that happens to be pointed at 
 Read [`remote-listener.md`](./remote-listener.md) first for the listener itself; this page is only
 what is different when the thing driving it is not a hosted model.
 
+**For the measurements, go to [`local-model-eval.md`](./local-model-eval.md).** The two runs
+recorded here are one model on one surface at one window — sightings, and they say so. The eval is
+the grid they argued for: three local models against three tool surfaces and three context windows
+with a frontier control, scored against an answer key. Where the two disagree, the grid wins; the
+clearest case is the arithmetic under *What this server costs a model* below, which predicts that
+the 51-tool surface cannot fit an 8k window, and the grid answers all six tasks at a served 8,192
+anyway.
+
 ## The three pieces
 
 **1 — the engine plane.** The Windows machine runs the listener, bound to loopback, with its token
@@ -299,9 +307,14 @@ The claims worth testing are about the *client's* budget, not this server's corr
 smoke tiers cannot reach them — which is why the driver script exists and why the run above is
 written down rather than remembered:
 
-- **Does the surface fit**, at the context the runtime is actually serving.
+- **Does the surface fit**, at the context the runtime is actually serving. **Measured, and the
+  answer was no-question-asked yes** — see the eval: at a *served* 8,192 window a 17,300-token
+  surface answered every task. Note *served*: `num_ctx` does not shrink an instance the runtime
+  already holds, and asking `/api/ps` is the only way to know which of the two numbers you have.
 - **Does the model pick the right tool out of 51**, which is orthogonal to window size and is the
-  part a bigger context does not fix.
+  part a bigger context does not fix. **Measured, and it is the axis that separates models** —
+  three ~30B builds scored 15, 14 and 10 of 15 answerable tasks, and the interesting differences
+  are in *how* the failures look rather than in the totals.
 - **Do individual answers blow the window.** `read_memory` returns up to ~4 MiB by design, and is
   reachable in one careless call. `modules` was the other half of that and is **fixed** since
   2026-08-21: it answers with 64 rows unless a `limit` says otherwise, which on the checked-in
