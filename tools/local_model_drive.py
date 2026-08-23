@@ -612,8 +612,39 @@ def write_record(record):
         log.write(json.dumps(record, default=str) + "\n")
 
 
+def release_everything():
+    """End every session this credential holds, and say goodbye to the MCP session.
+
+    For the one case the per-run fence cannot cover: a cell killed at its wall-clock budget, whose
+    driver never reached its own cleanup. Whatever it had open then stays attached until the
+    listener's lease expires, and the next cell on the same surface either routes a
+    `session_id`-less call to a stranger's target or meets the four-session cap.
+
+    **Deliberately everything, not just what a run opened** - there is no run here to have opened
+    anything. That is only safe because of the rule the rest of this bench is built on: the
+    credential belongs to this run alone (`docs/local-model-eval.md`). Pointed at a shared token it
+    would end somebody's sessions, which is the same reason the script refuses to borrow one.
+    """
+    handshake()
+    try:
+        sessions = live_sessions()
+    except Exception as e:  # noqa: BLE001 - cleanup is best effort by construction
+        print(f"  could not list sessions to release: {e}")
+        sessions = []
+    for session in sessions:
+        try:
+            mcp("tools/call", {"name": "end_session", "arguments": {"session_id": session}})
+            print(f"  released {session}")
+        except Exception as e:  # noqa: BLE001
+            print(f"  could not release {session}: {e}")
+    close_transport_session()
+
+
 def main():
     global MODEL
+    if "--release" in sys.argv[1:]:
+        release_everything()
+        return
     MODEL = pick_model()
     print(f"model: {MODEL}")
     print("MCP revision negotiated:", handshake())

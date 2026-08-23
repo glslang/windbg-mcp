@@ -220,7 +220,9 @@ EVAL_TOKENS=bench-tokens.json python3 tools/local_model_eval.py tools/eval_plan.
 Cells are subprocesses and the log is append-only, so a run that dies in the middle leaves every
 finished cell on disk and re-running the same plan resumes rather than repeating. A cell that
 overruns its budget is killed and *that* is recorded — a model which cannot finish inside a
-generous wall clock has told you something.
+generous wall clock has told you something — and the kill is followed by a release pass with that
+cell's own credential, because a killed driver never reaches its own cleanup and whatever it had
+open would otherwise still be attached when the next cell on that surface starts.
 
 **Grading, separately**, over the log:
 
