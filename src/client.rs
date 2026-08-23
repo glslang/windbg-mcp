@@ -901,29 +901,47 @@ impl TokenFile {
     /// message lists the two fields an entry may have rather than the one it found. An operator
     /// can read their own file; a startup log going to a service's log file is not the place to
     /// find out what is in it.
-    fn entry_of(
-        name: &str,
-        value: serde_json::Value,
-        path: &Path,
-    ) -> Result<(String, Option<String>)> {
+    fn entry_of(name: &str, value: Written, path: &Path) -> Result<(String, Option<String>)> {
         match value {
-            serde_json::Value::String(token) => Ok((token, None)),
-            serde_json::Value::Object(fields) => {
+            Written::Text(token) => Ok((token, None)),
+            Written::Fields(Entries(fields)) => {
                 let mut token = None;
                 let mut tools = None;
                 for (field, value) in fields {
-                    let slot = match field.trim().to_ascii_lowercase().as_str() {
+                    // **Matched exactly, not folded**, which is the opposite of the rule a client
+                    // *name* follows two lines up — and deliberately. A name is the operator's,
+                    // configured in two places and compared across them, so it is normalised;
+                    // `token` is a keyword in a file format. Folding it would make
+                    // `{"token": …, "TOKEN": …}` two spellings of one field with no way to say
+                    // which was meant, and the later one would silently be the credential. `TOKEN`
+                    // gets the refusal below, which names what an entry may hold.
+                    let slot = match field.as_str() {
                         "token" => &mut token,
                         "tools" => &mut tools,
                         _ => bail!(
                             "`{name}` in {} is an object with a field this does not know. An \
                              entry names `token`, and optionally `tools` — the surface that \
-                             client is served, in the spelling `--tools` takes. The field is not \
-                             quoted here: a file written back to front makes a credential one.",
+                             client is served, in the spelling `--tools` takes, and both spelled \
+                             in lower case. The field is not quoted here: a file written back to \
+                             front makes a credential one.",
                             path.display()
                         ),
                     };
-                    let Some(text) = value.as_str() else {
+                    // **A repeated field is refused, not resolved** — the rule [`Entries`] holds a
+                    // file's client names to, one level down and about the same secret. Reachable
+                    // only because that type keeps the pairs: a `serde_json::Map` would have
+                    // thrown one of these away before this loop ever ran.
+                    if slot.is_some() {
+                        bail!(
+                            "`{name}` in {} names `{field}` more than once. Give each field one \
+                             entry: which of the two took effect would be whichever the parser \
+                             kept, so the other is something the operator can read in the file \
+                             and nothing acts on. Neither is quoted here — one of them may be a \
+                             credential.",
+                            path.display()
+                        );
+                    }
+                    let Written::Text(text) = value else {
                         bail!(
                             "`{name}`'s `{field}` in {} must be a string.",
                             path.display()
@@ -941,7 +959,7 @@ impl TokenFile {
                 };
                 Ok((token, tools.filter(|spec| !spec.is_empty())))
             }
-            _ => bail!(
+            Written::Other => bail!(
                 "`{name}` in {} must be the bearer token that client presents, or an object \
                  naming it — `{{\"token\": \"<token>\", \"tools\": \"session,crash\"}}`.",
                 path.display()
@@ -1087,10 +1105,28 @@ fn is_presentable(token: &str) -> bool {
 /// token that lost is one the operator can read in the file and no client can present. Collecting
 /// the pairs is what lets [`TokenFile::parse`] refuse that.
 ///
-/// It quotes nothing either: keys arrive as `String` and values as `serde_json::Value`, so no
-/// serde type error can be raised about a value here — the check that a value is a string is
-/// [`TokenFile::parse`]'s, which names the key instead.
-struct Entries(Vec<(String, serde_json::Value)>);
+/// **The same one level down**, since an entry may itself be an object ([`Written`]): a
+/// `serde_json::Value` there would have collapsed `{"token": …, "token": …}` before this module
+/// ever saw it, which is the identical failure about the identical secret. So the value type is
+/// recursive and this rule holds wherever a key does.
+///
+/// It quotes nothing either: keys arrive as `String` and values as [`Written`], which accepts
+/// every JSON type rather than refusing one — so no serde type error can be raised about a value
+/// here, and the check that a value is a string is [`TokenFile::parse`]'s, which names the key
+/// instead.
+struct Entries(Vec<(String, Written)>);
+
+impl Entries {
+    /// Every pair a map access will yield. Shared by both visitors, because "duplicates and all"
+    /// has to mean the same thing at both levels.
+    fn every_pair<'de, M: serde::de::MapAccess<'de>>(mut map: M) -> Result<Self, M::Error> {
+        let mut pairs = Vec::new();
+        while let Some(pair) = map.next_entry::<String, Written>()? {
+            pairs.push(pair);
+        }
+        Ok(Entries(pairs))
+    }
+}
 
 impl<'de> serde::Deserialize<'de> for Entries {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -1102,18 +1138,87 @@ impl<'de> serde::Deserialize<'de> for Entries {
                 f.write_str("a JSON object of client name to token")
             }
 
-            fn visit_map<M: serde::de::MapAccess<'de>>(
-                self,
-                mut map: M,
-            ) -> Result<Entries, M::Error> {
-                let mut pairs = Vec::new();
-                while let Some(pair) = map.next_entry::<String, serde_json::Value>()? {
-                    pairs.push(pair);
-                }
-                Ok(Entries(pairs))
+            fn visit_map<M: serde::de::MapAccess<'de>>(self, map: M) -> Result<Entries, M::Error> {
+                Entries::every_pair(map)
             }
         }
         deserializer.deserialize_map(EveryPair)
+    }
+}
+
+/// One value out of the credential file, in the three shapes this module has anything to say about.
+///
+/// **Nothing here is a refusal**, which is the whole reason it exists rather than a typed struct: a
+/// value in this file is a credential, and serde's type errors quote what they rejected (`invalid
+/// type: integer 5`). So every JSON type is accepted into a variant and [`TokenFile::parse`] does
+/// the refusing, naming the *key*.
+enum Written {
+    /// A string. At the top level that is the bearer token, which is the whole of what an entry
+    /// was before one could say anything else; inside an entry it is a field's value.
+    Text(String),
+    /// An object: an entry naming `token` and, optionally, `tools`.
+    Fields(Entries),
+    /// A number, a list, `null` — anything that is neither of the above.
+    Other,
+}
+
+impl<'de> serde::Deserialize<'de> for Written {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Anything;
+        impl<'de> serde::de::Visitor<'de> for Anything {
+            type Value = Written;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a bearer token, or an object naming one")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, text: &str) -> Result<Written, E> {
+                Ok(Written::Text(text.to_string()))
+            }
+
+            fn visit_map<M: serde::de::MapAccess<'de>>(self, map: M) -> Result<Written, M::Error> {
+                Entries::every_pair(map).map(Written::Fields)
+            }
+
+            // The rest are `Other`, one line each, rather than serde's default — which is the
+            // `invalid_type` error this type exists to avoid raising.
+            fn visit_seq<S: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: S,
+            ) -> Result<Written, S::Error> {
+                while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+                Ok(Written::Other)
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Written, E> {
+                Ok(Written::Other)
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Written, E> {
+                Ok(Written::Other)
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Written, E> {
+                Ok(Written::Other)
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Written, E> {
+                Ok(Written::Other)
+            }
+
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Written, E> {
+                Ok(Written::Other)
+            }
+
+            fn visit_none<E: serde::de::Error>(self) -> Result<Written, E> {
+                Ok(Written::Other)
+            }
+
+            fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<Written, D::Error> {
+                d.deserialize_any(self)
+            }
+        }
+        deserializer.deserialize_any(Anything)
     }
 }
 
@@ -1512,6 +1617,29 @@ mod tests {
                 r#"{"ci": {"token": "t", "surface": "crash"}}"#,
                 "a field this does not know",
             ),
+            // **A field name is matched exactly**, so a case variant is an unknown field rather
+            // than a second spelling of a known one. Folding it is what would make this pair
+            // ambiguous, and the value that won would be the credential (review on #196).
+            (
+                r#"{"ci": {"token": "t", "TOKEN": "u"}}"#,
+                "a field this does not know",
+            ),
+            // And the exact repeat, which only reaches this module at all because `Entries` keeps
+            // every pair one level down as well: a `serde_json::Map` would have thrown one of
+            // these away and left a token in the file that nothing acts on.
+            (
+                r#"{"ci": {"token": "t", "token": "u"}}"#,
+                "names `token` more than once",
+            ),
+            (
+                r#"{"ci": {"token": "t", "tools": "crash", "tools": "inspect"}}"#,
+                "names `tools` more than once",
+            ),
+            // Every JSON type a value can be is carried into a variant rather than refused by
+            // serde, so no refusal here is one serde wrote — which is what keeps values unquoted.
+            (r#"{"ci": [1, 2]}"#, "or an object naming it"),
+            (r#"{"ci": null}"#, "or an object naming it"),
+            (r#"{"ci": {"token": ["t"]}}"#, "must be a string"),
             // And a spec that names nothing this server has, which is the same refusal `--tools`
             // gives — named after the entry it is in rather than after a flag nobody typed.
             (
