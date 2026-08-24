@@ -2560,10 +2560,6 @@ impl WindbgServer {
         self
     }
 
-    /// The router this instance answers from: rmcp's, minus whatever the surface excludes.
-    ///
-    /// Built per call, which is what `Self::tool_router()` already was — the schemas underneath it
-    /// are cached by type, so this is a map of fifty-one `Arc` clones and a `retain`.
     /// The instructions this client is served: the base, plus a fragment per group it has.
     ///
     /// The pair to [`Self::router`] - that decides which tools this client may call, and this
@@ -2581,17 +2577,49 @@ impl WindbgServer {
         text
     }
 
+    /// The router this instance answers from: rmcp's, minus whatever the surface excludes, plus
+    /// the cross-references this surface may read.
+    ///
+    /// Built per call, which is what `Self::tool_router()` already was — the schemas underneath it
+    /// are cached by type, so this is a map of fifty-one `Arc` clones and a `retain`.
+    ///
+    /// It is also the path `call_tool` takes, which pays for [`Self::annotate`] on every call and
+    /// reads none of it. That is deliberate: `list_tools` and `get_tool` are the macro's and take
+    /// whatever this returns, so a second assembly for them alone would be a second place for the
+    /// surface to be applied — and the cost is fifteen `format!`s against a debugger round trip.
     fn router(&self) -> rmcp::handler::server::tool::ToolRouter<Self> {
         let mut router = Self::tool_router();
         self.surface.narrow(&mut router);
+        self.annotate(&mut router);
         router
+    }
+
+    /// Append to each served tool's description the notes this surface has earned.
+    ///
+    /// Runs **after** [`crate::toolset::Toolset::narrow`], so a note whose own tool was dropped
+    /// finds nothing to attach to and is skipped rather than resurrecting it. Reaches `map`
+    /// directly for the same reason `narrow` does — there is no by-name accessor that hands back
+    /// a route to mutate.
+    fn annotate(&self, router: &mut rmcp::handler::server::tool::ToolRouter<Self>) {
+        for ToolNote { tool, names, note } in TOOL_NOTES {
+            if !names.iter().all(|named| self.surface.includes(named)) {
+                continue;
+            }
+            let Some(route) = router.map.get_mut(*tool) else {
+                continue;
+            };
+            route.attr.description = Some(match route.attr.description.take() {
+                Some(text) => format!("{text}\n{note}").into(),
+                None => (*note).into(),
+            });
+        }
     }
 
     /// Open a crash dump (.dmp) or a Time Travel Debugging trace (.run) and wait for it to load.
     /// Opens a new session in its own engine process — sessions already open are left alone —
     /// and returns a `session_id` that routes later calls to it. End it with `end_session`.
     /// The result is a summary of the target — build, kernel/primary image base, module count and
-    /// the bug check a crash dump stopped on — not its module table, which `modules` lists.
+    /// the bug check a crash dump stopped on — not its module table.
     #[rmcp::tool(
         annotations(
             title = "Open crash dump or TTD trace",
@@ -2744,10 +2772,9 @@ impl WindbgServer {
     /// Find every **allocated** kernel pool chunk carrying a tag, with its size, allocator
     /// and backend. Needs a broken-in x64 kernel target.
     /// This walks the pool's own descriptors rather than shelling out to `!poolused`, so the
-    /// result is structured and consistent with `pool_chunk`/`pool_census`.
+    /// result is structured.
     /// Only allocated chunks are indexed by tag — a freed chunk's tag is not reliably
-    /// preserved by the allocator, so this never reports freed memory. To ask whether one
-    /// specific address has been freed, use `pool_chunk`.
+    /// preserved by the allocator, so this never reports freed memory.
     #[rmcp::tool(
         annotations(
             title = "Find pool chunks by tag",
@@ -2813,11 +2840,10 @@ impl WindbgServer {
 
     /// The pool walk's own diagnostics, verbatim, optionally narrowed by substring.
     /// Needs a broken-in x64 kernel target.
-    /// Use this when a chunk you can see with `!pool` does not appear in `pool_find_tag`
-    /// or `pool_chunk`. A real walk emits tens of thousands of diagnostics across a
-    /// hundred-plus categories, so the summaries the other tools print are necessarily
-    /// truncated — and the one line explaining a specific heap is reliably not in the
-    /// truncated head. Filter by a heap address or a phrase to get at it.
+    /// A real walk emits tens of thousands of diagnostics across a hundred-plus categories, so
+    /// the summaries the other tools print are necessarily truncated — and the one line
+    /// explaining a specific heap is reliably not in the truncated head. Filter by a heap
+    /// address or a phrase to get at it.
     /// `walk.gaps` on any pool answer sizes the three things a walk *records* running into —
     /// pages a region query stalled on, chunk headers a decoder refused, and committed bytes it
     /// declined to decode because it could not say where a chunk began in them — in bytes and
@@ -2850,8 +2876,7 @@ impl WindbgServer {
 
     /// Per-tag census of the kernel pool: allocation counts and bytes, heaviest first.
     /// Needs a broken-in x64 kernel target.
-    /// The structured answer to what `!poolused` renders as text, taken from the same walk
-    /// as `pool_find_tag` and `pool_chunk` so the three cannot disagree. Useful for spotting
+    /// The structured answer to what `!poolused` renders as text. Useful for spotting
     /// which tag a driver's allocations are landing under before querying it by name.
     #[rmcp::tool(
         annotations(
@@ -3058,10 +3083,10 @@ impl WindbgServer {
     /// saved and restored around the call.
     /// The stack it reports is the target's default context — the crash, on a crash dump —
     /// whenever the `!analyze` ran to completion, since running it is what resets the scope
-    /// there. Otherwise it is whatever the session has selected, the same stack `backtrace`
-    /// would show: with `analyze: false`, when the analysis could not run (no time left in the
-    /// call, no `ext.dll` on the engine), and when it was cut short, since the reset happens
-    /// partway through the analysis and a truncated one may not have reached it.
+    /// there. Otherwise it is whatever the session has selected: with `analyze: false`, when the
+    /// analysis could not run (no time left in the call, no `ext.dll` on the engine), and when it
+    /// was cut short, since the reset happens partway through the analysis and a truncated one
+    /// may not have reached it.
     /// `analysis.ran` and `analysis.truncated` are what tell those apart.
     #[rmcp::tool(
         annotations(
@@ -3288,7 +3313,7 @@ impl WindbgServer {
     }
 
     /// Stop the operation a session is currently running, **keeping the session and its target**.
-    /// The graceful way out of a call that is taking too long — a broad `s` search, a `go` that
+    /// The graceful way out of a call that is taking too long — a broad `s` search, a run that
     /// has not hit anything, a pool walk over a slow KD link.
     ///
     /// This is a Ctrl+Break, exactly as at a WinDbg prompt. The interrupted operation ends at the
@@ -3309,15 +3334,6 @@ impl WindbgServer {
     /// operation that never polls for the break, and a live-kernel `attach_kernel` whose target has
     /// not connected yet (the documented case — see `session_status`). `end_session` is what ends
     /// those, at the cost of the target.
-    ///
-    /// A `debug_batch` interrupted this way stops at its next step and runs its `always` block, and
-    /// its own result reports `BATCH: INTERRUPTED` with the rollback state — so no step after the
-    /// interrupt is applied, and the session keeps its target (unlike `end_session`, which also
-    /// stops a batch but takes the session with it). Its **rollback cannot be interrupted**: a
-    /// restore cut short would report success while leaving the target changed, so a call aimed at
-    /// a batch that is unwinding, or repeated while one is still stopping, says so and sends
-    /// nothing. If a rollback will not end, `end_session` is the way out, at the cost of the
-    /// target.
     // `idempotent_hint = false`, which is not the intuitive reading: raising the same Ctrl+Break
     // twice on the same operation plainly has no second effect. But the hint is about *repeating
     // the call*, and what a repeat addresses is whichever job is running when it arrives — which
@@ -3354,10 +3370,6 @@ impl WindbgServer {
     /// within a short grace period — a live-kernel attach whose target never dialed in cannot,
     /// since nothing can interrupt that wait — its engine process is terminated outright. The
     /// session ends either way, and no other session is affected.
-    ///
-    /// A `debug_batch` running on the session is told to stop at its next step and run its
-    /// rollback before the target is released, and the batch's own call reports that; the grace
-    /// covers the step in flight and the rollback after it.
     #[rmcp::tool(
         annotations(
             title = "End debug session",
@@ -3549,10 +3561,10 @@ impl WindbgServer {
     /// Walk a structure and read named fields out of every node — **without one unreadable
     /// address ending the walk**.
     /// This is the tool for a list, a handle table or a pointer array where some entries are
-    /// freed: a MASM `.for` loop through `execute` aborts on the first unmapped dereference with
-    /// `0x80040205` and no partial output, which loses exactly the node worth looking at. Here an
-    /// unreadable value is `null` in its own field, an unreadable node is counted, and the walk
-    /// carries on.
+    /// freed: a MASM `.for` loop through a raw command aborts on the first unmapped dereference
+    /// with `0x80040205` and no partial output, which loses exactly the node worth looking at.
+    /// Here an unreadable value is `null` in its own field, an unreadable node is counted, and
+    /// the walk carries on.
     /// Three ways to name the nodes, one of them required: `addresses` (an explicit list — the
     /// bulk read), `start` + `stride` (an array), or `start` + `next_offset` (a pointer chain).
     /// `fields` says what to read from each node; offsets may be negative, so a pool header at
@@ -3608,10 +3620,8 @@ impl WindbgServer {
     /// Show the call stack of the current thread as typed frames. Each carries `module` + `rva` —
     /// the offset into the image, from its load base — beside the `module!Symbol` the debugger
     /// resolves: the symbol is missing on a driver with no PDB, the offset never is, and it stays
-    /// comparable across reboots and joins a disassembler's function list. Same records as
-    /// `crash_triage`'s `frames`. `frames_truncated` says when the stack went on past the cap.
-    /// `execute { "command": "k" }` gives the engine's own listing instead, with `Child-SP` /
-    /// `RetAddr` and the inline-frame rows a stack walk does not return.
+    /// comparable across reboots and joins a disassembler's function list.
+    /// `frames_truncated` says when the stack went on past the cap.
     #[rmcp::tool(
         annotations(
             title = "Show call stack",
@@ -3645,8 +3655,7 @@ impl WindbgServer {
     /// how many matched, so pass `filter` to ask about one driver rather than paging through a
     /// table of two hundred. The modules that have **unloaded** come back in their own
     /// `unloaded` list, narrowed by the same filter — that is what can name an address in a driver
-    /// that is no longer there. For the engine's own listing verbatim,
-    /// `execute { "command": "lm" }`.
+    /// that is no longer there.
     #[rmcp::tool(
         annotations(
             title = "List modules",
@@ -3717,8 +3726,7 @@ impl WindbgServer {
     /// pair per instruction rather than inheriting the first: a range can run off the end of an
     /// image, and an instruction in no module has neither half. Default 16 instructions, maximum
     /// 128; `stopped_early` says the code ended before the count, which is an answer rather than a
-    /// truncation. For the engine's own listing with its `module!Symbol+0x1c:` labels,
-    /// `execute { "command": "u" }` — or `uf` to follow a whole function.
+    /// truncation.
     #[rmcp::tool(
         annotations(
             title = "Disassemble",
@@ -3759,9 +3767,8 @@ impl WindbgServer {
     }
 
     /// Evaluate a data-model (LINQ) expression with `dx` — ideal for TTD queries.
-    /// The data model can also run debugger commands, so this is a second command hatch
-    /// alongside `execute` and is annotated and handle-checked as one; see
-    /// [`dx_executes_commands`].
+    /// The data model can also run debugger commands, so this is a command hatch and is
+    /// annotated and handle-checked as one; see [`dx_executes_commands`].
     #[rmcp::tool(annotations(
         title = "Evaluate data-model expression",
         read_only_hint = false,
@@ -3792,8 +3799,7 @@ impl WindbgServer {
 
     /// TTD: find every call to a function across the whole trace
     /// (`dx @$cursession.TTD.Calls(...)`). Each result carries the time, thread,
-    /// parameters, and return value. Append LINQ in a follow-up `dx`/`execute` to
-    /// filter (e.g. `.Where(c => c.ReturnValue != 0)`).
+    /// parameters, and return value.
     #[rmcp::tool(annotations(
         title = "TTD: find calls to a function",
         read_only_hint = true,
@@ -3948,8 +3954,8 @@ impl WindbgServer {
     /// disturb existing breakpoints) and report a structured verdict: HIT (reached it),
     /// STOPPED ELSEWHERE (another breakpoint/exception fired first), or TIMEOUT (not
     /// reached in time). Confirms *live* that the current input/state drives execution to
-    /// a block — e.g. one from `reachable_from_dispatch`. Needs a real KDNET/VM kernel
-    /// target (a local kernel can't set code breakpoints).
+    /// a block. Needs a real KDNET/VM kernel target (a local kernel can't set code
+    /// breakpoints).
     #[rmcp::tool(
         annotations(
             title = "Run to address",
@@ -4033,7 +4039,7 @@ impl WindbgServer {
         engine_result_for(args.session_id.as_deref(), out)
     }
 
-    /// Step backward one instruction in a TTD trace (`t-`). Reverse of step_into.
+    /// Step backward one instruction in a TTD trace (`t-`), the reverse of `t`.
     // The reverse-navigation tools only work on a TTD trace, which is a recorded replay:
     // moving through it cannot destroy state, unlike stepping a live target.
     #[rmcp::tool(
@@ -4062,7 +4068,7 @@ impl WindbgServer {
         engine_result_for(args.session_id.as_deref(), out)
     }
 
-    /// Step over one call backward in a TTD trace (`p-`). Reverse of step_over.
+    /// Step over one call backward in a TTD trace (`p-`), the reverse of `p`.
     #[rmcp::tool(
         annotations(
             title = "Step over back (TTD)",
@@ -4514,6 +4520,148 @@ const GROUP_INSTRUCTIONS: &[(&[&str], &str)] = &[
     ),
 ];
 
+/// A sentence in one tool's description that names **another** tool, held here rather than in the
+/// doc comment so it ships only to a client served every tool it names.
+///
+/// The other half of the prose a client reads, and the half that is bigger. `FOLLOWUPS.md` item
+/// 40 narrowed the `instructions`; item 41 measured what was left - on `--tools crash` five
+/// descriptions of tools the client *is* served named four it is not, and the eval bench put
+/// **13 of 61** calls on that surface into asking for `modules` or `debug_batch` because of them.
+/// That is three times what the instructions were costing.
+///
+/// **Why a table and not a filter.** A description has no assembly point the way the instructions
+/// do - it is one literal per tool, shipped by the macro - so the appending is what this adds. The
+/// alternative shapes are both worse: deleting the sentences costs the fifty-one-tool client a
+/// pointer that is doing real work ("the opener does not give you the module table, `modules`
+/// does" is how the second call gets made), and saying it without the name keeps the pointer while
+/// losing the one string a model can copy into a call.
+///
+/// **Where a note is the wrong tool, the sentence was reworded instead**, because a note appends
+/// at the end and a cross-reference in the middle of an argument does not survive the move. Three
+/// were: `interrupt`'s "a `go` that has not hit anything" and `walk_memory`'s "a MASM `.for` loop
+/// through `execute`" are illustrations rather than pointers - nobody calls either tool because
+/// they read the name there - and `step_back`/`step_over_back` now name the WinDbg command they
+/// reverse (`t`, `p`) rather than the forward tool, which the line beside them already gives.
+struct ToolNote {
+    /// The tool whose description this extends. A note for a tool the surface dropped has nothing
+    /// to attach to and is skipped.
+    tool: &'static str,
+    /// Every tool the sentence names; it ships only when the surface has all of them.
+    ///
+    /// The same rule as [`GROUP_INSTRUCTIONS`], and adopted for the same reason review gave there:
+    /// a spec may select part of a group (`--tools registers` is valid), so asking whether the
+    /// *group* was served would reintroduce this very defect for a partial surface. The
+    /// consequence is silence rather than a half-sentence - a client with `dx` and not `execute`
+    /// reads `ttd_calls`'s LINQ note not at all.
+    names: &'static [&'static str],
+    /// The sentence, appended to the description on a line of its own - which is how the doc
+    /// comment it came out of reached the wire, since rmcp joins `///` lines with `\n` and drops
+    /// the blank ones. So a paragraph lifted into a note costs the description no bytes: each
+    /// newline it used to carry becomes a space inside one literal.
+    note: &'static str,
+}
+
+/// Every cross-reference this server's descriptions make, in the order they are appended.
+///
+/// `no_description_names_a_tool_the_client_cannot_call` is what keeps this complete: it walks the
+/// tightest surface each tool can be served on (`--tools <that tool>`, which is `session` plus it)
+/// and fails on any name left behind in a doc comment. That single-tool walk is the whole
+/// invariant rather than a sample of it - a fragment only ever ships when its own names are
+/// served, so if the base description is clean on the tightest surface it is clean on every wider
+/// one.
+const TOOL_NOTES: &[ToolNote] = &[
+    ToolNote {
+        tool: "open_dump",
+        names: &["modules"],
+        note: "`modules` lists that table.",
+    },
+    ToolNote {
+        tool: "pool_find_tag",
+        names: &["pool_chunk", "pool_census"],
+        note: "It comes from the same walk as `pool_chunk` and `pool_census`, so the three cannot \
+               disagree.",
+    },
+    ToolNote {
+        tool: "pool_find_tag",
+        names: &["pool_chunk"],
+        note: "To ask whether one specific address has been freed, use `pool_chunk`.",
+    },
+    ToolNote {
+        tool: "pool_diagnostics",
+        names: &["pool_find_tag", "pool_chunk"],
+        note: "Use this when a chunk you can see with `!pool` does not appear in `pool_find_tag` \
+               or `pool_chunk`.",
+    },
+    ToolNote {
+        tool: "pool_census",
+        names: &["pool_find_tag", "pool_chunk"],
+        note: "It comes from the same walk as `pool_find_tag` and `pool_chunk`, so the three \
+               cannot disagree.",
+    },
+    ToolNote {
+        tool: "crash_triage",
+        names: &["backtrace"],
+        note: "The stack it falls back to is the one `backtrace` would show.",
+    },
+    ToolNote {
+        tool: "interrupt",
+        names: &["debug_batch", "end_session"],
+        note: "A `debug_batch` interrupted this way stops at its next step and runs its `always` \
+               block, and its own result reports `BATCH: INTERRUPTED` with the rollback state — so \
+               no step after the interrupt is applied, and the session keeps its target (unlike \
+               `end_session`, which also stops a batch but takes the session with it). Its \
+               **rollback cannot be interrupted**: a restore cut short would report success while \
+               leaving the target changed, so a call aimed at a batch that is unwinding, or \
+               repeated while one is still stopping, says so and sends nothing. If a rollback will \
+               not end, `end_session` is the way out, at the cost of the target.",
+    },
+    ToolNote {
+        tool: "end_session",
+        names: &["debug_batch"],
+        note: "A `debug_batch` running on the session is told to stop at its next step and run its \
+               rollback before the target is released, and the batch's own call reports that; the \
+               grace covers the step in flight and the rollback after it.",
+    },
+    ToolNote {
+        tool: "backtrace",
+        names: &["crash_triage"],
+        note: "Same records as `crash_triage`'s `frames`.",
+    },
+    ToolNote {
+        tool: "backtrace",
+        names: &["execute"],
+        note: "`execute { \"command\": \"k\" }` gives the engine's own listing instead, with \
+               `Child-SP` / `RetAddr` and the inline-frame rows a stack walk does not return.",
+    },
+    ToolNote {
+        tool: "modules",
+        names: &["execute"],
+        note: "For the engine's own listing verbatim, `execute { \"command\": \"lm\" }`.",
+    },
+    ToolNote {
+        tool: "disassemble",
+        names: &["execute"],
+        note: "For the engine's own listing with its `module!Symbol+0x1c:` labels, \
+               `execute { \"command\": \"u\" }` — or `uf` to follow a whole function.",
+    },
+    ToolNote {
+        tool: "dx",
+        names: &["execute"],
+        note: "It is the second such hatch, alongside `execute`.",
+    },
+    ToolNote {
+        tool: "ttd_calls",
+        names: &["dx", "execute"],
+        note: "Append LINQ in a follow-up `dx`/`execute` to filter \
+               (e.g. `.Where(c => c.ReturnValue != 0)`).",
+    },
+    ToolNote {
+        tool: "run_to_address",
+        names: &["reachable_from_dispatch"],
+        note: "The block can be one `reachable_from_dispatch` reported.",
+    },
+];
+
 // **Sized to what the client actually reads.** Measured at 2,048 characters, and the text this
 // replaced was 3,147 - so 1,099 characters were paid for on every connection and never arrived.
 // Kept ASCII so the count cannot differ between characters and bytes, and
@@ -4677,14 +4825,37 @@ mod tests {
         text
     }
 
-    /// Whether a tool's name appears in prose, as a word rather than inside another word — `go`
-    /// and `dx` are tool names and are also two letters long.
+    /// Whether prose **names a tool** — the check both the instructions and the descriptions are
+    /// held to, and the one thing that has to be right for either to mean anything.
+    ///
+    /// Two rules, each because the other alone gets a real sentence here wrong:
+    ///
+    /// - **Written as code**: a backtick span that *is* the name, or that opens a call with it
+    ///   (`execute { "command": "k" }`). Plain containment cannot be the rule, because several of
+    ///   these names are also English — `crash_triage` says frames are "attributed to modules",
+    ///   `end_session` says a stuck session "does not let go" — and a rule that forbids the words
+    ///   *modules* and *go* is not one anyone can write prose under. Nor can "anywhere inside a
+    ///   code span" be it: the TTD tools quote the expression they run,
+    ///   `dx @$cursession.TTD.Calls(...)`, which names the debugger command `dx` is built on and
+    ///   not the `dx` tool.
+    /// - **Or bare, if the name has an underscore**: `step_back`'s description said "Reverse of
+    ///   step_into.", as copyable as any backticked name and invisible to the first rule. An
+    ///   underscored name is an identifier and never an English word, so this half needs no
+    ///   exceptions.
     fn names_tool(text: &str, tool: &str) -> bool {
+        let as_code = text.split('`').skip(1).step_by(2).any(|span| {
+            span == tool
+                || span
+                    .strip_prefix(tool)
+                    .is_some_and(|rest| rest.starts_with(" {"))
+        });
         let boundary = |c: Option<char>| c.is_none_or(|c| !c.is_alphanumeric() && c != '_');
-        text.match_indices(tool).any(|(at, _)| {
-            boundary(text[..at].chars().next_back())
-                && boundary(text[at + tool.len()..].chars().next())
-        })
+        as_code
+            || (tool.contains('_')
+                && text.match_indices(tool).any(|(at, _)| {
+                    boundary(text[..at].chars().next_back())
+                        && boundary(text[at + tool.len()..].chars().next())
+                }))
     }
 
     /// **The property this whole split exists for**: whatever a client is served, its instructions
@@ -4746,6 +4917,114 @@ mod tests {
                 assert!(
                     crate::toolset::Toolset::exists(tool),
                     "`{tool}` is named in the instructions and is not a tool this server has"
+                );
+            }
+        }
+    }
+
+    // ---- the descriptions a client is served ---------------------------
+
+    /// Every description this surface serves, exactly as `tools/list` carries it.
+    ///
+    /// Through the real `router()` rather than a re-assembly beside it — the notes are appended
+    /// there, and a test that appended them itself would pass whatever `router()` did.
+    fn descriptions_for(spec: &str) -> Vec<(String, String)> {
+        let surface = crate::toolset::Toolset::parse(spec)
+            .unwrap_or_else(|e| panic!("`{spec}` should be a valid spec: {e}"));
+        WindbgServer::new(Sessions::new(Duration::from_secs(1)))
+            .with_tools(surface, crate::toolset::Chosen::ForTheRun)
+            .router()
+            .list_all()
+            .into_iter()
+            .map(|tool| {
+                (
+                    tool.name.to_string(),
+                    tool.description.unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// **The same property as the instructions, on the prose that is bigger.** Whatever a client
+    /// is served, no description it reads names a tool it cannot call.
+    ///
+    /// Walked over the *tightest* surface each tool can be served on — `--tools <that tool>`,
+    /// which is `session` plus it — and that is the whole invariant rather than a sample of it. A
+    /// note ships only when every tool it names is served, so all a wider surface can add is a
+    /// sentence already cleared by its own list; what a narrow one exposes is whatever was left
+    /// behind in the doc comment, and the single-tool spec is where the doc comment stands barest.
+    #[test]
+    fn no_description_names_a_tool_the_client_cannot_call() {
+        for spec in crate::toolset::Toolset::every_tool() {
+            let surface = crate::toolset::Toolset::parse(spec).expect("a tool name is a spec");
+            for (name, description) in descriptions_for(spec) {
+                for tool in crate::toolset::Toolset::every_tool() {
+                    if surface.includes(tool) {
+                        continue;
+                    }
+                    assert!(
+                        !names_tool(&description, tool),
+                        "`--tools {spec}` is not served `{tool}` and `{name}`'s description \
+                         names it:\n{description}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// And the other direction, which is the half worth having: the client that *can* act on a
+    /// pointer still reads it. On the whole surface every note is back in the description it came
+    /// out of — deleting the cross-references outright would pass the test above and fail this
+    /// one.
+    #[test]
+    fn the_whole_surface_reads_every_note() {
+        let served: std::collections::HashMap<String, String> =
+            descriptions_for(crate::toolset::ALL).into_iter().collect();
+        for ToolNote { tool, note, .. } in TOOL_NOTES {
+            let description = served
+                .get(*tool)
+                .unwrap_or_else(|| panic!("`{tool}` has a note and is not served at all"));
+            assert!(
+                description.contains(*note),
+                "`{tool}`'s note did not reach the surface that has every tool it names:\n{note}"
+            );
+        }
+    }
+
+    /// The tools beside each note are exactly what it says, so the two cannot drift. This is what
+    /// makes the walk above an invariant rather than a spot check: a name added to a note and left
+    /// out of its list would ship to a client that has neither, and only the surface that happens
+    /// to be walked would notice.
+    #[test]
+    fn every_note_declares_the_tools_it_names() {
+        for ToolNote { tool, names, note } in TOOL_NOTES {
+            for named in crate::toolset::Toolset::every_tool() {
+                let declared = names.contains(&named);
+                let said = names_tool(note, named);
+                assert_eq!(
+                    declared,
+                    said,
+                    "`{named}` is {} in `{tool}`'s note and {} beside it:\n{note}",
+                    if said { "named" } else { "absent" },
+                    if declared { "declared" } else { "not declared" },
+                );
+            }
+        }
+    }
+
+    /// A note attached to, or naming, a tool this server does not have would never be seen — and
+    /// a misspelled owner is the quiet half, since `annotate` skips a note it cannot place.
+    #[test]
+    fn every_note_names_real_tools() {
+        for ToolNote { tool, names, .. } in TOOL_NOTES {
+            assert!(
+                crate::toolset::Toolset::exists(tool),
+                "`{tool}` carries a note and is not a tool this server has"
+            );
+            for named in *names {
+                assert!(
+                    crate::toolset::Toolset::exists(named),
+                    "`{named}` is named in `{tool}`'s note and is not a tool this server has"
                 );
             }
         }
