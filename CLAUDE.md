@@ -545,7 +545,7 @@ as the parser having made things worse.
 
 Two files, not one. A tool is declared in `src/server.rs` as always, and its name also goes in a
 **group** in `src/toolset.rs` — the table behind `--tools`, which advertises a named subset of the
-surface because 74% of the 67,658-byte tool surface is prose a model needs and cannot be trimmed
+surface because 74% of the 67,766-byte tool surface is prose a model needs and cannot be trimmed
 (`docs/token-budget.md` finding 8).
 
 Forgetting the second half fails in the one direction nothing would notice: the *default* surface
@@ -555,9 +555,9 @@ it — it starts a server with all eight group names and asserts that equals the
 There is no such thing as a tool in two groups, and a group named after a tool is refused by a unit
 test, because `Toolset::parse` resolves group names first and would decide it silently.
 
-Three rules worth knowing before touching it. **`session` is in every surface** whatever the spec
+Four rules worth knowing before touching it. **`session` is in every surface** whatever the spec
 says, because every other tool routes by a `session_id` this server alone issues — so `--tools
-crash` is eleven tools and 12,161 B is the floor. **Output schemas carry no prose at all**
+crash` is eleven tools and 11,265 B is the floor. **Output schemas carry no prose at all**
 (`src/schema.rs`): declare one with `schema::constraints_of`, never rmcp's `schema_for_output`, or
 the tool ships every doc comment in its `$defs` closure and the wire ceiling notices. And **a
 surface is per client, not per run** (item 36): `--tools` is the run's *default*, and a listener's
@@ -566,6 +566,21 @@ the credential file) that replaces it. So a change to a group is a change to wha
 differently-budgeted callers see, and the assertion that catches a per-client mistake is two
 credentials on one port — `two_clients_on_one_listener_are_served_two_surfaces`, not a unit test,
 for the reason the next section gives.
+
+And **a description that names another tool is data, not a doc comment** (item 41). A
+cross-reference lives in `TOOL_NOTES` beside the tools it names, and `annotate` appends it in
+`router()` only when the surface has every one of them — so the doc comment itself must name no
+tool but the always-served ones, and `no_description_names_a_tool_the_client_cannot_call` fails the
+build if a new tool's prose points at one its own single-tool spec does not serve. Three
+consequences when you add one. The invariant is checked on `--tools <that tool>` and nowhere else,
+because that is the tightest surface it can be served on and every wider one is covered by
+construction. **Group bytes no longer add up to a surface's**: `crash` is 14,138 B against the
+15,093 its two groups sum to in `docs/token-budget.md`, since narrowing shortens what stays as well
+as dropping what goes. And the check for "names a tool" is deliberately not word containment — this
+prose says frames are "attributed to modules" and that a stuck session "does not let go", while a
+TTD description quotes `dx @$cursession.TTD.Calls(...)`, which is the debugger command and not the
+`dx` tool; the rule is a code span that *is* the name or opens a call with it, plus bare-if-it-has-
+an-underscore, which is what caught `step_back`'s "Reverse of step_into.".
 
 ## Several clients on one listener (`src/client.rs`)
 
@@ -825,14 +840,19 @@ not comparable with the ollama rows — its own system prompt is most of it — 
 so rather than quoting it.
 
 **A model "inventing" tools on a narrowed surface is almost always this server advertising them,
-and there are two channels, of which only one is now narrowed.** The `instructions` string is
-per-client since item 40; a *tool's description* is not, and the descriptions of tools a `crash`
-client **is** served still name `modules` (`open_dump`), `debug_batch` (`interrupt`,
-`end_session`), `backtrace` (`crash_triage`) and `go` (`interrupt`) - five references on an
-eleven-tool surface. Re-running the five `min` cells against item 40's fix (2026-08-24) moved unserved
-calls 17 -> 14, with 13 of the remainder naming exactly those - `FOLLOWUPS.md` item 41. So the
+and there were two channels; both are narrowed now.** The `instructions` string went per-client
+with item 40, and a *tool's description* with item 41 - the descriptions of tools a `crash` client
+**is** served used to name `modules` (`open_dump`), `debug_batch` (`interrupt`, `end_session`),
+`backtrace` (`crash_triage`) and `go` (`interrupt`), five references on an eleven-tool surface.
+Re-running the five `min` cells against item 40's fix (2026-08-24) moved unserved calls 17 -> 14,
+and **13 of the remainder named exactly those five**, which is what item 41 then removed. So the
 metric is still `unserved` rather than "hallucinated", and it still measures the server before it
 measures the model. One call in 61 was a genuine invention, which is the floor.
+
+**The grid has not been re-run against item 41**, so 13-in-61 is what those descriptions were
+costing and not what they now cost. That re-run is worth more than item 40's was: a composition
+going 13 -> 0 by name is several times the noise five cells of one sample each showed, where item
+40's own effect was the size of a single dropped call.
 
 **And the ollama rows never read the `instructions` at all**, which is what nearly made that fix
 look bigger than it is. `tools/local_model_drive.py`'s handshake keeps the negotiated protocol

@@ -1,39 +1,46 @@
 //! Which of this server's fifty-one tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
-//! 67,658 bytes — roughly 17k tokens. Three quarters of that is prose, and the prose is what tells
+//! 67,766 bytes — roughly 17k tokens. Three quarters of that is prose, and the prose is what tells
 //! a model how to drive the tools, so there is no strip here the way there was in
 //! [`crate::schema`]: `FOLLOWUPS.md` item 24 measured it and the only honest lever left is the one
 //! this module is — **not offering every tool to every caller**.
 //!
-//! Nothing changes for a client that says nothing. `--tools` is the whole interface, the default is
-//! every tool, and a narrowed surface costs no description a word.
+//! Nothing changes for a client that says nothing. `--tools` is the whole interface and the default
+//! is every tool. A narrowed surface costs a description one thing only: the sentences pointing at
+//! tools it no longer has (`FOLLOWUPS.md` item 41, `TOOL_NOTES` in [`crate::server`]), which is why
+//! the bytes below do not add up to what a spec actually serves — see the note under the table.
 //!
 //! # What a group is
 //!
 //! A group is *an activity*, not a subsystem: the tools you reach for while doing one kind of
 //! debugging. A caller reading a crash dump has no use for the nine TTD tools or the ten allocator
-//! ones, and pays 22,747 bytes for them at the start of every conversation.
+//! ones, and pays 22,798 bytes for them at the start of every conversation.
 //!
 //! ```text
 //!   group      tools   bytes   what it is for
-//!   session       10   12,161  opening a target, ending it, and watching this server
-//!   allocator     10   15,914  pool and heap walks, and `walk_memory`
-//!   inspect        9   10,192  registers, stacks, memory, modules, symbols, raw commands
-//!   ttd            9    6,833  recording, indexing and querying a Time Travel trace
+//!   session       10   12,157  opening a target, ending it, and watching this server
+//!   allocator     10   15,969  pool and heap walks, and `walk_memory`
+//!   inspect        9   10,215  registers, stacks, memory, modules, symbols, raw commands
+//!   ttd            9    6,829  recording, indexing and querying a Time Travel trace
 //!   ioctl          6    6,494  driver objects, IRP stacks, and dispatch reachability
-//!   exec           5    3,406  breakpoints and execution control
+//!   exec           5    3,420  breakpoints and execution control
 //!   batch          1    9,746  `debug_batch`
-//!   crash          1    2,912  `crash_triage`
+//!   crash          1    2,936  `crash_triage`
 //! ```
+//!
+//! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
+//! 14,138 bytes, not the 15,093 its two rows add to, because the eleven tools it keeps also stop
+//! carrying the five sentences that pointed at `modules`, `debug_batch`, `go` and `backtrace`. A
+//! spec is always cheaper than its rows suggest, never dearer.
 //!
 //! # `session` is always in the surface
 //!
 //! Not a convenience: every other tool here routes by a `session_id`, and this server is the only
 //! thing that can issue one. A surface with `registers` and no opener cannot be used at all, so a
-//! spec that leaves one out is asking for something that does not exist. It is 12,161 bytes, and it
-//! is the floor of any usable surface — `--tools crash` is eleven tools, not one, and the startup
-//! line says so rather than leaving the addition to be discovered.
+//! spec that leaves one out is asking for something that does not exist. On its own it is 11,265
+//! bytes, and that is the floor of any usable surface — `--tools crash` is eleven tools, not one,
+//! and the startup line says so rather than leaving the addition to be discovered.
 //!
 //! # Who a surface belongs to
 //!

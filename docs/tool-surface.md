@@ -6,7 +6,7 @@ how much of that surface a run serves, and three behaviours the table has no roo
 ## Serving fewer tools (`--tools`)
 
 All fifty-one tools are served unless you say otherwise, and their definitions cost the model
-**67,658 bytes — about 17k tokens — before it has asked anything**, once per conversation. Three
+**67,766 bytes — about 17k tokens — before it has asked anything**, once per conversation. Three
 quarters of that is the prose that tells a model how to drive them, so it cannot be trimmed without
 making the tools harder to use correctly (see
 [`token-budget.md`](token-budget.md)). What *can* change is how many of them a given run
@@ -18,10 +18,10 @@ windbg-mcp.exe --tools session,inspect,crash
 
 | `--tools` | Tools | Model context |
 |---|---:|---:|
-| *(absent)* — every tool | 51 | 67,658 B |
-| `session,inspect,exec,crash` | 25 | 28,671 B |
-| `session,inspect,crash` | 20 | 25,265 B |
-| `crash` | 11 | 15,073 B |
+| *(absent)* — every tool | 51 | 67,766 B |
+| `session,inspect,exec,crash` | 25 | 27,807 B |
+| `session,inspect,crash` | 20 | 24,445 B |
+| `crash` | 11 | 14,138 B |
 
 The spec is a comma-separated list of the group names in the [tool table](../README.md#tools), of
 individual tool names, or `all`.
@@ -34,6 +34,11 @@ Two things worth knowing:
   `session_id`, and this server is the only thing that issues one, so a surface with `registers`
   and no opener cannot be used at all. That is why `--tools crash` is eleven tools rather than one.
   The startup log line names the surface it ended up with.
+- **The prose narrows with the list.** A client is told about the tools it has and no others: the
+  `instructions` sent at `initialize` are assembled from the surface, and a tool's description
+  carries its cross-references to *other* tools only when those are served too — so `open_dump` on
+  a `crash` surface no longer says the module table is what `modules` lists. That is most of why a
+  narrowed surface is smaller than its groups' shares add up to.
 - **Calling a tool that exists but is not served** is refused by name — "not on the surface this
   run advertises" — rather than as an unknown tool, because the remedy is a flag on a command line
   the caller cannot see.

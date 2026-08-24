@@ -330,7 +330,7 @@ client-side.**
 
 - **The tool-surface profile is `--tools`** (2026-08-22). Start the listener with
   `--tools session,inspect,crash` and the surface is 20 tools and 25,265 B instead of 51 and
-  67,658 — `--tools crash` is 11 and 15,073 B, which is the difference between "roughly twice an 8k
+  67,766 — `--tools crash` is 11 and 14,138 B, which is the difference between "roughly twice an 8k
   window" and "half of one". Nothing is reworded: the tools that remain are the tools they were.
   The whole table is in [`token-budget.md`](./token-budget.md) under finding 8, and the README has
   the operator's half. **And it is per client as well as per run** (2026-08-22): a listener's

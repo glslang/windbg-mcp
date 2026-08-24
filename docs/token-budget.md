@@ -67,15 +67,21 @@ thing between them is finding 1 — the prose taken out of every `outputSchema`.
 
 | Component | Baseline | Today | Reaches the model |
 |---|---:|---:|---|
-| **Whole `tools/list` payload** | **391,172** | **177,460** | partly |
-| — the 51 tools themselves | 391,054 | 177,342 | partly |
+| **Whole `tools/list` payload** | **391,172** | **177,568** | partly |
+| — the 51 tools themselves | 391,054 | 177,450 | partly |
 | — result-level fields (`resultType`, `ttlMs`, `cacheScope`) | 118 | 118 | no |
 | `outputSchema` (the 33 tools that have one) | 317,236 | 102,942 | no |
 | `inputSchema` (all 51) | 39,667 | 40,207 | yes |
-| `description` (all 51) | 24,752 | 24,794 | yes |
+| `description` (all 51) | 24,752 | 24,902 | yes |
 | `annotations` | 5,449 | 5,449 | no |
-| **Model-visible total** | **67,076** | **67,658** (~17k tokens) | — |
+| **Model-visible total** | **67,076** | **67,766** (~17k tokens) | — |
 | `initialize` instructions | 1,996 | 1,983 | yes, **all of it** |
+
+**Every figure here is the *whole* surface**, which since `FOLLOWUPS.md` item 41 is the only one a
+golden can record: a description carries the sentences pointing at other tools only when the client
+is served all of them, so a narrowed surface reads shorter descriptions as well as fewer of them.
+That is 108 of the 150 bytes `description` has gained — the price the fifty-one-tool client pays so
+that the eleven-tool one stops reading about `modules`.
 
 The two halves moved independently, which is the whole argument for measuring them apart: the wire
 fell by 55% and the model-visible column did not move at all except for what the tools themselves
@@ -289,40 +295,46 @@ None of these is a bug. They are recorded because they were invisible, and
    output schemas because nothing read it. Prose in an *input* schema is the opposite: it is most of
    what tells a model how to drive the tool, and `debug_batch` is the tool where getting that wrong
    leaves a patched byte in a running kernel. Measured across all 51 tools, **74% of the
-   model-visible surface is prose** — 24,794 B of tool descriptions and 25,333 B inside the input
+   model-visible surface is prose** — 24,902 B of tool descriptions and 25,333 B inside the input
    schemas — so a strip here buys context by making the tools harder to drive correctly.
 
    The structural remainder does not pay for the risk either. Dropping `"default": null`, which
    schemars emits 109 times and which tells a model nothing an absent field does not, is 1,744 B —
    2.6%. The other candidates are not free: `$schema` is 2,850 B but is how a client picks a
    validator dialect (and `tool_schemas_declare_one_dialect_and_are_self_contained` pins it), and
-   `minimum`/`format` are constraints. **Roughly 1.7 KB of 67,658 is the whole honest total** for
+   `minimum`/`format` are constraints. **Roughly 1.7 KB of 67,766 is the whole honest total** for
    trimming the schemas.
 
-   So the third lever is the one taken: `--tools` (`src/toolset.rs`) advertises a named subset. No
-   description gets a word shorter; a caller that is reading a crash dump stops paying for nine TTD
-   tools and ten allocator ones. Where the bytes sit, and what each profile costs:
+   So the third lever is the one taken: `--tools` (`src/toolset.rs`) advertises a named subset. A
+   caller that is reading a crash dump stops paying for nine TTD tools and ten allocator ones —
+   and, since item 41, for the sentences the tools it keeps used to spend on pointing at them.
+   Where the bytes sit, and what each profile costs:
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 10 | 15,914 | 23.5% |
-   | `session` | 10 | 12,161 | 18.0% |
-   | `inspect` | 9 | 10,192 | 15.1% |
+   | `allocator` | 10 | 15,969 | 23.6% |
+   | `session` | 10 | 12,157 | 17.9% |
+   | `inspect` | 9 | 10,215 | 15.1% |
    | `batch` | 1 | 9,746 | 14.4% |
-   | `ttd` | 9 | 6,833 | 10.1% |
+   | `ttd` | 9 | 6,829 | 10.1% |
    | `ioctl` | 6 | 6,494 | 9.6% |
-   | `exec` | 5 | 3,406 | 5.0% |
-   | `crash` | 1 | 2,912 | 4.3% |
+   | `exec` | 5 | 3,420 | 5.0% |
+   | `crash` | 1 | 2,936 | 4.3% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 51 | 67,658 |
-   | `session,inspect,exec,crash` | 25 | 28,671 |
-   | `session,inspect,crash` | 20 | 25,265 |
-   | `crash` | 11 | 15,073 |
+   | *(absent)* | 51 | 67,766 |
+   | `session,inspect,exec,crash` | 25 | 27,807 |
+   | `session,inspect,crash` | 20 | 24,445 |
+   | `crash` | 11 | 14,138 |
+
+   **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
+   share of the whole surface; the second is what a spec actually serves, which is less — `crash`
+   is 14,138 rather than the 15,093 its two rows sum to, because five cross-references leave with
+   the tools they name.
 
    `session` is in every surface because every other tool routes by a `session_id` this server is
-   the only issuer of — 12,161 B is the floor, and `crash` is eleven tools rather than one. The
+   the only issuer of — 11,265 B is the floor, and `crash` is eleven tools rather than one. The
    flag is a **run's** choice, and on a listener it is the *default*: a named client may be
    configured with a spec of its own (`WINDBG_MCP_TOOLS_<NAME>`), so the figures above are per
    client rather than per server — which is what lets a local model and a hosted client share one
