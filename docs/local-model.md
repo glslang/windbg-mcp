@@ -113,7 +113,7 @@ setx WINDBG_MCP_TOOLS_DRIVER        "session,inspect,crash"
 ```
 
 The second line is what makes this work on a listener the editor also uses: the driver is served 20
-tools and 25,265 B while every other client on that listener keeps all 51. Leave it out and the
+tools and 24,445 B while every other client on that listener keeps all 51. Leave it out and the
 driver is served whatever the listener was started with, which is the older behaviour and is the
 right one when the listener is the driver's own.
 
@@ -174,9 +174,9 @@ decide whether a local model can hold this surface at all. Bytes of minified JSO
 
 | | bytes | ≈tokens |
 |---|---|---|
-| The tool surface, paid once per conversation | 67,076 (51 tools) | ~17k |
-| — the same surface as `--tools session,inspect,crash` | 25,265 (20 tools) | ~6k |
-| — as `--tools crash` | 15,073 (11 tools) | ~4k |
+| The tool surface, paid once per conversation | 67,766 (51 tools) | ~17k |
+| — the same surface as `--tools session,inspect,crash` | 24,445 (20 tools) | ~6k |
+| — as `--tools crash` | 14,138 (11 tools) | ~3.5k |
 | Its worst single tool (`debug_batch`) | 9,746 | ~2.4k |
 | The largest answer this server gives (`modules`) | 53,875 | ~13k |
 | `read_memory` at its design limit | ~4 MiB of hex | ~1M |
@@ -329,9 +329,10 @@ budget, a text-or-data content switch. **Two of the three now exist, and neither
 client-side.**
 
 - **The tool-surface profile is `--tools`** (2026-08-22). Start the listener with
-  `--tools session,inspect,crash` and the surface is 20 tools and 25,265 B instead of 51 and
+  `--tools session,inspect,crash` and the surface is 20 tools and 24,445 B instead of 51 and
   67,766 — `--tools crash` is 11 and 14,138 B, which is the difference between "roughly twice an 8k
-  window" and "half of one". Nothing is reworded: the tools that remain are the tools they were.
+  window" and "half of one". The tools that remain are the tools they were, less the sentences
+  pointing at ones that went (item 41).
   The whole table is in [`token-budget.md`](./token-budget.md) under finding 8, and the README has
   the operator's half. **And it is per client as well as per run** (2026-08-22): a listener's
   clients are named already, so `WINDBG_MCP_TOOLS_<NAME>` beside the token gives one of them its

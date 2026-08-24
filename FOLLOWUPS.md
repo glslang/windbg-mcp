@@ -810,12 +810,14 @@ landed on their own so that each of the items below can be argued, and measured,
   description loses a word; a caller reading a crash dump stops paying for nine TTD tools and ten
   allocator ones. `session,inspect,crash` is 20 tools / 25,265 B; `crash` is 11 / 15,073 B against
   51 / 67,658 B. A spec names groups, individual tools, or `all`, and anything else is refused at
-  startup rather than quietly serving something different.
+  startup rather than quietly serving something different. (Every figure in this item is as
+  measured on 2026-08-17. Item 41 has since moved all of them — the narrowed surfaces down and the
+  whole one up; `docs/token-budget.md` carries today's.)
 
   Three things it settled that the bullet did not anticipate. **`session` has to be in every
   surface** — every other tool routes by a `session_id` this server is the only issuer of, so a
-  surface with `registers` and no opener is not a smaller surface but a broken one; 12,161 B is the
-  floor and `--tools crash` is eleven tools. **A tool that exists and is not served needs its own
+  surface with `registers` and no opener is not a smaller surface but a broken one; 12,161 B was
+  the floor then and `--tools crash` is eleven tools. **A tool that exists and is not served needs its own
   refusal**: rmcp answers `tool not found`, which is what a typo gets, while this is an operator's
   flag the caller cannot see. And **the group table needs joining to the live surface**, because a
   tool added to `src/server.rs` and not put in a group vanishes from every *narrowed* surface while
