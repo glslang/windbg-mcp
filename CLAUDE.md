@@ -126,12 +126,20 @@ was unchanged, so a change written against the older source compiled on the VM f
 was luck rather than method. The glob is a second way to pick the wrong one even when the right one
 is there — `tokio-1.53.0` and `tokio-1.53.1` are both unpacked here and only the second is pinned.
 
-**`cargo fetch` is the fix, and it works on this Mac**: it resolves and downloads without compiling
-anything, so the Windows-only dependencies are no obstacle, it takes seconds, and it leaves
-`Cargo.lock` untouched (measured). Run it, then open the version the lock names — `grep -A1 'name =
-"<crate>"' Cargo.lock` — rather than whatever a `*` matches, since the older copy stays unpacked
-beside the new one. Anything read this way is still a claim about source, not about behaviour;
-`cargo test` on the VM is where the pinned version is the one that compiles.
+**`cargo fetch --locked` is the fix, and it works on this Mac**: it resolves and downloads without
+compiling anything, so the Windows-only dependencies are no obstacle, and it takes seconds. The
+flag is not decoration. Bare `cargo fetch` re-resolves whenever `Cargo.toml` and `Cargo.lock` are
+out of step — which is exactly the state the middle of a `rev` bump leaves them in — and would then
+unpack a version nobody reviewed while moving the pin under you; `--locked` fails instead.
+
+Then read the version the lock names, and ask **`cargo pkgid <crate>`** for it rather than grepping.
+`cargo pkgid rmcp` answers `rmcp@3.1.4`; where a crate is in the graph twice it refuses and prints
+both candidates rather than letting you take the wrong one silently, which a `grep -A1 'name = …'`
+will (`syn` is here at 2.0.117 and 3.0.3, and is this lock's only such crate). The `*` in the path
+is the other way to take the wrong one, since the older copy stays unpacked beside the new one.
+
+Anything read this way is still a claim about source, not about behaviour; `cargo test` on the VM is
+where the pinned version is the one that compiles.
 
 **Two of CI's gates are not Rust and both run on a Mac in seconds**, which matters because this repo
 is edited from one and compiled on a VM — so the checks that need no Windows are the cheapest ones
@@ -740,8 +748,9 @@ carried the bug. `PowerShell`'s `Invoke-WebRequest` throws
 on a 4xx and leaves the body on the exception, so those refusals read as empty when they in fact
 name what is missing. Before believing any protocol-level claim about `--listen`, read the validator
 that produced it: the rmcp source is on the Mac and needs no Windows build, at
-`~/.cargo/registry/src/*/rmcp-<ver>/src/transport/streamable_http_server/tower.rs` — `cargo fetch`
-first and open the `<ver>` `Cargo.lock` names, for the reason under *Local verification*.
+`~/.cargo/registry/src/*/rmcp-<ver>/src/transport/streamable_http_server/tower.rs` — `cargo fetch
+--locked` first and open the `<ver>` that `cargo pkgid rmcp` names, for the reason under *Local
+verification*.
 
 **A listener test that needs a real engine worker belongs in the debugger tier**, however cheap it
 looks — the protocol tier's contract is "no debugger target". An attach cannot *park* without
