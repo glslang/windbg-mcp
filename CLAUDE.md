@@ -118,6 +118,21 @@ For a compile/behavior check without touching the locked release exe, use the **
 `cargo clippy --all-targets`. The release
 build differs only in optimization and is exercised by CI on a fresh runner.
 
+**A dependency's source can be read on the Mac, and the copy there may not be the pinned one.**
+`~/.cargo/registry/src/*/<crate>-<ver>/` holds only what this machine has *fetched*, and nothing
+fetches after a bump the Mac never built — on 2026-08-24 it had `rmcp-3.1.2` while `Cargo.lock`
+pinned `3.1.4` (dependabot #207 bumped it two days earlier). That reads as nothing at all: the API
+was unchanged, so a change written against the older source compiled on the VM first try, and it
+was luck rather than method. The glob is a second way to pick the wrong one even when the right one
+is there — `tokio-1.53.0` and `tokio-1.53.1` are both unpacked here and only the second is pinned.
+
+**`cargo fetch` is the fix, and it works on this Mac**: it resolves and downloads without compiling
+anything, so the Windows-only dependencies are no obstacle, it takes seconds, and it leaves
+`Cargo.lock` untouched (measured). Run it, then open the version the lock names — `grep -A1 'name =
+"<crate>"' Cargo.lock` — rather than whatever a `*` matches, since the older copy stays unpacked
+beside the new one. Anything read this way is still a claim about source, not about behaviour;
+`cargo test` on the VM is where the pinned version is the one that compiles.
+
 **Two of CI's gates are not Rust and both run on a Mac in seconds**, which matters because this repo
 is edited from one and compiled on a VM — so the checks that need no Windows are the cheapest ones
 to forget. `cargo fmt --all --check` is the first step of *Build & test*. The other is
@@ -725,7 +740,8 @@ carried the bug. `PowerShell`'s `Invoke-WebRequest` throws
 on a 4xx and leaves the body on the exception, so those refusals read as empty when they in fact
 name what is missing. Before believing any protocol-level claim about `--listen`, read the validator
 that produced it: the rmcp source is on the Mac and needs no Windows build, at
-`~/.cargo/registry/src/*/rmcp-<ver>/src/transport/streamable_http_server/tower.rs`.
+`~/.cargo/registry/src/*/rmcp-<ver>/src/transport/streamable_http_server/tower.rs` — `cargo fetch`
+first and open the `<ver>` `Cargo.lock` names, for the reason under *Local verification*.
 
 **A listener test that needs a real engine worker belongs in the debugger tier**, however cheap it
 looks — the protocol tier's contract is "no debugger target". An attach cannot *park* without
