@@ -524,6 +524,35 @@ def close_transport_session():
         SESSION = None
 
 
+def end_sessions(sessions):
+    """End each of these sessions; hand back the ones that are still there afterwards.
+
+    **Read the structured answer, not the absence of an exception.** `end_session` reports an
+    ordinary failure as a perfectly good MCP result carrying an error - a stale handle, a worker
+    that will not let go - so a caller that treats "no exception" as "released" announces a clean
+    namespace it has not got. Two of this bench's three cleanup paths did exactly that, in their
+    own words, which is why there is now one of these instead of three.
+
+    `stale_session` and `worker_lost` count as released: both mean the target is gone, which is
+    what the caller wanted.
+    """
+    kept = []
+    for session in sessions:
+        try:
+            out = mcp("tools/call", {"name": "end_session", "arguments": {"session_id": session}})
+            error = ((out.get("result") or {}).get("structuredContent") or {}).get("error") or {}
+            category = error.get("category")
+            if not error or category in ("stale_session", "worker_lost"):
+                print(f"  released {session}")
+                continue
+            kept.append(session)
+            print(f"  could not release {session}: {error.get('message', category)}")
+        except Exception as e:  # noqa: BLE001 - a cleanup failure is reported, never raised
+            kept.append(session)
+            print(f"  could not release {session}: {e}")
+    return kept
+
+
 def release_what_this_run_opened():
     """End the run's own sessions, so the next one starts from nothing.
 
@@ -535,24 +564,7 @@ def release_what_this_run_opened():
     # **What could not be released stays on the list.** Clearing it regardless would
     # leave the final pass with nothing to retry, and the next task routing its
     # session-less calls to a target this one was supposed to have let go.
-    kept = []
-    for session in list(OPENED):
-        try:
-            out = mcp("tools/call", {"name": "end_session", "arguments": {"session_id": session}})
-            error = ((out.get("result") or {}).get("structuredContent") or {}).get("error") or {}
-            category = error.get("category")
-            if not error:
-                print(f"  released {session}")
-            elif category in ("stale_session", "worker_lost"):
-                # Gone either way, so there is nothing left to retry.
-                print(f"  {session} was already gone ({category})")
-            else:
-                kept.append(session)
-                print(f"  could not release {session}: {error.get('message', category)}")
-        except Exception as e:
-            kept.append(session)
-            print(f"  could not release {session}: {e}")
-    OPENED[:] = kept
+    OPENED[:] = end_sessions(list(OPENED))
 
 
 def load_tasks(path):
@@ -631,13 +643,14 @@ def release_everything():
     except Exception as e:  # noqa: BLE001 - cleanup is best effort by construction
         print(f"  could not list sessions to release: {e}")
         sessions = []
-    for session in sessions:
-        try:
-            mcp("tools/call", {"name": "end_session", "arguments": {"session_id": session}})
-            print(f"  released {session}")
-        except Exception as e:  # noqa: BLE001
-            print(f"  could not release {session}: {e}")
+    kept = end_sessions(sessions)
     close_transport_session()
+    if kept:
+        # **The one caller reads this.** A preflight that cannot clear the namespace has not made
+        # the cell that follows it clean, and saying so is the whole difference between a
+        # best-effort cleanup and one that quietly did nothing.
+        raise SystemExit(f"{len(kept)} session(s) still attached after the release: "
+                         + ", ".join(kept))
 
 
 def main():

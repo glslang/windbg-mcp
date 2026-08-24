@@ -214,14 +214,14 @@ def release_new_sessions(before):
     except Exception as e:  # noqa: BLE001 - cleanup must not end the run
         print(f"  could not list sessions to clean up: {e}")
         return
-    for session in now:
-        if session in before:
-            continue
-        try:
-            drive.mcp("tools/call", {"name": "end_session", "arguments": {"session_id": session}})
-            print(f"  released {session}")
-        except Exception as e:  # noqa: BLE001
-            print(f"  could not release {session}: {e}")
+    # Through the shared helper, which reads the structured answer: this printed `released` for a
+    # session `end_session` had refused, and the next task then snapshotted that leftover as
+    # pre-existing - so it was skipped for ever and its target could take the following task's
+    # session-less calls.
+    kept = drive.end_sessions([s for s in now if s not in before])
+    if kept:
+        print(f"  {len(kept)} session(s) this task opened are still attached; the next task's "
+              f"isolation is not guaranteed")
 
 
 def main():
