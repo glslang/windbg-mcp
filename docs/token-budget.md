@@ -282,8 +282,8 @@ None of these is a bug. They are recorded because they were invisible, and
    than their prose — **answered** (2026-08-22) by serving fewer tools rather than smaller ones.
    `debug_batch` alone is 9,746 B — 14% of everything a model is given before it asks anything — of
    which 7,980 B is the `StepAction`/`Check` vocabulary its schema pulls out of `src/batch.rs`.
-   Then `walk_memory` 4,076, `crash_triage` 2,912, `reachable_from_dispatch` 2,628, `server_log`
-   2,599: **21,961 B, 33%**, against a median tool of 900 B.
+   Then `walk_memory` 4,080, `crash_triage` 2,936, `reachable_from_dispatch` 2,628, `server_log`
+   2,599: **21,989 B, 33%**, against a median tool of 900 B.
 
    This is where the weight is, and it is a different kind of problem from findings 1–4. Those were
    duplication and waste — the same string paid for repeatedly, or a tail nobody reads. This is one
@@ -359,7 +359,7 @@ put in a group would vanish from every narrowed surface without a word — the d
 still carry it, so nothing else would notice. And
 `a_narrowed_tool_surface_serves_only_what_it_was_asked_for` starts a server with `--tools crash` and
 checks the three things that makes true: eleven tools, a refusal by name for a tool that exists and
-is not served, and a figure under half the whole surface (it prints 15,073 B).
+is not served, and a figure under half the whole surface (it prints 14,138 B).
 
 Beside them, `output_schemas_carry_constraints_not_prose` is the
 assertion that finding 1 stays fixed. It reads `tools/list` off the wire, so it catches the way that

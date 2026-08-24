@@ -38,8 +38,9 @@ difference and it is a flat ~3% on all three, so either figure supports the arit
 quote whichever matches what you are measuring, and do not mix them in one sum.
 
 Both columns are **the server this grid ran against**. `FOLLOWUPS.md` item 41 has since taken the
-narrowed surfaces down again — `crash` is 14,138 B rather than 15,073 — so read the table above as
-the run's conditions and [`token-budget.md`](./token-budget.md) for today's.
+narrowed surfaces down again — `crash` is 14,138 B rather than 15,073, `session,inspect,crash`
+24,445 rather than 25,265 — so read the table above as the run's conditions and
+[`token-budget.md`](./token-budget.md) for today's.
 
 **The last column is a finding, not a caption.** Identical bytes cost gemma 14,540 tokens, qwen
 17,270 and nemotron 18,501 — a 27% spread on the same surface, entirely tokenizer. So "does the
