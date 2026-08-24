@@ -648,6 +648,16 @@ passed, because each supplies the identity itself.
   `local` is told to widen the run's `--tools`, `bench` is told about its own entry — since naming
   the wrong one sends an operator to a spec that is not in force. Both routes again, for the reason
   above.
+
+  **And the prose narrows with the list**, which is two more claims here because a golden records
+  one surface and can see neither. The `instructions` at `initialize` are assembled per client
+  (item 40), so `bench` reads 927 characters naming only tools it has where `local` reads its own;
+  and no description `bench` is served names `modules`, `debug_batch`, `go` or `backtrace` (item
+  41), while `local`'s `open_dump` still says which tool lists the module table. Both directions
+  are asserted, because deleting the cross-references outright would satisfy the first and lose the
+  pointer the fifty-one-tool client is the one that can use. Backticked names, not bare ones: this
+  surface says frames are "attributed to modules" and that a stuck session "does not let go", and
+  neither sentence points anywhere.
 - *A **token file** naming two clients serves both* — the item-31 test in the list further up,
   counted here as well because it is the third of the three: under a service that file is the whole
   of what is read, so it is the only place a second client can come from at all.

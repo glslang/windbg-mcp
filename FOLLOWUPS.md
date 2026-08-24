@@ -1784,20 +1784,20 @@ did not move by one. The 12%-of-prompt figure describes a client like Claude Cod
 at ~27,500 tokens on this surface — where the saving is ~265 tokens, about 1%. The wasted *turns*
 were always the larger cost of the two this item names.
 
-## 41. [windbg-mcp] A served tool's description advertises tools the client is not served
+## 41. [windbg-mcp] A served tool's description advertises tools the client is not served — **done** (2026-08-24)
 
 Item 40 narrowed the `instructions` string per client. It is not the only prose a client reads: the
 **description of every tool it is served** is the other, and those cross-reference tools that a
 narrowed surface has removed. On `--tools crash` (eleven tools) there are five such references,
 naming four tools:
 
-| The client is served | and its description names | at |
-| --- | --- | --- |
-| `open_dump` | `modules` — "not its module table, which `modules` lists" | `src/server.rs:2594` |
-| `interrupt` | `go` — "a broad `s` search, a `go` that …" | `:3291` |
-| `interrupt` | `debug_batch` | `:3313` |
-| `end_session` | `debug_batch` | `:3358` |
-| `crash_triage` | `backtrace` | `:3061` |
+| The client is served | and its description names |
+| --- | --- |
+| `open_dump` | `modules` — "not its module table, which `modules` lists" |
+| `interrupt` | `go` — "a broad `s` search, a `go` that …" |
+| `interrupt` | `debug_batch` |
+| `end_session` | `debug_batch` |
+| `crash_triage` | `backtrace` |
 
 `--tools session,inspect,crash` keeps the three on `interrupt` and `end_session`; the whole surface
 has none, by definition. Count them with a scan that skips plain `//` comments as well as code:
@@ -1811,27 +1811,67 @@ this entry first said four.
 `list_modules`, is a name this server does not have anywhere, which is the floor this class has:
 narrowing every string cannot take it to zero.
 
-**Why it is deferred rather than done with item 40, and why it may not be worth doing at all.**
-Item 40 had an assembly point — one string, built per client, so the fragment for a group nobody is
-served simply is not appended. A description has none: it is one literal per tool, shipped in
-`tools/list`, and the sentence naming `modules` is *correct and useful* for the client that has
-`modules`. So the shapes available are all worse than the one item 40 used:
+**What it took.** The shape item 40 used, moved one level down: a cross-reference comes out of the
+doc comment into `TOOL_NOTES` (`src/server.rs`), which pairs the sentence with **every tool it
+names**, and `WindbgServer::annotate` appends it in `router()` — after `Toolset::narrow`, so a note
+whose own tool was dropped has nothing to attach to. `router()` is what `list_tools`, `get_tool`
+and `call_tool` all take, so the surface is applied in one place and the call path pays sixteen
+`format!`s it never reads, which is the trade the alternative (a second assembly for listing alone)
+would have bought back at the price of a second place to get the surface wrong.
 
-- **Delete the cross-reference.** Cheapest, and it costs every `full`-surface client a pointer that
-  is doing real work — "the opener does not give you the module table, `modules` does" is how a
-  model learns the second call.
-- **Assemble descriptions per client, as item 40 does for instructions.** Correct, and it makes
-  every tool's description a function of the surface: the tool-budget golden then has to record a
-  surface rather than a tool (`docs/token-budget.md`'s per-tool rows lose their meaning), and
-  `schema::constraints_of` is no longer the only thing standing between a doc comment and the wire.
-- **Say it without the name** — "the module table has a tool of its own". Keeps the pointer, loses
-  the exact string a model can copy into a call, and reads worse for the 51-tool client who is the
-  one that can act on it.
+Four things the entry did not anticipate, and the first is why the fix is bigger than the table
+above.
 
-**Where it picks up.** The test is the cheap half and already has a sibling to copy:
-`instructions_never_name_a_tool_the_client_cannot_call` walks eight specs; the same walk over each
-served tool's `description` fails today on the five references above. Land that as an `#[ignore]`d
-or `should_panic` assertion only if a remedy is chosen — a red test with no intended fix is worse
-than this entry. The number worth having first is the cost: **13 wasted turns in 61 calls** is what
-the descriptions bought, against the four calls the instructions were costing, so the question is
-whether a turn is worth more than a cross-reference to the clients that keep it.
+**Five was one surface's count, not the class.** Across *every* valid spec there are **22**
+(tool, tool-it-names) pairs in **16** descriptions, carried by fifteen sentences. Six of the pairs
+are inside one group — `backtrace`, `modules`,
+`disassemble` and `dx` all point at `execute`; the three pool tools point at each other — and no
+group spec reaches those, only `--tools <single tool>`, which is exactly the case review made this
+server honour on item 40. Two more (`step_back` → `step_into`, `step_over_back` → `step_over`) were
+invisible to any backtick-based count, because they were written bare.
+
+**"Names a tool" needed a predicate, and both obvious ones are wrong.** Plain word-boundary
+containment flags English: this prose says frames are "attributed to modules" and that a stuck
+session "does not let go", and a rule that forbids the words *modules* and *go* is not one anyone
+can write under. "Inside a backtick span" flags the debugger command a TTD tool quotes —
+`dx @$cursession.TTD.Calls(...)` names the command `dx` is built on, not the `dx` tool. What works,
+and is now shared with the instructions test: a code span that **is** the name or opens a call with
+it (`execute { "command": "k" }`), plus bare-if-underscored, since an underscored name is an
+identifier and never an English word. That last half is the only thing that catches `step_back`'s
+"Reverse of step_into." — as copyable as any backticked name.
+
+**The budget golden did not have to record a surface**, which this entry expected and used as an
+argument against the fix. A note is a `const` appended to the description the macro already built,
+so the *whole* surface reads what it read before plus 108 bytes and the golden still records
+one row per tool — `docs/token-budget.md`'s per-tool rows keep their meaning. Lifting a trailing
+paragraph out of a doc comment costs nothing at all: rmcp joins `///` lines with `\n`, so each
+newline becomes a space inside one literal and five of the sixteen tools moved by zero bytes. What
+*did* lose its meaning is **additivity of the group table**: `--tools crash` is 14,138 B against the
+15,093 its two groups sum to, because narrowing now shortens the descriptions of the tools that
+stay as well as dropping the ones it drops.
+
+**Three references were reworded rather than moved**, because a note appends at the end and a
+cross-reference in the middle of an argument does not survive the move. `interrupt`'s "a `go` that
+has not hit anything" and `walk_memory`'s "a MASM `.for` loop through `execute`" are illustrations
+rather than pointers — nobody calls either tool because they read the name there — and
+`step_back`/`step_over_back` now name the WinDbg command they reverse (`t`, `p`), which the line
+beside them already gives.
+
+**What it cost and what it bought, statically.** The whole surface grows 67,658 → **67,766 B**
+(+0.16%), which is the price of keeping the pointer for the client that can follow it. Every
+narrowed surface shrinks: `crash` 15,073 → **14,138** (−6.2%), `session,inspect,crash` 25,265 →
+**24,445**, and the floor — `session` alone — 12,161 → **11,265**. Off-surface names go to zero on
+every spec, asserted two ways: `no_description_names_a_tool_the_client_cannot_call` walks the
+tightest surface each tool can be served on (`--tools <that tool>`), which is the whole invariant
+rather than a sample of it — a note ships only when its own names are served, so all a wider
+surface can add is a sentence already cleared — and `two_clients_on_one_listener_are_served_two_surfaces`
+puts `crash` and `session,inspect` on one port, since a golden records one surface and cannot see
+the direction that matters. `the_whole_surface_reads_every_note` is the other direction, and is
+what stops the fix degenerating into the "delete the cross-reference" option: deleting them would
+pass every other assertion here.
+
+**Not measured: the bench.** The eval grid has not been re-run against this, so the 13-calls-in-61
+figure above is what the descriptions *were* costing rather than what they now cost. It is the
+re-run worth having — unlike item 40's, where the previous entry's own caveat holds (five cells of
+one sample each, and nemotron's single dropped call was the same size as the effect claimed), a
+composition going 13 → 0 by name would be several times the noise that run showed.

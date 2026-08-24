@@ -37,6 +37,10 @@ the same 51 tools, 25,265 for the same 20, 15,073 for the same 11. The function-
 difference and it is a flat ~3% on all three, so either figure supports the arithmetic below —
 quote whichever matches what you are measuring, and do not mix them in one sum.
 
+Both columns are **the server this grid ran against**. `FOLLOWUPS.md` item 41 has since taken the
+narrowed surfaces down again — `crash` is 14,138 B rather than 15,073 — so read the table above as
+the run's conditions and [`token-budget.md`](./token-budget.md) for today's.
+
 **The last column is a finding, not a caption.** Identical bytes cost gemma 14,540 tokens, qwen
 17,270 and nemotron 18,501 — a 27% spread on the same surface, entirely tokenizer. So "does the
 surface fit" has no single answer even at one surface size and one window, and the ≈4 B/token rule
@@ -364,7 +368,7 @@ The fix was confirmed live before the time was spent, by reading `initialize` pe
 **Seventeen unserved calls became fourteen**, and the total is the least interesting part of
 that — read it by name, because the composition is what moved:
 
-| Name asked for | First run | Re-run | Still advertised to a `min` client by |
+| Name asked for | First run | Re-run | Advertised to a `min` client, then, by |
 | --- | --- | --- | --- |
 | `debug_batch` | 9 | 10 | the descriptions of `interrupt` and `end_session` |
 | `modules` | 4 | 3 | the description of `open_dump` |
@@ -383,6 +387,14 @@ that remain name a tool the `min` client is still told about by the description 
 served** — one advertising channel narrowed, the other untouched, which is `FOLLOWUPS.md` item 41.
 The fourteenth is a name this server does not have anywhere, so the invention rate this page
 originally reported as zero is not: it is one call in the re-run's 61.
+
+**Item 41 has since landed** (2026-08-24) and removed all three of those descriptions'
+cross-references: on `--tools crash` no served tool's description names a tool the client cannot
+call, asserted rather than inspected. **The grid has not been re-run against it**, so the thirteen
+above is what those sentences were costing and not a measurement of what they cost now. That re-run
+is worth more than this one was: thirteen calls going to zero by name is several times the noise
+five cells of one sample each can show, where the effect claimed here was the size of nemotron's
+one dropped call.
 
 **The prompt-token columns did not move by a token**, which is the same finding wearing its other
 face — an ollama row's prompt never carried the string, so there was nothing in it to save:

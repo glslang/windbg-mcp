@@ -23,6 +23,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `session,inspect,crash`, and **927 for `crash`** — a 53% cut, worth ~265 tokens to a client that
   reads it, on the surface that exists to be small.
 
+- **And no served tool's description advertises one the client cannot call** (`FOLLOWUPS.md` item
+  41, which closes it). Item 40 fixed one of the two channels above; this is the other and the
+  larger. A tool's description cross-references other tools — `open_dump` said the module table is
+  "what `modules` lists", `interrupt` and `end_session` both named `debug_batch`, `crash_triage`
+  named `backtrace` — and on `--tools crash` those five sentences named four tools the client is
+  refused. The eval measured them: with item 40 live, 13 of 61 calls on that surface still asked
+  for `modules` or `debug_batch`, three times what the instructions were costing. Every such
+  sentence now lives in `TOOL_NOTES` beside the tools it names and is appended only to a client
+  served all of them, so `--tools crash` reads **14,138 B instead of 15,073** (−6.2%) and names
+  nothing it cannot call, `session` alone 11,265 instead of 12,161, and the fifty-one-tool client
+  keeps every pointer for 108 bytes more (67,766). Twenty-two (tool, tool-it-names) pairs across
+  sixteen descriptions, not the five one surface showed: a spec may name a single tool, and six of
+  the pairs — four pointing at `execute`, the three pool tools at each other — are inside one group
+  where no group spec reaches them.
+
 - **`--list-listen-clients` sorts both halves of what it prints.** A credential file's entries
   already came back sorted; the environment's arrived in the order the variables were scanned,
   which on Windows is by *variable* name — so `WINDBG_MCP_LISTEN_TOKEN` came before
