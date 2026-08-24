@@ -32,19 +32,12 @@ This file is the map. Each topic is one document, and each document is the whole
 | [Session transcripts](docs/transcripts.md) | `WINDBG_MCP_TRANSCRIPT`: a JSONL record of every call, what is redacted, and rendering one as an asciicast |
 | [Limitations & notes](docs/limitations.md) | The honest edges — TTD is user-mode only, static reachability is best-effort, pool and heap walks need a stopped x64 target |
 | [Walkthroughs](docs/walkthroughs.md) | Worked sessions end to end: crash-dump triage, TTD, a Flare-On solve, driver IOCTL surfaces |
+| [The local-model eval](docs/local-model-eval.md) | A grid of model × tool surface × context window against a verified answer key: what a laptop-sized model can drive, and the two defects it found in this server |
 
 Operator and reference material: [remote listener](docs/remote-listener.md),
-[local model](docs/local-model.md), [the local-model eval](docs/local-model-eval.md),
-[disassembler coordinates](docs/coordinates.md), [smoke test](docs/smoke-test.md),
-[token budget](docs/token-budget.md), [releasing](docs/releasing.md).
-
-The eval also has a visual write-up of the original grid —
-[**The Tool Surface Grid**](https://claude.ai/code/artifact/aad9956d-47f3-450a-a436-1d2b29939a39),
-33 cells of three ~30B local models against three tool surfaces and three context windows, with
-Claude Code as the control. It is a snapshot of **2026-08-23** and is not kept in step with the
-server: its "narrowing the surface leaks tools" finding is one this server no longer has, closed by
-`FOLLOWUPS.md` items 40 and 41. [`docs/local-model-eval.md`](docs/local-model-eval.md) is the
-current account, including the two re-runs that measured those fixes.
+[local model](docs/local-model.md), [disassembler coordinates](docs/coordinates.md),
+[smoke test](docs/smoke-test.md), [token budget](docs/token-budget.md),
+[releasing](docs/releasing.md).
 
 ## Quick start
 
@@ -140,6 +133,32 @@ Worked sessions with the real outputs and the gotchas — the long form is in
   KDNET kernel and deciding user-mode reachability.
 - [Disassembler coordinates](docs/coordinates.md) — joining a `crash_triage` frame to a function in
   an image fetched on another machine.
+
+## Driving it with a local model
+
+The tool surface is paid on every turn, so *"can a model that runs on a laptop actually drive
+this?"* is a question about **this server** as much as about the model. The repo ships the
+benchmark rather than the assertion: `tools/local_model_eval.py` runs a grid of model × tool
+surface × context window, `tools/bench_listener.ps1` serves all three surfaces from one listener as
+three separately-budgeted clients, and the answer key is read off the checked-in crash dumps with
+this server's own tools before any model sees them. Claude is in the grid as the control, not as a
+competitor. [`docs/local-model-eval.md`](docs/local-model-eval.md) is the write-up.
+
+- **The context window was not the binding constraint.** A 17,300-token surface answered all six
+  tasks at a *served* 8,192-token window — multi-turn ones carrying 10,000 characters of tool
+  output included. The arithmetic that predicted otherwise is in `docs/local-model.md`, and it was
+  wrong.
+- **Cutting 51 tools to 11 costs two of six answers.** Most facts here are reachable by more than
+  one route, so a narrow surface keeps the ones that matter.
+- **It measures this server before it measures the model.** Every off-surface tool call the first
+  grid recorded was a name this server had advertised and would then refuse — in the `instructions`
+  sent at connect time, and in the descriptions of the tools it *does* serve. Both are narrowed per
+  client now, and re-running the narrow cells took those calls from 17 to 6, with every
+  server-taught name at zero.
+
+[**The Tool Surface Grid**](https://claude.ai/code/artifact/aad9956d-47f3-450a-a436-1d2b29939a39)
+is the visual write-up — 33 cells, five models, the three axes, and what the two fixes it produced
+did and did not buy.
 
 ## Limitations
 
