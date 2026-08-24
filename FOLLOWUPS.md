@@ -1747,8 +1747,17 @@ tests assert on (`the_instructions_fit_what_the_client_reads`, the discovery ass
 **Where it picks up — and it did.** `#[rmcp::tool_handler]` supplies `get_info` only when the impl
 does not, the same rule `call_tool` already relies on, so the override is a hand-written `get_info`
 assembling the text from the surface `WindbgServer` already holds (`crate::client::current()` is
-not right here: the surface is captured in the listener's factory). Done that way, with
-`Toolset::serves_group` as the question each fragment asks.
+not right here: the surface is captured in the listener's factory).
+
+**The invariant, which is not the one this entry first proposed:** a fragment ships only when
+**every tool it names** is served. The first attempt asked whether the fragment's *group* was
+served at all, and review caught what that costs — `--tools registers` is a valid spec, and the
+inspect sentence names `modules`, `dx` and `execute` in one breath, so a client served one tool of
+that family read about three it could not call. That is this item's own defect, reintroduced for
+partial surfaces. Each fragment therefore carries the tools it names, `instructions()` requires all
+of them, and `instructions_never_name_a_tool_the_client_cannot_call` asserts it over eight specs —
+it fails on the group-level predicate, which was checked by putting that predicate back rather than
+by reasoning about it.
 
 Two things the entry did not anticipate. **`name` had to move with `instructions`**, because both
 are literals on the same attribute and the macro reads them only while generating the `get_info`
