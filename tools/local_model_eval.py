@@ -67,6 +67,19 @@ def tokens_for(plan):
     return tokens
 
 
+def usable(record):
+    """Whether a record measures what it says it does.
+
+    A cell asking for an 8,192-token window and served 32,768 - the runtime reusing an instance it
+    already holds - is not a measurement of either window. **One predicate, read by both the resume
+    set and the grader**, because they disagreed once and the disagreement was unreachable from
+    either side: grading excluded such a record while resume counted it as done, so the cell could
+    never be re-run without hand-editing an append-only log.
+    """
+    served, asked = record.get("served_context"), record.get("num_ctx")
+    return not (asked and served and asked != served)
+
+
 def already_done(log_path):
     """Which (model, context, surface, task) the log already holds, so a re-run resumes.
 
@@ -84,6 +97,10 @@ def already_done(log_path):
             if not line:
                 continue
             r = json.loads(line)
+            if not usable(r):
+                # Not done: it has to be run again, once whatever served the wrong window is
+                # evicted. The grader will not score it either.
+                continue
             # **Keyed by backend too.** Two groups can name the same model - an ollama tag
             # aliased `sonnet` beside the Claude Code row - and without this the first one's
             # records make the second's whole cell look finished.
@@ -98,6 +115,24 @@ def cell_tasks(tasks_file, subset):
         wanted = load(tasks_file)["subsets"][subset]
         tasks = [t for t in tasks if t["id"] in wanted]
     return tasks
+
+
+def release_sessions(env, why):
+    """End whatever this credential holds, best effort and never fatal.
+
+    Best effort *by construction*, not by neglect: the only caller runs it as a cell's own
+    precondition, so a release that fails costs that cell the four-session cap at worst and the
+    grid nothing. Nothing downstream reads a result from it, which is why it has none.
+    """
+    try:
+        done = subprocess.run([sys.executable, "-u", DRIVER, "--release"], env=env,
+                              capture_output=True, text=True, timeout=120)
+        released = [line for line in done.stdout.splitlines() if "released" in line]
+        if released or done.returncode:
+            print(f"    {why}: {len(released)} session(s) released"
+                  + (f", exit {done.returncode}" if done.returncode else ""))
+    except (subprocess.TimeoutExpired, OSError) as e:
+        print(f"    {why}: could not release ({e})")
 
 
 def run_cell(plan, tokens, backend, model, context, surface, subset, budget_s, log_path,
@@ -133,6 +168,15 @@ def run_cell(plan, tokens, backend, model, context, surface, subset, budget_s, l
     else:
         raise SystemExit(f"unknown backend `{backend}`")
 
+    # **This cell clears its own namespace before it starts, rather than the last one clearing up
+    # after itself.** Cleanup used to be a postcondition: kill the cell, then release what it had
+    # open, then check that the release worked, then handle its timeout, then handle its exit
+    # code - four rounds of review, each finding a way for the guarantee to be lost, because a
+    # postcondition can only be as good as the reporting of it. As a precondition it cannot be
+    # lost: however the previous cell died - killed, crashed, cleanly finished - this one begins
+    # with nothing of its own attached, and nothing has to notice.
+    release_sessions(env, f"before {label}")
+
     os.makedirs(logs_dir, exist_ok=True)
     # **Claude Code reads the project it is started in, and walks *up* to find it.** `CLAUDE.md`,
     # settings, the checkout itself - and this repository's `CLAUDE.md` now quotes two of the six
@@ -167,27 +211,6 @@ def run_cell(plan, tokens, backend, model, context, surface, subset, budget_s, l
                 proc.kill()
             proc.wait()
             print(f"    budget of {budget_s}s exceeded; cell killed")
-            # **The kill skipped the driver's own cleanup**, so whatever it had open is still
-            # attached under this cell's credential - and the next cell on the same surface would
-            # inherit it, or meet the four-session cap because of it. Released here, with that
-            # credential, before anything else runs.
-            try:
-                release = subprocess.run([sys.executable, "-u", DRIVER, "--release"], env=env,
-                                         capture_output=True, text=True, timeout=120)
-                for line in release.stdout.splitlines():
-                    print(f"    {line.strip()}")
-                if release.returncode:
-                    # It exits nonzero on a credential it cannot use or a listener it cannot
-                    # reach, and returns normally either way - so nothing above notices, and the
-                    # next cell on this surface inherits whatever the killed one still holds.
-                    print(f"    cleanup exited {release.returncode}; this cell's sessions may "
-                          f"still be attached: {release.stderr.strip()[:200]}")
-            except (subprocess.TimeoutExpired, OSError) as e:
-                # The listener is unreachable, or the release is slower than the whole budget it
-                # was given. Both leave sessions behind, and neither is a reason to abandon the
-                # cells after this one - which is the entire point of killing a cell rather than
-                # waiting for it.
-                print(f"    could not release this cell's sessions: {e}")
             note = {"run": plan["run"], "backend": backend, "model": model,
                     "num_ctx": context or None, "surface": {"client": surface},
                     "task": None, "error": f"cell exceeded its {budget_s}s budget"}
@@ -366,12 +389,9 @@ def summarise(log_path, tasks_file):
             # A cell-level note - a killed cell - rather than a task record.
             cell["cell_error"] = record.get("error")
             continue
-        served, asked = record.get("served_context"), record.get("num_ctx")
-        if asked and served and asked != served:
-            # **Not scored, at all.** The record is a measurement of a window nobody asked for -
-            # the runtime served an instance it already had - so counting it would publish a
-            # result under the wrong context. `--matrix` marks these `?`; here they are simply
-            # not part of the arithmetic, and the row says how many were dropped.
+        if not usable(record):
+            # **Not scored, at all** - counting it would publish a result under a window nobody
+            # asked for. `--matrix` marks these `?`; the row says how many were dropped.
             cell["mis_served"] = cell.get("mis_served", 0) + 1
             continue
         task = key.get(record["task"])
@@ -455,8 +475,7 @@ def matrix(log_path, tasks_file):
         if task is None:
             continue
         graded = grade_record(record, task, surface.get("names"))
-        served, asked = record.get("served_context"), record.get("num_ctx")
-        if asked and served and asked != served:
+        if not usable(record):
             mark = "?"
         elif graded["error"]:
             mark = "!"
@@ -557,16 +576,16 @@ def main():
                     # 32768; `served_context` caught it, and eviction is what prevents it.
                     # It also keeps three 30B-class models from having to co-reside.
                     evicted = subprocess.run(["ollama", "stop", model], capture_output=True,
-                                         text=True)
-                if evicted.returncode:
+                                             text=True)
+                    if evicted.returncode:
                     # Not cosmetic: the next context's cells would be served this instance's
                     # window instead of the one they asked for, which is the 32k-served-as-8k
                     # contamination this eviction exists to prevent. The grader refuses to score a
                     # record whose served window is not the requested one, so the run cannot
                     # publish it either way - this is what says *why* those cells went missing.
-                    print(f"    could not evict {model} ({evicted.returncode}): "
-                          f"{evicted.stderr.strip()[:200]}\n"
-                          f"    cells at the next context may be served this one's window")
+                        print(f"    could not evict {model} ({evicted.returncode}): "
+                              f"{evicted.stderr.strip()[:200]}\n"
+                              f"    cells at the next context may be served this one's window")
 
     cells = summarise(log_path, plan["tasks"])
     print_table(cells)

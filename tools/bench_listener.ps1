@@ -37,29 +37,22 @@ foreach ($client in 'full', 'lean', 'min') {
     }
 }
 
-# **Three inherited variables, each of which breaks this run in a different way.** The account
-# this lands in is whatever the ssh session gives you, and it may already be configured to run
-# this server.
+# **Nothing this server reads survives into the listener except what is set below.**
 #
-#   WINDBG_MCP_LISTEN_TOKEN       would name a client called `local`, which is what the *editor*
-#                                 connects as on the other listener - two clients of one name on
-#                                 two ports is a confusion this run does not need.
-#   WINDBG_MCP_TOOLS_LOCAL        has to go with it, and not for tidiness: a spec naming a client
-#                                 nothing configures a token for is refused at startup, so
-#                                 removing the token and leaving this one stops the listener from
-#                                 starting at all on an otherwise correctly configured host.
-#   WINDBG_MCP_LISTEN_TOKEN_FILE  is worse than it looks: a configured file is the *whole*
-#                                 configuration and shuts the environment out entirely, named
-#                                 tokens included, so the three below would create no clients at
-#                                 all and every cell would fail authentication.
-#   WINDBG_MCP_TOOLS_FULL         would pair an inherited spec with the token minted below, so the
-#                                 51-tool control would be silently narrowed while this script
-#                                 still announces `full (all)` - a benchmark measuring a surface
-#                                 nobody chose.
-Remove-Item Env:WINDBG_MCP_LISTEN_TOKEN -ErrorAction SilentlyContinue
-Remove-Item Env:WINDBG_MCP_TOOLS_LOCAL -ErrorAction SilentlyContinue
-Remove-Item Env:WINDBG_MCP_LISTEN_TOKEN_FILE -ErrorAction SilentlyContinue
-Remove-Item Env:WINDBG_MCP_TOOLS_FULL -ErrorAction SilentlyContinue
+# This started as one `Remove-Item` for `WINDBG_MCP_LISTEN_TOKEN`, and review found three more the
+# hard way: `WINDBG_MCP_TOOLS_LOCAL` (an orphaned spec is refused at startup, so the listener does
+# not start at all), `WINDBG_MCP_LISTEN_TOKEN_FILE` (a configured file is the *whole* configuration
+# and shuts the environment out, so the tokens below would create no clients), and
+# `WINDBG_MCP_TOOLS_FULL` (an inherited spec silently narrows the 51-tool control while this script
+# still announces `full (all)`).
+#
+# Each of those was a real defect and each fix was correct, which is exactly why the list kept
+# growing: subtracting the variables somebody thought of cannot cover the one added to the server
+# next. So the run does not inherit *any* of them. The two this script reads for itself are read
+# above, before the wipe.
+Get-ChildItem Env: |
+    Where-Object { $_.Name -like 'WINDBG_MCP_*' } |
+    ForEach-Object { Remove-Item -LiteralPath ("Env:" + $_.Name) }
 
 $env:WINDBG_MCP_LISTEN_TOKEN_FULL = $cfg.full
 $env:WINDBG_MCP_LISTEN_TOKEN_LEAN = $cfg.lean
