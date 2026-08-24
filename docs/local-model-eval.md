@@ -373,11 +373,12 @@ that — read it by name, because the composition is what moved:
 | `list_modules` | 0 | 1 | nothing; no surface here serves it |
 | **total** | **17** | **14** | |
 
-Both names the fix could reach went to zero, and neither came back — and they went to zero in the
-**two control rows**, which are exactly the two that read the string. That is as close to a
-controlled test of the injection claim above as this bench offers: the rows whose prompts carried
-the instructions stopped asking for what the instructions no longer name, and the rows whose
-prompts never carried them did not change at all. **Thirteen of the fourteen
+Both names the fix could reach went to zero, and neither came back. Both were also asked for by
+**only the two rows that read the string** — before the fix as much as after — which is consistent
+with the injection claim above rather than a test of it. It cannot be a test: these are five cells
+of one sample each, nemotron's single dropped call (a `modules`, which `open_dump` still advertises)
+is the same size as the effect being claimed, and the variance that took qwen's score from 4/4 to
+2/4 two sections down is larger than either. **Thirteen of the fourteen
 that remain name a tool the `min` client is still told about by the description of a tool it *is*
 served** — one advertising channel narrowed, the other untouched, which is `FOLLOWUPS.md` item 41.
 The fourteenth is a name this server does not have anywhere, so the invention rate this page
