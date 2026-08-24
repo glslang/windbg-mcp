@@ -242,6 +242,14 @@ def main():
         "backend": "claude-code",
         "model": MODEL,
         "num_ctx": None,
+        "draw": drive.DRAW,
+        # **Null rather than absent, and it cannot be anything else here.** `claude -p` exposes no
+        # sampling seed to ask for, where the ollama rows at least ask - which is a property of
+        # this row worth recording rather than a field to leave out. It is a smaller difference
+        # than it looks: the ollama rows' seed does not reproduce a draw on this bench either
+        # (`local_model_drive.SEED`), so no row here replays one. The grader reads `draw` from
+        # both backends and `seed` from neither.
+        "seed": None,
         "surface": {"client": os.environ.get("EVAL_SURFACE", ""), "tools": len(tools),
                     "bytes": surface_bytes, "names": sorted(t["name"] for t in tools)},
     }

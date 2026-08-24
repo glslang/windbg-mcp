@@ -28,7 +28,16 @@ a plan is checked in and a credential is not.
 **Cells are subprocesses, and the log is append-only.** A matrix run is hours long; a cell that
 wedges must not take the grid with it (`budget_s` kills it and records why), and a run that
 dies in the middle must leave every finished cell on disk. Re-running the same plan **resumes**:
-a (model, context, surface, task) already in the log is not run again.
+a (model, context, surface, draw, task) already in the log is not run again.
+
+**One draw per cell answers a different question from n draws of one cell.** The grid moves one
+knob at a time across many cells, which is enough for failure *modes* and for whether a surface
+fits at all, and is not enough for any statement of the form "X caused Y" - three write-ups
+reached past that anyway (`FOLLOWUPS.md` item 42). A cell group may therefore ask for `draws: n`,
+which runs the same cell n times asking for seed 1..n, and every reader here keys on the draw so
+repeats **accumulate** rather than replace: the grader counts over draws, and `--matrix` prints a
+distribution (`3Y2n`) where a single draw prints a mark. A record from before draws existed is
+draw 1, so an old log grades exactly as it did.
 """
 import json
 import os
@@ -96,12 +105,28 @@ def usable(record, task=None):
     return served is not None and served == asked
 
 
+def draw_of(record):
+    """Which draw a record is, for a log that spans the change that introduced them.
+
+    **A record with no `draw` is draw 1**, and that is the whole compatibility story: the runs
+    this bench has already recorded grade to exactly what they graded to before, and a re-run of
+    the plan that produced them still counts them as done. Everything that keys on a draw goes through here, so
+    the default lives in one place rather than in four `or 1`s that could drift apart.
+    """
+    return record.get("draw") or 1
+
+
 def already_done(log_path, tasks):
-    """Which (backend, model, context, surface, task) the log already holds, so a re-run resumes.
+    """Which (backend, model, context, surface, draw, task) the log already holds, so a re-run
+    resumes.
 
     Keyed on the things a cell is identified by rather than on a cell id, because the plan can grow
     a surface or a context between runs and everything already measured is still valid - what must
     not happen is a task being run twice into one log and graded twice.
+
+    **The draw is part of that identity**, which is what lets a plan ask for more draws of a cell
+    it has already run: draws 1-3 stay done and 4-5 run. Without it a second draw would be
+    indistinguishable from a repeat of the first and would never be run at all.
 
     `tasks` is the suite as it is *now*, because [`usable`] compares each record against the
     question currently being asked.
@@ -126,7 +151,7 @@ def already_done(log_path, tasks):
             # aliased `sonnet` beside the Claude Code row - and without this the first one's
             # records make the second's whole cell look finished.
             seen.add((r.get("backend"), r.get("model"), r.get("num_ctx"),
-                      (r.get("surface") or {}).get("client"), r.get("task")))
+                      (r.get("surface") or {}).get("client"), draw_of(r), r.get("task")))
     if stale:
         print(f"  {stale} record(s) in the log no longer measure what this plan asks "
               f"(a changed prompt, or a window that was not the one requested); they will run again")
@@ -159,10 +184,11 @@ def release_sessions(env, why):
         print(f"    {why}: could not release ({e})")
 
 
-def run_cell(plan, tokens, backend, model, context, surface, subset, budget_s, log_path,
+def run_cell(plan, tokens, backend, model, context, surface, draw, subset, budget_s, log_path,
              logs_dir):
-    """One (backend, model, context, surface) cell: a driver process over the task list."""
-    label = f"{backend}:{model} ctx={context or 'default'} surface={surface}"
+    """One (backend, model, context, surface, draw) cell: a driver process over the task list."""
+    label = (f"{backend}:{model} ctx={context or 'default'} surface={surface}"
+             + (f" draw={draw}" if draw != 1 else ""))
     env = dict(os.environ)
     env.update({
         "WINDBG_MCP_URL": plan["url"],
@@ -170,6 +196,7 @@ def run_cell(plan, tokens, backend, model, context, surface, subset, budget_s, l
         "WINDBG_MCP_EVAL_OUT": log_path,
         "EVAL_RUN": plan["run"],
         "EVAL_SURFACE": surface,
+        "EVAL_DRAW": str(draw),
         "MAX_STEPS": str(plan.get("max_steps", 6)),
     })
     if subset:
@@ -177,6 +204,13 @@ def run_cell(plan, tokens, backend, model, context, surface, subset, budget_s, l
     if backend == "ollama":
         env["LOCAL_MODEL"] = model
         env["NUM_CTX"] = str(context or 0)
+        # **The seed is the draw index**, which on a runtime that honours it pairs arm A's draw 3
+        # with arm B's draw 3 - the experiment draws are for (item 42) is an A/B, and a paired
+        # comparison beats averaging two independent samplings. It does not reproduce one here:
+        # measured 2026-08-24, four identical requests under one seed gave four different answers
+        # (`local_model_drive.SEED`). So it is recorded as what was asked for, the draws vary
+        # anyway, and the distribution over them is the measurement.
+        env["EVAL_SEED"] = str(draw)
         # Residency for the length of a cell, then eviction: the next cell is either the same
         # model at another surface (keep it) or a different window, which reloads regardless.
         env["OLLAMA_KEEP_ALIVE"] = plan.get("keep_alive", "10m")
@@ -213,7 +247,11 @@ def run_cell(plan, tokens, backend, model, context, surface, subset, budget_s, l
     cwd = tempfile.mkdtemp(prefix="windbg-eval-cwd-") if backend == "claude-code" else None
     stdout_path = os.path.join(
         logs_dir, f"{backend}_{model.replace(':', '-').replace('/', '-')}_"
-                  f"{context or 'default'}_{surface}.log")
+                  f"{context or 'default'}_{surface}"
+                  # Only a repeated cell carries the suffix, so a plan that never asked for draws
+                  # keeps writing the log names it has always written and a resume overwrites the
+                  # same file rather than leaving a `_d1` beside it.
+                  + (f"_d{draw}" if draw != 1 else "") + ".log")
     print(f"\n=== cell {label} -> {os.path.basename(stdout_path)}")
     started = time.time()
     killed = False
@@ -238,7 +276,7 @@ def run_cell(plan, tokens, backend, model, context, surface, subset, budget_s, l
             print(f"    budget of {budget_s}s exceeded; cell killed")
             killed = True
             note = {"run": plan["run"], "backend": backend, "model": model,
-                    "num_ctx": context or None, "surface": {"client": surface},
+                    "num_ctx": context or None, "surface": {"client": surface}, "draw": draw,
                     "task": None, "error": f"cell exceeded its {budget_s}s budget"}
             with open(log_path, "a", encoding="utf-8") as log:
                 log.write(json.dumps(note) + "\n")
@@ -256,7 +294,7 @@ def run_cell(plan, tokens, backend, model, context, surface, subset, budget_s, l
         # without this the summary shows a short row or no row at all - an incomplete grid
         # reading as a finished one. The note gives the cell a row that says what happened.
         note = {"run": plan["run"], "backend": backend, "model": model,
-                "num_ctx": context or None, "surface": {"client": surface},
+                "num_ctx": context or None, "surface": {"client": surface}, "draw": draw,
                 "task": None,
                 "error": f"driver exited {proc.returncode}; see {os.path.basename(stdout_path)}"}
         with open(log_path, "a", encoding="utf-8") as log:
@@ -368,12 +406,18 @@ def grade_record(record, task, surface_names):
 
 
 def records(log_path):
-    """Every record in the log, **deduplicated to the last run of each (cell, task)**.
+    """Every record in the log, **deduplicated to the last run of each (cell, draw, task)**.
 
     Resume works at cell granularity - an outstanding task re-runs its cell's whole list - so a
     log legitimately holds a task twice, and the second run is the one that counts. Counting
     both would inflate a cell's task count and average two runs that were never meant to be
     averaged.
+
+    **The draw is inside the key, and that is the difference between a repeat and a re-run**
+    (`FOLLOWUPS.md` item 42). Two records of one task under one draw index are the same
+    measurement made twice, and the later wins; two records under different indices are two draws
+    of it, and both count. Deduplicating on (cell, task) alone - which is what this did - meant n
+    draws of a cell collapsed to the last one, so repeating a cell measured nothing.
     """
     latest, seen_at = {}, {}
     for at, line in enumerate(open(log_path, encoding="utf-8")):
@@ -383,13 +427,17 @@ def records(log_path):
         record = json.loads(line)
         surface = (record.get("surface") or {})
         cell = (record.get("backend"), record.get("model"), record.get("num_ctx"),
-                surface.get("client"))
+                surface.get("client"), draw_of(record))
         latest[(*cell, record.get("task"))] = record
         seen_at[(*cell, record.get("task"))] = at
     # **A cell-level note is superseded by anything that cell recorded afterwards.** The note says
     # "this cell failed"; it is keyed on `task: null`, so a successful resume - which writes only
     # task records - leaves it in place and the summary goes on printing a finished cell as
     # FAILED for ever.
+    #
+    # *That cell* now means that draw of it, because `cell` above carries the draw index: a draw
+    # that was killed is not un-killed by the next draw of the same cell running to completion
+    # afterwards, which is what a draw-blind comparison here would have decided.
     for key in list(latest):
         if key[-1] is not None:
             continue
@@ -401,7 +449,14 @@ def records(log_path):
 
 
 def summarise(log_path, tasks_file):
-    """Grade the whole log and reduce it to one row per cell."""
+    """Grade the whole log and reduce it to one row per cell, **over every draw of it**.
+
+    A cell's row is keyed without the draw index on purpose: n draws of one cell are n samples of
+    the same measurement, and a row per draw would be the grid again with a new axis rather than
+    the repetition item 42 asks for. So `possible` and `correct` count draw-tasks, `draws` says
+    how many draws they came from, and a rate is the two read together. `--matrix` is where the
+    per-task distribution lives.
+    """
     key = {t["id"]: t for t in load(tasks_file)["tasks"]}
     cells = {}
     for record in records(log_path):
@@ -412,11 +467,16 @@ def summarise(log_path, tasks_file):
             "backend": cell_id[0], "model": cell_id[1], "num_ctx": cell_id[2],
             "surface": cell_id[3], "tools": surface.get("tools"),
             "surface_bytes": surface.get("bytes"), "served_context": record.get("served_context"),
-            "tasks": [], "cell_error": None, "uncounted": 0,
+            "tasks": [], "cell_error": None, "failed_draws": 0, "uncounted": 0,
+            "draw_ids": set(),
         })
+        cell["draw_ids"].add(draw_of(record))
         if record.get("task") is None:
-            # A cell-level note - a killed cell - rather than a task record.
+            # A cell-level note - a killed draw of this cell - rather than a task record. Counted
+            # as well as kept: on a repeated cell "FAILED" alone cannot say whether one draw of
+            # five died or all five did, and those are different findings.
             cell["cell_error"] = record.get("error")
+            cell["failed_draws"] += 1
             continue
         if not usable(record, key.get(record.get("task"))):
             # **Not scored, at all** - counting it would publish a result under a window nobody
@@ -433,6 +493,7 @@ def summarise(log_path, tasks_file):
         cell["tasks"].append(grade_record(record, task, surface.get("names")))
     for cell in cells.values():
         graded = cell["tasks"]
+        cell["draws"] = len(cell.pop("draw_ids"))
         cell["n"] = len(graded)
         cell["possible"] = sum(1 for g in graded if g["possible"])
         cell["correct"] = sum(1 for g in graded if g["correct"])
@@ -458,8 +519,13 @@ def summarise(log_path, tasks_file):
 
 
 def print_table(cells):
+    # **The draws column appears only when a cell was repeated.** Every log written before draws
+    # existed has exactly one per cell - including the three this bench has published - and a
+    # column of `1`s would restate a constant in every table pasted into a write-up.
+    repeated = any(c.get("draws", 1) > 1 for c in cells)
+    draws_head = f"{'draws':>6} " if repeated else ""
     head = (f"{'backend':<12} {'model':<28} {'ctx':>7} {'surface':<6} {'tools':>5} "
-            f"{'ok/possible':>13} {'tokens':>13} {'calls u/w/n/r/e':>16} {'wall':>6}")
+            f"{draws_head}{'ok/possible':>13} {'tokens':>13} {'calls u/w/n/r/e':>16} {'wall':>6}")
     print("\n" + head)
     print("-" * len(head))
     for c in sorted(cells, key=lambda c: (c["backend"], c["model"], -(c["num_ctx"] or 0),
@@ -471,7 +537,10 @@ def print_table(cells):
         # seeing, so they travel beside the score as `+n` rather than inside it.
         extra = c["correct"] - c["correct_of_possible"]
         score = f"{c['correct_of_possible']}/{c['possible']}" + (f"+{extra}" if extra else "")
-        failed = " FAILED" if c.get("cell_error") else ""
+        # `x n` when more than one draw of the cell died, because on a repeated cell a bare
+        # FAILED cannot tell one bad draw from a cell that never completes.
+        failed = (" FAILED" + (f" x{c['failed_draws']}" if c.get("failed_draws", 0) > 1 else "")
+                  if c.get("cell_error") else "")
         if c.get("uncounted"):
             # One counter for one predicate: a record can stop counting because the window it ran
             # at was not the one it asked for, or because the question has changed since. Naming
@@ -480,10 +549,36 @@ def print_table(cells):
         print(f"{c['backend']:<12} {(c['model'] or '')[:28]:<28} "
               f"{str(c['num_ctx'] or 'dflt'):>7} {str(c['surface'] or '')[:6]:<6} "
               f"{str(c['tools'] or '-'):>5} "
-              f"{score} of {c['n']:<5} {tokens:>13} "
+              + (f"{c['draws']:>6} " if repeated else "")
+              + f"{score} of {c['n']:<5} {tokens:>13} "
               f"{c['useful']}/{c['wasted']}/{c['unserved']}/{c['refused']}/"
               f"{c['call_errors']:<8} "
               f"{c['wall_s']:>5}s{failed}")
+
+
+# The marks a cell-task can carry, in the order a distribution prints them. Fixed rather than
+# sorted by count, so `3Y2n` and `2n3Y` cannot be two spellings of one result.
+MARK_ORDER = "Yno-!?"
+
+
+def distribution(marks):
+    """One draw's mark, or a count per mark across n of them.
+
+    **A single draw prints the bare mark**, which is what every log written before draws existed
+    holds and what the legend has always described - `Y1` everywhere would be a new notation for
+    an unchanged result. More than one prints `3Y2n`, which is the thing item 42 says the grid
+    could not produce: a rate rather than a sighting, in a column narrow enough to scan.
+    """
+    if len(marks) == 1:
+        return marks[0]
+    counts = {}
+    for mark in marks:
+        counts[mark] = counts.get(mark, 0) + 1
+    # Anything not in the alphabet still prints, after it: a mark this function has not been
+    # taught is a bug worth seeing rather than a draw worth dropping silently.
+    order = ([m for m in MARK_ORDER if m in counts]
+             + sorted(m for m in counts if m not in MARK_ORDER))
+    return "".join(f"{counts[m]}{m}" for m in order)
 
 
 def matrix(log_path, tasks_file):
@@ -494,6 +589,11 @@ def matrix(log_path, tasks_file):
     misses - at which point the finding is about the task, or about the tool it needs, rather
     than about any of the models. It is also what the control is *for*: a task the frontier row
     misses too is a bad question, not a weak local model.
+
+    **And with `draws: n`, it answers "how often".** Every draw of a (cell, task) lands in one
+    entry - its mark, its calls and its answer kept per draw, because the interesting thing about
+    a `3Y2n` is usually what the two did differently - and the printed mark becomes the
+    distribution over them.
     """
     key = {t["id"]: t for t in load(tasks_file)["tasks"]}
     order = [t["id"] for t in load(tasks_file)["tasks"]]
@@ -519,16 +619,25 @@ def matrix(log_path, tasks_file):
             mark = "o" if graded["correct"] else "-"
         else:
             mark = "Y" if graded["correct"] else "n"
-        row[record["task"]] = {"mark": mark, "calls": [c.get("name") for c in
-                                                       (record.get("calls") or [])],
+        entry = row.setdefault(record["task"], {"mark": None, "draws": []})
+        entry["draws"].append({"draw": draw_of(record), "seed": record.get("seed"), "mark": mark,
+                               "calls": [c.get("name") for c in (record.get("calls") or [])],
                                "wall_s": record.get("wall_s"),
                                "answer": (record.get("answer") or "")[:2000],
-                               "error": record.get("error")}
+                               "error": record.get("error")})
+    for row in rows.values():
+        for entry in row.values():
+            entry["draws"].sort(key=lambda d: d["draw"])
+            entry["mark"] = distribution([d["mark"] for d in entry["draws"]])
     return order, rows
 
 
 def print_matrix(order, rows):
-    width = max(len(t) for t in order) + 2
+    # Wide enough for a distribution as well as a task name: `3Y2n` is four characters and a
+    # ten-draw cell is longer still, and a column that clips one would misreport the result
+    # rather than merely look untidy.
+    marks = [m.get("mark") or "" for row in rows.values() for m in row.values()]
+    width = max([len(t) for t in order] + [len(m) for m in marks] or [0]) + 2
     header = f"{'cell':<44}" + "".join(f"{t:<{width}}" for t in order)
     print("\n" + header)
     print("-" * len(header))
@@ -541,6 +650,9 @@ def print_matrix(order, rows):
     print("\nY correct   n wrong   - not answerable on this surface   "
           "o answered anyway   ! the runtime refused the request   "
           "? served a different window than asked for")
+    if any(len(m.get("draws") or []) > 1 for row in rows.values() for m in row.values()):
+        print("A repeated cell prints its distribution: `3Y2n` is five draws, three of them "
+              "correct.")
 
 
 def main():
@@ -587,20 +699,28 @@ def main():
 
     for group in plan["cells"]:
         backend = group["backend"]
+        # **`draws` repeats a cell; it does not add an axis.** A group asking for 5 runs the same
+        # (model, context, surface) five times, and the grader counts over them - which is the one
+        # thing the grid could not do (`FOLLOWUPS.md` item 42). Default 1, so a plan that does not
+        # mention it is the grid as it was.
+        draws = int(group.get("draws", 1))
         for model in group["models"]:
             for context in group.get("contexts", [None]):
                 for surface in group["surfaces"]:
                     subset = group.get("subset")
                     wanted = cell_tasks(plan["tasks"], subset)
-                    outstanding = [t for t in wanted
-                                   if (backend, model, context, surface, t["id"]) not in done]
-                    if not outstanding:
-                        print(f"  skipping {backend}:{model} ctx={context} {surface}: "
-                              f"all {len(wanted)} tasks already recorded")
-                        continue
-                    run_cell(plan, tokens, backend, model, context, surface, subset,
-                             group.get("budget_s", 1800), log_path, logs_dir)
-                    done = already_done(log_path, suite)
+                    for draw in range(1, draws + 1):
+                        outstanding = [t for t in wanted
+                                       if (backend, model, context, surface, draw, t["id"])
+                                       not in done]
+                        if not outstanding:
+                            print(f"  skipping {backend}:{model} ctx={context} {surface}"
+                                  + (f" draw {draw}" if draws > 1 else "")
+                                  + f": all {len(wanted)} tasks already recorded")
+                            continue
+                        run_cell(plan, tokens, backend, model, context, surface, draw, subset,
+                                 group.get("budget_s", 1800), log_path, logs_dir)
+                        done = already_done(log_path, suite)
                 if backend == "ollama":
                     # **Evicted between contexts, not only between models** - and this is the
                     # one that had to be learned. `num_ctx` on a request does not shrink an

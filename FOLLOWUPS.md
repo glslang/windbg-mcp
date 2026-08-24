@@ -26,7 +26,7 @@ and the model as a **grid** rather than as a sighting, and from what that grid f
 through the one thing `--tools` does not narrow (both 2026-08-23), and item 41 from re-running
 the narrowed cells against that fix and finding two of the same names arriving by a second route
 (2026-08-24), and items 42–43 from measuring item 41 and having two readings of that measurement
-corrected in review (2026-08-24). Each item notes its repo,
+corrected in review (2026-08-24, item 42 landing the same day). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -48,6 +48,9 @@ is kept because item 8 rests on it: what it built is the job binding, and what i
 not build is the queued-job half that only `tasks/cancel` can ask for. **Item 12 has landed**
 (2026-08-02) and is kept because what validating it *disproved* outlives what it confirmed: a kernel
 attach whose target never dials in has no bound at all, which is the constraint item 10 contains.
+**Item 42 has landed** (2026-08-24) and is kept for the same reason as item 41 above: what it built
+is the capability to repeat a cell, and what it deliberately did not run is the A/B that motivated
+it — plus one of its own sentences turned out to be false on this bench, which the entry now records.
 
 ## 1. [win-kexp] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -1900,7 +1903,7 @@ change stops it. **The 4 → 0 on answerable tasks does not prove it and was our
 all four were gemma's `debug_batch`, so they are the row above counted twice, not independent
 evidence.
 
-## 42. [windbg-mcp] The eval cannot tell a cause from a coincidence, because n=1
+## 42. [windbg-mcp] The eval cannot tell a cause from a coincidence, because n=1 — **done** (2026-08-24)
 
 Three runs of the `min` cells have now produced a correlation that review had to take back, and the
 same shape each time: an aggregate that moved (or did not) across cells whose *composition* also
@@ -1931,6 +1934,26 @@ does not depend on which of the two it was.
 **Where it picks up.** The grader already keeps the last record per (cell, task), which is the thing
 that would have to change first — repeated draws need to accumulate rather than replace. Give the
 record a `draw` index, key on it, and report a distribution instead of a mark.
+
+**What landed** (2026-08-24), which is the capability rather than the experiment — the A/B it was
+written for is still not worth running, for the reason above. A record carries `draw` and `seed`
+from both backends; a cell group asks for repeats with `draws: n`, which is a loop around the cell
+and not a fourth axis; and every reader keys on the draw index, so `already_done` resumes per draw
+(3 done and 5 asked for runs 4 and 5), `records` accumulates instead of keeping the last, and
+`--matrix` prints `3Y2n` where it printed `Y`. **A record with no `draw` is draw 1** (`draw_of`),
+so a run already recorded grades to exactly what it graded to — checked against the two logs this
+bench still has, whose `--grade` and `--matrix` output is byte-identical either side of the
+change.
+
+**Two things the entry did not see.** The first is a measurement that contradicts it: *"a seed
+column in the record"* was written on the assumption that a seeded draw can be replayed, and on
+this bench it cannot — four identical requests to `qwen3.8:27b-mlx` under `seed: 7` returned four
+different answers (ollama 0.32.15, MLX). The seed is still sent and recorded — sending it costs
+nothing, and a runtime that does reproduce under it would pair the arms of an A/B — but every
+sentence around it now says the column is what was *asked for*. Unmeasured, it would have shipped
+as a replay guarantee in the comments and in all three documents this touched. The second is smaller and is the deletion trap in reverse:
+the rule that a cell-level failure note is superseded by later records of that cell had to learn
+about draws too, or draw 4 dying would be un-recorded by draw 5 completing afterwards.
 
 ## 43. [windbg-mcp] `unserved` is two different measurements sharing a column
 
