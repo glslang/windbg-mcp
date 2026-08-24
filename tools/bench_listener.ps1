@@ -44,6 +44,10 @@ foreach ($client in 'full', 'lean', 'min') {
 #   WINDBG_MCP_LISTEN_TOKEN       would name a client called `local`, which is what the *editor*
 #                                 connects as on the other listener - two clients of one name on
 #                                 two ports is a confusion this run does not need.
+#   WINDBG_MCP_TOOLS_LOCAL        has to go with it, and not for tidiness: a spec naming a client
+#                                 nothing configures a token for is refused at startup, so
+#                                 removing the token and leaving this one stops the listener from
+#                                 starting at all on an otherwise correctly configured host.
 #   WINDBG_MCP_LISTEN_TOKEN_FILE  is worse than it looks: a configured file is the *whole*
 #                                 configuration and shuts the environment out entirely, named
 #                                 tokens included, so the three below would create no clients at
@@ -53,6 +57,7 @@ foreach ($client in 'full', 'lean', 'min') {
 #                                 still announces `full (all)` - a benchmark measuring a surface
 #                                 nobody chose.
 Remove-Item Env:WINDBG_MCP_LISTEN_TOKEN -ErrorAction SilentlyContinue
+Remove-Item Env:WINDBG_MCP_TOOLS_LOCAL -ErrorAction SilentlyContinue
 Remove-Item Env:WINDBG_MCP_LISTEN_TOKEN_FILE -ErrorAction SilentlyContinue
 Remove-Item Env:WINDBG_MCP_TOOLS_FULL -ErrorAction SilentlyContinue
 

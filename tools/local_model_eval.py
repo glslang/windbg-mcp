@@ -176,6 +176,12 @@ def run_cell(plan, tokens, backend, model, context, surface, subset, budget_s, l
                                          capture_output=True, text=True, timeout=120)
                 for line in release.stdout.splitlines():
                     print(f"    {line.strip()}")
+                if release.returncode:
+                    # It exits nonzero on a credential it cannot use or a listener it cannot
+                    # reach, and returns normally either way - so nothing above notices, and the
+                    # next cell on this surface inherits whatever the killed one still holds.
+                    print(f"    cleanup exited {release.returncode}; this cell's sessions may "
+                          f"still be attached: {release.stderr.strip()[:200]}")
             except (subprocess.TimeoutExpired, OSError) as e:
                 # The listener is unreachable, or the release is slower than the whole budget it
                 # was given. Both leave sessions behind, and neither is a reason to abandon the
@@ -354,11 +360,19 @@ def summarise(log_path, tasks_file):
             "backend": cell_id[0], "model": cell_id[1], "num_ctx": cell_id[2],
             "surface": cell_id[3], "tools": surface.get("tools"),
             "surface_bytes": surface.get("bytes"), "served_context": record.get("served_context"),
-            "tasks": [], "cell_error": None,
+            "tasks": [], "cell_error": None, "mis_served": 0,
         })
         if record.get("task") is None:
             # A cell-level note - a killed cell - rather than a task record.
             cell["cell_error"] = record.get("error")
+            continue
+        served, asked = record.get("served_context"), record.get("num_ctx")
+        if asked and served and asked != served:
+            # **Not scored, at all.** The record is a measurement of a window nobody asked for -
+            # the runtime served an instance it already had - so counting it would publish a
+            # result under the wrong context. `--matrix` marks these `?`; here they are simply
+            # not part of the arithmetic, and the row says how many were dropped.
+            cell["mis_served"] = cell.get("mis_served", 0) + 1
             continue
         task = key.get(record["task"])
         if task is None:
@@ -408,6 +422,8 @@ def print_table(cells):
         extra = c["correct"] - c["correct_of_possible"]
         score = f"{c['correct_of_possible']}/{c['possible']}" + (f"+{extra}" if extra else "")
         failed = " FAILED" if c.get("cell_error") else ""
+        if c.get("mis_served"):
+            failed += f" MIS-SERVED x{c['mis_served']}"
         print(f"{c['backend']:<12} {(c['model'] or '')[:28]:<28} "
               f"{str(c['num_ctx'] or 'dflt'):>7} {str(c['surface'] or '')[:6]:<6} "
               f"{str(c['tools'] or '-'):>5} "
@@ -540,7 +556,17 @@ def main():
                     # first run of this grid recorded five cells labelled 8192 that ran at
                     # 32768; `served_context` caught it, and eviction is what prevents it.
                     # It also keeps three 30B-class models from having to co-reside.
-                    subprocess.run(["ollama", "stop", model], capture_output=True)
+                    evicted = subprocess.run(["ollama", "stop", model], capture_output=True,
+                                         text=True)
+                if evicted.returncode:
+                    # Not cosmetic: the next context's cells would be served this instance's
+                    # window instead of the one they asked for, which is the 32k-served-as-8k
+                    # contamination this eviction exists to prevent. The grader refuses to score a
+                    # record whose served window is not the requested one, so the run cannot
+                    # publish it either way - this is what says *why* those cells went missing.
+                    print(f"    could not evict {model} ({evicted.returncode}): "
+                          f"{evicted.stderr.strip()[:200]}\n"
+                          f"    cells at the next context may be served this one's window")
 
     cells = summarise(log_path, plan["tasks"])
     print_table(cells)
