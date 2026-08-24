@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twenty clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty-one clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/win-kexp#71, 2026-08-01), items 13–14 from the bounded-command coverage review
@@ -25,7 +25,8 @@ says against a real service (both 2026-08-23), and items 39–40 from running th
 and the model as a **grid** rather than as a sighting, and from what that grid found leaking
 through the one thing `--tools` does not narrow (both 2026-08-23), and item 41 from re-running
 the narrowed cells against that fix and finding two of the same names arriving by a second route
-(2026-08-24). Each item notes its repo,
+(2026-08-24), and items 42–43 from measuring item 41 and having two readings of that measurement
+corrected in review (2026-08-24). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -1898,3 +1899,58 @@ cannot answer the question, so a model that spots the missing capability is righ
 change stops it. **The 4 → 0 on answerable tasks does not prove it and was our own double count**:
 all four were gemma's `debug_batch`, so they are the row above counted twice, not independent
 evidence.
+
+## 42. [windbg-mcp] The eval cannot tell a cause from a coincidence, because n=1
+
+Three runs of the `min` cells have now produced a correlation that review had to take back, and the
+same shape each time: an aggregate that moved (or did not) across cells whose *composition* also
+changed, read as though the surface were the only thing varying.
+
+- **#209**: the re-run's cleanest correlation stated as a controlled test, which at one sample per
+  cell it cannot be.
+- **#212**, twice. `modules` held at 3 → 3 and was read as proving `open_dump`'s description had
+  never caused it — but the callers went nemotron/Opus/Sonnet → qwen/gemma/Opus, only Opus
+  repeating, so a steady total is composition rather than a rate. And "unserved on answerable tasks
+  went 4 → 0" was a **double count**: all four were gemma's `debug_batch`, already counted in the
+  row above it.
+
+**What the grid can and cannot answer.** It runs one draw per (model, context, surface, task), which
+is enough for what it was built for — failure *modes*, and whether a surface fits at all — and is
+not enough for any statement of the form "X caused Y". `docs/local-model-eval.md` says so in as many
+words ("one sample per cell is one draw") and that has not stopped three write-ups, mine included,
+from reaching past it. The rule is not missing; the grid's shape is what makes it easy to ignore.
+
+**What would close it**, and why it is a different experiment rather than a bigger one: *n* draws of
+**one** cell with one thing varied, rather than more cells. The question that actually needs it —
+did a description ever contribute to a `modules` call? — is a single A/B: the same model, the same
+task, the same surface, with and without the sentence, repeated enough times to see a rate. That is
+`local_model_drive.py` in a loop and a seed column in the record, not a change to the matrix runner.
+It is deferred because the answer is worth little now: the sentence is gone either way, and the fix
+does not depend on which of the two it was.
+
+**Where it picks up.** The grader already keeps the last record per (cell, task), which is the thing
+that would have to change first — repeated draws need to accumulate rather than replace. Give the
+record a `draw` index, key on it, and report a distribution instead of a mark.
+
+## 43. [windbg-mcp] `unserved` is two different measurements sharing a column
+
+The metric was renamed from `hallucinated` when the first grid found that a model asking for a tool
+it could not call was usually reading this server's own advertising. Items 40 and 41 removed that
+advertising, and the number that remains is no longer measuring the same thing:
+
+- **Names this server taught.** `execute`, `decode_ioctl` (item 40), `debug_batch` (item 41). Now
+  **zero**, and a regression here is a defect in this server.
+- **Capabilities the surface does not have.** The six survivors, all on `unloaded_driver`, whose
+  answer lives in `modules`'s `unloaded` list — three asking for `modules` and three for
+  `run_command`, which does not exist. A model that spots a missing capability and reaches for it is
+  *right*; the surface is what says no.
+
+Summed, they hide each other: the first going to zero looks like a 57% improvement rather than an
+elimination, and the second could grow without anything being wrong. The task's own `possible_on`
+already carries what separates them, so this is a grader change and not a new measurement — split
+the column into `taught` and `wanted`, and let a regression test assert only the first.
+
+**Why deferred.** Nothing is currently wrong: `taught` is zero, so the sum happens to be the
+interesting number by accident. The split is worth making the next time the eval runs against a
+prose change, and doing it now would re-grade three runs of records to prove a partition that no
+present data disagrees with.

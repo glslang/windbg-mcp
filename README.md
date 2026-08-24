@@ -38,6 +38,14 @@ Operator and reference material: [remote listener](docs/remote-listener.md),
 [disassembler coordinates](docs/coordinates.md), [smoke test](docs/smoke-test.md),
 [token budget](docs/token-budget.md), [releasing](docs/releasing.md).
 
+The eval also has a visual write-up of the original grid —
+[**The Tool Surface Grid**](https://claude.ai/code/artifact/aad9956d-47f3-450a-a436-1d2b29939a39),
+33 cells of three ~30B local models against three tool surfaces and three context windows, with
+Claude Code as the control. It is a snapshot of **2026-08-23** and is not kept in step with the
+server: its "narrowing the surface leaks tools" finding is one this server no longer has, closed by
+`FOLLOWUPS.md` items 40 and 41. [`docs/local-model-eval.md`](docs/local-model-eval.md) is the
+current account, including the two re-runs that measured those fixes.
+
 ## Quick start
 
 Windows x64, with `dbgeng.dll` from `System32` — enough for live user-mode, kernel and crash-dump
