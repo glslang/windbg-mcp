@@ -269,8 +269,10 @@ than replace each other:
   one.
 - `--matrix` prints a distribution where it printed a mark: `3Y2n` is five draws, three of them
   correct. One draw still prints `Y`, so every matrix on this page reads as it did.
-- A draw that dies is recorded against *that* draw, and its row reads `FAILED x2` when more than
-  one of them did.
+- A draw that dies is recorded against *that* draw: its row reads `FAILED on 2 draws` when more
+  than one of them did, and the draws it never recorded count as `x` in each task's distribution.
+  `1Y1x` is a cell that was asked for twice and answered once — a bare `Y` there would be
+  indistinguishable from one clean draw, which is the denominator this whole section is about.
 
 A record written before draws existed is draw 1, so the runs already on disk grade to exactly what
 they graded to.

@@ -471,6 +471,16 @@ def summarise(log_path, tasks_file):
             "draw_ids": set(),
         })
         cell["draw_ids"].add(draw_of(record))
+        # **Filled in by whichever record first carries it, not by whichever record comes first.**
+        # A draw that died writes a note naming only its client, and with `draws` a dead draw 1
+        # followed by live ones is ordinary rather than exotic - so a `setdefault` alone froze
+        # `tools`, `surface_bytes` and `served_context` at that note's nulls, and the row printed
+        # a cell's tool count as `-` while the graded JSON lost the window every later draw ran at.
+        for field, value in (("tools", surface.get("tools")),
+                             ("surface_bytes", surface.get("bytes")),
+                             ("served_context", record.get("served_context"))):
+            if cell[field] is None and value is not None:
+                cell[field] = value
         if record.get("task") is None:
             # A cell-level note - a killed draw of this cell - rather than a task record. Counted
             # as well as kept: on a repeated cell "FAILED" alone cannot say whether one draw of
@@ -537,10 +547,12 @@ def print_table(cells):
         # seeing, so they travel beside the score as `+n` rather than inside it.
         extra = c["correct"] - c["correct_of_possible"]
         score = f"{c['correct_of_possible']}/{c['possible']}" + (f"+{extra}" if extra else "")
-        # `x n` when more than one draw of the cell died, because on a repeated cell a bare
-        # FAILED cannot tell one bad draw from a cell that never completes.
-        failed = (" FAILED" + (f" x{c['failed_draws']}" if c.get("failed_draws", 0) > 1 else "")
-                  if c.get("cell_error") else "")
+        # Counted when more than one draw of the cell died, because on a repeated cell a bare
+        # FAILED cannot tell one bad draw from a cell that never completes. Spelled out rather
+        # than `x2`, since `x` is a *mark* in the matrix beside this and one letter should not be
+        # two notations.
+        failed = (" FAILED" + (f" on {c['failed_draws']} draws" if c.get("failed_draws", 0) > 1
+                               else "") if c.get("cell_error") else "")
         if c.get("uncounted"):
             # One counter for one predicate: a record can stop counting because the window it ran
             # at was not the one it asked for, or because the question has changed since. Naming
@@ -558,7 +570,7 @@ def print_table(cells):
 
 # The marks a cell-task can carry, in the order a distribution prints them. Fixed rather than
 # sorted by count, so `3Y2n` and `2n3Y` cannot be two spellings of one result.
-MARK_ORDER = "Yno-!?"
+MARK_ORDER = "Yno-!?x"
 
 
 def distribution(marks):
@@ -594,16 +606,28 @@ def matrix(log_path, tasks_file):
     entry - its mark, its calls and its answer kept per draw, because the interesting thing about
     a `3Y2n` is usually what the two did differently - and the printed mark becomes the
     distribution over them.
+
+    **A draw that recorded nothing is still one of the draws** (`x`), which is the denominator
+    this would otherwise lose: a cell killed on draw 1 writes a note and no task record, so
+    building each distribution from the surviving records alone printed a bare `Y` for "one draw
+    died, one passed" - indistinguishable from a single clean draw, and understating the sample
+    exactly the way item 42 is about.
     """
     key = {t["id"]: t for t in load(tasks_file)["tasks"]}
     order = [t["id"] for t in load(tasks_file)["tasks"]]
     rows = {}
+    # Every draw this cell *attempted*, and why a draw died where one did - both read off the
+    # cell-level notes, which are the only record a draw that wrote nothing else leaves.
+    attempted, died = {}, {}
     for record in records(log_path):
-        if record.get("task") is None:
-            continue
         surface = record.get("surface") or {}
-        row = rows.setdefault((record.get("backend"), record.get("model"), record.get("num_ctx"),
-                               surface.get("client")), {})
+        cell_id = (record.get("backend"), record.get("model"), record.get("num_ctx"),
+                   surface.get("client"))
+        attempted.setdefault(cell_id, set()).add(draw_of(record))
+        if record.get("task") is None:
+            died[(cell_id, draw_of(record))] = record.get("error")
+            continue
+        row = rows.setdefault(cell_id, {})
         task = key.get(record["task"])
         if task is None:
             continue
@@ -625,8 +649,13 @@ def matrix(log_path, tasks_file):
                                "wall_s": record.get("wall_s"),
                                "answer": (record.get("answer") or "")[:2000],
                                "error": record.get("error")})
-    for row in rows.values():
+    for cell_id, row in rows.items():
         for entry in row.values():
+            recorded = {d["draw"] for d in entry["draws"]}
+            for missing in attempted.get(cell_id, set()) - recorded:
+                entry["draws"].append({"draw": missing, "seed": None, "mark": "x", "calls": [],
+                                       "wall_s": None, "answer": "",
+                                       "error": died.get((cell_id, missing))})
             entry["draws"].sort(key=lambda d: d["draw"])
             entry["mark"] = distribution([d["mark"] for d in entry["draws"]])
     return order, rows
@@ -650,9 +679,13 @@ def print_matrix(order, rows):
     print("\nY correct   n wrong   - not answerable on this surface   "
           "o answered anyway   ! the runtime refused the request   "
           "? served a different window than asked for")
-    if any(len(m.get("draws") or []) > 1 for row in rows.values() for m in row.values()):
+    entries = [m for row in rows.values() for m in row.values()]
+    if any(len(m.get("draws") or []) > 1 for m in entries):
         print("A repeated cell prints its distribution: `3Y2n` is five draws, three of them "
               "correct.")
+    if any(d["mark"] == "x" for m in entries for d in m.get("draws") or []):
+        print("x   the draw recorded nothing for this task - its cell died first, and it counts "
+              "in the denominator")
 
 
 def main():
