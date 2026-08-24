@@ -119,24 +119,33 @@ For a compile/behavior check without touching the locked release exe, use the **
 build differs only in optimization and is exercised by CI on a fresh runner.
 
 **A dependency's source can be read on the Mac, and the copy there may not be the pinned one.**
-`~/.cargo/registry/src/*/<crate>-<ver>/` holds only what this machine has *fetched*, and nothing
-fetches after a bump the Mac never built — on 2026-08-24 it had `rmcp-3.1.2` while `Cargo.lock`
-pinned `3.1.4` (dependabot #207 bumped it two days earlier). That reads as nothing at all: the API
-was unchanged, so a change written against the older source compiled on the VM first try, and it
-was luck rather than method. The glob is a second way to pick the wrong one even when the right one
-is there — `tokio-1.53.0` and `tokio-1.53.1` are both unpacked here and only the second is pinned.
+`~/.cargo/registry/src/` holds only what this machine has *fetched*, and nothing fetches after a
+bump the Mac never built — on 2026-08-24 it had `rmcp-3.1.2` while `Cargo.lock` pinned `3.1.4`
+(dependabot #207 bumped it two days earlier). That reads as nothing at all: the API was unchanged,
+so a change written against the older source compiled on the VM first try, and it was luck rather
+than method.
 
-**`cargo fetch --locked` is the fix, and it works on this Mac**: it resolves and downloads without
-compiling anything, so the Windows-only dependencies are no obstacle, and it takes seconds. The
-flag is not decoration. Bare `cargo fetch` re-resolves whenever `Cargo.toml` and `Cargo.lock` are
-out of step — which is exactly the state the middle of a `rev` bump leaves them in — and would then
-unpack a version nobody reviewed while moving the pin under you; `--locked` fails instead.
+**So `cargo fetch --locked`, and then let Cargo say where the source is** — do not build the path:
 
-Then read the version the lock names, and ask **`cargo pkgid <crate>`** for it rather than grepping.
-`cargo pkgid rmcp` answers `rmcp@3.1.4`; where a crate is in the graph twice it refuses and prints
-both candidates rather than letting you take the wrong one silently, which a `grep -A1 'name = …'`
-will (`syn` is here at 2.0.117 and 3.0.3, and is this lock's only such crate). The `*` in the path
-is the other way to take the wrong one, since the older copy stays unpacked beside the new one.
+```console
+cargo fetch --locked
+cargo metadata --locked --format-version 1 |
+  jq -r '.packages[] | select(.name=="rmcp") | "\(.version) \(.manifest_path)"'
+```
+
+The fetch resolves and downloads without compiling, so the Windows-only dependencies are no
+obstacle, and it takes seconds. `--locked` on both is not decoration: bare `cargo fetch`
+re-resolves whenever `Cargo.toml` and `Cargo.lock` are out of step — which is exactly what the
+middle of a `win-kexp` `rev` bump is — and would unpack a version nobody reviewed while moving the
+pin under you. Neither command touches the lock (measured).
+
+**Reading the path out of `cargo metadata` rather than assembling one is the whole point**, because
+a hand-built `registry/src/*/<crate>-<ver>/` is wrong three different ways and this is wrong none:
+the `*` matches a copy fetched earlier as readily as the pinned one (`tokio-1.53.0` and `1.53.1`
+are both unpacked here); a crate can be in the graph twice, so a name alone does not identify a
+version (`syn` is at 2.0.117 and 3.0.3); and a **git** dependency is not under `registry/src` at
+all — `win-kexp` is at `~/.cargo/git/checkouts/win-kexp-<hash>/<short-rev>/`, which is both the
+dependency most worth reading here and the one a registry path misses silently.
 
 Anything read this way is still a claim about source, not about behaviour; `cargo test` on the VM is
 where the pinned version is the one that compiles.
@@ -748,9 +757,9 @@ carried the bug. `PowerShell`'s `Invoke-WebRequest` throws
 on a 4xx and leaves the body on the exception, so those refusals read as empty when they in fact
 name what is missing. Before believing any protocol-level claim about `--listen`, read the validator
 that produced it: the rmcp source is on the Mac and needs no Windows build, at
-`~/.cargo/registry/src/*/rmcp-<ver>/src/transport/streamable_http_server/tower.rs` — `cargo fetch
---locked` first and open the `<ver>` that `cargo pkgid rmcp` names, for the reason under *Local
-verification*.
+`<rmcp>/src/transport/streamable_http_server/tower.rs`, where `<rmcp>` is the directory
+`cargo metadata` reports for the pinned version rather than one assembled by hand — see *Local
+verification* for why that distinction has teeth.
 
 **A listener test that needs a real engine worker belongs in the debugger tier**, however cheap it
 looks — the protocol tier's contract is "no debugger target". An attach cannot *park* without
