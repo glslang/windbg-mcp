@@ -1883,16 +1883,18 @@ read-only fence was catching. Every row's prompt shrank too, unlike item 40: a d
 in `tools/list`, which every row reads, where the `instructions` reach only a client that injects
 them — −223 tokens on each ollama row, −307 on both Claude rows.
 
-**But this entry attributed the `modules` calls wrongly, and the re-run is what shows it.** It
-named `open_dump`'s description as what was advertising them. `open_dump` no longer names
-`modules`, checked on the wire, and all three calls came anyway — from qwen, gemma and Opus. Those
-models were not reading this server; they wanted a module listing and reached for the obvious name,
-which here happens to be a real tool. A guessed name can collide with a real one, so the previous
-run's "one invention in 61" was an undercount of the floor rather than a measure of it.
+**But this entry overstated the `modules` calls, and the re-run shows the evidence does not carry
+it.** It named `open_dump`'s description as what was advertising them. `open_dump` no longer names
+`modules`, checked on the wire, and three calls came anyway — so the description is **not
+necessary**. It does not follow that it caused none of the earlier three, because the callers
+changed: nemotron, Opus and Sonnet before, qwen, gemma and Opus after, only Opus repeating. An
+aggregate holding at three across a different set of models, one sample each, is a coincidence of
+composition rather than a rate. Cause was claimed where the evidence supports a contributor.
 
-**What the remainder has in common is the task, not the prose.** All six are on `unloaded_driver`,
-the one task of the six whose answer lives in a tool a `crash` client is not served (`modules`'s
-`unloaded` list). On tasks the surface *can* answer, unserved calls went **4 → 0** — `arm64_pc` had
-four and now has none. A model that identifies a missing capability and reaches for it is not
-misled by prose; it is right, and the surface is what says no. That floor is set by the task list
-and no narrowing moves it, which is the honest end of this class.
+**Every survivor is on `unloaded_driver`**, the one task whose answer lives in a tool a `crash`
+client is not served, and each is a direct reach for a module listing (three `modules`, three
+`run_command` carrying the same `lm m nvhda64v`). That is what a floor looks like — the surface
+cannot answer the question, so a model that spots the missing capability is right and no prose
+change stops it. **The 4 → 0 on answerable tasks does not prove it and was our own double count**:
+all four were gemma's `debug_batch`, so they are the row above counted twice, not independent
+evidence.

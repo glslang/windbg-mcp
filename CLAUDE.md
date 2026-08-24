@@ -885,13 +885,16 @@ metric is still `unserved` rather than "hallucinated", and it still measures the
 measures the model. One call in 61 was a genuine invention, which is the floor.
 
 **Re-run against item 41** (2026-08-24): unserved calls 14 -> 6, with `debug_batch` going 10 -> 0
-and every name this server was teaching now gone. Two things in that worth carrying forward. The
-three `modules` calls did **not** move even though `open_dump` no longer names it, so they were
-never advertising - a model wanting a module listing reaches for the obvious name, and here it
-collides with a real tool, which is how it got miscounted. And all six survivors are on
-`unloaded_driver`, the one task whose answer lives in a tool a `crash` client is not served: on
-tasks the surface *can* answer the count is **4 -> 0**. So the floor of `unserved` is set by the
-task list rather than by prose, and the next narrowing has nothing left to take.
+and every name this server was teaching now gone. What that re-run mostly taught is **how easy it
+is to over-read at n=1, in a file that already says so**. Two claims had to be pulled back after
+review, and both had passed my own reading first. The three `modules` calls did not move even
+though `open_dump` no longer names it - which shows the description is not *necessary*, and not
+that it caused none of the earlier three: the callers changed (nemotron/Opus/Sonnet, then
+qwen/gemma/Opus), so an aggregate holding at three is a coincidence of composition. And "unserved
+on answerable tasks went 4 -> 0" was a **double count** of our own - all four were gemma's
+`debug_batch`, so it is the first row again, not independent evidence. What survives is the shape:
+every survivor is a direct reach for a module listing on `unloaded_driver`, the one task whose
+answer lives in a tool a `crash` client is not served.
 
 **A description reaches every row; the instructions reach two.** `tools/list` is read by all five
 rows, so item 41 moved every prompt (-223 tokens on each ollama row, -307 on each Claude one) where
