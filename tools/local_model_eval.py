@@ -67,15 +67,24 @@ def tokens_for(plan):
     return tokens
 
 
-def usable(record):
-    """Whether a record measures what it says it does.
+def usable(record, task=None):
+    """Whether a record still measures what this run is asking.
 
-    A cell asking for an 8,192-token window and served 32,768 - the runtime reusing an instance it
-    already holds - is not a measurement of either window. **One predicate, read by both the resume
-    set and the grader**, because they disagreed once and the disagreement was unreachable from
-    either side: grading excluded such a record while resume counted it as done, so the cell could
-    never be re-run without hand-editing an append-only log.
+    **One predicate, read by the resume set, the grader and the matrix**, because they disagreed
+    once and the disagreement was unreachable from either side: grading excluded a record while
+    resume counted it as done, so the cell could never be re-run without hand-editing an
+    append-only log. Every reason a record has stopped counting belongs here rather than in another
+    tuple element somebody has to remember.
+
+    Two reasons so far. A cell asking for an 8,192-token window and served 32,768 - the runtime
+    reusing an instance it already holds - is not a measurement of either window. And an answer to
+    a question the suite no longer asks is not an answer to the one it asks now: this run changed
+    `unloaded_driver`'s prompt mid-flight and had to delete those records **by hand**, because
+    resume would otherwise have skipped the task while the grader scored the old answers against
+    the new key.
     """
+    if task is not None and record.get("prompt") and record["prompt"] != task.get("prompt"):
+        return False
     served, asked = record.get("served_context"), record.get("num_ctx")
     if not asked:
         # Nothing was requested - a Claude cell, or a run left at the runtime's default - so
@@ -87,14 +96,18 @@ def usable(record):
     return served is not None and served == asked
 
 
-def already_done(log_path):
-    """Which (model, context, surface, task) the log already holds, so a re-run resumes.
+def already_done(log_path, tasks):
+    """Which (backend, model, context, surface, task) the log already holds, so a re-run resumes.
 
-    Keyed on the four things a cell is identified by rather than on a cell id, because the
-    plan can grow a surface or a context between runs and everything already measured is
-    still valid - what must not happen is a task being run twice into one log and graded
-    twice.
+    Keyed on the things a cell is identified by rather than on a cell id, because the plan can grow
+    a surface or a context between runs and everything already measured is still valid - what must
+    not happen is a task being run twice into one log and graded twice.
+
+    `tasks` is the suite as it is *now*, because [`usable`] compares each record against the
+    question currently being asked.
     """
+    by_id = {t["id"]: t for t in tasks}
+    stale = 0
     seen = set()
     if not os.path.exists(log_path):
         return seen
@@ -104,15 +117,19 @@ def already_done(log_path):
             if not line:
                 continue
             r = json.loads(line)
-            if not usable(r):
-                # Not done: it has to be run again, once whatever served the wrong window is
-                # evicted. The grader will not score it either.
+            if not usable(r, by_id.get(r.get("task"))):
+                # Not done: the window it ran at was not the one it asked for, or the question has
+                # changed since. It has to run again, and the grader will not score it either.
+                stale += 1
                 continue
             # **Keyed by backend too.** Two groups can name the same model - an ollama tag
             # aliased `sonnet` beside the Claude Code row - and without this the first one's
             # records make the second's whole cell look finished.
             seen.add((r.get("backend"), r.get("model"), r.get("num_ctx"),
                       (r.get("surface") or {}).get("client"), r.get("task")))
+    if stale:
+        print(f"  {stale} record(s) in the log no longer measure what this plan asks "
+              f"(a changed prompt, or a window that was not the one requested); they will run again")
     return seen
 
 
@@ -395,16 +412,17 @@ def summarise(log_path, tasks_file):
             "backend": cell_id[0], "model": cell_id[1], "num_ctx": cell_id[2],
             "surface": cell_id[3], "tools": surface.get("tools"),
             "surface_bytes": surface.get("bytes"), "served_context": record.get("served_context"),
-            "tasks": [], "cell_error": None, "mis_served": 0,
+            "tasks": [], "cell_error": None, "uncounted": 0,
         })
         if record.get("task") is None:
             # A cell-level note - a killed cell - rather than a task record.
             cell["cell_error"] = record.get("error")
             continue
-        if not usable(record):
+        if not usable(record, key.get(record.get("task"))):
             # **Not scored, at all** - counting it would publish a result under a window nobody
-            # asked for. `--matrix` marks these `?`; the row says how many were dropped.
-            cell["mis_served"] = cell.get("mis_served", 0) + 1
+            # asked for, or against a question the suite no longer asks. `--matrix` marks these
+            # `?`; the row says how many were dropped.
+            cell["uncounted"] = cell.get("uncounted", 0) + 1
             continue
         task = key.get(record["task"])
         if task is None:
@@ -454,8 +472,11 @@ def print_table(cells):
         extra = c["correct"] - c["correct_of_possible"]
         score = f"{c['correct_of_possible']}/{c['possible']}" + (f"+{extra}" if extra else "")
         failed = " FAILED" if c.get("cell_error") else ""
-        if c.get("mis_served"):
-            failed += f" MIS-SERVED x{c['mis_served']}"
+        if c.get("uncounted"):
+            # One counter for one predicate: a record can stop counting because the window it ran
+            # at was not the one it asked for, or because the question has changed since. Naming
+            # the row after either reason would be wrong half the time.
+            failed += f" UNCOUNTED x{c['uncounted']}"
         print(f"{c['backend']:<12} {(c['model'] or '')[:28]:<28} "
               f"{str(c['num_ctx'] or 'dflt'):>7} {str(c['surface'] or '')[:6]:<6} "
               f"{str(c['tools'] or '-'):>5} "
@@ -487,7 +508,7 @@ def matrix(log_path, tasks_file):
         if task is None:
             continue
         graded = grade_record(record, task, surface.get("names"))
-        if not usable(record):
+        if not usable(record, key.get(record.get("task"))):
             mark = "?"
         elif graded["error"]:
             mark = "!"
@@ -560,7 +581,8 @@ def main():
     tokens = tokens_for(plan)
     log_path = plan["out"]
     logs_dir = plan.get("logs", os.path.join(os.path.dirname(log_path), "logs"))
-    done = already_done(log_path)
+    suite = cell_tasks(plan["tasks"], None)
+    done = already_done(log_path, suite)
     print(f"plan {plan['run']}: {len(done)} task records already in {log_path}")
 
     for group in plan["cells"]:
@@ -578,7 +600,7 @@ def main():
                         continue
                     run_cell(plan, tokens, backend, model, context, surface, subset,
                              group.get("budget_s", 1800), log_path, logs_dir)
-                    done = already_done(log_path)
+                    done = already_done(log_path, suite)
                 if backend == "ollama":
                     # **Evicted between contexts, not only between models** - and this is the
                     # one that had to be learned. `num_ctx` on a request does not shrink an
