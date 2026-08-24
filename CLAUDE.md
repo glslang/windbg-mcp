@@ -130,7 +130,8 @@ than method.
 ```console
 cargo fetch --locked
 cargo metadata --locked --format-version 1 |
-  jq -r '.packages[] | select(.name=="rmcp") | "\(.version) \(.manifest_path)"'
+  jq -r '.packages[] | select(.name=="rmcp")
+         | "\(.version) \(.manifest_path | rtrimstr("/Cargo.toml"))"'
 ```
 
 The fetch resolves and downloads without compiling, so the Windows-only dependencies are no
