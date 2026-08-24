@@ -623,16 +623,19 @@ def matrix(log_path, tasks_file):
     key = {t["id"]: t for t in load(tasks_file)["tasks"]}
     order = [t["id"] for t in load(tasks_file)["tasks"]]
     rows = {}
-    # Every draw this cell *attempted*, and why a draw died where one did - both read off the
-    # cell-level notes, which are the only record a draw that wrote nothing else leaves.
-    attempted, died = {}, {}
+    # **Only a draw that *died* can leave a task unrecorded**, which is what makes the notes the
+    # whole story here: a draw that completed wrote every task it was asked, so one it has no
+    # record for was never on its list - a cell group's `subset`, not a failure. Reading a
+    # missing record as a dead draw put `x` on tasks a successful subset draw had deliberately
+    # skipped, which corrupts the very denominator this exists to keep.
+    dead = {}
     for record in records(log_path):
         surface = record.get("surface") or {}
         cell_id = (record.get("backend"), record.get("model"), record.get("num_ctx"),
                    surface.get("client"))
-        attempted.setdefault(cell_id, set()).add(draw_of(record))
         if record.get("task") is None:
-            died[(cell_id, draw_of(record))] = record.get("error")
+            dead.setdefault(cell_id, {})[draw_of(record)] = {
+                "planned": record.get("planned"), "error": record.get("error")}
             # **A task that *no* draw reached still belongs in the row**, and the note is the only
             # place its name survives. Seeded from the note's own `planned` list rather than from
             # the suite: a cell group may run a `subset`, and from the log alone "the subset left
@@ -643,6 +646,7 @@ def matrix(log_path, tasks_file):
                 if key.get(planned) is not None:
                     rows.setdefault(cell_id, {}).setdefault(planned, {"mark": None, "draws": []})
             continue
+
         row = rows.setdefault(cell_id, {})
         task = key.get(record["task"])
         if task is None:
@@ -666,12 +670,18 @@ def matrix(log_path, tasks_file):
                                "answer": (record.get("answer") or "")[:2000],
                                "error": record.get("error")})
     for cell_id, row in rows.items():
-        for entry in row.values():
+        for task_id, entry in row.items():
             recorded = {d["draw"] for d in entry["draws"]}
-            for missing in attempted.get(cell_id, set()) - recorded:
-                entry["draws"].append({"draw": missing, "seed": None, "mark": "x", "calls": [],
-                                       "wall_s": None, "answer": "",
-                                       "error": died.get((cell_id, missing))})
+            for draw, note in dead.get(cell_id, {}).items():
+                if draw in recorded:
+                    continue
+                if note["planned"] is not None and task_id not in note["planned"]:
+                    # That draw was never going to run this task, so its death says nothing about
+                    # it. One full-suite draw beside five `subset` ones shares a cell id with
+                    # them, and without this every task outside the subset read `1Y5x`.
+                    continue
+                entry["draws"].append({"draw": draw, "seed": None, "mark": "x", "calls": [],
+                                       "wall_s": None, "answer": "", "error": note["error"]})
             entry["draws"].sort(key=lambda d: d["draw"])
             entry["mark"] = distribution([d["mark"] for d in entry["draws"]])
     return order, rows
