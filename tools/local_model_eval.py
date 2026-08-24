@@ -77,7 +77,14 @@ def usable(record):
     never be re-run without hand-editing an append-only log.
     """
     served, asked = record.get("served_context"), record.get("num_ctx")
-    return not (asked and served and asked != served)
+    if not asked:
+        # Nothing was requested - a Claude cell, or a run left at the runtime's default - so
+        # there is no claim to check.
+        return True
+    # `served_context` is null when `/api/ps` was unavailable or did not know the tag. That is not
+    # agreement, it is silence: the harness never saw which window this ran at, and scoring it
+    # would publish the requested number as though it had been verified.
+    return served is not None and served == asked
 
 
 def already_done(log_path):
@@ -192,6 +199,7 @@ def run_cell(plan, tokens, backend, model, context, surface, subset, budget_s, l
                   f"{context or 'default'}_{surface}.log")
     print(f"\n=== cell {label} -> {os.path.basename(stdout_path)}")
     started = time.time()
+    killed = False
     with open(stdout_path, "w", encoding="utf-8") as out:
         # Its own process group, so the budget below can take the *cell* down rather than only
         # the driver: a Claude cell's driver has `claude` as a child, and killing the parent
@@ -211,6 +219,7 @@ def run_cell(plan, tokens, backend, model, context, surface, subset, budget_s, l
                 proc.kill()
             proc.wait()
             print(f"    budget of {budget_s}s exceeded; cell killed")
+            killed = True
             note = {"run": plan["run"], "backend": backend, "model": model,
                     "num_ctx": context or None, "surface": {"client": surface},
                     "task": None, "error": f"cell exceeded its {budget_s}s budget"}
@@ -221,7 +230,10 @@ def run_cell(plan, tokens, backend, model, context, surface, subset, budget_s, l
         # in, and a cell must not fail on the way out because its scratch was not empty.
         shutil.rmtree(cwd, ignore_errors=True)
     print(f"    {round(time.time() - started)}s, exit {proc.returncode}")
-    if proc.returncode:
+    # **Not after a kill.** `records()` keeps the last `task: null` note for a cell, so a generic
+    # `driver exited -9` written here would bury the budget-exceeded note above - which is the one
+    # that says why - and the summary would report the wrong reason for the only outcome it has.
+    if proc.returncode and not killed:
         # **A cell that failed is not a cell with fewer tasks.** A driver that dies on a bad
         # credential, an MCP handshake or a missing model writes some records or none, and
         # without this the summary shows a short row or no row at all - an incomplete grid
