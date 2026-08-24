@@ -1766,7 +1766,7 @@ fn every_tool_belongs_to_exactly_one_group() {
 
 /// A narrowed surface serves fewer tools, and says so rather than pretending the rest never were.
 ///
-/// The measurement behind `--tools` is that three quarters of the 67,658-byte tool surface is
+/// The measurement behind `--tools` is that three quarters of the 67,766-byte tool surface is
 /// prose a model needs, so the only way to spend less of a caller's context is to offer fewer
 /// tools — `FOLLOWUPS.md` item 24. This asserts the three things that makes true.
 #[test]
@@ -2834,6 +2834,65 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
         to_bench.len(),
         to_local.len()
     );
+
+    // **And so do the tool descriptions**, the third and largest channel of prose. Item 40 left
+    // them behind and `FOLLOWUPS.md` item 41 measured what that cost: on `--tools crash` five
+    // descriptions of tools the client *is* served named four it is not, and 13 of 61 calls on
+    // that surface went to asking for them — three times what the instructions were costing. The
+    // budget golden cannot see this, because it records one surface; so it is asserted the way
+    // every other per-client property here is, with two credentials on one port.
+    let described = |server: &mut Listener, token: &str, session: &str| -> Vec<(String, String)> {
+        let reply = server.call_as(token, Some(session), "tools/list", json!({}));
+        assert_eq!(reply.status, 200, "{}", reply.body);
+        reply.payload.clone().expect("a JSON-RPC payload")["result"]["tools"]
+            .as_array()
+            .expect("tools/list returns an array")
+            .iter()
+            .map(|t| {
+                (
+                    t["name"].as_str().unwrap_or_default().to_string(),
+                    t["description"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    };
+    let prose_local = described(&mut server, &local_token, &local_mcp);
+    let prose_bench = described(&mut server, &bench_token, &bench_mcp);
+    // Backticked, because that is what "names a tool" means here and a bare word is not: this
+    // very surface says frames are "attributed to modules" and that a stuck session "does not let
+    // go", and neither sentence points anywhere.
+    for name in ["`modules`", "`debug_batch`", "`go`", "`backtrace`"] {
+        for (tool, text) in &prose_bench {
+            assert!(
+                !text.contains(name),
+                "`bench` is served crash and `{tool}`'s description names {name}:\n{text}"
+            );
+        }
+    }
+    let of = |tools: &[(String, String)], want: &str| -> String {
+        tools
+            .iter()
+            .find(|(name, _)| name == want)
+            .map(|(_, text)| text.clone())
+            .unwrap_or_else(|| panic!("`{want}` is not on this surface"))
+    };
+    // The other direction, which is the half worth keeping: the client that can act on a pointer
+    // still reads it. Deleting the cross-references outright would pass the loop above.
+    let opener_local = of(&prose_local, "open_dump");
+    let opener_bench = of(&prose_bench, "open_dump");
+    assert!(opener_local.contains("`modules`"), "{opener_local}");
+    assert!(
+        opener_bench.len() < opener_local.len(),
+        "the opener should read shorter on the surface that cannot follow its pointer: bench {} \
+         vs local {}",
+        opener_bench.len(),
+        opener_local.len()
+    );
+    // And it is per reference rather than per tool: `local` has `execute` and not `crash_triage`,
+    // so `backtrace` keeps one of its two notes and loses the other.
+    let stack = of(&prose_local, "backtrace");
+    assert!(!stack.contains("`crash_triage`"), "{stack}");
+    assert!(stack.contains(r#"`execute { "command": "k" }`"#), "{stack}");
 
     // And a tool off the surface is refused by name, with the remedy for *this* caller: `local`
     // takes the run's, so the flag is the answer; `bench` has one of its own, so the client
