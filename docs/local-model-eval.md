@@ -117,7 +117,8 @@ Mechanical, and stated so it can be argued with:
   question), `off_surface` (the server refused it — on a narrowed surface, the tool is not served),
   `refused` (the harness's read-only fence), and `errored`.
 - **`unserved`** — a call naming a tool this client is not served. It was called `hallucinated`
-  until the run was read properly; see below, because the server is where those names came from.
+  until the run was read properly; see below, because the server is where all but one of those
+  names came from.
 
 Nothing is graded by a model. A substring check accepts an answer a reader would not in exactly one
 direction — a model that lists every bug check code including the right one — and every cell's raw
@@ -239,7 +240,9 @@ python3 tools/local_model_eval.py --grade results.jsonl tools/eval_tasks.json
 
 Run 2026-08-23, on the ARM64 bench described in `local-model.md`: 33 cells, 144 task runs, about
 three hours of wall clock. The raw log, every answer and every tool call are what the tables below
-are reduced from.
+are reduced from. A second, narrow run followed on 2026-08-24 — the five `min` cells against the
+server fix this one found — and is reported in its own section rather than folded into these
+numbers, because a table that mixed two servers would answer neither question.
 
 ### At the window this bench actually serves
 
@@ -263,7 +266,9 @@ qwen tries and gets it wrong — twice, in prose, in full view.
 rows drop `arm64_pc` on the narrowest surface — the cell two sections down. Read that as the task
 set being within reach rather than as a ranking: four of the five models are within one answer of
 each other, the fifth is five behind, and the control's own miss is the most useful single result
-here, since a question the frontier gets wrong is a question worth re-reading.
+here, since a question the frontier gets wrong is a question worth re-reading. **And read the sweep
+itself as one draw**: re-running the `min` column alone took that cell from 4/4 to 2/4 with nothing
+changed that qwen reads (below), which is what a single sample per cell is worth.
 
 That is not a claim that local models are as good. It is a claim about *these questions*, which
 are the shape a debugger MCP server is asked most often — open a target, read a field, name a
@@ -277,39 +282,50 @@ because `crash_triage`'s frame 0 is the `pc` that `registers` reports. Facts her
 more than one route, and the narrow surface keeps the routes that matter.
 
 What the cut *does* produce, in every row including the control, is **calls to tools that are not
-there** — and the reason is this server, not the models:
+there** — and most of the reason is this server, not the models. The **after** column is the same
+five cells re-run against the fix, two sections down:
 
-| Cell | Unserved calls | What it asked for |
-| --- | --- | --- |
-| gemma4 `min` | 9 | `debug_batch`, every one of them — five on one task, four on another |
-| Opus `min` | 4 | `execute` twice, `modules`, `decode_ioctl` |
-| Sonnet `min` | 2 | `modules`, `execute` |
-| nemotron `min` | 2 | `modules`, twice |
-| every `full` and `lean` cell | 0 | — |
+| Cell | Unserved calls | After | What it asks for now |
+| --- | --- | --- | --- |
+| gemma4 `min` | 9 | 9 | `debug_batch`, every one of them — five on one task, four on another |
+| Opus `min` | 4 | 3 | `modules`, `debug_batch`, and `list_modules`, which no surface serves |
+| Sonnet `min` | 2 | 1 | `modules` |
+| nemotron `min` | 2 | 1 | `modules` |
+| qwen `min` | 0 | 0 | — |
+| every `full` and `lean` cell | 0 | not re-run | — |
 
-**The models were told about those tools by the server.** `#196` narrows `tools/list` per client;
-it does not narrow the `instructions` string the server sends at `initialize`, which is a compile-
-time constant naming twenty-one tools by name — `modules`, `execute`, `decode_ioctl` and
-`debug_batch` among them. Measured against this bench: the `min` client is served **11** tools and
-told about **21**, of which **17 it cannot call**. Every off-surface call in the table above is one
-of those seventeen.
+**The models were told about those tools by the server**, and the re-run corrected *which part* of
+the server told them. `#196` narrows `tools/list` per client; it did not narrow the `instructions`
+string sent at `initialize`, which was a compile-time constant naming twenty-one tools — `modules`,
+`execute`, `decode_ioctl` and `debug_batch` among them. Measured against this bench: the `min`
+client is served **11** tools and told about **21**, of which **17 it cannot call**. Every
+off-surface call in the table above is one of those seventeen.
 
-So this is not invention, and the column that used to be called `hallucinated` is now `unserved`.
-It is a real cost — wasted turns, and gemma's whole turn budget on one task — but it is the cost of
-the server advertising what it will then refuse. The refusal (`#196` again, which names the client's
-own surface) is what makes it recoverable: Opus and qwen decline honestly after it, gemma re-asks
+**Only the two control rows ever read that string, though.** `tools/local_model_drive.py`'s
+handshake keeps the negotiated protocol version and discards the rest of the `initialize` result,
+so an ollama row's prompt is the one-sentence system prompt plus `tools/list` and nothing else.
+Claude Code injects an MCP server's instructions into its own system prompt; the bare `/api/chat`
+loop does not. So gemma's nine `debug_batch` calls and nemotron's `modules` came from the *other*
+place this server names tools a client may not be served — the **descriptions of the tools it is
+served**. `open_dump`'s says the module table is "what `modules` lists"; `interrupt`'s and
+`end_session`'s both name `debug_batch`; `crash_triage`'s names `backtrace`; `interrupt`'s also
+names `go`. Five references on the 11-tool surface, naming four tools it cannot call.
+
+So this is not invention: not one of the seventeen is a name this server does not have, which is
+why the column that used to be called `hallucinated` is `unserved`. (The re-run turned up exactly
+one that is — Opus asking for `list_modules` — so the floor is not zero.) It
+is a real cost — wasted turns, and gemma's whole turn budget
+on one task — but it is the cost of the server advertising what it will then refuse. What makes it
+recoverable is *a* refusal rather than the server's: `debug_batch` is on the harness's read-only
+fence, so gemma's loop never reaches the listener at all and is answered `refused: debug_batch is
+not permitted in this harness`. Opus and qwen decline honestly after either wording; gemma re-asks
 until it runs out.
 
-The same string is also **1,990 characters (~497 tokens) charged to every client identically**, of
-which **59% is sentences naming only tools the `min` client cannot call** — about 12% of that
-client's entire prompt. A narrowed surface drops 54,000 bytes of schemas and keeps every word of
+The instructions string is also **1,990 characters (~497 tokens) charged identically to every
+client that reads it**, of which **59% is sentences naming only tools the `min` client cannot
+call** — about 12% of such a client's entire prompt, and 0% of the three ollama prompts here,
+which never carried it. A narrowed surface drops 54,000 bytes of schemas and keeps every word of
 the prose advertising what was dropped.
-
-**Fixed after this run, in the follow-up that `FOLLOWUPS.md` item 40 describes**: the instructions
-are now a base plus a fragment per group, assembled for the client's own surface, so the `min`
-client reads 927 characters naming only what it is served. Every number on this page was measured
-against the behaviour above, which is the behaviour every model here met; a re-run would find fewer
-unserved calls, and that is the point of having measured it.
 
 ### Same surface, same tool output, three different outcomes
 
@@ -328,6 +344,74 @@ them:
 exactly". On the narrowest surface the 27B local model was the only one to get it right. Failure
 modes, not scores, are what separate these rows: only one of those three failures is visible to
 whoever asked the question.
+
+**And on the re-run, qwen made it too** — same cell, same surface, same two tool calls, and the
+answer was `0x0000019e7b820000` with a paragraph explaining that it matches parameter 1. Nothing
+about the cell changed but the instructions string qwen never reads. So the failure modes are the
+finding and *the ranking is not*: one sample per cell is enough to say that three models fail this
+question in three distinguishable ways, and not enough to say which model gets it right.
+
+### Re-running the narrow cells against the fix
+
+2026-08-24, once `FOLLOWUPS.md` item 40 had landed: the same three-client listener on a rebuilt
+server, `min` only, at 262,144, five rows, six tasks — 30 records. `full` and `lean` were not
+re-run, because both were already 0 unserved and the fix costs the `full` surface seven characters.
+
+The fix was confirmed live before the time was spent, by reading `initialize` per client:
+**1,983** characters for `full`, **1,220** for `lean`, **927** for `min` — and `min`'s naming only
+`crash_triage`, `end_session`, `interrupt` and `session_status`, every one of them served.
+
+**Seventeen unserved calls became fourteen**, and the total is the least interesting part of
+that — read it by name, because the composition is what moved:
+
+| Name asked for | First run | Re-run | Still advertised to a `min` client by |
+| --- | --- | --- | --- |
+| `debug_batch` | 9 | 10 | the descriptions of `interrupt` and `end_session` |
+| `modules` | 4 | 3 | the description of `open_dump` |
+| `execute` | 3 | 0 | nothing — it was named only in the instructions |
+| `decode_ioctl` | 1 | 0 | nothing — likewise |
+| `list_modules` | 0 | 1 | nothing; no surface here serves it |
+| **total** | **17** | **14** | |
+
+Both names the fix could reach went to zero, and neither came back — and they went to zero in the
+**two control rows**, which are exactly the two that read the string. That is as close to a
+controlled test of the injection claim above as this bench offers: the rows whose prompts carried
+the instructions stopped asking for what the instructions no longer name, and the rows whose
+prompts never carried them did not change at all. **Thirteen of the fourteen
+that remain name a tool the `min` client is still told about by the description of a tool it *is*
+served** — one advertising channel narrowed, the other untouched, which is `FOLLOWUPS.md` item 41.
+The fourteenth is a name this server does not have anywhere, so the invention rate this page
+originally reported as zero is not: it is one call in the re-run's 61.
+
+**The prompt-token columns did not move by a token**, which is the same finding wearing its other
+face — an ollama row's prompt never carried the string, so there was nothing in it to save:
+
+| Model | `min` prompt, first run | Re-run |
+| --- | --- | --- |
+| gemma4:31b | 3,447 | 3,447–3,489 |
+| qwen3.8:27b | 3,838 | 3,838–3,878 |
+| nemotron-3.5-lightning:30b | 3,926 | 3,926–3,965 |
+
+The cut is real for a client that does read the instructions: the two Claude rows sit at
+27,493–27,659 tokens on this surface, where ~265 tokens is about 1% of the prompt. Which is the
+honest size of that half of item 40 — the wasted *turns* were always the larger cost.
+
+**One score moved, and not for this reason.** Four of the five cells scored exactly what they
+scored before, and this time all five lost `arm64_pc`:
+
+| Cell | First run | Re-run |
+| --- | --- | --- |
+| Opus `min` | 3/4 **+1** | 3/4 **+1** |
+| Sonnet `min` | 3/4 **+1** | 3/4 **+1** |
+| qwen3.8 `min` | 4/4 | 2/4 **+1** |
+| gemma4 `min` | 3/4 | 3/4 **+1** |
+| nemotron `min` | 3/4 | 3/4 |
+
+qwen lost two, with 0 unserved calls in both runs and no exposure to the string that changed. On
+`arm64_pc` it made nemotron's mistake (above); on `bugcheck` it opened the dump, called
+`end_session`, and answered *"Session closed."* — throwing away a fact its opener had already
+handed it. Both are single-sample variance, and so is the **+1** appearing in two cells it had not
+appeared in. Read the correctness columns of any one cell here as one draw, not as a rating.
 
 ### The context axis did not bite, and nearly reported that it did
 

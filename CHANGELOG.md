@@ -16,10 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   call eleven tools and was told about twenty-one, so it would ask for `modules`, `execute` or
   `debug_batch` and be refused; driving this server with local models measured every one of those
   wasted calls (`docs/local-model-eval.md`) and read them as models inventing tool names. They were
-  reading this server. The string is now a base plus a fragment per group, assembled for the
-  client's own surface: 1,983 characters for the whole surface against the constant's 1,990, 1,220
-  for `session,inspect,crash`, and **927 for `crash`** — which also removes ~12% of that client's
-  prompt, on the surface that exists to be small.
+  reading this server — through this string where the client injects it into its prompt, and
+  through the descriptions of tools they *are* served where it does not (`FOLLOWUPS.md` item 41).
+  The string is now a base plus a fragment per group, assembled for the client's own surface:
+  1,983 characters for the whole surface against the constant's 1,990, 1,220 for
+  `session,inspect,crash`, and **927 for `crash`** — a 53% cut, worth ~265 tokens to a client that
+  reads it, on the surface that exists to be small.
 
 - **`--list-listen-clients` sorts both halves of what it prints.** A credential file's entries
   already came back sorted; the environment's arrived in the order the variables were scanned,
