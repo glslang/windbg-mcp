@@ -448,32 +448,34 @@ clients is served names a tool that client cannot call.
 was gemma's whole turn budget on one task. Harness refusals fall with it, 9 to 4, because
 `debug_batch` is what the read-only fence was catching.
 
-**And `modules` did not move, which says item 41's entry attributed it wrongly.** That entry named
-`open_dump`'s description as what was advertising it. `open_dump` no longer names it — checked on
-the wire, not inferred — and all three calls came anyway, from qwen, gemma and Opus. The models
-were not reading this server. They wanted a module listing and reached for the obvious name, which
-on this server happens to be a real one.
+**`modules` did not move, and what that does and does not establish is worth being careful about.**
+Item 41's entry named `open_dump`'s description as what was advertising it. `open_dump` no longer
+names it — checked on the wire, not inferred — and three calls came anyway. So the description is
+**not necessary**: a model will reach for `modules` with nothing on this server naming it.
 
-**What the six remaining calls actually have in common is the task, not the prose.** Sorted by task
-rather than by name, the picture is unambiguous:
+It does **not** follow that the description caused none of the earlier three, and the callers are
+why. Before: nemotron, Opus, Sonnet. After: qwen, gemma, Opus. Only Opus repeated, so an aggregate
+that held at three is a coincidence of composition rather than a stable rate — one sample per cell,
+and a different set of models each time. The honest reading is that item 41's entry stated a cause
+where the evidence supports at most a contributor.
 
-| Task | Answerable on `min`? | Unserved after #206 | after #210 |
-| --- | --- | ---: | ---: |
-| `unloaded_driver` | **no** (`full`, `lean`) | 10 | 6 |
-| `arm64_pc` | yes | 4 | 0 |
-| the other four | yes / `ioctl_decode` no | 0 | 0 |
+**Every remaining call is on `unloaded_driver`, and each is a direct reach for a module listing** —
+three `modules`, and three `run_command` all carrying the same `lm m nvhda64v`. That is the one
+task of the six whose answer lives in a tool a `crash` client is not served (`modules`'s `unloaded`
+list), and it is what a floor would look like: the surface cannot answer the question, so a model
+that spots the missing capability and asks for it is right, and no narrowing of prose can stop it.
 
-So **unserved calls on a task the surface can answer went to zero**, and every one that remains is
-on the single task whose answer lives in a tool this client does not have — `modules`'s `unloaded`
-list. A model that identifies the missing capability and reaches for it is not misled; it is
-right, and the surface is the thing saying no. That is a floor set by the task list, not by prose,
-and no amount of narrowing moves it.
+**The arithmetic that looks like it proves that does not, and it is our own double count.** Sorted
+by task, `arm64_pc` had four unserved before and none now — but all four were gemma's
+`debug_batch`, so their disappearance *is* the `debug_batch` row above, counted a second way rather
+than independent evidence that answerable tasks are now clean. What supports the floor is the shape
+of what remains, not that subtraction.
 
 **The invention rate is higher than the last run could see.** gemma, refused, asked for
-`run_command` three times with the same `lm m nvhda64v` — a name this server does not have. Add
-Opus's `list_modules` from the previous run and the floor is not "one call in 61": a model denied a
-capability guesses a name for it, and `modules` is the case that shows a guess can *collide with a
-real tool*, which is why it was miscounted as advertising in the first place.
+`run_command` three times — a name this server does not have anywhere — and the previous run had
+one such call in 61. Two runs cannot fix a rate, but they are enough to say the floor is not
+measurable by counting names that do not exist: `modules` shows a guess can land on a real tool,
+where it is indistinguishable from having been advertised.
 
 **Every row's prompt shrank this time, and that is the difference from item 40.** A tool's
 description travels in `tools/list`, which every row reads; the `instructions` string only reaches
