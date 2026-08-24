@@ -215,6 +215,15 @@ None of these is a bug. They are recorded because they were invisible, and
    1,220 for `session,inspect,crash`, **927 for `crash`**. The number in the table above is the
    whole-surface one, which is the only one a golden can pin; the other two are asserted by two
    credentials on one listener.
+
+   **Whether any of it reaches the model is the client's choice**, which the eval bench settled by
+   accident (2026-08-24, `docs/local-model-eval.md`): Claude Code injects a server's instructions
+   into its own system prompt, while `tools/local_model_drive.py`'s bare `/api/chat` loop keeps the
+   negotiated revision out of the `initialize` result and discards the rest. So the *yes, all of it*
+   in the table is a ceiling rather than a measurement of any particular caller — a client that
+   never injects the string pays nothing for it, and narrowing it saves that client nothing. Two
+   consequences: budget this row as a cost you cannot count on paying, and do not read a
+   prompt-token measurement taken on such a client as evidence about instructions.
 5. **`modules` had neither a `limit` nor a cap**, alone among the high-volume tools — **fixed**.
    53,875 B here; more on a live kernel. It now takes a `limit` (default 64 rows, maximum 2000)
    that bounds the **whole** listing, the loaded and unloaded halves sharing it through the same
