@@ -23,7 +23,9 @@ service's clients fixed at install time (both 2026-08-22), and items 37–38 fro
 file gaining a fourth writer while still having no reader, and from exercising what that reader
 says against a real service (both 2026-08-23), and items 39–40 from running the surface, the window
 and the model as a **grid** rather than as a sighting, and from what that grid found leaking
-through the one thing `--tools` does not narrow (both 2026-08-23). Each item notes its repo,
+through the one thing `--tools` does not narrow (both 2026-08-23), and item 41 from re-running
+the narrowed cells against that fix and finding two of the same names arriving by a second route
+(2026-08-24). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -1767,3 +1769,69 @@ characters**: the whole-surface assembly is 1,983 against the constant's 1,990, 
 part of this a golden can see. What it cannot see is the direction that mattered — `crash` reading
 927 characters instead of 1,990 — so that is asserted with two credentials on one listener, which
 is the same shape every other per-client property here needs.
+
+**What it actually bought, measured** (2026-08-24, the five `min` cells of
+[`docs/local-model-eval.md`](./docs/local-model-eval.md) re-run against the fix). Unserved calls
+went from 17 to 14, and both names that lived nowhere but the instructions — `execute` (3 calls)
+and `decode_ioctl` (1) — went to zero and stayed there. The other two did not move: `debug_batch`
+(9 calls, then 10) and `modules` (4, then 3), because the tools a `min` client *is* served name
+them in their own descriptions. That remainder is item 41.
+
+And **the context half of this entry is smaller than it reads** for anything but a client that
+injects the string. The eval's own ollama driver discards `initialize`'s result past the protocol
+version, so the three local rows' prompts never carried the 1,990 characters and their token counts
+did not move by one. The 12%-of-prompt figure describes a client like Claude Code, whose rows sit
+at ~27,500 tokens on this surface — where the saving is ~265 tokens, about 1%. The wasted *turns*
+were always the larger cost of the two this item names.
+
+## 41. [windbg-mcp] A served tool's description advertises tools the client is not served
+
+Item 40 narrowed the `instructions` string per client. It is not the only prose a client reads: the
+**description of every tool it is served** is the other, and those cross-reference tools that a
+narrowed surface has removed. On `--tools crash` (eleven tools) there are five such references,
+naming four tools:
+
+| The client is served | and its description names | at |
+| --- | --- | --- |
+| `open_dump` | `modules` — "not its module table, which `modules` lists" | `src/server.rs:2594` |
+| `interrupt` | `go` — "a broad `s` search, a `go` that …" | `:3291` |
+| `interrupt` | `debug_batch` | `:3313` |
+| `end_session` | `debug_batch` | `:3358` |
+| `crash_triage` | `backtrace` | `:3061` |
+
+`--tools session,inspect,crash` keeps the three on `interrupt` and `end_session`; the whole surface
+has none, by definition. Count them with a scan that skips plain `//` comments as well as code:
+`interrupt`'s doc block is separated from its `#[rmcp::tool(…)]` by a note to the reader of the
+source, so a walk-back that stops at the first non-`///` line misses two of the five — which is how
+this entry first said four.
+
+**Measured, on the same bench that found item 40** (2026-08-24): with item 40's fix live, the five
+`min` cells still produced **14** unserved calls, and **13 of them** name `modules` or
+`debug_batch` — exactly the three descriptions above. The fourteenth, Opus asking for
+`list_modules`, is a name this server does not have anywhere, which is the floor this class has:
+narrowing every string cannot take it to zero.
+
+**Why it is deferred rather than done with item 40, and why it may not be worth doing at all.**
+Item 40 had an assembly point — one string, built per client, so the fragment for a group nobody is
+served simply is not appended. A description has none: it is one literal per tool, shipped in
+`tools/list`, and the sentence naming `modules` is *correct and useful* for the client that has
+`modules`. So the shapes available are all worse than the one item 40 used:
+
+- **Delete the cross-reference.** Cheapest, and it costs every `full`-surface client a pointer that
+  is doing real work — "the opener does not give you the module table, `modules` does" is how a
+  model learns the second call.
+- **Assemble descriptions per client, as item 40 does for instructions.** Correct, and it makes
+  every tool's description a function of the surface: the tool-budget golden then has to record a
+  surface rather than a tool (`docs/token-budget.md`'s per-tool rows lose their meaning), and
+  `schema::constraints_of` is no longer the only thing standing between a doc comment and the wire.
+- **Say it without the name** — "the module table has a tool of its own". Keeps the pointer, loses
+  the exact string a model can copy into a call, and reads worse for the 51-tool client who is the
+  one that can act on it.
+
+**Where it picks up.** The test is the cheap half and already has a sibling to copy:
+`instructions_never_name_a_tool_the_client_cannot_call` walks eight specs; the same walk over each
+served tool's `description` fails today on the five references above. Land that as an `#[ignore]`d
+or `should_panic` assertion only if a remedy is chosen — a red test with no intended fix is worse
+than this entry. The number worth having first is the cost: **13 wasted turns in 61 calls** is what
+the descriptions bought, against the four calls the instructions were costing, so the question is
+whether a turn is worth more than a cross-reference to the clients that keep it.

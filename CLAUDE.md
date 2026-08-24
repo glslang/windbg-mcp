@@ -824,13 +824,23 @@ directory**, since Claude Code reads the project it is started in. Its prompt-to
 not comparable with the ollama rows — its own system prompt is most of it — and the document says
 so rather than quoting it.
 
-**`--tools` narrows the router and not the `instructions`, and that shows up as a model
-"inventing" tools.** The string on `#[rmcp::tool_handler]` is a compile-time constant naming
-twenty-one tools, sent identically to every client: a `crash`-surface client is served 11 tools and
-told about 21, of which 17 it cannot call. Every off-surface call the grid recorded is one of those
-seventeen, so a count of them measures this server's advertising rather than any model's
-imagination - the metric is `unserved` for that reason, and `FOLLOWUPS.md` item 40 is the fix.
-Worth knowing before reading any tool-selection result from a narrowed surface.
+**A model "inventing" tools on a narrowed surface is almost always this server advertising them,
+and there are two channels, of which only one is now narrowed.** The `instructions` string is
+per-client since item 40; a *tool's description* is not, and the descriptions of tools a `crash`
+client **is** served still name `modules` (`open_dump`), `debug_batch` (`interrupt`,
+`end_session`), `backtrace` (`crash_triage`) and `go` (`interrupt`) - five references on an
+eleven-tool surface. Re-running the five `min` cells against item 40's fix (2026-08-24) moved unserved
+calls 17 -> 14, with 13 of the remainder naming exactly those - `FOLLOWUPS.md` item 41. So the
+metric is still `unserved` rather than "hallucinated", and it still measures the server before it
+measures the model. One call in 61 was a genuine invention, which is the floor.
+
+**And the ollama rows never read the `instructions` at all**, which is what nearly made that fix
+look bigger than it is. `tools/local_model_drive.py`'s handshake keeps the negotiated protocol
+version and discards the rest of the `initialize` result, so a local row's prompt is the
+one-sentence system prompt plus `tools/list`: narrowing that string cannot move those prompt-token
+columns by one token, and it did not. Claude Code injects a server's instructions into its own
+system prompt, so the two control rows are the only ones any instructions measurement is about.
+Check which half of the bench a prose change can reach before predicting what it will do.
 
 **The bench listener is the shipped per-client feature in anger.** `tools/bench_listener.ps1`
 serves `full`, `lean` and `min` from one foreground process, tokens arriving on **stdin**; its
