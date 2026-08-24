@@ -273,6 +273,9 @@ than replace each other:
   than one of them did, and the draws it never recorded count as `x` in each task's distribution.
   `1Y1x` is a cell that was asked for twice and answered once — a bare `Y` there would be
   indistinguishable from one clean draw, which is the denominator this whole section is about.
+  A task **no** draw reached reads `2x` rather than a blank, because a dead draw's note carries
+  the ids it was going to run; a blank still means the cell was never asked for that task, which
+  is what a group's `subset` does.
 
 A record written before draws existed is draw 1, so the runs already on disk grade to exactly what
 they graded to.

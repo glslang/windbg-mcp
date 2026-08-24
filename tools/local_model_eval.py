@@ -184,9 +184,15 @@ def release_sessions(env, why):
         print(f"    {why}: could not release ({e})")
 
 
-def run_cell(plan, tokens, backend, model, context, surface, draw, subset, budget_s, log_path,
-             logs_dir):
-    """One (backend, model, context, surface, draw) cell: a driver process over the task list."""
+def run_cell(plan, tokens, backend, model, context, surface, draw, subset, planned, budget_s,
+             log_path, logs_dir):
+    """One (backend, model, context, surface, draw) cell: a driver process over the task list.
+
+    `planned` is the ids this draw was asked to run, and it exists to travel into the cell-level
+    note: a draw that dies leaves nothing else behind, and without the list a task **no** draw ever
+    reached is indistinguishable in the log from one the cell was never asked (a group's `subset`).
+    The grader cannot recover that, so the runner records it.
+    """
     label = (f"{backend}:{model} ctx={context or 'default'} surface={surface}"
              + (f" draw={draw}" if draw != 1 else ""))
     env = dict(os.environ)
@@ -277,7 +283,8 @@ def run_cell(plan, tokens, backend, model, context, surface, draw, subset, budge
             killed = True
             note = {"run": plan["run"], "backend": backend, "model": model,
                     "num_ctx": context or None, "surface": {"client": surface}, "draw": draw,
-                    "task": None, "error": f"cell exceeded its {budget_s}s budget"}
+                    "task": None, "planned": planned,
+                    "error": f"cell exceeded its {budget_s}s budget"}
             with open(log_path, "a", encoding="utf-8") as log:
                 log.write(json.dumps(note) + "\n")
     if cwd:
@@ -295,7 +302,7 @@ def run_cell(plan, tokens, backend, model, context, surface, draw, subset, budge
         # reading as a finished one. The note gives the cell a row that says what happened.
         note = {"run": plan["run"], "backend": backend, "model": model,
                 "num_ctx": context or None, "surface": {"client": surface}, "draw": draw,
-                "task": None,
+                "task": None, "planned": planned,
                 "error": f"driver exited {proc.returncode}; see {os.path.basename(stdout_path)}"}
         with open(log_path, "a", encoding="utf-8") as log:
             log.write(json.dumps(note) + "\n")
@@ -626,6 +633,15 @@ def matrix(log_path, tasks_file):
         attempted.setdefault(cell_id, set()).add(draw_of(record))
         if record.get("task") is None:
             died[(cell_id, draw_of(record))] = record.get("error")
+            # **A task that *no* draw reached still belongs in the row**, and the note is the only
+            # place its name survives. Seeded from the note's own `planned` list rather than from
+            # the suite: a cell group may run a `subset`, and from the log alone "the subset left
+            # this task out" and "every draw died before reaching it" look identical - so filling
+            # from `order` would invent a denominator instead of restoring one. A note written
+            # before this field existed carries nothing, and those cells read as they did.
+            for planned in record.get("planned") or []:
+                if key.get(planned) is not None:
+                    rows.setdefault(cell_id, {}).setdefault(planned, {"mark": None, "draws": []})
             continue
         row = rows.setdefault(cell_id, {})
         task = key.get(record["task"])
@@ -752,7 +768,8 @@ def main():
                                   + f": all {len(wanted)} tasks already recorded")
                             continue
                         run_cell(plan, tokens, backend, model, context, surface, draw, subset,
-                                 group.get("budget_s", 1800), log_path, logs_dir)
+                                 [t["id"] for t in wanted], group.get("budget_s", 1800),
+                                 log_path, logs_dir)
                         done = already_done(log_path, suite)
                 if backend == "ollama":
                     # **Evicted between contexts, not only between models** - and this is the
