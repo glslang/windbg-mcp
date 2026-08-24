@@ -1872,8 +1872,27 @@ the direction that matters. `the_whole_surface_reads_every_note` is the other di
 what stops the fix degenerating into the "delete the cross-reference" option: deleting them would
 pass every other assertion here.
 
-**Not measured: the bench.** The eval grid has not been re-run against this, so the 13-calls-in-61
-figure above is what the descriptions *were* costing rather than what they now cost. It is the
-re-run worth having — unlike item 40's, where the previous entry's own caveat holds (five cells of
-one sample each, and nemotron's single dropped call was the same size as the effect claimed), a
-composition going 13 → 0 by name would be several times the noise that run showed.
+**Measured** (2026-08-24, the same five `min` cells re-run against this;
+[`docs/local-model-eval.md`](./docs/local-model-eval.md)). **Fourteen unserved calls became six**,
+and the composition is the finding rather than the total.
+
+**Every name this server was teaching is gone.** `debug_batch` was ten of the fourteen — gemma's
+whole turn budget on one task — and is now zero, which with item 40's `execute` and `decode_ioctl`
+empties that category. Harness refusals fall 9 → 4 with it, since `debug_batch` is what the
+read-only fence was catching. Every row's prompt shrank too, unlike item 40: a description travels
+in `tools/list`, which every row reads, where the `instructions` reach only a client that injects
+them — −223 tokens on each ollama row, −307 on both Claude rows.
+
+**But this entry attributed the `modules` calls wrongly, and the re-run is what shows it.** It
+named `open_dump`'s description as what was advertising them. `open_dump` no longer names
+`modules`, checked on the wire, and all three calls came anyway — from qwen, gemma and Opus. Those
+models were not reading this server; they wanted a module listing and reached for the obvious name,
+which here happens to be a real tool. A guessed name can collide with a real one, so the previous
+run's "one invention in 61" was an undercount of the floor rather than a measure of it.
+
+**What the remainder has in common is the task, not the prose.** All six are on `unloaded_driver`,
+the one task of the six whose answer lives in a tool a `crash` client is not served (`modules`'s
+`unloaded` list). On tasks the surface *can* answer, unserved calls went **4 → 0** — `arm64_pc` had
+four and now has none. A model that identifies a missing capability and reaches for it is not
+misled by prose; it is right, and the surface is what says no. That floor is set by the task list
+and no narrowing moves it, which is the honest end of this class.

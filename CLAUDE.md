@@ -884,10 +884,19 @@ and **13 of the remainder named exactly those five**, which is what item 41 then
 metric is still `unserved` rather than "hallucinated", and it still measures the server before it
 measures the model. One call in 61 was a genuine invention, which is the floor.
 
-**The grid has not been re-run against item 41**, so 13-in-61 is what those descriptions were
-costing and not what they now cost. That re-run is worth more than item 40's was: a composition
-going 13 -> 0 by name is several times the noise five cells of one sample each showed, where item
-40's own effect was the size of a single dropped call.
+**Re-run against item 41** (2026-08-24): unserved calls 14 -> 6, with `debug_batch` going 10 -> 0
+and every name this server was teaching now gone. Two things in that worth carrying forward. The
+three `modules` calls did **not** move even though `open_dump` no longer names it, so they were
+never advertising - a model wanting a module listing reaches for the obvious name, and here it
+collides with a real tool, which is how it got miscounted. And all six survivors are on
+`unloaded_driver`, the one task whose answer lives in a tool a `crash` client is not served: on
+tasks the surface *can* answer the count is **4 -> 0**. So the floor of `unserved` is set by the
+task list rather than by prose, and the next narrowing has nothing left to take.
+
+**A description reaches every row; the instructions reach two.** `tools/list` is read by all five
+rows, so item 41 moved every prompt (-223 tokens on each ollama row, -307 on each Claude one) where
+item 40 could not move a local one by a token. Check which channel a prose change travels on before
+predicting which columns it can touch.
 
 **And the ollama rows never read the `instructions` at all**, which is what nearly made that fix
 look bigger than it is. `tools/local_model_drive.py`'s handshake keeps the negotiated protocol

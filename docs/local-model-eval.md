@@ -391,11 +391,9 @@ originally reported as zero is not: it is one call in the re-run's 61.
 
 **Item 41 has since landed** (2026-08-24) and removed all three of those descriptions'
 cross-references: on `--tools crash` no served tool's description names a tool the client cannot
-call, asserted rather than inspected. **The grid has not been re-run against it**, so the thirteen
-above is what those sentences were costing and not a measurement of what they cost now. That re-run
-is worth more than this one was: thirteen calls going to zero by name is several times the noise
-five cells of one sample each can show, where the effect claimed here was the size of nemotron's
-one dropped call.
+call. The next section re-runs these same five cells against it — and the ten `debug_batch` calls
+go to zero while the three `modules` do not, which is how the attribution in the row above turned
+out to be half wrong.
 
 **The prompt-token columns did not move by a token**, which is the same finding wearing its other
 face — an ollama row's prompt never carried the string, so there was nothing in it to save:
@@ -426,6 +424,77 @@ qwen lost two, with 0 unserved calls in both runs and no exposure to the string 
 `end_session`, and answered *"Session closed."* — throwing away a fact its opener had already
 handed it. Both are single-sample variance, and so is the **+1** appearing in two cells it had not
 appeared in. Read the correctness columns of any one cell here as one draw, not as a rating.
+
+### And again against the second channel, which is where the interesting answer was
+
+2026-08-24, once `FOLLOWUPS.md` item 41 had landed ([#210](https://github.com/glslang/windbg-mcp/pull/210)):
+the same five `min` cells, the same six tasks, the same listener on a rebuilt server — 30 records.
+Confirmed live before the time was spent, by reading `tools/list` per client: `min`'s eleven
+descriptions are **7,732** characters against 8,654, and **no** description any of the three
+clients is served names a tool that client cannot call.
+
+**Fourteen unserved calls became six**, and again the total is the least interesting part:
+
+| Name asked for | After #206 | After #210 | What was advertising it |
+| --- | --- | --- | --- |
+| `debug_batch` | 10 | **0** | the descriptions of `interrupt` and `end_session` |
+| `modules` | 3 | **3** | nothing — see below |
+| `list_modules` | 1 | 0 | nothing; no surface here serves it |
+| `run_command` | 0 | 3 | nothing; likewise |
+| **total** | **14** | **6** | |
+
+**Every name this server was teaching is now gone.** Item 40 took `execute` (3) and `decode_ioctl`
+(1) to zero and they stayed there; item 41 takes `debug_batch`, which was ten of the fourteen and
+was gemma's whole turn budget on one task. Harness refusals fall with it, 9 to 4, because
+`debug_batch` is what the read-only fence was catching.
+
+**And `modules` did not move, which says item 41's entry attributed it wrongly.** That entry named
+`open_dump`'s description as what was advertising it. `open_dump` no longer names it — checked on
+the wire, not inferred — and all three calls came anyway, from qwen, gemma and Opus. The models
+were not reading this server. They wanted a module listing and reached for the obvious name, which
+on this server happens to be a real one.
+
+**What the six remaining calls actually have in common is the task, not the prose.** Sorted by task
+rather than by name, the picture is unambiguous:
+
+| Task | Answerable on `min`? | Unserved after #206 | after #210 |
+| --- | --- | ---: | ---: |
+| `unloaded_driver` | **no** (`full`, `lean`) | 10 | 6 |
+| `arm64_pc` | yes | 4 | 0 |
+| the other four | yes / `ioctl_decode` no | 0 | 0 |
+
+So **unserved calls on a task the surface can answer went to zero**, and every one that remains is
+on the single task whose answer lives in a tool this client does not have — `modules`'s `unloaded`
+list. A model that identifies the missing capability and reaches for it is not misled; it is
+right, and the surface is the thing saying no. That is a floor set by the task list, not by prose,
+and no amount of narrowing moves it.
+
+**The invention rate is higher than the last run could see.** gemma, refused, asked for
+`run_command` three times with the same `lm m nvhda64v` — a name this server does not have. Add
+Opus's `list_modules` from the previous run and the floor is not "one call in 61": a model denied a
+capability guesses a name for it, and `modules` is the case that shows a guess can *collide with a
+real tool*, which is why it was miscounted as advertising in the first place.
+
+**Every row's prompt shrank this time, and that is the difference from item 40.** A tool's
+description travels in `tools/list`, which every row reads; the `instructions` string only reaches
+a client that injects it, which is why item 40 could not move an ollama prompt by a token.
+
+| Row | `min` prompt after #206 | after #210 | Δ |
+| --- | ---: | ---: | ---: |
+| gemma4:31b | 3,447–3,489 | 3,224–3,266 | −223 |
+| qwen3.8:27b | 3,838–3,878 | 3,615–3,655 | −223 |
+| nemotron-3.5-lightning:30b | 3,926–3,965 | 3,700–3,739 | −226 |
+| Opus | 27,493–27,543 | 27,186–27,236 | −307 |
+| Sonnet | 27,609–27,659 | 27,302–27,352 | −307 |
+
+922 characters off the surface, ~223 tokens off a local prompt (≈4.1 B/token, matching this page's
+rule of thumb) and 307 off a Claude one, which encodes a tool definition differently. It is ~6% of
+an ollama row's prompt on this surface and ~1% of a Claude row's.
+
+**Scores did not move in aggregate**: 14 of 20 answerable, both runs. Cells moved inside that —
+nemotron 3/4 to 2/4, qwen 2/4 to 3/4, gemma losing the false positive it had gained — which is the
+same single-sample variance the previous re-run recorded, in the same direction on none of them.
+Read them as one draw each, as before.
 
 ### The context axis did not bite, and nearly reported that it did
 

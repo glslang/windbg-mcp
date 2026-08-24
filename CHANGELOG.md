@@ -29,7 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "what `modules` lists", `interrupt` and `end_session` both named `debug_batch`, `crash_triage`
   named `backtrace` — and on `--tools crash` those five sentences named four tools the client is
   refused. The eval measured them: with item 40 live, 13 of 61 calls on that surface still asked
-  for `modules` or `debug_batch`, three times what the instructions were costing. Every such
+  for `modules` or `debug_batch`, three times what the instructions were costing. Re-running those
+  five cells afterwards took unserved calls **14 to 6** and `debug_batch` to **zero**, and showed
+  the `modules` half of that attribution had been wrong — three models reach for it whether or not
+  anything names it, which is what a real tool name being the obvious guess looks like. Every such
   sentence now lives in `TOOL_NOTES` beside the tools it names and is appended only to a client
   served all of them, so `--tools crash` reads **14,138 B instead of 15,073** (−6.2%) and names
   nothing it cannot call, `session` alone 11,265 instead of 12,161, and the fifty-one-tool client
