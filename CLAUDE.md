@@ -861,8 +861,27 @@ with `crash` alone. Verify against the dump before scoring a model wrong for fin
 route; the `arm64_pc` entry was corrected mid-run for exactly this.
 
 **Resume is per *cell*, so the log legitimately holds a task twice.** An outstanding task re-runs
-its cell's whole list, and the grader keeps the **last** record per (cell, task). Do not "fix" a
-duplicated task id by deleting rows.
+its cell's whole list, and the grader keeps the **last** record per (cell, **draw**, task). Do not
+"fix" a duplicated task id by deleting rows.
+
+**One draw per cell is what the grid runs, and it cannot answer "X caused Y"** — a rule
+`docs/local-model-eval.md` states in as many words and that has not stopped three write-ups (#209
+once, #212 twice) from reading a moved aggregate as a controlled result (item 42).
+The trap is composition: a total that holds across two runs whose *callers* changed is a
+coincidence, not a rate. What answers a rate is `draws: n` on a cell group — the same cell n times,
+one thing varied — and the draw index is inside the grader's key, so repeats accumulate instead of
+the last one winning. Two consequences when editing that code. **A record with no `draw` is draw
+1**, which is the only reason a run recorded before the change still grades to what it graded to,
+and it lives in `draw_of` rather than in four `or 1`s. And `--matrix` prints a **distribution** (`3Y2n`)
+only when a cell was repeated; a single draw prints the bare mark, so nothing already published is
+restated in a new notation.
+
+**And the seed does not replay a draw on this bench, so do not write that it does.** Each draw asks
+for `seed: <draw index>` and records it, which is right where a seed reproduces a sample (the
+draws become repeatable, and arm A's draw 3 pairs with arm B's). It does not here: four identical
+requests to `qwen3.8:27b-mlx` under `seed: 7` returned four different answers (ollama 0.32.15, MLX,
+measured 2026-08-24 — after the comment claiming otherwise had already been written). The column is
+what was asked for; the distribution over draws is the measurement.
 
 **The Claude Code row needs four fences or it measures something else.** `--strict-mcp-config` (or
 it falls back to the editor's registered `windbg-vm`, whose credential is a different client and

@@ -42,6 +42,12 @@ Configuration:
                         and keeps nothing, which is what it did before the eval existed
     MAX_STEPS           tool-calling turns a task may take before it is given up on
                         (default 6)
+    EVAL_DRAW           which draw of this cell this process is (default 1). Repeating a
+                        cell is how a rate is measured rather than a sighting; the index
+                        is what keeps the repeats apart in an append-only log
+    EVAL_SEED           the sampling seed for this draw, sent to the runtime and recorded
+                        beside it. Unset means none was asked for. It is what was *asked*
+                        rather than a replay: one seed does not reproduce a draw here (`SEED`)
 
 **Why the keepalive exists.** The listener releases a client's sessions when its lease
 runs out, and the grace is derived from how long a *call* may take, on the assumption
@@ -66,6 +72,21 @@ NUM_CTX = int(os.environ.get("NUM_CTX", "0") or 0)
 KEEP_ALIVE = os.environ.get("OLLAMA_KEEP_ALIVE", "10m")
 EVAL_OUT = os.environ.get("WINDBG_MCP_EVAL_OUT", "")
 REVISION = "2025-06-18"
+
+# **Which draw this process is, and the seed it was sampled with** (`FOLLOWUPS.md` item 42).
+# The grid runs one draw per cell, which is enough to ask whether a surface fits and not enough
+# for any statement of the form "X caused Y" — that needs the same cell repeated with one thing
+# varied. `EVAL_DRAW` is what makes repeats *accumulate* rather than replace each other: it
+# reaches the record, and the grader keys on it.
+#
+# The seed travels beside it, and **on this bench it does not make a draw replayable** — measured,
+# 2026-08-24, because the comment here first claimed it did: four identical requests to
+# `qwen3.8:27b-mlx` under `seed: 7` (ollama 0.32.15, MLX) returned four different answers. The
+# option is sent and recorded because a runtime that honours it makes the draws reproducible for
+# free and nothing here has to change; what must not be written down is that a recorded seed *is*
+# a replay. Unset means none was asked for, and the record says so with a null.
+DRAW = int(os.environ.get("EVAL_DRAW", "1") or 1)
+SEED = int(os.environ["EVAL_SEED"]) if os.environ.get("EVAL_SEED", "").strip() else None
 
 # Tool calls this harness will actually execute. Everything else is reported back
 # to the model as refused, so a wrong pick is *measured* rather than performed —
@@ -296,13 +317,22 @@ class ChatFailed(Exception):
 def chat(messages, tools):
     body = {"model": MODEL, "messages": messages, "tools": tools, "stream": False,
             "think": False, "keep_alive": KEEP_ALIVE}
+    options = {}
     if NUM_CTX:
         # **The window is a property of the runtime, not of the model.** `ollama show` reports
         # what the weights could take; what a request is actually served is
         # `OLLAMA_CONTEXT_LENGTH` unless a request says otherwise, and this is that override —
         # the eval's context axis is this number moving. Setting it *reloads* the model, so the
         # matrix runs every surface at one context before it moves to the next.
-        body["options"] = {"num_ctx": NUM_CTX}
+        options["num_ctx"] = NUM_CTX
+    if SEED is not None:
+        # Per *draw*, not per run: on a runtime that honours it, draws of one cell all carrying
+        # one seed would be a single measurement recorded n times, which is the opposite of what
+        # repeating is for. The runner gives each draw a seed of its own. One seed does not
+        # reproduce a draw on this bench (see `SEED` above), so these draws vary regardless.
+        options["seed"] = SEED
+    if options:
+        body["options"] = options
     req = urllib.request.Request(OLLAMA, data=json.dumps(body).encode(), method="POST")
     req.add_header("Content-Type", "application/json")
     try:
@@ -660,6 +690,8 @@ def main():
         return
     MODEL = pick_model()
     print(f"model: {MODEL}")
+    if DRAW != 1 or SEED is not None:
+        print(f"draw {DRAW}, " + (f"seed {SEED}" if SEED is not None else "unseeded"))
     print("MCP revision negotiated:", handshake())
     threading.Thread(target=keepalive, daemon=True).start()
     tools = mcp("tools/list")["result"]["tools"]
@@ -679,6 +711,8 @@ def main():
         "backend": "ollama",
         "model": MODEL,
         "num_ctx": NUM_CTX or None,
+        "draw": DRAW,
+        "seed": SEED,
         "surface": {"client": os.environ.get("EVAL_SURFACE", ""),
                     "tools": len(tools), "bytes": surface,
                     "names": sorted(t["name"] for t in tools)},

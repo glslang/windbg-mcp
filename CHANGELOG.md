@@ -49,6 +49,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The eval can repeat a cell, which is the only way it can answer "how often"** (`FOLLOWUPS.md`
+  item 42, which closes it). The grid runs one draw per (model, context, surface, task) — enough
+  for failure *modes* and for whether a surface fits, and not enough for any sentence of the form
+  "X caused Y". Three write-ups reached past that anyway and review took two of them back, each
+  time because the cell's *composition* had changed too: an aggregate holding across two runs of
+  different models is a coincidence, not a rate. A cell group now takes `draws: n` and the draw
+  index is part of a record's identity, so repeats **accumulate** — `already_done` resumes per
+  draw, the grader counts over draws instead of keeping the last, and `--matrix` prints a
+  distribution (`3Y2n` is five draws, three correct) where one draw still prints `Y`. A record
+  written before this is draw 1, so the three published runs grade to exactly what they graded to.
+
+  **The seed rides along and does not replay a draw here.** Each draw asks for `seed: <draw index>`
+  and records it, which where a seed reproduces a sample makes draws repeatable and pairs the two
+  arms of an A/B. It does not here: four identical requests to `qwen3.8:27b-mlx` under
+  `seed: 7` returned four different answers (ollama 0.32.15, MLX). Measured after the code comment
+  claiming the opposite had been written — the column is what was *asked for*, and the distribution
+  over draws is the measurement.
+
 - **The local-model eval: a grid where there were two sightings**
   ([`docs/local-model-eval.md`](./docs/local-model-eval.md), `FOLLOWUPS.md` item 39). Three ~30B
   local models against three tool surfaces and three context windows, with Claude Code as the

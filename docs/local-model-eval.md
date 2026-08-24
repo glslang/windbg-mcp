@@ -241,6 +241,55 @@ ever fails. Such a record is also not counted as done, so re-running the plan re
 python3 tools/local_model_eval.py --grade results.jsonl tools/eval_tasks.json
 ```
 
+### Repeating a cell, when the question is a rate
+
+The grid runs **one draw per (model, context, surface, task)**, which is what every run on this
+page is. That is enough for the two things it was built for — failure *modes*, and whether a
+surface fits at all — and it is not enough for any sentence of the form "X caused Y". Three
+write-ups here reached past that anyway and review took two of them back
+(`FOLLOWUPS.md` item 42); the trap each time was a cell whose *composition* also changed, so an
+aggregate that held across two runs of different models read as a stable rate rather than as the
+coincidence it was.
+
+What answers a rate is the same cell run *n* times with one thing varied. A cell group asks for
+that with `draws`, and changes nothing else:
+
+```json
+{ "backend": "ollama", "models": ["qwen3.8:27b-mlx"], "contexts": [262144],
+  "surfaces": ["min"], "subset": "short", "draws": 5, "budget_s": 2400 }
+```
+
+The draw index is part of a record's identity, which is what makes repeats **accumulate** rather
+than replace each other:
+
+- Resume works per draw. A plan that ran 3 and now asks for 5 runs draws 4 and 5 and repeats
+  nothing.
+- The grader counts over draws. Deduplicating on (cell, task) alone — which is what it did — would
+  collapse *n* draws to the last one, so a repeated cell would measure exactly as much as a single
+  one.
+- `--matrix` prints a distribution where it printed a mark: `3Y2n` is five draws, three of them
+  correct. One draw still prints `Y`, so every matrix on this page reads as it did.
+- A draw that dies is recorded against *that* draw, and its row reads `FAILED x2` when more than
+  one of them did.
+
+A record written before draws existed is draw 1, so the runs already on disk grade to exactly what
+they graded to.
+
+**The seed is recorded and does not replay a draw here.** Each draw asks the runtime for a `seed`
+of its draw index — free to send, and where a seed reproduces a sample the draws become
+repeatable and arm A's draw 3 pairs with arm B's rather than averaging against it. It does not
+reproduce one here: measured 2026-08-24, four identical requests to `qwen3.8:27b-mlx` under
+`seed: 7` (ollama 0.32.15, MLX) returned four different answers. So the column says what was *asked for*, the
+draws vary regardless — which is what a rate needs — and nothing here claims a draw can be
+replayed. The Claude Code rows have no seed to ask for at all, and record a null.
+
+**The experiment this exists for is an A/B, and it is two runs rather than a bigger plan**: the
+same cell, with and without the prose under test, into two logs, and the two distributions
+compared. The variable is a server build, so no single plan can hold both arms. The question that
+prompted it — did `open_dump`'s description ever contribute to a `modules` call? — is still not
+worth the runtime: that sentence is gone either way, and the fix never depended on which of the two
+channels carried it.
+
 ## What one grid showed
 
 Run 2026-08-23, on the ARM64 bench described in `local-model.md`: 33 cells, 144 task runs, about
