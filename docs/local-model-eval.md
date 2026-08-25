@@ -627,6 +627,57 @@ Claude's prompt-token column is deliberately absent from these tables. It reads 
 surface, and most of that is Claude Code's own system prompt rather than this server's — see the
 last section.
 
+## Fourth run: the first read with every channel closed (2026-08-25)
+
+The five `min` cells again, this time at **five draws each** — 150 records, 25 cell-draws, ~59
+minutes of cell time — against a server carrying
+[#217](https://github.com/glslang/windbg-mcp/pull/217). That fix closed the **third** advertising
+channel: an opener's *result* was ending with "`modules` lists a page of the table and
+`modules { "filter": "<name>" }` answers for one", built in the worker, which knows nothing of a
+client's surface. So the eleven-tool client's first result had been handing it the exact name and
+its real argument the whole time — which is what made the third run's "three `modules` calls came
+anyway" reading unsafe.
+
+**`modules` is gone.**
+
+| | after #210 (1 draw/cell) | after #217 (5 draws/cell) |
+| --- | --- | --- |
+| cell-draws reaching off-surface | 3/5 | 5/25 |
+| naming `modules` | **3/5** | **0/25** |
+| `taught` | 0 | 0 |
+
+The three models that each named `modules` in their single draw before — gemma, opus and qwen —
+named it in **none of their fifteen draws** after. What remains is gemma reaching in four of its
+five draws and opus once in five; qwen, nemotron and sonnet never do.
+
+**And the composition flipped from a real name to invented ones.** Before: `modules`, which is the
+name that result was handing over. After: `execute_command` (12 calls, gemma, three draws),
+`execute` (3, gemma, one draw — a real tool, not served here), `run_command` (1, opus). Thirteen of
+the sixteen are names this server does not have.
+
+The two arms differ by **exactly one server behaviour change**: everything else merged between them
+was documentation, the grader or the runner. That is as clean as a single variable gets here — and
+the weakness is the other arm, which is one draw per cell. So the claim is not a rate against a
+rate; it is the sentence above about fifteen draws. Note also that gemma's twelve calls are a loop
+(four per draw, three draws), so **draw-level presence is the unit**, not call count.
+
+### Two things five draws bought that one could not
+
+- **`ioctl_decode` splits by tier as a rate.** Opus and sonnet answer it from their own knowledge
+  in all five draws (`5o`); the three local models manage it once in five (`1o4-`). At one draw
+  that is a coin toss reported as a fact.
+- **`arm64_pc` is `5n` in every row** — twenty-five wrong answers from five models, frontier rows
+  included. That is what a *task* defect looks like rather than a model one, and reading it that
+  way found one: **across all 35 runs of that task in every log this bench has, none has ever given
+  the key's answer and 32 gave the bug check's first parameter.** Measured on the dump, both are
+  defensible — `registers` reports `pc = 0xfffff8013c65bca8` and `crash_triage` frame 0 is the same
+  address, `nt!KeBugCheck2+0x2e8`, so the key is literally right; but that address is inside the
+  bug-check path the machine reached *after* the fault, while parameter 1 is the address whose
+  execution faulted. A model answering "the pc at the point of the crash" with the faulting address
+  is reading the question the way a person would. `FOLLOWUPS.md` item 44 carries what to do about
+  it; the scores in this document are as-graded, against a task whose wording is what they were
+  measuring.
+
 ## What this does not cover
 
 The same list `local-model.md` carries, minus what this closed. Still open: a long investigation
