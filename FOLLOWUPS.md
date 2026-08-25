@@ -2277,27 +2277,36 @@ assertions are the easy half.
 asks about, while one driven off `tasks` covers less than the key claims. Neither is wrong; a test
 that has not chosen is.
 
-**Almost none of this needs a symbol gate, and the first draft of this entry said it did** —
-asserted by analogy with the rest of the tier rather than checked against which facts read a
-target, and caught in review on
-[#221](https://github.com/glslang/windbg-mcp/pull/221). `docs/smoke-test.md` already draws the line
-and draws it elsewhere: a host that resolves nothing still reads **the bug check, the module list
-and the stack**, because those come out of the dump's own headers, and fails only the reads
-*behind* them with `0x8007001E`. So the module counts, the 26 unload records, the frame
-attribution, and the `pc` by **either** route — `registers`, or `crash_triage` frame 0 — are all
-checkable on a symbol-poor host. What is not: `walk_memory`, `disassemble`, and the `_EPROCESS`
-read behind `crash_triage`'s `process_name`.
+**Gating splits three ways, and this entry has now been wrong in both directions.** The first
+draft asserted a symbol gate over all of it, by analogy with the rest of the tier rather than from
+which facts read a target; the correction then removed it wholesale. Review was right both times
+([#221](https://github.com/glslang/windbg-mcp/pull/221)) and neither answer is the one the code
+supports:
 
-Getting that backwards is not a harmless over-gate. It would have stood these assertions down on
-precisely the hosts that can still run them — the ARM64 CI runner resolved nothing until item 25
-([#153](https://github.com/glslang/windbg-mcp/pull/153)) — so the drift protection would have gone
-quiet on the machine most likely to drift. **Gate on the tier and the dump, as the rest of that
-file does, and reserve the symbol gate for the fields that walk pointers or types.**
+- **No target at all.** The four `0x22200B` fields — which is why that tier already uses
+  `decode_ioctl` as its pure-tool fixture.
+- **No gate.** The module counts and the 26 unload records come out of the dump's own module list,
+  which `docs/smoke-test.md` says a host resolving nothing still reads and which
+  `tests/mcp_smoke.rs` already asserts with no symbol probe in front of it. Same for `pc` read
+  through `registers`: that is the saved context, not a walk.
+- **Gated on both probes.** `pc` through `crash_triage` **frame 0**, and the
+  `MessageManager+0x1654` attribution. `assert_driver_crash_names_its_driver` stands down unless
+  *both* `engine_reads_target_memory` and `engine_resolves_kernel_symbols` pass, and the
+  measurement behind it is why: with `_NT_SYMBOL_PATH` pointed at an empty directory the ARM64
+  sample "reads nothing at all", while the x64 one "gives up a module base and then walks a stack
+  of the bug check's own parameters — neither is an answer, and only one of them looks like a
+  failure".
 
-Which is a third reason to choose the corpus deliberately: the only symbol-gated fact anywhere near
-this is a **process name**, and `answer_key` carries two (`mm_exploit_v5.exe`, `powershell.exe`)
-while no *task* keys on one. Assert the tasks and no gate is needed at all; assert the key and
-exactly that field needs one.
+**That last clause is what makes the gate non-optional on the stack half.** An ungated frame-0
+assertion on a symbol-poor host does not fail; it compares against a plausible wrong stack. And it
+lands on this suite in particular: `arm64_pc` claims `possible_on: min` *because* frame 0 carries
+the `pc`, a `min` client having no `registers`. So the eval's narrow-surface route to that fact is
+precisely the gated one, and the ungated route is the one `min` cannot take — a test that asserts
+only through `registers` is not checking the route the task depends on.
+
+**And the corpus choice moves with it.** Asserting the tasks still needs the gate for frame 0;
+asserting `answer_key` needs it for the two process names as well (`mm_exploit_v5.exe`,
+`powershell.exe`), which the `_EPROCESS` read is behind and which no task keys on.
 
 **One fragility worth writing down while it is in view.** `arm64_pc` claims `possible_on: min`
 because `crash_triage` frame 0 carries the `pc`. That holds on a **freshly opened** dump, which is
@@ -2343,7 +2352,15 @@ same shape as the `served_context` lesson and should be read the same way:
 
 - `local_model_drive.py:served_context()` calls `/api/ps` and reads `context_length` off the
   matching entry. That response also carries the model's **`digest`**, which is a content address
-  rather than a name.
+  rather than a name. **This is the ollama rows only**, and the entry should not have implied
+  otherwise: `claude_code_drive.py` records `"model": MODEL` — `opus`, `sonnet` — which are
+  mutable aliases resolved inside a client this bench does not own, and there is no `/api/ps` to
+  ask. So the two control rows keep the ambiguity the digest removes from the other three, and
+  what is available to them (the `claude` CLI version, the alias as written) is a floor rather
+  than an identity. That file already has the right habit for this: its `seed` is `None` with a
+  comment saying why the row cannot have one, which is what a null digest should look like beside
+  it rather than an absent field. Naming a real version source for a Claude row is open, and
+  scoping the claim to what can actually be recorded is the minimum.
 - The handshake at `local_model_drive.py:264` returns `out["result"]["protocolVersion"]` and drops
   the rest of the `initialize` result - including `serverInfo.version`, which this server does
   send (`src/server.rs`, `with_server_info(... env!("CARGO_PKG_VERSION") ...)`).
