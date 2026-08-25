@@ -30,9 +30,10 @@ corrected in review (2026-08-24; **both have since landed** — item 42 the same
 2026-08-25, once #217 had shown that its "`taught` is zero" premise was false), and item 44 from
 the first run those two made possible: five draws of the narrowed cells, where a task failing in
 all twenty-five turned out to be failing at its own wording (2026-08-25, **landed** the same day),
-and item 45 from what closing it exposed: the suite's answer key is a set of facts read off the
-sample dumps that nothing re-checks, so it can rot while every model goes on scoring against it
-(2026-08-25). Each item notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
+and items 45–46 from what closing it opened up: the suite's answer key is a set of facts read off
+the sample dumps that nothing re-checks, so it can rot while every model goes on scoring against
+it, and a run can be graded but not *compared*, because nothing records the model weights or the
+server build it ran against (both 2026-08-25). Each item notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
 Items are roughly ordered by how soon they're worth doing, within each cluster. **Item 10 has
@@ -2298,3 +2299,67 @@ change, or a new sample replacing an old one, and none is scheduled.
 **Where it picks up.** `tests/mcp_smoke.rs`, beside `DRIVER_CRASHES` and `NATIVE_SAMPLE`, which
 already carry half of this and are the shape the rest wants; and `tools/eval_tasks.json`'s
 `answer_key`, which is the half that has to become readable before a test can honestly consume it.
+
+## 46. [windbg-mcp] A run can be graded but not compared, because nothing records what it ran against
+
+**Re-running a cell is the point, not a hazard.** As models are updated the same question on the
+same surface will be asked again, and what will matter is run N against run N-1 - the frozen suite
+(#220) exists so a *reworded question* cannot silently un-grade its own history, which is a
+different thing from discouraging a rerun. A rerun into a new log with a new plan is exactly what
+this bench is for. What it cannot do today is **compare two of them**.
+
+**A record identifies the question and the surface, and neither of the two things that change over
+time.** It carries `prompt` (the question identity #220 leaned on), `surface` with its client,
+tool count, byte size and names, plus `served_context`, `seed` and `draw`. It does not carry which
+*model weights* answered or which *server build* was asked.
+
+- **The model is a mutable tag.** `qwen3.8:27b-mlx` is a name that can be re-pulled onto different
+  weights, so two runs a month apart can agree on every recorded field and have been different
+  models. This is the axis the whole comparison is about.
+- **The server build is absent entirely.** `surface.bytes` is a real fingerprint of the tool prose
+  and did move when item 41 landed (8,654 -> 7,732 on `min`), but it is a fingerprint of one
+  channel: [#217](https://github.com/glslang/windbg-mcp/pull/217) changed an **opener's result**,
+  which no tool-list byte count can see. So the field that looks like a build identity is silent on
+  exactly the channel the last three findings were about.
+
+**Both facts are already on the wire and already parsed, and both are thrown away** - which is the
+same shape as the `served_context` lesson and should be read the same way:
+
+- `local_model_drive.py:served_context()` calls `/api/ps` and reads `context_length` off the
+  matching entry. That response also carries the model's **`digest`**, which is a content address
+  rather than a name.
+- The handshake at `local_model_drive.py:264` returns `out["result"]["protocolVersion"]` and drops
+  the rest of the `initialize` result - including `serverInfo.version`, which this server does
+  send (`src/server.rs`, `with_server_info(... env!("CARGO_PKG_VERSION") ...)`).
+
+**But the crate version is a floor, not an identity**, and the entry should not pretend otherwise:
+it moves on release, so two builds of one version are indistinguishable - the same trap the
+service-image warning already names in `CLAUDE.md`. Recording it is strictly better than recording
+nothing and is not sufficient; a build SHA would be, and that means deciding whether this server
+reports one. That decision is the item, not the two lines that record what is already there.
+
+**What would close it.** Identity fields on every record - model digest, server version (or SHA),
+suite id - and a **compare mode** over two logs: pair cells by `(backend, model, ctx, surface,
+task)`, print the two distributions side by side, and **name what differs in the run identity
+above the table**. That last clause is the whole value, and it is not a nicety: this repo has three
+times read a moved aggregate as a controlled result (items 42 and 43, and twice in
+[#212](https://github.com/glslang/windbg-mcp/pull/212)), and every one of those was a *composition*
+error - the callers changed and the total held. A comparison that states its own uncontrolled
+variables is the only version of this tool worth having, because the arithmetic is easy and the
+judgement it invites is what keeps going wrong.
+
+**And the reporting is the other half.** `docs/local-model-eval.md` accumulates a prose section per
+run, which reads well and cannot be diffed: the three tables in it measure three different servers,
+which the page says in words and no reader can check. A machine-readable series - one row per run,
+keyed by the identity above - is what makes "comparison with historic data" a query rather than a
+re-reading.
+
+**Why deferred.** Nothing already published is wrong, because each write-up names its own server
+build in prose; what is missing is the ability to *check* that, and to do it for a run nobody has
+written up yet. It wants doing before the next model refresh rather than after, since a run
+recorded without identity cannot have it added later - which is the one part of this that expires.
+
+**Where it picks up.** `tools/local_model_drive.py` - `served_context()` and the handshake, both of
+which already make the call that carries the fact; `tools/local_model_eval.py` for the compare mode
+beside `--grade` and `--matrix`; and `docs/local-model-eval.md` for what a versioned report looks
+like.
