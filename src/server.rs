@@ -2237,13 +2237,21 @@ pub(crate) fn reject_command_breakers(
 /// that split bought — this text must be unreachable for a failure that created nothing,
 /// because telling a caller "your session exists" when it does not strands them exactly as
 /// badly as the advice it replaced.
-fn post_commit_failure(err: &str, session_id: &str) -> String {
+fn post_commit_failure(err: &str, session_id: &str, can_execute: bool) -> String {
     format!(
         "{err}\n\nsession_id: {session_id}\nThis failure came *after* the target was opened, \
          so the handle above names a session that exists — what failed is the wait for it to \
          become ready. Do not open again to recover: for launch or attach, doing so would \
-         start a second process or attach a second time. Inspect it (`execute \
-         {{ \"command\": \"vertarget\" }}`) or `end_session` first."
+         start a second process or attach a second time. Inspect it{} or `end_session` first.",
+        // The advice is sound on every surface; the example is not. `execute` is `inspect`, so a
+        // `crash` client told to run one is told to call a tool it will be refused — the same
+        // defect [`SUMMARY_NOTES`] exists for, in the arm that carries a caller through a failure.
+        // `end_session` needs no such guard: it is in [`crate::toolset::ALWAYS`].
+        if can_execute {
+            " (`execute { \"command\": \"vertarget\" }`)"
+        } else {
+            ""
+        }
     )
 }
 
@@ -2442,20 +2450,27 @@ impl WindbgServer {
                 id,
                 report,
                 summary,
-            }) => outcome_result(
-                format!(
-                    "{report}\n\nsession_id: {id}\nPass this as `session_id` on later calls \
-                         to route them to this session and to fail loudly rather than act on a \
-                         different target."
-                ),
-                structured::OpenOutcome::Ok(structured::OpenedSession {
-                    session_id: id,
-                    kind: kind.into(),
-                    target,
-                    report,
-                    summary,
-                }),
-            ),
+            }) => {
+                // Annotated once, above both halves, because a structured-aware client forwards
+                // `structuredContent` and drops the text: a pointer added to only one of them is
+                // a pointer half the clients never see, and a pointer *removed* from only one is
+                // the leak still open on the other.
+                let report = self.annotated_report(report, &summary);
+                outcome_result(
+                    format!(
+                        "{report}\n\nsession_id: {id}\nPass this as `session_id` on later \
+                         calls to route them to this session and to fail loudly rather than act \
+                         on a different target."
+                    ),
+                    structured::OpenOutcome::Ok(structured::OpenedSession {
+                        session_id: id,
+                        kind: kind.into(),
+                        target,
+                        report,
+                        summary,
+                    }),
+                )
+            }
             // No worker, so no session — and no argument the model can change fixes that.
             Err(OpenError::Unavailable(m)) => Err(ErrorData::internal_error(m, None)),
             Err(OpenError::NoRoom(m)) => {
@@ -2476,7 +2491,7 @@ impl WindbgServer {
                          report failed, so the handle above is valid and usable."
                     )
                 } else {
-                    post_commit_failure(&message, &id)
+                    post_commit_failure(&message, &id, self.surface.includes("execute"))
                 },
                 Some(id),
                 // Both halves of this branch created a target; that is what "post commit" means,
@@ -2613,6 +2628,29 @@ impl WindbgServer {
                 None => (*note).into(),
             });
         }
+    }
+
+    /// An opener's report with the pointers this client can act on appended.
+    ///
+    /// The counterpart of [`Self::annotate`] for results rather than descriptions, and it runs on
+    /// every open rather than once per router, which is why it is a walk of two notes and not a
+    /// rebuild of anything.
+    fn annotated_report(&self, mut report: String, summary: &structured::TargetSummary) -> String {
+        for SummaryNote {
+            applies,
+            names,
+            note,
+        } in SUMMARY_NOTES
+        {
+            if !applies(summary) || !names.iter().all(|named| self.surface.includes(named)) {
+                continue;
+            }
+            if !report.is_empty() {
+                report.push_str("\n  ");
+            }
+            report.push_str(note);
+        }
+        report
     }
 
     /// Open a crash dump (.dmp) or a Time Travel Debugging trace (.run) and wait for it to load.
@@ -4561,6 +4599,45 @@ struct ToolNote {
     note: &'static str,
 }
 
+/// A cross-reference an **opener's summary** makes, appended only where the surface serves the
+/// tool it names.
+///
+/// [`ToolNote`]'s rule, one channel over. The description channel was closed by item 41 and the
+/// `instructions` one by item 40; this is the third thing a client reads, and the only one that
+/// arrives on every call. It was open until the eval's own question — how does a model on an
+/// eleven-tool surface produce the exact name `modules`, with its real `filter` argument — was
+/// traced back to the sentence an opener's summary ended with.
+///
+/// Why the sentence cannot simply live where it used to: `summary_text` runs in the **worker**,
+/// which owns one session and has never heard of a client, let alone its surface. So the summary
+/// crosses the pipe as facts, and the pointers are added here, where `self.surface` is.
+struct SummaryNote {
+    /// Whether this summary holds the thing the sentence points at. A pointer to the bug check on
+    /// a target that did not bug-check is noise, whoever is served.
+    applies: fn(&structured::TargetSummary) -> bool,
+    /// Every tool the sentence names; it ships only when the surface has all of them — the same
+    /// all-of rule as [`ToolNote`], because a spec may select part of a group.
+    names: &'static [&'static str],
+    /// The sentence, appended to the report on a line of its own.
+    note: &'static str,
+}
+
+/// Every cross-reference an opener's summary makes, in the order they are appended.
+const SUMMARY_NOTES: &[SummaryNote] = &[
+    SummaryNote {
+        applies: |summary| summary.bug_check.is_some(),
+        names: &["crash_triage"],
+        note: "`crash_triage` reads the bug check as fields, with the crashing stack and the \
+               module each frame belongs to.",
+    },
+    SummaryNote {
+        applies: |summary| summary.modules_loaded.is_some(),
+        names: &["modules"],
+        note: "`modules` lists a page of that table and `modules { \"filter\": \"<name>\" }` \
+               answers for one.",
+    },
+];
+
 /// Every cross-reference this server's descriptions make, in the order they are appended.
 ///
 /// `no_description_names_a_tool_the_client_cannot_call` is what keeps this complete: it walks the
@@ -4920,6 +4997,83 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- the pointers a client is served in a result -------------------
+
+    /// The opener's report for one surface, as [`WindbgServer::opened`] would build it.
+    fn report_for(spec: &str, summary: &structured::TargetSummary) -> String {
+        let surface = crate::toolset::Toolset::parse(spec)
+            .unwrap_or_else(|e| panic!("`{spec}` should be a valid spec: {e}"));
+        WindbgServer::new(Sessions::new(Duration::from_secs(1)))
+            .with_tools(surface, crate::toolset::Chosen::ForTheRun)
+            .annotated_report("Windows 10 Kernel Version 26100 MP".to_string(), summary)
+    }
+
+    /// A summary carrying both things the notes point at.
+    fn summary_with_everything() -> structured::TargetSummary {
+        structured::TargetSummary {
+            modules_loaded: Some(233),
+            bug_check: Some(crate::triage::bug_check_info(&win_kexp::dbgeng::BugCheck {
+                code: 0x9f,
+                parameters: [3, 0xffffe284ffe59060, 0, 0],
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// The defect this table exists for: an opener's *result* naming a tool the caller will be
+    /// refused. It is the third channel, after item 40's `instructions` and item 41's
+    /// descriptions, and it was the one the eval's own models were reading `modules` out of —
+    /// the sentence arrived with `filter` spelled out, on an eleven-tool surface.
+    ///
+    /// Asserted on `crash` rather than on a single tool, because that is the surface the bench
+    /// serves and the one the leak was measured on. `crash_triage` is *in* it, so the two notes
+    /// answer differently on the same report — which is the property a per-note rule has and a
+    /// per-result one does not.
+    #[test]
+    fn no_opener_report_names_a_tool_the_client_cannot_call() {
+        let summary = summary_with_everything();
+
+        let narrow = report_for("crash", &summary);
+        assert!(
+            !narrow.contains("`modules`"),
+            "`modules` is `inspect`; a `crash` client is refused it: {narrow}"
+        );
+        assert!(
+            !narrow.contains("filter"),
+            "the argument travelled with the name, which is what made it usable: {narrow}"
+        );
+        assert!(
+            narrow.contains("`crash_triage`"),
+            "and the pointer it *can* act on still ships: {narrow}"
+        );
+
+        let session_only = report_for("session", &summary);
+        assert!(
+            !session_only.contains("crash_triage") && !session_only.contains("modules"),
+            "neither is served here: {session_only}"
+        );
+        assert!(
+            session_only.contains("Windows 10 Kernel Version 26100 MP"),
+            "the report itself is not what the notes gate: {session_only}"
+        );
+
+        let full = report_for("all", &summary);
+        assert!(
+            full.contains("`modules`") && full.contains("`crash_triage`"),
+            "a full surface loses nothing: {full}"
+        );
+    }
+
+    /// A pointer to something this target does not have is noise on every surface.
+    #[test]
+    fn a_note_needs_the_thing_it_points_at() {
+        let bare = report_for("all", &structured::TargetSummary::default());
+        assert!(
+            !bare.contains("crash_triage") && !bare.contains("modules"),
+            "no bug check and no module count, so neither sentence has a subject: {bare}"
+        );
     }
 
     // ---- the descriptions a client is served ---------------------------
@@ -5820,7 +5974,7 @@ mod tests {
     /// clean slate and had to hedge on every attach and launch; now it knows which it is.
     #[test]
     fn a_post_commit_failure_returns_the_handle_and_warns_against_reopening() {
-        let msg = post_commit_failure("the target never broke in", "sess-1");
+        let msg = post_commit_failure("the target never broke in", "sess-1", true);
         assert!(
             msg.contains("the target never broke in"),
             "must keep the underlying error"
@@ -5834,6 +5988,18 @@ mod tests {
             "must name the cost of re-running blindly, for launch and attach alike"
         );
         assert!(msg.contains("vertarget"), "must say how to inspect it");
+
+        // The advice survives the surface that cannot take the example, which is the half worth
+        // asserting: a caller with no `execute` still has to be told not to open again.
+        let narrow = post_commit_failure("the target never broke in", "sess-1", false);
+        assert!(
+            !narrow.contains("execute") && !narrow.contains("vertarget"),
+            "a `crash` client is refused `execute`, so it must not be sent there: {narrow}"
+        );
+        assert!(
+            narrow.contains("end_session") && narrow.contains("second process"),
+            "the advice is the point and it is served on every surface: {narrow}"
+        );
     }
 
     // ---- Error reporting -----------------------------------------------
