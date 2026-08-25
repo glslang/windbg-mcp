@@ -18,8 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `local_model_eval.py --verify-key` drives the server and checks the lot through the same
   `present()` that grades. It catches a moved fact, a renamed field, a prompt repointed at another
   sample, an `expect` group nothing fetches, an `expect` group edited to something the server does
-  not say, an `expect` group widened to also accept something else, and a stale text pin — all
-  seven verified against a deliberately rotted copy of the suite, with the real one green. It is a command rather than a CI
+  not say, an `expect` group widened to also accept something else, a relation whose supporting
+  pin was deleted, and a stale text pin — all eight verified against deliberately rotted copies of
+  the suite, with the real one green. It is a command rather than a CI
   gate because a Rust test would need a second copy of `present()`, whose three rules were each
   learned from a wrong verdict; run it after a `win-kexp` bump, a symbol-path change or a new
   sample. Nothing was wrong when it landed.

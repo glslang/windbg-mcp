@@ -536,9 +536,19 @@ def gates_open(drive, session_id):
         # an error would turn every gated assertion into a silent no-op and still report success.
         # The Rust tier gets this for free by panicking on a bad `modules`; this has to say it.
         return None, f"could not probe the symbol gate: {error}"
-    modules = (result.get("structuredContent") or {}).get("modules") or []
+    modules = (result.get("structuredContent") or {}).get("modules")
+    if not isinstance(modules, list):
+        # The same rule one level in: a call that *succeeded* while answering no module list is
+        # schema drift, and coercing the absence to an empty list would close the gate on it.
+        return None, ("the symbol probe answered no `modules` list, which is drift rather "
+                      "than a symbol state")
     nt = next((m for m in modules if m.get("name") == "nt"), None)
-    return {"kernel_symbols": bool(nt and nt.get("symbols") in ("pdb", "dia"))}, None
+    if nt is None:
+        # And so is a kernel dump with no `nt` in a listing filtered for it — the module every one
+        # of these targets has. Reporting that as "no symbols" would stand a step down over a
+        # target that is not the shape this suite is about.
+        return None, "the symbol probe found no `nt` in this target, which no kernel dump should"
+    return {"kernel_symbols": nt.get("symbols") in ("pdb", "dia")}, None
 
 
 def run_step(drive, step, session_id):
@@ -570,7 +580,10 @@ def run_step(drive, step, session_id):
 
 
 def check_pins(step, structured, text):
-    """Every pin of one step, as `(read, ok, detail, rendered_value)` rows.
+    """Every pin of one step, as `(label, ok, detail, value, read)` rows.
+
+    The raw `read` travels beside the printable label because a `states` claim names the pins its
+    relation rests on, and a `has` pin's label carries the wanted text as well as the path.
 
     **Two verbs, and the difference is the server's own doing.** `is` is exact typed equality
     against a named field — the strong pin, and what a structured answer allows: `227` the integer
@@ -591,23 +604,23 @@ def check_pins(step, structured, text):
             want = pin["has"]
             haystack = normalise(text) if read == WHOLE_TEXT else None
             if haystack is None:
-                rows.append((read, False, f"`has` reads {WHOLE_TEXT} and nothing else", None))
+                rows.append((read, False, f"`has` reads {WHOLE_TEXT} and nothing else", None, read))
                 continue
             ok = present(normalise(want), haystack)
             rows.append((f"{read} has {want!r}", ok,
-                         "" if ok else "not in the answer's text", want))
+                         "" if ok else "not in the answer's text", want, read))
             continue
         try:
             got = field(structured, read)
         except KeyError:
-            rows.append((read, False, "no such field in the answer", None))
+            rows.append((read, False, "no such field in the answer", None, read))
             continue
         ok = got == pin["is"]
-        rows.append((read, ok, "" if ok else f"answered {got!r}, pinned {pin['is']!r}", got))
+        rows.append((read, ok, "" if ok else f"answered {got!r}, pinned {pin['is']!r}", got, read))
     return rows
 
 
-def grounding(task, pinned_by_step, ran):
+def grounding(task, pinned_by_step, held_by_step, ran):
     """How each `expect` group is tied to the facts this task pinned, and what is missing.
 
     Two ways a step may claim a group, and **the difference is declared rather than inferred**:
@@ -618,11 +631,15 @@ def grounding(task, pinned_by_step, ran):
       say (`ACCESS_VIOLATION` for a bug check that is `KERNEL_MODE_HEAP_CORRUPTION`) simply
       reported "relation" and passed, which is a broken key reached through the very mode meant to
       catch one.
-    - **`states`** — the group is a phrasing of a *relation* over the pinned facts rather than a
-      string the server prints: `unloaded_driver`'s "not loaded" is what `matched: 0` *means*. That
-      is not a hole either, because the fact behind it is pinned exactly and only the phrasing is
-      beyond a mechanical check — but it has to be **declared per group**, so the exemption covers
-      the two groups that earn it and cannot silently spread to the rest.
+    - **`states`** — the group is a phrasing of a *relation* over pinned facts rather than a string
+      the server prints: `unloaded_driver`'s "not loaded" is what `matched: 0` *means*. That is not
+      a hole either, because the fact behind it is pinned exactly and only the phrasing is beyond a
+      mechanical check — but it has to be **declared per group**, so the exemption covers the two
+      groups that earn it and cannot silently spread to the rest. And it **names the pins it rests
+      on** (`{"0": ["matched"]}`), which is the difference between a declaration and an exemption:
+      claiming it by the step alone meant deleting the `matched` pin left the relation reported and
+      nothing failing, so a binding edit could remove the fact behind a relational key while this
+      stayed green.
 
     A group whose claiming steps all stood down at a gate is `skipped`, which has to be its own
     word: reporting it as anything else would say this host checked something it did not.
@@ -632,20 +649,41 @@ def grounding(task, pinned_by_step, ran):
     """
     expect = task.get("expect") or []
     claimed = {}
+
+    def claim(index, kind, group):
+        if not isinstance(group, int) or not 0 <= group < len(expect):
+            return None
+        return claimed.setdefault(group, {"values": [], "value_ran": False,
+                                          "relation_ran": False, "lost": []})
+
     for index, step in enumerate(task.get("verify") or []):
-        for kind in ("grounds", "states"):
-            for group in step.get(kind) or []:
-                if not isinstance(group, int) or not 0 <= group < len(expect):
-                    return None, [f"step {index + 1} {kind} group {group}, "
-                                  f"which `expect` has not got"]
-                entry = claimed.setdefault(group, {"values": [], "value_ran": False,
-                                                   "relation_ran": False})
-                if kind == "states":
-                    entry["relation_ran"] = entry["relation_ran"] or index in ran
-                    continue
-                entry["value_ran"] = entry["value_ran"] or index in ran
-                if index in ran:
-                    entry["values"].extend(pinned_by_step.get(index, []))
+        for group in step.get("grounds") or []:
+            entry = claim(index, "grounds", group)
+            if entry is None:
+                return None, [f"step {index + 1} grounds group {group}, "
+                              f"which `expect` has not got"]
+            entry["value_ran"] = entry["value_ran"] or index in ran
+            if index in ran:
+                entry["values"].extend(pinned_by_step.get(index, []))
+        states = step.get("states") or {}
+        if not isinstance(states, dict):
+            # A malformed binding is refused by name rather than by traceback: `states` was a bare
+            # list of group indices before it had to name the pins each relation rests on, and a
+            # suite still carrying that shape should be told so.
+            return None, [f"step {index + 1} has a `states` that is not a map of group to the "
+                          f"pins its relation rests on"]
+        for named, reads in states.items():
+            group = int(named) if str(named).lstrip("-").isdigit() else named
+            entry = claim(index, "states", group)
+            if entry is None:
+                return None, [f"step {index + 1} states group {named}, "
+                              f"which `expect` has not got"]
+            if not isinstance(reads, list) or not reads:
+                return None, [f"step {index + 1} states group {group} over nothing - a relation "
+                              f"names the pins it rests on"]
+            if index in ran:
+                entry["relation_ran"] = True
+                entry["lost"].extend(r for r in reads if r not in held_by_step.get(index, set()))
     missing = [i for i in range(len(expect)) if i not in claimed]
     if missing:
         return None, [f"`expect` group {i} ({'|'.join(expect[i])}) is grounded by no step"
@@ -679,7 +717,11 @@ def grounding(task, pinned_by_step, ran):
             else:
                 how[group] = "value"
         elif entry["relation_ran"]:
-            how[group] = "relation"
+            if entry["lost"]:
+                failures.append(f"`expect` group {group} ({'|'.join(expect[group])}) is a relation "
+                                f"over {', '.join(entry['lost'])}, which this task no longer pins")
+            else:
+                how[group] = "relation"
         else:
             how[group] = "skipped"
     return how, failures
@@ -696,7 +738,7 @@ def verify_task(drive, task):
     [`gates_open`] for why it cannot be a property of the host.
     """
     failures, notes, session_id = [], [], None
-    pinned_by_step, ran, gates = {}, set(), None
+    pinned_by_step, held_by_step, ran, gates = {}, {}, set(), None
     failures.extend(prompt_renders_binding(task))
     try:
         for index, step in enumerate(task.get("verify") or []):
@@ -725,18 +767,20 @@ def verify_task(drive, task):
                 failures.append(f"{step['tool']}: opened no session to route the rest to")
                 break
             ran.add(index)
-            pinned = []
-            for read, ok, detail, value in check_pins(step, result.get("structuredContent") or {},
-                                                      text):
+            pinned, held = [], set()
+            for label, ok, detail, value, read in check_pins(
+                    step, result.get("structuredContent") or {}, text):
                 if ok:
                     pinned.append(rendered(value))
+                    held.add(read)
                 else:
-                    failures.append(f"{step['tool']} {read}: {detail}")
+                    failures.append(f"{step['tool']} {label}: {detail}")
             pinned_by_step[index] = pinned
+            held_by_step[index] = held
     finally:
         if session_id:
             drive.end_sessions([session_id])
-    how, gaps = grounding(task, pinned_by_step, ran)
+    how, gaps = grounding(task, pinned_by_step, held_by_step, ran)
     failures.extend(gaps)
     if how:
         by_kind = {}
