@@ -366,7 +366,8 @@ def grade_record(record, task, surface_names):
     calls = record.get("calls") or []
     useful = set(task.get("useful_tools", []))
     verdicts = {"useful": 0, "wasted": 0, "off_surface": 0, "refused": 0, "errored": 0,
-                "unserved": 0, "harness_tool": 0}
+                "unserved": 0, "taught": 0, "wanted": 0, "harness_tool": 0}
+    taught_tools = []
     for call in calls:
         name = call.get("name")
         verdict = call.get("verdict")
@@ -381,8 +382,34 @@ def grade_record(record, task, surface_names):
         # served them. A model asking for one of those was told about it by this server. The
         # count is still worth having - it measures a real cost in wasted turns - but it is a
         # measure of the server's advertising, not of the model's imagination.
+        #
+        # **And it is two measurements, split here by whether the task needed the reach**
+        # (item 43). `possible` says the answer key is reachable on this surface, so:
+        #
+        # - `wanted`: the task is *not* answerable here and the model reached for the capability
+        #   that would answer it. That is the model being right and the surface saying no; it can
+        #   grow without anything being wrong, and a floor of it is a property of the task list.
+        # - `taught`: the task *was* answerable here, so nothing about the question required a
+        #   name off this surface - the model got it from somewhere, and this server is the
+        #   likeliest somewhere. A regression here is a defect in the server.
+        #
+        # Summed they hide each other, which is what item 43 was written about: the first fix
+        # taking `taught` to zero read as a 57% improvement rather than an elimination.
+        #
+        # **What the split attributes is need, not provenance**, and #217 is why that has to be
+        # said. This server taught `modules` through an opener's *result* for as long as the
+        # summary named it - on `unloaded_driver`, which is also a task `min` cannot answer, so
+        # those calls land in `wanted`. `taught` is therefore a lower bound on advertising and
+        # `wanted` an upper bound on need. What separates them properly is one cell repeated with
+        # the sentence varied, which is the `draws` machinery beside this and not a column.
         if surface_names and name not in surface_names:
             verdicts["unserved"] += 1
+            verdicts["taught" if possible else "wanted"] += 1
+            if possible:
+                # The names, not just the count: "taught 3" is a number to argue about, while
+                # "`modules` on `bugcheck_code`" is a sentence somebody can go and check against
+                # the surface that client was served.
+                taught_tools.append(name)
         if verdict == "ok":
             verdicts["useful" if name in useful else "wasted"] += 1
         elif verdict == "refused_by_harness":
@@ -408,6 +435,7 @@ def grade_record(record, task, surface_names):
         "result_chars": sum(c.get("chars") or 0 for c in calls),
         "first_prompt_tokens": record.get("first_prompt_tokens"),
         "wall_s": record.get("wall_s"),
+        "taught_tools": sorted(set(taught_tools)),
         **verdicts,
     }
 
@@ -525,6 +553,10 @@ def summarise(log_path, tasks_file):
         cell["refused"] = sum(g["refused"] for g in graded)
         cell["off_surface"] = sum(g["off_surface"] for g in graded)
         cell["unserved"] = sum(g["unserved"] for g in graded)
+        cell["taught"] = sum(g["taught"] for g in graded)
+        cell["wanted"] = sum(g["wanted"] for g in graded)
+        cell["taught_detail"] = sorted({(g["task"], tool) for g in graded
+                                        for tool in g["taught_tools"]})
         cell["harness_tool"] = sum(g["harness_tool"] for g in graded)
         cell["wasted"] = sum(g["wasted"] for g in graded)
         cell["useful"] = sum(g["useful"] for g in graded)
@@ -542,7 +574,8 @@ def print_table(cells):
     repeated = any(c.get("draws", 1) > 1 for c in cells)
     draws_head = f"{'draws':>6} " if repeated else ""
     head = (f"{'backend':<12} {'model':<28} {'ctx':>7} {'surface':<6} {'tools':>5} "
-            f"{draws_head}{'ok/possible':>13} {'tokens':>13} {'calls u/w/n/r/e':>16} {'wall':>6}")
+            f"{draws_head}{'ok/possible':>13} {'tokens':>13} {'calls u/w/t+n/r/e':>18} "
+            f"{'wall':>6}")
     print("\n" + head)
     print("-" * len(head))
     for c in sorted(cells, key=lambda c: (c["backend"], c["model"], -(c["num_ctx"] or 0),
@@ -570,9 +603,31 @@ def print_table(cells):
               f"{str(c['tools'] or '-'):>5} "
               + (f"{c['draws']:>6} " if repeated else "")
               + f"{score} of {c['n']:<5} {tokens:>13} "
-              f"{c['useful']}/{c['wasted']}/{c['unserved']}/{c['refused']}/"
+              # `t+n` in the slot that used to hold one number: the sum is still readable at a
+              # glance, and the halves no longer hide each other (item 43).
+              f"{c['useful']}/{c['wasted']}/{c['taught']}+{c['wanted']}/{c['refused']}/"
               f"{c['call_errors']:<8} "
               f"{c['wall_s']:>5}s{failed}")
+    print_taught(cells)
+
+
+def print_taught(cells):
+    """The `taught` half, named rather than counted - and its absence stated rather than implied.
+
+    A column of zeroes is indistinguishable from a column nobody looked at, which is the failure
+    this whole item came out of: the scan that reported a clean result had compared nothing. So
+    this line prints either the offenders or the sentence that says there were none.
+    """
+    offenders = [(cell, task, tool) for cell in cells
+                 for task, tool in cell.get("taught_detail", [])]
+    if not offenders:
+        print("\ntaught: none - every off-surface call was on a task this surface cannot answer")
+        return
+    print(f"\ntaught: {sum(c['taught'] for c in cells)} call(s) naming a tool off the surface on "
+          f"a task that surface *can* answer -")
+    for cell, task, tool in offenders:
+        print(f"  {(cell['surface'] or '?'):<6} {(cell['model'] or '?')[:28]:<28} "
+              f"{task:<18} {tool}")
 
 
 # The marks a cell-task can carry, in the order a distribution prints them. Fixed rather than
@@ -729,10 +784,20 @@ def main():
         print(f"\nwrote {out}")
         return
     if sys.argv[1:2] == ["--grade"]:
-        log_path = sys.argv[2]
-        tasks_file = sys.argv[3] if len(sys.argv) > 3 else os.path.join(HERE, "eval_tasks.json")
+        # **The flag is filtered out before the positionals are read**, since the tasks file is
+        # argv[3] and a flag sitting there would be opened as one.
+        rest = [a for a in sys.argv[2:] if not a.startswith("--")]
+        strict = "--assert-no-taught" in sys.argv[2:]
+        log_path = rest[0]
+        tasks_file = rest[1] if len(rest) > 1 else os.path.join(HERE, "eval_tasks.json")
         cells = summarise(log_path, tasks_file)
         print_table(cells)
+        # The regression item 43 asked for, opt-in so an ordinary grading run still just prints.
+        # `wanted` is deliberately not assertable: it is a property of the task list and the
+        # surface, and a floor of it is what a narrowed surface *is*.
+        if strict and any(c["taught"] for c in cells):
+            print("\nFAILED: this server named a tool the client could not call")
+            sys.exit(1)
         out = os.path.splitext(log_path)[0] + ".graded.json"
         with open(out, "w", encoding="utf-8") as f:
             json.dump(cells, f, indent=2)

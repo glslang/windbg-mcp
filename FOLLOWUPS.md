@@ -26,7 +26,8 @@ and the model as a **grid** rather than as a sighting, and from what that grid f
 through the one thing `--tools` does not narrow (both 2026-08-23), and item 41 from re-running
 the narrowed cells against that fix and finding two of the same names arriving by a second route
 (2026-08-24), and items 42–43 from measuring item 41 and having two readings of that measurement
-corrected in review (2026-08-24, item 42 landing the same day). Each item notes its repo,
+corrected in review (2026-08-24; **both have since landed** — item 42 the same day, item 43 on
+2026-08-25, once #217 had shown that its "`taught` is zero" premise was false). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -1955,7 +1956,7 @@ as a replay guarantee in the comments and in all three documents this touched. T
 the rule that a cell-level failure note is superseded by later records of that cell had to learn
 about draws too, or draw 4 dying would be un-recorded by draw 5 completing afterwards.
 
-## 43. [windbg-mcp] `unserved` is two different measurements sharing a column
+## 43. [windbg-mcp] `unserved` is two different measurements sharing a column — **done** (2026-08-25)
 
 The metric was renamed from `hallucinated` when the first grid found that a model asking for a tool
 it could not call was usually reading this server's own advertising. Items 40 and 41 removed that
@@ -1973,10 +1974,28 @@ elimination, and the second could grow without anything being wrong. The task's 
 already carries what separates them, so this is a grader change and not a new measurement — split
 the column into `taught` and `wanted`, and let a regression test assert only the first.
 
-**Why deferred.** Nothing is currently wrong: `taught` is zero, so the sum happens to be the
-interesting number by accident. The split is worth making the next time the eval runs against a
-prose change, and doing it now would re-grade three runs of records to prove a partition that no
-present data disagrees with.
+**Why it was deferred, and what changed.** The argument was that `taught` was zero, so the sum
+happened to be the interesting number by accident, and the split would re-grade runs to prove a
+partition no present data disagreed with. Both halves of that turned out to be wrong: `taught` was
+not zero (the paragraphs below), and the re-grade is what *demonstrates* the partition rather than
+what costs it — the two logs on disk split **4+10** and **0+6**, so item 41's fix reads as an
+elimination of the half it was aimed at rather than a 57% improvement in a total.
+
+**What landed.** `possible` already said whether the answer key was reachable on this surface, so
+the split is that predicate and no new measurement: `taught` when the task *was* answerable here
+and the model still reached off-surface, `wanted` when it was not. The table prints `t+n` in the
+slot that held one number, so the sum stays readable and the halves stop hiding each other.
+`--grade --assert-no-taught` exits non-zero on a taught call, which is the regression this item
+asked for; `wanted` is deliberately not assertable, being a property of the task list and the
+surface rather than of this server. And `taught` prints its offenders by name — "`debug_batch` on
+`arm64_pc`" is checkable, where "taught: 4" is a number to argue about.
+
+**What the split does not do**, stated here because the entry that proposed it did not know yet:
+it attributes by **need, not provenance**. This server taught `modules` through an opener's result
+until [#217](https://github.com/glslang/windbg-mcp/pull/217), on `unloaded_driver`, which is also a
+task `min` cannot answer — so those calls are `wanted`. `taught` is a lower bound on advertising
+and `wanted` an upper bound on need. Separating them properly needs one cell repeated with the
+sentence varied, which is item 42's `draws` and not a fourth column.
 
 **A third channel was checked, and the checking is worth more than the result** (2026-08-24,
 prompted by the reasonable question of how a model on an eleven-tool surface produces the *exact*

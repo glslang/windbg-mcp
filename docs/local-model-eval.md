@@ -121,9 +121,23 @@ Mechanical, and stated so it can be argued with:
   `useful` (a tool the task needs, and it worked), `wasted` (worked, but nothing to do with the
   question), `off_surface` (the server refused it — on a narrowed surface, the tool is not served),
   `refused` (the harness's read-only fence), and `errored`.
-- **`unserved`** — a call naming a tool this client is not served. It was called `hallucinated`
-  until the run was read properly; see below, because the server is where all but one of those
-  names came from.
+- **`unserved`** — a call naming a tool this client is not served, printed as **`taught+wanted`**
+  because it is two measurements that hide each other:
+  - **`taught`** — the task *was* answerable on this surface, so nothing about the question
+    required a name off it. The model got that name somewhere, and this server is the likeliest
+    somewhere. A regression here is a defect in the server, and `--grade --assert-no-taught`
+    exits non-zero on one.
+  - **`wanted`** — the task is *not* answerable here and the model reached for the capability that
+    would answer it. That is the model being right and the surface saying no. It can grow without
+    anything being wrong, so nothing asserts on it.
+
+  It was called `hallucinated` until the first run was read properly; see below, because the server
+  is where all but one of those names came from. **What the split attributes is need, not
+  provenance**: this server taught `modules` through an opener's *result* until
+  [#217](https://github.com/glslang/windbg-mcp/pull/217), on a task `min` cannot answer, so those
+  calls land in `wanted`. Read `taught` as a lower bound on advertising and `wanted` as an upper
+  bound on need; separating them properly is one cell repeated with the sentence varied, which is
+  what `draws` is for.
 
 Nothing is graded by a model. A substring check accepts an answer a reader would not in exactly one
 direction — a model that lists every bug check code including the right one — and every cell's raw
@@ -496,6 +510,12 @@ clients is served names a tool that client cannot call.
 | `list_modules` | 1 | 0 | nothing; no surface here serves it |
 | `run_command` | 0 | 3 | nothing; likewise |
 | **total** | **14** | **6** | |
+
+**Split by whether the task needed the reach** (the `taught`/`wanted` columns, added later and
+re-graded over both logs): **4+10 became 0+6**. That is the argument for splitting the column at
+all — summed, item 41 reads as a 57% improvement; split, the half it was aimed at is *eliminated*
+and the half it was never aimed at is unchanged. All four were gemma's `debug_batch` on
+`arm64_pc`, a task `min` can answer, so nothing about the question required a name off the surface.
 
 **Every name this server was teaching is now gone.** Item 40 took `execute` (3) and `decode_ioctl`
 (1) to zero and they stayed there; item 41 takes `debug_batch`, which was ten of the fourteen and
