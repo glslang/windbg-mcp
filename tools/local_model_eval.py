@@ -744,7 +744,15 @@ def verify_task(drive, task):
         for index, step in enumerate(task.get("verify") or []):
             need = step.get("needs")
             if need:
-                if gates is None and session_id:
+                if not session_id:
+                    # **A binding error, not a gate.** A gated step ordered before its opener has
+                    # no target to probe, and treating that as "closed" would stand the step down
+                    # and pass - the false green this whole mode exists to prevent, produced by a
+                    # reordered binding rather than by a host.
+                    failures.append(f"{step['tool']} needs the `{need}` gate but no step before it "
+                                    f"opened a target to probe")
+                    break
+                if gates is None:
                     gates, probe_failed = gates_open(drive, session_id)
                     if probe_failed:
                         failures.append(probe_failed)
@@ -754,12 +762,21 @@ def verify_task(drive, task):
                 if not (gates or {}).get(need):
                     notes.append(f"    SKIPPED {step['tool']}: {GATES[need]}")
                     continue
+            opened = set(drive.OPENED)
             result, text, error = run_step(drive, step, session_id)
             if step.get("session") == "open":
                 # **Read before the error is acted on**, through the driver's own helper: an opener
                 # that registered a session and then failed reports the only handle that can reach
                 # it inside the error, and dropping it leaves a worker holding a dump.
                 session_id = drive.opened_session(result) or session_id
+                if not session_id and error and error.startswith("transport"):
+                    # **Ambiguous, not failed** - the same reasoning as the driver's own call path,
+                    # reusing its machinery rather than restating it. The request may have reached
+                    # the server and opened a target before the answer went missing, and nothing
+                    # else will ever name that handle. Bounded by the startup snapshot, so a
+                    # session belonging to another run is not adopted and not ended.
+                    drive.reconcile_opened()
+                    session_id = next((s for s in drive.OPENED if s not in opened), None)
             if error:
                 failures.append(f"{step['tool']}: {error}")
                 continue
@@ -827,6 +844,11 @@ def verify_against(drive, suite, tasks):
     if wanted - served:
         raise SystemExit(f"this credential is not served {', '.join(sorted(wanted - served))}; "
                          "verifying the key needs the whole surface, not a narrowed one")
+
+    # **Before anything is opened**, because the reconciliation above is bounded by it: without a
+    # baseline it would adopt - and then end - whatever this credential already held, which on a
+    # shared token is somebody else's target.
+    drive.snapshot_existing()
 
     unpinned = [t["id"] for t in tasks if not t.get("verify")]
     if unpinned:

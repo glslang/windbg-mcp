@@ -209,7 +209,7 @@ WINDBG_MCP_URL=http://127.0.0.1:8766/ WINDBG_MCP_TOKEN=<the full surface's token
 ```
 
 It opens each dump itself, calls the tools a model would call, and checks every pinned value.
-Eight things it catches, each of which is a way the key rots without anything looking wrong:
+Nine things it catches, each of which is a way the key rots without anything looking wrong:
 
 | What moved | How it reads |
 | --- | --- |
@@ -220,6 +220,7 @@ Eight things it catches, each of which is a way the key rots without anything lo
 | a key, wrong — a group edited to something the server does not say | `group 1 (access_violation) is in nothing this task pinned - the server answers 0x13a, kernel_mode_heap_corruption` |
 | a key, too permissive — a group that also accepts something else | `group 1 also accepts access_violation, which is no spelling of anything this task pinned` |
 | a relation whose fact went — the pin a `states` group rests on was deleted | `group 0 (...) is a relation over matched, which this task no longer pins` |
+| a binding — a gated step ordered before the step that opens its target | `crash_triage needs the kernel_symbols gate but no step before it opened a target to probe` |
 | a tool — `decode_ioctl` stopped saying `METHOD_NEITHER` | `decode_ioctl @text has 'METHOD_NEITHER': not in the answer's text` |
 
 **The binding carries the inputs, which is the half the suite used to lack.** `expect` says what an
