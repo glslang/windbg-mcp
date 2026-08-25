@@ -4218,15 +4218,20 @@ fn primary_module(
 /// The opener's diagnostic with the summary rendered under it.
 ///
 /// Three lines at most, and each is there because it answers a question its reader would otherwise
-/// spend a whole tool call on: which bug check this dump is (and that `crash_triage` reads the rest
-/// of it), and where the target's own image is loaded — with the pointer to `modules` for the table
-/// that used to arrive here unasked.
+/// spend a whole tool call on: which bug check this dump is, and where the target's own image is
+/// loaded.
+///
+/// **The pointers to the tools that read the rest are not here**, though they used to be: a worker
+/// serves one session and knows nothing of the client's surface, so a sentence naming `modules`
+/// reached an eleven-tool caller that cannot call it — the same defect items 40 and 41 removed from
+/// the instructions and the descriptions, surviving in the one channel nobody had scanned. They are
+/// appended by [`crate::server::WindbgServer::annotated_report`], from this same summary, and only
+/// where the surface serves the tool named.
 fn summary_text(diagnostic: &str, summary: &structured::TargetSummary) -> String {
     let mut lines: Vec<String> = Vec::new();
     if let Some(bug_check) = &summary.bug_check {
         lines.push(format!(
-            "Bug check {}{}, parameters {}.\n  `crash_triage` reads it as fields, with the \
-             crashing stack and the module each frame belongs to.",
+            "Bug check {}{}, parameters {}.",
             bug_check.code,
             bug_check
                 .name
@@ -4246,15 +4251,11 @@ fn summary_text(diagnostic: &str, summary: &structured::TargetSummary) -> String
             // closes one. The table solves the same problem with a fence; a sentence cannot carry
             // a fence, so it carries the span instead.
             Some(module) => format!(
-                "{loaded} module(s) loaded, `{}` at {}; `modules` lists a page of the table and \
-                 `modules {{ \"filter\": \"<name>\" }}` answers for one.",
+                "{loaded} module(s) loaded, `{}` at {}.",
                 renderable(&module.name),
                 module.start
             ),
-            None => format!(
-                "{loaded} module(s) loaded; `modules` lists a page of the table and \
-                 `modules {{ \"filter\": \"<name>\" }}` answers for one."
-            ),
+            None => format!("{loaded} module(s) loaded."),
         });
     }
     let diagnostic = diagnostic.trim_end();
@@ -6837,9 +6838,11 @@ mod tests {
         assert!(text.contains("233 module(s) loaded"), "{text}");
         // Quoted, because the name is the target's: see `a_primary_module_cannot_rename_itself`.
         assert!(text.contains("`nt` at 0xfffff80312000000"), "{text}");
+        // The pointer to `modules` is the *server's* to add, and only for a surface that serves
+        // it: see `SUMMARY_NOTES`. What the worker owes is the count, which is the fact.
         assert!(
-            text.contains("`modules`"),
-            "the table has to be nameable on demand: {text}"
+            !text.contains("`modules`"),
+            "a worker knows no surface, so it names no tool: {text}"
         );
     }
 
@@ -6895,8 +6898,8 @@ mod tests {
             "the parameters are the half a caller reads first: {text}"
         );
         assert!(
-            text.contains("crash_triage"),
-            "two lines here, the whole crash one call away: {text}"
+            !text.contains("crash_triage"),
+            "the pointer to it is the server's, which alone knows the surface: {text}"
         );
     }
 
