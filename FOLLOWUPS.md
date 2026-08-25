@@ -2318,7 +2318,13 @@ verifier quietly querying the old one.
   gate on drift - and two blind spots in the cleanup this mode had newly come to depend on: the
   driver's `end_sessions` read a structured tool error but not a top-level protocol one, and
   `close_transport_session` printed a failed `DELETE` without reporting it. Both are fixed in the
-  driver rather than worked around here, since three callers share them.
+  driver rather than worked around here, since three callers share them. A seventh round took the
+  same rule to its end - a `symbols` that is no longer a *string* would have read as "no PDB" - and
+  found that the pins themselves were laxer than their own docstring: Python's `==` accepts
+  `False == 0` and `227.0 == 227`, so a `matched` turning from the integer `0` into `false` passed
+  the pin *and* the relation resting on it. Types are compared now. Half of that round's remedy
+  was declined: checking `symbols` against a *recognized* set would fail on a state win-kexp
+  legitimately adds, and a new symbol state is not a rotted key.
 
 **And a pin can be too tight.** The first cut pinned the `pc` register as `registers.32.value` —
 its position in the ARM64 bank, which is an engine detail rather than anything the key rests on, so

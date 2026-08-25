@@ -232,8 +232,9 @@ and matching expectations that never changed: green, and drifted. So the prompt 
 the question, and every dump the question names must be one a step opens.
 
 **Two verbs, and the difference is the server's own doing.** `is` is exact typed equality against a
-named field (`227` the integer is not `"227"` the string, and a renamed field is a failure rather
-than a pass). `has` is the grader's own `present()` over the answer's text, for a tool with no
+named field — `227` the integer is not `"227"` the string, nor `227.0` the float, nor `0` the
+boolean `False`, all of which Python's own `==` would have accepted; a renamed field is a failure
+rather than a pass. `has` is the grader's own `present()` over the answer's text, for a tool with no
 structured half to name a field in — `decode_ioctl`, which is also the one task needing no target
 at all.
 
@@ -291,7 +292,9 @@ is not a closed gate**, either: a gate that closes stands its steps down and *pa
 answering an error would turn every gated assertion into a silent no-op — it is a task failure
 instead, as is a `modules` answer carrying no module list, one whose module list is no longer a
 list, a kernel target with no `nt` in a listing filtered for it, and an `nt` record carrying no
-`symbols` field. Only "`nt` resolved, without a PDB" closes the gate. **Nothing in this mode reads a structured answer with a default** — one helper
+`symbols` field, and a `symbols` that is no longer a string. Only "`nt` resolved, without a PDB"
+closes the gate — any *other* string closes it too, since the set of symbol states can legitimately
+grow and one this verifier has not heard of is not a rotted key. **Nothing in this mode reads a structured answer with a default** — one helper
 returns a value or a reason, which is what stopped five review rounds finding the same shape in
 five places. `arm64_pc` is asserted through **both**
 routes — `registers`, which needs nothing, and frame 0, which does — because frame 0 is the route
