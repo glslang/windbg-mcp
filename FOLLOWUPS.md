@@ -2018,8 +2018,23 @@ quotes the tool the caller just asked for, and ours adds only group names — a 
 tool name is refused outright (`src/toolset.rs`) — and, for a partly-held group,
 tools the client *is* served. So the transcript covers the bodies, which is where an introduction
 could hide; the eval log covers the refusals, which are echoes by construction; a scan wanting the
-model's whole view reads both. What no route reaches is *these* two runs: nothing kept the bytes
-the driver discarded, so this one cannot be answered backwards.
+model's whole view reads both.
+
+**And a transcript scan can only over-count, which is why a null from it still means something**
+(fourth round, same reviewer). The transcript holds *both* halves of a result, and a client that
+understands structured results forwards `structuredContent` and drops the rendering — a forwarding
+policy, not protocol, which `tool_results_stay_within_their_budget` exists to keep both sides of and
+which applies to the 31 tools that have an output schema. So a name living only in the half the
+client discarded was never read by the model, and a transcript hit is a *candidate* rather than a
+sighting. It bites the two Claude Code rows and not the three ollama ones, whose driver appends the
+result's text verbatim as the tool message. The consequence is one-directional and worth stating in
+the entry that plans the scan: a **null** result from the transcript is sound, since neither half
+named anything; a **positive** has to be checked against which half that client forwarded, and
+capturing the whole `tool_result` in `claude_code_drive.py` is what would settle it without
+reproducing a policy that can change under us.
+
+What no route reaches is *these* two runs: nothing kept the bytes the driver discarded, so this one
+cannot be answered backwards.
 
 Names have to be matched the way
 `no_description_names_a_tool_the_client_cannot_call` matches them — bare if the name has an
