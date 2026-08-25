@@ -2309,7 +2309,8 @@ verifier quietly querying the old one.
   unpinned. Verified against a deliberately rotted copy of the suite: a moved fact, a renamed
   field, a repointed prompt, an ungrounded group, a group edited to something the server does not
   say, a group widened to also accept something else, a relation whose supporting pin was
-  deleted, and a stale text pin all fail — eight channels — and the clean suite passes.
+  deleted, a gated step ordered before its opener, and a stale text pin all fail — nine channels —
+  and the clean suite passes.
 
 **And a pin can be too tight.** The first cut pinned the `pc` register as `registers.32.value` —
 its position in the ARM64 bank, which is an engine detail rather than anything the key rests on, so
@@ -2334,7 +2335,9 @@ round after *that* took it one level in: a `modules` answer with no module list,
 with no `nt` in a listing filtered for it, are drift too - only "`nt` resolved, without a PDB"
 closes the gate. And a `states` group now **names the pins its relation rests on**, because claiming
 it by the step alone meant deleting the `matched` pin left the relation reported and nothing
-failing.
+failing. And a gated step with **no target to probe** - a binding reordered so it precedes its
+opener - is a binding failure rather than a closed gate, since the closed answer stands it down and
+passes.
 
 **Two lifecycle defects came in with it, both from plumbing this reimplemented rather than reused.**
 An opener that registers a session and *then* fails reports the only handle that can reach it inside

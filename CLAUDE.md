@@ -964,8 +964,8 @@ accepts without moving anything a whole-group check would see. **The gate is ask
 records an engine failing differently per dump, so a host-wide gate stands the ARM64 step down over
 a missing *x64* PDB — and **a failed probe is a task failure, not a closed gate**, because a closed
 gate stands steps down and passes; so are a `modules` answer with no module list and a target with
-no `nt`. A `states` group **names the pins its relation rests on**, so the exemption cannot outlive
-the fact underneath it. **A pin can be too
+no `nt`, as is a gated step with no target to probe. A `states` group **names the pins its relation
+rests on**, so the exemption cannot outlive the fact underneath it. **A pin can be too
 tight**: the `pc` fact was first pinned as `registers.32.value`, a position in the ARM64 bank that
 an engine may reorder without the key having rotted, so a `read` path enters a list by name
 (`registers.name=pc.value`) as well as by index. And **`tools/eval_tasks_v1.json` carries no
