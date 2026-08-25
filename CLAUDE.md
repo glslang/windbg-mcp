@@ -1055,9 +1055,16 @@ verification on [#220](https://github.com/glslang/windbg-mcp/pull/220):
 
 **The tell is that the sentence is about behaviour and the file is not open.** It is the same error
 as the eval task that started that work — answering the question the way it reads rather than the
-way it is keyed — which is worth knowing because at the time it does not feel like guessing. And it
-survives being noticed: the paragraph you are reading claimed "five review rounds" and attributed a
-three-way split to `docs/smoke-test.md`, and both were wrong until counted and re-read.
+way it is keyed — which is worth knowing because at the time it does not feel like guessing.
+
+**And it survives being noticed, which is the last thing this paragraph is for.** Its first draft
+opened "Five review rounds on #221 were all this". Five was neither: it was the *finding* count at
+that moment, written as a *round* count, and there were four rounds — by the time either was
+counted from the API rather than from my own commit subjects (which had numbered my own edits as
+rounds) there were **five rounds and six findings**, the sixth having landed while the paragraph
+was being written. The same draft also credited `docs/smoke-test.md` with the three-way symbol
+split; that file draws a two-way line — target memory against the dump's structure — and the third
+way was mine.
 
 **And this file is not linted.** `CLAUDE.md` and `FOLLOWUPS.md` are absent from CI's markdownlint
 globs (see *Local verification* above). Point the linter at them anyway and it reports ten
