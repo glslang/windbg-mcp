@@ -4218,26 +4218,36 @@ fn a_raw_execution_control_command_moves_the_target_instead_of_wedging_the_sessi
         outputs.push(format!("`{command}` -> {out:?}"));
     }
 
-    // And the same property through the typed tool, which is what a caller reaches for next.
+    // And the same property through the **typed** surface, which is what a caller reaches for
+    // next and what the issue reports as broken.
+    //
+    // A step rather than `go`, and that is a measurement rather than a preference. `go` here runs
+    // until something stops the target — and on x64 nothing does: `cmd.exe` calls `NtCreateFile`
+    // while spawning `ping` and then waits thirty seconds for it, so the `go` outlives the target
+    // and comes back `Catastrophic failure (0x8000FFFF)`. That is what DbgEng answers for a
+    // debuggee that exited during the wait, on this branch and equally with the finite wait
+    // restored (measured both ways) — a pre-existing rough edge, `FOLLOWUPS.md` item 48, and
+    // nothing this test is about. A step always completes on the next instruction, on every
+    // architecture, and is execution control just as much as `go` is.
     //
     // Not `tool_data`: its refusal quotes the debugger's error and nothing around it, and what
     // makes a failure here readable is the state the three commands above left behind.
     let where_ = debugger_state(&mut server, &session);
-    let stopped = server.call_tool("go", json!({ "session_id": &session }), TARGET_STEP);
+    let stepped = server.call_tool("step_over", json!({ "session_id": &session }), TARGET_STEP);
     assert!(
-        !is_tool_error(&stopped),
-        "`go` failed after three raw execution-control commands, each of which left the session \
-         answering `registers`. Their outputs were {outputs:?}. The session held {where_}. `go` \
-         answered {stopped}"
+        !is_tool_error(&stepped),
+        "`step_over` failed after three raw execution-control commands, each of which left the \
+         session answering `registers`. Their outputs were {outputs:?}. The session held \
+         {where_}. `step_over` answered {stepped}"
     );
-    let stop = &stopped["result"]["structuredContent"];
+    let stop = &stepped["result"]["structuredContent"];
     assert_eq!(
         stop["timed_out"], false,
-        "a `go` that reached its breakpoint must not report a bound it never hit: {stop}"
+        "a step that completed must not report a bound it never hit: {stop}"
     );
     assert!(
         stop["stopped_at"].is_string(),
-        "a `go` that stopped must say where: {stop}"
+        "a step that completed must say where: {stop}"
     );
 
     server.call_tool(

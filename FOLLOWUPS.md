@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twenty-four clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty-five clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/win-kexp#71, 2026-08-01), items 13–14 from the bounded-command coverage review
@@ -34,8 +34,9 @@ and items 45–46 from what closing it opened up: the suite's answer key is a se
 the sample dumps that nothing re-checks, so it can rot while every model goes on scoring against
 it, and a run can be graded but not *compared*, because nothing records the model weights or the
 server build it ran against (both 2026-08-25, and **both have since landed**, the same day), and
-item 47 from fixing [#226](https://github.com/glslang/windbg-mcp/issues/226), where making every
-target take the bounded wait left one target type nobody on this bench can measure (2026-08-25).
+items 47–48 from fixing [#226](https://github.com/glslang/windbg-mcp/issues/226) — where making
+every target take the bounded wait left one target type nobody on this bench can measure, and where
+an x64 CI failure turned out to be a pre-existing answer to an ordinary outcome (2026-08-25).
 Each item notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -2610,3 +2611,41 @@ recorder.
 `a_raw_execution_control_command_moves_the_target_instead_of_wedging_the_session` /
 `a_resume_that_reaches_no_stop_says_so_and_leaves_the_session_usable` in `tests/mcp_smoke.rs`,
 which are the shape a TTD one would copy.
+
+---
+
+## 48. [win-kexp + windbg-mcp] A target that exits during a `go` is reported as a catastrophic failure
+
+**What happens.** `go`, a step, or a `resume` whose debuggee exits while the engine is waiting comes
+back as `Debug command failed: Catastrophic failure (0x8000FFFF)`. That is the raw `E_UNEXPECTED`
+DbgEng answers once the wait ends with no debuggee left — reported, unchanged, for the ordinary
+outcome of running a program to completion. The *next* call then says "No active debuggee", which
+is the accurate half arriving one call too late.
+
+**Measured, and pre-existing.** `cmd.exe /c exit`, launched and then `execute_and_wait("g",
+10_000)`: `Catastrophic failure` on the first call and "No active debuggee" on the two after it —
+**identical** with the bounded wait of #226 and with the finite wait it replaced, so this is not
+that change. It was found by an x64 CI runner failing a new test where both ARM64 runners passed:
+`cmd.exe` calls `NtCreateFile` while spawning `ping` and then waits thirty seconds for it, so a
+`go` there outlives the target where on ARM64 it stops again first.
+
+**Why it was not fixed alongside #226.** The message is the small half. The real question is
+whether an exited target is an **error at all** — WinDbg treats it as a stop and prints
+`cmd.exe exited with code 0`, and the engine's output buffer holds exactly that text, which the
+`Err` path currently throws away. Answering "it is a stop" means deciding what the *session* then
+holds: a handle whose target is gone is what `changes_debug_target` and the retirement machinery
+exist to prevent, and nothing today notices a target that left without being told to. That is a
+seam worth one deliberate change rather than a message tweak smuggled into a bug fix.
+
+**What would close it.** Decide the question above first. If it stays an error, it needs a variant
+of its own carrying the exit banner, and a category (`ErrorCategory`) a caller can act on — "the
+target is gone, open a new session" rather than "something catastrophic happened". If it becomes a
+stop, the session has to be retired the way `.detach` retires it, and `session_status` has to say
+so. Either way it wants the tier that now launches a process (`launch_tier`), where the shape is
+one line: launch `cmd.exe /c exit`, `go`, read the answer.
+
+**Where it picks up.** `DebugEngine::execute_and_wait`'s tail in win-kexp's `src/dbgeng.rs`
+(`waited.map_err(DbgEngError::CommandFailed)?`), `DbgEngError::NoDebuggee` beside it, and
+`worker::resumed`. The workaround in the meantime is in
+`a_raw_execution_control_command_moves_the_target_instead_of_wedging_the_session`, which asserts
+with a step rather than a `go` and says why.

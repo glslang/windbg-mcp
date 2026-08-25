@@ -634,6 +634,14 @@ tier now does (`launch_tier`, two tests in `tests/mcp_smoke.rs`). The one target
 unmeasured on this path is **TTD replay**, because replay does not work on this host at all —
 `FOLLOWUPS.md` item 47.
 
+**And a live target has a lifetime, which is what makes a launch test different from every other
+one here.** A dump does not go away mid-test; a process does. `go` on `cmd.exe /c ping -n 30` runs
+to a breakpoint on ARM64 and to *process exit* on x64 — where `cmd` opens `ping.exe`, hits
+`NtCreateFile` once and then waits thirty seconds — and a target that exits during the wait comes
+back as `Catastrophic failure (0x8000FFFF)`, which is pre-existing (measured against both waits)
+and is `FOLLOWUPS.md` item 48. So a launch test asserts with a **step**, which completes on the
+next instruction on every architecture, unless the target's lifetime is what it is about.
+
 ## Adding a tool (`src/toolset.rs`)
 
 Two files, not one. A tool is declared in `src/server.rs` as always, and its name also goes in a
