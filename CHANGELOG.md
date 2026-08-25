@@ -10,8 +10,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **The server reports the git revision it was built from**, as semver build metadata on the
-  version it already reported: `0.11.0+g1a2b3c4`, and `-dirty` where the build inputs differ from
-  that commit. It reaches both places that carried the crate version alone and are the two a reader
+  version it already reported: `0.11.0+g1a2b3c4`, and `-dirty.<digest>` where the build inputs
+  differ from that commit — the digest, over the working-tree diff, so that two uncommitted
+  iterations on one `HEAD` are not one identity. It reaches both places that carried the crate version alone and are the two a reader
   reaches for when asking *which* build did something — MCP `serverInfo.version`, and a
   transcript's `start` record. A crate version moves only on release, so every build between two of
   them was indistinguishable, including the pairs that matter most: the behaviour a bug report or a

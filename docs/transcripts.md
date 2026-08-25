@@ -16,7 +16,8 @@ $env:WINDBG_MCP_TRANSCRIPT = "$env:USERPROFILE\.windbg-mcp\session.jsonl"
 Every record carries the format version, the run that wrote it, a sequence number, a wall clock
 and a monotonic offset. A run opens with a `start` record whose own `version` is **the build that
 wrote the file** — the crate version with the git revision it was built from appended
-(`0.11.0+g1a2b3c4`, and `-dirty` where the build inputs differed from that commit). Two builds of
+(`0.11.0+g1a2b3c4`, and `-dirty.<digest>` where the build inputs differed from that commit, the
+digest telling two uncommitted iterations apart). Two builds of
 one release are otherwise indistinguishable, which is what makes a recording hard to place months
 later; a build with no git beside it reports the bare crate version.
 The events are the tool call and its result; a session opening, changing state and being released;

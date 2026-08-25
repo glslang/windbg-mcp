@@ -956,8 +956,13 @@ so anything asserting on it is a *prefix* check - and the smoke test additionall
 revision is **there** when built from a checkout, which is the assertion that catches a `build.rs`
 that stopped running. **`build.rs`'s watch list and its dirty check are one `INPUTS` const**,
 because emitting any `rerun-if-changed` replaces Cargo's default of watching the whole package, and
-two lists would disagree about what a clean build is; `-dirty` therefore means "the build inputs
-differ from that commit", not "the tree is dirty". And **the two `/api/ps` facts are one call**
+two lists would disagree about what a clean build is; `-dirty.<digest>` therefore means "the build
+inputs differ from that commit", not "the tree is dirty", and the digest is over the diff so two
+uncommitted iterations on one `HEAD` are two identities. Git paths go through
+`rev-parse --git-path` (and the branch ref through `symbolic-ref`, since `--git-path` takes a path
+relative to the git dir and not a revision): a `git worktree` checkout has a `.git` **file**, so a
+literal `.git/HEAD` is a watched path that does not exist, which Cargo reads as always-changed and
+recompiles the crate on every no-op build. And **the two `/api/ps` facts are one call**
 (`runtime_identity`): asking twice could catch different instances and pair one model's window with
 another's digest.
 

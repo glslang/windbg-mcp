@@ -1400,7 +1400,11 @@ def matrix(log_path, tasks_file):
         # on it: a task id is not the question (`arm64_pc` has the same id under two
         # materially different wordings), and the record is the only place the wording
         # survives.
-        entry.setdefault("prompt", record.get("prompt"))
+        # **Assigned, not `setdefault`.** A draw that died writes a placeholder for every task it
+        # planned, and that placeholder already carries `prompt: None` - so a `setdefault` here
+        # kept the null and `comparable()` then read "no prompt recorded" as "comparable", pairing
+        # two different questions instead of blocking them.
+        entry["prompt"] = entry.get("prompt") or record.get("prompt")
         entry["draws"].append({"draw": draw_of(record), "seed": record.get("seed"), "mark": mark,
                                "calls": [c.get("name") for c in (record.get("calls") or [])],
                                "wall_s": record.get("wall_s"),
@@ -1490,6 +1494,14 @@ def identity(log_records):
     fields = {"run": set(), "suite": set(), "server": set(), "harness": set()}
     weights = {}
     for record in log_records:
+        if record.get("task") is None:
+            # **A cell-failure note is not a measurement and carries no identity.** `run_cell`
+            # writes it with the cell's coordinates and nothing else, so counting it here put an
+            # `unrecorded` beside the real server a current run *did* record - a partially failed
+            # cell then reading as a second, unknown build, and the whole log as one written
+            # before these fields existed.
+            fields["run"].add(record.get("run") or UNRECORDED)
+            continue
         fields["run"].add(record.get("run") or UNRECORDED)
         suite = record.get("suite") or {}
         fields["suite"].add(f"{suite.get('name')} ({suite.get('file')})" if suite else UNRECORDED)
@@ -1529,6 +1541,53 @@ def print_identity(ident, indent="  ", header=True):
             any(UNRECORDED in d for d in ident["weights"].values()):
         print(f"{indent}({UNRECORDED} is a log written before a field existed — it cannot be "
               f"filled in afterwards)")
+
+
+def cell_facts(log_records):
+    """Per cell, the two variables a run-wide identity line cannot hold.
+
+    **A surface and a served window belong to a cell, not to a log.** The grid varies both on
+    purpose, so listing them run-wide says nothing: two runs both covering `min` at three windows
+    agree at that level while a single cell moved underneath. What a comparison needs is whether
+    *this* cell got the same one twice.
+
+    Both were missing, and both had already happened here. `surface.client` is a **label**: `min`
+    was 11 tools and 8,654 B before item 41 and 11 tools and 7,732 B after, so pairing on the label
+    alone presented a surface change as a model or build comparison. And a cell that asks for no
+    window records `num_ctx: null` while the runtime serves whatever it likes, so two runs can pair
+    a 4K result against a 32K one with nothing said.
+
+    Named rather than blocked, which is the split the rest of this follows: a changed *question* is
+    not comparable at all, while a changed surface is often the very intervention a rerun exists to
+    measure — items 40, 41 and #217 each changed one and were read across two runs.
+    """
+    facts = {}
+    for record in log_records:
+        surface = record.get("surface") or {}
+        cell_id = (record.get("backend"), record.get("model"), record.get("num_ctx"),
+                   surface.get("client"))
+        entry = facts.setdefault(cell_id, {"surface": set(), "window": set()})
+        if surface.get("tools") is not None or surface.get("bytes") is not None:
+            # A cell-failure note carries the client and nothing else, so it contributes no
+            # fingerprint rather than an `unrecorded` one.
+            entry["surface"].add(f"{surface.get('tools')} tools, {surface.get('bytes')} B")
+        if record.get("served_context") is not None:
+            entry["window"].add(str(record["served_context"]))
+    return facts
+
+
+def moved_cells(old_facts, new_facts):
+    """Per cell, which of [`cell_facts`] differ between two runs — `{cell: {name: (old, new)}}`."""
+    moved = {}
+    for cell in sorted(set(old_facts) | set(new_facts)):
+        before, after = old_facts.get(cell, {}), new_facts.get(cell, {})
+        for name in ("surface", "window"):
+            was, now = sorted(before.get(name) or []), sorted(after.get(name) or [])
+            if was and now and was != now:
+                # Only when both runs recorded one: a log written before a field existed has
+                # nothing to say about it, and reporting that as a move would be an invention.
+                moved.setdefault(cell, {})[name] = (", ".join(was), ", ".join(now))
+    return moved
 
 
 def comparable(old_entry, new_entry):
@@ -1578,11 +1637,13 @@ def compare(old_path, new_path, tasks_file):
                 continue
             rows[cell][task] = {"old": old_entry["mark"], "new": new_entry["mark"],
                                 "blocked": comparable(old_entry, new_entry)}
-    identities = (identity(records(old_path)), identity(records(new_path)))
-    return order, rows, identities
+    old_records, new_records = records(old_path), records(new_path)
+    identities = (identity(old_records), identity(new_records))
+    moved = moved_cells(cell_facts(old_records), cell_facts(new_records))
+    return order, rows, identities, moved
 
 
-def print_compare(order, rows, identities, old_path, new_path):
+def print_compare(order, rows, identities, moved_by_cell, old_path, new_path):
     old_ident, new_ident = identities
     print(f"\ncomparing {old_path} -> {new_path}")
     print("\nrun identity — the uncontrolled variables, which are not the question or the surface:")
@@ -1629,6 +1690,14 @@ def print_compare(order, rows, identities, old_path, new_path):
         # At the row rather than in a header, which is the same principle as the `UNCOUNTED` line
         # beside it: a blocked pairing is a fact about those tasks, not about the comparison.
         print(f"--  not compared for {', '.join(sorted(set(tasks)))}: {reason}")
+    if moved_by_cell:
+        # Beneath the table rather than above it, because these are per cell where the identity
+        # block is per run - and named rather than blocking, for the reason `cell_facts` gives.
+        print("\ncells where something besides the question moved:")
+        for cell, moved in moved_by_cell.items():
+            label = f"{(cell[1] or '?')[:24]} {str(cell[2] or 'dflt'):>6} {cell[3] or '?'}"
+            for name, (was, now) in sorted(moved.items()):
+                print(f"  {label:<40} {name} {was} -> {now}")
 
 
 def series(log_paths, tasks_file, out_path):
@@ -1676,8 +1745,8 @@ def main():
         if len(rest) < 2:
             raise SystemExit("--compare needs two logs: the earlier one first")
         tasks_file = rest[2] if len(rest) > 2 else os.path.join(HERE, "eval_tasks.json")
-        order, rows, identities = compare(rest[0], rest[1], tasks_file)
-        print_compare(order, rows, identities, rest[0], rest[1])
+        order, rows, identities, moved = compare(rest[0], rest[1], tasks_file)
+        print_compare(order, rows, identities, moved, rest[0], rest[1])
         return
     if sys.argv[1:2] == ["--series"]:
         # `-o` names the output, because a series is a file somebody keeps rather than a sibling

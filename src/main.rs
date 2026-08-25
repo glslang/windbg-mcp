@@ -44,8 +44,8 @@ use crate::server::WindbgServer;
 
 /// What this build calls itself: the crate version, plus the git revision it was built from.
 ///
-/// `0.11.0+g1a2b3c4`, or `0.11.0+g1a2b3c4-dirty`, or a bare `0.11.0` where `build.rs` could not ask
-/// git. Reported in two places that had the crate version alone and are the two a reader reaches
+/// `0.11.0+g1a2b3c4`, or `0.11.0+g1a2b3c4-dirty.5f2a91c0` where the build inputs differ from that
+/// commit, or a bare `0.11.0` where `build.rs` could not ask git. Reported in two places that had the crate version alone and are the two a reader reaches
 /// for when asking *which* build did something: MCP `serverInfo.version`, and the `Start` record of
 /// a transcript.
 ///
