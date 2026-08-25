@@ -529,7 +529,7 @@ def reconcile_opened():
 
 
 def close_transport_session():
-    """Say goodbye to the MCP session as well as to the debug sessions.
+    """Say goodbye to the MCP session as well as to the debug sessions; `True` if it went.
 
     The revision this speaks mints an `Mcp-Session-Id`, and a run that simply stops
     leaves it resident in the server until a whole grace passes with no traffic at
@@ -542,16 +542,23 @@ def close_transport_session():
     STOP.set()
     with WIRE:
         if not SESSION:
-            return
+            return True
         req = urllib.request.Request(MCP_URL, method="DELETE")
         req.add_header("Authorization", AUTH)
         req.add_header("Mcp-Session-Id", SESSION)
+        # **Whether it closed is returned, not only printed.** A `finally` guarantees the attempt
+        # and can say nothing about the outcome, so a caller that wants to report a session left
+        # resident until the lease expires had no way to know. The drivers ignore it, as they did
+        # before; `--verify-key` does not.
+        closed = True
         try:
             with urllib.request.urlopen(req, timeout=60) as response:
                 print(f"  closed the MCP session ({response.status})")
         except Exception as e:
             print(f"  could not close the MCP session: {e}")
+            closed = False
         SESSION = None
+        return closed
 
 
 def end_sessions(sessions):
@@ -570,6 +577,16 @@ def end_sessions(sessions):
     for session in sessions:
         try:
             out = mcp("tools/call", {"name": "end_session", "arguments": {"session_id": session}})
+            if "error" in out:
+                # **A protocol error is a failure too**, and it was the one shape this read past:
+                # a top-level JSON-RPC `error` leaves no `result`, so the structured lookup below
+                # found nothing and called it a clean release. Same class as the sentence above -
+                # a caller that treats the absence of a complaint as success announces a namespace
+                # it has not got.
+                kept.append(session)
+                print(f"  could not release {session}: "
+                      f"{(out['error'] or {}).get('message', 'protocol error')}")
+                continue
             error = ((out.get("result") or {}).get("structuredContent") or {}).get("error") or {}
             category = error.get("category")
             if not error or category in ("stale_session", "worker_lost"):

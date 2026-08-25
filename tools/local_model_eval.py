@@ -570,7 +570,15 @@ def gates_open(drive, session_id):
         # of these targets has. Reporting that as "no symbols" would stand a step down over a
         # target that is not the shape this suite is about.
         return None, "the symbol probe found no `nt` in this target, which no kernel dump should"
-    return {"kernel_symbols": nt.get("symbols") in ("pdb", "dia")}, None
+    try:
+        # The same rule one level further in, and the last place it can hide: a renamed or absent
+        # `symbols` reads as `None`, which is not one of the PDB-backed states and so would have
+        # closed the gate on drift. [`field`] raises rather than defaulting, which is why the rest
+        # of this mode reads through it.
+        state = field(nt, "symbols")
+    except KeyError:
+        return None, "the `nt` record carries no `symbols`, which is drift rather than a state"
+    return {"kernel_symbols": state in ("pdb", "dia")}, None
 
 
 def run_step(drive, step, session_id):
@@ -849,17 +857,26 @@ def verify_key(tasks_file):
     try:
         # **Inside the cleanup, because the handshake is two requests.** `initialize` mints the
         # session id and `notifications/initialized` follows it; a failure between them leaves an
-        # id nothing will delete, which is the leak this `finally` is for arriving one request
+        # id nothing will delete, which is the leak this cleanup is for arriving one request
         # earlier than the first cut allowed for.
         print("MCP revision negotiated:", drive.handshake())
-        return verify_against(drive, suite, tasks)
-    finally:
-        # **The transport session is this run's too.** The revision spoken here mints an
-        # `Mcp-Session-Id`, and a run that simply stops leaves it resident until a whole grace
-        # passes with no traffic - so repeated verifications on one credential pile them up, each
-        # new request renewing the lease that would have swept them. Every path closes it,
-        # including the surface refusal below, which happens after the handshake.
+        outcome = verify_against(drive, suite, tasks)
+    except BaseException:
+        # Every abnormal exit closes it too — including the `SystemExit` a narrowed surface raises,
+        # which happens after the handshake — and then goes on being the exit it was.
         drive.close_transport_session()
+        raise
+    # **Written out rather than left to a `finally`**, because a `finally` guarantees the attempt
+    # and can say nothing about the outcome: a `DELETE` that failed left a session resident until
+    # its lease expired while the command still exited zero. The revision spoken here mints an
+    # `Mcp-Session-Id`, and repeated verifications on one credential otherwise pile them up, each
+    # new request renewing the lease that would have swept them.
+    if not drive.close_transport_session():
+        print("\nATTENTION: the MCP transport session could not be closed and stays resident until "
+              "its lease expires."
+              + (" The key itself verified." if outcome == 0 else ""))
+        return 1
+    return outcome
 
 
 def verify_against(drive, suite, tasks):
