@@ -1,6 +1,6 @@
 {
   "suite": "windbg-mcp local-model eval v2",
-  "note": "Six tasks with a mechanical answer key, read off the checked-in sample dumps with this server's own tools before any model saw them (2026-08-23). `needs` names the tool group a task cannot be answered without, which is what makes the surface axis predictive rather than decorative: `session` is in every surface whatever a spec says, `crash` is in all three of these, `inspect` in two of them, and `ioctl` only in the whole one. `expect` is a list of groups, all of which must appear in the final answer, any alternative within a group counting; `bonus` is recorded but never decides pass/fail. `possible_on` names the surfaces on which the answer key is reachable at all, which is what keeps a narrowed surface from being scored as a stupid model: on `min` three of the six tasks have no tool that can answer them. Two tasks are reachable on every surface because `open_dump`'s own summary carries the bug check and the module count - the opener is doing more work than the tool table suggests. Every prompt was re-read against its key on 2026-08-25 (`FOLLOWUPS.md` item 44), after `arm64_pc` turned out to be measuring its own wording rather than the surface: five draws of five models had failed it in all twenty-five. Only that one was reworded - the audit is recorded in the `note` of each task it found anything in - and its scores from before that date are not comparable with later ones.",
+  "note": "Six tasks with a mechanical answer key, read off the checked-in sample dumps with this server's own tools before any model saw them (2026-08-23). `needs` names the tool group a task cannot be answered without, which is what makes the surface axis predictive rather than decorative: `session` is in every surface whatever a spec says, `crash` is in all three of these, `inspect` in two of them, and `ioctl` only in the whole one. `expect` is a list of groups, all of which must appear in the final answer, any alternative within a group counting; `bonus` is recorded but never decides pass/fail. `possible_on` names the surfaces on which the answer key is reachable at all, which is what keeps a narrowed surface from being scored as a stupid model: on `min` three of the six tasks have no tool that can answer them. Two tasks are reachable on every surface because `open_dump`'s own summary carries the bug check and the module count - the opener is doing more work than the tool table suggests. Every prompt was re-read against its key on 2026-08-25 (`FOLLOWUPS.md` item 44), after `arm64_pc` turned out to be measuring its own wording rather than the surface: five draws of five models had failed it in all twenty-five. Only that one was reworded - the audit is recorded in the `note` of each task it found anything in - and its scores from before that date are not comparable with later ones. Each task also carries **`verify`**, an ordered list of `(tool, args)` steps with the values expected back, which is what `local_model_eval.py --verify-key` re-reads off the dumps (`FOLLOWUPS.md` item 45). It is the *inputs* half the suite used to lack: `expect` says what an answer must contain and nothing structured said what to call to get it, so a task pointed at another sample would have left a verifier querying the old one. `pin` is exact typed equality against a named field (`has` where a tool answers in prose alone), `grounds` names which `expect` groups those facts answer, and the prompt is checked as a *rendering* of the binding rather than its only home - every string a step sends must appear in the question, and every dump the question names must be one a step opens. **`answer_key` below is prose and nothing reads it**: `matches()` grades from `expect`, and `verify` is what is asserted. It describes the whole sample corpus, including `082126-7015-01.dmp`, which no task references and `--verify-key` therefore reports as unasserted rather than checking.",
   "tasks": [
     {
       "id": "bugcheck",
@@ -26,6 +26,51 @@
         "crash_triage",
         "session_status",
         "end_session"
+      ],
+      "verify": [
+        {
+          "tool": "open_dump",
+          "args": {
+            "path": "C:\\workspace\\windbg-mcp\\docs\\samples\\081226-2187-01.dmp"
+          },
+          "session": "open",
+          "pin": [
+            {
+              "read": "summary.bug_check.code",
+              "is": "0x13a"
+            },
+            {
+              "read": "summary.bug_check.name",
+              "is": "KERNEL_MODE_HEAP_CORRUPTION"
+            }
+          ],
+          "grounds": [
+            0,
+            1
+          ]
+        },
+        {
+          "tool": "crash_triage",
+          "args": {
+            "session_id": "$session",
+            "analyze": false,
+            "frames": 10
+          },
+          "pin": [
+            {
+              "read": "bug_check.code",
+              "is": "0x13a"
+            },
+            {
+              "read": "bug_check.name",
+              "is": "KERNEL_MODE_HEAP_CORRUPTION"
+            }
+          ],
+          "grounds": [
+            0,
+            1
+          ]
+        }
       ]
     },
     {
@@ -54,6 +99,46 @@
         "session_status",
         "end_session"
       ],
+      "verify": [
+        {
+          "tool": "open_dump",
+          "args": {
+            "path": "C:\\workspace\\windbg-mcp\\docs\\samples\\081226-2187-01.dmp"
+          },
+          "session": "open"
+        },
+        {
+          "tool": "crash_triage",
+          "args": {
+            "session_id": "$session",
+            "analyze": false,
+            "frames": 10
+          },
+          "needs": "kernel_symbols",
+          "pin": [
+            {
+              "read": "faulting_frame.module",
+              "is": "MessageManager"
+            },
+            {
+              "read": "faulting_frame.rva",
+              "is": "0x1654"
+            },
+            {
+              "read": "faulting_frame.index",
+              "is": 7
+            },
+            {
+              "read": "frames.6.symbol",
+              "is": "nt!ExFreePoolWithTag"
+            }
+          ],
+          "grounds": [
+            0,
+            1
+          ]
+        }
+      ],
       "note": "Checked against item 44's defect on 2026-08-25 and it is not the same one: 33 of the 35 recorded runs agree with the key and the two that do not are an empty answer and a closed session, so no second reading is one a model actually gives. Worth knowing anyway - `MessageManager+0x1654` is frame 7, the address the call into `nt!ExFreePoolWithTag` returns to, rather than an instruction that itself faulted. `crash_triage` names it `faulting_frame`, which is the vocabulary the question borrows."
     },
     {
@@ -75,6 +160,40 @@
         "modules",
         "session_status",
         "end_session"
+      ],
+      "verify": [
+        {
+          "tool": "open_dump",
+          "args": {
+            "path": "C:\\workspace\\windbg-mcp\\docs\\samples\\052126-34312-01.dmp"
+          },
+          "session": "open",
+          "pin": [
+            {
+              "read": "summary.modules_loaded",
+              "is": 227
+            }
+          ],
+          "grounds": [
+            0
+          ]
+        },
+        {
+          "tool": "modules",
+          "args": {
+            "session_id": "$session",
+            "limit": 1
+          },
+          "pin": [
+            {
+              "read": "loaded",
+              "is": 227
+            }
+          ],
+          "grounds": [
+            0
+          ]
+        }
       ]
     },
     {
@@ -106,6 +225,41 @@
         "modules",
         "session_status",
         "end_session"
+      ],
+      "verify": [
+        {
+          "tool": "open_dump",
+          "args": {
+            "path": "C:\\workspace\\windbg-mcp\\docs\\samples\\052126-34312-01.dmp"
+          },
+          "session": "open"
+        },
+        {
+          "tool": "modules",
+          "args": {
+            "session_id": "$session",
+            "filter": "nvhda64v.sys"
+          },
+          "pin": [
+            {
+              "read": "matched",
+              "is": 0
+            },
+            {
+              "read": "unloaded_matched",
+              "is": 26
+            },
+            {
+              "read": "unloaded.0.image_name",
+              "is": "nvhda64v.sys"
+            }
+          ],
+          "grounds": [
+            0,
+            1,
+            2
+          ]
+        }
       ]
     },
     {
@@ -130,6 +284,60 @@
         "backtrace",
         "session_status",
         "end_session"
+      ],
+      "verify": [
+        {
+          "tool": "open_dump",
+          "args": {
+            "path": "C:\\workspace\\windbg-mcp\\docs\\samples\\121524-4703-01.dmp"
+          },
+          "session": "open"
+        },
+        {
+          "tool": "registers",
+          "args": {
+            "session_id": "$session"
+          },
+          "pin": [
+            {
+              "read": "instruction_pointer",
+              "is": "0xfffff8013c65bca8"
+            },
+            {
+              "read": "registers.name=pc.value",
+              "is": "0xfffff8013c65bca8"
+            }
+          ],
+          "grounds": [
+            0
+          ]
+        },
+        {
+          "tool": "crash_triage",
+          "args": {
+            "session_id": "$session",
+            "analyze": false,
+            "frames": 3
+          },
+          "needs": "kernel_symbols",
+          "pin": [
+            {
+              "read": "frames.0.address",
+              "is": "0xfffff8013c65bca8"
+            },
+            {
+              "read": "frames.0.symbol",
+              "is": "nt!KeBugCheck2"
+            },
+            {
+              "read": "frames.0.displacement",
+              "is": "0x2e8"
+            }
+          ],
+          "grounds": [
+            0
+          ]
+        }
       ],
       "note": "`registers` is the direct route; `crash_triage` frame 0 carries the same address on this dump, which is why every surface can reach it - that half of this note is unchanged and is what argued `possible_on` should include `min`. **The prompt was reworded on 2026-08-25** (`FOLLOWUPS.md` item 44), so scores against it before that date measure a different question. It used to ask for \"the value of the pc register at the point of the crash\", which reads as the address whose execution faulted: bug check parameter 1, `0x0000019e7b820000`, also in `x24`. Thirty-two of the thirty-five recorded runs answered exactly that, and none gave the key. Both readings are defensible on this dump - `pc` is `nt!KeBugCheck2+0x2e8`, inside the bug-check path the machine reached *after* the fault - which is why the fix is the question rather than the key: widening `expect` to accept parameter 1 would let the task pass off `open_dump`'s summary alone, where the parameters already are, and it exists to check that a narrow surface reaches a *register* through `crash_triage` frame 0."
     },
@@ -159,6 +367,38 @@
       ],
       "useful_tools": [
         "decode_ioctl"
+      ],
+      "verify": [
+        {
+          "tool": "decode_ioctl",
+          "args": {
+            "code": "0x22200B"
+          },
+          "pin": [
+            {
+              "read": "@text",
+              "has": "0x0022"
+            },
+            {
+              "read": "@text",
+              "has": "0x802"
+            },
+            {
+              "read": "@text",
+              "has": "METHOD_NEITHER"
+            },
+            {
+              "read": "@text",
+              "has": "FILE_ANY_ACCESS"
+            }
+          ],
+          "grounds": [
+            0,
+            1,
+            2,
+            3
+          ]
+        }
       ]
     }
   ],
