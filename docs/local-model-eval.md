@@ -471,7 +471,7 @@ time. So every record now also carries:
 
 | Field | What it settles | Where it comes from |
 | --- | --- | --- |
-| `server` | which **build** answered — `windbg-mcp 0.11.0+g1a2b3c4` | the `initialize` result, which the handshake used to discard |
+| `server` | which **build** answered — `windbg-mcp 0.11.0+g1a2b3c4`, with `-dirty.<digest>` telling two uncommitted iterations apart | the `initialize` result, which the handshake used to discard |
 | `model_digest` | which **weights** answered, behind a mutable tag | `/api/ps`, beside the window it already reported |
 | `harness_version` | the Claude row's floor: what resolved the alias | `claude --version` |
 | `suite` | which task list the questions came from | the file the driver loaded |
@@ -509,6 +509,14 @@ qwen3.8:27b-mlx 262144 min           n -> Y    Y -> Y        Y -> Y        - -> 
 old -> new per cell-task; `(old)`/`(new)` is a cell only one run covered.
 ```
 
+A per-cell move, when there is one, prints under that legend:
+
+```text
+cells where something besides the question moved:
+  qwen3.8:27b-mlx 262144 min               surface 11 tools, 14606 B -> 11 tools, 7732 B
+  gemma4:31b-mlx 262144 min                window 262144 -> 32768
+```
+
 Those two runs were recorded before the identity fields existed, so nothing above the table names a
 moved variable — which is exactly what a pair of logs written today would not look like. The two
 lines that appear when something did move were checked against a log doctored to move them:
@@ -528,9 +536,12 @@ lines that appear when something did move were checked against a log doctored to
   printed at the **row** with its reason, which is the principle the `UNCOUNTED` line beside it
   follows. It is a floor: `expect` can move too, and a pairing predicate reading only the prompt
   catches the change the frozen suite was about and not every change there could be.
-- **Everything else is named above the table.** The build, the weights, the harness, the suite —
-  the uncontrolled variables that are *not* the question. Naming them is not a nicety: this repo
-  has three times read a moved aggregate as a controlled result, and every one was a **composition**
+- **Everything else is named.** The build, the weights, the harness and the suite go *above* the
+  table, being run-wide; the **surface fingerprint and the served window** go *beneath* it, being
+  per cell. `surface.client` is a label — `min` was 11 tools and 8,654 B before item 41 and 7,732 B
+  after — so pairing on the label alone would present a surface change as a model comparison, which
+  is the very intervention a rerun exists to measure. Naming them is not a nicety: this repo has
+  three times read a moved aggregate as a controlled result, and every one was a **composition**
   error, where the callers changed and the total held.
 
 **And a series, so history is a query rather than a re-reading.** This page accumulates a prose

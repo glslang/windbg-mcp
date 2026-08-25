@@ -2443,7 +2443,7 @@ served window and not for the `digest` beside it.
 crate version is a floor, not an identity - it moves on release, so two builds of `0.11.0` were
 indistinguishable, which is the same trap the service-image warning names in `CLAUDE.md`. `build.rs`
 now stamps the short git revision into the version the server reports, as semver build metadata
-(`0.11.0+g1a2b3c4`, `-dirty` where the build inputs differ from that commit), and the transcript's
+(`0.11.0+g1a2b3c4`, `-dirty.<digest>` where the build inputs differ from that commit), and the transcript's
 `start` record carries the same string - it had the same weakness and nothing had noticed.
 
 **Four things it needed that this entry did not anticipate.**
@@ -2453,7 +2453,20 @@ now stamps the short git revision into the version the server reports, as semver
   clean on a tree that is not is worse than no stamp. Both read one `INPUTS` const - what actually
   reaches the binary and its tests - which also gives `-dirty` a meaning that can be stated: the
   build inputs differ from that commit, and an edit under `docs/` does not make a binary a
-  different binary.
+  different binary. **And those git paths must be resolved by git**, which review caught: a
+  `git worktree` checkout has a `.git` *file*, so a literal `.git/HEAD` is a watched path that does
+  not exist - Cargo reads that as perpetually changed and recompiles the whole crate on every
+  otherwise no-op build. `rev-parse --git-path` answers in every layout, with the branch's ref name
+  from `symbolic-ref` first, since `--git-path` takes a path relative to the git directory and not
+  a revision (`--git-path @` answers `.git/@`, which is nothing - checked, after writing it the
+  wrong way).
+- **And `-dirty` alone is not an identity**, which review caught too and which is this item's own
+  argument one level below the commit: the workflow this exists for is edit, rebuild, evaluate, and
+  two iterations on one `HEAD` would stamp the same string while behaving differently. It carries a
+  digest of the working-tree diff now. The hash is hand-rolled FNV-1a rather than `DefaultHasher`
+  for a reason worth writing down - that one is explicitly not stable across Rust releases, so two
+  machines on different toolchains would tag one working tree two ways, relocating the failure
+  rather than removing it.
 - **The two version assertions had to become prefix checks, and that is a weakening** - so the
   smoke test gained one that is not: built from a git checkout, the version *must* carry a
   revision. Without it a `build.rs` that silently stopped running would leave every assertion
@@ -2463,7 +2476,21 @@ now stamps the short git revision into the version the server reports, as semver
   different instances - a record pairing one model's window with another's digest would be worse
   than either field missing. `served_context()` became `runtime_identity()`.
 - **`--compare` needed the *wording* kept per cell-task**, which `matrix()` did not carry. A task
-  id is not the question, and the record is the only place the wording survives.
+  id is not the question, and the record is the only place the wording survives. Two rounds on that
+  one: the placeholder a dead draw writes already carries `prompt: None`, so a `setdefault` froze
+  the null and `comparable()` then read "no prompt recorded" as "comparable" - pairing two
+  different questions rather than blocking them.
+- **A surface and a served window are per cell, not per run**, so the identity line could not hold
+  them and the first cut simply omitted both. `surface.client` is a *label*: `min` was 11 tools and
+  8,654 B before item 41 and 7,732 B after, so pairing on the label alone presented a surface change
+  as a model comparison - the very intervention these runs exist to measure, silently. And a cell
+  that asks for no window records `num_ctx: null` while the runtime serves what it likes. Both are
+  named per cell beneath the table now, on the same rule as everything else that is not the
+  question: weighable, so named rather than blocking.
+- **A cell-failure note carries no identity and must not contribute one.** `run_cell` writes it
+  with the cell's coordinates and nothing else, so counting it put an `unrecorded` beside the real
+  server a current run *had* recorded - a partially failed cell reading as a second, unknown
+  build.
 
 **Pairing refuses at the task, it does not annotate.** A cell pairs on `(backend, model, ctx,
 surface, task)`, but `arm64_pc` has the same id in `tools/eval_tasks_v1.json` and
@@ -2496,7 +2523,7 @@ yet.
 
 **Verified rather than described.** `/api/ps` carries `digest` beside `context_length`, measured
 against a loaded model rather than read off a document; the live listener's `serverInfo` is
-captured by the driver; the stamp reads the branch head's short revision, and gains `-dirty` after a one-line
+captured by the driver; the stamp reads the branch head's short revision, and gains `-dirty.<digest>` after a one-line
 edit under `src/` — which exercises the rerun trigger and the dirty check together; and `--compare`'s
 blocked-pairing and one-sided-cell paths were run against a doctored log. `cargo test` on the ARM64
 bench: 540 unit tests and 76 smoke tests, no new clippy warning.
