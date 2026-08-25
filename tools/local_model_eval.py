@@ -578,6 +578,15 @@ def gates_open(drive, session_id):
         state = field(nt, "symbols")
     except KeyError:
         return None, "the `nt` record carries no `symbols`, which is drift rather than a state"
+    if not isinstance(state, str):
+        # A `symbols` that is no longer a string is drift too, and the membership test below would
+        # have read it as "no PDB". The server states that it is always one - an unnamed symbol
+        # type adds a sibling `symbol_type_code` rather than turning the field into an object
+        # (`structured::SymbolState`) - which is a promise worth checking rather than assuming.
+        return None, f"the `nt` record's `symbols` is a {type(state).__name__}, not a state"
+    # **Any other string closes the gate rather than failing**, and that half of the suggestion is
+    # declined deliberately: the set of states can legitimately grow - `SymbolState::Other` exists
+    # because it does - and a symbol state this verifier has not heard of is not a rotted key.
     return {"kernel_symbols": state in ("pdb", "dia")}, None
 
 
@@ -617,7 +626,8 @@ def check_pins(step, structured, text):
 
     **Two verbs, and the difference is the server's own doing.** `is` is exact typed equality
     against a named field — the strong pin, and what a structured answer allows: `227` the integer
-    is not `"227"` the string, and a field renamed is a `KeyError` rather than a pass. `has` is
+    is not `"227"` the string (nor `227.0` the float, nor `0` the boolean `False`, which Python's
+    own `==` would have accepted), and a field renamed is a `KeyError` rather than a pass. `has` is
     [`present`] over the rendered text, for a tool with no structured half to name a field in; it
     is weaker on purpose and is used exactly once, which is once more than nothing would be.
 
@@ -645,8 +655,15 @@ def check_pins(step, structured, text):
         except KeyError:
             rows.append((read, False, "no such field in the answer", None, read))
             continue
-        ok = got == pin["is"]
-        rows.append((read, ok, "" if ok else f"answered {got!r}, pinned {pin['is']!r}", got, read))
+        # **The type as well as the value**, because Python's equality is laxer than the contract
+        # this docstring states: `False == 0`, `True == 1` and `227.0 == 227` are all true, so a
+        # `matched` that turned from the integer `0` into `false` would have passed the pin *and*
+        # the relation resting on it - a schema change of exactly the kind this exists to catch.
+        ok = type(got) is type(pin["is"]) and got == pin["is"]
+        rows.append((read, ok,
+                     "" if ok else f"answered {got!r} ({type(got).__name__}), "
+                                   f"pinned {pin['is']!r} ({type(pin['is']).__name__})",
+                     got, read))
     return rows
 
 
