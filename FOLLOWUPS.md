@@ -2291,6 +2291,17 @@ and the entry should not pretend one is obvious:
 Deciding between the first two is the work. The assertions are the easy half, and the third option
 is the one that looks easiest and is the item repeating itself.
 
+**And whatever holds the ground truth has to carry the *inputs*, not only the expectations** —
+which review found next and which defeats all three shapes as written. `expect` says what an answer
+must contain; **nothing structured says what to call to get it.** A task's dump path lives only in
+the prose `prompt`, and `useful_tools` names tools with no arguments and no order — so a verifier
+must either parse prose or hard-code the calls, and a task later pointed at a different sample
+would leave it querying the old one and matching expectations that never changed. Green, and
+drifted: this item's own failure mode, one level further down than the `answer_key` version of it.
+So the structured thing is a per-task binding of **`(tool, arguments)` to the value expected back**,
+which the verifier's calls and the task's `expect` both derive from, leaving the prompt's path a
+rendering of that binding rather than its only home.
+
 **And say which corpus is being asserted**, because the two disagree: `082126-7015-01.dmp` is in
 `answer_key` and no task references it, so a test driven off the key covers a dump the eval never
 asks about, while one driven off `tasks` covers less than the key claims. Neither is wrong; a test
