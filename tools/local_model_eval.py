@@ -511,6 +511,34 @@ def prompt_renders_binding(task):
     return complaints
 
 
+def probe(drive, tool, args, session_id, read, kind):
+    """One structured field off one call, with **every way of not getting it** reported as an error.
+
+    Returns `(value, error)`. This exists because four review rounds found the same shape in four
+    places: a value that could not be obtained read as a benign default. `or []` on a missing
+    module list closed the symbol gate; the same on a failed `session_status` produced an empty
+    ownership baseline. Each was locally a one-line fix, and the count of places was going up, so
+    the choice generating them is deleted instead — nothing here reads a structured answer with a
+    default, and a caller gets a value or a reason.
+
+    `kind` is the type the field must be, because the drift worth catching is a field that is still
+    *there* and no longer a list.
+    """
+    result, _, error = run_step(drive, {"tool": tool, "args": args}, session_id)
+    if error:
+        return None, error
+    structured = result.get("structuredContent")
+    if not isinstance(structured, dict):
+        return None, f"`{tool}` answered no structured content"
+    try:
+        value = field(structured, read)
+    except KeyError:
+        return None, f"`{tool}` answered no `{read}`, which is drift rather than an answer"
+    if not isinstance(value, kind):
+        return None, f"`{tool}` answered a `{read}` that is not a {kind.__name__}"
+    return value, None
+
+
 def gates_open(drive, session_id):
     """Which of [`GATES`] this **session's target** satisfies, asked of the engine, not assumed.
 
@@ -527,21 +555,15 @@ def gates_open(drive, session_id):
     checked the route `arm64_pc`'s `possible_on: min` rests on. The Rust tier asks per session for
     the same reason; so does this.
     """
-    result, text, error = run_step(drive, {"tool": "modules",
-                                           "args": {"session_id": session_id, "filter": "nt"}},
-                                   session_id)
+    # **A failed probe is not a closed gate**, and conflating them is the worst failure this mode
+    # can have: a gate that closes *stands steps down and passes*, so anything short of an answer
+    # would turn every gated assertion into a silent no-op and still report success. [`probe`] is
+    # what makes that impossible to get wrong here — an error, a missing `modules`, or a `modules`
+    # that is no longer a list all come back as reasons rather than as an empty table.
+    modules, error = probe(drive, "modules", {"session_id": session_id, "filter": "nt"},
+                           session_id, "modules", list)
     if error:
-        # **A failed probe is not a closed gate**, and conflating them is the worst failure this
-        # mode can have: a gate that closes *stands steps down and passes*, so a probe answering
-        # an error would turn every gated assertion into a silent no-op and still report success.
-        # The Rust tier gets this for free by panicking on a bad `modules`; this has to say it.
         return None, f"could not probe the symbol gate: {error}"
-    modules = (result.get("structuredContent") or {}).get("modules")
-    if not isinstance(modules, list):
-        # The same rule one level in: a call that *succeeded* while answering no module list is
-        # schema drift, and coercing the absence to an empty list would close the gate on it.
-        return None, ("the symbol probe answered no `modules` list, which is drift rather "
-                      "than a symbol state")
     nt = next((m for m in modules if m.get("name") == "nt"), None)
     if nt is None:
         # And so is a kernel dump with no `nt` in a listing filtered for it — the module every one
@@ -795,8 +817,11 @@ def verify_task(drive, task):
             pinned_by_step[index] = pinned
             held_by_step[index] = held
     finally:
-        if session_id:
-            drive.end_sessions([session_id])
+        # **What could not be released comes back**, and is handed to the caller rather than
+        # dropped: `end_sessions` reports a refusal as a return value, so discarding it announces a
+        # clean namespace this run has not got - a worker keeps its dump for the whole lease grace,
+        # the next run reads it as pre-existing, and the four-session cap arrives instead.
+        held = drive.end_sessions([session_id]) if session_id else []
     how, gaps = grounding(task, pinned_by_step, held_by_step, ran)
     failures.extend(gaps)
     if how:
@@ -805,7 +830,7 @@ def verify_task(drive, task):
             by_kind.setdefault(kind, []).append(str(group))
         notes.append("    grounds " + ", ".join(f"{kind}: {', '.join(groups)}"
                                                 for kind, groups in sorted(by_kind.items())))
-    return failures, notes
+    return failures, notes, held
 
 
 def verify_key(tasks_file):
@@ -845,10 +870,24 @@ def verify_against(drive, suite, tasks):
         raise SystemExit(f"this credential is not served {', '.join(sorted(wanted - served))}; "
                          "verifying the key needs the whole surface, not a narrowed one")
 
-    # **Before anything is opened**, because the reconciliation above is bounded by it: without a
-    # baseline it would adopt - and then end - whatever this credential already held, which on a
-    # shared token is somebody else's target.
-    drive.snapshot_existing()
+    # **Before anything is opened**, because the reconciliation in `verify_task` is bounded by it:
+    # without a baseline it would adopt - and then end - whatever this credential already held,
+    # which on a shared token is somebody else's target.
+    #
+    # Read through [`probe`] rather than through `drive.snapshot_existing()`, which swallows the
+    # exception, and rather than `drive.live_sessions()`, which turns a tool error into an empty
+    # list. Both are right for a driver, whose fence failing costs it a cell; here an empty
+    # baseline for the wrong reason is the difference between adopting nothing and adopting a
+    # stranger's target, so this refuses to run instead.
+    sessions, error = probe(drive, "session_status", {}, None, "sessions", list)
+    if error:
+        raise SystemExit(f"could not read this credential's existing sessions ({error}); refusing "
+                         "to run, since that baseline is the only thing keeping an ambiguous open "
+                         "from adopting and then ending another run's target")
+    drive.PRE_EXISTING.update(s["session_id"] for s in sessions if s.get("session_id"))
+    if drive.PRE_EXISTING:
+        print(f"  {len(drive.PRE_EXISTING)} session(s) already open on this credential; this run "
+              f"will neither adopt nor release them")
 
     unpinned = [t["id"] for t in tasks if not t.get("verify")]
     if unpinned:
@@ -859,10 +898,11 @@ def verify_against(drive, suite, tasks):
               f"the facts they are graded against")
         return 1
 
-    failed = {}
+    failed, leaked = {}, []
     for task in tasks:
         print(f"\n  {task['id']}")
-        failures, notes = verify_task(drive, task)
+        failures, notes, held = verify_task(drive, task)
+        leaked.extend(held)
         for note in notes:
             print(note)
         for failure in failures:
@@ -885,11 +925,20 @@ def verify_against(drive, suite, tasks):
     if failed:
         print(f"\nFAILED: {len(failed)} task(s) are graded against a fact this server no longer "
               f"reports - {', '.join(sorted(failed))}")
-        return 1
-    print(f"\nOK: every fact {len(tasks)} tasks are graded against still reads off the dumps. "
-          f"CI does not run this - re-run it after a win-kexp bump, a symbol-path change or a "
-          f"new sample.")
-    return 0
+    else:
+        print(f"\nOK: every fact {len(tasks)} tasks are graded against still reads off the dumps. "
+              f"CI does not run this - re-run it after a win-kexp bump, a symbol-path change or a "
+              f"new sample.")
+    if leaked:
+        # **Retried once, then said out loud.** A target this run opened and could not release is
+        # not a wrong answer about the key - the verdict above stands - but it is the next run's
+        # problem, and silence about it is what the exit code is for.
+        leaked = drive.end_sessions(list(dict.fromkeys(leaked)))
+    if leaked:
+        print(f"\nATTENTION: {len(leaked)} session(s) this run opened are still attached "
+              f"({', '.join(leaked)}). They hold their targets until the lease grace expires, and "
+              f"the next run will read them as pre-existing.")
+    return 1 if failed or leaked else 0
 
 
 def grade_record(record, task, surface_names):

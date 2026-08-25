@@ -289,8 +289,11 @@ so a gate taken off the first opener could stand the ARM64 step down because an 
 missing, and report success without checking the route `arm64_pc` depends on. **A probe that fails
 is not a closed gate**, either: a gate that closes stands its steps down and *passes*, so a probe
 answering an error would turn every gated assertion into a silent no-op — it is a task failure
-instead, as is a `modules` answer carrying no module list, or a kernel target with no `nt` in a
-listing filtered for it. Only "`nt` resolved, without a PDB" closes the gate. `arm64_pc` is asserted through **both**
+instead, as is a `modules` answer carrying no module list, one whose module list is no longer a
+list, and a kernel target with no `nt` in a listing filtered for it. Only "`nt` resolved, without a
+PDB" closes the gate. **Nothing in this mode reads a structured answer with a default** — one helper
+returns a value or a reason, which is what stopped five review rounds finding the same shape in
+five places. `arm64_pc` is asserted through **both**
 routes — `registers`, which needs nothing, and frame 0, which does — because frame 0 is the route
 the task's `possible_on: min` depends on and `registers` alone would not be checking it.
 

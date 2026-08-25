@@ -2310,7 +2310,10 @@ verifier quietly querying the old one.
   field, a repointed prompt, an ungrounded group, a group edited to something the server does not
   say, a group widened to also accept something else, a relation whose supporting pin was
   deleted, a gated step ordered before its opener, and a stale text pin all fail — nine channels —
-  and the clean suite passes.
+  and the clean suite passes. Five rounds found one shape — a value that could not be obtained read
+  as a benign default — in five places, so the choice generating it was deleted rather than patched
+  a fifth time: one helper reads a structured field and answers a value or a reason, and nothing in
+  this mode carries an `or []`.
 
 **And a pin can be too tight.** The first cut pinned the `pc` register as `registers.32.value` —
 its position in the ARM64 bank, which is an engine detail rather than anything the key rests on, so
@@ -2344,8 +2347,12 @@ An opener that registers a session and *then* fails reports the only handle that
 the error, and the first cut dropped the result on that path — so the target leaked, and repeated
 runs against one drift would have met the four-session cap instead of reporting the drift;
 `local_model_drive.opened_session` already reads both places that handle can be, and is now what
-reads it. And the MCP transport session was never closed, so repeated verifications piled up on the
-listener until the lease grace. Both are the same shape as the accumulation rule in `CLAUDE.md`,
+reads it — and an opener whose *answer went missing* may have opened a target too, so the driver's
+`reconcile_opened` handles that ambiguity here as it does there, which in turn made the ownership
+baseline load-bearing: without it a reconciliation adopts, and then ends, whatever the credential
+already held. And the MCP transport session was never closed, so repeated verifications piled up on
+the listener until the lease grace; what `end_sessions` could *not* release is now retried once and
+reported, since discarding it announces a clean namespace the run has not got. Both are the same shape as the accumulation rule in `CLAUDE.md`,
 seen small: a parallel path beside one that already worked. The cleanup then had to move one
 request earlier still, since the handshake is *two* requests and a failure between them leaves an
 id nothing deletes.
