@@ -1025,6 +1025,40 @@ has gone wrong here, each of which produced a confident wrong edit or came one s
   five tests gating on those conditions, because the four are the ones opening `NATIVE_SAMPLE` and
   the fifth is deliberately separate — counting `skip` call sites would have "fixed" it wrongly.
 
+**And re-read every mechanism, for the same reason.** A number gets re-derived; a claim about *how
+something works* gets the file opened. What goes wrong is stating it from the shape of the code
+around it, from a field's name, from one backend in front of you, or from what a neighbouring rule
+does — and it is cheap to avoid, because every instance below was one `grep` or one `sed` away.
+**Six findings across five review rounds** on
+[#221](https://github.com/glslang/windbg-mcp/pull/221) were all this, and so was a wrong
+verification on [#220](https://github.com/glslang/windbg-mcp/pull/220):
+
+- **From the neighbours.** A proposed test's module counts and `pc` "need a symbol gate", because
+  the tier around them gates. `docs/smoke-test.md` already draws that line — target memory against
+  the dump's structure — and carries the measurement that settles where a *stack* falls; two rounds
+  to land, and what the entry carries now is a pointer to that file rather than a second copy of it.
+- **From a name.** A drift test was to pin `answer_key`. **Nothing reads `answer_key`** — `grep -rn`
+  finds no consumer in `tools/`, `tests/` or `src/` — because `matches()` grades from each task's
+  `expect`. The test would have stayed green while the facts models are scored against rotted.
+- **From an identifier.** A compare mode was to pair two runs on `(backend, model, ctx, surface,
+  task)` and note any suite difference above the table, while `usable()` in that same file
+  *refuses* a record whose prompt differs. The proposal was laxer than the code beside it.
+- **From one backend.** "Record the model digest on every record", generalised from the ollama
+  driver, which is the only one with an `/api/ps` to ask; `claude_code_drive.py` records a mutable
+  alias and has no equivalent to offer.
+- **From what a field is for.** `expect` was taken as ground truth for a verifier, but it holds only
+  the expected *answers* — a task's dump path lives in its prose `prompt` and `useful_tools` carries
+  no arguments, so nothing structured says what to call.
+- **From the half that agreed.** "Grades unchanged" after rewording a task, checked by running
+  `--grade` and reading the numerators, which did match. The denominators had gone 20 to 15 and
+  every row said `UNCOUNTED x5`.
+
+**The tell is that the sentence is about behaviour and the file is not open.** It is the same error
+as the eval task that started that work — answering the question the way it reads rather than the
+way it is keyed — which is worth knowing because at the time it does not feel like guessing. And it
+survives being noticed: the paragraph you are reading claimed "five review rounds" and attributed a
+three-way split to `docs/smoke-test.md`, and both were wrong until counted and re-read.
+
 **And this file is not linted.** `CLAUDE.md` and `FOLLOWUPS.md` are absent from CI's markdownlint
 globs (see *Local verification* above). Point the linter at them anyway and it reports ten
 pre-existing errors — fence and list spacing, nothing that renders wrongly — so neither a clean run
