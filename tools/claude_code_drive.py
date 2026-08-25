@@ -201,6 +201,28 @@ def one_task(task, config_path):
     return report
 
 
+def harness_version():
+    """What `claude --version` says — a **floor**, not an identity, and recorded as one.
+
+    The ollama rows get a content digest of the weights that answered (`local_model_drive`'s
+    `runtime_identity`). This row cannot: `opus` and `sonnet` are mutable aliases resolved inside a
+    client this bench does not own, and there is no `/api/ps` to ask. What *is* available is the
+    version of the harness doing the resolving, which moves when the client does and says nothing
+    about the weights behind the alias. Recording it is strictly better than recording nothing and
+    is not sufficient — the same shape as the server's crate version before `build.rs` stamped a
+    revision beside it (`FOLLOWUPS.md` item 46).
+
+    Best effort: a client that will not answer leaves the field null rather than failing the row.
+    """
+    try:
+        out = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0:
+        return None
+    return out.stdout.strip() or None
+
+
 def release_new_sessions(before):
     """End every session this credential gained while the task ran.
 
@@ -237,6 +259,7 @@ def main():
     if owned:
         scratch = tempfile.mkdtemp(prefix="windbg-eval-")
     config_path = mcp_config(scratch)
+    tasks = drive.load_tasks(sys.argv[1]) if len(sys.argv) > 1 else []
     cell = {
         "run": os.environ.get("EVAL_RUN", time.strftime("%Y%m%dT%H%M%S")),
         "backend": "claude-code",
@@ -250,10 +273,17 @@ def main():
         # (`local_model_drive.SEED`), so no row here replays one. The grader reads `draw` from
         # both backends and `seed` from neither.
         "seed": None,
+        # **Null rather than absent here too, and for the same kind of reason.** The ollama rows
+        # record the digest of the weights that answered; an alias resolved inside `claude` has no
+        # such address to offer, and leaving the field out would make this row's ambiguity look
+        # like a field nobody thought to record. `harness_version` is what this row *can* say.
+        "model_digest": None,
+        "harness_version": harness_version(),
+        "server": dict(drive.SERVER_INFO) or None,
+        "suite": dict(drive.SUITE) or None,
         "surface": {"client": os.environ.get("EVAL_SURFACE", ""), "tools": len(tools),
                     "bytes": surface_bytes, "names": sorted(t["name"] for t in tools)},
     }
-    tasks = drive.load_tasks(sys.argv[1]) if len(sys.argv) > 1 else []
     try:
         for i, task in enumerate(tasks, 1):
             prompt = task["prompt"] if isinstance(task, dict) else task

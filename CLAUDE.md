@@ -943,6 +943,24 @@ disk, and has been answered right once ever — qwen, in the original grid, reas
 gives the bug check's parameter 1 instead — the address whose execution faulted. **A task that fails
 everywhere is a task to read, not a model to blame.**
 
+**A run records what it ran against, and that is what makes two of them comparable** (item 46).
+Every record carries `server` (the build that answered), `model_digest` (the weights behind a
+mutable ollama tag), `suite`, and `harness_version` for the Claude rows, which can have no digest -
+`opus` and `sonnet` are aliases resolved inside a client this bench does not own. `--compare` reads
+two logs with **two rules that are not one rule**: a *changed question* blocks a pairing (via
+`stale_prompt`, printed at the row), while a changed build, model or window is *named above the
+table* for a reader to weigh - conflating them is how a moved aggregate gets read as a controlled
+result. `--series` reduces logs to one row per run in `docs/eval-runs.json`. Three things bite.
+**The server's version now carries its git revision** (`0.11.0+g1a2b3c4`), stamped by `build.rs`,
+so anything asserting on it is a *prefix* check - and the smoke test additionally asserts the
+revision is **there** when built from a checkout, which is the assertion that catches a `build.rs`
+that stopped running. **`build.rs`'s watch list and its dirty check are one `INPUTS` const**,
+because emitting any `rerun-if-changed` replaces Cargo's default of watching the whole package, and
+two lists would disagree about what a clean build is; `-dirty` therefore means "the build inputs
+differ from that commit", not "the tree is dirty". And **the two `/api/ps` facts are one call**
+(`runtime_identity`): asking twice could catch different instances and pair one model's window with
+another's digest.
+
 **The key is a snapshot, and `--verify-key` is what re-takes it** (item 45). The six tasks are
 graded against facts read off the checked-in dumps with this server's own tools, so a fact that
 stops being what the server reports leaves the suite grading and every model scoring against

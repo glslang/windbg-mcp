@@ -33,7 +33,7 @@ all twenty-five turned out to be failing at its own wording (2026-08-25, **lande
 and items 45–46 from what closing it opened up: the suite's answer key is a set of facts read off
 the sample dumps that nothing re-checks, so it can rot while every model goes on scoring against
 it, and a run can be graded but not *compared*, because nothing records the model weights or the
-server build it ran against (both 2026-08-25; **item 45 has since landed**, the same day). Each item notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
+server build it ran against (both 2026-08-25, and **both have since landed**, the same day). Each item notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
 Items are roughly ordered by how soon they're worth doing, within each cluster. **Item 10 has
@@ -64,6 +64,10 @@ which is a judgement nothing has measured, and the entry now records what would 
 that proposed it: `expect` turned out not to be *derivable* from a binding — two of one task's
 groups are phrasings of a relation rather than strings the server prints — a tool with no
 structured half needed a second verb, and the ratchet is the coverage rule rather than any pin.
+**Item 46 has landed** (2026-08-25) and is kept for the decision it deferred and the entry now
+records: this server *does* report a build revision, stamped by a `build.rs` whose watch list and
+dirty check have to be one list or they disagree — which is the sort of thing an entry proposing
+"record a build SHA" cannot see from where it is written.
 
 ## 1. [win-kexp] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -2407,87 +2411,102 @@ deliberately carries **no** binding — it is the wording published logs were gr
 mode refuses it by name rather than skipping it quietly.
 
 
-## 46. [windbg-mcp] A run can be graded but not compared, because nothing records what it ran against
+## 46. [windbg-mcp] A run can be graded but not compared, because nothing records what it ran against — **done** (2026-08-25)
 
 **Re-running a cell is the point, not a hazard.** As models are updated the same question on the
 same surface will be asked again, and what will matter is run N against run N-1 - the frozen suite
 (#220) exists so a *reworded question* cannot silently un-grade its own history, which is a
 different thing from discouraging a rerun. A rerun into a new log with a new plan is exactly what
-this bench is for. What it cannot do today is **compare two of them**.
+this bench is for. What it could not do was **compare two of them**.
 
-**A record identifies the question and the surface, and neither of the two things that change over
-time.** It carries `prompt` (the question identity #220 leaned on), `surface` with its client,
-tool count, byte size and names, plus `served_context`, `seed` and `draw`. It does not carry which
+**A record identified the question and the surface, and neither of the two things that change over
+time.** It carried `prompt` (the question identity #220 leaned on), `surface` with its client, tool
+count, byte size and names, plus `served_context`, `seed` and `draw`. It did not carry which
 *model weights* answered or which *server build* was asked.
 
 - **The model is a mutable tag.** `qwen3.8:27b-mlx` is a name that can be re-pulled onto different
   weights, so two runs a month apart can agree on every recorded field and have been different
   models. This is the axis the whole comparison is about.
-- **The server build is absent entirely.** `surface.bytes` is a real fingerprint of the tool prose
+- **The server build was absent entirely.** `surface.bytes` is a real fingerprint of the tool prose
   and did move when item 41 landed (8,654 -> 7,732 on `min`), but it is a fingerprint of one
   channel: [#217](https://github.com/glslang/windbg-mcp/pull/217) changed an **opener's result**,
-  which no tool-list byte count can see. So the field that looks like a build identity is silent on
-  exactly the channel the last three findings were about.
+  which no tool-list byte count can see. So the field that looked like a build identity was silent
+  on exactly the channel the last three findings were about.
 
-**Both facts are already on the wire and already parsed, and both are thrown away** - which is the
-same shape as the `served_context` lesson and should be read the same way:
+**What closed it.** Identity fields on every record - `server`, `model_digest`, `suite`, and
+`harness_version` for the row that can have no digest - plus `--compare` over two logs and
+`--series` over any number of them. Both facts were already on the wire and both were being thrown
+away: the handshake kept `protocolVersion` and dropped `serverInfo`, and `/api/ps` was read for the
+served window and not for the `digest` beside it.
 
-- `local_model_drive.py:served_context()` calls `/api/ps` and reads `context_length` off the
-  matching entry. That response also carries the model's **`digest`**, which is a content address
-  rather than a name. **This is the ollama rows only**, and the entry should not have implied
-  otherwise: `claude_code_drive.py` records `"model": MODEL` — `opus`, `sonnet` — which are
-  mutable aliases resolved inside a client this bench does not own, and there is no `/api/ps` to
-  ask. So the two control rows keep the ambiguity the digest removes from the other three, and
-  what is available to them (the `claude` CLI version, the alias as written) is a floor rather
-  than an identity. That file already has the right habit for this: its `seed` is `None` with a
-  comment saying why the row cannot have one, which is what a null digest should look like beside
-  it rather than an absent field. Naming a real version source for a Claude row is open, and
-  scoping the claim to what can actually be recorded is the minimum.
-- The handshake at `local_model_drive.py:264` returns `out["result"]["protocolVersion"]` and drops
-  the rest of the `initialize` result - including `serverInfo.version`, which this server does
-  send (`src/server.rs`, `with_server_info(... env!("CARGO_PKG_VERSION") ...)`).
+**And the decision this entry said *was* the item: yes, this server reports a build revision.** A
+crate version is a floor, not an identity - it moves on release, so two builds of `0.11.0` were
+indistinguishable, which is the same trap the service-image warning names in `CLAUDE.md`. `build.rs`
+now stamps the short git revision into the version the server reports, as semver build metadata
+(`0.11.0+g1a2b3c4`, `-dirty` where the build inputs differ from that commit), and the transcript's
+`start` record carries the same string - it had the same weakness and nothing had noticed.
 
-**But the crate version is a floor, not an identity**, and the entry should not pretend otherwise:
-it moves on release, so two builds of one version are indistinguishable - the same trap the
-service-image warning already names in `CLAUDE.md`. Recording it is strictly better than recording
-nothing and is not sufficient; a build SHA would be, and that means deciding whether this server
-reports one. That decision is the item, not the two lines that record what is already there.
+**Four things it needed that this entry did not anticipate.**
 
-**What would close it.** Identity fields on every record - model digest where one exists, server
-version (or SHA), suite id - and a **compare mode** over two logs, with two rules that are not the
-same rule.
+- **A build script that names git files loses Cargo's default of watching the whole package**, so
+  the watch list and the dirty check have to be *the same list* or they disagree: a stamp saying
+  clean on a tree that is not is worse than no stamp. Both read one `INPUTS` const - what actually
+  reaches the binary and its tests - which also gives `-dirty` a meaning that can be stated: the
+  build inputs differ from that commit, and an edit under `docs/` does not make a binary a
+  different binary.
+- **The two version assertions had to become prefix checks, and that is a weakening** - so the
+  smoke test gained one that is not: built from a git checkout, the version *must* carry a
+  revision. Without it a `build.rs` that silently stopped running would leave every assertion
+  passing on the bare crate version, which is the legitimate tarball answer.
+- **The two `/api/ps` facts are one call, not two.** This entry treated the digest as a second
+  field to read; it is the same question about the same live state, and two calls could catch
+  different instances - a record pairing one model's window with another's digest would be worse
+  than either field missing. `served_context()` became `runtime_identity()`.
+- **`--compare` needed the *wording* kept per cell-task**, which `matrix()` did not carry. A task
+  id is not the question, and the record is the only place the wording survives.
 
 **Pairing refuses at the task, it does not annotate.** A cell pairs on `(backend, model, ctx,
-surface, task)`, but a task id is not the question: `arm64_pc` has the same id in
-`tools/eval_tasks_v1.json` and `tools/eval_tasks.json` and a materially different prompt, so
-pairing on id would put two distributions side by side that #220 established are not comparable -
-and would be *weaker than the grader already is*, since `usable()` refuses such a record outright.
-The predicate for this already exists and has a home: `stale_prompt`, split out of `usable` in
-#220 so the reason could be named rather than restated. A compare mode reuses it and renders that
-row as incomparable with the reason, at the row rather than in a header - which is the same
-principle as the `UNCOUNTED` line beside it. (`expect` can move too; a pairing predicate that
-reads only the prompt is a floor.)
+surface, task)`, but `arm64_pc` has the same id in `tools/eval_tasks_v1.json` and
+`tools/eval_tasks.json` and a materially different prompt, so pairing on the id would put two
+distributions side by side that #220 established are not comparable - and would be *weaker than the
+grader already is*, since `usable()` refuses such a record outright. It reuses `stale_prompt`, the
+predicate split out of `usable` in #220 so the reason could be named, and renders the row as `--`
+with that reason beneath the table - the same principle as the `UNCOUNTED` line beside it. It is a
+floor: `expect` can move too, and a pairing predicate that reads only the prompt does not see that.
 
 **The run-identity line is for what is left**, and that is its actual job: the uncontrolled
-variables that are *not* the question - model weights, server build, served window. Naming them
+variables that are *not* the question - model weights, server build, harness, suite. Naming them
 above the table is not a nicety, because this repo has three times read a moved aggregate as a
 controlled result (items 42 and 43, and twice in
 [#212](https://github.com/glslang/windbg-mcp/pull/212)), and every one was a *composition* error -
 the callers changed and the total held. But a note is the right instrument only for a variable a
-reader can weigh. A changed question is not one of those; it blocks the comparison.
+reader can weigh; a changed question is not one of those, which is why the two rules are separate.
 
 **And the reporting is the other half.** `docs/local-model-eval.md` accumulates a prose section per
-run, which reads well and cannot be diffed: the three tables in it measure three different servers,
-which the page says in words and no reader can check. A machine-readable series - one row per run,
-keyed by the identity above - is what makes "comparison with historic data" a query rather than a
-re-reading.
+run, which reads well and cannot be diffed: the tables in it measure different servers, which the
+page says in words and no reader can check. `docs/eval-runs.json` is the machine-readable series,
+one row per run keyed by the identity above, regenerated rather than appended to so a log re-graded
+under a corrected key updates its own row.
 
-**Why deferred.** Nothing already published is wrong, because each write-up names its own server
-build in prose; what is missing is the ability to *check* that, and to do it for a run nobody has
-written up yet. It wants doing before the next model refresh rather than after, since a run
-recorded without identity cannot have it added later - which is the one part of this that expires.
+**The three runs already in that series read `unrecorded` for every identity field**, which is the
+part of this that expires rather than an omission: a run recorded without identity cannot have it
+added later. Nothing already published is wrong - each write-up names its own server build in prose
+- and what was missing is the ability to *check* that, and to do it for a run nobody has written up
+yet.
 
-**Where it picks up.** `tools/local_model_drive.py` - `served_context()` and the handshake, both of
-which already make the call that carries the fact; `tools/local_model_eval.py` for the compare mode
-beside `--grade` and `--matrix`; and `docs/local-model-eval.md` for what a versioned report looks
-like.
+**Verified rather than described.** `/api/ps` carries `digest` beside `context_length`, measured
+against a loaded model rather than read off a document; the live listener's `serverInfo` is
+captured by the driver; the stamp reads the branch head's short revision, and gains `-dirty` after a one-line
+edit under `src/` — which exercises the rerun trigger and the dirty check together; and `--compare`'s
+blocked-pairing and one-sided-cell paths were run against a doctored log. `cargo test` on the ARM64
+bench: 540 unit tests and 76 smoke tests, no new clippy warning.
+
+**Left open.** Naming a real version source for a Claude row. `harness_version` is `claude
+--version`, which moves when the client does and says nothing about the weights behind `opus` or
+`sonnet` - a floor, recorded as one, exactly as the crate version was before `build.rs`.
+
+**Where it picks up.** `build.rs` and `src/main.rs`'s `BUILD_VERSION`;
+`tools/local_model_drive.py` (`handshake`, `runtime_identity`, `load_tasks`) and
+`tools/claude_code_drive.py`; `tools/local_model_eval.py` for `identity`, `--compare` and
+`--series`; and `docs/local-model-eval.md` beside `docs/eval-runs.json`.
+

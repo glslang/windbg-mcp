@@ -165,6 +165,17 @@ AUTH = bearer()
 SCENARIO = bool(os.environ.get("WINDBG_MCP_SCENARIO"))
 SESSION = None
 
+# **What this run was asked against, kept rather than discarded.** A record used to identify the
+# question and the surface and neither of the two things that change over *time* - which weights
+# answered, and which build was asked (`FOLLOWUPS.md` item 46). Both were already on the wire and
+# both were thrown away: the `initialize` result carries `serverInfo`, and `/api/ps` carries the
+# model's content digest beside the window it reports. A run recorded without them cannot have them
+# added later, which is the one part of this that expires.
+#
+# Dicts rather than scalars, filled in place, so the readers below need no `global`.
+SERVER_INFO = {}
+SUITE = {}
+
 # One request at a time on this MCP session: the keepalive below runs on its own thread,
 # and two requests sharing `SESSION` would race over the header it may hand back.
 WIRE = threading.Lock()
@@ -255,13 +266,26 @@ def keepalive():
 
 
 def handshake():
+    """Open the MCP session, and **keep the half of the answer this used to drop**.
+
+    The negotiated revision was all this returned; `serverInfo` went in the bin with the rest of the
+    result. That is the server's own identity - `windbg-mcp` at `0.11.0+g1a2b3c4` since the version
+    carries the git revision it was built from - and it is the field a comparison of two runs needs
+    most, because the behaviour that moves between them is often a changed *result* rather than a
+    changed API: no tool count and no surface byte count can see one.
+
+    Both drivers reach it through this function, so the two rows record the server the same way.
+    """
     out = mcp("initialize", {
         "protocolVersion": REVISION,
         "capabilities": {},
         "clientInfo": {"name": "local-model-drive", "version": "1"},
     })
     mcp("notifications/initialized", notify=True)
-    return out["result"]["protocolVersion"]
+    result = out["result"]
+    SERVER_INFO.clear()
+    SERVER_INFO.update(result.get("serverInfo") or {})
+    return result["protocolVersion"]
 
 
 def ollama(path, body=None):
@@ -628,8 +652,12 @@ def load_tasks(path):
     """
     with open(path, encoding="utf-8") as f:
         loaded = json.load(f)
+    SUITE.clear()
     if isinstance(loaded, list):
+        # A bare list has no identity to record, and saying so is not the same as saying nothing:
+        # a record whose `suite` is null ran against a task list that never had a name.
         return loaded
+    SUITE.update({"name": loaded.get("suite"), "file": os.path.basename(path)})
     tasks = loaded["tasks"]
     subset = os.environ.get("EVAL_SUBSET", "")
     if subset:
@@ -640,21 +668,35 @@ def load_tasks(path):
     return tasks
 
 
-def served_context():
-    """What the runtime is actually serving this model, which is not what it could serve.
+def runtime_identity():
+    """What the runtime is serving this model, and **which weights** are serving it.
 
-    Asked rather than assumed for the reason `docs/local-model.md` gives: the default
-    `OLLAMA_CONTEXT_LENGTH` picks 4k, 32k or 256k from the box's memory, so a model whose
-    card says 262144 is routinely served far less. Best effort — a runtime that does not
-    report it leaves the field null rather than failing a run over telemetry.
+    Two facts off one `/api/ps`, because they are one question asked of one live state: a second
+    call could catch a different instance, and a record pairing one model's window with another's
+    digest would be worse than either field missing.
+
+    - `served_context` is not what the model *could* serve. `docs/local-model.md` has the reason:
+      the default `OLLAMA_CONTEXT_LENGTH` picks 4k, 32k or 256k from the box's memory, so a model
+      whose card says 262144 is routinely served far less - and a request's `num_ctx` does not
+      shrink an instance the runtime already holds, which is the contamination this field caught.
+    - `model_digest` is the content address of the weights. `qwen3.8:27b-mlx` is a *mutable tag*:
+      it can be re-pulled onto different weights, so two runs a month apart can agree on every
+      other recorded field and have been different models - which is the axis a comparison of two
+      runs is entirely about. This is the ollama rows only; `claude_code_drive.py` records a
+      mutable alias and has no `/api/ps` to ask (`FOLLOWUPS.md` item 46).
+
+    Best effort - a runtime that does not report either leaves the field null rather than failing a
+    run over telemetry.
     """
+    blank = {"served_context": None, "model_digest": None}
     try:
         for loaded in ollama("/api/ps").get("models", []):
             if loaded.get("name") == MODEL or loaded.get("model") == MODEL:
-                return loaded.get("context_length")
+                return {"served_context": loaded.get("context_length"),
+                        "model_digest": loaded.get("digest")}
     except Exception:  # noqa: BLE001 - a missing figure must not end a run
-        return None
-    return None
+        return blank
+    return blank
 
 
 def write_record(record):
@@ -730,6 +772,11 @@ def main():
         "num_ctx": NUM_CTX or None,
         "draw": DRAW,
         "seed": SEED,
+        # The two identity fields that are constant for a cell: which build was asked, and which
+        # task list it was asked from. The third - which weights answered - is read per task, since
+        # it is a property of the instance the runtime happened to have loaded.
+        "server": dict(SERVER_INFO) or None,
+        "suite": dict(SUITE) or None,
         "surface": {"client": os.environ.get("EVAL_SURFACE", ""),
                     "tools": len(tools), "bytes": surface,
                     "names": sorted(t["name"] for t in tools)},
@@ -742,7 +789,7 @@ def main():
             transcript, report = run(task, offered, transcript)
             # Read *after* the first turn: nothing is loaded before one, so asking earlier
             # reports the previous model's window or nothing at all.
-            record = dict(cell, served_context=served_context(), **report)
+            record = dict(cell, **runtime_identity(), **report)
             if NUM_CTX and record["served_context"] and record["served_context"] != NUM_CTX:
                 # Loudly, because it is invisible otherwise and it invalidates the cell: a
                 # request's `num_ctx` does not shrink an instance the runtime already holds.

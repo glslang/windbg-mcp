@@ -190,7 +190,7 @@ impl Recorder {
             request: AtomicU64::new(0),
         })));
         recorder.write(Event::Start {
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: crate::BUILD_VERSION.to_string(),
             pid: std::process::id(),
             field_limit: limit,
             schema: SCHEMA,
