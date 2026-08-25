@@ -943,6 +943,25 @@ disk, and has been answered right once ever — qwen, in the original grid, reas
 gives the bug check's parameter 1 instead — the address whose execution faulted. **A task that fails
 everywhere is a task to read, not a model to blame.**
 
+**The key is a snapshot, and `--verify-key` is what re-takes it** (item 45). The six tasks are
+graded against facts read off the checked-in dumps with this server's own tools, so a fact that
+stops being what the server reports leaves the suite grading and every model scoring against
+nothing — a key that has rotted looks exactly like a model that got worse. Each task carries a
+`verify` binding of `(tool, args)` steps to the values expected back, and
+`WINDBG_MCP_TOKEN=<full surface> python3 tools/local_model_eval.py --verify-key` re-reads the lot.
+Four things bite when touching it. **It is a command, not a CI gate**, and that is the decision
+rather than an omission: the oracle is `present()`, so a Rust test would need a second copy of
+three rules each learned from a wrong verdict — run it after a `win-kexp` bump, a symbol-path
+change or a new sample. **The binding grounds `expect`, it does not generate it**: two of
+`unloaded_driver`'s three groups are phrasings of a *relation* (`matched: 0` is what "not loaded"
+means), so a run reports each group as `value`, `relation` or `skipped`, and only a group **no**
+step grounds is a failure — that coverage rule is the ratchet, not the pins. **A pin can be too
+tight**: the `pc` fact was first pinned as `registers.32.value`, a position in the ARM64 bank that
+an engine may reorder without the key having rotted, so a `read` path enters a list by name
+(`registers.name=pc.value`) as well as by index. And **`tools/eval_tasks_v1.json` carries no
+binding on purpose** — it is the wording published logs were graded against — so the mode refuses
+it by name rather than skipping it.
+
 **Re-run against item 41** (2026-08-24): unserved calls 14 -> 6, with `debug_batch` going 10 -> 0
 and every name this server was teaching now gone. What that re-run mostly taught is **how easy it
 is to over-read at n=1, in a file that already says so**. Two claims had to be pulled back after

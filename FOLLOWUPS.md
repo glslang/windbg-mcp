@@ -33,7 +33,7 @@ all twenty-five turned out to be failing at its own wording (2026-08-25, **lande
 and items 45–46 from what closing it opened up: the suite's answer key is a set of facts read off
 the sample dumps that nothing re-checks, so it can rot while every model goes on scoring against
 it, and a run can be graded but not *compared*, because nothing records the model weights or the
-server build it ran against (both 2026-08-25). Each item notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
+server build it ran against (both 2026-08-25; **item 45 has since landed**, the same day). Each item notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
 Items are roughly ordered by how soon they're worth doing, within each cluster. **Item 10 has
@@ -60,6 +60,10 @@ it — plus one of its own sentences turned out to be false on this bench, which
 **Item 44 has landed** (2026-08-25) and is kept because its own proposed wording was not the wording
 that shipped: closing the reading it identified needed the prompt to say what the answer is *not*,
 which is a judgement nothing has measured, and the entry now records what would settle it.
+**Item 45 has landed** (2026-08-25) and is kept because three things it needed are not in the entry
+that proposed it: `expect` turned out not to be *derivable* from a binding — two of one task's
+groups are phrasings of a relation rather than strings the server prints — a tool with no
+structured half needed a second verb, and the ratchet is the coverage rule rather than any pin.
 
 ## 1. [win-kexp] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -2230,7 +2234,7 @@ anyone reading the task file first. Nothing about the server was wrong here, so 
 findings (items 40, 41, 43, and #217) are unaffected, and the next run starts against a question
 with one reading.
 
-## 45. [windbg-mcp] The eval's answer key is a snapshot, and nothing checks it still holds
+## 45. [windbg-mcp] The eval's answer key is a snapshot, and nothing checks it still holds — **done** (2026-08-25)
 
 The six tasks are graded against facts read off the checked-in dumps **with this server's own
 tools**, before any model saw them. That is what makes the bench mechanical, and it is also the
@@ -2238,9 +2242,9 @@ whole exposure: if one of those facts stops being what the server reports, the s
 every model keeps scoring, and the number measures nothing. A key that rots is indistinguishable
 from a model that got worse.
 
-**Part of it is already pinned, in `tests/mcp_smoke.rs`** — the debugger tier reads the same dumps
+**Part of it was already pinned, in `tests/mcp_smoke.rs`** — the debugger tier reads the same dumps
 and asserts bug check code and name, `Arg1`, the crashing process, and each driver crash's
-`module` + `rva` + kernel frame (`DRIVER_CRASHES`, `NATIVE_SAMPLE`). What is *not* pinned is the
+`module` + `rva` + kernel frame (`DRIVER_CRASHES`, `NATIVE_SAMPLE`). What was *not* pinned was the
 rest of what the tasks depend on:
 
 | Fact a task is keyed to | Asserted by the tier? |
@@ -2252,90 +2256,77 @@ rest of what the tasks depend on:
 | the four `0x22200B` fields | no — the tier exercises `0x70000` |
 | `pc = 0xfffff8013c65bca8` | **no** |
 
-**The last row is the one that makes the case**, and it is exactly item 44 wearing its other face.
+**The last row is the one that made the case**, and it is exactly item 44 wearing its other face.
 `NATIVE_SAMPLE` pins `first_parameter: "0x0000019e7b820000"` — the address 32 of 35 recorded runs
-gave — while nothing in this repo pins the `pc` the task is actually keyed to. Both halves of the
-ambiguity are named in the codebase, in two different files, and the half the eval depends on is
+gave — while nothing in this repo pinned the `pc` the task is actually keyed to. Both halves of the
+ambiguity are named in the codebase, in two different files, and the half the eval depends on was
 the unasserted one.
 
-**What would close it.** A table-driven check over the facts the tasks depend on — `open_dump`,
-`crash_triage`, `registers`, `modules` and `decode_ioctl` against dumps the debugger tier already
-opens. It is cheap in the way the rest of that tier is not: no model, no ollama, no listener, no
-grid, seconds rather than minutes. The `0x22200B` half is cheaper still and needs no target at
-all, which is why that tier already uses `decode_ioctl` as its pure-tool fixture. *Where* it runs
-is not settled — see the next paragraph, which is the part that has to be decided first.
+**What closed it.** `--verify-key`, beside `--grade` in `tools/local_model_eval.py`, driving the
+server and re-reading every fact through the tools a model would call. That was the first of the
+three shapes this entry weighed, and the argument for it is unchanged: the oracle is `present()`,
+whose three rules were each learned from a wrong verdict, so a Rust gate would need a **second copy
+of it** — and two copies drifting apart is this item's own failure mode reached through this item's
+own fix. The cost taken deliberately is that CI cannot run it: it needs a listener and a
+credential, so it is a command for after a `win-kexp` bump, a symbol-path change or a new sample,
+and the run says so on every pass. The Rust tier goes on pinning what it already pins.
 
-**Assert against the oracle, and `answer_key` is not it** — a correction this entry needed, because
-its first draft proposed pinning exactly the wrong half. **Nothing in this repo reads
-`answer_key`**: `grep` finds no consumer in `tools/`, `tests/` or `src/`. It is one prose string
-per dump ("x64, 0x13a KERNEL_MODE_HEAP_CORRUPTION, 158 modules, faulting frame
-MessageManager+0x1654, …") and it is documentation. What decides pass or fail is `matches()`, which
-reads a task's **`expect`** groups and nothing else. So a drift test pinned to `answer_key` would
-stay green while the facts models are actually graded against went stale — this item's own failure
-mode, reached through this item's own fix.
+**The binding is per task and carries the inputs**, which is what review found this entry lacking
+and what defeated all three shapes as first written: `expect` said what an answer must contain and
+nothing structured said what to *call* to get it. Each task now carries `verify` — an ordered list
+of `(tool, args)` steps with the values expected back — and the prompt is checked as a **rendering**
+of it: every string a step sends must appear in the question, and every dump the question names
+must be one a step opens. A prompt repointed at another sample is now a failure rather than a
+verifier quietly querying the old one.
 
-**And the oracle is in the wrong language for the tier this proposed putting it in**, which is the
-real constraint. `expect` is answer *alternatives* matched by `present()` — hex-boundary rules,
-leading zeros, separators, all three learned from a wrong verdict — so consuming it faithfully
-means having `present()`. That is Python, beside the grader; `mcp_smoke` is Rust. Three shapes,
-and the entry should not pretend one is obvious:
+**Three things it needed that this entry did not anticipate.**
 
-- **A `--verify-key` mode beside `--grade`**, driving the server and checking each task's `expect`
-  against what the tools answer, through the same `present()` that grades. One oracle, no second
-  copy — and not a `cargo test` gate, since CI runs the Rust tier and not this.
-- **A Rust test whose constants are generated from `tools/eval_tasks.json`.** A CI gate, at the
-  cost of a codegen step and of `present()`'s rules having to hold on the generated side.
-- **A Rust test with the facts written out by hand** — a CI gate today and the second copy this
-  item exists to prevent, with the two drifting apart being the failure it would then have.
+- **`expect` cannot be *derived* from the binding**, which is what this entry's own sentence
+  claimed. Two of `unloaded_driver`'s three groups are phrasings of a **relation** — "not loaded"
+  is what `matched: 0` *means*, not a string the server prints — so the binding **grounds**
+  `expect` rather than generating it, and each run reports which groups are tied by `value`, which
+  by `relation`, and which were `skipped` at a gate on this host. The relation groups are not a
+  hole: the fact behind them is pinned exactly, and only the phrasing is beyond a mechanical check.
+- **A second verb, for a tool with no structured half.** `decode_ioctl` answers in prose alone, so
+  a binding that could only name a field would have had nothing to say about the one task needing
+  no target at all — the cheapest half this entry singled out. `is` is exact typed equality against
+  a named field; `has` is `present()` over the text, used exactly once.
+- **The ratchet is coverage, not the pins.** A group **no** step grounds is a failure, which is what
+  stops `expect` growing an alternative the binding does not fetch, and stops a new task arriving
+  unpinned. Verified against a deliberately rotted copy of the suite: a moved fact, a renamed
+  field, a repointed prompt, an ungrounded group and a stale text pin all fail, and the clean suite
+  passes.
 
-Deciding between the first two is the work. The assertions are the easy half, and the third option
-is the one that looks easiest and is the item repeating itself.
+**And a pin can be too tight.** The first cut pinned the `pc` register as `registers.32.value` —
+its position in the ARM64 bank, which is an engine detail rather than anything the key rests on, so
+a reordered bank would have failed a key that had not rotted. A `read` path now enters a list two
+ways: `frames.0` by position, `registers.name=pc.value` by the register's own name.
 
-**And whatever holds the ground truth has to carry the *inputs*, not only the expectations** —
-which review found next and which defeats all three shapes as written. `expect` says what an answer
-must contain; **nothing structured says what to call to get it.** A task's dump path lives only in
-the prose `prompt`, and `useful_tools` names tools with no arguments and no order — so a verifier
-must either parse prose or hard-code the calls, and a task later pointed at a different sample
-would leave it querying the old one and matching expectations that never changed. Green, and
-drifted: this item's own failure mode, one level further down than the `answer_key` version of it.
-So the structured thing is a per-task binding of **`(tool, arguments)` to the value expected back**,
-which the verifier's calls and the task's `expect` both derive from, leaving the prompt's path a
-rendering of that binding rather than its only home.
+**Which corpus, said rather than implied.** The run names the dumps it re-read and then names the
+one it did not: `answer_key` is prose and nothing reads it — `grep` still finds no consumer, and
+`matches()` grades from `expect` alone — and it documents `082126-7015-01.dmp`, which no task
+references. Reporting the gap is the honest form of the choice, rather than a test covering more
+than the suite asks or less than the key claims.
 
-**And say which corpus is being asserted**, because the two disagree: `082126-7015-01.dmp` is in
-`answer_key` and no task references it, so a test driven off the key covers a dump the eval never
-asks about, while one driven off `tasks` covers less than the key claims. Neither is wrong; a test
-that has not chosen is. It also changes what has to stand down: the key's two process names
-(`mm_exploit_v5.exe`, `powershell.exe`) sit behind the `_EPROCESS` read and no task keys on one.
+**Gating: `docs/smoke-test.md` draws that line and this keeps no second copy of it.** Three review
+rounds on [#221](https://github.com/glslang/windbg-mcp/pull/221) were corrections to a second copy
+kept in this entry — first too wide, then too narrow — so `GATES` holds the sentence a stood-down
+step *prints* and that file holds the rule. `arm64_pc` is asserted through **both** routes, since
+its `possible_on: min` rests on `crash_triage` frame 0 and `registers` alone would not be checking
+it; the frame-0 half takes the gate, opens the dump itself rather than inheriting a session, and
+passes `analyze: false` — frame 0 is the crash context on a freshly opened dump and otherwise
+whatever the session has selected.
 
-**Gating: `docs/smoke-test.md` already draws that line, and this entry deliberately does not draw
-it again.** Which reads survive a host that resolves no symbols, which do not, and the measurement
-behind the distinction all live there. Three review rounds on this entry
-([#221](https://github.com/glslang/windbg-mcp/pull/221)) were corrections to a *second copy* of it
-kept here — first too wide, then too narrow — which is the argument for keeping none. Read it
-there when implementing this, and do not restate it.
+**Nothing was wrong when it landed**, which is what makes this protection against future drift
+rather than a bug fix: all three dumps were re-read on 2026-08-25 and every fact the tasks depend
+on still holds. What will move it is an engine or `win-kexp` bump, a symbol-path change, or a new
+sample replacing an old one.
 
-**What that file cannot tell you is where its line falls on this suite, and for `arm64_pc` it falls
-awkwardly.** The task claims `possible_on: min` *because* `crash_triage` frame 0 carries the `pc` —
-a `min` client has no `registers`. Frame 0 is on the standing-down side of that file's line and
-`registers` is not, so **a test asserting this fact through `registers` alone would not be checking
-the route the task depends on**, and the route it does depend on is the one that goes quiet on a
-symbol-poor host. Frame 0 carries a second condition besides: it is the crash context only on a
-**freshly opened** dump — what every cell does, but not `crash_triage`'s general contract, whose
-stack is the default context only when `!analyze` ran to completion and otherwise whatever the
-session has selected. So a test here opens the dump rather than inheriting a session, asserts
-through frame 0 as well as `registers`, and takes that file's gate on the frame-0 half. Measured
-2026-08-25 with `analyze: false` on a fresh open: frame 0 is `nt!KeBugCheck2+0x2e8`, the address
-`registers` reports.
+**Where it picks up.** `tools/local_model_eval.py` (`--verify-key` and the helpers under it),
+`tools/eval_tasks.json`'s `verify` blocks, and `docs/local-model-eval.md`. `tools/eval_tasks_v1.json`
+deliberately carries **no** binding — it is the wording published logs were graded against, and the
+mode refuses it by name rather than skipping it quietly.
 
-**Why deferred.** Nothing is wrong today — all three dumps were re-read on 2026-08-25 and every
-fact the tasks depend on still holds, which is what makes this protection against future drift
-rather than a bug. The things that would move it are an engine or `win-kexp` bump, a symbol-path
-change, or a new sample replacing an old one, and none is scheduled.
-
-**Where it picks up.** `tests/mcp_smoke.rs`, beside `DRIVER_CRASHES` and `NATIVE_SAMPLE`, which
-already carry half of this and are the shape the rest wants; and `tools/eval_tasks.json`'s
-`answer_key`, which is the half that has to become readable before a test can honestly consume it.
 
 ## 46. [windbg-mcp] A run can be graded but not compared, because nothing records what it ran against
 

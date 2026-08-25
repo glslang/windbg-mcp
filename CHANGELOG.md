@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The eval's answer key is re-read off the dumps rather than trusted** (`FOLLOWUPS.md` item 45,
+  which closes it). Its six tasks are graded against facts read off the checked-in samples with
+  this server's own tools, and nothing re-checked them — so a fact that stopped being what the
+  server reports would leave the suite grading, every model scoring, and a rotted key looking
+  exactly like a model that got worse. Each task now carries a **`verify` binding** of
+  `(tool, arguments)` steps to the values expected back, and
+  `local_model_eval.py --verify-key` drives the server and checks the lot through the same
+  `present()` that grades. It catches a moved fact, a renamed field, a prompt repointed at another
+  sample, an `expect` group nothing fetches and a stale text pin — all five verified against a
+  deliberately rotted copy of the suite, with the real one green. It is a command rather than a CI
+  gate because a Rust test would need a second copy of `present()`, whose three rules were each
+  learned from a wrong verdict; run it after a `win-kexp` bump, a symbol-path change or a new
+  sample. Nothing was wrong when it landed.
+
 - **The eval's `arm64_pc` task asks a question with one reading** (`FOLLOWUPS.md` item 44, which
   closes it). It asked for "the value of the `pc` register at the point of the crash", which reads
   as the address whose execution faulted — bug check parameter 1 — rather than as the register's

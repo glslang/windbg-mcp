@@ -192,6 +192,88 @@ route. Verified against the dump before the key was changed, and it is the kind 
 finds that a prediction does not: two tools carry one fact, so narrowing a surface removes fewer
 answers than the tool table suggests.
 
+### The key is a snapshot, and `--verify-key` is what re-takes it
+
+Every fact above was read off the checked-in dumps with this server's own tools before any model
+saw them. That is what makes the bench mechanical, and it is the whole exposure: if one of those
+facts stops being what the server reports, the suite goes on grading, every model goes on scoring,
+and the number measures nothing. **A key that has rotted is indistinguishable from a model that got
+worse.**
+
+So each task carries a **`verify` binding** beside its `expect` — an ordered list of
+`(tool, arguments)` steps with the values expected back — and one command re-reads the lot:
+
+```console
+WINDBG_MCP_URL=http://127.0.0.1:8766/ WINDBG_MCP_TOKEN=<the full surface's token> \
+  python3 tools/local_model_eval.py --verify-key
+```
+
+It opens each dump itself, calls the tools a model would call, and checks every pinned value.
+Five things it catches, each of which is a way the key rots without anything looking wrong:
+
+| What moved | How it reads |
+| --- | --- |
+| a fact — the dump now has 228 modules | `modules loaded: answered 227, pinned 228` |
+| a field — the answer's shape changed under it | `crash_triage bug_check.code: no such field in the answer` |
+| a question — the prompt was pointed at another sample | `the prompt names …082126-7015-01.dmp, which no step of the binding opens` |
+| a key — `expect` grew an alternative nothing fetches | `group 2 (0xfffff80561281654) is grounded by no step` |
+| a tool — `decode_ioctl` stopped saying `METHOD_NEITHER` | `decode_ioctl @text has 'METHOD_NEITHER': not in the answer's text` |
+
+**The binding carries the inputs, which is the half the suite used to lack.** `expect` says what an
+answer must *contain*; nothing structured said what to **call** to get it — a task's dump path
+lived only in its prose prompt, and `useful_tools` names tools with no arguments and no order. A
+task later pointed at a different sample would therefore have left a verifier querying the old one
+and matching expectations that never changed: green, and drifted. So the prompt is checked as a
+*rendering* of the binding rather than as its only home — every string a step sends must appear in
+the question, and every dump the question names must be one a step opens.
+
+**Two verbs, and the difference is the server's own doing.** `is` is exact typed equality against a
+named field (`227` the integer is not `"227"` the string, and a renamed field is a failure rather
+than a pass). `has` is the grader's own `present()` over the answer's text, for a tool with no
+structured half to name a field in — `decode_ioctl`, which is also the one task needing no target
+at all.
+
+**A `read` path enters a list two ways, and the second is usually the right one.** `frames.0` is a
+position; `registers.name=pc.value` is the register *called* `pc`. The `pc` fact sits at entry 32
+of the ARM64 bank, and a pin on 32 would fail on an engine that reordered the bank while still
+answering the question the task asks — which would be a false alarm about a key that had not
+rotted.
+
+**`grounds` ties a pin to the group models are graded on**, through that same `present()`, and the
+run says which kind of tie each one is:
+
+- **`value`** — a model repeating the server's own answer would be graded correct on that group.
+- **`relation`** — the group is a phrasing of a relation over pinned facts rather than a string the
+  server prints. `unloaded_driver`'s "not loaded" is what `matched: 0` *means*; the fact is pinned
+  exactly, and only the phrasing is beyond a mechanical check.
+- **`skipped`** — every step grounding it stood down at a gate on this host, which has to be its
+  own word: calling it a relation would claim a check this run did not make.
+
+A group **no** step grounds is a failure, and that is the ratchet: `expect` cannot grow a fact the
+binding does not fetch, and a new task cannot arrive unpinned.
+
+**Which corpus is asserted, said rather than implied.** The run names the dumps it re-read and then
+names the ones it did not: `answer_key` is prose, nothing reads it — `matches()` grades from
+`expect` alone — and it describes the whole sample corpus including `082126-7015-01.dmp`, which no
+task references. The two disagree by construction, so the run reports the gap instead of quietly
+covering more or less than the suite.
+
+**What stands down where symbols do.** Two steps walk `nt`'s types — `driver_blame`'s stack walk
+and `arm64_pc`'s frame 0 — and on a host whose engine resolves no PDB a stack walk gives back
+frames made of the bug check's own parameters. Those print `SKIPPED` with the reason, exactly as
+the Rust tier does; [`smoke-test.md`](./smoke-test.md) has the line and the measurement behind it,
+and this mode deliberately keeps no second copy of either. `arm64_pc` is asserted through **both**
+routes — `registers`, which needs nothing, and frame 0, which does — because frame 0 is the route
+the task's `possible_on: min` depends on and `registers` alone would not be checking it.
+
+**It is a command, not a CI gate, and that was the decision.** The oracle is `present()`, whose
+three rules were each learned from a wrong verdict; a Rust test in `tests/mcp_smoke.rs` would need
+a second copy of it, and two copies drifting apart is this failure mode reached through its own
+fix. The Rust tier goes on pinning what it already pins — the bug checks, `Arg1`, the crashing
+process, each driver crash's `module`+`rva` — and this pins what the *tasks* depend on, through the
+tools a model would call. Run it after a `win-kexp` bump, a symbol-path change, or a new sample
+replacing an old one; nothing else will.
+
 ## Running it
 
 Three pieces, and only the first is unusual.

@@ -9,6 +9,7 @@ what comes back against the answer key in `tools/eval_tasks.json`, so the questi
     EVAL_TOKENS=<tokens.json> python3 tools/local_model_eval.py <plan.json>
     python3 tools/local_model_eval.py --grade  <results.jsonl> [tasks.json]
     python3 tools/local_model_eval.py --matrix <results.jsonl> [tasks.json]
+    WINDBG_MCP_TOKEN=<token> python3 tools/local_model_eval.py --verify-key [tasks.json]
 
 **Three axes, and they are not independent.** The tool surface is bytes of prose in every
 turn; the context is what the runtime will hold; the model is what can pick a tool out of
@@ -29,6 +30,14 @@ a plan is checked in and a credential is not.
 wedges must not take the grid with it (`budget_s` kills it and records why), and a run that
 dies in the middle must leave every finished cell on disk. Re-running the same plan **resumes**:
 a (model, context, surface, draw, task) already in the log is not run again.
+
+**The key is a snapshot, and `--verify-key` is what re-takes it.** The six tasks are graded
+against facts read off the checked-in dumps with this server's own tools, so a fact that stops
+being what the server reports leaves the suite grading, every model scoring, and the number
+measuring nothing - a key that has rotted looks exactly like a model that got worse. That mode
+re-reads every fact through the tools a model would call, against a per-task binding of
+`(tool, arguments)` to the values expected back. It needs a credential and a live server, which
+is why it is a command rather than a CI gate (`FOLLOWUPS.md` item 45).
 
 **One draw per cell answers a different question from n draws of one cell.** The grid moves one
 knob at a time across many cells, which is enough for failure *modes* and for whether a surface
@@ -373,6 +382,361 @@ def matches(record, task):
     if not answer:
         return False
     return all(any(present(alt, answer) for alt in group) for group in task.get("expect", []))
+
+
+# --------------------------------------------------------------------------------------------
+# `--verify-key`: whether the server still answers what the suite grades models against.
+#
+# The suite is mechanical because its facts were read off the checked-in dumps with this server's
+# own tools before any model saw them (`FOLLOWUPS.md` item 45). That is also the whole exposure:
+# if one of those facts stops being what the server reports, the suite goes on grading, every
+# model goes on scoring, and a key that has rotted is indistinguishable from a model that got
+# worse. This is the check that tells them apart.
+#
+# **It lives here rather than in `tests/mcp_smoke.rs`, and that was the decision.** The oracle is
+# `present()` a hundred lines up - hex boundaries, leading zeros, separators, each rule learned
+# from a wrong verdict - so a Rust gate would need a second copy of it, and two copies drifting
+# apart is this item's own failure mode reached through this item's own fix. The Rust tier keeps
+# pinning what it already pins (`DRIVER_CRASHES`, `NATIVE_SAMPLE`: the bug checks, `Arg1`, the
+# crashing process, each driver crash's `module`+`rva`); this pins what the *tasks* depend on,
+# through the tools a model would call. The cost of the choice is that CI cannot run it - CI has
+# no listener and no credential - so it is a command to run when a dependency, a symbol path or a
+# sample moves, and `--verify-key` says so on every run.
+#
+# **The binding carries the inputs, not only the expectations.** `expect` says what an answer must
+# contain and nothing structured said what to *call* to get it: a task's dump path lived only in
+# its prose prompt and `useful_tools` names tools with no arguments and no order. So a task
+# pointed at a different sample would have left a verifier querying the old one and matching
+# expectations that never changed - green, and drifted. Each task now carries `verify`, an ordered
+# list of `(tool, args)` steps with the values expected back, and [`prompt_renders_binding`]
+# asserts the prompt is a rendering of it rather than its only home.
+# --------------------------------------------------------------------------------------------
+
+# Why a step stands down, keyed by what it asked for. The line this draws is not redrawn here:
+# `docs/smoke-test.md` has which reads survive a host whose engine resolves no symbols, which do
+# not, and the measurement behind the distinction. Keeping a second copy of it cost three review
+# rounds on #221, so this table holds the *reason a step prints*, and that document holds the rule.
+GATES = {
+    "kernel_symbols": "`nt` resolved no PDB on this host, so a stack walk has no types to read "
+                      "and gives back frames made of the bug check's own parameters (issue #142). "
+                      "The facts behind this step are asserted through their other route.",
+}
+
+# The whole text of a result rather than a field of it, for a tool that has no structured half.
+# `decode_ioctl` is the only one the suite calls that answers in prose alone, and it is also the
+# one task needing no target at all - so the pure-tool fixture and the untyped answer are the same
+# tool, and a `read` that could only name a field would have had nothing to say about it.
+WHOLE_TEXT = "@text"
+
+
+def field(result, path):
+    """One `read` path into a result — dotted, with two ways of entering a list.
+
+    An integer segment indexes it, and `name=pc` selects the first element whose `name` is `pc`.
+    The second exists because **a position in a list is usually not the fact**: the `pc` register
+    is entry 32 of the ARM64 bank, and pinning 32 would fail on an engine that reordered the bank
+    while still answering the question the task asks. What the key rests on is that the register
+    *called* `pc` holds that value, and this is how a pin says so.
+
+    Raises `KeyError` naming the path that ran out rather than returning a default, because a
+    field that has *moved* is exactly the drift this mode exists to catch: a pin that quietly
+    read `None` and compared it against `None` would pass on a server that had stopped answering
+    at all.
+    """
+    cursor = result
+    for segment in path.split("."):
+        if isinstance(cursor, list):
+            if "=" in segment:
+                key, _, want = segment.partition("=")
+                match = next((e for e in cursor
+                              if isinstance(e, dict) and str(e.get(key)) == want), None)
+                if match is None:
+                    raise KeyError(path)
+                cursor = match
+                continue
+            if not segment.isdigit() or int(segment) >= len(cursor):
+                raise KeyError(path)
+            cursor = cursor[int(segment)]
+        elif isinstance(cursor, dict) and segment in cursor:
+            cursor = cursor[segment]
+        else:
+            raise KeyError(path)
+    return cursor
+
+
+def rendered(value):
+    """A pinned value as `present()` would have to read it — the grader's own normalisation.
+
+    Shared with the grading path deliberately: a pin is only evidence about the key if the string
+    it is checked as is the string a model's answer would be checked as.
+    """
+    return normalise(value if isinstance(value, str) else json.dumps(value))
+
+
+def prompt_renders_binding(task):
+    """Whether the question still asks for what the binding fetches. Returns the complaints.
+
+    **Both directions, because they rot differently.** Every string this task's steps *send* has
+    to appear in the prompt, so a binding repointed at another sample cannot go on being described
+    by the old question; and every `.dmp` the prompt names has to be one some step opens, so a
+    question repointed at another sample cannot go on being verified against the old one. Numbers
+    and booleans are excluded — `frames: 3` is how this asks, not what it asks about — and so is
+    the session placeholder, which names nothing outside the run.
+    """
+    prompt = (task.get("prompt") or "").lower()
+    complaints = []
+    sent = []
+    for step in task.get("verify") or []:
+        for name, value in (step.get("args") or {}).items():
+            if not isinstance(value, str) or value.startswith("$"):
+                continue
+            sent.append(value)
+            if value.lower() not in prompt:
+                complaints.append(f"the binding sends {name}={value!r}, which the prompt "
+                                  f"never names")
+    for named in re.findall(r"[^\s,;]+\.dmp", prompt, flags=re.IGNORECASE):
+        if not any(named.lower() == s.lower() for s in sent):
+            complaints.append(f"the prompt names {named}, which no step of the binding opens")
+    return complaints
+
+
+def gates_open(drive, session_id):
+    """Which of [`GATES`] this host can satisfy, asked of the engine rather than assumed.
+
+    One probe today, and it is the one the suite needs: whether `nt` resolved to a **PDB**, which
+    is what a walk through its types needs. `tests/mcp_smoke.rs` asks the same question the same
+    way (`engine_resolves_kernel_symbols`), and both PDB-backed states count — `dia` is the same
+    PDB read through another API, and the server treats them alike.
+    """
+    out = drive.mcp("tools/call", {"name": "modules",
+                                   "arguments": {"session_id": session_id, "filter": "nt"}})
+    modules = ((out.get("result") or {}).get("structuredContent") or {}).get("modules") or []
+    nt = next((m for m in modules if m.get("name") == "nt"), None)
+    return {"kernel_symbols": bool(nt and nt.get("symbols") in ("pdb", "dia"))}
+
+
+def run_step(drive, step, session_id):
+    """One step of a binding: call the tool, hand back its two halves and what went wrong.
+
+    Returns `(structured, text, error)`. A tool that fails is an `error` rather than an exception,
+    because the interesting failure here is a *fact* that has moved and the run must reach the
+    rest of the task's pins to say which.
+    """
+    args = {k: (session_id if v == "$session" else v)
+            for k, v in (step.get("args") or {}).items()}
+    try:
+        out = drive.mcp("tools/call", {"name": step["tool"], "arguments": args})
+    except Exception as e:  # noqa: BLE001 - a transport failure is this step's result
+        return None, "", f"transport error: {e}"
+    if "error" in out:
+        return None, "", f"protocol error: {json.dumps(out['error'])[:200]}"
+    result = out.get("result") or {}
+    text = "\n".join(block.get("text") or "" for block in (result.get("content") or [])
+                     if block.get("type") == "text")
+    if result.get("isError"):
+        return None, text, f"the tool refused: {text[:200]}"
+    return result.get("structuredContent") or {}, text, None
+
+
+def check_pins(step, structured, text):
+    """Every pin of one step, as `(read, ok, detail, rendered_value)` rows.
+
+    **Two verbs, and the difference is the server's own doing.** `is` is exact typed equality
+    against a named field — the strong pin, and what a structured answer allows: `227` the integer
+    is not `"227"` the string, and a field renamed is a `KeyError` rather than a pass. `has` is
+    [`present`] over the rendered text, for a tool with no structured half to name a field in; it
+    is weaker on purpose and is used exactly once, which is once more than nothing would be.
+    """
+    rows = []
+    for pin in step.get("pin") or []:
+        read = pin.get("read")
+        if "has" in pin:
+            want = pin["has"]
+            haystack = normalise(text) if read == WHOLE_TEXT else None
+            if haystack is None:
+                rows.append((read, False, f"`has` reads {WHOLE_TEXT} and nothing else", None))
+                continue
+            ok = present(normalise(want), haystack)
+            rows.append((f"{read} has {want!r}", ok,
+                         "" if ok else "not in the answer's text", want))
+            continue
+        try:
+            got = field(structured, read)
+        except KeyError:
+            rows.append((read, False, "no such field in the answer", None))
+            continue
+        ok = got == pin["is"]
+        rows.append((read, ok, "" if ok else f"answered {got!r}, pinned {pin['is']!r}", got))
+    return rows
+
+
+def grounding(task, rendered_by_step, ran):
+    """How each `expect` group is tied to the facts this task pinned, and what is missing.
+
+    The tie is checked through [`present`], the same oracle that decides pass or fail, so a group
+    reported `value` is one a model repeating the server's own answer would still be graded
+    correct on. A group nothing renders is reported **relation**, which is not a hole: the fact
+    behind it is pinned exactly - `matched: 0` is what "not loaded" is a phrasing *of* - and what
+    cannot be checked mechanically is only the phrasing. A group whose every step stood down at a
+    gate is `skipped`, which has to be its own word: reporting it as a relation would say this
+    host checked something it did not.
+
+    What *is* a hole is a group no step claims at all, and that is the failure returned here. It
+    is what catches `expect` growing an alternative, or a task being keyed to a new fact, without
+    the binding moving with it.
+    """
+    expect = task.get("expect") or []
+    claimed = {}
+    for index, step in enumerate(task.get("verify") or []):
+        for group in step.get("grounds") or []:
+            if not isinstance(group, int) or not 0 <= group < len(expect):
+                return None, [f"step {index + 1} grounds group {group}, "
+                              f"which `expect` has not got"]
+            entry = claimed.setdefault(group, {"values": [], "ran": False})
+            entry["values"].extend(rendered_by_step.get(index, []))
+            entry["ran"] = entry["ran"] or index in ran
+    missing = [i for i in range(len(expect)) if i not in claimed]
+    if missing:
+        return None, [f"`expect` group {i} ({'|'.join(expect[i])}) is grounded by no step"
+                      for i in missing]
+    how = {}
+    for group, entry in claimed.items():
+        if not entry["ran"]:
+            how[group] = "skipped"
+        elif any(present(alt, value) for alt in expect[group] for value in entry["values"]):
+            how[group] = "value"
+        else:
+            how[group] = "relation"
+    return how, []
+
+
+def verify_task(drive, task, symbols):
+    """One task's binding, against the live server. Returns `(failures, notes)`.
+
+    Opens its own target rather than inheriting a session, which is not tidiness: `crash_triage`'s
+    stack is the crash context on a *freshly opened* dump and otherwise whatever the session has
+    selected, and the `arm64_pc` fact is read off frame 0.
+    """
+    failures, notes, session_id = [], [], None
+    rendered_by_step, ran = {}, set()
+    for complaint in prompt_renders_binding(task):
+        failures.append(complaint)
+    try:
+        for index, step in enumerate(task.get("verify") or []):
+            need = step.get("needs")
+            if need and not symbols.get(need):
+                notes.append(f"    SKIPPED {step['tool']}: {GATES[need]}")
+                continue
+            structured, text, error = run_step(drive, step, session_id)
+            if error:
+                failures.append(f"{step['tool']}: {error}")
+                continue
+            if step.get("session") == "open":
+                session_id = (structured or {}).get("session_id")
+                if not session_id:
+                    failures.append(f"{step['tool']}: opened no session to route the rest to")
+                    break
+            ran.add(index)
+            rendered_values = []
+            for read, ok, detail, value in check_pins(step, structured, text):
+                if ok:
+                    rendered_values.append(rendered(value))
+                else:
+                    failures.append(f"{step['tool']} {read}: {detail}")
+            rendered_by_step[index] = rendered_values
+    finally:
+        if session_id:
+            drive.end_sessions([session_id])
+    how, gaps = grounding(task, rendered_by_step, ran)
+    failures.extend(gaps)
+    if how:
+        by_kind = {}
+        for group, kind in sorted(how.items()):
+            by_kind.setdefault(kind, []).append(str(group))
+        notes.append("    grounds " + ", ".join(f"{kind}: {', '.join(groups)}"
+                                                for kind, groups in sorted(by_kind.items())))
+    return failures, notes
+
+
+def verify_key(tasks_file):
+    """Re-read the suite's answer key off the dumps, through the tools a model would call.
+
+    **Imported here rather than at the top of the file**, because `local_model_drive` resolves a
+    bearer token as it loads and exits if there is none — which is right for a driver and would
+    make `--grade` unusable on a machine that is only reading a log.
+    """
+    sys.path.insert(0, HERE)
+    import local_model_drive as drive  # noqa: PLC0415 - see the docstring
+
+    suite = load(tasks_file)
+    tasks = suite["tasks"]
+    print(f"verifying {suite.get('suite', tasks_file)} against {drive.MCP_URL}")
+    print("MCP revision negotiated:", drive.handshake())
+    served = {t["name"] for t in drive.mcp("tools/list")["result"]["tools"]}
+    wanted = {step["tool"] for t in tasks for step in t.get("verify") or []}
+    if wanted - served:
+        raise SystemExit(f"this credential is not served {', '.join(sorted(wanted - served))}; "
+                         "verifying the key needs the whole surface, not a narrowed one")
+
+    unpinned = [t["id"] for t in tasks if not t.get("verify")]
+    if unpinned:
+        # **A task with no binding is the hole this mode exists to close**, so it fails rather
+        # than being skipped quietly: an unpinned task is one whose facts nothing re-reads, which
+        # is the state the whole suite was in before this existed.
+        print(f"\nFAILED: {', '.join(unpinned)} carry no `verify` binding, so nothing re-reads "
+              f"the facts they are graded against")
+        return 1
+
+    # One probe for the run, on a target of its own: every gated step asks the same question of
+    # the same host, and asking it per task would be the same answer fetched six times.
+    probe = None
+    symbols = {gate: False for gate in GATES}
+    opener = next((step for t in tasks for step in t["verify"] if step.get("session") == "open"),
+                  None)
+    if opener:
+        structured, _, error = run_step(drive, opener, None)
+        probe = (structured or {}).get("session_id")
+        if error or not probe:
+            raise SystemExit(f"could not open {opener['args']['path']} to probe this host: "
+                             f"{error or 'no session'}")
+        try:
+            symbols = gates_open(drive, probe)
+        finally:
+            drive.end_sessions([probe])
+    for gate, open_ in sorted(symbols.items()):
+        print(f"  gate {gate}: {'open' if open_ else 'closed - steps needing it stand down'}")
+
+    failed = {}
+    for task in tasks:
+        print(f"\n  {task['id']}")
+        failures, notes = verify_task(drive, task, symbols)
+        for note in notes:
+            print(note)
+        for failure in failures:
+            print(f"    FAILED {failure}")
+        if failures:
+            failed[task["id"]] = failures
+
+    # **Which corpus was asserted, said rather than implied.** `answer_key` is prose and nothing
+    # reads it — not this mode, and not `matches()`, which grades from `expect` alone. The two
+    # disagree by construction: the key describes the sample corpus and the tasks reference part
+    # of it, so a line naming the gap is the honest form of "which corpus is this about".
+    opened = {step["args"]["path"].rsplit("\\", 1)[-1]
+              for t in tasks for step in t["verify"] if "path" in (step.get("args") or {})}
+    documented = set(suite.get("answer_key") or {})
+    uncovered = sorted(k for k in documented if k.endswith(".dmp") and k not in opened)
+    print(f"\ncorpus: {len(opened)} dump(s) re-read - {', '.join(sorted(opened))}")
+    if uncovered:
+        print(f"  `answer_key` also documents {', '.join(uncovered)}, which no task references "
+              f"and this mode therefore does not assert")
+    if failed:
+        print(f"\nFAILED: {len(failed)} task(s) are graded against a fact this server no longer "
+              f"reports - {', '.join(sorted(failed))}")
+        return 1
+    print(f"\nOK: every fact {len(tasks)} tasks are graded against still reads off the dumps. "
+          f"CI does not run this - re-run it after a win-kexp bump, a symbol-path change or a "
+          f"new sample.")
+    return 0
 
 
 def grade_record(record, task, surface_names):
@@ -798,6 +1162,14 @@ def print_matrix(order, rows):
 
 
 def main():
+    if sys.argv[1:2] == ["--verify-key"]:
+        # No log to read: this mode asks the *server*, not a run of it. The tasks file is the
+        # only positional, and it defaults to the suite in use rather than to a frozen one -
+        # `eval_tasks_v1.json` is the wording published logs were graded against and carries no
+        # binding, which this refuses by name rather than by skipping it.
+        rest = [a for a in sys.argv[2:] if not a.startswith("--")]
+        tasks_file = rest[0] if rest else os.path.join(HERE, "eval_tasks.json")
+        sys.exit(verify_key(tasks_file))
     if sys.argv[1:2] == ["--matrix"]:
         log_path = sys.argv[2]
         tasks_file = sys.argv[3] if len(sys.argv) > 3 else os.path.join(HERE, "eval_tasks.json")
