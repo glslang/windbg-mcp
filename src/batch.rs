@@ -805,6 +805,16 @@ pub trait Debuggee {
     /// what the break actually reached, and a fact travelling with the value it is about cannot be
     /// forgotten at one of the places that reads it.
     fn interrupted(&self) -> bool;
+    /// Whether the engine has been told to run and is waiting to be pumped — `None` when it
+    /// could not be asked.
+    ///
+    /// Asked by [`probe_state`], which cannot answer "what does this session hold now?" from
+    /// `? @$ip` alone: that command answers *normally* on an engine left in a running state, so a
+    /// probe that reads only the instruction pointer reports `Stopped` on a session it has just
+    /// wedged. Measured on a `{"op": "command", "command": "g"}` step before this existed — the
+    /// report said `committed`, `rollback_complete` and `stopped`, on a session whose every later
+    /// `go` failed.
+    fn running(&mut self) -> Option<bool>;
     /// Announces that the main steps are over and the `always` block is about to run.
     ///
     /// A safety boundary, not bookkeeping: cleanup must not be interruptible, because a restore cut
@@ -1460,6 +1470,15 @@ fn probe_state(
             && !s.ok()
     });
 
+    // Asked before `? @$ip`, and not merely beside it: on an engine that has been told to run,
+    // `? @$ip` answers with the last position perfectly happily, so reading it first would settle
+    // the question wrongly and never reach this.
+    if guarded(|| Ok(d.running())) == Ok(Some(true)) {
+        return SessionAfter::Running {
+            why: "the engine has been told to run and has not been pumped to a stop".to_string(),
+        };
+    }
+
     let budget_ms = step_budget_ms(d.elapsed(), budget).max(MIN_STEP_BUDGET_MS);
     match guarded(|| d.command("? @$ip", budget_ms).map(|ran| ran.output)) {
         Ok(text) => match parse_eval(&text) {
@@ -1655,7 +1674,6 @@ mod tests {
     /// test that waits out a 30s reserve is a test nobody runs — so time advances by whatever the
     /// scripted answer says its call cost, and the executor's arithmetic is exercised exactly as
     /// it would be against a slow target.
-    #[derive(Default)]
     struct Script {
         answers: Vec<(String, Answer)>,
         calls: Vec<String>,
@@ -1675,14 +1693,46 @@ mod tests {
         /// Whether the executor announced its rollback — the notification a host turns into "no
         /// break may reach this job any more".
         sealed: bool,
+        /// What the engine answers about its own run state; see [`Script::left_running`].
+        running: Option<bool>,
     }
 
     /// The message a scripted panic carries, so the report can be asserted to have kept it.
     const PANIC: &str = "called `Option::unwrap()` on a `None` value";
 
     impl Script {
+        /// A stopped engine that has answered nothing yet.
+        ///
+        /// Spelled out rather than `#[derive(Default)]`, because the field that decides whether a
+        /// report says `stopped` or `running` must not take its value from whatever `Option`
+        /// happens to default to: `None` there means "the engine could not be asked", which is a
+        /// third state and not the one nearly every test below wants.
         fn new() -> Self {
-            Self::default()
+            Self {
+                answers: Vec::new(),
+                calls: Vec::new(),
+                clock: Duration::ZERO,
+                panic_on: Vec::new(),
+                abandon_after: None,
+                interrupt_after: None,
+                cut_short_after: None,
+                sealed: false,
+                running: Some(false),
+            }
+        }
+
+        /// Makes the engine report itself **told to run and not yet pumped** — the state a plain
+        /// `Execute` of `g` leaves behind, in which `? @$ip` still answers with the last position
+        /// and every later `g` fails.
+        fn left_running(mut self) -> Self {
+            self.running = Some(true);
+            self
+        }
+
+        /// Makes the engine refuse to say, which is what a failed `GetExecutionStatus` looks like.
+        fn cannot_say_whether_it_is_running(mut self) -> Self {
+            self.running = None;
+            self
         }
 
         /// Answers any call whose text contains `matching`.
@@ -1815,6 +1865,9 @@ mod tests {
         fn interrupted(&self) -> bool {
             self.interrupt_after
                 .is_some_and(|after| self.calls.len() >= after)
+        }
+        fn running(&mut self) -> Option<bool> {
+            self.running
         }
         fn rolling_back(&mut self) {
             // A real host seals the job against further breaks here; the script only records that
@@ -2762,6 +2815,48 @@ mod tests {
         let report = run(&mut d, &op(vec![cmd("lm")], vec![]), BUDGET);
         assert!(
             matches!(report.after, SessionAfter::Uncertain { .. }),
+            "{:?}",
+            report.after
+        );
+    }
+
+    /// An engine that has been **told to run** is reported as running, however happily `? @$ip`
+    /// answers.
+    ///
+    /// The lie this replaces was measured through the shipped server (issue #226): a
+    /// `{"op": "command", "command": "g"}` step set the run state without pumping it, and the
+    /// report came back `committed`, `rollback_complete: true` and `after: stopped` on a session
+    /// whose every later `go` failed with `0x80040205`. `? @$ip` cannot see that state — it is
+    /// one of the commands that keeps working — so nothing built on it could have caught this.
+    #[test]
+    fn an_engine_left_running_is_reported_running_however_well_the_pointer_reads() {
+        let mut d = Script::new()
+            .left_running()
+            .on("g", Ok("g"))
+            .on("? @$ip", Ok("Evaluate expression: 1 = fffff803`1a2b3c4d"));
+        let report = run(&mut d, &op(vec![cmd("g")], vec![]), BUDGET);
+        assert!(
+            matches!(report.after, SessionAfter::Running { .. }),
+            "a batch that left the engine running reported {:?}",
+            report.after
+        );
+        assert!(render(&report).contains("session after: RUNNING"));
+    }
+
+    /// An engine that cannot say still falls back to the instruction pointer, rather than being
+    /// reported as running on a failure to ask.
+    ///
+    /// The two are opposite mistakes and only one of them is loud: "running" on a stopped session
+    /// tells a caller their target is moving when it is not.
+    #[test]
+    fn an_engine_that_cannot_say_whether_it_is_running_still_reads_the_pointer() {
+        let mut d = Script::new()
+            .cannot_say_whether_it_is_running()
+            .on("lm", Ok("start end module"))
+            .on("? @$ip", Ok("Evaluate expression: 1 = fffff803`1a2b3c4d"));
+        let report = run(&mut d, &op(vec![cmd("lm")], vec![]), BUDGET);
+        assert!(
+            matches!(report.after, SessionAfter::Stopped { .. }),
             "{:?}",
             report.after
         );

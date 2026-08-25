@@ -57,8 +57,9 @@ use crate::proto::{
     ReachabilityOp, WorkerMessage, WorkerRequest,
 };
 use crate::server::{
-    fmt_addr, format_recipe, format_report, hexdump, matches_module_pattern, module_pattern,
-    parse_eval, parse_lm_base, parse_u64, parse_windbg_addr, path_recipe, reachability,
+    EXEC_WAIT_MS, fmt_addr, format_recipe, format_report, hexdump, matches_module_pattern,
+    module_pattern, parse_eval, parse_lm_base, parse_u64, parse_windbg_addr, path_recipe,
+    reachability,
 };
 use crate::structured;
 use crate::triage::{self, Analysis, AttributedFrame, Attribution};
@@ -1374,28 +1375,149 @@ fn failed<E: ToString>(e: E) -> Failed {
 /// string-match for it. Only the deadline earns one — an interrupt *on request* is explained to
 /// the caller by [`cut_short`], and to the one who asked by their own reply.
 fn told(run: CommandRun) -> String {
-    let mut out = run.output;
-    if let Some(Interruption::Deadline { after_ms }) = run.cut_short {
-        if !out.is_empty() && !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str(&format!(
+    let note = match run.cut_short {
+        Some(Interruption::Deadline { after_ms }) => Some(format!(
             "[windbg-mcp] command interrupted after {after_ms} ms (Ctrl+Break) — it was taking \
              too long. Scope it (e.g. a bounded memory range) and retry."
-        ));
-    }
-    out
+        )),
+        _ => None,
+    };
+    appended(run.output, note)
 }
 
-/// Executes arbitrary debugger text and conservatively retires allocator snapshots afterward.
+/// [`told`] for a command that was **moving the target**, where the same deadline means something
+/// else entirely and `told`'s advice would be wrong.
+///
+/// There, a bound reached means the query was too broad and should be scoped. Here it means the
+/// target had not stopped yet, so the debugger broke in — which is neither a failure nor a stop
+/// the target reached, and a caller reading the position without knowing that reads it as one.
+///
+/// **Names no tool**, deliberately: this text is built in the worker, which owns one session and
+/// has never heard of the caller's surface, so a pointer to `go` or `step_over` here would ship to
+/// callers not served them (`FOLLOWUPS.md` item 43). The fact goes on the wire; a pointer, if one
+/// is ever wanted, belongs where `self.surface` is.
+fn told_moving(run: CommandRun) -> String {
+    let note = match run.cut_short {
+        Some(Interruption::Deadline { after_ms }) => Some(format!(
+            "[windbg-mcp] the target had not stopped after {after_ms} ms, so the debugger broke in \
+             (Ctrl+Break). It is stopped where it happened to be, which is not a stop it reached \
+             — run it on, or allow this call longer."
+        )),
+        _ => None,
+    };
+    appended(run.output, note)
+}
+
+/// `text` with `note` on a line of its own, when there is one.
+fn appended(mut text: String, note: Option<String>) -> String {
+    let Some(note) = note else { return text };
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&note);
+    text
+}
+
+/// Executes arbitrary debugger text, **settles anything it left running**, and conservatively
+/// retires allocator snapshots afterward.
 ///
 /// A raw command can resume the target or write allocator memory, and DbgEng does not expose a
 /// reliable classification of those effects. Invalidate even when execution reports an error:
 /// the command may have changed memory before its failing token was reached.
+///
+/// **The settle is what keeps this hatch from wedging its session** (issue #226). A plain
+/// `Execute` of execution-control text — `g`, `p`, `t`, a `;` list ending in one, an alias, a
+/// script that reaches one — sets the run state and returns *without moving the target*; until
+/// something pumps it the session answers read-only commands normally and refuses every later
+/// `g`/`p`/`t` with `0x80040205`, which reads as half alive. `settle` asks the **engine** whether
+/// that happened rather than reading the command text, which is the only way to cover the routes
+/// no name list can enumerate — and the reason this needs no list at all.
+///
+/// It runs on the error path too: a command that failed part-way may still have run an earlier
+/// segment that resumed the target, and a wedged engine after a failed command is no better than
+/// one after a successful command.
 fn raw_command(e: &DebugEngine, command: &str, budget_ms: u32) -> Result<CommandRun, String> {
+    let started = Instant::now();
     let result = e.execute_command_bounded(command, budget_ms).map_err(es);
     query::invalidate_allocator_snapshots();
-    result
+
+    // Capped at the ordinary execution wait, and again at what is left of the caller's clock.
+    //
+    // [`EXEC_WAIT_MS`] because a raw `g` that reaches no stop should cost what `go` costs and not
+    // what this caller's patience happens to be — which with the default call timeout is nearly
+    // four minutes, so the hatch would block far longer than the typed tool doing the same thing.
+    // The remaining budget because the two share one clock, and zero is a fine answer there rather
+    // than a floor to defend: it breaks the target in at once, which is the guarantee that
+    // actually matters — the session survives. In practice nearly the whole budget is still here,
+    // since a command that leaves the target running returns from `Execute` almost immediately.
+    //
+    // An unbounded op (`budget_ms == 0`) has no clock to divide, so it takes the cap alone.
+    let settle_ms = match budget_ms {
+        0 => EXEC_WAIT_MS,
+        budget => budget.saturating_sub(elapsed_ms(started)).min(EXEC_WAIT_MS),
+    };
+    let settled = match e.settle(settle_ms) {
+        Ok(settled) => settled,
+        Err(why) => {
+            // Reported and dropped: the command's own answer is what the caller asked for, and a
+            // failure to *ask* about the run state must not turn a command that ran into an error.
+            // A session really left running shows up on the next call regardless.
+            tracing::warn!("worker: could not settle the target after a raw command: {why}");
+            None
+        }
+    };
+    let Some(settled) = settled else {
+        return result;
+    };
+    // Read before `settled` is consumed below.
+    let forced = matches!(settled.cut_short, Some(Interruption::Deadline { .. }));
+    tracing::debug!(
+        "worker: `{command}` left the target running; pumped it to a stop within {settle_ms} ms"
+    );
+
+    // The pump's output, and then a sentence naming where the target ended up.
+    //
+    // The sentence is not decoration the way it would be on [`resumed`], which answers with a
+    // typed `stopped_at` beside its text while this path has no structured half at all. And the
+    // pump's output can be **empty**: measured, a `g` captures the module loads and the stop
+    // banner, while a `t` or a `p` captures nothing, because DbgEng prints a step's new position
+    // from the command's own completion rather than from the wait. Without the sentence, `execute`
+    // with `t` would move the target and still answer with nothing but its own echo — which is
+    // exactly the reading that made the bug this fixes look like a swallow.
+    let pumped = appended(told_moving(settled), Some(moved_note(e, forced)));
+    match result {
+        Ok(mut run) => {
+            run.output = appended(run.output, Some(pumped));
+            Ok(run)
+        }
+        // The command failed *and* left the target running. Both facts, in the one channel an
+        // error has: dropping the second would report a session as untouched when it was pumped.
+        Err(why) => Err(appended(why, Some(pumped))),
+    }
+}
+
+/// Where a raw command left the target, for the note above.
+///
+/// The position is read *after* the pump rather than parsed out of its output, since a step prints
+/// none. One that cannot be read is left out of the sentence rather than guessed at or reported as
+/// zero — the same rule as [`resumed`]'s `stopped_at`, and the same reason.
+///
+/// `forced` only decides how much is claimed: [`told_moving`] has already said what a break at the
+/// bound means, so this must not also call that position a stop the target reached.
+fn moved_note(e: &DebugEngine, forced: bool) -> String {
+    let at = match e.instruction_pointer() {
+        Ok(ip) => format!(" at {}", fmt_addr(ip)),
+        Err(_) => String::new(),
+    };
+    match forced {
+        true => format!("[windbg-mcp] this command moved the target, which is now stopped{at}."),
+        false => format!("[windbg-mcp] this command moved the target; it is now stopped{at}."),
+    }
+}
+
+/// Milliseconds since `started`, saturating — the shape every budget subtraction here wants.
+fn elapsed_ms(started: Instant) -> u32 {
+    started.elapsed().as_millis().min(u128::from(u32::MAX)) as u32
 }
 
 /// Runs a command that moves the target, and reports where it ended up.
@@ -1411,20 +1533,21 @@ fn resumed(e: &DebugEngine, command: &str, timeout_ms: u32) -> Result<Output, Fa
     let run = e.execute_and_wait(command, timeout_ms).map_err(failed)?;
     query::invalidate_allocator_snapshots();
     let stopped_at = e.instruction_pointer().ok().map(structured::addr);
-    // Matched on the variant rather than on "was it cut short at all", even though
-    // `execute_and_wait` produces only `OnRequest` today: a go/step that hits its own deadline is
-    // a *forced break at the bound*, which win-kexp deliberately does not report as a cut-short
-    // because the target simply had not stopped yet. That is an invariant of another crate and is
-    // invisible here, so naming the variant this field means keeps the two from drifting apart in
-    // silence — the field says "somebody asked", and only `OnRequest` is somebody asking.
+    // Two different things, matched on the variant rather than on "was it cut short at all",
+    // because a caller acts differently on each: `OnRequest` is somebody having asked, and
+    // `Deadline` is this call's own bound passing with the target still going — so the
+    // position above is where it happened to be, not a stop it reached. Rolling the two into one
+    // flag is how "the target had not stopped" comes to be read as "it stopped here".
     let interrupted = matches!(run.cut_short, Some(Interruption::OnRequest));
-    let text = told(run.clone());
+    let timed_out = matches!(run.cut_short, Some(Interruption::Deadline { .. }));
+    let text = told_moving(run.clone());
     Ok(Output::typed(
         text,
         structured::StopReport {
             command: command.to_string(),
             stopped_at,
             interrupted,
+            timed_out,
             output: run.output,
         },
     ))
@@ -2871,9 +2994,21 @@ impl BatchEngine<'_> {
     /// A command's result as the executor sees it: the text with any deadline note, and whether a
     /// break reached it — from the engine, which knows, or from this worker, which raised it.
     fn ran(&self, run: CommandRun) -> Ran {
+        self.ran_told(run, told)
+    }
+
+    /// [`Self::ran`] for a step that was moving the target, which needs [`told_moving`]'s reading
+    /// of a deadline rather than [`told`]'s. Only the prose differs; `interrupted` is the same
+    /// question either way, and a *deadline* is deliberately not it — that is the step's own
+    /// `timeout_ms` doing its job, which its output now says in as many words.
+    fn ran_moving(&self, run: CommandRun) -> Ran {
+        self.ran_told(run, told_moving)
+    }
+
+    fn ran_told(&self, run: CommandRun, note: fn(CommandRun) -> String) -> Ran {
         Ran {
             interrupted: matches!(run.cut_short, Some(Interruption::OnRequest)) || self.broken(),
-            output: told(run),
+            output: note(run),
         }
     }
 }
@@ -2889,8 +3024,12 @@ impl Debuggee for BatchEngine<'_> {
         self.e
             .execute_and_wait(command, timeout_ms)
             .inspect(|_| query::invalidate_allocator_snapshots())
-            .map(|run| self.ran(run))
+            .map(|run| self.ran_moving(run))
             .map_err(es)
+    }
+
+    fn running(&mut self) -> Option<bool> {
+        self.e.is_running().ok()
     }
 
     fn run_to(&mut self, address: &str, timeout_ms: u32) -> Result<Ran, String> {

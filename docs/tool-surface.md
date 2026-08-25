@@ -86,7 +86,15 @@ The forward (`go`/`step_over`/`step_into`) and reverse (`reverse_go`/`step_over_
 control tools mirror a debugger UI's F9/F8/F7 and Shift+F9/F8/F7, so an agent can drive a trace in
 both directions and jump anywhere with `goto_position`. All of these issue the command **and pump the
 engine to the next stop** (a plain `Execute` only sets the run state — it doesn't move the target),
-which is what makes both live stepping and TTD forward/reverse navigation actually advance.
+which is what makes both live stepping and TTD forward/reverse navigation actually advance. A stop
+that does not arrive within the wait is a **forced break at the bound**, not a failure: the result
+says `timed_out`, and the position it reports is where the target happened to be.
+
+A raw `execute` of the same commands works too, because the server asks the engine after every raw
+command whether it was left running and pumps it if it was — which is a check on the *engine's*
+state rather than on the command's text, so it covers `bp X; g`, an alias, and anything else that
+reaches execution without announcing it. Prefer the typed tools anyway: they answer with a typed
+position and stop reason, where `execute` answers with debugger text and one appended line.
 
 `ttd_calls`/`ttd_memory`/`ttd_events` are convenience wrappers over the TTD data model: `ttd_calls`
 and `ttd_memory` query `@$cursession.TTD.{Calls,Memory}` (every call to a function / every access to

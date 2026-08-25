@@ -29,7 +29,7 @@ all.
 | Tier | Gate | Needs | Catches |
 | --- | --- | --- | --- |
 | **Protocol** | always | no debugger, no target, and no network off this machine — it does bind a loopback port for the listener | transport, revision negotiation, tool-surface drift, and the listener's lease up to the point a session is opened |
-| **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump | `win-kexp` / DbgEng regressions, and a lease expiry releasing a real engine worker |
+| **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump, and `cmd.exe` for the two that launch one | `win-kexp` / DbgEng regressions, a lease expiry releasing a real engine worker, and driving execution on a live user-mode target |
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a live kernel target you can freeze — KDNET, or serial | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
 | **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
@@ -514,6 +514,32 @@ processes, so they need real ones:
   COMPLETE`, with the target still changed. The batch's `always` block writes a marker when it
   starts and another when it finishes, so the interrupt is staged on the first and the second is the
   proof the rollback ran whole; the refusal has to say it is a rollback, or it reads as a bug.
+
+- *A raw execution-control command moves the target instead of wedging the session.*
+  [#226](https://github.com/glslang/windbg-mcp/issues/226), end to end through the shipped
+  transport. `execute` with `t`, `p` and then `g` against a launched `cmd.exe`: each has to say the
+  target moved, the `g` has to report the breakpoint it reached, and a `go` afterwards has to work
+  — the last being the property the issue is actually about, since before the fix every
+  execution-control call on that session failed with `0x80040205` for good while `bl` and `r` kept
+  answering. All three commands rather than one, because all three are doors to the same state and
+  a fix that closed one would look identical from the outside. What is asserted about `t` and `p`
+  is the appended *position* rather than debugger output, and that is measured rather than a
+  stylistic choice: the pump captures module loads and a stop banner for a `g` and an **empty
+  string** for a step, because DbgEng prints a step's new location from the command's own
+  completion and not from the wait.
+- *A resume that reaches no stop says so and leaves the session usable.* The bug underneath #226,
+  and the more serious of the two — reachable with no `execute` anywhere near it. A `debug_batch`
+  `resume` step given three seconds against a target that will not stop in three seconds: the text
+  has to say the target was broken in at the bound, `registers` afterwards has to work, and the
+  report has to call the session stopped. Before the fix the finite `WaitForEvent` underneath left
+  the target running with no current process/thread, so every one of those failed and the call
+  still reported success. Driven through a batch rather than `go` for the three-second bound; the
+  `timed_out` field `go` itself answers with is asserted false on the test above, and its true case
+  belongs to win-kexp's own engine tests, where a two-second bound costs nothing.
+
+  These two are the only tests in the suite that drive **execution** on anything but a live kernel,
+  which is exactly why the bug survived: the live-kernel tier was already on the bounded wait, and
+  no other tier can `go` at all.
 
 **The listener's lease.** `--listen` gives up the one property stdio has for free: a closed stdin
 means the client is definitively gone, and every target is released. Over HTTP a silent client is

@@ -574,6 +574,66 @@ this repo believed for a while: Visual Studio Build Tools ships it, including an
 — because the first fetch takes minutes and everything around it times out, which reads convincingly
 as the parser having made things worse.
 
+## Driving execution: the two waits, and the state a raw command can leave
+
+**A plain `Execute` of execution-control text does not move the target.** DbgEng sets the run state
+and returns; nothing happens until a `WaitForEvent` pumps it. That is why `go`/`step_*`/`reverse_*`
+build `EngineOp::CommandAndWait` (→ `resumed` → `execute_and_wait`) and everything else goes through
+`EngineOp::BoundedCommand` (→ `raw_command` → `execute_command_bounded`).
+
+**The hatch used to wedge its session, and the fix is not a list of command names** (issue #226,
+2026-08-25). `execute { "command": "g" }` set the run state, answered with its own echo, and left
+every later `g`/`p`/`t` failing `0x80040205` while `bl`, `r` and `.lastevent` kept working — half
+alive, with no way back but `end_session`. `raw_command` now calls win-kexp's `settle` after every
+`Execute`, which asks the **engine** (`GetExecutionStatus`) whether it was left running and pumps it
+if so. Ask the engine rather than the text: `bp X; g`, an alias, `.if (1) { g }` and
+`dx …ExecuteCommand("g")` all reach execution without saying so, and the list that would catch them
+cannot be finished. `debug_batch`'s `{"op": "command"}` step is the same door and is covered by the
+same call, because it goes through `raw_command` too.
+
+**Three things about that settle bite.**
+
+- **A step prints nothing.** Measured: the pump captures module loads and a stop banner for a `g`
+  and an **empty string** for a `t` or a `p`, because DbgEng prints a step's new position from the
+  command's own completion rather than from the wait. So `raw_command` appends a sentence naming
+  where the target ended up; without it `execute { "command": "t" }` moves the target and still
+  answers with its own echo, which is indistinguishable from the bug.
+- **Its budget is capped at `EXEC_WAIT_MS` as well as at what is left of the caller's clock.** The
+  cap is not belt-and-braces: without it a raw `g` that reaches no stop blocks for the caller's
+  whole patience, which on the default call timeout is nearly four minutes — far longer than `go`
+  doing the same thing.
+- **The note it appends names no tool.** It is built in the worker, which owns one session and has
+  never heard of the client's surface. That is `FOLLOWUPS.md` item 43's rule, and this is exactly
+  the shape it was written about.
+
+**And underneath it: `execute_and_wait` used a *finite* `WaitForEvent` for everything that was not
+a live kernel.** On expiry that returns `S_FALSE` with the target still running and the engine
+holding no current process/thread, and nothing recovers — `SetInterrupt` plus another wait does not,
+measured. So **any** `go`/step/`resume` that reached no stop within 60s destroyed its session, with
+no `execute` involved, while reporting success. `run_to_address` had documented that hazard since it
+was written and used the bounded INFINITE wait for every target type; only this path had not. It now
+does, and a forced break at the bound is reported (`Interruption::Deadline` → `StopReport.timed_out`)
+rather than passing for a stop.
+
+Two consequences worth carrying:
+
+- **The reason the finite wait looked attractive was a sleep.** Both win-kexp watchdogs polled a
+  flag on a fixed 200/300ms nap, so `join` waited out the rest of it and *every* bounded operation
+  paid up to one interval — the tax `DECISIONS.md` (2026-08-02) measured at 200ms on a command whose
+  unbounded median was 0.22ms, and routed the cheap queries around the bounded path to avoid.
+  `Watchdog` now wakes on a condvar, so a disarm is immediate and the bound costs nothing until it
+  is reached. That trade-off is retired rather than worked around; the criterion in `DECISIONS.md`
+  still stands, but its price has changed.
+- **The origin of a break is the watchdog's own flag, not `interrupt_raised`** — which the watchdog
+  sets too, since that is what `InterruptHandle::interrupt` does. Reading the shared flag alone
+  reports the crate's own deadline as "a host asked".
+
+**Why nothing caught any of it.** Every tier that drives execution was the live-kernel one, which
+was already on the bounded wait; a dump cannot `go`, and no tier launched a process. The debugger
+tier now does (`launch_tier`, two tests in `tests/mcp_smoke.rs`). The one target type still
+unmeasured on this path is **TTD replay**, because replay does not work on this host at all —
+`FOLLOWUPS.md` item 47.
+
 ## Adding a tool (`src/toolset.rs`)
 
 Two files, not one. A tool is declared in `src/server.rs` as always, and its name also goes in a
