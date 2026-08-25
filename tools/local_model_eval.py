@@ -417,9 +417,12 @@ def matches(record, task):
 # not, and the measurement behind the distinction. Keeping a second copy of it cost three review
 # rounds on #221, so this table holds the *reason a step prints*, and that document holds the rule.
 GATES = {
+    # **It does not claim the facts are covered elsewhere**, which the first cut did: that is true
+    # of `arm64_pc`, whose `registers` route is ungated, and false of `driver_blame`, whose only
+    # fact-checking step is this one. Whether anything else grounded them is a per-task question,
+    # and the run answers it per task rather than in a sentence printed for both.
     "kernel_symbols": "`nt` resolved no PDB on this host, so a stack walk has no types to read "
-                      "and gives back frames made of the bug check's own parameters (issue #142). "
-                      "The facts behind this step are asserted through their other route.",
+                      "and gives back frames made of the bug check's own parameters (issue #142).",
 }
 
 # The whole text of a result rather than a field of it, for a tool that has no structured half.
@@ -775,7 +778,7 @@ def grounding(task, pinned_by_step, held_by_step, ran):
 
 
 def verify_task(drive, task):
-    """One task's binding, against the live server. Returns `(failures, notes)`.
+    """One task's binding, against the live server. Returns `(failures, notes, held, unchecked)`.
 
     Opens its own target rather than inheriting a session, which is not tidiness: `crash_triage`'s
     stack is the crash context on a *freshly opened* dump and otherwise whatever the session has
@@ -855,7 +858,17 @@ def verify_task(drive, task):
             by_kind.setdefault(kind, []).append(str(group))
         notes.append("    grounds " + ", ".join(f"{kind}: {', '.join(groups)}"
                                                 for kind, groups in sorted(by_kind.items())))
-    return failures, notes, held
+    # **A task nothing checked is not a task that passed.** `driver_blame`'s only fact-checking
+    # step is gated, so on a host whose engine resolves no PDB every one of its groups stands down
+    # - and the run would then print that every fact the suite grades against still reads off the
+    # dumps, having read none of that task's. `arm64_pc` is the contrast: its `registers` route is
+    # ungated, so one half standing down still leaves the fact verified.
+    #
+    # Reported apart from a failure, and it *is* separate: the key has not rotted, this host cannot
+    # tell. The exit code is non-zero all the same, because "verified nothing about this task" is
+    # not a result a script should read as success.
+    unchecked = bool(how) and all(kind == "skipped" for kind in how.values())
+    return failures, notes, held, unchecked
 
 
 def verify_key(tasks_file):
@@ -932,11 +945,13 @@ def verify_against(drive, suite, tasks):
               f"the facts they are graded against")
         return 1
 
-    failed, leaked = {}, []
+    failed, leaked, unchecked = {}, [], []
     for task in tasks:
         print(f"\n  {task['id']}")
-        failures, notes, held = verify_task(drive, task)
+        failures, notes, held, stood_down = verify_task(drive, task)
         leaked.extend(held)
+        if stood_down:
+            unchecked.append(task["id"])
         for note in notes:
             print(note)
         for failure in failures:
@@ -959,6 +974,11 @@ def verify_against(drive, suite, tasks):
     if failed:
         print(f"\nFAILED: {len(failed)} task(s) are graded against a fact this server no longer "
               f"reports - {', '.join(sorted(failed))}")
+    elif unchecked:
+        print(f"\nINCOMPLETE: {len(tasks) - len(unchecked)} of {len(tasks)} tasks verified. "
+              f"Nothing was checked for {', '.join(unchecked)} - every step grounding those "
+              f"groups stood down at a gate this host cannot open. The key has not rotted; this "
+              f"host cannot say either way, so run it where symbols resolve.")
     else:
         print(f"\nOK: every fact {len(tasks)} tasks are graded against still reads off the dumps. "
               f"CI does not run this - re-run it after a win-kexp bump, a symbol-path change or a "
@@ -972,7 +992,7 @@ def verify_against(drive, suite, tasks):
         print(f"\nATTENTION: {len(leaked)} session(s) this run opened are still attached "
               f"({', '.join(leaked)}). They hold their targets until the lease grace expires, and "
               f"the next run will read them as pre-existing.")
-    return 1 if failed or leaked else 0
+    return 1 if failed or leaked or unchecked else 0
 
 
 def grade_record(record, task, surface_names):
