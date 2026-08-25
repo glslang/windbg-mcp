@@ -2127,14 +2127,21 @@ prior exposure cannot be excluded at one draw per cell. Separating memorised-fro
 guessed-by-convention is item 42's machinery (the same cell repeated with that sentence varied),
 not this item's.
 
-## 44. [windbg-mcp] `arm64_pc` has never measured what it asks, on any surface
+## 44. [windbg-mcp] `arm64_pc` is answered the way it reads, not the way it is keyed
 
 The eval's `arm64_pc` task asks for "the value of the `pc` register at the point of the crash" on
 the ARM64 sample, and its key is `0xfffff8013c65bca8`. **Across the 35 runs of it in the three logs
-this bench has, no model on any surface has ever given that answer, and 32 gave
-`0x0000019e7b820000`** — the bug check's first parameter. Five draws of five models on `min`
-(2026-08-25) is `5n` in every row, frontier rows included, which is what made it visible: at one
-draw per cell it read as a hard task.
+still on disk, no model on any surface gave that answer, and 32 gave `0x0000019e7b820000`** — the
+bug check's first parameter. Five draws of five models on `min` (2026-08-25) is `5n` in every row,
+frontier rows included, which is what made it visible: at one draw per cell it read as a hard task.
+
+**It has been answered correctly once**, in the original grid — qwen, reasoning that frame 0 of the
+bug-check stack *is* the `pc`, which is exactly the route the key wants and is written up in
+`docs/local-model-eval.md`. That log is no longer on disk, so the honest figure is roughly one in
+fifty rather than none in thirty-five (Codex caught the stronger claim on
+[#219](https://github.com/glslang/windbg-mcp/pull/219), against this repo's own published text).
+It matters in the right direction: the task *is* reachable and the route *does* work, so what is
+wrong is only that almost nobody reads the question that way.
 
 **Both answers are defensible, and the debugger says so.** Measured on the dump:
 
@@ -2147,8 +2154,8 @@ draw per cell it read as a hard task.
 
 So a model answering "the pc at the point of the crash" with the faulting address is reading the
 question the way a person would, and the key wants the register's literal value in a context that
-is not the crash. **A task 35 runs have never passed is measuring its own wording**, not the
-surface it was written to probe.
+is not the crash. **A task passed once in about fifty attempts is measuring its own wording**, not
+the surface it was written to probe.
 
 **What would close it.** Reword the prompt so one reading survives - "what value does `pc` hold in
 the crash context, as the debugger reports it" - rather than widening `expect` to accept both,
