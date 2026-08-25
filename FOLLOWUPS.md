@@ -2334,6 +2334,10 @@ verifier quietly querying the old one.
   `registers` route is ungated, so one half standing down still leaves the fact verified. The
   gate's stood-down sentence also stopped claiming "the facts behind this step are asserted through
   their other route", which is true of one of those two tasks and false of the other.
+- **And a task with no `expect` at all** is the unpinned hole at the other end, found a round later:
+  `matches()` runs `all()` over the group list and `all([])` is true, so such a task grades *every*
+  non-empty answer correct - while a suite with no groups also has no ungrounded ones, so nothing
+  downstream complained. It is refused beside the unbound ones.
 
 **And a pin can be too tight.** The first cut pinned the `pc` register as `registers.32.value` —
 its position in the ARM64 bank, which is an engine detail rather than anything the key rests on, so
