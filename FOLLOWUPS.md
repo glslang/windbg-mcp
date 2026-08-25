@@ -1998,11 +1998,20 @@ nothing until it has been shown printing on a known one.*
 **Redone against `excerpt`, sixteen results do name a tool their client is not served — and every
 one is the model's own request coming back.** Nine are the ollama driver's own refusal — the one
 that names the tool it is refusing, "`debug_batch` is not permitted in this harness" — four are
-Claude Code's "No such tool available: `mcp__windbg__…`", and three are **this server's** `-32602`. Nothing is *introduced*: no result names
-a tool the model had not just asked for, so `taught` is zero on this channel too — but by a
-narrower warrant than "clean". The log keeps a **262-character prefix** of each result (96 of the
-114 are truncated; the mean full result is 1,826 characters), so this scans what a result *opens*
-with. And names have to be matched the way
+Claude Code's "No such tool available: `mcp__windbg__…`", and three are **this server's**
+`-32602`. Nothing is *introduced*: no result names a tool the model had not just asked for.
+
+**That is zero within the prefixes the log keeps, and it cannot be stated wider than that**
+(Codex's second round on #216, and correct). `local_model_drive.py` records `text[:300]`, so 96 of
+the 114 results are truncated and 29,946 characters of a 208,266-character corpus were compared: a
+name mentioned late in a long module listing is invisible to this scan by construction. The
+whole-result version needs **no new code and no re-grade** — `Recorder::tool_result` writes each
+result's text into the server transcript, scrubbed then capped, and
+`WINDBG_MCP_TRANSCRIPT_MAX_FIELD=0` lifts the cap — so setting `WINDBG_MCP_TRANSCRIPT` on the bench
+listener answers it outright on the next run. It cannot be answered backwards: nothing kept the
+bytes these two runs discarded.
+
+Names have to be matched the way
 `no_description_names_a_tool_the_client_cannot_call` matches them — bare if the name has an
 underscore, in call context otherwise — because plain containment scores `execute` eight times
 inside `ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY` and "the attempted execute", and because a
