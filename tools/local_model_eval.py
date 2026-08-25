@@ -464,6 +464,17 @@ def field(result, path):
     return cursor
 
 
+def spelling(text):
+    """A string reduced to its letters and digits — how two *spellings* of one fact compare.
+
+    `heap corruption` and `heap_corruption` are one fact written two ways, and the suite lists both
+    because a model writes prose where a tool writes an identifier. `access_violation` is not a
+    spelling of either. That distinction is what lets [`grounding`] account for every alternative a
+    group accepts without demanding that each one appear verbatim in an answer the server gives.
+    """
+    return re.sub(r"[^0-9a-z]", "", text.lower())
+
+
 def rendered(value):
     """A pinned value as `present()` would have to read it — the grader's own normalisation.
 
@@ -506,7 +517,7 @@ def gates_open(drive, session_id):
     One probe today, and it is the one the suite needs: whether `nt` resolved to a **PDB**, which
     is what a walk through its types needs. `tests/mcp_smoke.rs` asks the same question the same
     way (`engine_resolves_kernel_symbols`), and both PDB-backed states count — `dia` is the same
-    PDB read through another API, and the server treats them alike.
+    PDB read through another API, and the server treats them alike. Returns `(gates, error)`.
 
     **Per dump, not per host, and this repo has the measurement.** Each sample has its own `nt` with
     its own PDB identity, so a host can resolve one and not another: `docs/smoke-test.md` records an
@@ -516,11 +527,18 @@ def gates_open(drive, session_id):
     checked the route `arm64_pc`'s `possible_on: min` rests on. The Rust tier asks per session for
     the same reason; so does this.
     """
-    out = drive.mcp("tools/call", {"name": "modules",
-                                   "arguments": {"session_id": session_id, "filter": "nt"}})
-    modules = ((out.get("result") or {}).get("structuredContent") or {}).get("modules") or []
+    result, text, error = run_step(drive, {"tool": "modules",
+                                           "args": {"session_id": session_id, "filter": "nt"}},
+                                   session_id)
+    if error:
+        # **A failed probe is not a closed gate**, and conflating them is the worst failure this
+        # mode can have: a gate that closes *stands steps down and passes*, so a probe answering
+        # an error would turn every gated assertion into a silent no-op and still report success.
+        # The Rust tier gets this for free by panicking on a bad `modules`; this has to say it.
+        return None, f"could not probe the symbol gate: {error}"
+    modules = (result.get("structuredContent") or {}).get("modules") or []
     nt = next((m for m in modules if m.get("name") == "nt"), None)
-    return {"kernel_symbols": bool(nt and nt.get("symbols") in ("pdb", "dia"))}
+    return {"kernel_symbols": bool(nt and nt.get("symbols") in ("pdb", "dia"))}, None
 
 
 def run_step(drive, step, session_id):
@@ -635,15 +653,31 @@ def grounding(task, pinned_by_step, ran):
     how, failures = {}, []
     for group, entry in sorted(claimed.items()):
         if entry["value_ran"]:
-            if any(present(alt, value) for alt in expect[group] for value in entry["values"]):
-                how[group] = "value"
-            else:
+            # **Every alternative, not the group as a whole.** Checking that *some* alternative
+            # renders leaves the group open at the other end: appending `access_violation` beside a
+            # `heap_corruption` that still matches widens what `matches()` accepts while this stays
+            # green - a key going quietly permissive, which is the same rot pointed the other way.
+            # So an alternative must render, or be a [`spelling`] of one that does: the suite lists
+            # `heap corruption` beside `heap_corruption` because a model writes prose where a tool
+            # writes an identifier, and that is a second spelling rather than a second fact.
+            answers = entry["values"]
+            renders = [alt for alt in expect[group] if any(present(alt, v) for v in answers)]
+            spellings = {spelling(alt) for alt in renders}
+            stray = [alt for alt in expect[group]
+                     if alt not in renders and spelling(alt) not in spellings]
+            if not renders:
                 # The key says one thing and the server another. Named as the key's problem, since
                 # the pins themselves all held: this is what the group was edited to, against what
                 # the tools actually answer.
                 failures.append(f"`expect` group {group} ({'|'.join(expect[group])}) is in nothing "
                                 f"this task pinned - the server answers "
-                                f"{', '.join(sorted(set(entry['values']))) or '(nothing)'}")
+                                f"{', '.join(sorted(set(answers))) or '(nothing)'}")
+            elif stray:
+                failures.append(f"`expect` group {group} also accepts {', '.join(stray)}, which is "
+                                f"no spelling of anything this task pinned - an answer carrying "
+                                f"only that would be graded correct without the tool being read")
+            else:
+                how[group] = "value"
         elif entry["relation_ran"]:
             how[group] = "relation"
         else:
@@ -669,7 +703,10 @@ def verify_task(drive, task):
             need = step.get("needs")
             if need:
                 if gates is None and session_id:
-                    gates = gates_open(drive, session_id)
+                    gates, probe_failed = gates_open(drive, session_id)
+                    if probe_failed:
+                        failures.append(probe_failed)
+                        break
                     notes.extend(f"    gate {name}: {'open' if open_ else 'closed'}"
                                  for name, open_ in sorted(gates.items()))
                 if not (gates or {}).get(need):
@@ -723,8 +760,12 @@ def verify_key(tasks_file):
     suite = load(tasks_file)
     tasks = suite["tasks"]
     print(f"verifying {suite.get('suite', tasks_file)} against {drive.MCP_URL}")
-    print("MCP revision negotiated:", drive.handshake())
     try:
+        # **Inside the cleanup, because the handshake is two requests.** `initialize` mints the
+        # session id and `notifications/initialized` follows it; a failure between them leaves an
+        # id nothing will delete, which is the leak this `finally` is for arriving one request
+        # earlier than the first cut allowed for.
+        print("MCP revision negotiated:", drive.handshake())
         return verify_against(drive, suite, tasks)
     finally:
         # **The transport session is this run's too.** The revision spoken here mints an

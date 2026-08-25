@@ -209,7 +209,7 @@ WINDBG_MCP_URL=http://127.0.0.1:8766/ WINDBG_MCP_TOKEN=<the full surface's token
 ```
 
 It opens each dump itself, calls the tools a model would call, and checks every pinned value.
-Six things it catches, each of which is a way the key rots without anything looking wrong:
+Seven things it catches, each of which is a way the key rots without anything looking wrong:
 
 | What moved | How it reads |
 | --- | --- |
@@ -218,6 +218,7 @@ Six things it catches, each of which is a way the key rots without anything look
 | a question — the prompt was pointed at another sample | `the prompt names …082126-7015-01.dmp, which no step of the binding opens` |
 | a key, widened — `expect` grew an alternative nothing fetches | `group 3 (0xfffff8033d680000) is grounded by no step` |
 | a key, wrong — a group edited to something the server does not say | `group 1 (access_violation) is in nothing this task pinned - the server answers 0x13a, kernel_mode_heap_corruption` |
+| a key, too permissive — a group that also accepts something else | `group 1 also accepts access_violation, which is no spelling of anything this task pinned` |
 | a tool — `decode_ioctl` stopped saying `METHOD_NEITHER` | `decode_ioctl @text has 'METHOD_NEITHER': not in the answer's text` |
 
 **The binding carries the inputs, which is the half the suite used to lack.** `expect` says what an
@@ -257,6 +258,14 @@ Inferring `relation` from "no pinned value matched" was the first cut, and it wa
 found: a group edited to `ACCESS_VIOLATION` for a bug check that is `KERNEL_MODE_HEAP_CORRUPTION`
 simply reported `relation` and passed — a broken key reached through the mode meant to catch one.
 
+**And a `grounds` group is checked alternative by alternative, not as a whole**, which closes the
+same hole pointed the other way: `expect` *appending* `access_violation` beside a `heap_corruption`
+that still matches would widen what the grader accepts while the run stayed green. So every
+alternative must render against a pinned value, or be a **spelling** of one that does — letters and
+digits only, which is why the suite can list `heap corruption` beside `heap_corruption` (a model
+writes prose where a tool writes an identifier) and `` fffff801`3c65bca8 `` beside the plain hex,
+while `access_violation` is refused as a second *fact* rather than a second spelling.
+
 A group **no** step claims is a failure too, and that is the ratchet: `expect` cannot grow a fact
 the binding does not fetch, and a new task cannot arrive unpinned.
 
@@ -273,7 +282,10 @@ the Rust tier does; [`smoke-test.md`](./smoke-test.md) has the line and the meas
 and this mode deliberately keeps no second copy of either. **The gate is asked of each task's own
 dump**, not once of the host: that same document records an engine failing *differently per dump*,
 so a gate taken off the first opener could stand the ARM64 step down because an x64 PDB was
-missing, and report success without checking the route `arm64_pc` depends on. `arm64_pc` is asserted through **both**
+missing, and report success without checking the route `arm64_pc` depends on. **A probe that fails
+is not a closed gate**, either: a gate that closes stands its steps down and *passes*, so a probe
+answering an error would turn every gated assertion into a silent no-op — it is a task failure
+instead. `arm64_pc` is asserted through **both**
 routes — `registers`, which needs nothing, and frame 0, which does — because frame 0 is the route
 the task's `possible_on: min` depends on and `registers` alone would not be checking it.
 
