@@ -209,7 +209,7 @@ WINDBG_MCP_URL=http://127.0.0.1:8766/ WINDBG_MCP_TOKEN=<the full surface's token
 ```
 
 It opens each dump itself, calls the tools a model would call, and checks every pinned value.
-Seven things it catches, each of which is a way the key rots without anything looking wrong:
+Eight things it catches, each of which is a way the key rots without anything looking wrong:
 
 | What moved | How it reads |
 | --- | --- |
@@ -219,6 +219,7 @@ Seven things it catches, each of which is a way the key rots without anything lo
 | a key, widened — `expect` grew an alternative nothing fetches | `group 3 (0xfffff8033d680000) is grounded by no step` |
 | a key, wrong — a group edited to something the server does not say | `group 1 (access_violation) is in nothing this task pinned - the server answers 0x13a, kernel_mode_heap_corruption` |
 | a key, too permissive — a group that also accepts something else | `group 1 also accepts access_violation, which is no spelling of anything this task pinned` |
+| a relation whose fact went — the pin a `states` group rests on was deleted | `group 0 (...) is a relation over matched, which this task no longer pins` |
 | a tool — `decode_ioctl` stopped saying `METHOD_NEITHER` | `decode_ioctl @text has 'METHOD_NEITHER': not in the answer's text` |
 
 **The binding carries the inputs, which is the half the suite used to lack.** `expect` says what an
@@ -247,10 +248,12 @@ rotted.
   `present()`. A claimed group nothing renders is a **failure**, which is the row above: an
   `expect` edited to a value the tools do not answer is a broken key, and every model would be
   graded wrong by it.
-- **`states`** — the group is a phrasing of a *relation* over the pinned facts rather than a string
-  the server prints. `unloaded_driver`'s "not loaded" is what `matched: 0` *means*. That is not a
-  hole — the fact behind it is pinned exactly, and only the phrasing is beyond a mechanical check —
-  but it is declared **per group**, so the exemption covers the two that earn it and cannot spread.
+- **`states`** — the group is a phrasing of a *relation* over pinned facts rather than a string the
+  server prints. `unloaded_driver`'s "not loaded" is what `matched: 0` *means*. That is not a hole —
+  the fact behind it is pinned exactly, and only the phrasing is beyond a mechanical check — but it
+  is declared **per group** and **names the pins it rests on** (`{"0": ["matched"]}`), so the
+  exemption covers the two that earn it, cannot spread, and cannot outlive the fact underneath it:
+  deleting the `matched` pin fails rather than leaving the relation reported.
 - **`skipped`** — every step claiming it stood down at a gate on this host, which has to be its own
   word: calling it anything else would claim a check this run did not make.
 
@@ -285,7 +288,8 @@ so a gate taken off the first opener could stand the ARM64 step down because an 
 missing, and report success without checking the route `arm64_pc` depends on. **A probe that fails
 is not a closed gate**, either: a gate that closes stands its steps down and *passes*, so a probe
 answering an error would turn every gated assertion into a silent no-op — it is a task failure
-instead. `arm64_pc` is asserted through **both**
+instead, as is a `modules` answer carrying no module list, or a kernel target with no `nt` in a
+listing filtered for it. Only "`nt` resolved, without a PDB" closes the gate. `arm64_pc` is asserted through **both**
 routes — `registers`, which needs nothing, and frame 0, which does — because frame 0 is the route
 the task's `possible_on: min` depends on and `registers` alone would not be checking it.
 

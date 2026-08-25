@@ -2308,8 +2308,8 @@ verifier quietly querying the old one.
   stops `expect` growing an alternative the binding does not fetch, and stops a new task arriving
   unpinned. Verified against a deliberately rotted copy of the suite: a moved fact, a renamed
   field, a repointed prompt, an ungrounded group, a group edited to something the server does not
-  say, a group widened to also accept something else, and a stale text pin all fail — seven
-  channels — and the clean suite passes.
+  say, a group widened to also accept something else, a relation whose supporting pin was
+  deleted, and a stale text pin all fail — eight channels — and the clean suite passes.
 
 **And a pin can be too tight.** The first cut pinned the `pc` register as `registers.32.value` —
 its position in the ARM64 bank, which is an engine detail rather than anything the key rests on, so
@@ -2329,7 +2329,12 @@ would therefore have stood the ARM64 frame-0 step down because an *x64* PDB was 
 reported success without checking the route `arm64_pc`'s `possible_on: min` rests on. It is asked
 of each task's own session now, as the Rust tier asks it — and **a probe that fails is not a closed
 gate**, which the round after that caught: a gate that closes stands its steps down and *passes*,
-so a probe answering an error would have turned every gated assertion into a silent no-op.
+so a probe answering an error would have turned every gated assertion into a silent no-op. The
+round after *that* took it one level in: a `modules` answer with no module list, and a kernel target
+with no `nt` in a listing filtered for it, are drift too - only "`nt` resolved, without a PDB"
+closes the gate. And a `states` group now **names the pins its relation rests on**, because claiming
+it by the step alone meant deleting the `matched` pin left the relation reported and nothing
+failing.
 
 **Two lifecycle defects came in with it, both from plumbing this reimplemented rather than reused.**
 An opener that registers a session and *then* fails reports the only handle that can reach it inside
