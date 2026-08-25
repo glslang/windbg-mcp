@@ -537,13 +537,13 @@ lines that appear when something did move were checked against a log doctored to
   follows. It is a floor: `expect` can move too, and a pairing predicate reading only the prompt
   catches the change the frozen suite was about and not every change there could be.
 - **Everything else is named.** The build, the weights, the harness and the suite go *above* the
-  table, being run-wide; the **surface fingerprint, the served window and the weights** go
-  *beneath* it, being per cell — the identity block's `weights` line is a run-wide set, and a set
-  cannot say which digest answered which cell, so two runs assigning the same two digests to
-  opposite cells compare equal there. The **build** is per cell for the same reason: a log is
-  append-only and a plan resumes, so a run can legitimately span a rebuild. Those per-cell
-  conditions travel into the series too, beside each cell's score, or a historical row holding two
-  digests could not attribute its own numbers. `surface.client` is a label — `min` was 11 tools and 8,654 B before item 41 and 7,732 B
+  table, being run-wide; the **surface fingerprint and the served window** go *beneath* it, being
+  per cell — the grid varies both deliberately, cell by cell, every run. The weights and the build
+  stay run-wide on purpose: a set cannot say which digest answered which cell, but reaching that
+  state needs a model re-pulled while a run holds it, or a run spanning a rebuild of the server,
+  and neither happens here — the second would invalidate the run outright. The identity line
+  already reports a model answering under two digests, which is the form that would actually
+  take. `surface.client` is a label — `min` was 11 tools and 8,654 B before item 41 and 7,732 B
   after — so pairing on the label alone would present a surface change as a model comparison, which
   is the very intervention a rerun exists to measure. The fingerprint is a **digest of the surface
   as it went over the wire**, not its length: a byte count moves for almost any prose edit and for

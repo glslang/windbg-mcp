@@ -2501,11 +2501,19 @@ now stamps the short git revision into the version the server reports, as semver
   `weights` is a run-wide set, and two runs assigning the same two digests to opposite cells - one
   model at two contexts, a tag re-pulled between the runs - compare equal there while pairing
   results from different weights. And a row label carries its **backend**, since a cell is keyed by
-  one and an ollama tag may be the same string as a Claude alias. The **build** followed the
-  weights a round later, on the identical argument - a log is append-only and a plan resumes, so a
-  run can span a rebuild and two logs holding the same revision *set* with the cells swapped
-  compare equal run-wide - and the series learned to carry all four per cell, since a historical
-  row holding two digests could not otherwise attribute its own numbers.
+  one and an ollama tag may be the same string as a Claude alias.
+
+**Two rounds were declined after being built, which is the more useful record.** Review asked for
+the model weights and then the server build to become per-cell facts beside the surface and the
+window, on a sound argument: a run-wide *set* cannot say which digest or revision answered which
+cell, so two logs assigning the same two to opposite cells compare equal. Both were implemented and
+then taken back out, because the premise is not reachable on this bench - a model cannot be
+re-pulled while a run holds it, and a run that spanned a rebuild of the server is invalid for
+reasons no comparison could repair. A surface and a window are different in kind: the grid varies
+both deliberately, cell by cell, every run. What survives is the one thing a historical row cannot
+recover from the identity line, the surface digest per cell in the series. **`tools/` is a
+developer script, not the server**, and the bar for defending it against states its own workflow
+cannot produce is lower than `src/`'s.
 - **Absent is not the same as deliberately null**, which the same round caught. A Claude row's
   `model_digest` is null *on purpose* - an alias resolved inside a client this bench does not own
   has no content address - and folding that into `unrecorded` labelled every current run containing
