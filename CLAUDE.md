@@ -172,7 +172,7 @@ It checks *same-file* fragments only, so a cross-file `../README.md#some-heading
 verify by hand.
 
 **The pass count does not say which tiers ran.** Each gate is inside its test, so the `mcp_smoke`
-harness reports the same **76 passed** with the debugger tier off as with it on — that harness's own
+harness reports the same **79 passed** with the debugger tier off as with it on — that harness's own
 result line, since a plain `cargo test` runs the crate's several hundred unit tests beside it and
 prints a result line per binary. What differs between the two runs is the runtime (measured on the
 ARM64 bench 2026-08-23: **1.6s against 61s** for `cargo test --test mcp_smoke`) and the `SKIPPED`
@@ -660,7 +660,11 @@ Four rules worth knowing before touching it. **`session` is in every surface** w
 says, because every other tool routes by a `session_id` this server alone issues — so `--tools
 crash` is eleven tools and 11,265 B is the floor. **Output schemas carry no prose at all**
 (`src/schema.rs`): declare one with `schema::constraints_of`, never rmcp's `schema_for_output`, or
-the tool ships every doc comment in its `$defs` closure and the wire ceiling notices. And **a
+the tool ships every doc comment in its `$defs` closure and the wire ceiling notices. That call is
+also what supplies the root `type: "object"` a discriminated union does not generate and rmcp does
+not add — without which every released TypeScript-SDK client rejects the *whole* `tools/list` and
+registers no tools at all, not 50 of 51 (issue #223, measured: 0 of 51 against SDK 1.30.0). Both
+halves are asserted on the wire in `mcp_smoke`, because both come undone the same way. And **a
 surface is per client, not per run** (item 36): `--tools` is the run's *default*, and a listener's
 client may be configured with a spec of its own (`WINDBG_MCP_TOOLS_<NAME>`, or a `tools` field in
 the credential file) that replaces it. So a change to a group is a change to what several

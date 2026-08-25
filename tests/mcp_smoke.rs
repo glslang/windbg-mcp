@@ -1132,6 +1132,13 @@ fn digest_tool(tool: &Value) -> Value {
 /// is emitted would otherwise land silently on every consumer. The digest keeps the branch shape
 /// rather than the whole schema — the point is that the discriminator and its branches survive,
 /// not the wording of every field's description.
+///
+/// The root `type` is in it for the same reason and one sharper one: it is the keyword whose
+/// absence costs a strict client every tool on the list rather than the one tool that lacks it
+/// (issue #223), and it is supplied by `src/schema.rs` rather than by the generator — so a
+/// `schemars` release that started emitting one, or a change that stopped supplying it, is a line
+/// of this diff either way. [`output_schemas_are_object_rooted`] is the assertion; this is the
+/// record.
 fn digest_output_schema(schema: &Value) -> Value {
     if schema.is_null() {
         return Value::Null;
@@ -1166,6 +1173,7 @@ fn digest_output_schema(schema: &Value) -> Value {
         .unwrap_or_default();
     json!({
         "dialect": schema["$schema"],
+        "root": schema["type"],
         "branches": branches,
     })
 }
@@ -1738,6 +1746,64 @@ fn output_schemas_carry_constraints_not_prose() {
         input_prose > 100,
         "input schemas carry only {input_prose} descriptions: the strip has reached the half a \
          model actually reads"
+    );
+}
+
+/// Every declared `outputSchema` is rooted at `type: "object"`, which is what keeps a strict
+/// client holding **any** of this server's tools.
+///
+/// The structured results are serde internally-tagged enums, and `schemars` renders one as
+/// `{ $schema, oneOf, $defs }` — object-ness stated on each branch of the union and nowhere at the
+/// root. rmcp passes that through: `schema_for_input` requires a root `type: "object"` and refuses
+/// anything else, while `schema_for_output` deliberately does not, SEP-2106 (`2026-07-28`) having
+/// relaxed the requirement for output schemas.
+///
+/// What that relaxation does not do is reach the clients. Every released
+/// `@modelcontextprotocol/sdk` 1.x — 1.30.0 included — parses `Tool.outputSchema` as
+/// `z.object({ type: z.literal("object"), … })` and `tools/list` as `z.array(ToolSchema)`, so the
+/// array fails on the first non-conforming tool and the client registers **none** of them.
+/// Measured against 1.30.0 on the shape this server emitted: 17 conforming tools plus one
+/// `oneOf`-rooted schema parses to zero tools, not 17. That is issue #223 — windbg-mcp v0.11.0
+/// behind a 1.29.0 client: no tools registered, reconnect loop exhausted, server deregistered.
+///
+/// It is asserted here rather than in `src/schema.rs` alone because the unit test knows what
+/// `constraints_of` returns and this knows what a client is *sent* — and the way the fix comes
+/// undone is a tool declaring its schema with rmcp's `schema_for_output` instead, which only the
+/// wire would show. The sibling check is
+/// [`output_schemas_carry_constraints_not_prose`], which fails the same way for the same reason.
+#[test]
+fn output_schemas_are_object_rooted() {
+    let mut server = Server::started();
+    let response = server.request("tools/list", json!({}), STEP);
+    assert_no_error(&response, "tools/list");
+    let tools = response["result"]["tools"]
+        .as_array()
+        .expect("tools/list returns an array")
+        .clone();
+
+    let mut with_schema = 0;
+    for tool in &tools {
+        let name = tool["name"].as_str().unwrap_or("<unnamed>");
+        let Some(schema) = tool.get("outputSchema").filter(|s| !s.is_null()) else {
+            continue;
+        };
+        with_schema += 1;
+        assert_eq!(
+            schema["type"],
+            json!("object"),
+            "`{name}` declares an outputSchema with no root `type: \"object\"`. A strict client \
+             rejects the whole `tools/list` on it and registers none of the {} tools this server \
+             serves — not {} of them. Declare it with `schema::constraints_of`, not rmcp's \
+             `schema_for_output`.",
+            tools.len(),
+            tools.len() - 1
+        );
+    }
+
+    assert!(
+        with_schema > 20,
+        "only {with_schema} tools declare an output schema — this test has stopped covering the \
+         surface it is about"
     );
 }
 

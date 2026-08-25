@@ -154,8 +154,9 @@ suppress it — not ship an advertisement clients will call into a dead end.
 surface as it appears on the wire: JSON Schema dialect, `$defs` usage (`true` since `debug_batch`
 introduced the first nested schema), tool count, and per tool its
 name, title, four behaviour hints, required arguments, each parameter's type/format/enum, and — for
-the tools that declare one — the shape of its `outputSchema`: the dialect, and for each branch of
-the result union its `status` const, the payload type it references, and what that branch requires.
+the tools that declare one — the shape of its `outputSchema`: the dialect, the root `type`, and for
+each branch of the result union its `status` const, the payload type it references, and what that
+branch requires.
 It deliberately excludes descriptions, so prose edits do not churn it while a `schemars` dialect
 switch, an `rmcp` annotation-casing change, a discriminator that stops being emitted, or an
 accidental tool rename all land as a readable line diff.
@@ -165,6 +166,25 @@ descriptions **at all** — 68% of every `outputSchema` byte used to be rustdoc 
 and no validator reads, which is `FOLLOWUPS.md` item 24's first finding. It reads `tools/list` off
 the wire because the way that comes undone is one tool declaring its schema with rmcp's
 `schema_for_output` instead of `schema::constraints_of`, and nothing else would report it.
+
+And beside *that*, `output_schemas_are_object_rooted` asserts every declared `outputSchema` is
+rooted at `type: "object"` — the keyword whose absence costs a strict client not the one tool that
+lacks it but **every tool on the list**. The structured results are internally-tagged enums, which
+`schemars` renders as `{ $schema, oneOf, $defs }` with the object-ness on each branch and none at
+the root, and rmcp passes that through: `schema_for_input` requires a root `object` and refuses
+anything else, while `schema_for_output` deliberately does not, SEP-2106 (`2026-07-28`) having
+relaxed the requirement. That relaxation is what a server may emit, not what clients accept — every
+released `@modelcontextprotocol/sdk` 1.x through 1.30.0 parses `Tool.outputSchema` as
+`z.object({ type: z.literal("object"), … })` and `tools/list` as `z.array(ToolSchema)`, so the array
+fails on the first non-conforming tool. Measured against 1.30.0 on this server's own captured
+`tools/list`: **0 of 51 tools before the fix, 51 of 51 after**, and all 33 schemas compile under
+`ajv`. That is issue #223, which reached a real client as zero tools registered and the server
+deregistered after its reconnect loop. `src/schema.rs` supplies the keyword; this is the assertion
+that it reaches the wire, since the failure is a tool declaring its schema the other way round.
+
+The reason no tier caught it is worth keeping: this harness is a hand-rolled JSON-RPC client, and
+it never validated a tool *definition* — only the results of calling one. The assertion encodes the
+SDK's rule rather than adding a Node client to CI.
 
 Re-record after an *intended* change, and read the diff before committing:
 
