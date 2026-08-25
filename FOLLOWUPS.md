@@ -2258,20 +2258,38 @@ gave — while nothing in this repo pins the `pc` the task is actually keyed to.
 ambiguity are named in the codebase, in two different files, and the half the eval depends on is
 the unasserted one.
 
-**What would close it.** A table-driven test in the debugger tier over the facts the tasks depend
-on. It is cheap in the way the rest of that tier is not: no model, no ollama, no listener, no
-grid — `open_dump`, `crash_triage`, `registers`, `modules` and `decode_ioctl` against dumps the
-tier already opens, in seconds. The `0x22200B` half is cheaper still and needs no target at all,
-which is why that tier already uses `decode_ioctl` as its pure-tool fixture.
+**What would close it.** A table-driven check over the facts the tasks depend on — `open_dump`,
+`crash_triage`, `registers`, `modules` and `decode_ioctl` against dumps the debugger tier already
+opens. It is cheap in the way the rest of that tier is not: no model, no ollama, no listener, no
+grid, seconds rather than minutes. The `0x22200B` half is cheaper still and needs no target at
+all, which is why that tier already uses `decode_ioctl` as its pure-tool fixture. *Where* it runs
+is not settled — see the next paragraph, which is the part that has to be decided first.
 
-**The design question it must not skip is where the facts live**, because the key is not in a form
-a test can consume. `answer_key` is one prose string per dump ("x64, 0x13a
-KERNEL_MODE_HEAP_CORRUPTION, 158 modules, faulting frame MessageManager+0x1654, …") and `expect` is
-a list of answer alternatives keyed to a *question* rather than to a tool call, so neither can be
-read mechanically. Either the key becomes machine-readable and the test consumes it, or the test
-restates the facts — and restating them creates the second copy this item exists to prevent, with
-the two drifting apart being the failure mode it would then have. Decide that first; the
-assertions are the easy half.
+**Assert against the oracle, and `answer_key` is not it** — a correction this entry needed, because
+its first draft proposed pinning exactly the wrong half. **Nothing in this repo reads
+`answer_key`**: `grep` finds no consumer in `tools/`, `tests/` or `src/`. It is one prose string
+per dump ("x64, 0x13a KERNEL_MODE_HEAP_CORRUPTION, 158 modules, faulting frame
+MessageManager+0x1654, …") and it is documentation. What decides pass or fail is `matches()`, which
+reads a task's **`expect`** groups and nothing else. So a drift test pinned to `answer_key` would
+stay green while the facts models are actually graded against went stale — this item's own failure
+mode, reached through this item's own fix.
+
+**And the oracle is in the wrong language for the tier this proposed putting it in**, which is the
+real constraint. `expect` is answer *alternatives* matched by `present()` — hex-boundary rules,
+leading zeros, separators, all three learned from a wrong verdict — so consuming it faithfully
+means having `present()`. That is Python, beside the grader; `mcp_smoke` is Rust. Three shapes,
+and the entry should not pretend one is obvious:
+
+- **A `--verify-key` mode beside `--grade`**, driving the server and checking each task's `expect`
+  against what the tools answer, through the same `present()` that grades. One oracle, no second
+  copy — and not a `cargo test` gate, since CI runs the Rust tier and not this.
+- **A Rust test whose constants are generated from `tools/eval_tasks.json`.** A CI gate, at the
+  cost of a codegen step and of `present()`'s rules having to hold on the generated side.
+- **A Rust test with the facts written out by hand** — a CI gate today and the second copy this
+  item exists to prevent, with the two drifting apart being the failure it would then have.
+
+Deciding between the first two is the work. The assertions are the easy half, and the third option
+is the one that looks easiest and is the item repeating itself.
 
 **And say which corpus is being asserted**, because the two disagree: `082126-7015-01.dmp` is in
 `answer_key` and no task references it, so a test driven off the key covers a dump the eval never
