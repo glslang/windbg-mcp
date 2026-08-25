@@ -2334,6 +2334,12 @@ verifier quietly querying the old one.
   `registers` route is ungated, so one half standing down still leaves the fact verified. The
   gate's stood-down sentence also stopped claiming "the facts behind this step are asserted through
   their other route", which is true of one of those two tasks and false of the other.
+- **The unit is the `expect` group, not the task** - a refinement the round after made, and the
+  reason it matters is that a task can come back *mixed*: one group grounded by an ungated step and
+  another only by a gated one. Treating that as verified reports a graded fact as checked having
+  read nothing of it. And an **empty suite** is not a verified one, which the same round caught:
+  the run printed "every fact 0 tasks are graded against still reads off the dumps" and exited
+  zero, so a file an edit had emptied was indistinguishable from a key that holds.
 - **And a task with no `expect` at all** is the unpinned hole at the other end, found a round later:
   `matches()` runs `all()` over the group list and `all([])` is true, so such a task grades *every*
   non-empty answer correct - while a suite with no groups also has no ungrounded ones, so nothing

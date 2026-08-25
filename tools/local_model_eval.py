@@ -858,17 +858,19 @@ def verify_task(drive, task):
             by_kind.setdefault(kind, []).append(str(group))
         notes.append("    grounds " + ", ".join(f"{kind}: {', '.join(groups)}"
                                                 for kind, groups in sorted(by_kind.items())))
-    # **A task nothing checked is not a task that passed.** `driver_blame`'s only fact-checking
-    # step is gated, so on a host whose engine resolves no PDB every one of its groups stands down
-    # - and the run would then print that every fact the suite grades against still reads off the
-    # dumps, having read none of that task's. `arm64_pc` is the contrast: its `registers` route is
-    # ungated, so one half standing down still leaves the fact verified.
+    # **A fact nothing checked is not a fact that held**, and the unit is the *group*, not the task.
+    # `driver_blame`'s only fact-checking step is gated, so on a host whose engine resolves no PDB
+    # every one of its groups stands down - but a task can also come back mixed, one group grounded
+    # by an ungated step and another only by a gated one, and calling that verified would report a
+    # graded fact as checked having read nothing of it. `arm64_pc` is the case that stays whole:
+    # its group is grounded by `registers` *and* by frame 0, so one route standing down leaves the
+    # fact verified.
     #
     # Reported apart from a failure, and it *is* separate: the key has not rotted, this host cannot
-    # tell. The exit code is non-zero all the same, because "verified nothing about this task" is
+    # tell. The exit code is non-zero all the same, because "verified nothing about this fact" is
     # not a result a script should read as success.
-    unchecked = bool(how) and all(kind == "skipped" for kind in how.values())
-    return failures, notes, held, unchecked
+    return failures, notes, held, sorted(g for g, kind in (how or {}).items()
+                                         if kind == "skipped")
 
 
 def verify_key(tasks_file):
@@ -883,6 +885,11 @@ def verify_key(tasks_file):
 
     suite = load(tasks_file)
     tasks = suite["tasks"]
+    if not tasks:
+        # **An empty suite is not a verified one**, and without this the run printed "every fact 0
+        # tasks are graded against still reads off the dumps" and exited zero - making a file an
+        # edit had emptied indistinguishable from a key that holds.
+        raise SystemExit(f"{tasks_file} has no tasks; there is nothing to verify")
     print(f"verifying {suite.get('suite', tasks_file)} against {drive.MCP_URL}")
     try:
         # **Inside the cleanup, because the handshake is two requests.** `initialize` mints the
@@ -960,7 +967,7 @@ def verify_against(drive, suite, tasks):
         failures, notes, held, stood_down = verify_task(drive, task)
         leaked.extend(held)
         if stood_down:
-            unchecked.append(task["id"])
+            unchecked.append((task["id"], stood_down, len(task.get("expect") or [])))
         for note in notes:
             print(note)
         for failure in failures:
@@ -984,10 +991,11 @@ def verify_against(drive, suite, tasks):
         print(f"\nFAILED: {len(failed)} task(s) are graded against a fact this server no longer "
               f"reports - {', '.join(sorted(failed))}")
     elif unchecked:
-        print(f"\nINCOMPLETE: {len(tasks) - len(unchecked)} of {len(tasks)} tasks verified. "
-              f"Nothing was checked for {', '.join(unchecked)} - every step grounding those "
-              f"groups stood down at a gate this host cannot open. The key has not rotted; this "
-              f"host cannot say either way, so run it where symbols resolve.")
+        stood = ", ".join(f"{name} ({len(groups)} of {total})" for name, groups, total in unchecked)
+        print(f"\nINCOMPLETE: {len(tasks) - len(unchecked)} of {len(tasks)} tasks fully verified. "
+              f"{sum(len(g) for _, g, _ in unchecked)} `expect` group(s) stood down at a gate this "
+              f"host cannot open - {stood}. The key has not rotted; this host cannot say either "
+              f"way, so run it where symbols resolve.")
     else:
         print(f"\nOK: every fact {len(tasks)} tasks are graded against still reads off the dumps. "
               f"CI does not run this - re-run it after a win-kexp bump, a symbol-path change or a "
