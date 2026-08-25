@@ -931,8 +931,10 @@ assertable. **The split attributes need, not provenance**: an opener's result ta
 
 **Fourth run, five draws of the five `min` cells** (2026-08-25, against #217): `modules` went from
 3 of 5 cell-draws to **0 of 25**, and what remains is mostly invented (`execute_command`,
-`run_command`). The arms differ by exactly one server change, so this is the cleanest causal read
-the bench has produced — with the weakness on the *other* side, which is one draw per cell. Two
+`run_command`). The arms differ by exactly one server behaviour *these tasks reach* - the opener's
+summary; the other two paths #217 changed were measured as unexercised (0 user-mode refusals in 95
+`crash_triage` calls, 0 post-commit failures) - so this is the cleanest causal read the bench has
+produced — with the weakness on the *other* side, which is one draw per cell. Two
 things only draws could say: `ioctl_decode` is answered from a frontier model's own knowledge 5/5
 and from a local one's 1/5, and **`arm64_pc` is `5n` in every row**, which is what sent someone to
 look at the task rather than the models. It went unanswered in all 35 runs in the logs still on

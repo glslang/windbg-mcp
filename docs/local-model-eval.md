@@ -656,8 +656,12 @@ name that result was handing over. After: `execute_command` (12 calls, gemma, th
 `execute` (3, gemma, one draw — a real tool, not served here), `run_command` (1, opus). Thirteen of
 the sixteen are names this server does not have.
 
-The two arms differ by **exactly one server behaviour change**: everything else merged between them
-was documentation, the grader or the runner. That is as clean as a single variable gets here — and
+The two arms differ by **exactly one server behaviour these tasks can reach** — the opener's
+summary. Two other paths changed in the same window and neither was exercised, which is measured
+rather than assumed: the user-mode refusal that stopped naming `backtrace` and `execute` (0 of the
+run's 95 `crash_triage` calls reached it — every task here opens a kernel dump) and the
+post-commit failure's `execute` example (no open failed after commit). Everything else merged
+between the runs was documentation, the grader or the runner. That is as clean as a single variable gets here — and
 the weakness is the other arm, which is one draw per cell. So the claim is not a rate against a
 rate; it is the sentence above about fifteen draws. Note also that gemma's twelve calls are a loop
 (four per draw, three draws), so **draw-level presence is the unit**, not call count.
