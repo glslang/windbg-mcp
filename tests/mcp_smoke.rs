@@ -4131,6 +4131,169 @@ fn target_tier() -> Option<&'static str> {
     Some(SAMPLE_DUMP)
 }
 
+/// The debugger tier's gate for a test that needs an engine and a **live process** rather than the
+/// sample dump.
+///
+/// The same environment variable, because what it means is "this host has DbgEng"; without the
+/// file check, which would stand a launch test down over a dump it never opens.
+///
+/// A tier of its own would be worse than either: these are the only tests in the suite that drive
+/// *execution* on anything but a live kernel, and that is exactly the gap they exist to close
+/// (issue #226). A gate nothing sets is a gap that stays open.
+fn launch_tier() -> bool {
+    if std::env::var_os("WINDBG_MCP_SMOKE_DUMP").is_none() {
+        skip("set WINDBG_MCP_SMOKE_DUMP=1 to run the debugger tier");
+        return false;
+    }
+    true
+}
+
+/// A live user-mode target that runs long enough to be driven and exits on its own.
+const LIVE_TARGET: &str = "cmd.exe /c ping -n 30 127.0.0.1";
+
+/// Issue #226: a raw `execute` of execution-control text must **move the target**, not set a run
+/// state nobody pumps.
+///
+/// What it did before: `Execute` set the run state and returned, so the call answered with its own
+/// echoed command and nothing else, the target had not moved, and every later `g`/`p`/`t` on that
+/// session failed with `0x80040205` while `bl`, `r` and `.lastevent` kept working. There was no
+/// way back short of `end_session`.
+///
+/// All three commands the issue names, because all three are doors to the same state and a fix
+/// that closed one would look identical from the outside. `t` and `p` stop on their own next
+/// instruction; `g` needs somewhere to stop, which is what the breakpoint is for.
+///
+/// The fix is not a list of command names — it is `settle`, which asks the engine whether it was
+/// left running. That is why this test does not have to enumerate every way to reach execution.
+#[test]
+fn a_raw_execution_control_command_moves_the_target_instead_of_wedging_the_session() {
+    if !launch_tier() {
+        return;
+    }
+    let mut server = Server::started();
+    let session = server.open_session(
+        "launch",
+        json!({ "command_line": LIVE_TARGET }),
+        TARGET_STEP,
+    );
+
+    for command in ["t", "p"] {
+        let out = server.tool_text(
+            "execute",
+            json!({ "session_id": &session, "command": command }),
+            TARGET_STEP,
+        );
+        // The bug's own signature, quoted from the issue: "returns only the echoed command text".
+        //
+        // A step's *position* is what says it moved, because DbgEng prints nothing else for one:
+        // measured, the pump captures module loads and a stop banner for a `g` and an empty
+        // string for a `t`, since the engine prints a step's new location from the command's own
+        // completion rather than from the wait.
+        assert!(
+            out.contains("moved the target"),
+            "`execute` with `{command}` answered `{out}`, which does not say the target moved"
+        );
+    }
+
+    server.tool_data(
+        "set_breakpoint",
+        json!({ "session_id": &session, "expression": "ntdll!NtCreateFile" }),
+        TARGET_STEP,
+    );
+    let out = server.tool_text(
+        "execute",
+        json!({ "session_id": &session, "command": "g" }),
+        TARGET_STEP,
+    );
+    assert!(
+        out.contains("Breakpoint"),
+        "a raw `g` must run the target on to its breakpoint and report the stop: {out}"
+    );
+
+    // The property the issue is actually about, and the one no amount of output can stand in for:
+    // execution control still works on this session afterwards.
+    let stop = server.tool_data("go", json!({ "session_id": &session }), TARGET_STEP);
+    assert_eq!(
+        stop["timed_out"], false,
+        "a `go` that reached its breakpoint must not report a bound it never hit: {stop}"
+    );
+    assert!(
+        stop["stopped_at"].is_string(),
+        "a `go` that stopped must say where: {stop}"
+    );
+
+    server.call_tool(
+        "end_session",
+        json!({ "session_id": &session }),
+        TARGET_STEP,
+    );
+}
+
+/// A resume that reaches **no** stop says so, and leaves the session usable.
+///
+/// The bug underneath #226, and the more serious of the two: `execute_and_wait` used a finite
+/// `WaitForEvent` for every target that was not a live kernel, and on expiry that returns
+/// `S_FALSE` with the target still running and the engine holding no current process/thread.
+/// Measured before the fix: one `go` with nothing to stop it left `registers`, `bl` and `? @$ip`
+/// failing with `0x80040205` for the life of the session, while the call itself reported success.
+///
+/// Nothing caught it because the only tier that drove execution was the live-kernel one, which was
+/// already on the bounded wait.
+///
+/// Driven through a `debug_batch` rather than `go` for the bound: `go`'s own wait is a minute, and
+/// three seconds of a target that will not stop proves the same thing. The `timed_out` field `go`
+/// answers with is asserted `false` above; `true` is win-kexp's to cover, in
+/// `a_go_that_never_stops_is_reported_and_leaves_the_engine_usable`, where a two-second bound
+/// costs nothing.
+#[test]
+fn a_resume_that_reaches_no_stop_says_so_and_leaves_the_session_usable() {
+    if !launch_tier() {
+        return;
+    }
+    let mut server = Server::started();
+    let session = server.open_session(
+        "launch",
+        json!({ "command_line": LIVE_TARGET }),
+        TARGET_STEP,
+    );
+
+    let batch = server.call_tool(
+        "debug_batch",
+        json!({
+            "session_id": &session,
+            "steps": [{ "op": "resume", "command": "g", "timeout_ms": 3000 }],
+            "timeout_ms": 30000,
+        }),
+        TARGET_STEP,
+    );
+    // Asserted on the **text**, because that is where a step's output lives: the structured report
+    // carries what each step did and not what the debugger printed while it did it.
+    let rendered = text_of(&batch["result"]);
+    assert!(
+        rendered.contains("had not stopped after 3000 ms"),
+        "a resume broken in at its own bound must say so rather than pass for a stop: {rendered}"
+    );
+    let report = &batch["result"]["structuredContent"];
+
+    // The regression. Read through a *typed* tool, not `execute`, because the failure was the
+    // engine losing its current process/thread and every one of these goes through it.
+    let after = server.call_tool("registers", json!({ "session_id": &session }), TARGET_STEP);
+    assert!(
+        !is_tool_error(&after),
+        "the session is unusable after a resume that reached no stop: {after}"
+    );
+    assert_eq!(
+        report["after"]["state"], "stopped",
+        "the target was broken in, so the batch must report it stopped: {report}"
+    );
+
+    server.call_tool(
+        "end_session",
+        json!({ "session_id": &session }),
+        TARGET_STEP,
+    );
+}
+
 /// The same gate for a test that reads a **target's memory** rather than the structure of the dump
 /// around it: [`NATIVE_SAMPLE`], the crash paired with this host's architecture.
 fn native_sample_tier() -> Option<&'static KernelSample> {

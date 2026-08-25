@@ -85,6 +85,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A raw `execute` of `g`/`p`/`t` moves the target instead of wedging the session**
+  ([#226](https://github.com/glslang/windbg-mcp/issues/226)). `execute` runs a plain
+  `IDebugControl::Execute`, and DbgEng's execution-control commands only *set the run state*
+  there — nothing moves until a `WaitForEvent` pumps it. So the call answered with its own echoed
+  command, the target had not moved, and from then on every `go`/`step_*` on that session failed
+  with `0x80040205` while `bl`, `r` and `.lastevent` kept working, which reads as half alive. There
+  was no way back short of `end_session`. The same door was open through `debug_batch`'s
+  `{"op": "command"}` step, which reported `committed`, `rollback_complete: true` and
+  `after: stopped` on a session it had just wedged.
+
+  The fix asks the **engine** rather than the command text: after any raw `Execute`, win-kexp's new
+  `settle` reads the execution status and pumps a target that was left running. That is why no list
+  of command names appears anywhere in it — `bp X; g`, an alias, `.if (1) { g }` and the data
+  model all reach execution without saying so, and a list would have to enumerate them. The result
+  carries what the pump printed plus a line naming where the target ended up, since a step prints
+  nothing at all; `debug_batch` now asks the same question before reporting what its session holds.
+
+- **A `go`, step or `resume` that reaches no stop no longer destroys its session**, and says what
+  happened. Underneath #226 and reachable with no `execute` at all: win-kexp's `execute_and_wait`
+  used a *finite* `WaitForEvent` for every target that was not a live kernel, and on expiry that
+  returns `S_FALSE` with the target still running and the engine holding no current process/thread
+  — unrecoverable, while the call reported success. Measured: one `go` on a launched process with
+  nothing to stop it, and every later `registers`, `bl` and `? @$ip` failed with `0x80040205` for
+  the life of the session, with `session_status` still calling it open and live. The wait is now
+  the bounded INFINITE one `run_to_address` has always used, so the target is broken in at the
+  bound and the session survives, and `go`/`step_*`/`reverse_*` answer with a new
+  `timed_out` beside `interrupted` — two different reasons the position is real but is not a stop
+  the target reached. Nothing caught this because the only tier that drove execution was the
+  live-kernel one, which was already on the bounded wait; the debugger tier now launches a process
+  and drives it.
+
 - **And no *result* names one either, which was the channel nobody had scanned** (`FOLLOWUPS.md`
   item 43). Items 40 and 41 below closed the `instructions` string and the descriptions; an
   opener's summary went on ending with "`modules` lists a page of the table and `modules

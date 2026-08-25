@@ -118,5 +118,16 @@
   recorder's startup output to `<out_dir>\ttd_record.log` and watches it briefly, so a fast failure
   (e.g. running un-elevated → `0x80070005 Access is denied`) is reported as an error rather than a
   false "recording started".
-- Control-flow tools (`go`/`step*`) issue the corresponding debugger command; precise stop/wait
-  semantics for long-running `go` against a live target are bounded by the per-call timeout.
+- **Control-flow tools (`go`/`step*`/`reverse_*`) wait 60s for a stop, then break the target in.**
+  The command is issued and the engine pumped to the next stop; if the target has not reached one
+  by then the debugger raises a Ctrl+Break, so the call returns with the target *stopped where it
+  happened to be* rather than left running. That case is reported rather than left to be inferred:
+  `timed_out` is set in the structured result and the text says so. It is not an error and not an
+  `interrupt` — nobody asked — and the next move is to run the target on, or to give it something
+  to stop at.
+- **A raw `execute` of an execution-control command works, and is not the same as the typed tool.**
+  `g`, `p`, `t`, `bp X; g` and anything else that reaches execution moves the target: the server
+  asks the engine whether a command left it running and pumps it if so, under the same 60s bound.
+  What you get back is the debugger's output plus a line naming where the target ended up — there
+  is no structured `stopped_at`, no typed `timed_out`, and a step prints nothing of its own, so
+  that line is the only position in the answer. The typed tools are still the better call.
