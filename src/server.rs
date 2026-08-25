@@ -4800,7 +4800,7 @@ impl rmcp::ServerHandler for WindbgServer {
         )
         .with_server_info(rmcp::model::Implementation::new(
             "windbg-mcp",
-            env!("CARGO_PKG_VERSION"),
+            crate::BUILD_VERSION,
         ))
         .with_instructions(self.instructions())
     }
@@ -5522,10 +5522,18 @@ mod tests {
             server_info["name"], "windbg-mcp",
             "the server must not report the SDK's identity as its own: {line}"
         );
-        assert_eq!(
-            server_info["version"],
-            env!("CARGO_PKG_VERSION"),
+        // **Starts with** the crate version rather than equalling it: `build.rs` appends the git
+        // revision as semver build metadata, so an equality here would fail on every build that
+        // has a `.git` beside it and pass only on the tarball case nobody runs.
+        let reported = server_info["version"].as_str().unwrap_or_default();
+        assert!(
+            reported.starts_with(env!("CARGO_PKG_VERSION")),
             "the reported version must track this crate, not the SDK: {line}"
+        );
+        assert_eq!(
+            reported,
+            crate::BUILD_VERSION,
+            "the reported version must be the one this build stamped: {line}"
         );
 
         service.cancel().await.expect("shut the service down");

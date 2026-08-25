@@ -1,0 +1,308 @@
+[
+  {
+    "log": "after-206.jsonl",
+    "identity": {
+      "run": [
+        "2026-08-24-after-206"
+      ],
+      "suite": [
+        "unrecorded"
+      ],
+      "server": [
+        "unrecorded"
+      ],
+      "harness": [
+        "unrecorded"
+      ],
+      "weights": {
+        "gemma4:31b-mlx": [
+          "unrecorded"
+        ],
+        "nemotron-3.5-lightning:30b-mlx": [
+          "unrecorded"
+        ],
+        "opus": [
+          "unrecorded"
+        ],
+        "qwen3.8:27b-mlx": [
+          "unrecorded"
+        ],
+        "sonnet": [
+          "unrecorded"
+        ]
+      }
+    },
+    "graded_against": "eval_tasks_v1.json",
+    "cells": [
+      {
+        "backend": "claude-code",
+        "model": "opus",
+        "num_ctx": null,
+        "surface": "min",
+        "tools": 11,
+        "draws": 1,
+        "correct_of_possible": 3,
+        "possible": 4,
+        "taught": 0,
+        "wanted": 3,
+        "served_context": null
+      },
+      {
+        "backend": "claude-code",
+        "model": "sonnet",
+        "num_ctx": null,
+        "surface": "min",
+        "tools": 11,
+        "draws": 1,
+        "correct_of_possible": 3,
+        "possible": 4,
+        "taught": 0,
+        "wanted": 1,
+        "served_context": null
+      },
+      {
+        "backend": "ollama",
+        "model": "gemma4:31b-mlx",
+        "num_ctx": 262144,
+        "surface": "min",
+        "tools": 11,
+        "draws": 1,
+        "correct_of_possible": 3,
+        "possible": 4,
+        "taught": 4,
+        "wanted": 5,
+        "served_context": 262144
+      },
+      {
+        "backend": "ollama",
+        "model": "nemotron-3.5-lightning:30b-mlx",
+        "num_ctx": 262144,
+        "surface": "min",
+        "tools": 11,
+        "draws": 1,
+        "correct_of_possible": 3,
+        "possible": 4,
+        "taught": 0,
+        "wanted": 1,
+        "served_context": 262144
+      },
+      {
+        "backend": "ollama",
+        "model": "qwen3.8:27b-mlx",
+        "num_ctx": 262144,
+        "surface": "min",
+        "tools": 11,
+        "draws": 1,
+        "correct_of_possible": 2,
+        "possible": 4,
+        "taught": 0,
+        "wanted": 0,
+        "served_context": 262144
+      }
+    ]
+  },
+  {
+    "log": "after-210.jsonl",
+    "identity": {
+      "run": [
+        "2026-08-24-after-210"
+      ],
+      "suite": [
+        "unrecorded"
+      ],
+      "server": [
+        "unrecorded"
+      ],
+      "harness": [
+        "unrecorded"
+      ],
+      "weights": {
+        "gemma4:31b-mlx": [
+          "unrecorded"
+        ],
+        "nemotron-3.5-lightning:30b-mlx": [
+          "unrecorded"
+        ],
+        "opus": [
+          "unrecorded"
+        ],
+        "qwen3.8:27b-mlx": [
+          "unrecorded"
+        ],
+        "sonnet": [
+          "unrecorded"
+        ]
+      }
+    },
+    "graded_against": "eval_tasks_v1.json",
+    "cells": [
+      {
+        "backend": "claude-code",
+        "model": "opus",
+        "num_ctx": null,
+        "surface": "min",
+        "tools": 11,
+        "draws": 1,
+        "correct_of_possible": 3,
+        "possible": 4,
+        "taught": 0,
+        "wanted": 1,
+        "served_context": null
+      },
+      {
+        "backend": "claude-code",
+        "model": "sonnet",
+        "num_ctx": null,
+        "surface": "min",
+        "tools": 11,
+        "draws": 1,
+        "correct_of_possible": 3,
+        "possible": 4,
+        "taught": 0,
+        "wanted": 0,
+        "served_context": null
+      },
+      {
+        "backend": "ollama",
+        "model": "gemma4:31b-mlx",
+        "num_ctx": 262144,
+        "surface": "min",
+        "tools": 11,
+        "draws": 1,
+        "correct_of_possible": 3,
+        "possible": 4,
+        "taught": 0,
+        "wanted": 4,
+        "served_context": 262144
+      },
+      {
+        "backend": "ollama",
+        "model": "nemotron-3.5-lightning:30b-mlx",
+        "num_ctx": 262144,
+        "surface": "min",
+        "tools": 11,
+        "draws": 1,
+        "correct_of_possible": 2,
+        "possible": 4,
+        "taught": 0,
+        "wanted": 0,
+        "served_context": 262144
+      },
+      {
+        "backend": "ollama",
+        "model": "qwen3.8:27b-mlx",
+        "num_ctx": 262144,
+        "surface": "min",
+        "tools": 11,
+        "draws": 1,
+        "correct_of_possible": 3,
+        "possible": 4,
+        "taught": 0,
+        "wanted": 1,
+        "served_context": 262144
+      }
+    ]
+  },
+  {
+    "log": "after-217.jsonl",
+    "identity": {
+      "run": [
+        "2026-08-25 after #217: the five min cells, five draws each"
+      ],
+      "suite": [
+        "unrecorded"
+      ],
+      "server": [
+        "unrecorded"
+      ],
+      "harness": [
+        "unrecorded"
+      ],
+      "weights": {
+        "gemma4:31b-mlx": [
+          "unrecorded"
+        ],
+        "nemotron-3.5-lightning:30b-mlx": [
+          "unrecorded"
+        ],
+        "opus": [
+          "unrecorded"
+        ],
+        "qwen3.8:27b-mlx": [
+          "unrecorded"
+        ],
+        "sonnet": [
+          "unrecorded"
+        ]
+      }
+    },
+    "graded_against": "eval_tasks_v1.json",
+    "cells": [
+      {
+        "backend": "claude-code",
+        "model": "opus",
+        "num_ctx": null,
+        "surface": "min",
+        "tools": 11,
+        "draws": 5,
+        "correct_of_possible": 14,
+        "possible": 20,
+        "taught": 0,
+        "wanted": 1,
+        "served_context": null
+      },
+      {
+        "backend": "claude-code",
+        "model": "sonnet",
+        "num_ctx": null,
+        "surface": "min",
+        "tools": 11,
+        "draws": 5,
+        "correct_of_possible": 15,
+        "possible": 20,
+        "taught": 0,
+        "wanted": 0,
+        "served_context": null
+      },
+      {
+        "backend": "ollama",
+        "model": "gemma4:31b-mlx",
+        "num_ctx": 262144,
+        "surface": "min",
+        "tools": 11,
+        "draws": 5,
+        "correct_of_possible": 15,
+        "possible": 20,
+        "taught": 0,
+        "wanted": 15,
+        "served_context": 262144
+      },
+      {
+        "backend": "ollama",
+        "model": "nemotron-3.5-lightning:30b-mlx",
+        "num_ctx": 262144,
+        "surface": "min",
+        "tools": 11,
+        "draws": 5,
+        "correct_of_possible": 13,
+        "possible": 20,
+        "taught": 0,
+        "wanted": 0,
+        "served_context": 262144
+      },
+      {
+        "backend": "ollama",
+        "model": "qwen3.8:27b-mlx",
+        "num_ctx": 262144,
+        "surface": "min",
+        "tools": 11,
+        "draws": 5,
+        "correct_of_possible": 14,
+        "possible": 20,
+        "taught": 0,
+        "wanted": 0,
+        "served_context": 262144
+      }
+    ]
+  }
+]

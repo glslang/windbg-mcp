@@ -10,6 +10,8 @@ what comes back against the answer key in `tools/eval_tasks.json`, so the questi
     python3 tools/local_model_eval.py --grade  <results.jsonl> [tasks.json]
     python3 tools/local_model_eval.py --matrix <results.jsonl> [tasks.json]
     WINDBG_MCP_TOKEN=<token> python3 tools/local_model_eval.py --verify-key [tasks.json]
+    python3 tools/local_model_eval.py --compare <old.jsonl> <new.jsonl> [tasks.json]
+    python3 tools/local_model_eval.py --series <results.jsonl>... [tasks.json] -o <series.json>
 
 **Three axes, and they are not independent.** The tool surface is bytes of prose in every
 turn; the context is what the runtime will hold; the model is what can pick a tool out of
@@ -30,6 +32,15 @@ a plan is checked in and a credential is not.
 wedges must not take the grid with it (`budget_s` kills it and records why), and a run that
 dies in the middle must leave every finished cell on disk. Re-running the same plan **resumes**:
 a (model, context, surface, draw, task) already in the log is not run again.
+
+**A run is identified by what it ran against, not only by what it asked.** Every record carries
+the server build that answered (`serverInfo.version`, which since `build.rs` carries the git
+revision), the digest of the model weights where the runtime has one, and the suite the questions
+came from - the two things that change over *time* and used to be recorded nowhere. `--compare`
+reads two logs against each other with two rules that are not one rule: a **changed question blocks
+a pairing**, and a changed build, model or window is **named above the table** for a reader to
+weigh (`FOLLOWUPS.md` item 46). `--series` reduces logs to one row per run, which is what makes
+comparison with historic data a query rather than a re-reading.
 
 **The key is a snapshot, and `--verify-key` is what re-takes it.** The six tasks are graded
 against facts read off the checked-in dumps with this server's own tools, so a fact that stops
@@ -1364,7 +1375,8 @@ def matrix(log_path, tasks_file):
             # before this field existed carries nothing, and those cells read as they did.
             for planned in record.get("planned") or []:
                 if key.get(planned) is not None:
-                    rows.setdefault(cell_id, {}).setdefault(planned, {"mark": None, "draws": []})
+                    rows.setdefault(cell_id, {}).setdefault(
+                        planned, {"mark": None, "draws": [], "prompt": None})
             continue
 
         row = rows.setdefault(cell_id, {})
@@ -1384,6 +1396,11 @@ def matrix(log_path, tasks_file):
         else:
             mark = "Y" if graded["correct"] else "n"
         entry = row.setdefault(record["task"], {"mark": None, "draws": []})
+        # **The question this draw was asked**, kept on the entry because `--compare` pairs
+        # on it: a task id is not the question (`arm64_pc` has the same id under two
+        # materially different wordings), and the record is the only place the wording
+        # survives.
+        entry.setdefault("prompt", record.get("prompt"))
         entry["draws"].append({"draw": draw_of(record), "seed": record.get("seed"), "mark": mark,
                                "calls": [c.get("name") for c in (record.get("calls") or [])],
                                "wall_s": record.get("wall_s"),
@@ -1434,6 +1451,217 @@ def print_matrix(order, rows):
               "in the denominator")
 
 
+# --------------------------------------------------------------------------------------------
+# Run identity, `--compare` and `--series`: what a log has to carry before two of them can be
+# read against each other (`FOLLOWUPS.md` item 46).
+#
+# **Re-running a cell is the point, not a hazard.** As models are updated the same question on the
+# same surface will be asked again, and what matters is run N against run N-1 — the frozen suite
+# (#220) exists so a *reworded question* cannot silently un-grade its own history, which is a
+# different thing from discouraging a rerun. What this bench could not do was compare two of them.
+#
+# A record identified the question and the surface and neither of the two things that change over
+# time: which **model weights** answered, and which **server build** was asked. `surface.bytes` is a
+# real fingerprint of the tool prose and moved when item 41 landed — and it is a fingerprint of one
+# channel, silent on the one the last three findings were about, since #217 changed an *opener's
+# result*. Both facts were already on the wire and both were thrown away; the drivers now keep them.
+#
+# **Two rules here, and they are not the same rule.** A changed question **blocks** a pairing: it
+# does not annotate one. A changed model, build or served window is **named above the table**,
+# because those a reader can weigh. Conflating them is how this repo has three times read a moved
+# aggregate as a controlled result (items 42 and 43, and twice in #212) — every one a *composition*
+# error, where the callers changed and the total held.
+# --------------------------------------------------------------------------------------------
+
+# What a log does not say, printed rather than left blank. A run recorded before these fields
+# existed cannot have them added later, and a column of empty cells reads as "nothing changed"
+# where the truth is "nobody knows" — which is the whole argument for recording them now.
+UNRECORDED = "unrecorded"
+
+
+def identity(log_records):
+    """The uncontrolled variables of a run: what is neither the question nor the surface.
+
+    Deliberately *not* the tool count or the surface bytes, which a cell already carries and which
+    the grid varies on purpose. These are the ones nothing controls — the build that answered, the
+    weights behind a mutable tag, the harness resolving an alias, and the task list the questions
+    came from.
+    """
+    fields = {"run": set(), "suite": set(), "server": set(), "harness": set()}
+    weights = {}
+    for record in log_records:
+        fields["run"].add(record.get("run") or UNRECORDED)
+        suite = record.get("suite") or {}
+        fields["suite"].add(f"{suite.get('name')} ({suite.get('file')})" if suite else UNRECORDED)
+        server = record.get("server") or {}
+        fields["server"].add(f"{server.get('name')} {server.get('version')}"
+                             if server else UNRECORDED)
+        if record.get("backend") == "claude-code":
+            fields["harness"].add(record.get("harness_version") or UNRECORDED)
+        model = record.get("model")
+        if model:
+            weights.setdefault(model, set()).add(record.get("model_digest") or UNRECORDED)
+    return {name: sorted(values) for name, values in fields.items()} | {
+        "weights": {model: sorted(digests) for model, digests in sorted(weights.items())}}
+
+
+def print_identity(ident, indent="  ", header=True):
+    """The identity block, above whatever table follows it.
+
+    Printed on every `--grade`, not only on a comparison, because the value of a run's identity is
+    that it is recorded *at the time*: a table pasted into a write-up with this above it can be
+    placed months later, and one without it cannot be placed at all.
+    """
+    if header:
+        print("\nrun identity — the uncontrolled variables, which are not the question or the "
+              "surface:")
+    for name in ("run", "suite", "server", "harness"):
+        if ident[name]:
+            print(f"{indent}{name:<8} {', '.join(ident[name])}")
+    for model, digests in ident["weights"].items():
+        # A model answering under two digests inside one log is a re-pull mid-run, which is worth
+        # seeing loudly: the cells before it and the cells after it are different models.
+        # Twelve characters, which is what `ollama list` prints in its `ID` column — so a digest
+        # here can be matched against the machine's own listing by eye, and the full value is in
+        # the record for anything that needs to be exact.
+        print(f"{indent}{'weights':<8} {model} {' '.join(d[:12] for d in digests)}")
+    if any(UNRECORDED in ident[name] for name in ("suite", "server")) or \
+            any(UNRECORDED in d for d in ident["weights"].values()):
+        print(f"{indent}({UNRECORDED} is a log written before a field existed — it cannot be "
+              f"filled in afterwards)")
+
+
+def comparable(old_entry, new_entry):
+    """Why these two cannot be paired, or `None` if they can.
+
+    **A changed question blocks the pairing** rather than annotating it: `arm64_pc` has the same id
+    in `eval_tasks_v1.json` and `eval_tasks.json` and a materially different prompt, so pairing on
+    the id alone would put two distributions side by side that #220 established are not comparable
+    — and would be laxer than the grader already is, since [`usable`] refuses such a record
+    outright. So this reuses [`stale_prompt`], the predicate split out of `usable` for exactly this
+    naming, with one log's record standing in for the other's task.
+
+    It is a **floor**: `expect` can move too, and a log records the question it asked but not the
+    key it was graded against. A pairing predicate that reads only the prompt catches the change
+    #220 was about and not every change there could be.
+    """
+    old_prompt, new_prompt = old_entry.get("prompt"), new_entry.get("prompt")
+    if not old_prompt or not new_prompt:
+        return None
+    if stale_prompt({"prompt": new_prompt}, {"prompt": old_prompt}):
+        return "the question changed between these runs"
+    return None
+
+
+def compare(old_path, new_path, tasks_file):
+    """Two logs, cell by cell and task by task. Returns `(order, rows, identities)`.
+
+    Pairs on `(backend, model, num_ctx, surface, task)` — the cell a grid varies, plus the task —
+    and a side present in one log and not the other is shown as such rather than dropped, since a
+    run that stopped covering a cell is a finding about the comparison.
+    """
+    old_order, old_rows = matrix(old_path, tasks_file)
+    new_order, new_rows = matrix(new_path, tasks_file)
+    order = old_order if old_order == new_order else sorted(set(old_order) | set(new_order))
+    rows = {}
+    for cell in sorted(set(old_rows) | set(new_rows), key=lambda c: (c[0], c[1], -(c[2] or 0),
+                                                                    c[3] or "")):
+        old_row, new_row = old_rows.get(cell, {}), new_rows.get(cell, {})
+        rows[cell] = {}
+        for task in order:
+            old_entry, new_entry = old_row.get(task), new_row.get(task)
+            if old_entry is None and new_entry is None:
+                continue
+            if old_entry is None or new_entry is None:
+                rows[cell][task] = {"mark": (new_entry or old_entry)["mark"],
+                                    "only": "new" if old_entry is None else "old"}
+                continue
+            rows[cell][task] = {"old": old_entry["mark"], "new": new_entry["mark"],
+                                "blocked": comparable(old_entry, new_entry)}
+    identities = (identity(records(old_path)), identity(records(new_path)))
+    return order, rows, identities
+
+
+def print_compare(order, rows, identities, old_path, new_path):
+    old_ident, new_ident = identities
+    print(f"\ncomparing {old_path} -> {new_path}")
+    print("\nrun identity — the uncontrolled variables, which are not the question or the surface:")
+    print_identity(old_ident, indent="  old  ", header=False)
+    print_identity(new_ident, indent="  new  ", header=False)
+    moved = [name for name in ("suite", "server", "harness")
+             if old_ident[name] != new_ident[name]]
+    if old_ident["weights"] != new_ident["weights"]:
+        moved.append("weights")
+    if moved:
+        # Named, not scored. These are the variables a reader has to weigh against any movement in
+        # the table below, and the failure this prevents is the composition error: an aggregate
+        # that holds across two runs whose callers changed is a coincidence, not a rate.
+        print(f"\n  moved between these runs, besides the question: {', '.join(moved)}")
+
+    # **Spaces around the arrow, which is not cosmetic.** `-` is the mark for a task this surface
+    # cannot answer, so an unspaced arrow renders "unanswerable both times" as `-->-`, which reads
+    # as one long arrow and hides a mark on each side.
+    width = max([len(t) for t in order]
+                + [len(f"{m.get('old', '')} -> {m.get('new', '')}")
+                   for row in rows.values() for m in row.values()] or [0]) + 2
+    header = f"{'cell':<44}" + "".join(f"{t:<{width}}" for t in order)
+    print("\n" + header)
+    print("-" * len(header))
+    blocked = {}
+    for cell, marks in rows.items():
+        backend, model, ctx, surface = cell
+        label = f"{model[:24]} {str(ctx or 'dflt'):>6} {surface}"
+        rendered_row = []
+        for task in order:
+            mark = marks.get(task)
+            if mark is None:
+                rendered_row.append("")
+            elif mark.get("only"):
+                rendered_row.append(f"{mark['mark']}({mark['only']})")
+            elif mark.get("blocked"):
+                blocked.setdefault(mark["blocked"], []).append(task)
+                rendered_row.append("--")
+            else:
+                rendered_row.append(f"{mark['old']} -> {mark['new']}")
+        print(f"{label:<44}" + "".join(f"{r:<{width}}" for r in rendered_row))
+    print("\nold -> new per cell-task; `(old)`/`(new)` is a cell only one run covered.")
+    for reason, tasks in blocked.items():
+        # At the row rather than in a header, which is the same principle as the `UNCOUNTED` line
+        # beside it: a blocked pairing is a fact about those tasks, not about the comparison.
+        print(f"--  not compared for {', '.join(sorted(set(tasks)))}: {reason}")
+
+
+def series(log_paths, tasks_file, out_path):
+    """One row per run, keyed by its identity — the thing that makes history a query.
+
+    `docs/local-model-eval.md` accumulates a prose section per run, which reads well and cannot be
+    diffed: its tables measure different servers, which the page says in words and no reader can
+    check. This is the machine-readable half. It is regenerated rather than appended to, so a log
+    re-graded under a corrected key updates its own row instead of growing a second one.
+    """
+    rows = []
+    for log_path in log_paths:
+        cells = summarise(log_path, tasks_file)
+        ident = identity(records(log_path))
+        rows.append({
+            "log": os.path.basename(log_path),
+            "identity": ident,
+            "graded_against": os.path.basename(tasks_file),
+            "cells": [{"backend": c["backend"], "model": c["model"], "num_ctx": c["num_ctx"],
+                       "surface": c["surface"], "tools": c["tools"], "draws": c.get("draws", 1),
+                       "correct_of_possible": c["correct_of_possible"], "possible": c["possible"],
+                       "taught": c["taught"], "wanted": c["wanted"],
+                       "served_context": c["served_context"]}
+                      for c in sorted(cells, key=lambda c: (c["backend"], c["model"] or "",
+                                                            c["surface"] or ""))],
+        })
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(rows, f, indent=2)
+        f.write("\n")
+    print(f"\nwrote {out_path}: {len(rows)} run(s)")
+    return rows
+
+
 def main():
     if sys.argv[1:2] == ["--verify-key"]:
         # No log to read: this mode asks the *server*, not a run of it. The tasks file is the
@@ -1443,6 +1671,29 @@ def main():
         rest = [a for a in sys.argv[2:] if not a.startswith("--")]
         tasks_file = rest[0] if rest else os.path.join(HERE, "eval_tasks.json")
         sys.exit(verify_key(tasks_file))
+    if sys.argv[1:2] == ["--compare"]:
+        rest = [a for a in sys.argv[2:] if not a.startswith("--")]
+        if len(rest) < 2:
+            raise SystemExit("--compare needs two logs: the earlier one first")
+        tasks_file = rest[2] if len(rest) > 2 else os.path.join(HERE, "eval_tasks.json")
+        order, rows, identities = compare(rest[0], rest[1], tasks_file)
+        print_compare(order, rows, identities, rest[0], rest[1])
+        return
+    if sys.argv[1:2] == ["--series"]:
+        # `-o` names the output, because a series is a file somebody keeps rather than a sibling
+        # of whichever log happened to be listed first.
+        args = sys.argv[2:]
+        if args[-1:] == ["-o"]:
+            raise SystemExit("-o needs a path to write the series to")
+        out = args[args.index("-o") + 1] if "-o" in args else "eval-runs.json"
+        rest = [a for a in args if not a.startswith("-") and a != out]
+        logs = [a for a in rest if a.endswith(".jsonl")]
+        tasks_file = next((a for a in rest if a.endswith(".json")),
+                          os.path.join(HERE, "eval_tasks.json"))
+        if not logs:
+            raise SystemExit("--series needs at least one .jsonl log")
+        series(logs, tasks_file, out)
+        return
     if sys.argv[1:2] == ["--matrix"]:
         log_path = sys.argv[2]
         tasks_file = sys.argv[3] if len(sys.argv) > 3 else os.path.join(HERE, "eval_tasks.json")
@@ -1464,6 +1715,8 @@ def main():
         log_path = rest[0]
         tasks_file = rest[1] if len(rest) > 1 else os.path.join(HERE, "eval_tasks.json")
         cells = summarise(log_path, tasks_file)
+        ident = identity(records(log_path))
+        print_identity(ident)
         print_table(cells)
         # The regression item 43 asked for, opt-in so an ordinary grading run still just prints.
         # `wanted` is deliberately not assertable: it is a property of the task list and the
@@ -1473,7 +1726,10 @@ def main():
             sys.exit(1)
         out = os.path.splitext(log_path)[0] + ".graded.json"
         with open(out, "w", encoding="utf-8") as f:
-            json.dump(cells, f, indent=2)
+            # **The identity travels with the table, not beside it.** A graded file pasted into a
+            # write-up months later is placeable only if it says what it ran against; one that
+            # carries cells alone is the thing item 46 was written about.
+            json.dump({"identity": ident, "cells": cells}, f, indent=2)
         print(f"\nwrote {out}")
         return
 
@@ -1540,9 +1796,11 @@ def main():
                               f"    cells at the next context may be served this one's window")
 
     cells = summarise(log_path, plan["tasks"])
+    ident = identity(records(log_path))
+    print_identity(ident)
     print_table(cells)
     with open(os.path.splitext(log_path)[0] + ".graded.json", "w", encoding="utf-8") as f:
-        json.dump(cells, f, indent=2)
+        json.dump({"identity": ident, "cells": cells}, f, indent=2)
 
 
 if __name__ == "__main__":

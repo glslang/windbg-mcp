@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The server reports the git revision it was built from**, as semver build metadata on the
+  version it already reported: `0.11.0+g1a2b3c4`, and `-dirty` where the build inputs differ from
+  that commit. It reaches both places that carried the crate version alone and are the two a reader
+  reaches for when asking *which* build did something — MCP `serverInfo.version`, and a
+  transcript's `start` record. A crate version moves only on release, so every build between two of
+  them was indistinguishable, including the pairs that matter most: the behaviour a bug report or a
+  bench turns on is often a changed *result* rather than a changed API. Absent git, the reported
+  version is the bare crate version, and nothing that compares versions is affected — build
+  metadata is ignored for precedence.
+
+- **The eval records what a run ran against, so two runs can be compared** (`FOLLOWUPS.md` item 46,
+  which closes it). A record identified the question and the surface and neither of the two things
+  that change over time: which model weights answered — `qwen3.8:27b-mlx` is a mutable tag that can
+  be re-pulled onto different ones — and which server build was asked. Both facts were already on
+  the wire and both were thrown away, so every record now carries `server`, `model_digest`, `suite`
+  and, for the Claude rows that can have no digest, `harness_version`. `--compare` reads two logs
+  with two rules that are not one rule: a **changed question blocks** a pairing, and a changed
+  build, model or window is **named above the table**. `--series` reduces logs to one row per run
+  in `docs/eval-runs.json`. The three runs already recorded read `unrecorded` throughout, which is
+  the part of this that expires: a run recorded without identity cannot have it added later.
+
 - **The eval's answer key is re-read off the dumps rather than trusted** (`FOLLOWUPS.md` item 45,
   which closes it). Its six tasks are graded against facts read off the checked-in samples with
   this server's own tools, and nothing re-checked them — so a fact that stopped being what the

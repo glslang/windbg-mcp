@@ -459,6 +459,96 @@ prompted it — did `open_dump`'s description ever contribute to a `modules` cal
 worth the runtime: that sentence is gone either way, and the fix never depended on which of the two
 channels carried it.
 
+### Comparing two runs, which needs a run to say what it ran against
+
+**Re-running a cell is the point, not a hazard.** As models are updated the same question on the
+same surface will be asked again, and what will matter is run N against run N-1. The frozen suite
+exists so a *reworded question* cannot silently un-grade its own history — a different thing from
+discouraging a rerun. What this bench could not do until now was **compare two of them**.
+
+A record identified the question and the surface, and neither of the two things that change over
+time. So every record now also carries:
+
+| Field | What it settles | Where it comes from |
+| --- | --- | --- |
+| `server` | which **build** answered — `windbg-mcp 0.11.0+g1a2b3c4` | the `initialize` result, which the handshake used to discard |
+| `model_digest` | which **weights** answered, behind a mutable tag | `/api/ps`, beside the window it already reported |
+| `harness_version` | the Claude row's floor: what resolved the alias | `claude --version` |
+| `suite` | which task list the questions came from | the file the driver loaded |
+
+**The build is the one that had to be added on the server side.** `surface.bytes` is a real
+fingerprint of the tool prose and moved when item 41 landed — and it is a fingerprint of *one
+channel*, silent on exactly the one the last three findings were about, since
+[#217](https://github.com/glslang/windbg-mcp/pull/217) changed an **opener's result**. And a crate
+version is a floor rather than an identity, since it moves only on release: two builds of `0.11.0`
+were indistinguishable. So `build.rs` now stamps the git revision into the version this server
+reports, and the same string goes into a transcript's `start` record.
+
+**`qwen3.8:27b-mlx` is a name, not a model.** It can be re-pulled onto different weights, so two
+runs a month apart can agree on every other recorded field and have been different models — the
+axis the whole comparison is about. The digest is a content address and settles it. **The two
+control rows cannot have one**: `opus` and `sonnet` are aliases resolved inside a client this bench
+does not own, and there is no `/api/ps` to ask, so they record `model_digest: null` beside the
+harness version, which is a floor. Naming a real version source for a Claude row is open.
+
+Then:
+
+```console
+python3 tools/local_model_eval.py --compare eval-out/after-206.jsonl eval-out/after-210.jsonl \
+  tools/eval_tasks_v1.json
+```
+
+```text
+cell                                 bugcheck  driver_blame  module_count  unloaded_driver  arm64_pc  ioctl_decode
+opus   dflt min                      Y -> Y    Y -> Y        Y -> Y        - -> -           n -> n    o -> o
+sonnet   dflt min                    Y -> Y    Y -> Y        Y -> Y        - -> -           n -> n    o -> o
+gemma4:31b-mlx 262144 min            Y -> Y    Y -> Y        Y -> Y        - -> -           n -> n    o -> -
+nemotron-3.5-lightning:3 262144 min  Y -> Y    Y -> Y        Y -> n        - -> -           n -> n    - -> -
+qwen3.8:27b-mlx 262144 min           n -> Y    Y -> Y        Y -> Y        - -> -           n -> n    o -> -
+
+old -> new per cell-task; `(old)`/`(new)` is a cell only one run covered.
+```
+
+Those two runs were recorded before the identity fields existed, so nothing above the table names a
+moved variable — which is exactly what a pair of logs written today would not look like. The two
+lines that appear when something did move were checked against a log doctored to move them:
+
+```text
+  moved between these runs, besides the question: suite, server, harness, weights
+--  not compared for arm64_pc: the question changed between these runs
+```
+
+**Two rules, and they are not the same rule.**
+
+- **A changed question blocks a pairing.** It does not annotate one. `arm64_pc` has the same id in
+  `eval_tasks_v1.json` and `eval_tasks.json` and a materially different prompt, so pairing on the
+  id would put two distributions side by side that the frozen suite established are not comparable
+  — and would be *laxer than the grader already is*, since `usable()` refuses such a record
+  outright. The predicate is `stale_prompt`, the same one the grader uses, and the refusal is
+  printed at the **row** with its reason, which is the principle the `UNCOUNTED` line beside it
+  follows. It is a floor: `expect` can move too, and a pairing predicate reading only the prompt
+  catches the change the frozen suite was about and not every change there could be.
+- **Everything else is named above the table.** The build, the weights, the harness, the suite —
+  the uncontrolled variables that are *not* the question. Naming them is not a nicety: this repo
+  has three times read a moved aggregate as a controlled result, and every one was a **composition**
+  error, where the callers changed and the total held.
+
+**And a series, so history is a query rather than a re-reading.** This page accumulates a prose
+section per run, which reads well and cannot be diffed — the tables in it measure different
+servers, which the page says in words and no reader can check.
+[`eval-runs.json`](./eval-runs.json) is the machine-readable half, one row per run keyed by the
+identity above:
+
+```console
+python3 tools/local_model_eval.py --series eval-out/*.jsonl tools/eval_tasks_v1.json \
+  -o docs/eval-runs.json
+```
+
+The three runs already in it read `unrecorded` for every identity field, and that is the point
+rather than an omission: **a run recorded without identity cannot have it added later.** Each of
+those write-ups names its own server build in prose, which is why nothing published is wrong; what
+was missing was any way to *check* it, and to do it for a run nobody has written up yet.
+
 ## What one grid showed
 
 Run 2026-08-23, on the ARM64 bench described in `local-model.md`: 33 cells, 144 task runs, about

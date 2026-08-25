@@ -42,6 +42,27 @@ use tracing_subscriber::EnvFilter;
 use crate::engine::Sessions;
 use crate::server::WindbgServer;
 
+/// What this build calls itself: the crate version, plus the git revision it was built from.
+///
+/// `0.11.0+g1a2b3c4`, or `0.11.0+g1a2b3c4-dirty`, or a bare `0.11.0` where `build.rs` could not ask
+/// git. Reported in two places that had the crate version alone and are the two a reader reaches
+/// for when asking *which* build did something: MCP `serverInfo.version`, and the `Start` record of
+/// a transcript.
+///
+/// **The suffix is what makes it an identity rather than a floor.** A crate version moves on
+/// release, so every build between two of them is indistinguishable — including the pairs that
+/// matter most, since the behaviour a bench or a bug report turns on is often a changed *result*
+/// rather than a changed API. `FOLLOWUPS.md` item 46 is the case that forced it: #217 changed what
+/// an opener's summary says, which no version, tool count or surface byte count can see.
+///
+/// It is semver build metadata, ignored for precedence, so a consumer comparing versions reads up
+/// to the `+` and is unaffected.
+pub const BUILD_VERSION: &str = if env!("WINDBG_MCP_BUILD").is_empty() {
+    env!("CARGO_PKG_VERSION")
+} else {
+    concat!(env!("CARGO_PKG_VERSION"), "+", env!("WINDBG_MCP_BUILD"))
+};
+
 /// Upper bound for any single debugger operation before the tool call reports a timeout.
 const ENGINE_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 
