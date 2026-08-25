@@ -540,9 +540,16 @@ lines that appear when something did move were checked against a log doctored to
   table, being run-wide; the **surface fingerprint and the served window** go *beneath* it, being
   per cell. `surface.client` is a label — `min` was 11 tools and 8,654 B before item 41 and 7,732 B
   after — so pairing on the label alone would present a surface change as a model comparison, which
-  is the very intervention a rerun exists to measure. Naming them is not a nicety: this repo has
-  three times read a moved aggregate as a controlled result, and every one was a **composition**
-  error, where the callers changed and the total held.
+  is the very intervention a rerun exists to measure. The fingerprint is a **digest of the surface
+  as it went over the wire**, not its length: a byte count moves for almost any prose edit and for
+  none reliably, so a same-length reword or an equal-sized allowlist swap would leave it saying
+  nothing had happened. Naming them is not a nicety: this repo has three times read a moved
+  aggregate as a controlled result, and every one was a **composition** error, where the callers
+  changed and the total held.
+
+  Run against the two published logs it reports one immediately — `min` was 15,544 B in
+  `after-206` and 14,606 B in `after-210` — which is a difference those two write-ups compared
+  across without either of them saying so.
 
 **And a series, so history is a query rather than a re-reading.** This page accumulates a prose
 section per run, which reads well and cannot be diffed — the tables in it measure different
@@ -555,8 +562,14 @@ python3 tools/local_model_eval.py --series eval-out/*.jsonl tools/eval_tasks_v1.
   -o docs/eval-runs.json
 ```
 
-The three runs already in it read `unrecorded` for every identity field, and that is the point
-rather than an omission: **a run recorded without identity cannot have it added later.** Each of
+`unrecorded` and `unavailable` are kept apart, which matters more than it looks: the first means
+nobody recorded the field and now nobody can, while the second is a row that has no such answer to
+give — a Claude cell's `model_digest`, since `opus` is an alias resolved inside a client this bench
+does not own. Folding them together would label every current run containing a Claude cell as a
+legacy log.
+
+The three runs already in the series read `unrecorded` for every identity field, and that is the
+point rather than an omission: **a run recorded without identity cannot have it added later.** Each of
 those write-ups names its own server build in prose, which is why nothing published is wrong; what
 was missing was any way to *check* it, and to do it for a run nobody has written up yet.
 

@@ -2486,7 +2486,17 @@ now stamps the short git revision into the version the server reports, as semver
   as a model comparison - the very intervention these runs exist to measure, silently. And a cell
   that asks for no window records `num_ctx: null` while the runtime serves what it likes. Both are
   named per cell beneath the table now, on the same rule as everything else that is not the
-  question: weighable, so named rather than blocking.
+  question: weighable, so named rather than blocking. And the surface is compared **by digest**,
+  not by length - the round after found that a byte count moves for almost any prose edit and for
+  none reliably, so a same-length reword or an equal-sized allowlist swap said nothing had happened;
+  the drivers record a digest of the surface exactly as it went over the wire. Pointed at the two
+  published logs it reports one at once: `min` was 15,544 B in `after-206` and 14,606 B in
+  `after-210`, a difference those write-ups compared across in silence.
+- **Absent is not the same as deliberately null**, which the same round caught. A Claude row's
+  `model_digest` is null *on purpose* - an alias resolved inside a client this bench does not own
+  has no content address - and folding that into `unrecorded` labelled every current run containing
+  a Claude cell as a log predating the field. `unavailable` is the second word, and one predicate
+  reads presence for all four fields rather than four special cases.
 - **A cell-failure note carries no identity and must not contribute one.** `run_cell` writes it
   with the cell's coordinates and nothing else, so counting it put an `unrecorded` beside the real
   server a current run *had* recorded - a partially failed cell reading as a second, unknown

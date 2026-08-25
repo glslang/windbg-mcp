@@ -57,6 +57,7 @@ model thinking, with no request in flight, and one measured here took **440s aga
 came back `404 Session not found`, which reads exactly like a broken server. A ping
 during a long turn costs nothing and removes the whole class.
 """
+import hashlib
 import json
 import os
 import sys
@@ -699,6 +700,17 @@ def runtime_identity():
     return blank
 
 
+def surface_digest(wire):
+    """A short content address for the tool surface exactly as it was served.
+
+    Twelve hex characters of SHA-256 over the minified JSON — enough that two surfaces differing at
+    all differ here, short enough to print beside a cell. It is the only field that can tell a
+    same-length description edit from no edit at all, which is what `--compare` needs before it can
+    say a score moved because of the *model* (`FOLLOWUPS.md` item 46).
+    """
+    return hashlib.sha256(wire.encode("utf-8")).hexdigest()[:12]
+
+
 def write_record(record):
     """Append one task's record to the eval log, if this run is part of an eval.
 
@@ -755,7 +767,8 @@ def main():
     threading.Thread(target=keepalive, daemon=True).start()
     tools = mcp("tools/list")["result"]["tools"]
     offered = as_ollama(tools)
-    surface = len(json.dumps(offered, separators=(",", ":")))
+    wire = json.dumps(offered, separators=(",", ":"))
+    surface = len(wire)
     print(f"tools offered: {len(tools)} ({surface} B of minified JSON)")
     if NUM_CTX:
         print(f"context requested: {NUM_CTX}")
@@ -779,7 +792,13 @@ def main():
         "suite": dict(SUITE) or None,
         "surface": {"client": os.environ.get("EVAL_SURFACE", ""),
                     "tools": len(tools), "bytes": surface,
-                    "names": sorted(t["name"] for t in tools)},
+                    "names": sorted(t["name"] for t in tools),
+                    # **The fingerprint, rather than its length.** A byte count moves for almost
+                    # any prose change and for none reliably: a same-length reword, or an
+                    # allowlist swap of equal size, leaves both the count and the length alone
+                    # while the model is handed different tools. This is the surface as it went
+                    # over the wire, which is the thing a comparison is actually about.
+                    "digest": surface_digest(wire)},
     }
     transcript = None
     try:

@@ -950,7 +950,7 @@ mutable ollama tag), `suite`, and `harness_version` for the Claude rows, which c
 two logs with **two rules that are not one rule**: a *changed question* blocks a pairing (via
 `stale_prompt`, printed at the row), while a changed build, model or window is *named above the
 table* for a reader to weigh - conflating them is how a moved aggregate gets read as a controlled
-result. `--series` reduces logs to one row per run in `docs/eval-runs.json`. Three things bite.
+result. `--series` reduces logs to one row per run in `docs/eval-runs.json`. Five things bite.
 **The server's version now carries its git revision** (`0.11.0+g1a2b3c4`), stamped by `build.rs`,
 so anything asserting on it is a *prefix* check - and the smoke test additionally asserts the
 revision is **there** when built from a checkout, which is the assertion that catches a `build.rs`
@@ -964,7 +964,10 @@ relative to the git dir and not a revision): a `git worktree` checkout has a `.g
 literal `.git/HEAD` is a watched path that does not exist, which Cargo reads as always-changed and
 recompiles the crate on every no-op build. And **the two `/api/ps` facts are one call**
 (`runtime_identity`): asking twice could catch different instances and pair one model's window with
-another's digest.
+another's digest. **A surface is compared by digest, not byte length** - a same-length reword or an
+equal-sized allowlist swap moves neither the count nor the length - and **`unrecorded` (nobody
+recorded it) is kept apart from `unavailable`** (this row has no such answer), or every run with a
+Claude cell reads as a legacy log.
 
 **The key is a snapshot, and `--verify-key` is what re-takes it** (item 45). The six tasks are
 graded against facts read off the checked-in dumps with this server's own tools, so a fact that
