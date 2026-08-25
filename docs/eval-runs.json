@@ -45,7 +45,10 @@
         "possible": 4,
         "taught": 0,
         "wanted": 3,
-        "served_context": null
+        "window": [],
+        "weights": [],
+        "server": [],
+        "surface_digest": []
       },
       {
         "backend": "claude-code",
@@ -58,7 +61,10 @@
         "possible": 4,
         "taught": 0,
         "wanted": 1,
-        "served_context": null
+        "window": [],
+        "weights": [],
+        "server": [],
+        "surface_digest": []
       },
       {
         "backend": "ollama",
@@ -71,7 +77,12 @@
         "possible": 4,
         "taught": 4,
         "wanted": 5,
-        "served_context": 262144
+        "window": [
+          "262144"
+        ],
+        "weights": [],
+        "server": [],
+        "surface_digest": []
       },
       {
         "backend": "ollama",
@@ -84,7 +95,12 @@
         "possible": 4,
         "taught": 0,
         "wanted": 1,
-        "served_context": 262144
+        "window": [
+          "262144"
+        ],
+        "weights": [],
+        "server": [],
+        "surface_digest": []
       },
       {
         "backend": "ollama",
@@ -97,7 +113,12 @@
         "possible": 4,
         "taught": 0,
         "wanted": 0,
-        "served_context": 262144
+        "window": [
+          "262144"
+        ],
+        "weights": [],
+        "server": [],
+        "surface_digest": []
       }
     ]
   },
@@ -147,7 +168,10 @@
         "possible": 4,
         "taught": 0,
         "wanted": 1,
-        "served_context": null
+        "window": [],
+        "weights": [],
+        "server": [],
+        "surface_digest": []
       },
       {
         "backend": "claude-code",
@@ -160,7 +184,10 @@
         "possible": 4,
         "taught": 0,
         "wanted": 0,
-        "served_context": null
+        "window": [],
+        "weights": [],
+        "server": [],
+        "surface_digest": []
       },
       {
         "backend": "ollama",
@@ -173,7 +200,12 @@
         "possible": 4,
         "taught": 0,
         "wanted": 4,
-        "served_context": 262144
+        "window": [
+          "262144"
+        ],
+        "weights": [],
+        "server": [],
+        "surface_digest": []
       },
       {
         "backend": "ollama",
@@ -186,7 +218,12 @@
         "possible": 4,
         "taught": 0,
         "wanted": 0,
-        "served_context": 262144
+        "window": [
+          "262144"
+        ],
+        "weights": [],
+        "server": [],
+        "surface_digest": []
       },
       {
         "backend": "ollama",
@@ -199,7 +236,12 @@
         "possible": 4,
         "taught": 0,
         "wanted": 1,
-        "served_context": 262144
+        "window": [
+          "262144"
+        ],
+        "weights": [],
+        "server": [],
+        "surface_digest": []
       }
     ]
   },
@@ -249,7 +291,10 @@
         "possible": 20,
         "taught": 0,
         "wanted": 1,
-        "served_context": null
+        "window": [],
+        "weights": [],
+        "server": [],
+        "surface_digest": []
       },
       {
         "backend": "claude-code",
@@ -262,7 +307,10 @@
         "possible": 20,
         "taught": 0,
         "wanted": 0,
-        "served_context": null
+        "window": [],
+        "weights": [],
+        "server": [],
+        "surface_digest": []
       },
       {
         "backend": "ollama",
@@ -275,7 +323,12 @@
         "possible": 20,
         "taught": 0,
         "wanted": 15,
-        "served_context": 262144
+        "window": [
+          "262144"
+        ],
+        "weights": [],
+        "server": [],
+        "surface_digest": []
       },
       {
         "backend": "ollama",
@@ -288,7 +341,12 @@
         "possible": 20,
         "taught": 0,
         "wanted": 0,
-        "served_context": 262144
+        "window": [
+          "262144"
+        ],
+        "weights": [],
+        "server": [],
+        "surface_digest": []
       },
       {
         "backend": "ollama",
@@ -301,7 +359,12 @@
         "possible": 20,
         "taught": 0,
         "wanted": 0,
-        "served_context": 262144
+        "window": [
+          "262144"
+        ],
+        "weights": [],
+        "server": [],
+        "surface_digest": []
       }
     ]
   }

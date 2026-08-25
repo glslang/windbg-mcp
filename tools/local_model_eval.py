@@ -1586,7 +1586,7 @@ def cell_order(cell):
 
 
 def cell_facts(log_records):
-    """Per cell, the three variables a run-wide identity line cannot hold.
+    """Per cell, the four variables a run-wide identity line cannot hold.
 
     **A surface and a served window belong to a cell, not to a log.** The grid varies both on
     purpose, so listing them run-wide says nothing: two runs both covering `min` at three windows
@@ -1614,7 +1614,8 @@ def cell_facts(log_records):
         surface = record.get("surface") or {}
         cell_id = (record.get("backend"), record.get("model"), record.get("num_ctx"),
                    surface.get("client"))
-        entry = facts.setdefault(cell_id, {"surface": set(), "window": set(), "weights": set()})
+        entry = facts.setdefault(cell_id, {"surface": set(), "window": set(), "weights": set(),
+                                           "server": set()})
         # **The weights per cell, not only per run.** The identity block's `weights` line is a
         # run-wide set, and a set loses which digest answered which cell: two runs whose *same two*
         # digests are assigned to opposite cells - a tag re-pulled between them - compare equal
@@ -1622,6 +1623,13 @@ def cell_facts(log_records):
         # the surface and the window already get.
         if record.get("model_digest"):
             entry["weights"].add(record["model_digest"][:12])
+        # **And the build, for exactly the same reason.** A log is append-only and a plan resumes,
+        # so a run can legitimately span a rebuild: two logs holding the same *set* of revisions
+        # with the cells swapped compare equal on the run-wide line and pair results from different
+        # builds. Run-wide is the overview; per cell is the comparison.
+        server = record.get("server") or {}
+        if server.get("version"):
+            entry["server"].add(str(server["version"]))
         if surface.get("tools") is not None or surface.get("bytes") is not None:
             # **Kept as its parts, not as a rendered string.** A cell-failure note carries the
             # client and nothing else, so it contributes nothing rather than an `unrecorded`
@@ -1674,7 +1682,7 @@ def moved_cells(old_facts, new_facts):
                     ("surface", surface_text(was), surface_text(now), "unverifiable"))
             elif not any(digested):
                 undigested.add(cell)
-        for name in ("window", "weights"):
+        for name in ("window", "weights", "server"):
             was, now = sorted(before.get(name) or []), sorted(after.get(name) or [])
             if was and now and was != now:
                 moved.setdefault(cell, []).append(
@@ -1811,7 +1819,13 @@ def series(log_paths, tasks_file, out_path):
     rows = []
     for log_path in log_paths:
         cells = summarise(log_path, tasks_file)
-        ident = identity(records(log_path))
+        log_records = records(log_path)
+        ident = identity(log_records)
+        # **The per-cell conditions travel with the per-cell scores.** The identity above keeps a
+        # run-wide *set* of digests and revisions, which cannot say which of them produced which
+        # cell - so a historical row holding two of either could not attribute its own numbers.
+        # Read through the same [`cell_facts`] a comparison uses, rather than a second projection.
+        facts = cell_facts(log_records)
         rows.append({
             "log": os.path.basename(log_path),
             "identity": ident,
@@ -1820,7 +1834,16 @@ def series(log_paths, tasks_file, out_path):
                        "surface": c["surface"], "tools": c["tools"], "draws": c.get("draws", 1),
                        "correct_of_possible": c["correct_of_possible"], "possible": c["possible"],
                        "taught": c["taught"], "wanted": c["wanted"],
-                       "served_context": c["served_context"]}
+                       # `window` rather than the cell's `served_context`, which is the *first*
+                       # non-null one: a cell whose draws were served two different windows is
+                       # exactly the condition a historical row has to be able to state.
+                       **{name: sorted(values) for name, values in
+                          (facts.get((c["backend"], c["model"], c["num_ctx"], c["surface"]))
+                           or {}).items() if name != "surface"},
+                       "surface_digest": sorted(
+                           {f[2] for f in (facts.get((c["backend"], c["model"], c["num_ctx"],
+                                                      c["surface"])) or {}).get("surface", set())
+                            if f[2]})}
                       for c in sorted(cells, key=lambda c: (c["backend"], c["model"] or "",
                                                             c["surface"] or ""))],
         })
