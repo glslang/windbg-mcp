@@ -45,9 +45,7 @@
         "possible": 4,
         "taught": 0,
         "wanted": 3,
-        "window": [],
-        "weights": [],
-        "server": [],
+        "served_context": null,
         "surface_digest": []
       },
       {
@@ -61,9 +59,7 @@
         "possible": 4,
         "taught": 0,
         "wanted": 1,
-        "window": [],
-        "weights": [],
-        "server": [],
+        "served_context": null,
         "surface_digest": []
       },
       {
@@ -77,11 +73,7 @@
         "possible": 4,
         "taught": 4,
         "wanted": 5,
-        "window": [
-          "262144"
-        ],
-        "weights": [],
-        "server": [],
+        "served_context": 262144,
         "surface_digest": []
       },
       {
@@ -95,11 +87,7 @@
         "possible": 4,
         "taught": 0,
         "wanted": 1,
-        "window": [
-          "262144"
-        ],
-        "weights": [],
-        "server": [],
+        "served_context": 262144,
         "surface_digest": []
       },
       {
@@ -113,11 +101,7 @@
         "possible": 4,
         "taught": 0,
         "wanted": 0,
-        "window": [
-          "262144"
-        ],
-        "weights": [],
-        "server": [],
+        "served_context": 262144,
         "surface_digest": []
       }
     ]
@@ -168,9 +152,7 @@
         "possible": 4,
         "taught": 0,
         "wanted": 1,
-        "window": [],
-        "weights": [],
-        "server": [],
+        "served_context": null,
         "surface_digest": []
       },
       {
@@ -184,9 +166,7 @@
         "possible": 4,
         "taught": 0,
         "wanted": 0,
-        "window": [],
-        "weights": [],
-        "server": [],
+        "served_context": null,
         "surface_digest": []
       },
       {
@@ -200,11 +180,7 @@
         "possible": 4,
         "taught": 0,
         "wanted": 4,
-        "window": [
-          "262144"
-        ],
-        "weights": [],
-        "server": [],
+        "served_context": 262144,
         "surface_digest": []
       },
       {
@@ -218,11 +194,7 @@
         "possible": 4,
         "taught": 0,
         "wanted": 0,
-        "window": [
-          "262144"
-        ],
-        "weights": [],
-        "server": [],
+        "served_context": 262144,
         "surface_digest": []
       },
       {
@@ -236,11 +208,7 @@
         "possible": 4,
         "taught": 0,
         "wanted": 1,
-        "window": [
-          "262144"
-        ],
-        "weights": [],
-        "server": [],
+        "served_context": 262144,
         "surface_digest": []
       }
     ]
@@ -291,9 +259,7 @@
         "possible": 20,
         "taught": 0,
         "wanted": 1,
-        "window": [],
-        "weights": [],
-        "server": [],
+        "served_context": null,
         "surface_digest": []
       },
       {
@@ -307,9 +273,7 @@
         "possible": 20,
         "taught": 0,
         "wanted": 0,
-        "window": [],
-        "weights": [],
-        "server": [],
+        "served_context": null,
         "surface_digest": []
       },
       {
@@ -323,11 +287,7 @@
         "possible": 20,
         "taught": 0,
         "wanted": 15,
-        "window": [
-          "262144"
-        ],
-        "weights": [],
-        "server": [],
+        "served_context": 262144,
         "surface_digest": []
       },
       {
@@ -341,11 +301,7 @@
         "possible": 20,
         "taught": 0,
         "wanted": 0,
-        "window": [
-          "262144"
-        ],
-        "weights": [],
-        "server": [],
+        "served_context": 262144,
         "surface_digest": []
       },
       {
@@ -359,11 +315,7 @@
         "possible": 20,
         "taught": 0,
         "wanted": 0,
-        "window": [
-          "262144"
-        ],
-        "weights": [],
-        "server": [],
+        "served_context": 262144,
         "surface_digest": []
       }
     ]

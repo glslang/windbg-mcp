@@ -950,7 +950,7 @@ mutable ollama tag), `suite`, and `harness_version` for the Claude rows, which c
 two logs with **two rules that are not one rule**: a *changed question* blocks a pairing (via
 `stale_prompt`, printed at the row), while a changed build, model or window is *named above the
 table* for a reader to weigh - conflating them is how a moved aggregate gets read as a controlled
-result. `--series` reduces logs to one row per run in `docs/eval-runs.json`. Five things bite.
+result. `--series` reduces logs to one row per run in `docs/eval-runs.json`. Six things bite.
 **The server's version now carries its git revision** (`0.11.0+g1a2b3c4`), stamped by `build.rs`,
 so anything asserting on it is a *prefix* check - and the smoke test additionally asserts the
 revision is **there** when built from a checkout, which is the assertion that catches a `build.rs`
@@ -964,7 +964,12 @@ relative to the git dir and not a revision): a `git worktree` checkout has a `.g
 literal `.git/HEAD` is a watched path that does not exist, which Cargo reads as always-changed and
 recompiles the crate on every no-op build. And **the two `/api/ps` facts are one call**
 (`runtime_identity`): asking twice could catch different instances and pair one model's window with
-another's digest. **A surface is compared by digest, not byte length** - a same-length reword or an
+another's digest. **The surface and the window are per-cell facts; the weights and the build are
+deliberately not** - review asked for both and both were built and then removed, because reaching
+the state they guard needs a model re-pulled mid-run or a run spanning a rebuild, and neither
+happens here. `tools/` is a developer script and the bar for defending it against states its own
+workflow cannot produce is lower than `src/`'s. **A surface is compared by digest, not byte
+length** - a same-length reword or an
 equal-sized allowlist swap moves neither the count nor the length, though a comparison spanning the
 rollout falls back to what both sides recorded and says `unverifiable` rather than `moved` - and **`unrecorded` (nobody
 recorded it) is kept apart from `unavailable`** (this row has no such answer), or every run with a
