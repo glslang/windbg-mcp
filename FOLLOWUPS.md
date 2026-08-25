@@ -1978,14 +1978,49 @@ interesting number by accident. The split is worth making the next time the eval
 prose change, and doing it now would re-grade three runs of records to prove a partition that no
 present data disagrees with.
 
-**A third channel was checked and is clean** (2026-08-24, prompted by the reasonable question of
-how a model on an eleven-tool surface produces the *exact* name `modules` with its real `filter`
-argument). Items 40 and 41 closed the `instructions` string and the tool descriptions; nobody had
-looked at what a **result** says. Every tool result shown to a model on a narrowed surface, across
-both logs this bench still holds, was scanned for the name of any tool that client is not served —
-against a 59-name superset of the surface taken from `tests/golden/tool_budget.json`, so the net is
-wider than the 51 tools rather than narrower. **None.** So `taught` is zero on all three channels a
-client reads, not only the two that were fixed.
+**A third channel was checked, and the checking is worth more than the result** (2026-08-24,
+prompted by the reasonable question of how a model on an eleven-tool surface produces the *exact*
+name `modules` with its real `filter` argument). Items 40 and 41 closed the `instructions` string
+and the tool descriptions; nobody had looked at what a **result** says, which is the third thing a
+model reads and the only one that arrives on every call.
+
+**The first scan reported "none" without having compared anything.** It read each call's `text`,
+and a call record carries `excerpt` — so the loop body never ran, and "none" meant "nothing was
+looked at". The number quoted beside it was audited and the scan behind it was not: a "59-name
+superset" is 51 tool names plus the eight JSON field names (`annotations`, `description`,
+`instructions`, `name`, `payload`, `tools`, `totals`, `wire`) that a recursive walk of
+`tests/golden/tool_budget.json` picks up, which Codex asked about on
+[#216](https://github.com/glslang/windbg-mcp/pull/216) and which is how the empty loop surfaced.
+The rule underneath is the one this repo already writes down twice — *a grep is not an
+enumeration*, and a monitor's *silence is not success*: *a scan that can only print on a hit proves
+nothing until it has been shown printing on a known one.*
+
+**Redone against `excerpt`, sixteen results do name a tool their client is not served — and every
+one is the model's own request coming back.** Nine are the ollama driver's own refusal — the one
+that names the tool it is refusing, "`debug_batch` is not permitted in this harness" — four are
+Claude Code's "No such tool available: `mcp__windbg__…`", and three are **this server's** `-32602`. Nothing is *introduced*: no result names
+a tool the model had not just asked for, so `taught` is zero on this channel too — but by a
+narrower warrant than "clean". The log keeps a **262-character prefix** of each result (96 of the
+114 are truncated; the mean full result is 1,826 characters), so this scans what a result *opens*
+with. And names have to be matched the way
+`no_description_names_a_tool_the_client_cannot_call` matches them — bare if the name has an
+underscore, in call context otherwise — because plain containment scores `execute` eight times
+inside `ATTEMPTED_EXECUTE_OF_NOEXECUTE_MEMORY` and "the attempted execute", and because a
+lookbehind of `[A-Za-z0-9_]` silently drops `mcp__windbg__debug_batch`.
+
+**The one of those three that is ours is not neutral, and the split has no box for it.**
+`Toolset::refusal` (`src/toolset.rs`) answers a narrowed client with "`modules` is a tool this
+server has, but it is not on the surface it serves `min` (11 of 51 tools (session, crash))", and
+then how to widen it. That is deliberate, and the doc comment says why: the reader it is written
+for is an operator who can see neither this server's command line nor its client list. On the
+bench the reader is the model, and what it gets is a **guessed name confirmed as real**, beside the
+surface's group names and the size of the full one. It teaches no name — the model supplied it — so
+it is not `taught`; it is not nothing either. A third count, *a refusal that says yes*, is what
+this channel would contribute to the split. In these logs it changed no behaviour — nobody retried
+a name after being told it was real: gemma went from `modules` to `run_command` three times and
+opus to `list_modules`, while the retries that did happen (`debug_batch` five times, then four)
+follow the *driver's* refusal, which confirms nothing. That is one draw per cell, though, and a
+retry is precisely what the confirmation would buy.
 
 **What the survivors' *shape* says, and where it stops.** The names asked for are a mixture of real
 and invented — `modules` (3) beside `list_modules` (1) before item 41, and `modules` (3) beside
