@@ -1977,3 +1977,25 @@ the column into `taught` and `wanted`, and let a regression test assert only the
 interesting number by accident. The split is worth making the next time the eval runs against a
 prose change, and doing it now would re-grade three runs of records to prove a partition that no
 present data disagrees with.
+
+**A third channel was checked and is clean** (2026-08-24, prompted by the reasonable question of
+how a model on an eleven-tool surface produces the *exact* name `modules` with its real `filter`
+argument). Items 40 and 41 closed the `instructions` string and the tool descriptions; nobody had
+looked at what a **result** says. Every tool result shown to a model on a narrowed surface, across
+both logs this bench still holds, was scanned for the name of any tool that client is not served —
+against a 59-name superset of the surface taken from `tests/golden/tool_budget.json`, so the net is
+wider than the 51 tools rather than narrower. **None.** So `taught` is zero on all three channels a
+client reads, not only the two that were fixed.
+
+**What the survivors' *shape* says, and where it stops.** The names asked for are a mixture of real
+and invented — `modules` (3) beside `list_modules` (1) before item 41, and `modules` (3) beside
+`run_command` (3) after it, the latter carrying `{"command": "lm m nvhda64v"}`, which is the right
+idea under a name this server does not have. A model copying an advertisement produces exact names
+only; a mixture is what guessing looks like, which is evidence for the `wanted` reading of the
+remainder. Two things keep it from being proof. The *concept* is still on the narrow surface even
+though the name is not — `open_dump` ends "…module count and the bug check a crash dump stopped on
+— not its module table", and the task prompt says "how many **modules** are loaded" — so a model is
+told a module table exists and has to name a tool for it. And this is a public repository, so
+prior exposure cannot be excluded at one draw per cell. Separating memorised-from-GitHub from
+guessed-by-convention is item 42's machinery (the same cell repeated with that sentence varied),
+not this item's.
