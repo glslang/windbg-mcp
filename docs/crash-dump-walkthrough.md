@@ -30,8 +30,14 @@ Kernel base = 0xfffff803`89200000 PsLoadedModuleList = 0xfffff803`8a0f52d0
 Debug session time: Thu May 21 12:44:54.667 2026 (UTC + 1:00)
 
 Bug check 0x9f DRIVER_POWER_STATE_FAILURE, parameters 0x0000000000000003 …
-227 module(s) loaded, `nt` at 0xfffff80389200000; `modules` lists a page of the table and `modules { "filter": "<name>" }` answers for one.
+227 module(s) loaded, `nt` at 0xfffff80389200000.
+  `crash_triage` reads the bug check as fields, with the crashing stack and the module each frame belongs to.
+  `modules` lists a page of that table and `modules { "filter": "<name>" }` answers for one.
 ```
+
+Those last two lines are **the surface's, not the target's**: each is appended only where the
+client is served the tool it names, so a caller restricted to `crash` reads the `crash_triage`
+line and not the `modules` one. The summary above them is the same on every surface.
 
 The same fields come back as `structuredContent.summary`. The **table** is `modules`, and it is
 worth a call here because it tells a story — but read it deliberately: 227 rows is the largest

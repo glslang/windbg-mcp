@@ -9,6 +9,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **And no *result* names one either, which was the channel nobody had scanned** (`FOLLOWUPS.md`
+  item 43). Items 40 and 41 below closed the `instructions` string and the descriptions; an
+  opener's summary went on ending with "`modules` lists a page of the table and `modules
+  { \"filter\": \"<name>\" }` answers for one", because `summary_text` runs in the **worker**,
+  which owns one session and has never heard of a client, let alone its surface. `modules` is
+  `inspect`, so on an eleven-tool `crash` surface the first result a client ever saw handed it the
+  exact name together with its real argument — which is where the local-model bench's "invented"
+  `modules` calls were coming from. `crash_triage` rode along the same way, and a post-commit
+  failure sent any caller to `execute`. The summary now crosses the pipe as facts and the pointers
+  are appended where the surface is (`SUMMARY_NOTES`, `annotated_report`), on both halves of the
+  result, since a structured-aware client forwards `structuredContent` and drops the text. Two
+  more sentences went the same way: a post-commit failure keeps its advice on every surface and
+  drops only the `execute` example, and `crash_triage`'s user-mode refusal — which named
+  `backtrace` and `execute` to the one caller that has neither, `crash_triage` being `crash` while
+  both of those are `inspect`.
+
 - **A client is told about the tools it is served, and no others** (`FOLLOWUPS.md` item 40, which
   closes it). `--tools` narrowed the router per client — `tools/list` answers with that client's
   set, and anything else is refused by name — while the `instructions` string sent at `initialize`

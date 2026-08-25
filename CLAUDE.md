@@ -615,6 +615,23 @@ TTD description quotes `dx @$cursession.TTD.Calls(...)`, which is the debugger c
 `dx` tool; the rule is a code span that *is* the name or opens a call with it, plus bare-if-it-has-
 an-underscore, which is what caught `step_back`'s "Reverse of step_into.".
 
+**And the same rule again for a *result*, which is the channel that took longest to find** (item
+43). `SUMMARY_NOTES` beside `TOOL_NOTES`, appended by `annotated_report` rather than `annotate`.
+The reason it is a second table and not a wider first one is where the text is built: an opener's
+summary is assembled by `summary_text` in the **worker**, which owns one session and has never
+heard of a client — so a sentence naming `modules`, with its `filter` argument spelled out, shipped
+to an eleven-tool caller for as long as that sentence existed. The summary crosses the pipe as
+facts; the pointers are added where `self.surface` is. Three things to know before touching it.
+**Annotate above both halves of the result**, because a structured-aware client forwards
+`structuredContent` and drops the text — a pointer added to one half is one half the clients never
+see, and a pointer *removed* from one half is the leak still open on the other. **A note carries a
+predicate**, since a pointer to the bug check on a target that did not bug-check is noise on every
+surface. And **the leak was invisible to the eval that was measuring it**: `local_model_drive.py`
+records `text[:300]` and the sentence sat at the end of a 2,508-character summary, so two rounds of
+"which names is this server teaching" never saw the largest one. What found it was a scan of `src/`
+string literals against the tool table — seconds, no bench and no VM, because what a server prints
+is a static question and was never an eval's to answer.
+
 ## Several clients on one listener (`src/client.rs`)
 
 A `--listen` server holds **one bearer token per client**: `WINDBG_MCP_LISTEN_TOKEN_<NAME>` names
