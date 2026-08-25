@@ -2004,12 +2004,22 @@ Claude Code's "No such tool available: `mcp__windbg__…`", and three are **this
 **That is zero within the prefixes the log keeps, and it cannot be stated wider than that**
 (Codex's second round on #216, and correct). `local_model_drive.py` records `text[:300]`, so 96 of
 the 114 results are truncated and 29,946 characters of a 208,266-character corpus were compared: a
-name mentioned late in a long module listing is invisible to this scan by construction. The
-whole-result version needs **no new code and no re-grade** — `Recorder::tool_result` writes each
-result's text into the server transcript, scrubbed then capped, and
-`WINDBG_MCP_TRANSCRIPT_MAX_FIELD=0` lifts the cap — so setting `WINDBG_MCP_TRANSCRIPT` on the bench
-listener answers it outright on the next run. It cannot be answered backwards: nothing kept the
-bytes these two runs discarded.
+name mentioned late in a long module listing is invisible to this scan by construction.
+
+**The whole-result version needs no new code, and it is not the same corpus** — the third round of
+the same review, also correct. `Recorder::tool_result` writes each result's text into the server
+transcript, scrubbed then capped, and `WINDBG_MCP_TRANSCRIPT_MAX_FIELD=0` lifts the cap, so
+`WINDBG_MCP_TRANSCRIPT` on the bench listener records every *served* call's result whole. It
+records none of the sixteen: an off-surface call is refused at the top of `WindbgServer::dispatch`
+(`src/server.rs`) and returns before `rec.tool_request` runs, and the other two refusals are the
+ollama driver's and Claude Code's, which never reach this server at all. That is not a gap in the
+answer, because those three classes are exactly the ones that **cannot** introduce a name: each
+quotes the tool the caller just asked for, and ours adds only group names — a group that is also a
+tool name is refused outright (`src/toolset.rs`) — and, for a partly-held group,
+tools the client *is* served. So the transcript covers the bodies, which is where an introduction
+could hide; the eval log covers the refusals, which are echoes by construction; a scan wanting the
+model's whole view reads both. What no route reaches is *these* two runs: nothing kept the bytes
+the driver discarded, so this one cannot be answered backwards.
 
 Names have to be matched the way
 `no_description_names_a_tool_the_client_cannot_call` matches them — bare if the name has an
