@@ -1458,13 +1458,7 @@ fn raw_command(e: &DebugEngine, command: &str, budget_ms: u32) -> Result<Command
     };
     let settled = match e.settle(settle_ms) {
         Ok(settled) => settled,
-        Err(why) => {
-            // Reported and dropped: the command's own answer is what the caller asked for, and a
-            // failure to *ask* about the run state must not turn a command that ran into an error.
-            // A session really left running shows up on the next call regardless.
-            tracing::warn!("worker: could not settle the target after a raw command: {why}");
-            None
-        }
+        Err(why) => return settle_failed(e, result, &es(why)),
     };
     let Some(settled) = settled else {
         return result;
@@ -1513,6 +1507,96 @@ fn moved_note(e: &DebugEngine, forced: bool) -> String {
         true => format!("[windbg-mcp] this command moved the target, which is now stopped{at}."),
         false => format!("[windbg-mcp] this command moved the target; it is now stopped{at}."),
     }
+}
+
+/// What a failed settle means for the session, decided from what the engine says afterwards.
+#[derive(Debug, PartialEq)]
+enum SettleVerdict {
+    /// The engine is still running: the recovery itself failed, and execution control on this
+    /// session will fail until the target stops.
+    Damaged(String),
+    /// Whatever failed, the engine is stopped and the session is fine.
+    Fine,
+    /// The engine could not be asked either, so nothing is claimed about it.
+    Unknown(String),
+}
+
+/// [`DebugEngine::settle`] does two things behind one `Result`: it asks whether the engine was
+/// left running, and, if it was, it pumps it to a stop. Treating every failure as the first —
+/// logging it and handing back the command's own answer — is right for a status query that could
+/// not be made and wrong for a pump that did not work, which leaves the session in exactly the
+/// state the settle exists to prevent while telling the caller it succeeded.
+///
+/// So the engine is asked again, and the three answers are three different things. Split from
+/// [`settle_failed`] because the engine is what makes it untestable and the decision is what is
+/// worth testing.
+fn settle_verdict(running: Result<bool, String>, why: &str) -> SettleVerdict {
+    match running {
+        Ok(true) => SettleVerdict::Damaged(format!(
+            "The command ran, and it left the target running. Pumping it to a stop failed \
+             ({why}), and the engine still reports it running, so execution control on this \
+             session will fail until the target stops. The command's own output follows."
+        )),
+        Ok(false) => SettleVerdict::Fine,
+        // Reported as not knowing rather than guessed at, which is this server's rule everywhere
+        // else. A caller acting on a guess either abandons a working session or keeps a broken one.
+        Err(unreadable) => SettleVerdict::Unknown(format!(
+            "[windbg-mcp] this command may have left the target running: the debugger could not \
+             be pumped ({why}) and could not be asked whether it is running ({unreadable}). If a \
+             later call fails with 0x80040205, that is why."
+        )),
+    }
+}
+
+/// [`settle_verdict`] applied to what the command itself answered.
+///
+/// The output survives every branch, including the one that becomes an error: a caller whose
+/// session is damaged still needs to see what the command printed, and this is the only copy.
+fn settled_or(
+    verdict: SettleVerdict,
+    result: Result<CommandRun, String>,
+) -> Result<CommandRun, String> {
+    match verdict {
+        SettleVerdict::Fine => result,
+        SettleVerdict::Damaged(said) => Err(appended(said, output_of(result))),
+        SettleVerdict::Unknown(note) => match result {
+            Ok(mut run) => {
+                run.output = appended(run.output, Some(note));
+                Ok(run)
+            }
+            Err(command_failed) => Err(appended(command_failed, Some(note))),
+        },
+    }
+}
+
+/// Asks the engine what a failed settle left behind, and answers accordingly.
+fn settle_failed(
+    e: &DebugEngine,
+    result: Result<CommandRun, String>,
+    why: &str,
+) -> Result<CommandRun, String> {
+    let verdict = settle_verdict(e.is_running().map_err(es), why);
+    match &verdict {
+        SettleVerdict::Damaged(_) => tracing::warn!(
+            "worker: the settle after a raw command failed and the target is still running: {why}"
+        ),
+        SettleVerdict::Fine => {
+            tracing::warn!("worker: could not settle the target after a raw command: {why}")
+        }
+        SettleVerdict::Unknown(_) => tracing::warn!(
+            "worker: the settle after a raw command failed and the run state is unreadable: {why}"
+        ),
+    }
+    settled_or(verdict, result)
+}
+
+/// A command's text whichever way it ended, for a message that has to carry both.
+fn output_of(result: Result<CommandRun, String>) -> Option<String> {
+    Some(match result {
+        Ok(run) => run.output,
+        Err(why) => why,
+    })
+    .filter(|text| !text.trim().is_empty())
 }
 
 /// Milliseconds since `started`, saturating — the shape every budget subtraction here wants.
@@ -7203,6 +7287,75 @@ mod tests {
             explained.contains("ttd\\"),
             "it names the directory to copy: {explained}"
         );
+    }
+
+    /// A settle that failed is three different situations, and only one of them is an error.
+    ///
+    /// [`DebugEngine::settle`] asks whether the engine was left running *and* pumps it, behind one
+    /// `Result`. Folding both into "log it and hand back the command's answer" reports
+    /// `status: "ok"` on a session whose next execution-control call cannot work — which is the
+    /// bug this whole settle exists to prevent, arriving through the recovery for it.
+    #[test]
+    fn a_failed_settle_is_read_from_what_the_engine_says_afterwards() {
+        let damaged = settle_verdict(Ok(true), "the pump timed out");
+        let SettleVerdict::Damaged(said) = &damaged else {
+            panic!("an engine that is still running is a damaged session: {damaged:?}")
+        };
+        assert!(said.contains("the pump timed out"), "{said}");
+
+        assert_eq!(
+            settle_verdict(Ok(false), "the pump timed out"),
+            SettleVerdict::Fine,
+            "an engine that is stopped is a session that is fine, whatever failed on the way"
+        );
+
+        let unknown = settle_verdict(Err("no current process".to_string()), "the pump timed out");
+        let SettleVerdict::Unknown(note) = &unknown else {
+            panic!("an engine that cannot be asked is not a verdict: {unknown:?}")
+        };
+        // Both reasons, because either alone reads as the whole story.
+        assert!(note.contains("the pump timed out"), "{note}");
+        assert!(note.contains("no current process"), "{note}");
+    }
+
+    /// And the command's output survives all three, including the branch that becomes an error.
+    ///
+    /// The one copy of it is in the value being turned into a message, so a caller whose session is
+    /// damaged would otherwise be told that and nothing about what they ran.
+    #[test]
+    fn a_settle_verdict_never_swallows_what_the_command_printed() {
+        let ran = || {
+            Ok(CommandRun {
+                output: "0:000> the command said this".to_string(),
+                cut_short: None,
+            })
+        };
+
+        let damaged = settled_or(SettleVerdict::Damaged("still running".into()), ran())
+            .expect_err("a damaged session is an error");
+        assert!(damaged.contains("still running"), "{damaged}");
+        assert!(damaged.contains("the command said this"), "{damaged}");
+
+        let fine = settled_or(SettleVerdict::Fine, ran()).expect("a fine session is not an error");
+        assert_eq!(fine.output, "0:000> the command said this");
+
+        let unknown = settled_or(SettleVerdict::Unknown("cannot say".into()), ran())
+            .expect("not knowing is not the command failing");
+        assert!(
+            unknown.output.contains("the command said this"),
+            "{unknown:?}"
+        );
+        assert!(unknown.output.contains("cannot say"), "{unknown:?}");
+
+        // And when the command itself failed, both facts reach the caller through the one channel
+        // an error has.
+        let both = settled_or(
+            SettleVerdict::Unknown("cannot say".into()),
+            Err("the command failed".to_string()),
+        )
+        .expect_err("a failed command stays failed");
+        assert!(both.contains("the command failed"), "{both}");
+        assert!(both.contains("cannot say"), "{both}");
     }
 
     /// And it claims only what it can know.
