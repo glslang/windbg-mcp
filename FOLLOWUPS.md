@@ -2200,6 +2200,26 @@ question borrowed in the first place. **A wording defect shows up as agreement o
 answer, not as imprecision**, which is the check to run rather than re-reading prompts for rigour.
 Recorded in that task's `note` rather than fixed, so its published numbers stay comparable.
 
+**A reworded task un-grades its own history, which review caught and the first attempt had not**
+([#220](https://github.com/glslang/windbg-mcp/pull/220), Codex). `usable()` drops any record whose
+stored `prompt` differs from the one the suite asks now - deliberate machinery, added when this
+bench reworded `unloaded_driver` mid-flight - so changing the live suite quietly took `arm64_pc`
+out of every checked-in plan. Measured on `after-217.jsonl`: the denominator went **20 to 15** per
+cell and 25 of the 150 records became `UNCOUNTED`. Worse, a *resume* of either checked-in plan
+would re-run the task and append new-wording answers under the same `(cell, draw, task)` key as the
+old ones, where `records()` keeps the later - one log, two experiments, nothing saying so. **A
+run's identity includes the question it asked**, so the old wording is frozen as
+`tools/eval_tasks_v1.json` and both historical plans name it: `after-217.jsonl` grades to 20 again
+and resume counts 150 of 150 done. The live suite is `v2`. And the one uncounted reason a reader
+can *act* on now says so under the table, since a served window that was not the one asked for is
+unrecoverable while a changed question is only the wrong suite - `stale_prompt` is split out of
+`usable` rather than restated inside it, so the predicate keeps one home.
+
+**My own verification of this was wrong, and the way it was wrong is worth keeping.** "Grades
+unchanged" was checked by running `--grade` and reading the numerators, which did match. The
+denominators did not, and the rows said `UNCOUNTED x5` in plain sight. Re-grading proves nothing
+unless the comparison is against the *previous output* rather than against expectations.
+
 **Where the published numbers stand.** `docs/local-model-eval.md` now says, once and above every
 table, that every score in it was graded against the old wording and is not comparable with a run
 against the new one on this task. The suite `note` in `tools/eval_tasks.json` says the same for

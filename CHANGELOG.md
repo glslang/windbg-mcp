@@ -23,6 +23,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   — `docs/local-model-eval.md`, three tables over — were graded against the old wording and say so
   now.
 
+- **A run's identity includes the question it asked**, so the suite the published runs used is
+  frozen as `tools/eval_tasks_v1.json` and both checked-in plans name it; the live
+  `tools/eval_tasks.json` is `v2`. `usable()` drops any record whose stored prompt is not the one
+  the suite asks now — right for a resume, and it meant rewording `arm64_pc` in place took that
+  task out of every historical plan: `after-217.jsonl` graded 15 possible per cell instead of 20,
+  with 25 of 150 records `UNCOUNTED`, and a *resumed* plan would have appended new-wording answers
+  under the same `(cell, draw, task)` key as the old ones. Pinned, it grades to 20 again and
+  resume counts 150 of 150 done. The grader now also names that reason under the table when it
+  fires, because it is the one uncounted reason a reader can act on — a served window that was not
+  the one requested is unrecoverable, a changed question is only the wrong suite.
+
 - **The eval's `unserved` column is two numbers, because it was two measurements** (`FOLLOWUPS.md`
   item 43, which closes it). A call naming a tool the client is not served is either `taught` — the
   task *was* answerable on this surface, so nothing about the question required a name off it — or

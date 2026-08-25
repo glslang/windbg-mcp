@@ -76,6 +76,21 @@ def tokens_for(plan):
     return tokens
 
 
+def stale_prompt(record, task):
+    """Whether this record answers a question the suite no longer asks.
+
+    Split out of [`usable`] rather than restated inside it, so the comparison that decides a
+    record's fate keeps one home *and* the grader can say which of `usable`'s two reasons dropped
+    a record. Rewording a task un-grades every answer to the old wording, which is right for a
+    resume and is a footgun when re-grading a log that was published against it - the denominator
+    shrinks and the row says only `UNCOUNTED`. `tools/eval_tasks_v1.json` is the suite frozen at
+    the wording the logs on disk were run against, and each checked-in plan names the one its own
+    log belongs to.
+    """
+    return bool(task is not None and record.get("prompt")
+                and record["prompt"] != task.get("prompt"))
+
+
 def usable(record, task=None):
     """Whether a record still measures what this run is asking.
 
@@ -92,7 +107,7 @@ def usable(record, task=None):
     resume would otherwise have skipped the task while the grader scored the old answers against
     the new key.
     """
-    if task is not None and record.get("prompt") and record["prompt"] != task.get("prompt"):
+    if stale_prompt(record, task):
         return False
     served, asked = record.get("served_context"), record.get("num_ctx")
     if not asked:
@@ -503,6 +518,7 @@ def summarise(log_path, tasks_file):
             "surface": cell_id[3], "tools": surface.get("tools"),
             "surface_bytes": surface.get("bytes"), "served_context": record.get("served_context"),
             "tasks": [], "cell_error": None, "failed_draws": 0, "uncounted": 0,
+            "stale_prompt": 0,
             "draw_ids": set(),
         })
         cell["draw_ids"].add(draw_of(record))
@@ -528,6 +544,8 @@ def summarise(log_path, tasks_file):
             # asked for, or against a question the suite no longer asks. `--matrix` marks these
             # `?`; the row says how many were dropped.
             cell["uncounted"] = cell.get("uncounted", 0) + 1
+            if stale_prompt(record, key.get(record.get("task"))):
+                cell["stale_prompt"] = cell.get("stale_prompt", 0) + 1
             continue
         task = key.get(record["task"])
         if task is None:
@@ -608,6 +626,16 @@ def print_table(cells):
               f"{c['useful']}/{c['wasted']}/{c['taught']}+{c['wanted']}/{c['refused']}/"
               f"{c['call_errors']:<8} "
               f"{c['wall_s']:>5}s{failed}")
+    stale = sum(c.get("stale_prompt", 0) for c in cells)
+    if stale:
+        # **The one uncounted reason a reader can act on.** A served window that was not the one
+        # asked for is a property of the run and nothing recovers it; a changed question is a
+        # property of *which suite this log is being graded against*, and grading it against the
+        # one it ran on gives every record back.
+        print(f"\n  {stale} record(s) answer a question this suite no longer asks and are "
+              f"uncounted above.\n  Grade a published log against the suite it ran on - each "
+              f"plan in tools/ names its own\n  (tools/eval_tasks_v1.json for the logs this "
+              f"bench has published).")
     print_taught(cells)
 
 

@@ -1,6 +1,6 @@
 {
   "run": "2026-08-23",
-  "tasks": "tools/eval_tasks.json",
+  "tasks": "tools/eval_tasks_v1.json",
   "url": "http://127.0.0.1:8766/",
   "out": "eval-out/results.jsonl",
   "logs": "eval-out/logs",

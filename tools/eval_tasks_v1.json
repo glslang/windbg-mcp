@@ -1,6 +1,7 @@
 {
-  "suite": "windbg-mcp local-model eval v2",
-  "note": "Six tasks with a mechanical answer key, read off the checked-in sample dumps with this server's own tools before any model saw them (2026-08-23). `needs` names the tool group a task cannot be answered without, which is what makes the surface axis predictive rather than decorative: `session` is in every surface whatever a spec says, `crash` is in all three of these, `inspect` in two of them, and `ioctl` only in the whole one. `expect` is a list of groups, all of which must appear in the final answer, any alternative within a group counting; `bonus` is recorded but never decides pass/fail. `possible_on` names the surfaces on which the answer key is reachable at all, which is what keeps a narrowed surface from being scored as a stupid model: on `min` three of the six tasks have no tool that can answer them. Two tasks are reachable on every surface because `open_dump`'s own summary carries the bug check and the module count - the opener is doing more work than the tool table suggests. Every prompt was re-read against its key on 2026-08-25 (`FOLLOWUPS.md` item 44), after `arm64_pc` turned out to be measuring its own wording rather than the surface: five draws of five models had failed it in all twenty-five. Only that one was reworded - the audit is recorded in the `note` of each task it found anything in - and its scores from before that date are not comparable with later ones.",
+  "frozen": "The suite as it stood until 2026-08-25, kept because a run's identity includes the question it asked. `tools/eval_plan.json` and `tools/eval_plan_after_217.json` point here, so the runs already published grade to what they graded to and a resume of either cannot append answers to a different question under the same (cell, draw, task) key. `arm64_pc` was reworded in the live suite (`tools/eval_tasks.json`, `FOLLOWUPS.md` item 44); nothing here may be edited - a changed `prompt` is what `usable()` compares, and editing one would silently un-grade the log it belongs to.",
+  "suite": "windbg-mcp local-model eval v1",
+  "note": "Six tasks with a mechanical answer key, read off the checked-in sample dumps with this server's own tools before any model saw them (2026-08-23). `needs` names the tool group a task cannot be answered without, which is what makes the surface axis predictive rather than decorative: `session` is in every surface whatever a spec says, `crash` is in all three of these, `inspect` in two of them, and `ioctl` only in the whole one. `expect` is a list of groups, all of which must appear in the final answer, any alternative within a group counting; `bonus` is recorded but never decides pass/fail. `possible_on` names the surfaces on which the answer key is reachable at all, which is what keeps a narrowed surface from being scored as a stupid model: on `min` three of the six tasks have no tool that can answer them. Two tasks are reachable on every surface because `open_dump`'s own summary carries the bug check and the module count - the opener is doing more work than the tool table suggests.",
   "tasks": [
     {
       "id": "bugcheck",
@@ -53,8 +54,7 @@
         "modules",
         "session_status",
         "end_session"
-      ],
-      "note": "Checked against item 44's defect on 2026-08-25 and it is not the same one: 33 of the 35 recorded runs agree with the key and the two that do not are an empty answer and a closed session, so no second reading is one a model actually gives. Worth knowing anyway - `MessageManager+0x1654` is frame 7, the address the call into `nt!ExFreePoolWithTag` returns to, rather than an instruction that itself faulted. `crash_triage` names it `faulting_frame`, which is the vocabulary the question borrows."
+      ]
     },
     {
       "id": "module_count",
@@ -116,7 +116,7 @@
         "lean",
         "min"
       ],
-      "prompt": "Open the ARM64 kernel crash dump C:\\workspace\\windbg-mcp\\docs\\samples\\121524-4703-01.dmp and tell me what value the pc register holds in the crash context the dump saved - the register's own value as the debugger reports it, not an address taken from the bug check's parameters.",
+      "prompt": "Open the ARM64 kernel crash dump C:\\workspace\\windbg-mcp\\docs\\samples\\121524-4703-01.dmp and tell me the value of the pc register at the point of the crash.",
       "expect": [
         [
           "0xfffff8013c65bca8",
@@ -131,7 +131,7 @@
         "session_status",
         "end_session"
       ],
-      "note": "`registers` is the direct route; `crash_triage` frame 0 carries the same address on this dump, which is why every surface can reach it - that half of this note is unchanged and is what argued `possible_on` should include `min`. **The prompt was reworded on 2026-08-25** (`FOLLOWUPS.md` item 44), so scores against it before that date measure a different question. It used to ask for \"the value of the pc register at the point of the crash\", which reads as the address whose execution faulted: bug check parameter 1, `0x0000019e7b820000`, also in `x24`. Thirty-two of the thirty-five recorded runs answered exactly that, and none gave the key. Both readings are defensible on this dump - `pc` is `nt!KeBugCheck2+0x2e8`, inside the bug-check path the machine reached *after* the fault - which is why the fix is the question rather than the key: widening `expect` to accept parameter 1 would let the task pass off `open_dump`'s summary alone, where the parameters already are, and it exists to check that a narrow surface reaches a *register* through `crash_triage` frame 0."
+      "note": "`registers` is the direct route; `crash_triage` frame 0 carries the same address on this dump, which is why every surface can reach it."
     },
     {
       "id": "ioctl_decode",

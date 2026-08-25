@@ -1,7 +1,7 @@
 {
   "run": "2026-08-25 after #217: the five min cells, five draws each",
   "note": "The first read of the min surface with all three advertising channels closed. Items 40 and 41 took the `instructions` string and the tool descriptions; #217 took the opener's *result*, which was still handing `modules` over with its `filter` argument and is why the earlier 'three calls came anyway' reading was confounded. Five draws because one cannot answer 'how often' - see item 42 and the `draws` column - and because the arms it is being compared against are n=1, which is a weakness of the comparison rather than of this run.",
-  "tasks": "tools/eval_tasks.json",
+  "tasks": "tools/eval_tasks_v1.json",
   "url": "http://127.0.0.1:8766/",
   "out": "eval-out/after-217.jsonl",
   "logs": "eval-out/logs-after-217",

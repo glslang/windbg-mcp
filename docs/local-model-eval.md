@@ -119,6 +119,15 @@ five prompts were re-read against their keys at the same time and none has the s
 the check did find is in each task's `note` in `tools/eval_tasks.json`, and the measurement that
 prompted it is the fourth run below.
 
+**So a run's identity includes the question it asked**, and the old wording is kept as
+[`tools/eval_tasks_v1.json`](../tools/eval_tasks_v1.json) rather than overwritten. The two
+checked-in plans name it, which is what keeps this page re-gradable: `usable()` drops every answer
+to a question the suite no longer asks — correct for a resume, and the reason a reworded task would
+otherwise both shrink these tables' denominators and let a *resumed* plan append new-wording
+answers under the same (cell, draw, task) key as the old ones. Grade a published log against the
+suite its plan names; grading one against the live suite drops those records and says so under the
+table.
+
 ## Grading
 
 Mechanical, and stated so it can be argued with:
@@ -225,7 +234,7 @@ grid is re-runnable rather than described:
 ```json
 {
   "run": "2026-08-23",
-  "tasks": "tools/eval_tasks.json",
+  "tasks": "tools/eval_tasks_v1.json",
   "url": "http://127.0.0.1:8766/",
   "out": "eval-out/results.jsonl",
   "surfaces": [{ "client": "full" }, { "client": "lean" }, { "client": "min" }],
@@ -264,6 +273,11 @@ ever fails. Such a record is also not counted as done, so re-running the plan re
 ```console
 python3 tools/local_model_eval.py --grade results.jsonl tools/eval_tasks.json
 ```
+
+The suite argument is the one the log's **plan** names, not whichever suite is current —
+`tools/eval_tasks_v1.json` for every log this page reports. It defaults to `tools/eval_tasks.json`,
+so a published log graded with the default loses each record whose question has been reworded
+since; the count and what to do about it print under the table.
 
 ### Repeating a cell, when the question is a rate
 
