@@ -257,8 +257,9 @@ python3 tools/local_model_eval.py --grade results.jsonl tools/eval_tasks.json
 
 ### Repeating a cell, when the question is a rate
 
-The grid runs **one draw per (model, context, surface, task)**, which is what every run on this
-page is. That is enough for the two things it was built for — failure *modes*, and whether a
+The grid runs **one draw per (model, context, surface, task)**, which is what the first three runs
+on this page are; the fourth (2026-08-25) repeats each cell five times and is the only one that
+does. That is enough for the two things it was built for — failure *modes*, and whether a
 surface fits at all — and it is not enough for any sentence of the form "X caused Y". Three
 write-ups here reached past that anyway and review took two of them back
 (`FOLLOWUPS.md` item 42); the trap each time was a cell whose *composition* also changed, so an
@@ -668,8 +669,12 @@ rate; it is the sentence above about fifteen draws. Note also that gemma's twelv
   that is a coin toss reported as a fact.
 - **`arm64_pc` is `5n` in every row** — twenty-five wrong answers from five models, frontier rows
   included. That is what a *task* defect looks like rather than a model one, and reading it that
-  way found one: **across all 35 runs of that task in every log this bench has, none has ever given
-  the key's answer and 32 gave the bug check's first parameter.** Measured on the dump, both are
+  way found one: **across the 35 runs of that task in the three logs still on disk, none gave the
+  key's answer and 32 gave the bug check's first parameter.** It has been answered correctly
+  exactly once, in the original grid — qwen, above, reasoning that frame 0 of the bug-check stack
+  *is* the `pc`. That log is no longer on disk, so one correct answer in fifty is the best this can
+  be put; the point survives the arithmetic either way, since a task whose intended reading is
+  reached about 2% of the time is measuring its wording. Measured on the dump, both are
   defensible — `registers` reports `pc = 0xfffff8013c65bca8` and `crash_triage` frame 0 is the same
   address, `nt!KeBugCheck2+0x2e8`, so the key is literally right; but that address is inside the
   bug-check path the machine reached *after* the fault, while parameter 1 is the address whose

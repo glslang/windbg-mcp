@@ -935,9 +935,10 @@ assertable. **The split attributes need, not provenance**: an opener's result ta
 the bench has produced — with the weakness on the *other* side, which is one draw per cell. Two
 things only draws could say: `ioctl_decode` is answered from a frontier model's own knowledge 5/5
 and from a local one's 1/5, and **`arm64_pc` is `5n` in every row**, which is what sent someone to
-look at the task rather than the models. It has never been answered correctly in 35 runs across
-every log (item 44): the key is the literal `pc`, `nt!KeBugCheck2+0x2e8`, and every model gives the
-bug check's parameter 1 instead — the address whose execution faulted. **A task that fails
+look at the task rather than the models. It went unanswered in all 35 runs in the logs still on
+disk, and has been answered right once ever — qwen, in the original grid, reasoning that frame 0
+*is* the `pc` (item 44). The key is the literal `pc`, `nt!KeBugCheck2+0x2e8`; almost every model
+gives the bug check's parameter 1 instead — the address whose execution faulted. **A task that fails
 everywhere is a task to read, not a model to blame.**
 
 **Re-run against item 41** (2026-08-24): unserved calls 14 -> 6, with `debug_batch` going 10 -> 0
