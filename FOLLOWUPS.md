@@ -2496,7 +2496,12 @@ now stamps the short git revision into the version the server reports, as semver
   the rollout would have read every cell as moved on a telemetry format. It falls back to what both
   runs recorded, and reports `unverifiable` rather than agreement where one side has no digest —
   once beneath the table, rather than per cell, where *neither* side has one, since then it is true
-  of every cell equally and the per-cell wording would be false.
+  of every cell equally and the per-cell wording would be false. The **weights** joined those two
+  as a per-cell fact a round later, for the same reason the surface did: the identity line's
+  `weights` is a run-wide set, and two runs assigning the same two digests to opposite cells - one
+  model at two contexts, a tag re-pulled between the runs - compare equal there while pairing
+  results from different weights. And a row label carries its **backend**, since a cell is keyed by
+  one and an ollama tag may be the same string as a Claude alias.
 - **Absent is not the same as deliberately null**, which the same round caught. A Claude row's
   `model_digest` is null *on purpose* - an alias resolved inside a client this bench does not own
   has no content address - and folding that into `unrecorded` labelled every current run containing

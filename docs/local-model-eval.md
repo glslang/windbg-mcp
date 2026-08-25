@@ -537,8 +537,10 @@ lines that appear when something did move were checked against a log doctored to
   follows. It is a floor: `expect` can move too, and a pairing predicate reading only the prompt
   catches the change the frozen suite was about and not every change there could be.
 - **Everything else is named.** The build, the weights, the harness and the suite go *above* the
-  table, being run-wide; the **surface fingerprint and the served window** go *beneath* it, being
-  per cell. `surface.client` is a label — `min` was 11 tools and 8,654 B before item 41 and 7,732 B
+  table, being run-wide; the **surface fingerprint, the served window and the weights** go
+  *beneath* it, being per cell — the identity block's `weights` line is a run-wide set, and a set
+  cannot say which digest answered which cell, so two runs assigning the same two digests to
+  opposite cells compare equal there. `surface.client` is a label — `min` was 11 tools and 8,654 B before item 41 and 7,732 B
   after — so pairing on the label alone would present a surface change as a model comparison, which
   is the very intervention a rerun exists to measure. The fingerprint is a **digest of the surface
   as it went over the wire**, not its length: a byte count moves for almost any prose edit and for
