@@ -1591,33 +1591,56 @@ def cell_facts(log_records):
         cell_id = (record.get("backend"), record.get("model"), record.get("num_ctx"),
                    surface.get("client"))
         entry = facts.setdefault(cell_id, {"surface": set(), "window": set()})
-        if surface.get("digest"):
-            # **The digest when there is one**, because a count and a byte length are not a
-            # fingerprint: a same-length reword, or an allowlist swap of equal size, leaves both
-            # unchanged while the model is handed different tools. Older logs have no digest, and
-            # for those the count and length are what there is - a floor, said as one.
-            entry["surface"].add(f"{surface.get('tools')} tools, {surface['digest']}")
-        elif surface.get("tools") is not None or surface.get("bytes") is not None:
-            # A cell-failure note carries the client and nothing else, so it contributes no
-            # fingerprint rather than an `unrecorded` one.
-            entry["surface"].add(f"{surface.get('tools')} tools, {surface.get('bytes')} B "
-                                 f"(no digest recorded)")
+        if surface.get("tools") is not None or surface.get("bytes") is not None:
+            # **Kept as its parts, not as a rendered string.** A cell-failure note carries the
+            # client and nothing else, so it contributes nothing rather than an `unrecorded`
+            # fingerprint - and the comparison below has to be able to fall back to the count and
+            # the length when one side predates the digest, which a pre-rendered string forbids.
+            entry["surface"].add((surface.get("tools"), surface.get("bytes"),
+                                  surface.get("digest")))
         if record.get("served_context") is not None:
             entry["window"].add(str(record["served_context"]))
     return facts
 
 
+def surface_text(fingerprints):
+    """A cell's surface as a line — the digest where there is one, the length where there is not."""
+    return ", ".join(f"{tools} tools, {digest or f'{size} B'}"
+                     for tools, size, digest in sorted(fingerprints, key=str))
+
+
 def moved_cells(old_facts, new_facts):
-    """Per cell, which of [`cell_facts`] differ between two runs — `{cell: {name: (old, new)}}`."""
+    """Per cell, what differs between two runs — `{cell: [(name, old, new, kind)]}`.
+
+    `kind` is `moved` or `unverifiable`, and the second exists because **adopting the digest is not
+    a surface change**. A log written before that field carries a tool count and a byte length; one
+    written after carries a digest as well. Comparing whatever each side happens to have would make
+    every cell of the first post-digest comparison read as moved, on nothing but a telemetry format
+    — the same false-positive class as the sentence in [`cell_facts`], pointed the other way. So
+    the two are compared on what they share, and a match there with a digest missing on one side is
+    reported as *unverifiable* rather than as agreement: a byte count cannot see a same-length
+    reword, which is the whole reason the digest exists.
+    """
     moved = {}
     for cell in sorted(set(old_facts) | set(new_facts)):
         before, after = old_facts.get(cell, {}), new_facts.get(cell, {})
-        for name in ("surface", "window"):
-            was, now = sorted(before.get(name) or []), sorted(after.get(name) or [])
-            if was and now and was != now:
-                # Only when both runs recorded one: a log written before a field existed has
-                # nothing to say about it, and reporting that as a move would be an invention.
-                moved.setdefault(cell, {})[name] = (", ".join(was), ", ".join(now))
+        was, now = before.get("surface") or set(), after.get("surface") or set()
+        if was and now:
+            # Only when both runs recorded one: a log with nothing to say about a field cannot
+            # have moved in it, and reporting that as a move would be an invention.
+            both_digested = all(f[2] for f in was | now)
+            comparable_was = was if both_digested else {(f[0], f[1]) for f in was}
+            comparable_now = now if both_digested else {(f[0], f[1]) for f in now}
+            if comparable_was != comparable_now:
+                moved.setdefault(cell, []).append(
+                    ("surface", surface_text(was), surface_text(now), "moved"))
+            elif not both_digested:
+                moved.setdefault(cell, []).append(
+                    ("surface", surface_text(was), surface_text(now), "unverifiable"))
+        was, now = sorted(before.get("window") or []), sorted(after.get("window") or [])
+        if was and now and was != now:
+            moved.setdefault(cell, []).append(
+                ("window", ", ".join(was), ", ".join(now), "moved"))
     return moved
 
 
@@ -1727,8 +1750,13 @@ def print_compare(order, rows, identities, moved_by_cell, old_path, new_path):
         print("\ncells where something besides the question moved:")
         for cell, moved in moved_by_cell.items():
             label = f"{(cell[1] or '?')[:24]} {str(cell[2] or 'dflt'):>6} {cell[3] or '?'}"
-            for name, (was, now) in sorted(moved.items()):
-                print(f"  {label:<40} {name} {was} -> {now}")
+            for name, was, now, kind in moved:
+                if kind == "unverifiable":
+                    print(f"  {label:<40} {name} {was} -> {now} (same on what both runs "
+                          f"recorded; only one has a digest, so a same-length edit cannot be "
+                          f"ruled out)")
+                else:
+                    print(f"  {label:<40} {name} {was} -> {now}")
 
 
 def series(log_paths, tasks_file, out_path):
