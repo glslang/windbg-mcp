@@ -29,8 +29,8 @@ the narrowed cells against that fix and finding two of the same names arriving b
 corrected in review (2026-08-24; **both have since landed** — item 42 the same day, item 43 on
 2026-08-25, once #217 had shown that its "`taught` is zero" premise was false), and item 44 from
 the first run those two made possible: five draws of the narrowed cells, where a task failing in
-all twenty-five turned out to be failing at its own wording (2026-08-25). Each item notes its repo,
-why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
+all twenty-five turned out to be failing at its own wording (2026-08-25, **landed** the same day).
+Each item notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
 Items are roughly ordered by how soon they're worth doing, within each cluster. **Item 10 has
@@ -54,6 +54,9 @@ attach whose target never dials in has no bound at all, which is the constraint 
 **Item 42 has landed** (2026-08-24) and is kept for the same reason as item 41 above: what it built
 is the capability to repeat a cell, and what it deliberately did not run is the A/B that motivated
 it — plus one of its own sentences turned out to be false on this bench, which the entry now records.
+**Item 44 has landed** (2026-08-25) and is kept because its own proposed wording was not the wording
+that shipped: closing the reading it identified needed the prompt to say what the answer is *not*,
+which is a judgement nothing has measured, and the entry now records what would settle it.
 
 ## 1. [win-kexp] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -2127,9 +2130,9 @@ prior exposure cannot be excluded at one draw per cell. Separating memorised-fro
 guessed-by-convention is item 42's machinery (the same cell repeated with that sentence varied),
 not this item's.
 
-## 44. [windbg-mcp] `arm64_pc` is answered the way it reads, not the way it is keyed
+## 44. [windbg-mcp] `arm64_pc` is answered the way it reads, not the way it is keyed — **done** (2026-08-25)
 
-The eval's `arm64_pc` task asks for "the value of the `pc` register at the point of the crash" on
+The eval's `arm64_pc` task asked for "the value of the `pc` register at the point of the crash" on
 the ARM64 sample, and its key is `0xfffff8013c65bca8`. **Across the 35 runs of it in the three logs
 still on disk, no model on any surface gave that answer, and 32 gave `0x0000019e7b820000`** — the
 bug check's first parameter. Five draws of five models on `min` (2026-08-25) is `5n` in every row,
@@ -2157,18 +2160,49 @@ question the way a person would, and the key wants the register's literal value 
 is not the crash. **A task passed once in about fifty attempts is measuring its own wording**, not
 the surface it was written to probe.
 
-**What would close it.** Reword the prompt so one reading survives - "what value does `pc` hold in
-the crash context, as the debugger reports it" - rather than widening `expect` to accept both,
-which is the tempting fix and the wrong one: the task exists to check that a *narrow* surface can
-reach a register value through `crash_triage` frame 0, and accepting parameter 1 would let it pass
-without that route being taken at all. Check the other five tasks for the same defect while there:
-this one was found by five draws agreeing, and nothing says it is the only one.
+**What landed.** The prompt, not the key: it now asks for "what value the pc register holds in the
+crash context the dump saved - the register's own value as the debugger reports it, not an address
+taken from the bug check's parameters". Widening `expect` to accept parameter 1 stayed rejected for
+the reason above, and re-measuring on the dump gave it a second one this entry had not stated:
+`open_dump`'s summary carries all four parameters, so a key accepting parameter 1 would let the
+task pass off the *opener's* result with neither `registers` nor `crash_triage` called - the exact
+route it exists to check would be the one route not taken.
 
-**Why deferred.** It invalidates comparison with every run published so far - the six-task score is
-in `docs/local-model-eval.md` three times over - so it wants doing at the start of the next run
-rather than between two, and the numbers already published want a line saying which task they were
-scored against. Nothing about the server is wrong here, which is why this is not urgent: the grid's
-*server* findings (items 40, 41, 43, and #217) never depended on this task.
+**The entry's own suggested wording was not enough, and that is a judgement rather than a
+measurement.** "In the crash context, as the debugger reports it" removes the phrase that invites
+the faulting-address reading, but it leaves the reading itself available to a model that believes
+the bug check's parameter *is* the `pc` - which is what 32 of the 35 recorded runs believed. So the
+prompt names what the answer is not. That cannot hand the answer over, and it keeps the tool route
+required; what it costs is that the question now mentions the bug check at all. Nobody has measured
+the shorter wording, and what would settle it is item 42's `draws` on one cell with the sentence
+varied - the same A/B this bench keeps deferring.
 
-**Where it picks up.** `tools/eval_tasks.json`, the `arm64_pc` entry - and note its `note` field is
-what argued `possible_on` should include `min`, which is still true and is not what is wrong.
+**Re-verified before rewriting anything**, since the numbers above were the whole argument and
+were inherited rather than measured here. Both dump readings again, and the log breakdown finer
+than "no model gave that answer": of the 35 runs, **0** gave the key, **32** gave parameter 1, and
+the remaining **3** answered nothing at all - two closing the session and reporting that, one
+empty. So the split is not 33 wrong readings and 2 failures; every run that produced an answer
+produced the same wrong one.
+
+**The other five were checked, and none has it - but the corpus only stretches to four.** The three
+logs are `min` cells, so `unloaded_driver` and `ioctl_decode` have no answers in them at all
+(neither is answerable on that surface); those two were checked by reading the prompt against the
+key. The other three grade **33 of 35** correct each, and all six failures between them are
+non-answers or noise - three that closed the session and said so, one empty, one turn that ran out
+mid-narration, one invented module count - rather than a second reading anything agreed on.
+
+**`driver_blame` is the near miss, and it is what sharpened the rule.** It asks "at what offset into
+that driver did it fault", and the key `0x1654` is frame 7: the address `nt!ExFreePoolWithTag`
+returns to, not an instruction that itself faulted. So the prompt is loose in exactly the way
+`arm64_pc` was - and it is *not* the same defect, because no model takes the other reading: 33 of
+35 give the key, and `crash_triage` calls that frame `faulting_frame`, which is the vocabulary the
+question borrowed in the first place. **A wording defect shows up as agreement on a different
+answer, not as imprecision**, which is the check to run rather than re-reading prompts for rigour.
+Recorded in that task's `note` rather than fixed, so its published numbers stay comparable.
+
+**Where the published numbers stand.** `docs/local-model-eval.md` now says, once and above every
+table, that every score in it was graded against the old wording and is not comparable with a run
+against the new one on this task. The suite `note` in `tools/eval_tasks.json` says the same for
+anyone reading the task file first. Nothing about the server was wrong here, so the grid's *server*
+findings (items 40, 41, 43, and #217) are unaffected, and the next run starts against a question
+with one reading.

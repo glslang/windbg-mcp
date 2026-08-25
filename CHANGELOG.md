@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The eval's `arm64_pc` task asks a question with one reading** (`FOLLOWUPS.md` item 44, which
+  closes it). It asked for "the value of the `pc` register at the point of the crash", which reads
+  as the address whose execution faulted — bug check parameter 1 — rather than as the register's
+  value: across the 35 runs of it in the three logs on disk, **none** gave the key and **32** gave
+  parameter 1. Both are defensible on that dump (`pc` is `nt!KeBugCheck2+0x2e8`, inside the
+  bug-check path the machine reached *after* the fault), so the fix is the question and not the
+  key — widening `expect` to accept parameter 1 would let the task pass off `open_dump`'s summary,
+  where the parameters already are, without the route it exists to check being taken at all. The
+  other five prompts were re-read against their keys at the same time and none has the same
+  defect; `driver_blame`'s `0x1654` is the nearest thing and is recorded in that task's `note`
+  rather than changed, since 33 of its 35 runs give the key. **Scores published before this**
+  — `docs/local-model-eval.md`, three tables over — were graded against the old wording and say so
+  now.
+
 - **The eval's `unserved` column is two numbers, because it was two measurements** (`FOLLOWUPS.md`
   item 43, which closes it). A call naming a tool the client is not served is either `taught` — the
   task *was* answerable on this surface, so nothing about the question required a name off it — or

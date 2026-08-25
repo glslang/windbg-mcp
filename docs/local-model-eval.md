@@ -109,6 +109,16 @@ what the other two measure is what a model does when the tool it wants is not th
 for it anyway, or compute the answer itself — `CTL_CODE` is arithmetic, and a model that knows the
 macro can decode a code with no tool at all.
 
+**One of the six has been reworded since every run on this page** (2026-08-25, `FOLLOWUPS.md`
+item 44). `arm64_pc` used to ask for "the value of the `pc` register at the point of the crash",
+which reads as the address whose execution faulted — bug check parameter 1 — rather than as the
+register's value; it now asks for the register's own value as the debugger reports it, and not for
+an address taken from the bug check's parameters. **Every score below was graded against the old
+wording**, so none of them is comparable with a run against the current one on that task. The other
+five prompts were re-read against their keys at the same time and none has the same defect; what
+the check did find is in each task's `note` in `tools/eval_tasks.json`, and the measurement that
+prompted it is the fourth run below.
+
 ## Grading
 
 Mechanical, and stated so it can be argued with:
@@ -683,9 +693,18 @@ rate; it is the sentence above about fifteen draws. Note also that gemma's twelv
   address, `nt!KeBugCheck2+0x2e8`, so the key is literally right; but that address is inside the
   bug-check path the machine reached *after* the fault, while parameter 1 is the address whose
   execution faulted. A model answering "the pc at the point of the crash" with the faulting address
-  is reading the question the way a person would. `FOLLOWUPS.md` item 44 carries what to do about
-  it; the scores in this document are as-graded, against a task whose wording is what they were
-  measuring.
+  is reading the question the way a person would. **The prompt has since been reworded** (item 44,
+  2026-08-25): it asks for the register's own value as the debugger reports it, and not for an
+  address taken from the bug check's parameters. Widening the key to accept parameter 1 was the
+  tempting fix and the wrong one — `open_dump`'s summary already carries the parameters, so the
+  task would then pass without the route it exists to check, which is a narrow surface reaching a
+  *register* through `crash_triage` frame 0. The scores in this document are as-graded, against
+  the old wording. Re-reading the other five prompts against their keys at the same time found no
+  second instance: `driver_blame` is the only one with any looseness at all — its `0x1654` is the
+  address `nt!ExFreePoolWithTag` returns to rather than one that itself faulted, which is the
+  frame `crash_triage` calls `faulting_frame` — and 33 of its 35 recorded runs give the key, the
+  other two being an empty answer and a closed session. A wording defect shows up as *agreement
+  on a different answer*, and only this task has one.
 
 ## What this does not cover
 
