@@ -949,13 +949,18 @@ stops being what the server reports leaves the suite grading and every model sco
 nothing — a key that has rotted looks exactly like a model that got worse. Each task carries a
 `verify` binding of `(tool, args)` steps to the values expected back, and
 `WINDBG_MCP_TOKEN=<full surface> python3 tools/local_model_eval.py --verify-key` re-reads the lot.
-Four things bite when touching it. **It is a command, not a CI gate**, and that is the decision
+Five things bite when touching it. **It is a command, not a CI gate**, and that is the decision
 rather than an omission: the oracle is `present()`, so a Rust test would need a second copy of
 three rules each learned from a wrong verdict — run it after a `win-kexp` bump, a symbol-path
 change or a new sample. **The binding grounds `expect`, it does not generate it**: two of
 `unloaded_driver`'s three groups are phrasings of a *relation* (`matched: 0` is what "not loaded"
-means), so a run reports each group as `value`, `relation` or `skipped`, and only a group **no**
-step grounds is a failure — that coverage rule is the ratchet, not the pins. **A pin can be too
+means), so a run reports each group as `value`, `relation` or `skipped`. **Which are relational is
+declared (`states`), never inferred** — reading "no pinned value matched" as a relation let a group
+edited to a value the tools do not answer pass, which is a broken key reached through the mode
+meant to catch one — so a group `grounds` claims but nothing renders is a failure, as is a group
+**no** step claims. **The gate is asked per dump**, not once of the host: `docs/smoke-test.md`
+records an engine failing differently per dump, so a host-wide gate stands the ARM64 step down over
+a missing *x64* PDB. **A pin can be too
 tight**: the `pc` fact was first pinned as `registers.32.value`, a position in the ARM64 bank that
 an engine may reorder without the key having rotted, so a `read` path enters a list by name
 (`registers.name=pc.value`) as well as by index. And **`tools/eval_tasks_v1.json` carries no

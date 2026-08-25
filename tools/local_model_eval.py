@@ -501,12 +501,20 @@ def prompt_renders_binding(task):
 
 
 def gates_open(drive, session_id):
-    """Which of [`GATES`] this host can satisfy, asked of the engine rather than assumed.
+    """Which of [`GATES`] this **session's target** satisfies, asked of the engine, not assumed.
 
     One probe today, and it is the one the suite needs: whether `nt` resolved to a **PDB**, which
     is what a walk through its types needs. `tests/mcp_smoke.rs` asks the same question the same
     way (`engine_resolves_kernel_symbols`), and both PDB-backed states count — `dia` is the same
     PDB read through another API, and the server treats them alike.
+
+    **Per dump, not per host, and this repo has the measurement.** Each sample has its own `nt` with
+    its own PDB identity, so a host can resolve one and not another: `docs/smoke-test.md` records an
+    engine that "fails *differently per dump*" — the ARM64 sample reading nothing while the x64 one
+    gave up a module base. A gate taken once off the first opener and reused would therefore stand
+    the ARM64 frame-0 step down because an *x64* PDB was missing, and report success without having
+    checked the route `arm64_pc`'s `possible_on: min` rests on. The Rust tier asks per session for
+    the same reason; so does this.
     """
     out = drive.mcp("tools/call", {"name": "modules",
                                    "arguments": {"session_id": session_id, "filter": "nt"}})
@@ -516,26 +524,31 @@ def gates_open(drive, session_id):
 
 
 def run_step(drive, step, session_id):
-    """One step of a binding: call the tool, hand back its two halves and what went wrong.
+    """One step of a binding: call the tool, hand back the whole result and what went wrong.
 
-    Returns `(structured, text, error)`. A tool that fails is an `error` rather than an exception,
-    because the interesting failure here is a *fact* that has moved and the run must reach the
-    rest of the task's pins to say which.
+    Returns `(result, text, error)`. A tool that fails is an `error` rather than an exception,
+    because the interesting failure here is a *fact* that has moved and the run must reach the rest
+    of the task's pins to say which.
+
+    **The result comes back even when the call failed**, which is not tidiness: an opener can
+    register a session and *then* fail, and the only handle that can reach that target is in
+    `structuredContent.error.session_id`. Discarding it left the caller unable to release a worker
+    holding a dump — and repeated runs against the same drift would then meet the four-session cap
+    instead of reporting the drift. `local_model_drive.opened_session` already reads both places
+    that handle can be, so the caller uses it rather than a second copy of the rule.
     """
     args = {k: (session_id if v == "$session" else v)
             for k, v in (step.get("args") or {}).items()}
     try:
         out = drive.mcp("tools/call", {"name": step["tool"], "arguments": args})
     except Exception as e:  # noqa: BLE001 - a transport failure is this step's result
-        return None, "", f"transport error: {e}"
+        return {}, "", f"transport error: {e}"
     if "error" in out:
-        return None, "", f"protocol error: {json.dumps(out['error'])[:200]}"
+        return {}, "", f"protocol error: {json.dumps(out['error'])[:200]}"
     result = out.get("result") or {}
     text = "\n".join(block.get("text") or "" for block in (result.get("content") or [])
                      if block.get("type") == "text")
-    if result.get("isError"):
-        return None, text, f"the tool refused: {text[:200]}"
-    return result.get("structuredContent") or {}, text, None
+    return result, text, f"the tool refused: {text[:200]}" if result.get("isError") else None
 
 
 def check_pins(step, structured, text):
@@ -546,6 +559,12 @@ def check_pins(step, structured, text):
     is not `"227"` the string, and a field renamed is a `KeyError` rather than a pass. `has` is
     [`present`] over the rendered text, for a tool with no structured half to name a field in; it
     is weaker on purpose and is used exactly once, which is once more than nothing would be.
+
+    A `has` value is normalised as well as the text, which `matches()` does not do to an `expect`
+    alternative — the asymmetry is deliberate and narrow. A pin asks "does the server still print
+    this", so both sides being spelled the same way is what makes it answerable; the tie back to
+    *grading* is [`grounding`], and that one compares a raw alternative against a normalised value
+    exactly as `matches()` does.
     """
     rows = []
     for pin in step.get("pin") or []:
@@ -570,84 +589,117 @@ def check_pins(step, structured, text):
     return rows
 
 
-def grounding(task, rendered_by_step, ran):
+def grounding(task, pinned_by_step, ran):
     """How each `expect` group is tied to the facts this task pinned, and what is missing.
 
-    The tie is checked through [`present`], the same oracle that decides pass or fail, so a group
-    reported `value` is one a model repeating the server's own answer would still be graded
-    correct on. A group nothing renders is reported **relation**, which is not a hole: the fact
-    behind it is pinned exactly - `matched: 0` is what "not loaded" is a phrasing *of* - and what
-    cannot be checked mechanically is only the phrasing. A group whose every step stood down at a
-    gate is `skipped`, which has to be its own word: reporting it as a relation would say this
-    host checked something it did not.
+    Two ways a step may claim a group, and **the difference is declared rather than inferred**:
 
-    What *is* a hole is a group no step claims at all, and that is the failure returned here. It
-    is what catches `expect` growing an alternative, or a task being keyed to a new fact, without
-    the binding moving with it.
+    - **`grounds`** — the group is answered by a value the server prints, checked through
+      [`present`], the same oracle that decides pass or fail. A claimed group nothing renders is a
+      **failure**. Inferring this instead was a hole: a group edited to a value the server does not
+      say (`ACCESS_VIOLATION` for a bug check that is `KERNEL_MODE_HEAP_CORRUPTION`) simply
+      reported "relation" and passed, which is a broken key reached through the very mode meant to
+      catch one.
+    - **`states`** — the group is a phrasing of a *relation* over the pinned facts rather than a
+      string the server prints: `unloaded_driver`'s "not loaded" is what `matched: 0` *means*. That
+      is not a hole either, because the fact behind it is pinned exactly and only the phrasing is
+      beyond a mechanical check — but it has to be **declared per group**, so the exemption covers
+      the two groups that earn it and cannot silently spread to the rest.
+
+    A group whose claiming steps all stood down at a gate is `skipped`, which has to be its own
+    word: reporting it as anything else would say this host checked something it did not.
+
+    And a group **no** step claims at all is the failure that makes this a ratchet: `expect` cannot
+    grow an alternative the binding does not fetch, and a new task cannot arrive unpinned.
     """
     expect = task.get("expect") or []
     claimed = {}
     for index, step in enumerate(task.get("verify") or []):
-        for group in step.get("grounds") or []:
-            if not isinstance(group, int) or not 0 <= group < len(expect):
-                return None, [f"step {index + 1} grounds group {group}, "
-                              f"which `expect` has not got"]
-            entry = claimed.setdefault(group, {"values": [], "ran": False})
-            entry["values"].extend(rendered_by_step.get(index, []))
-            entry["ran"] = entry["ran"] or index in ran
+        for kind in ("grounds", "states"):
+            for group in step.get(kind) or []:
+                if not isinstance(group, int) or not 0 <= group < len(expect):
+                    return None, [f"step {index + 1} {kind} group {group}, "
+                                  f"which `expect` has not got"]
+                entry = claimed.setdefault(group, {"values": [], "value_ran": False,
+                                                   "relation_ran": False})
+                if kind == "states":
+                    entry["relation_ran"] = entry["relation_ran"] or index in ran
+                    continue
+                entry["value_ran"] = entry["value_ran"] or index in ran
+                if index in ran:
+                    entry["values"].extend(pinned_by_step.get(index, []))
     missing = [i for i in range(len(expect)) if i not in claimed]
     if missing:
         return None, [f"`expect` group {i} ({'|'.join(expect[i])}) is grounded by no step"
                       for i in missing]
-    how = {}
-    for group, entry in claimed.items():
-        if not entry["ran"]:
-            how[group] = "skipped"
-        elif any(present(alt, value) for alt in expect[group] for value in entry["values"]):
-            how[group] = "value"
-        else:
+    how, failures = {}, []
+    for group, entry in sorted(claimed.items()):
+        if entry["value_ran"]:
+            if any(present(alt, value) for alt in expect[group] for value in entry["values"]):
+                how[group] = "value"
+            else:
+                # The key says one thing and the server another. Named as the key's problem, since
+                # the pins themselves all held: this is what the group was edited to, against what
+                # the tools actually answer.
+                failures.append(f"`expect` group {group} ({'|'.join(expect[group])}) is in nothing "
+                                f"this task pinned - the server answers "
+                                f"{', '.join(sorted(set(entry['values']))) or '(nothing)'}")
+        elif entry["relation_ran"]:
             how[group] = "relation"
-    return how, []
+        else:
+            how[group] = "skipped"
+    return how, failures
 
 
-def verify_task(drive, task, symbols):
+def verify_task(drive, task):
     """One task's binding, against the live server. Returns `(failures, notes)`.
 
     Opens its own target rather than inheriting a session, which is not tidiness: `crash_triage`'s
     stack is the crash context on a *freshly opened* dump and otherwise whatever the session has
     selected, and the `arm64_pc` fact is read off frame 0.
+
+    The gate is probed on **this task's own session**, once and only if a step needs it — see
+    [`gates_open`] for why it cannot be a property of the host.
     """
     failures, notes, session_id = [], [], None
-    rendered_by_step, ran = {}, set()
-    for complaint in prompt_renders_binding(task):
-        failures.append(complaint)
+    pinned_by_step, ran, gates = {}, set(), None
+    failures.extend(prompt_renders_binding(task))
     try:
         for index, step in enumerate(task.get("verify") or []):
             need = step.get("needs")
-            if need and not symbols.get(need):
-                notes.append(f"    SKIPPED {step['tool']}: {GATES[need]}")
-                continue
-            structured, text, error = run_step(drive, step, session_id)
+            if need:
+                if gates is None and session_id:
+                    gates = gates_open(drive, session_id)
+                    notes.extend(f"    gate {name}: {'open' if open_ else 'closed'}"
+                                 for name, open_ in sorted(gates.items()))
+                if not (gates or {}).get(need):
+                    notes.append(f"    SKIPPED {step['tool']}: {GATES[need]}")
+                    continue
+            result, text, error = run_step(drive, step, session_id)
+            if step.get("session") == "open":
+                # **Read before the error is acted on**, through the driver's own helper: an opener
+                # that registered a session and then failed reports the only handle that can reach
+                # it inside the error, and dropping it leaves a worker holding a dump.
+                session_id = drive.opened_session(result) or session_id
             if error:
                 failures.append(f"{step['tool']}: {error}")
                 continue
-            if step.get("session") == "open":
-                session_id = (structured or {}).get("session_id")
-                if not session_id:
-                    failures.append(f"{step['tool']}: opened no session to route the rest to")
-                    break
+            if step.get("session") == "open" and not session_id:
+                failures.append(f"{step['tool']}: opened no session to route the rest to")
+                break
             ran.add(index)
-            rendered_values = []
-            for read, ok, detail, value in check_pins(step, structured, text):
+            pinned = []
+            for read, ok, detail, value in check_pins(step, result.get("structuredContent") or {},
+                                                      text):
                 if ok:
-                    rendered_values.append(rendered(value))
+                    pinned.append(rendered(value))
                 else:
                     failures.append(f"{step['tool']} {read}: {detail}")
-            rendered_by_step[index] = rendered_values
+            pinned_by_step[index] = pinned
     finally:
         if session_id:
             drive.end_sessions([session_id])
-    how, gaps = grounding(task, rendered_by_step, ran)
+    how, gaps = grounding(task, pinned_by_step, ran)
     failures.extend(gaps)
     if how:
         by_kind = {}
@@ -672,6 +724,19 @@ def verify_key(tasks_file):
     tasks = suite["tasks"]
     print(f"verifying {suite.get('suite', tasks_file)} against {drive.MCP_URL}")
     print("MCP revision negotiated:", drive.handshake())
+    try:
+        return verify_against(drive, suite, tasks)
+    finally:
+        # **The transport session is this run's too.** The revision spoken here mints an
+        # `Mcp-Session-Id`, and a run that simply stops leaves it resident until a whole grace
+        # passes with no traffic - so repeated verifications on one credential pile them up, each
+        # new request renewing the lease that would have swept them. Every path closes it,
+        # including the surface refusal below, which happens after the handshake.
+        drive.close_transport_session()
+
+
+def verify_against(drive, suite, tasks):
+    """The verification itself, inside the caller's transport cleanup. Returns an exit code."""
     served = {t["name"] for t in drive.mcp("tools/list")["result"]["tools"]}
     wanted = {step["tool"] for t in tasks for step in t.get("verify") or []}
     if wanted - served:
@@ -687,29 +752,10 @@ def verify_key(tasks_file):
               f"the facts they are graded against")
         return 1
 
-    # One probe for the run, on a target of its own: every gated step asks the same question of
-    # the same host, and asking it per task would be the same answer fetched six times.
-    probe = None
-    symbols = {gate: False for gate in GATES}
-    opener = next((step for t in tasks for step in t["verify"] if step.get("session") == "open"),
-                  None)
-    if opener:
-        structured, _, error = run_step(drive, opener, None)
-        probe = (structured or {}).get("session_id")
-        if error or not probe:
-            raise SystemExit(f"could not open {opener['args']['path']} to probe this host: "
-                             f"{error or 'no session'}")
-        try:
-            symbols = gates_open(drive, probe)
-        finally:
-            drive.end_sessions([probe])
-    for gate, open_ in sorted(symbols.items()):
-        print(f"  gate {gate}: {'open' if open_ else 'closed - steps needing it stand down'}")
-
     failed = {}
     for task in tasks:
         print(f"\n  {task['id']}")
-        failures, notes = verify_task(drive, task, symbols)
+        failures, notes = verify_task(drive, task)
         for note in notes:
             print(note)
         for failure in failures:

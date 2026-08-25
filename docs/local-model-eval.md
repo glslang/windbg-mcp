@@ -209,14 +209,15 @@ WINDBG_MCP_URL=http://127.0.0.1:8766/ WINDBG_MCP_TOKEN=<the full surface's token
 ```
 
 It opens each dump itself, calls the tools a model would call, and checks every pinned value.
-Five things it catches, each of which is a way the key rots without anything looking wrong:
+Six things it catches, each of which is a way the key rots without anything looking wrong:
 
 | What moved | How it reads |
 | --- | --- |
 | a fact — the dump now has 228 modules | `modules loaded: answered 227, pinned 228` |
 | a field — the answer's shape changed under it | `crash_triage bug_check.code: no such field in the answer` |
 | a question — the prompt was pointed at another sample | `the prompt names …082126-7015-01.dmp, which no step of the binding opens` |
-| a key — `expect` grew an alternative nothing fetches | `group 2 (0xfffff80561281654) is grounded by no step` |
+| a key, widened — `expect` grew an alternative nothing fetches | `group 3 (0xfffff8033d680000) is grounded by no step` |
+| a key, wrong — a group edited to something the server does not say | `group 1 (access_violation) is in nothing this task pinned - the server answers 0x13a, kernel_mode_heap_corruption` |
 | a tool — `decode_ioctl` stopped saying `METHOD_NEITHER` | `decode_ioctl @text has 'METHOD_NEITHER': not in the answer's text` |
 
 **The binding carries the inputs, which is the half the suite used to lack.** `expect` says what an
@@ -239,18 +240,25 @@ of the ARM64 bank, and a pin on 32 would fail on an engine that reordered the ba
 answering the question the task asks — which would be a false alarm about a key that had not
 rotted.
 
-**`grounds` ties a pin to the group models are graded on**, through that same `present()`, and the
-run says which kind of tie each one is:
+**A step ties a pin to the group models are graded on, and says *how* — declared, not inferred.**
 
-- **`value`** — a model repeating the server's own answer would be graded correct on that group.
-- **`relation`** — the group is a phrasing of a relation over pinned facts rather than a string the
-  server prints. `unloaded_driver`'s "not loaded" is what `matched: 0` *means*; the fact is pinned
-  exactly, and only the phrasing is beyond a mechanical check.
-- **`skipped`** — every step grounding it stood down at a gate on this host, which has to be its
-  own word: calling it a relation would claim a check this run did not make.
+- **`grounds`** — the group is answered by a value the server prints, checked through that same
+  `present()`. A claimed group nothing renders is a **failure**, which is the row above: an
+  `expect` edited to a value the tools do not answer is a broken key, and every model would be
+  graded wrong by it.
+- **`states`** — the group is a phrasing of a *relation* over the pinned facts rather than a string
+  the server prints. `unloaded_driver`'s "not loaded" is what `matched: 0` *means*. That is not a
+  hole — the fact behind it is pinned exactly, and only the phrasing is beyond a mechanical check —
+  but it is declared **per group**, so the exemption covers the two that earn it and cannot spread.
+- **`skipped`** — every step claiming it stood down at a gate on this host, which has to be its own
+  word: calling it anything else would claim a check this run did not make.
 
-A group **no** step grounds is a failure, and that is the ratchet: `expect` cannot grow a fact the
-binding does not fetch, and a new task cannot arrive unpinned.
+Inferring `relation` from "no pinned value matched" was the first cut, and it was a hole review
+found: a group edited to `ACCESS_VIOLATION` for a bug check that is `KERNEL_MODE_HEAP_CORRUPTION`
+simply reported `relation` and passed — a broken key reached through the mode meant to catch one.
+
+A group **no** step claims is a failure too, and that is the ratchet: `expect` cannot grow a fact
+the binding does not fetch, and a new task cannot arrive unpinned.
 
 **Which corpus is asserted, said rather than implied.** The run names the dumps it re-read and then
 names the ones it did not: `answer_key` is prose, nothing reads it — `matches()` grades from
@@ -262,7 +270,10 @@ covering more or less than the suite.
 and `arm64_pc`'s frame 0 — and on a host whose engine resolves no PDB a stack walk gives back
 frames made of the bug check's own parameters. Those print `SKIPPED` with the reason, exactly as
 the Rust tier does; [`smoke-test.md`](./smoke-test.md) has the line and the measurement behind it,
-and this mode deliberately keeps no second copy of either. `arm64_pc` is asserted through **both**
+and this mode deliberately keeps no second copy of either. **The gate is asked of each task's own
+dump**, not once of the host: that same document records an engine failing *differently per dump*,
+so a gate taken off the first opener could stand the ARM64 step down because an x64 PDB was
+missing, and report success without checking the route `arm64_pc` depends on. `arm64_pc` is asserted through **both**
 routes — `registers`, which needs nothing, and frame 0, which does — because frame 0 is the route
 the task's `possible_on: min` depends on and `registers` alone would not be checking it.
 

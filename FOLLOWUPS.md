@@ -2287,6 +2287,14 @@ verifier quietly querying the old one.
   `expect` rather than generating it, and each run reports which groups are tied by `value`, which
   by `relation`, and which were `skipped` at a gate on this host. The relation groups are not a
   hole: the fact behind them is pinned exactly, and only the phrasing is beyond a mechanical check.
+  **But which groups those are has to be declared, not inferred** — a correction review made, and
+  the sharpest finding on the PR. Reading "no pinned value matched" *as* a relation meant a group
+  edited to a value the tools do not answer (`ACCESS_VIOLATION` for a bug check that is
+  `KERNEL_MODE_HEAP_CORRUPTION`) reported `relation` and passed: a broken key, against which every
+  model would be graded wrong, reached through the very mode meant to catch one. So `grounds` is a
+  value claim and **fails** when nothing renders it, `states` is the declared-relational one, and
+  the exemption covers the two groups that earn it rather than spreading to whatever happens not to
+  match.
 - **A second verb, for a tool with no structured half.** `decode_ioctl` answers in prose alone, so
   a binding that could only name a field would have had nothing to say about the one task needing
   no target at all — the cheapest half this entry singled out. `is` is exact typed equality against
@@ -2294,8 +2302,8 @@ verifier quietly querying the old one.
 - **The ratchet is coverage, not the pins.** A group **no** step grounds is a failure, which is what
   stops `expect` growing an alternative the binding does not fetch, and stops a new task arriving
   unpinned. Verified against a deliberately rotted copy of the suite: a moved fact, a renamed
-  field, a repointed prompt, an ungrounded group and a stale text pin all fail, and the clean suite
-  passes.
+  field, a repointed prompt, an ungrounded group, a group edited to something the server does not
+  say, and a stale text pin all fail — six channels — and the clean suite passes.
 
 **And a pin can be too tight.** The first cut pinned the `pc` register as `registers.32.value` —
 its position in the ARM64 bank, which is an engine detail rather than anything the key rests on, so
@@ -2307,6 +2315,22 @@ one it did not: `answer_key` is prose and nothing reads it — `grep` still find
 `matches()` grades from `expect` alone — and it documents `082126-7015-01.dmp`, which no task
 references. Reporting the gap is the honest form of the choice, rather than a test covering more
 than the suite asks or less than the key claims.
+
+**And the gate is per dump, not per host** — the second thing review caught, and this repo already
+had the measurement: `docs/smoke-test.md` records an engine failing *differently per dump*, because
+each sample has its own `nt` with its own PDB identity. A gate probed once off the first opener
+would therefore have stood the ARM64 frame-0 step down because an *x64* PDB was missing, and
+reported success without checking the route `arm64_pc`'s `possible_on: min` rests on. It is asked
+of each task's own session now, as the Rust tier asks it.
+
+**Two lifecycle defects came in with it, both from plumbing this reimplemented rather than reused.**
+An opener that registers a session and *then* fails reports the only handle that can reach it inside
+the error, and the first cut dropped the result on that path — so the target leaked, and repeated
+runs against one drift would have met the four-session cap instead of reporting the drift;
+`local_model_drive.opened_session` already reads both places that handle can be, and is now what
+reads it. And the MCP transport session was never closed, so repeated verifications piled up on the
+listener until the lease grace. Both are the same shape as the accumulation rule in `CLAUDE.md`,
+seen small: a parallel path beside one that already worked.
 
 **Gating: `docs/smoke-test.md` draws that line and this keeps no second copy of it.** Three review
 rounds on [#221](https://github.com/glslang/windbg-mcp/pull/221) were corrections to a second copy
