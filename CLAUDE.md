@@ -920,6 +920,15 @@ and **13 of the remainder named exactly those five**, which is what item 41 then
 metric is still `unserved` rather than "hallucinated", and it still measures the server before it
 measures the model. One call in 61 was a genuine invention, which is the floor.
 
+**It is now two columns, `taught+wanted`** (item 43), split by the task's own `possible_on`: a
+reach off the surface on a task this surface *can* answer against one on a task it cannot. Summed
+they hide each other, which is the whole argument — re-graded, item 41's fix is `4+10 -> 0+6`, an
+elimination of the half it was aimed at rather than a 57% improvement in a total.
+`--grade --assert-no-taught` exits non-zero on a taught call and `wanted` is deliberately not
+assertable. **The split attributes need, not provenance**: an opener's result taught `modules` on
+`unloaded_driver` until #217, and that task is one `min` cannot answer, so those calls are
+`wanted`. Lower bound on advertising, upper bound on need.
+
 **Re-run against item 41** (2026-08-24): unserved calls 14 -> 6, with `debug_batch` going 10 -> 0
 and every name this server was teaching now gone. What that re-run mostly taught is **how easy it
 is to over-read at n=1, in a file that already says so**. Two claims had to be pulled back after

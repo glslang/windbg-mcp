@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **The eval's `unserved` column is two numbers, because it was two measurements** (`FOLLOWUPS.md`
+  item 43, which closes it). A call naming a tool the client is not served is either `taught` — the
+  task *was* answerable on this surface, so nothing about the question required a name off it — or
+  `wanted`, where it was not and the model reached for the capability that would answer it. Summed,
+  they hide each other: re-graded over the two logs on disk, item 41's fix is **4+10 -> 0+6**, an
+  elimination of the half it was aimed at rather than a 57% improvement in a total. `taught` prints
+  its offenders by name and `--grade --assert-no-taught` exits non-zero on one; `wanted` is not
+  assertable, being a property of the task list rather than of this server.
+
 ### Fixed
 
 - **And no *result* names one either, which was the channel nobody had scanned** (`FOLLOWUPS.md`
