@@ -2354,15 +2354,28 @@ service-image warning already names in `CLAUDE.md`. Recording it is strictly bet
 nothing and is not sufficient; a build SHA would be, and that means deciding whether this server
 reports one. That decision is the item, not the two lines that record what is already there.
 
-**What would close it.** Identity fields on every record - model digest, server version (or SHA),
-suite id - and a **compare mode** over two logs: pair cells by `(backend, model, ctx, surface,
-task)`, print the two distributions side by side, and **name what differs in the run identity
-above the table**. That last clause is the whole value, and it is not a nicety: this repo has three
-times read a moved aggregate as a controlled result (items 42 and 43, and twice in
-[#212](https://github.com/glslang/windbg-mcp/pull/212)), and every one of those was a *composition*
-error - the callers changed and the total held. A comparison that states its own uncontrolled
-variables is the only version of this tool worth having, because the arithmetic is easy and the
-judgement it invites is what keeps going wrong.
+**What would close it.** Identity fields on every record - model digest where one exists, server
+version (or SHA), suite id - and a **compare mode** over two logs, with two rules that are not the
+same rule.
+
+**Pairing refuses at the task, it does not annotate.** A cell pairs on `(backend, model, ctx,
+surface, task)`, but a task id is not the question: `arm64_pc` has the same id in
+`tools/eval_tasks_v1.json` and `tools/eval_tasks.json` and a materially different prompt, so
+pairing on id would put two distributions side by side that #220 established are not comparable -
+and would be *weaker than the grader already is*, since `usable()` refuses such a record outright.
+The predicate for this already exists and has a home: `stale_prompt`, split out of `usable` in
+#220 so the reason could be named rather than restated. A compare mode reuses it and renders that
+row as incomparable with the reason, at the row rather than in a header - which is the same
+principle as the `UNCOUNTED` line beside it. (`expect` can move too; a pairing predicate that
+reads only the prompt is a floor.)
+
+**The run-identity line is for what is left**, and that is its actual job: the uncontrolled
+variables that are *not* the question - model weights, server build, served window. Naming them
+above the table is not a nicety, because this repo has three times read a moved aggregate as a
+controlled result (items 42 and 43, and twice in
+[#212](https://github.com/glslang/windbg-mcp/pull/212)), and every one was a *composition* error -
+the callers changed and the total held. But a note is the right instrument only for a variable a
+reader can weigh. A changed question is not one of those; it blocks the comparison.
 
 **And the reporting is the other half.** `docs/local-model-eval.md` accumulates a prose section per
 run, which reads well and cannot be diffed: the three tables in it measure three different servers,
