@@ -2261,7 +2261,8 @@ the unasserted one.
 **What would close it.** A table-driven test in the debugger tier over the facts the tasks depend
 on. It is cheap in the way the rest of that tier is not: no model, no ollama, no listener, no
 grid — `open_dump`, `crash_triage`, `registers`, `modules` and `decode_ioctl` against dumps the
-tier already opens, in seconds.
+tier already opens, in seconds. The `0x22200B` half is cheaper still and needs no target at all,
+which is why that tier already uses `decode_ioctl` as its pure-tool fixture.
 
 **The design question it must not skip is where the facts live**, because the key is not in a form
 a test can consume. `answer_key` is one prose string per dump ("x64, 0x13a
@@ -2275,46 +2276,28 @@ assertions are the easy half.
 **And say which corpus is being asserted**, because the two disagree: `082126-7015-01.dmp` is in
 `answer_key` and no task references it, so a test driven off the key covers a dump the eval never
 asks about, while one driven off `tasks` covers less than the key claims. Neither is wrong; a test
-that has not chosen is.
+that has not chosen is. It also changes what has to stand down: the key's two process names
+(`mm_exploit_v5.exe`, `powershell.exe`) sit behind the `_EPROCESS` read and no task keys on one.
 
-**Gating splits three ways, and this entry has now been wrong in both directions.** The first
-draft asserted a symbol gate over all of it, by analogy with the rest of the tier rather than from
-which facts read a target; the correction then removed it wholesale. Review was right both times
-([#221](https://github.com/glslang/windbg-mcp/pull/221)) and neither answer is the one the code
-supports:
+**Gating: `docs/smoke-test.md` already draws that line, and this entry deliberately does not draw
+it again.** Which reads survive a host that resolves no symbols, which do not, and the measurement
+behind the distinction all live there. Three review rounds on this entry
+([#221](https://github.com/glslang/windbg-mcp/pull/221)) were corrections to a *second copy* of it
+kept here — first too wide, then too narrow — which is the argument for keeping none. Read it
+there when implementing this, and do not restate it.
 
-- **No target at all.** The four `0x22200B` fields — which is why that tier already uses
-  `decode_ioctl` as its pure-tool fixture.
-- **No gate.** The module counts and the 26 unload records come out of the dump's own module list,
-  which `docs/smoke-test.md` says a host resolving nothing still reads and which
-  `tests/mcp_smoke.rs` already asserts with no symbol probe in front of it. Same for `pc` read
-  through `registers`: that is the saved context, not a walk.
-- **Gated on both probes.** `pc` through `crash_triage` **frame 0**, and the
-  `MessageManager+0x1654` attribution. `assert_driver_crash_names_its_driver` stands down unless
-  *both* `engine_reads_target_memory` and `engine_resolves_kernel_symbols` pass, and the
-  measurement behind it is why: with `_NT_SYMBOL_PATH` pointed at an empty directory the ARM64
-  sample "reads nothing at all", while the x64 one "gives up a module base and then walks a stack
-  of the bug check's own parameters — neither is an answer, and only one of them looks like a
-  failure".
-
-**That last clause is what makes the gate non-optional on the stack half.** An ungated frame-0
-assertion on a symbol-poor host does not fail; it compares against a plausible wrong stack. And it
-lands on this suite in particular: `arm64_pc` claims `possible_on: min` *because* frame 0 carries
-the `pc`, a `min` client having no `registers`. So the eval's narrow-surface route to that fact is
-precisely the gated one, and the ungated route is the one `min` cannot take — a test that asserts
-only through `registers` is not checking the route the task depends on.
-
-**And the corpus choice moves with it.** Asserting the tasks still needs the gate for frame 0;
-asserting `answer_key` needs it for the two process names as well (`mm_exploit_v5.exe`,
-`powershell.exe`), which the `_EPROCESS` read is behind and which no task keys on.
-
-**One fragility worth writing down while it is in view.** `arm64_pc` claims `possible_on: min`
-because `crash_triage` frame 0 carries the `pc`. That holds on a **freshly opened** dump, which is
-what every cell does — but `crash_triage`'s own contract is that its stack is the target's default
-context only when `!analyze` ran to completion, and otherwise whatever the session has selected. So
-the claim is true for the eval and is not true in general, and a test asserting it should open the
-dump rather than inherit a session. Measured 2026-08-25 with `analyze: false` on a fresh open:
-frame 0 is `nt!KeBugCheck2+0x2e8`, the same address `registers` reports.
+**What that file cannot tell you is where its line falls on this suite, and for `arm64_pc` it falls
+awkwardly.** The task claims `possible_on: min` *because* `crash_triage` frame 0 carries the `pc` —
+a `min` client has no `registers`. Frame 0 is on the standing-down side of that file's line and
+`registers` is not, so **a test asserting this fact through `registers` alone would not be checking
+the route the task depends on**, and the route it does depend on is the one that goes quiet on a
+symbol-poor host. Frame 0 carries a second condition besides: it is the crash context only on a
+**freshly opened** dump — what every cell does, but not `crash_triage`'s general contract, whose
+stack is the default context only when `!analyze` ran to completion and otherwise whatever the
+session has selected. So a test here opens the dump rather than inheriting a session, asserts
+through frame 0 as well as `registers`, and takes that file's gate on the frame-0 half. Measured
+2026-08-25 with `analyze: false` on a fresh open: frame 0 is `nt!KeBugCheck2+0x2e8`, the address
+`registers` reports.
 
 **Why deferred.** Nothing is wrong today — all three dumps were re-read on 2026-08-25 and every
 fact the tasks depend on still holds, which is what makes this protection against future drift
