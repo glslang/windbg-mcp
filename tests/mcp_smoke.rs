@@ -4184,6 +4184,7 @@ fn a_raw_execution_control_command_moves_the_target_instead_of_wedging_the_sessi
         TARGET_STEP,
     );
 
+    let mut outputs: Vec<String> = Vec::new();
     for command in ["t", "p", "g"] {
         let out = server.tool_text(
             "execute",
@@ -4214,10 +4215,22 @@ fn a_raw_execution_control_command_moves_the_target_instead_of_wedging_the_sessi
              output was `{out}`; `registers` now answers {after}; the debugger's last event was \
              `{last}`"
         );
+        outputs.push(format!("`{command}` -> {out:?}"));
     }
 
     // And the same property through the typed tool, which is what a caller reaches for next.
-    let stop = server.tool_data("go", json!({ "session_id": &session }), TARGET_STEP);
+    //
+    // Not `tool_data`: its refusal quotes the debugger's error and nothing around it, and what
+    // makes a failure here readable is the state the three commands above left behind.
+    let where_ = debugger_state(&mut server, &session);
+    let stopped = server.call_tool("go", json!({ "session_id": &session }), TARGET_STEP);
+    assert!(
+        !is_tool_error(&stopped),
+        "`go` failed after three raw execution-control commands, each of which left the session \
+         answering `registers`. Their outputs were {outputs:?}. The session held {where_}. `go` \
+         answered {stopped}"
+    );
+    let stop = &stopped["result"]["structuredContent"];
     assert_eq!(
         stop["timed_out"], false,
         "a `go` that reached its breakpoint must not report a bound it never hit: {stop}"
@@ -4236,9 +4249,23 @@ fn a_raw_execution_control_command_moves_the_target_instead_of_wedging_the_sessi
 
 /// `.lastevent`, or whatever came back instead — for a failure message, never for an assertion.
 fn last_event(server: &mut Server, session: &str) -> String {
+    raw(server, session, ".lastevent")
+}
+
+/// Enough of the session's state to read an execution-control failure: what stopped it last, what
+/// breakpoints it holds, and which threads it has. For a message, never for an assertion.
+fn debugger_state(server: &mut Server, session: &str) -> String {
+    [".lastevent", "bl", "~", "r rip"]
+        .into_iter()
+        .map(|command| format!("[{command}] {}", raw(server, session, command)))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn raw(server: &mut Server, session: &str, command: &str) -> String {
     let response = server.call_tool(
         "execute",
-        json!({ "session_id": session, "command": ".lastevent" }),
+        json!({ "session_id": session, "command": command }),
         TARGET_STEP,
     );
     text_of(&response["result"]).trim().replace('\n', " | ")
