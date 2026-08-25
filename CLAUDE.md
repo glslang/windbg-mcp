@@ -929,6 +929,17 @@ assertable. **The split attributes need, not provenance**: an opener's result ta
 `unloaded_driver` until #217, and that task is one `min` cannot answer, so those calls are
 `wanted`. Lower bound on advertising, upper bound on need.
 
+**Fourth run, five draws of the five `min` cells** (2026-08-25, against #217): `modules` went from
+3 of 5 cell-draws to **0 of 25**, and what remains is mostly invented (`execute_command`,
+`run_command`). The arms differ by exactly one server change, so this is the cleanest causal read
+the bench has produced — with the weakness on the *other* side, which is one draw per cell. Two
+things only draws could say: `ioctl_decode` is answered from a frontier model's own knowledge 5/5
+and from a local one's 1/5, and **`arm64_pc` is `5n` in every row**, which is what sent someone to
+look at the task rather than the models. It has never been answered correctly in 35 runs across
+every log (item 44): the key is the literal `pc`, `nt!KeBugCheck2+0x2e8`, and every model gives the
+bug check's parameter 1 instead — the address whose execution faulted. **A task that fails
+everywhere is a task to read, not a model to blame.**
+
 **Re-run against item 41** (2026-08-24): unserved calls 14 -> 6, with `debug_batch` going 10 -> 0
 and every name this server was teaching now gone. What that re-run mostly taught is **how easy it
 is to over-read at n=1, in a file that already says so**. Two claims had to be pulled back after

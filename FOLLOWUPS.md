@@ -27,7 +27,9 @@ through the one thing `--tools` does not narrow (both 2026-08-23), and item 41 f
 the narrowed cells against that fix and finding two of the same names arriving by a second route
 (2026-08-24), and items 42–43 from measuring item 41 and having two readings of that measurement
 corrected in review (2026-08-24; **both have since landed** — item 42 the same day, item 43 on
-2026-08-25, once #217 had shown that its "`taught` is zero" premise was false). Each item notes its repo,
+2026-08-25, once #217 had shown that its "`taught` is zero" premise was false), and item 44 from
+the first run those two made possible: five draws of the narrowed cells, where a task failing in
+all twenty-five turned out to be failing at its own wording (2026-08-25). Each item notes its repo,
 why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -2124,3 +2126,42 @@ told a module table exists and has to name a tool for it. And this is a public r
 prior exposure cannot be excluded at one draw per cell. Separating memorised-from-GitHub from
 guessed-by-convention is item 42's machinery (the same cell repeated with that sentence varied),
 not this item's.
+
+## 44. [windbg-mcp] `arm64_pc` has never measured what it asks, on any surface
+
+The eval's `arm64_pc` task asks for "the value of the `pc` register at the point of the crash" on
+the ARM64 sample, and its key is `0xfffff8013c65bca8`. **Across the 35 runs of it in the three logs
+this bench has, no model on any surface has ever given that answer, and 32 gave
+`0x0000019e7b820000`** — the bug check's first parameter. Five draws of five models on `min`
+(2026-08-25) is `5n` in every row, frontier rows included, which is what made it visible: at one
+draw per cell it read as a hard task.
+
+**Both answers are defensible, and the debugger says so.** Measured on the dump:
+
+- `registers` reports `pc = 0xfffff8013c65bca8`, and `crash_triage` frame 0 is the same address,
+  `nt!KeBugCheck2+0x2e8`. So the key is literally right and the note claiming `min` can reach it
+  through frame 0 is right too - the route works.
+- That address is inside the **bug-check path**, which the machine reached *after* the fault. The
+  address whose execution faulted is parameter 1, `0x0000019e7b820000` (also in `x24`), and
+  `nt!MiCheckSystemNxFault` two frames up is the handler for exactly that.
+
+So a model answering "the pc at the point of the crash" with the faulting address is reading the
+question the way a person would, and the key wants the register's literal value in a context that
+is not the crash. **A task 35 runs have never passed is measuring its own wording**, not the
+surface it was written to probe.
+
+**What would close it.** Reword the prompt so one reading survives - "what value does `pc` hold in
+the crash context, as the debugger reports it" - rather than widening `expect` to accept both,
+which is the tempting fix and the wrong one: the task exists to check that a *narrow* surface can
+reach a register value through `crash_triage` frame 0, and accepting parameter 1 would let it pass
+without that route being taken at all. Check the other five tasks for the same defect while there:
+this one was found by five draws agreeing, and nothing says it is the only one.
+
+**Why deferred.** It invalidates comparison with every run published so far - the six-task score is
+in `docs/local-model-eval.md` three times over - so it wants doing at the start of the next run
+rather than between two, and the numbers already published want a line saying which task they were
+scored against. Nothing about the server is wrong here, which is why this is not urgent: the grid's
+*server* findings (items 40, 41, 43, and #217) never depended on this task.
+
+**Where it picks up.** `tools/eval_tasks.json`, the `arm64_pc` entry - and note its `note` field is
+what argued `possible_on` should include `min`, which is still true and is not what is wrong.
