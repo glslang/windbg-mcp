@@ -540,7 +540,10 @@ lines that appear when something did move were checked against a log doctored to
   table, being run-wide; the **surface fingerprint, the served window and the weights** go
   *beneath* it, being per cell — the identity block's `weights` line is a run-wide set, and a set
   cannot say which digest answered which cell, so two runs assigning the same two digests to
-  opposite cells compare equal there. `surface.client` is a label — `min` was 11 tools and 8,654 B before item 41 and 7,732 B
+  opposite cells compare equal there. The **build** is per cell for the same reason: a log is
+  append-only and a plan resumes, so a run can legitimately span a rebuild. Those per-cell
+  conditions travel into the series too, beside each cell's score, or a historical row holding two
+  digests could not attribute its own numbers. `surface.client` is a label — `min` was 11 tools and 8,654 B before item 41 and 7,732 B
   after — so pairing on the label alone would present a surface change as a model comparison, which
   is the very intervention a rerun exists to measure. The fingerprint is a **digest of the surface
   as it went over the wire**, not its length: a byte count moves for almost any prose edit and for

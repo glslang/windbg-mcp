@@ -2501,7 +2501,11 @@ now stamps the short git revision into the version the server reports, as semver
   `weights` is a run-wide set, and two runs assigning the same two digests to opposite cells - one
   model at two contexts, a tag re-pulled between the runs - compare equal there while pairing
   results from different weights. And a row label carries its **backend**, since a cell is keyed by
-  one and an ollama tag may be the same string as a Claude alias.
+  one and an ollama tag may be the same string as a Claude alias. The **build** followed the
+  weights a round later, on the identical argument - a log is append-only and a plan resumes, so a
+  run can span a rebuild and two logs holding the same revision *set* with the cells swapped
+  compare equal run-wide - and the series learned to carry all four per cell, since a historical
+  row holding two digests could not otherwise attribute its own numbers.
 - **Absent is not the same as deliberately null**, which the same round caught. A Claude row's
   `model_digest` is null *on purpose* - an alias resolved inside a client this bench does not own
   has no content address - and folding that into `unrecorded` labelled every current run containing
