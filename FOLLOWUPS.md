@@ -1999,7 +1999,44 @@ nothing until it has been shown printing on a known one.*
 one is the model's own request coming back.** Nine are the ollama driver's own refusal — the one
 that names the tool it is refusing, "`debug_batch` is not permitted in this harness" — four are
 Claude Code's "No such tool available: `mcp__windbg__…`", and three are **this server's**
-`-32602`. Nothing is *introduced*: no result names a tool the model had not just asked for.
+`-32602`. Nothing is *introduced* **in the part of a result the log kept** — and the qualifier is
+the whole finding, because outside it something was.
+
+**It was wrong, and the truncation bound is what was hiding it** (2026-08-25, one day later). An
+opener's summary ended with "`modules` lists a page of the table and `modules {"filter":
+"<name>"}` answers for one", built by `summary_text` in the **worker** — which owns one session and
+has never heard of a client, let alone its surface. `modules` is `inspect`, so on the bench's own
+eleven-tool `crash` surface the *first result a client ever saw* handed it the exact name together
+with its real argument. `crash_triage` rode along the same way, and `post_commit_failure` sent any
+caller to `execute`. So `taught` was **not** zero on this channel; it was the largest of the three,
+and it is the one that arrives on every call rather than once a conversation.
+
+Three things about how it stayed hidden, each of which is the real lesson:
+
+- **The scan could not have found it.** The excerpt is 300 characters of a 2,508-character summary,
+  and the sentence is at the end. Codex's round-2 bound was not a hedge about a hypothetical; it was
+  a description of where this was sitting.
+- **What found it took no run at all.** The question is what this server *prints*, not what a model
+  does with it, so it is answerable by reading `src/` — a scan of string literals against the tool
+  table, seconds on a laptop, no bench and no VM. Two channels' worth of eval work had been spent
+  on a question that was static all along.
+- **The eval's `modules` calls have a documented cause now**, so the "a mixture is what guessing
+  looks like" reading above is undercut for `modules` specifically: the name and its `filter`
+  argument were both in front of the model. The invented ones (`list_modules`, `run_command`) still
+  read as guesses, but that is a claim about the survivors, not about the three.
+
+Fixed by `SUMMARY_NOTES` and `WindbgServer::annotated_report` — [`ToolNote`]'s rule one channel
+over, with `no_opener_report_names_a_tool_the_client_cannot_call` as its invariant. The same scan
+found two more: a post-commit failure's `execute` example, and `crash_triage`'s user-mode refusal,
+which pointed at `backtrace` and `execute` — both `inspect`, while `crash_triage` is `crash`, so
+the caller most likely to reach it could act on neither half. A third was left alone as
+unreachable: the "a `debug_batch` is running its rollback" message needs a client served
+`debug_batch` to have started one.
+
+**What is still open here** is the count, not the leak. `unserved` is still one number, and the
+three runs on disk cannot be re-graded into `taught` and `wanted` — but the partition now has a
+known instance on the `taught` side rather than none, which is the evidence the entry above says
+it was missing. The next run against a prose change is where it gets made.
 
 **That is zero within the prefixes the log keeps, and it cannot be stated wider than that**
 (Codex's second round on #216, and correct). `local_model_drive.py` records `text[:300]`, so 96 of
