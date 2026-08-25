@@ -1482,6 +1482,12 @@ def print_matrix(order, rows):
 # where the truth is "nobody knows" — which is the whole argument for recording them now.
 UNRECORDED = "unrecorded"
 
+# And what a log *did* record as having no answer. A Claude row's `model_digest` is deliberately
+# null - an alias resolved inside a client this bench does not own has no content address - and
+# spelling that the same way as "nobody recorded it" made every current run with a Claude cell
+# read as a legacy log.
+UNAVAILABLE = "unavailable"
+
 
 def identity(log_records):
     """The uncontrolled variables of a run: what is neither the question nor the surface.
@@ -1491,6 +1497,20 @@ def identity(log_records):
     weights behind a mutable tag, the harness resolving an alias, and the task list the questions
     came from.
     """
+    def stated(record, name, render=str):
+        """One identity field, with **absent and null kept apart**.
+
+        A driver writes `model_digest: null` *deliberately* on a Claude row - an alias resolved
+        inside a client this bench does not own has no content address to offer - so folding that
+        into `unrecorded` labelled every current run containing a Claude cell as a log predating
+        the field. Absent means nobody recorded it and never can; null means this row cannot have
+        one. The series has to tell those apart or it cannot compare anything against history.
+        """
+        if name not in record:
+            return UNRECORDED
+        value = record[name]
+        return render(value) if value else UNAVAILABLE
+
     fields = {"run": set(), "suite": set(), "server": set(), "harness": set()}
     weights = {}
     for record in log_records:
@@ -1503,16 +1523,14 @@ def identity(log_records):
             fields["run"].add(record.get("run") or UNRECORDED)
             continue
         fields["run"].add(record.get("run") or UNRECORDED)
-        suite = record.get("suite") or {}
-        fields["suite"].add(f"{suite.get('name')} ({suite.get('file')})" if suite else UNRECORDED)
-        server = record.get("server") or {}
-        fields["server"].add(f"{server.get('name')} {server.get('version')}"
-                             if server else UNRECORDED)
+        fields["suite"].add(stated(record, "suite", lambda s: f"{s.get('name')} ({s.get('file')})"))
+        fields["server"].add(stated(record, "server",
+                                    lambda s: f"{s.get('name')} {s.get('version')}"))
         if record.get("backend") == "claude-code":
-            fields["harness"].add(record.get("harness_version") or UNRECORDED)
+            fields["harness"].add(stated(record, "harness_version"))
         model = record.get("model")
         if model:
-            weights.setdefault(model, set()).add(record.get("model_digest") or UNRECORDED)
+            weights.setdefault(model, set()).add(stated(record, "model_digest"))
     return {name: sorted(values) for name, values in fields.items()} | {
         "weights": {model: sorted(digests) for model, digests in sorted(weights.items())}}
 
@@ -1537,10 +1555,10 @@ def print_identity(ident, indent="  ", header=True):
         # here can be matched against the machine's own listing by eye, and the full value is in
         # the record for anything that needs to be exact.
         print(f"{indent}{'weights':<8} {model} {' '.join(d[:12] for d in digests)}")
-    if any(UNRECORDED in ident[name] for name in ("suite", "server")) or \
+    if any(UNRECORDED in ident[name] for name in ("suite", "server", "harness")) or \
             any(UNRECORDED in d for d in ident["weights"].values()):
         print(f"{indent}({UNRECORDED} is a log written before a field existed — it cannot be "
-              f"filled in afterwards)")
+              f"filled in afterwards; {UNAVAILABLE} is a row that has no such answer to give)")
 
 
 def cell_facts(log_records):
@@ -1557,6 +1575,12 @@ def cell_facts(log_records):
     window records `num_ctx: null` while the runtime serves whatever it likes, so two runs can pair
     a 4K result against a 32K one with nothing said.
 
+    **The surface is compared by digest, not by length**, which is the same distinction one level
+    down: a byte count moves for almost any prose edit and for none reliably, so a same-length
+    reword or an equal-sized allowlist swap would leave it saying nothing moved. The drivers record
+    a digest of the surface exactly as it went over the wire; a log written before that field
+    existed falls back to the count and the length, and says so.
+
     Named rather than blocked, which is the split the rest of this follows: a changed *question* is
     not comparable at all, while a changed surface is often the very intervention a rerun exists to
     measure — items 40, 41 and #217 each changed one and were read across two runs.
@@ -1567,10 +1591,17 @@ def cell_facts(log_records):
         cell_id = (record.get("backend"), record.get("model"), record.get("num_ctx"),
                    surface.get("client"))
         entry = facts.setdefault(cell_id, {"surface": set(), "window": set()})
-        if surface.get("tools") is not None or surface.get("bytes") is not None:
+        if surface.get("digest"):
+            # **The digest when there is one**, because a count and a byte length are not a
+            # fingerprint: a same-length reword, or an allowlist swap of equal size, leaves both
+            # unchanged while the model is handed different tools. Older logs have no digest, and
+            # for those the count and length are what there is - a floor, said as one.
+            entry["surface"].add(f"{surface.get('tools')} tools, {surface['digest']}")
+        elif surface.get("tools") is not None or surface.get("bytes") is not None:
             # A cell-failure note carries the client and nothing else, so it contributes no
             # fingerprint rather than an `unrecorded` one.
-            entry["surface"].add(f"{surface.get('tools')} tools, {surface.get('bytes')} B")
+            entry["surface"].add(f"{surface.get('tools')} tools, {surface.get('bytes')} B "
+                                 f"(no digest recorded)")
         if record.get("served_context") is not None:
             entry["window"].add(str(record["served_context"]))
     return facts

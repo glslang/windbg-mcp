@@ -251,7 +251,8 @@ def main():
     print("MCP revision negotiated:", drive.handshake())
     tools = drive.mcp("tools/list")["result"]["tools"]
     offered = drive.as_ollama(tools)
-    surface_bytes = len(json.dumps(offered, separators=(",", ":")))
+    wire = json.dumps(offered, separators=(",", ":"))
+    surface_bytes = len(wire)
     print(f"tools offered: {len(tools)} ({surface_bytes} B, measured as the ollama rows are)")
 
     scratch = os.environ.get("EVAL_SCRATCH", "")
@@ -282,7 +283,10 @@ def main():
         "server": dict(drive.SERVER_INFO) or None,
         "suite": dict(drive.SUITE) or None,
         "surface": {"client": os.environ.get("EVAL_SURFACE", ""), "tools": len(tools),
-                    "bytes": surface_bytes, "names": sorted(t["name"] for t in tools)},
+                    "bytes": surface_bytes, "names": sorted(t["name"] for t in tools),
+                    # Measured as the ollama rows measure it, through the same helper, so the two
+                    # backends' surfaces are comparable rather than merely similar.
+                    "digest": drive.surface_digest(wire)},
     }
     try:
         for i, task in enumerate(tasks, 1):

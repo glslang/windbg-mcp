@@ -25,7 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that change over time: which model weights answered — `qwen3.8:27b-mlx` is a mutable tag that can
   be re-pulled onto different ones — and which server build was asked. Both facts were already on
   the wire and both were thrown away, so every record now carries `server`, `model_digest`, `suite`
-  and, for the Claude rows that can have no digest, `harness_version`. `--compare` reads two logs
+  and, for the Claude rows that can have no digest, `harness_version`. A surface is fingerprinted
+  by a **digest** of what went over the wire rather than by its byte length, and a field that is
+  deliberately null (`unavailable`) is kept apart from one nobody recorded (`unrecorded`). `--compare` reads two logs
   with two rules that are not one rule: a **changed question blocks** a pairing, and a changed
   build, model or window is **named above the table**. `--series` reduces logs to one row per run
   in `docs/eval-runs.json`. The three runs already recorded read `unrecorded` throughout, which is
