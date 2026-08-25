@@ -85,6 +85,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Every tool's `outputSchema` is rooted at `type: "object"`, which is what keeps a strict client
+  holding any tools at all** (issue #223). The structured results are internally-tagged enums, and
+  `schemars` renders one as `{ $schema, oneOf, $defs }` — object-ness stated on each branch of the
+  union and nowhere at the root. rmcp passes that through deliberately, because SEP-2106
+  (`2026-07-28`) relaxed the requirement for output schemas. But that relaxation says what a server
+  *may* emit, not what clients accept: every released `@modelcontextprotocol/sdk` 1.x — 1.30.0
+  included — parses `Tool.outputSchema` as `z.object({ type: z.literal("object"), … })` and
+  `tools/list` as `z.array(ToolSchema)`, so the array fails on the first non-conforming tool and the
+  client registers **none** of them. Measured against 1.30.0 on this server's own captured
+  `tools/list`: **0 of 51 tools before, 51 of 51 after**. It reached a real client as zero tools
+  registered, a reconnect loop exhausted and the server deregistered.
+
+  Supplying the keyword is not a concession to old clients — it is *true*, since MCP types
+  `structuredContent` as a JSON object in every revision — and it changes nothing about what
+  validates: each branch of the `oneOf` already carried `"type": "object"`, and `ajv` gives success,
+  failure, a payload missing its required fields and an unknown discriminator the same verdict
+  either way. Emitting the relaxed shape only to peers that negotiated `2026-07-28` was considered
+  and rejected for the same reason: the object-rooted form is legal under both revisions, so the
+  version-aware branch would exist only to send a worse schema to half the population. It costs
+  16 bytes per tool — 528 across the surface, none of it model-visible.
+
 - **A raw `execute` of `g`/`p`/`t` moves the target instead of wedging the session**
   ([#226](https://github.com/glslang/windbg-mcp/issues/226)). `execute` runs a plain
   `IDebugControl::Execute`, and DbgEng's execution-control commands only *set the run state*

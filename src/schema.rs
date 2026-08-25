@@ -32,6 +32,11 @@
 //! model context, because `ModuleInfo` is embedded in six output shapes. The same type costs
 //! roughly a seventh of that now: the multiplier is unchanged, but what is being multiplied is a
 //! handful of keywords rather than a paragraph.
+//!
+//! The other thing this module does is **add** one keyword, for the opposite reason: a root
+//! `type: "object"` that `schemars` does not emit for a discriminated union and rmcp does not
+//! supply, without which every released TypeScript-SDK client rejects the whole `tools/list` and
+//! is left with no tools at all. [`object_rooted`] has the measurements.
 
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
@@ -62,14 +67,47 @@ pub fn constraints_of<T: JsonSchema + Any>() -> Arc<JsonObject> {
         return cached.clone();
     }
 
-    let lean = Arc::new(strip_descriptions(
+    let lean = Arc::new(object_rooted(strip_descriptions(
         &rmcp::handler::server::tool::schema_for_output::<T>(),
-    ));
+    )));
     CACHE
         .write()
         .expect("output schema cache poisoned")
         .insert(TypeId::of::<T>(), lean.clone());
     lean
+}
+
+/// The root's `"type": "object"`, supplied where the generator emitted no `type` at all.
+///
+/// Every structured result here is an [`Outcome`](crate::structured::Outcome) — a serde
+/// internally-tagged enum — and `schemars` renders one as `{ $schema, oneOf, $defs }` with the
+/// object-ness stated on each branch and nowhere at the root. rmcp does not fill it in: its
+/// `schema_for_input` requires a root `type: "object"` and refuses anything else, while
+/// `schema_for_output` deliberately does not, because SEP-2106 (`2026-07-28`) relaxed the
+/// requirement for output schemas.
+///
+/// The relaxation is what a *server* may emit, not what clients accept. Every released
+/// `@modelcontextprotocol/sdk` 1.x — through 1.30.0 — parses `Tool.outputSchema` as
+/// `z.object({ type: z.literal("object"), … })`, and `tools/list` as `z.array(ToolSchema)`, so a
+/// single non-conforming tool fails the array and the client is left with **no tools at all** —
+/// not 50 of 51 (issue #223). Such a client negotiates `2025-11-25`, which rmcp knows and echoes,
+/// so the session runs under the revision that requires the keyword anyway.
+///
+/// Supplying it is not a concession to old clients, because the keyword is *true*: MCP types
+/// `structuredContent` as a JSON object in every revision, so a tool result can be nothing else.
+/// Nor does it change what validates — measured, with `ajv` on both shapes: each branch of the
+/// `oneOf` already carries `"type": "object"`, so success, failure, a payload missing its required
+/// fields and an unknown discriminator all get the same verdict either way.
+///
+/// A root that *does* declare a type is left alone rather than corrected. Nothing produces one
+/// today; if something ever does, the type it declares is either `object` already or a bug worth
+/// seeing, and this function runs on every `router()` build — so the invariant is asserted in the
+/// tests below and on the wire in `mcp_smoke`, where a failure can be read rather than crashed on.
+fn object_rooted(mut schema: JsonObject) -> JsonObject {
+    schema
+        .entry("type")
+        .or_insert_with(|| Value::String("object".into()));
+    schema
 }
 
 /// Every `description` in a JSON Schema document, removed.
@@ -290,6 +328,53 @@ mod tests {
             rendered.contains("\"stale_session\""),
             "the ErrorCategory vocabulary is a constraint, not prose: {rendered}"
         );
+    }
+
+    /// The root keyword that decides whether a strict client keeps *any* of this server's tools.
+    ///
+    /// `schemars` states the object-ness of an internally-tagged enum on each branch of the
+    /// `oneOf` and nowhere at the root, and rmcp's `schema_for_output` passes that through. A
+    /// TypeScript-SDK 1.x client parses `tools/list` as an array of tools whose `outputSchema`
+    /// must be root-`object`, so one such schema costs the client the whole list (issue #223).
+    #[test]
+    fn a_declared_output_schema_is_object_rooted() {
+        for schema in [
+            constraints_of::<crate::structured::Outcome<crate::structured::SessionEnded>>(),
+            constraints_of::<crate::structured::OpenOutcome>(),
+        ] {
+            assert_eq!(
+                schema.get("type"),
+                Some(&json!("object")),
+                "an output schema with no root `type: \"object\"` is dropped by every released \
+                 TypeScript-SDK client, and it takes the other fifty tools with it: {schema:?}"
+            );
+        }
+    }
+
+    /// The keyword is supplied, not asserted: the branches already carry it, so what is added at
+    /// the root states what the union could only ever have meant.
+    #[test]
+    fn every_branch_was_already_an_object() {
+        let schema = constraints_of::<crate::structured::OpenOutcome>();
+        let branches = schema["oneOf"].as_array().expect("an outcome is a union");
+        assert!(!branches.is_empty(), "the union has branches: {schema:?}");
+        for branch in branches {
+            assert_eq!(
+                branch["type"], "object",
+                "a branch that is not an object would make the root keyword a lie: {branch}"
+            );
+        }
+    }
+
+    /// A root that already declares a type is left as it is. Nothing generates one today, and a
+    /// future one is either `object` already or a bug — and this runs on every `router()` build,
+    /// so it is the wire assertion in `mcp_smoke` that has to report it, not a panic in a live
+    /// server.
+    #[test]
+    fn a_root_that_declares_a_type_is_left_alone() {
+        let declared = json!({ "type": "array", "items": true });
+        let object = declared.as_object().expect("a schema is an object").clone();
+        assert_eq!(Value::Object(object_rooted(object)), declared);
     }
 
     /// Two calls hand back the same cached document rather than two walks of the same one.

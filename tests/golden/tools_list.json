@@ -30,7 +30,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "connection: string|null",
@@ -64,7 +65,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [],
       "required": [],
@@ -95,7 +97,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "pid: integer/uint32"
@@ -130,7 +133,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "frames: integer|null/uint32",
@@ -164,7 +168,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "analyze: boolean|null",
@@ -199,7 +204,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "always: array<ref(#/$defs/BatchStep)>",
@@ -272,7 +278,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "address: string|null",
@@ -343,7 +350,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "session_id: string|null"
@@ -394,7 +402,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "session_id: string|null"
@@ -445,7 +454,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "backend: enum[\"lfh\"|\"vs\"|\"segment\"|\"large\"]|null",
@@ -485,7 +495,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "heap: string|null",
@@ -521,7 +532,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "address: string",
@@ -558,7 +570,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "filter: string|null",
@@ -595,7 +608,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "refresh: boolean|null",
@@ -693,7 +707,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "command_line: string"
@@ -728,7 +743,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "filter: string|null",
@@ -763,7 +779,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "path: string"
@@ -798,7 +815,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "path: string"
@@ -833,7 +851,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "limit: integer|null/uint32",
@@ -868,7 +887,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "address: string",
@@ -905,7 +925,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "filter: string|null",
@@ -941,7 +962,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "limit: integer|null/uint32",
@@ -1045,7 +1067,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "all: boolean|null",
@@ -1079,7 +1102,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "session_id: string|null"
@@ -1112,7 +1136,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "address: string",
@@ -1149,7 +1174,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "level: enum[\"error\"|\"warn\"|\"info\"|\"debug\"|\"trace\"]|null",
@@ -1185,7 +1211,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "session_id: string|null"
@@ -1218,7 +1245,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "expression: string",
@@ -1274,7 +1302,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "session_id: string|null"
@@ -1307,7 +1336,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "session_id: string|null"
@@ -1340,7 +1370,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "session_id: string|null"
@@ -1373,7 +1404,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "session_id: string|null"
@@ -1475,7 +1507,8 @@
             "status": "error"
           }
         ],
-        "dialect": "https://json-schema.org/draft/2020-12/schema"
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
       },
       "params": [
         "addresses: array<string>",
