@@ -796,23 +796,23 @@ fn every_documented_protocol_revision_is_served() {
             reported.starts_with(env!("CARGO_PKG_VERSION")),
             "the reported version must track this crate, not the SDK (on {revision}): {reported}"
         );
-        // And the suffix is not decoration: a build that could not describe itself reports the bare
-        // crate version, which is legitimate, but a build under a git checkout that reports one is
-        // a `build.rs` that has stopped running. Only the shape is asserted, since the revision
-        // itself moves with every commit.
-        if std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join(".git")
-            .exists()
-        {
-            let stamp = reported
-                .strip_prefix(env!("CARGO_PKG_VERSION"))
-                .unwrap_or_default();
-            assert!(
-                stamp.starts_with("+g"),
-                "built from a git checkout, so the version must carry its revision (on \
-                 {revision}): {reported}"
-            );
-        }
+        // And the suffix is checked against **what this build actually stamped**, rather than
+        // against whether a `.git` is lying about. `build.rs` falls back to the bare crate version
+        // whenever git is unavailable or refuses — a minimal builder, or git's own safe-directory
+        // check — which is deliberate and would fail a `.git`-exists proxy on a perfectly good
+        // build. `WINDBG_MCP_BUILD` is the build script's own answer, so this asserts the served
+        // version *is* the one it produced — and a `build.rs` that stopped running fails to
+        // compile this rather than passing it.
+        let stamp = env!("WINDBG_MCP_BUILD");
+        let expected = if stamp.is_empty() {
+            env!("CARGO_PKG_VERSION").to_string()
+        } else {
+            format!("{}+{}", env!("CARGO_PKG_VERSION"), stamp)
+        };
+        assert_eq!(
+            reported, expected,
+            "the served version must be the one this build stamped (on {revision})"
+        );
 
         // Tools must be reachable on every revision, not just the newest.
         let tools = server.request("tools/list", json!({}), STEP);
