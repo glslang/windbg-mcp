@@ -968,7 +968,9 @@ no `nt`, as is a gated step with no target to probe. **Nothing there reads a str
 with a default** - one `probe` helper answers a value or a reason, which is what five review rounds
 finding the same shape in six places bought - the last of them a renamed `symbols` on the `nt`
 record, which reads as `None` and is not a PDB-backed state, and a `symbols` that is no longer a
-string. **Pins compare types too** (`False == 0` and `227.0 == 227` are true in Python, and one of
+string, and a task whose **every** grounding step stands down at a gate is `INCOMPLETE` and
+non-zero rather than OK - `driver_blame` has no ungated route where `arm64_pc` does. **Pins compare
+types too** (`False == 0` and `227.0 == 227` are true in Python, and one of
 those would have hidden a schema change). A `states` group **names the pins its relation
 rests on**, so the exemption cannot outlive the fact underneath it. **A pin can be too
 tight**: the `pc` fact was first pinned as `registers.32.value`, a position in the ARM64 bank that

@@ -282,8 +282,12 @@ covering more or less than the suite.
 
 **What stands down where symbols do.** Two steps walk `nt`'s types — `driver_blame`'s stack walk
 and `arm64_pc`'s frame 0 — and on a host whose engine resolves no PDB a stack walk gives back
-frames made of the bug check's own parameters. Those print `SKIPPED` with the reason, exactly as
-the Rust tier does; [`smoke-test.md`](./smoke-test.md) has the line and the measurement behind it,
+frames made of the bug check's own parameters. Those print `SKIPPED` with the reason, much as
+the Rust tier does — but a task whose **every** grounding step stands down is reported as
+`INCOMPLETE` by name and exits non-zero, because "verified nothing about this task" is not a result
+a script should read as success. `driver_blame` is the one that can reach that state: its only
+fact-checking step is gated, where `arm64_pc`'s `registers` route is not. The key has not rotted
+there; the host cannot say either way; [`smoke-test.md`](./smoke-test.md) has the line and the measurement behind it,
 and this mode deliberately keeps no second copy of either. **The gate is asked of each task's own
 dump**, not once of the host: that same document records an engine failing *differently per dump*,
 so a gate taken off the first opener could stand the ARM64 step down because an x64 PDB was

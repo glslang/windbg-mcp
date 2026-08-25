@@ -2325,6 +2325,15 @@ verifier quietly querying the old one.
   the pin *and* the relation resting on it. Types are compared now. Half of that round's remedy
   was declined: checking `symbols` against a *recognized* set would fail on a state win-kexp
   legitimately adds, and a new symbol state is not a rotted key.
+- **A task nothing checked is not a task that passed**, which an eighth round caught and which the
+  gating design had quietly licensed. `driver_blame`'s only fact-checking step is gated, so on a
+  symbol-poor host every group of it stands down and the run printed that every fact the suite
+  grades against still reads off the dumps - having read none of that task's. It is `INCOMPLETE` by
+  name and non-zero now, kept apart from key rot in the wording, since the key has not moved and
+  this host cannot say either way. `arm64_pc` is the contrast that made the rule easy to state: its
+  `registers` route is ungated, so one half standing down still leaves the fact verified. The
+  gate's stood-down sentence also stopped claiming "the facts behind this step are asserted through
+  their other route", which is true of one of those two tasks and false of the other.
 
 **And a pin can be too tight.** The first cut pinned the `pc` register as `registers.32.value` —
 its position in the ARM64 bank, which is an engine detail rather than anything the key rests on, so
