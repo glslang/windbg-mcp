@@ -2294,7 +2294,12 @@ verifier quietly querying the old one.
   model would be graded wrong, reached through the very mode meant to catch one. So `grounds` is a
   value claim and **fails** when nothing renders it, `states` is the declared-relational one, and
   the exemption covers the two groups that earn it rather than spreading to whatever happens not to
-  match.
+  match. The next round found the same hole pointed the other way — *appending* an alternative
+  beside one that still matches widens what the grader accepts while the run stays green — so a
+  `grounds` group is checked **alternative by alternative**: each must render, or be a *spelling*
+  of one that does (letters and digits only). That is what lets the suite keep `heap corruption`
+  beside `heap_corruption`, and refuses `access_violation` as a second fact rather than a second
+  spelling.
 - **A second verb, for a tool with no structured half.** `decode_ioctl` answers in prose alone, so
   a binding that could only name a field would have had nothing to say about the one task needing
   no target at all — the cheapest half this entry singled out. `is` is exact typed equality against
@@ -2303,7 +2308,8 @@ verifier quietly querying the old one.
   stops `expect` growing an alternative the binding does not fetch, and stops a new task arriving
   unpinned. Verified against a deliberately rotted copy of the suite: a moved fact, a renamed
   field, a repointed prompt, an ungrounded group, a group edited to something the server does not
-  say, and a stale text pin all fail — six channels — and the clean suite passes.
+  say, a group widened to also accept something else, and a stale text pin all fail — seven
+  channels — and the clean suite passes.
 
 **And a pin can be too tight.** The first cut pinned the `pc` register as `registers.32.value` —
 its position in the ARM64 bank, which is an engine detail rather than anything the key rests on, so
@@ -2321,7 +2327,9 @@ had the measurement: `docs/smoke-test.md` records an engine failing *differently
 each sample has its own `nt` with its own PDB identity. A gate probed once off the first opener
 would therefore have stood the ARM64 frame-0 step down because an *x64* PDB was missing, and
 reported success without checking the route `arm64_pc`'s `possible_on: min` rests on. It is asked
-of each task's own session now, as the Rust tier asks it.
+of each task's own session now, as the Rust tier asks it — and **a probe that fails is not a closed
+gate**, which the round after that caught: a gate that closes stands its steps down and *passes*,
+so a probe answering an error would have turned every gated assertion into a silent no-op.
 
 **Two lifecycle defects came in with it, both from plumbing this reimplemented rather than reused.**
 An opener that registers a session and *then* fails reports the only handle that can reach it inside
@@ -2330,7 +2338,9 @@ runs against one drift would have met the four-session cap instead of reporting 
 `local_model_drive.opened_session` already reads both places that handle can be, and is now what
 reads it. And the MCP transport session was never closed, so repeated verifications piled up on the
 listener until the lease grace. Both are the same shape as the accumulation rule in `CLAUDE.md`,
-seen small: a parallel path beside one that already worked.
+seen small: a parallel path beside one that already worked. The cleanup then had to move one
+request earlier still, since the handshake is *two* requests and a failure between them leaves an
+id nothing deletes.
 
 **Gating: `docs/smoke-test.md` draws that line and this keeps no second copy of it.** Three review
 rounds on [#221](https://github.com/glslang/windbg-mcp/pull/221) were corrections to a second copy

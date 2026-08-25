@@ -958,9 +958,12 @@ means), so a run reports each group as `value`, `relation` or `skipped`. **Which
 declared (`states`), never inferred** — reading "no pinned value matched" as a relation let a group
 edited to a value the tools do not answer pass, which is a broken key reached through the mode
 meant to catch one — so a group `grounds` claims but nothing renders is a failure, as is a group
-**no** step claims. **The gate is asked per dump**, not once of the host: `docs/smoke-test.md`
+**no** step claims, and a `grounds` group is checked *alternative by alternative* (each must render
+or be a **spelling** of one that does), since appending an alternative widens what the grader
+accepts without moving anything a whole-group check would see. **The gate is asked per dump**, not once of the host: `docs/smoke-test.md`
 records an engine failing differently per dump, so a host-wide gate stands the ARM64 step down over
-a missing *x64* PDB. **A pin can be too
+a missing *x64* PDB — and **a failed probe is a task failure, not a closed gate**, because a closed
+gate stands steps down and passes. **A pin can be too
 tight**: the `pc` fact was first pinned as `registers.32.value`, a position in the ARM64 bank that
 an engine may reorder without the key having rotted, so a `read` path enters a list by name
 (`registers.name=pc.value`) as well as by index. And **`tools/eval_tasks_v1.json` carries no
