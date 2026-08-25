@@ -2494,7 +2494,9 @@ now stamps the short git revision into the version the server reports, as semver
   `after-210`, a difference those write-ups compared across in silence. And the round after *that*
   caught the mirror image: adopting the digest is not a surface change, so a comparison spanning
   the rollout would have read every cell as moved on a telemetry format. It falls back to what both
-  runs recorded, and reports `unverifiable` rather than agreement where one side has no digest.
+  runs recorded, and reports `unverifiable` rather than agreement where one side has no digest —
+  once beneath the table, rather than per cell, where *neither* side has one, since then it is true
+  of every cell equally and the per-cell wording would be false.
 - **Absent is not the same as deliberately null**, which the same round caught. A Claude row's
   `model_digest` is null *on purpose* - an alias resolved inside a client this bench does not own
   has no content address - and folding that into `unrecorded` labelled every current run containing

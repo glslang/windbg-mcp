@@ -1437,8 +1437,7 @@ def print_matrix(order, rows):
     header = f"{'cell':<44}" + "".join(f"{t:<{width}}" for t in order)
     print("\n" + header)
     print("-" * len(header))
-    for cell, marks in sorted(rows.items(), key=lambda kv: (kv[0][0], kv[0][1],
-                                                            -(kv[0][2] or 0), kv[0][3] or "")):
+    for cell, marks in sorted(rows.items(), key=lambda kv: cell_order(kv[0])):
         backend, model, ctx, surface = cell
         label = f"{model[:24]} {str(ctx or 'dflt'):>6} {surface}"
         print(f"{label:<44}" + "".join(f"{marks.get(t, {}).get('mark', ' '):<{width}}"
@@ -1561,6 +1560,18 @@ def print_identity(ident, indent="  ", header=True):
               f"filled in afterwards; {UNAVAILABLE} is a row that has no such answer to give)")
 
 
+def cell_order(cell):
+    """How a `(backend, model, num_ctx, client)` key sorts — **never the raw tuple**.
+
+    A raw sort compares `num_ctx` values directly, and `None` against an integer raises in Python 3:
+    a plan may omit `contexts`, so one run recording `null` beside another recording `262144` for
+    the same model crashed `--compare` before it printed anything. Spelled once here rather than as
+    the third copy of a lambda two other sorts already carried.
+    """
+    backend, model, context, client = cell
+    return (backend or "", model or "", -(context or 0), client or "")
+
+
 def cell_facts(log_records):
     """Per cell, the two variables a run-wide identity line cannot hold.
 
@@ -1621,27 +1632,33 @@ def moved_cells(old_facts, new_facts):
     reported as *unverifiable* rather than as agreement: a byte count cannot see a same-length
     reword, which is the whole reason the digest exists.
     """
-    moved = {}
-    for cell in sorted(set(old_facts) | set(new_facts)):
+    moved, undigested = {}, set()
+    for cell in sorted(set(old_facts) | set(new_facts), key=cell_order):
         before, after = old_facts.get(cell, {}), new_facts.get(cell, {})
         was, now = before.get("surface") or set(), after.get("surface") or set()
         if was and now:
             # Only when both runs recorded one: a log with nothing to say about a field cannot
             # have moved in it, and reporting that as a move would be an invention.
-            both_digested = all(f[2] for f in was | now)
-            comparable_was = was if both_digested else {(f[0], f[1]) for f in was}
-            comparable_now = now if both_digested else {(f[0], f[1]) for f in now}
+            digested = all(f[2] for f in was), all(f[2] for f in now)
+            comparable_was = was if all(digested) else {(f[0], f[1]) for f in was}
+            comparable_now = now if all(digested) else {(f[0], f[1]) for f in now}
             if comparable_was != comparable_now:
                 moved.setdefault(cell, []).append(
                     ("surface", surface_text(was), surface_text(now), "moved"))
-            elif not both_digested:
+            elif digested[0] != digested[1]:
+                # **Only when the two sides disagree about having a digest** — the rollout, which
+                # is transient and worth naming per cell. When *neither* has one the whole
+                # comparison is equally unverifiable, and saying so on every row would be noise
+                # with a wrong reason attached; that is one line under the table instead.
                 moved.setdefault(cell, []).append(
                     ("surface", surface_text(was), surface_text(now), "unverifiable"))
+            elif not any(digested):
+                undigested.add(cell)
         was, now = sorted(before.get("window") or []), sorted(after.get("window") or [])
         if was and now and was != now:
             moved.setdefault(cell, []).append(
                 ("window", ", ".join(was), ", ".join(now), "moved"))
-    return moved
+    return moved, undigested
 
 
 def comparable(old_entry, new_entry):
@@ -1677,8 +1694,7 @@ def compare(old_path, new_path, tasks_file):
     new_order, new_rows = matrix(new_path, tasks_file)
     order = old_order if old_order == new_order else sorted(set(old_order) | set(new_order))
     rows = {}
-    for cell in sorted(set(old_rows) | set(new_rows), key=lambda c: (c[0], c[1], -(c[2] or 0),
-                                                                    c[3] or "")):
+    for cell in sorted(set(old_rows) | set(new_rows), key=cell_order):
         old_row, new_row = old_rows.get(cell, {}), new_rows.get(cell, {})
         rows[cell] = {}
         for task in order:
@@ -1693,11 +1709,12 @@ def compare(old_path, new_path, tasks_file):
                                 "blocked": comparable(old_entry, new_entry)}
     old_records, new_records = records(old_path), records(new_path)
     identities = (identity(old_records), identity(new_records))
-    moved = moved_cells(cell_facts(old_records), cell_facts(new_records))
-    return order, rows, identities, moved
+    moved, undigested = moved_cells(cell_facts(old_records), cell_facts(new_records))
+    return order, rows, identities, (moved, undigested)
 
 
-def print_compare(order, rows, identities, moved_by_cell, old_path, new_path):
+def print_compare(order, rows, identities, surfaces, old_path, new_path):
+    moved_by_cell, undigested = surfaces
     old_ident, new_ident = identities
     print(f"\ncomparing {old_path} -> {new_path}")
     print("\nrun identity — the uncontrolled variables, which are not the question or the surface:")
@@ -1757,6 +1774,10 @@ def print_compare(order, rows, identities, moved_by_cell, old_path, new_path):
                           f"ruled out)")
                 else:
                     print(f"  {label:<40} {name} {was} -> {now}")
+    if undigested:
+        print(f"\n{len(undigested)} cell(s) agree on tool count and byte length with **no surface "
+              f"digest on either side**, so a same-length edit cannot be ruled out for them. Both "
+              f"logs predate that field.")
 
 
 def series(log_paths, tasks_file, out_path):
