@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twenty-one clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty-three clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/win-kexp#71, 2026-08-01), items 13–14 from the bounded-command coverage review
@@ -29,8 +29,10 @@ the narrowed cells against that fix and finding two of the same names arriving b
 corrected in review (2026-08-24; **both have since landed** — item 42 the same day, item 43 on
 2026-08-25, once #217 had shown that its "`taught` is zero" premise was false), and item 44 from
 the first run those two made possible: five draws of the narrowed cells, where a task failing in
-all twenty-five turned out to be failing at its own wording (2026-08-25, **landed** the same day).
-Each item notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
+all twenty-five turned out to be failing at its own wording (2026-08-25, **landed** the same day),
+and item 45 from what closing it exposed: the suite's answer key is a set of facts read off the
+sample dumps that nothing re-checks, so it can rot while every model goes on scoring against it
+(2026-08-25). Each item notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
 Items are roughly ordered by how soon they're worth doing, within each cluster. **Item 10 has
@@ -2226,3 +2228,73 @@ against the new one on this task. The suite `note` in `tools/eval_tasks.json` sa
 anyone reading the task file first. Nothing about the server was wrong here, so the grid's *server*
 findings (items 40, 41, 43, and #217) are unaffected, and the next run starts against a question
 with one reading.
+
+## 45. [windbg-mcp] The eval's answer key is a snapshot, and nothing checks it still holds
+
+The six tasks are graded against facts read off the checked-in dumps **with this server's own
+tools**, before any model saw them. That is what makes the bench mechanical, and it is also the
+whole exposure: if one of those facts stops being what the server reports, the suite keeps grading,
+every model keeps scoring, and the number measures nothing. A key that rots is indistinguishable
+from a model that got worse.
+
+**Part of it is already pinned, in `tests/mcp_smoke.rs`** — the debugger tier reads the same dumps
+and asserts bug check code and name, `Arg1`, the crashing process, and each driver crash's
+`module` + `rva` + kernel frame (`DRIVER_CRASHES`, `NATIVE_SAMPLE`). What is *not* pinned is the
+rest of what the tasks depend on:
+
+| Fact a task is keyed to | Asserted by the tier? |
+| --- | --- |
+| bug check `0x13a` / `0x9f`, and the names | yes |
+| `MessageManager+0x1654` | yes |
+| `nvhda64v.sys` unloaded | yes, as a **relation** — not the **26** records `unloaded_driver` asks for |
+| module counts **227** / **158** / **177** | no |
+| the four `0x22200B` fields | no — the tier exercises `0x70000` |
+| `pc = 0xfffff8013c65bca8` | **no** |
+
+**The last row is the one that makes the case**, and it is exactly item 44 wearing its other face.
+`NATIVE_SAMPLE` pins `first_parameter: "0x0000019e7b820000"` — the address 32 of 35 recorded runs
+gave — while nothing in this repo pins the `pc` the task is actually keyed to. Both halves of the
+ambiguity are named in the codebase, in two different files, and the half the eval depends on is
+the unasserted one.
+
+**What would close it.** A table-driven test in the debugger tier over the facts the tasks depend
+on. It is cheap in the way the rest of that tier is not: no model, no ollama, no listener, no
+grid — `open_dump`, `crash_triage`, `registers`, `modules` and `decode_ioctl` against dumps the
+tier already opens, in seconds.
+
+**The design question it must not skip is where the facts live**, because the key is not in a form
+a test can consume. `answer_key` is one prose string per dump ("x64, 0x13a
+KERNEL_MODE_HEAP_CORRUPTION, 158 modules, faulting frame MessageManager+0x1654, …") and `expect` is
+a list of answer alternatives keyed to a *question* rather than to a tool call, so neither can be
+read mechanically. Either the key becomes machine-readable and the test consumes it, or the test
+restates the facts — and restating them creates the second copy this item exists to prevent, with
+the two drifting apart being the failure mode it would then have. Decide that first; the
+assertions are the easy half.
+
+**And say which corpus is being asserted**, because the two disagree: `082126-7015-01.dmp` is in
+`answer_key` and no task references it, so a test driven off the key covers a dump the eval never
+asks about, while one driven off `tasks` covers less than the key claims. Neither is wrong; a test
+that has not chosen is.
+
+**Gating is the same discipline as the rest of the tier**, and for the same reason. The module
+counts and the `pc` read a *target*, so a host that resolves no symbols cannot check them and must
+`SKIPPED`-and-pass rather than fail — a green tier there is not the same claim as a green tier
+here. The `0x22200B` decode is the exception and needs no target at all, which is why the tier
+already uses `decode_ioctl` as its pure-tool fixture.
+
+**One fragility worth writing down while it is in view.** `arm64_pc` claims `possible_on: min`
+because `crash_triage` frame 0 carries the `pc`. That holds on a **freshly opened** dump, which is
+what every cell does — but `crash_triage`'s own contract is that its stack is the target's default
+context only when `!analyze` ran to completion, and otherwise whatever the session has selected. So
+the claim is true for the eval and is not true in general, and a test asserting it should open the
+dump rather than inherit a session. Measured 2026-08-25 with `analyze: false` on a fresh open:
+frame 0 is `nt!KeBugCheck2+0x2e8`, the same address `registers` reports.
+
+**Why deferred.** Nothing is wrong today — all three dumps were re-read on 2026-08-25 and every
+fact the tasks depend on still holds, which is what makes this protection against future drift
+rather than a bug. The things that would move it are an engine or `win-kexp` bump, a symbol-path
+change, or a new sample replacing an old one, and none is scheduled.
+
+**Where it picks up.** `tests/mcp_smoke.rs`, beside `DRIVER_CRASHES` and `NATIVE_SAMPLE`, which
+already carry half of this and are the shape the rest wants; and `tools/eval_tasks.json`'s
+`answer_key`, which is the half that has to become readable before a test can honestly consume it.
