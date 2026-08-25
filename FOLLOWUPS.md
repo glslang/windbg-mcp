@@ -2313,7 +2313,12 @@ verifier quietly querying the old one.
   and the clean suite passes. Five rounds found one shape — a value that could not be obtained read
   as a benign default — in five places, so the choice generating it was deleted rather than patched
   a fifth time: one helper reads a structured field and answers a value or a reason, and nothing in
-  this mode carries an `or []`.
+  this mode carries an `or []`. A sixth round found the last place it could hide - a renamed
+  `symbols` on the `nt` record reads as `None`, which is not a PDB-backed state and so closed the
+  gate on drift - and two blind spots in the cleanup this mode had newly come to depend on: the
+  driver's `end_sessions` read a structured tool error but not a top-level protocol one, and
+  `close_transport_session` printed a failed `DELETE` without reporting it. Both are fixed in the
+  driver rather than worked around here, since three callers share them.
 
 **And a pin can be too tight.** The first cut pinned the `pc` register as `registers.32.value` —
 its position in the ARM64 bank, which is an engine detail rather than anything the key rests on, so
