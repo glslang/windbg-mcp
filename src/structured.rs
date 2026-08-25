@@ -110,6 +110,17 @@ pub struct FailureDetail {
     pub session_id: Option<String>,
 }
 
+/// `crash_triage`'s refusal on a user-mode session, without the pointer to what to read instead.
+///
+/// Shared so the server can recognise this exact message and append that pointer only where the
+/// surface serves the tools it names ([`crate::server::WindbgServer`]'s `crash_triage`) — an
+/// equality against one constant rather than a sniff at prose. The worker cannot append it
+/// itself: it owns one session and has never heard of the client's surface, which is the same
+/// reason an opener's summary crosses the pipe as facts. See `SUMMARY_NOTES`.
+pub const USER_MODE_NO_BUG_CHECK: &str = "this is a user-mode session, which has no bug check: \
+     `crash_triage` reads the kernel bug check data a crash dump or a bug-checked live kernel \
+     carries.";
+
 /// Why a tool call failed, as a value a caller can branch on.
 ///
 /// Deliberately coarse. These are the distinctions that change what a caller *does* next, and

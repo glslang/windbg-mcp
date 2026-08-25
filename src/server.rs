@@ -2653,6 +2653,29 @@ impl WindbgServer {
         report
     }
 
+    /// [`structured::USER_MODE_NO_BUG_CHECK`] with the pointer this client can act on.
+    ///
+    /// The third site of the same rule, and the one that shows why the worker cannot hold it: the
+    /// tools worth naming here are `inspect`'s, while the tool being refused is `crash`'s, so the
+    /// caller most likely to reach this message is exactly the one that cannot take its advice.
+    fn triage_refusal(&self, message: String) -> String {
+        if message != structured::USER_MODE_NO_BUG_CHECK {
+            return message;
+        }
+        // All of them or none, as everywhere else: half the pointer is worse than no pointer,
+        // since it reads as the whole answer.
+        if !["backtrace", "execute"]
+            .iter()
+            .all(|named| self.surface.includes(named))
+        {
+            return message;
+        }
+        format!(
+            "{message} For a user-mode crash use `backtrace` for the stack and \
+             `execute {{\"command\": \"!analyze -v\"}}` for the exception."
+        )
+    }
+
     /// Open a crash dump (.dmp) or a Time Travel Debugging trace (.run) and wait for it to load.
     /// Opens a new session in its own engine process — sessions already open are left alone —
     /// and returns a `session_id` that routes later calls to it. End it with `end_session`.
@@ -3169,6 +3192,12 @@ impl WindbgServer {
                 },
             )
             .await;
+        let out = match out {
+            Err(EngineError::Debugger(message)) => {
+                Err(EngineError::Debugger(self.triage_refusal(message)))
+            }
+            other => other,
+        };
         engine_result_for(args.session_id.as_deref(), out)
     }
 
@@ -5064,6 +5093,49 @@ mod tests {
             full.contains("`modules`") && full.contains("`crash_triage`"),
             "a full surface loses nothing: {full}"
         );
+    }
+
+    /// The same rule on an error, where the tool being refused and the tools worth naming are in
+    /// different groups — so the caller that reaches this message is the one least able to act on
+    /// the pointer it used to carry.
+    #[test]
+    fn a_user_mode_refusal_points_only_where_the_client_can_go() {
+        let refusal = |spec: &str| {
+            let surface = crate::toolset::Toolset::parse(spec)
+                .unwrap_or_else(|e| panic!("`{spec}` should be a valid spec: {e}"));
+            WindbgServer::new(Sessions::new(Duration::from_secs(1)))
+                .with_tools(surface, crate::toolset::Chosen::ForTheRun)
+                .triage_refusal(structured::USER_MODE_NO_BUG_CHECK.to_string())
+        };
+
+        let narrow = refusal("crash");
+        assert!(
+            narrow.contains("no bug check"),
+            "the fact is the answer and is served on every surface: {narrow}"
+        );
+        assert!(
+            !narrow.contains("`backtrace`") && !narrow.contains("`execute`"),
+            "both are `inspect`; this client has neither: {narrow}"
+        );
+
+        let full = refusal("all");
+        assert!(
+            full.contains("`backtrace`") && full.contains("!analyze -v"),
+            "a full surface keeps the pointer: {full}"
+        );
+
+        // Half a pointer reads as the whole answer, so a surface with one of the two gets neither.
+        let half = refusal("crash,backtrace");
+        assert!(
+            !half.contains("!analyze -v"),
+            "`execute` is not served here, so the sentence does not ship: {half}"
+        );
+
+        // Anything else passes through untouched — this is an equality against one constant, not
+        // a rewrite of every debugger error.
+        let untouched = WindbgServer::new(Sessions::new(Duration::from_secs(1)))
+            .triage_refusal("no such symbol".to_string());
+        assert_eq!(untouched, "no such symbol");
     }
 
     /// A pointer to something this target does not have is noise on every surface.

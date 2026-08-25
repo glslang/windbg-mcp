@@ -1927,11 +1927,11 @@ fn crash_triage(
             return Err(Failed::categorised(
                 structured::ErrorCategory::Debugger,
                 if user_mode {
-                    "this is a user-mode session, which has no bug check: `crash_triage` reads \
-                     the kernel bug check data a crash dump or a bug-checked live kernel carries. \
-                     For a user-mode crash use `backtrace` for the stack and \
-                     `execute {\"command\": \"!analyze -v\"}` for the exception."
-                        .to_string()
+                    // The pointer that used to end this sentence named `backtrace` and
+                    // `execute`, both `inspect`, while `crash_triage` is `crash` — so on an
+                    // eleven-tool surface it sent a caller to two tools it would be refused. The
+                    // server appends it, where the surface is.
+                    structured::USER_MODE_NO_BUG_CHECK.to_string()
                 } else {
                     format!("the target's bug check data could not be read: {why}")
                 },
