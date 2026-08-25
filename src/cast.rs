@@ -496,6 +496,7 @@ fn frame(record: &Record, max_lines: usize) -> Option<String> {
             command,
             stopped_at,
             interrupted,
+            timed_out,
             ..
         } => note(
             &mut out,
@@ -503,7 +504,14 @@ fn frame(record: &Record, max_lines: usize) -> Option<String> {
             &format!(
                 "`{command}` stopped at {}{}",
                 stopped_at.as_deref().unwrap_or("an unknown position"),
-                if *interrupted { " (on request)" } else { "" }
+                // Two reasons a position is real and is not a stop the target reached, and a
+                // renderer that showed neither read a forced break as an ordinary stop. They
+                // cannot both hold: the engine reports one cut-short, not two.
+                match (interrupted, timed_out) {
+                    (true, _) => " (on request)",
+                    (_, true) => " (broken in at the bound, not a stop it reached)",
+                    _ => "",
+                }
             ),
         ),
         Event::RunTo {

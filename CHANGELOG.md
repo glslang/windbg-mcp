@@ -114,7 +114,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `timed_out` beside `interrupted` — two different reasons the position is real but is not a stop
   the target reached. Nothing caught this because the only tier that drove execution was the
   live-kernel one, which was already on the bounded wait; the debugger tier now launches a process
-  and drives it.
+  and drives it. A session **transcript** records which of the two reasons a stop was not one the
+  target reached, and `--render-cast` says so, rather than showing a forced break as an ordinary
+  stop. And where the recovery itself fails, the answer depends on what the engine then says: still
+  running is an error carrying the command's output, stopped is the command's answer, and an engine
+  that cannot be asked is reported as not known instead of guessed at.
 
 - **And no *result* names one either, which was the channel nobody had scanned** (`FOLLOWUPS.md`
   item 43). Items 40 and 41 below closed the `instructions` string and the descriptions; an

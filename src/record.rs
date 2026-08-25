@@ -660,6 +660,15 @@ pub enum Event {
         stopped_at: Option<String>,
         /// Whether it was broken into on request rather than stopping on its own.
         interrupted: bool,
+        /// Whether the call's own wait ran out with the target still going, so the debugger broke
+        /// it in at the bound.
+        ///
+        /// Kept apart from `interrupted` for the reason the whole transcript exists:
+        /// both mean the position is real and is *not* a stop the target reached, and they need
+        /// opposite next moves — one had a cause outside the session, the other means the target
+        /// wanted longer. Defaulted, so a transcript written before this field reads back.
+        #[serde(default)]
+        timed_out: bool,
     },
     /// A `run_to_address` verdict.
     RunTo {
@@ -754,6 +763,7 @@ fn derived(call: &InFlight, data: &Value, limit: usize) -> Vec<Event> {
                 command: stop.command,
                 stopped_at: stop.stopped_at,
                 interrupted: stop.interrupted,
+                timed_out: stop.timed_out,
             }]
         }
         "run_to_address" => {
@@ -1120,6 +1130,50 @@ mod tests {
         assert_eq!(command, "g");
         assert_eq!(stopped_at.as_deref(), Some("0xfffff8031ab10000"));
         assert!(!interrupted);
+    }
+
+    /// A stop the target did not reach is recorded as one, and the two reasons are kept apart.
+    ///
+    /// The transcript is values about the session, and this is the value most worth having: a
+    /// `go` broken in at its own bound reports a real position that is **not** where the target
+    /// was going. Copying `interrupted` alone recorded that as an ordinary stop, which is the
+    /// same "a fact that exists in one channel and not another" this whole change is about.
+    #[test]
+    fn a_stop_records_which_of_the_two_reasons_it_did_not_reach() {
+        let (rec, path) = recorder("stop-reasons");
+        for (interrupted, timed_out) in [(false, true), (true, false), (false, false)] {
+            let call = rec.tool_request("go", Some(&serde_json::json!({ "session_id": "s" })));
+            rec.tool_result(
+                call,
+                false,
+                "stopped",
+                Some(&serde_json::json!({
+                    "status": "ok",
+                    "command": "g",
+                    "stopped_at": "0xfffff8031ab10000",
+                    "interrupted": interrupted,
+                    "timed_out": timed_out,
+                    "output": "stopped",
+                })),
+            );
+        }
+
+        let stops: Vec<(bool, bool)> = records(&path)
+            .into_iter()
+            .filter_map(|r| match r.event {
+                Event::Stop {
+                    interrupted,
+                    timed_out,
+                    ..
+                } => Some((interrupted, timed_out)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            stops,
+            [(false, true), (true, false), (false, false)],
+            "each stop must record its own reason, not the first one's"
+        );
     }
 
     /// The security criterion: a raw `connection` reaches this server as a tool argument, and the
