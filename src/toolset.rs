@@ -302,16 +302,25 @@ impl Toolset {
         })
     }
 
-    /// Is this tool served?
     /// Every tool this server has, for the assertions that have to range over all of them.
     ///
     /// `GROUPS` is the table and stays private - this is the read-only view of it that
     /// `src/server.rs` needs to check that no client's `instructions` name a tool it is not
     /// served.
+    ///
+    /// **`cfg(test)` because every caller is an assertion**, all of them in `src/server.rs`'s
+    /// test module: the prose checks that no description, fragment or note names a tool its own
+    /// surface does not serve. Nothing in a shipping build ranges over the whole table - a
+    /// surface answers `includes` for the tools it was asked about - so without the gate this is
+    /// dead code in the `windbg-mcp` binary, which `cargo clippy -- -D warnings` fails on. CI
+    /// runs clippy without `-D warnings`, so the gate is what keeps the stricter local command
+    /// (the one `CLAUDE.md` prescribes) green.
+    #[cfg(test)]
     pub fn every_tool() -> impl Iterator<Item = &'static str> {
         GROUPS.iter().flat_map(|group| group.tools.iter().copied())
     }
 
+    /// Is this tool served?
     pub fn includes(&self, name: &str) -> bool {
         match &self.included {
             None => true,
