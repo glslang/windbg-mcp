@@ -271,13 +271,14 @@ ever fails. Such a record is also not counted as done, so re-running the plan re
 **Grading, separately**, over the log:
 
 ```console
-python3 tools/local_model_eval.py --grade results.jsonl tools/eval_tasks.json
+python3 tools/local_model_eval.py --grade results.jsonl tools/eval_tasks_v1.json
 ```
 
-The suite argument is the one the log's **plan** names, not whichever suite is current —
-`tools/eval_tasks_v1.json` for every log this page reports. It defaults to `tools/eval_tasks.json`,
-so a published log graded with the default loses each record whose question has been reworded
-since; the count and what to do about it print under the table.
+**The suite argument is the one that log's plan names**, not whichever suite is current — the plan
+above writes `results.jsonl` and names `tools/eval_tasks_v1.json`, as does every log this page
+reports. It is optional and defaults to `tools/eval_tasks.json`, so a published log graded with the
+default silently loses each record whose question has been reworded since; the count and what to do
+about it print under the table.
 
 ### Repeating a cell, when the question is a rate
 
