@@ -2277,11 +2277,27 @@ assertions are the easy half.
 asks about, while one driven off `tasks` covers less than the key claims. Neither is wrong; a test
 that has not chosen is.
 
-**Gating is the same discipline as the rest of the tier**, and for the same reason. The module
-counts and the `pc` read a *target*, so a host that resolves no symbols cannot check them and must
-`SKIPPED`-and-pass rather than fail — a green tier there is not the same claim as a green tier
-here. The `0x22200B` decode is the exception and needs no target at all, which is why the tier
-already uses `decode_ioctl` as its pure-tool fixture.
+**Almost none of this needs a symbol gate, and the first draft of this entry said it did** —
+asserted by analogy with the rest of the tier rather than checked against which facts read a
+target, and caught in review on
+[#221](https://github.com/glslang/windbg-mcp/pull/221). `docs/smoke-test.md` already draws the line
+and draws it elsewhere: a host that resolves nothing still reads **the bug check, the module list
+and the stack**, because those come out of the dump's own headers, and fails only the reads
+*behind* them with `0x8007001E`. So the module counts, the 26 unload records, the frame
+attribution, and the `pc` by **either** route — `registers`, or `crash_triage` frame 0 — are all
+checkable on a symbol-poor host. What is not: `walk_memory`, `disassemble`, and the `_EPROCESS`
+read behind `crash_triage`'s `process_name`.
+
+Getting that backwards is not a harmless over-gate. It would have stood these assertions down on
+precisely the hosts that can still run them — the ARM64 CI runner resolved nothing until item 25
+([#153](https://github.com/glslang/windbg-mcp/pull/153)) — so the drift protection would have gone
+quiet on the machine most likely to drift. **Gate on the tier and the dump, as the rest of that
+file does, and reserve the symbol gate for the fields that walk pointers or types.**
+
+Which is a third reason to choose the corpus deliberately: the only symbol-gated fact anywhere near
+this is a **process name**, and `answer_key` carries two (`mm_exploit_v5.exe`, `powershell.exe`)
+while no *task* keys on one. Assert the tasks and no gate is needed at all; assert the key and
+exactly that field needs one.
 
 **One fragility worth writing down while it is in view.** `arm64_pc` claims `possible_on: min`
 because `crash_triage` frame 0 carries the `pc`. That holds on a **freshly opened** dump, which is
