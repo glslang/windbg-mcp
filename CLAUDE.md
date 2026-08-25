@@ -965,7 +965,8 @@ literal `.git/HEAD` is a watched path that does not exist, which Cargo reads as 
 recompiles the crate on every no-op build. And **the two `/api/ps` facts are one call**
 (`runtime_identity`): asking twice could catch different instances and pair one model's window with
 another's digest. **A surface is compared by digest, not byte length** - a same-length reword or an
-equal-sized allowlist swap moves neither the count nor the length - and **`unrecorded` (nobody
+equal-sized allowlist swap moves neither the count nor the length, though a comparison spanning the
+rollout falls back to what both sides recorded and says `unverifiable` rather than `moved` - and **`unrecorded` (nobody
 recorded it) is kept apart from `unavailable`** (this row has no such answer), or every run with a
 Claude cell reads as a legacy log.
 

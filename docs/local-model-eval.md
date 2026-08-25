@@ -543,7 +543,10 @@ lines that appear when something did move were checked against a log doctored to
   is the very intervention a rerun exists to measure. The fingerprint is a **digest of the surface
   as it went over the wire**, not its length: a byte count moves for almost any prose edit and for
   none reliably, so a same-length reword or an equal-sized allowlist swap would leave it saying
-  nothing had happened. Naming them is not a nicety: this repo has three times read a moved
+  nothing had happened. Adopting the digest is not itself a change, so a comparison across that
+  rollout falls back to what both runs recorded and reports the surface as **unverifiable** rather
+  than as moved — a match on count and length with no digest on one side cannot rule out the very
+  edit the digest exists to see. Naming them is not a nicety: this repo has three times read a moved
   aggregate as a controlled result, and every one was a **composition** error, where the callers
   changed and the total held.
 
