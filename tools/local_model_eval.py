@@ -936,13 +936,22 @@ def verify_against(drive, suite, tasks):
         print(f"  {len(drive.PRE_EXISTING)} session(s) already open on this credential; this run "
               f"will neither adopt nor release them")
 
-    unpinned = [t["id"] for t in tasks if not t.get("verify")]
+    # **A task with no binding is the hole this mode exists to close**, so it fails rather than
+    # being skipped quietly: an unpinned task is one whose facts nothing re-reads, which is the
+    # state the whole suite was in before this existed.
+    #
+    # **And a task with no `expect` is the same hole at the other end**, which is worse than it
+    # sounds: `matches()` runs `all()` over the group list, and `all([])` is true, so an empty
+    # `expect` grades *every* non-empty answer correct. Checking only for `verify` accepted that
+    # and then found nothing to complain about downstream, since a suite with no groups has no
+    # ungrounded ones.
+    unpinned = [t["id"] for t in tasks if not t.get("verify") or not t.get("expect")]
     if unpinned:
-        # **A task with no binding is the hole this mode exists to close**, so it fails rather
-        # than being skipped quietly: an unpinned task is one whose facts nothing re-reads, which
-        # is the state the whole suite was in before this existed.
-        print(f"\nFAILED: {', '.join(unpinned)} carry no `verify` binding, so nothing re-reads "
-              f"the facts they are graded against")
+        print(f"\nFAILED: {', '.join(unpinned)} "
+              f"{'carry' if len(unpinned) > 1 else 'carries'} no `verify` binding or no `expect` "
+              f"groups, "
+              f"so nothing re-reads the facts they are graded against - and a task with no groups "
+              f"grades every answer correct")
         return 1
 
     failed, leaked, unchecked = {}, [], []

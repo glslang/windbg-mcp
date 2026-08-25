@@ -272,7 +272,9 @@ writes prose where a tool writes an identifier) and `` fffff801`3c65bca8 `` besi
 while `access_violation` is refused as a second *fact* rather than a second spelling.
 
 A group **no** step claims is a failure too, and that is the ratchet: `expect` cannot grow a fact
-the binding does not fetch, and a new task cannot arrive unpinned.
+the binding does not fetch, and a new task cannot arrive unpinned — nor with **no** `expect` at all,
+which is the same hole at the other end and worse than it sounds: `matches()` runs `all()` over the
+group list, and `all([])` is true, so a task with no groups grades every answer correct.
 
 **Which corpus is asserted, said rather than implied.** The run names the dumps it re-read and then
 names the ones it did not: `answer_key` is prose, nothing reads it — `matches()` grades from
