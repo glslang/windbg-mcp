@@ -4176,8 +4176,15 @@ fn a_raw_execution_control_command_moves_the_target_instead_of_wedging_the_sessi
         json!({ "command_line": LIVE_TARGET }),
         TARGET_STEP,
     );
+    // Armed before the loop so the `g` has somewhere to stop. Harmless to the two steps, which
+    // stop on their own next instruction whatever is armed.
+    server.tool_data(
+        "set_breakpoint",
+        json!({ "session_id": &session, "expression": "ntdll!NtCreateFile" }),
+        TARGET_STEP,
+    );
 
-    for command in ["t", "p"] {
+    for command in ["t", "p", "g"] {
         let out = server.tool_text(
             "execute",
             json!({ "session_id": &session, "command": command }),
@@ -4185,33 +4192,31 @@ fn a_raw_execution_control_command_moves_the_target_instead_of_wedging_the_sessi
         );
         // The bug's own signature, quoted from the issue: "returns only the echoed command text".
         //
-        // A step's *position* is what says it moved, because DbgEng prints nothing else for one:
-        // measured, the pump captures module loads and a stop banner for a `g` and an empty
+        // For a step the *position* is what says it moved, because DbgEng prints nothing else for
+        // one: measured, the pump captures module loads and a stop banner for a `g` and an empty
         // string for a `t`, since the engine prints a step's new location from the command's own
         // completion rather than from the wait.
         assert!(
             out.contains("moved the target"),
             "`execute` with `{command}` answered `{out}`, which does not say the target moved"
         );
+
+        // Checked **per command**, not once at the end: this is the property the issue is about,
+        // and one check afterwards can only say that one of three commands broke the session.
+        // `.lastevent` goes into the message rather than into an assertion of its own — it is what
+        // tells a wedged engine apart from a target that simply went away, and those need opposite
+        // responses while producing identical execution-control failures.
+        let after = server.call_tool("registers", json!({ "session_id": &session }), TARGET_STEP);
+        let last = last_event(&mut server, &session);
+        assert!(
+            !is_tool_error(&after),
+            "the session is unusable after `execute` with `{command}`, which is the bug. Its \
+             output was `{out}`; `registers` now answers {after}; the debugger's last event was \
+             `{last}`"
+        );
     }
 
-    server.tool_data(
-        "set_breakpoint",
-        json!({ "session_id": &session, "expression": "ntdll!NtCreateFile" }),
-        TARGET_STEP,
-    );
-    let out = server.tool_text(
-        "execute",
-        json!({ "session_id": &session, "command": "g" }),
-        TARGET_STEP,
-    );
-    assert!(
-        out.contains("Breakpoint"),
-        "a raw `g` must run the target on to its breakpoint and report the stop: {out}"
-    );
-
-    // The property the issue is actually about, and the one no amount of output can stand in for:
-    // execution control still works on this session afterwards.
+    // And the same property through the typed tool, which is what a caller reaches for next.
     let stop = server.tool_data("go", json!({ "session_id": &session }), TARGET_STEP);
     assert_eq!(
         stop["timed_out"], false,
@@ -4227,6 +4232,16 @@ fn a_raw_execution_control_command_moves_the_target_instead_of_wedging_the_sessi
         json!({ "session_id": &session }),
         TARGET_STEP,
     );
+}
+
+/// `.lastevent`, or whatever came back instead — for a failure message, never for an assertion.
+fn last_event(server: &mut Server, session: &str) -> String {
+    let response = server.call_tool(
+        "execute",
+        json!({ "session_id": session, "command": ".lastevent" }),
+        TARGET_STEP,
+    );
+    text_of(&response["result"]).trim().replace('\n', " | ")
 }
 
 /// A resume that reaches **no** stop says so, and leaves the session usable.
