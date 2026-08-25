@@ -546,7 +546,8 @@ lines that appear when something did move were checked against a log doctored to
   nothing had happened. Adopting the digest is not itself a change, so a comparison across that
   rollout falls back to what both runs recorded and reports the surface as **unverifiable** rather
   than as moved — a match on count and length with no digest on one side cannot rule out the very
-  edit the digest exists to see. Naming them is not a nicety: this repo has three times read a moved
+  edit the digest exists to see. Where *neither* side has one, that is true of every cell equally
+  and is said once beneath the table rather than on every row. Naming them is not a nicety: this repo has three times read a moved
   aggregate as a controlled result, and every one was a **composition** error, where the callers
   changed and the total held.
 
