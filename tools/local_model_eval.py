@@ -1434,13 +1434,13 @@ def print_matrix(order, rows):
     # rather than merely look untidy.
     marks = [m.get("mark") or "" for row in rows.values() for m in row.values()]
     width = max([len(t) for t in order] + [len(m) for m in marks] or [0]) + 2
-    header = f"{'cell':<44}" + "".join(f"{t:<{width}}" for t in order)
+    header = f"{'cell':<52}" + "".join(f"{t:<{width}}" for t in order)
     print("\n" + header)
     print("-" * len(header))
     for cell, marks in sorted(rows.items(), key=lambda kv: cell_order(kv[0])):
         backend, model, ctx, surface = cell
         label = f"{model[:24]} {str(ctx or 'dflt'):>6} {surface}"
-        print(f"{label:<44}" + "".join(f"{marks.get(t, {}).get('mark', ' '):<{width}}"
+        print(f"{label:<52}" + "".join(f"{marks.get(t, {}).get('mark', ' '):<{width}}"
                                        for t in order))
     print("\nY correct   n wrong   - not answerable on this surface   "
           "o answered anyway   ! the runtime refused the request   "
@@ -1560,6 +1560,19 @@ def print_identity(ident, indent="  ", header=True):
               f"filled in afterwards; {UNAVAILABLE} is a row that has no such answer to give)")
 
 
+def cell_label(cell):
+    """A cell as a row heading — **backend included**, since a cell is keyed by it.
+
+    An ollama tag and a Claude Code alias may be the same string (`sonnet` is the example this bench
+    could reach), and two rows rendering identically leave a reader no way to tell which movement
+    note belongs to which backend. The summary table has a `backend` column; these rows are one
+    line, so it goes in the label.
+    """
+    backend, model, context, client = cell
+    return (f"{(backend or '?')[:11]} {(model or '?')[:24]} "
+            f"{str(context or 'dflt'):>6} {client or '?'}")
+
+
 def cell_order(cell):
     """How a `(backend, model, num_ctx, client)` key sorts — **never the raw tuple**.
 
@@ -1573,7 +1586,7 @@ def cell_order(cell):
 
 
 def cell_facts(log_records):
-    """Per cell, the two variables a run-wide identity line cannot hold.
+    """Per cell, the three variables a run-wide identity line cannot hold.
 
     **A surface and a served window belong to a cell, not to a log.** The grid varies both on
     purpose, so listing them run-wide says nothing: two runs both covering `min` at three windows
@@ -1601,7 +1614,14 @@ def cell_facts(log_records):
         surface = record.get("surface") or {}
         cell_id = (record.get("backend"), record.get("model"), record.get("num_ctx"),
                    surface.get("client"))
-        entry = facts.setdefault(cell_id, {"surface": set(), "window": set()})
+        entry = facts.setdefault(cell_id, {"surface": set(), "window": set(), "weights": set()})
+        # **The weights per cell, not only per run.** The identity block's `weights` line is a
+        # run-wide set, and a set loses which digest answered which cell: two runs whose *same two*
+        # digests are assigned to opposite cells - a tag re-pulled between them - compare equal
+        # there and pair results produced by different weights. This is the same per-cell reading
+        # the surface and the window already get.
+        if record.get("model_digest"):
+            entry["weights"].add(record["model_digest"][:12])
         if surface.get("tools") is not None or surface.get("bytes") is not None:
             # **Kept as its parts, not as a rendered string.** A cell-failure note carries the
             # client and nothing else, so it contributes nothing rather than an `unrecorded`
@@ -1654,10 +1674,11 @@ def moved_cells(old_facts, new_facts):
                     ("surface", surface_text(was), surface_text(now), "unverifiable"))
             elif not any(digested):
                 undigested.add(cell)
-        was, now = sorted(before.get("window") or []), sorted(after.get("window") or [])
-        if was and now and was != now:
-            moved.setdefault(cell, []).append(
-                ("window", ", ".join(was), ", ".join(now), "moved"))
+        for name in ("window", "weights"):
+            was, now = sorted(before.get(name) or []), sorted(after.get(name) or [])
+            if was and now and was != now:
+                moved.setdefault(cell, []).append(
+                    (name, ", ".join(was), ", ".join(now), "moved"))
     return moved, undigested
 
 
@@ -1736,13 +1757,12 @@ def print_compare(order, rows, identities, surfaces, old_path, new_path):
     width = max([len(t) for t in order]
                 + [len(f"{m.get('old', '')} -> {m.get('new', '')}")
                    for row in rows.values() for m in row.values()] or [0]) + 2
-    header = f"{'cell':<44}" + "".join(f"{t:<{width}}" for t in order)
+    header = f"{'cell':<52}" + "".join(f"{t:<{width}}" for t in order)
     print("\n" + header)
     print("-" * len(header))
     blocked = {}
     for cell, marks in rows.items():
-        backend, model, ctx, surface = cell
-        label = f"{model[:24]} {str(ctx or 'dflt'):>6} {surface}"
+        label = cell_label(cell)
         rendered_row = []
         for task in order:
             mark = marks.get(task)
@@ -1755,7 +1775,7 @@ def print_compare(order, rows, identities, surfaces, old_path, new_path):
                 rendered_row.append("--")
             else:
                 rendered_row.append(f"{mark['old']} -> {mark['new']}")
-        print(f"{label:<44}" + "".join(f"{r:<{width}}" for r in rendered_row))
+        print(f"{label:<52}" + "".join(f"{r:<{width}}" for r in rendered_row))
     print("\nold -> new per cell-task; `(old)`/`(new)` is a cell only one run covered.")
     for reason, tasks in blocked.items():
         # At the row rather than in a header, which is the same principle as the `UNCOUNTED` line
@@ -1766,14 +1786,14 @@ def print_compare(order, rows, identities, surfaces, old_path, new_path):
         # block is per run - and named rather than blocking, for the reason `cell_facts` gives.
         print("\ncells where something besides the question moved:")
         for cell, moved in moved_by_cell.items():
-            label = f"{(cell[1] or '?')[:24]} {str(cell[2] or 'dflt'):>6} {cell[3] or '?'}"
+            label = cell_label(cell)
             for name, was, now, kind in moved:
                 if kind == "unverifiable":
-                    print(f"  {label:<40} {name} {was} -> {now} (same on what both runs "
+                    print(f"  {label:<52} {name} {was} -> {now} (same on what both runs "
                           f"recorded; only one has a digest, so a same-length edit cannot be "
                           f"ruled out)")
                 else:
-                    print(f"  {label:<40} {name} {was} -> {now}")
+                    print(f"  {label:<52} {name} {was} -> {now}")
     if undigested:
         print(f"\n{len(undigested)} cell(s) agree on tool count and byte length with **no surface "
               f"digest on either side**, so a same-length edit cannot be ruled out for them. Both "
