@@ -846,18 +846,34 @@ fn read_version_field(field: &str) -> String {
             .collect()
     }
 
-    /// One sub-block of a version-info block, or `None` where it holds no such key.
-    fn query(block: &[u8], sub: &str) -> Option<(*const u16, u32)> {
+    /// One sub-block of a version-info block, as the UTF-16 units it holds — `None` where the block
+    /// has no such key.
+    ///
+    /// **Borrowed from `block`**, so the compiler enforces what a raw pointer out of
+    /// `VerQueryValueW` cannot say for itself. Returning the pointer instead put a value with no
+    /// lifetime across a function boundary, and nothing but a comment then stopped a later edit
+    /// reading it after `block` had gone; CodeQL was right to call that an invalid dereference.
+    ///
+    /// **`unit_bytes` is what `VerQueryValueW` reports the length *in*, and it is not one answer:**
+    /// `\VarFileInfo\Translation` comes back as a **byte** count and a string value as a
+    /// **character** count. That asymmetry is documented, and it is exactly what a helper that
+    /// picked one unit would turn into a slice running off the end of the block — so the caller
+    /// names it.
+    fn query<'a>(block: &'a [u8], sub: &str, unit_bytes: u32) -> Option<&'a [u16]> {
         let sub = wide(sub);
         let mut value: *mut core::ffi::c_void = std::ptr::null_mut();
         let mut len: u32 = 0;
-        // SAFETY: `block` holds a version-info block written by `GetFileVersionInfoW`, and `sub`
-        // is NUL-terminated. `value` and `len` are written only on success. The pointer handed back
-        // points *into* `block` and carries no lifetime saying so, which is the one thing a caller
-        // has to honour: both callers here read it before `block` goes out of scope.
+        // SAFETY: `block` holds a version-info block written by `GetFileVersionInfoW`, and `sub` is
+        // NUL-terminated. `value` and `len` are written only on success.
         let found =
             unsafe { VerQueryValueW(block.as_ptr().cast(), sub.as_ptr(), &mut value, &mut len) };
-        (found != 0 && len > 0).then(|| (value.cast::<u16>().cast_const(), len))
+        let units = (len as usize * unit_bytes as usize) / size_of::<u16>();
+        (found != 0 && units > 0).then(|| {
+            // SAFETY: on success the value lies inside `block` and spans `units` UTF-16 units, so
+            // the slice is in bounds — and the returned lifetime is `block`'s, which is what makes
+            // that hold for every read of it rather than only for the ones written today.
+            unsafe { std::slice::from_raw_parts(value.cast::<u16>().cast_const(), units) }
+        })
     }
 
     let missing = |what: &str| -> ! {
@@ -884,22 +900,19 @@ fn read_version_field(field: &str) -> String {
     // A value's key is qualified by language and codepage, and the block says which pair it wrote:
     // `winresource` emits the *language-neutral* `000004b0`, so the `040904b0` a hard-coded key
     // would name reads nothing at all.
-    let Some((translation, len)) = query(&block, r"\VarFileInfo\Translation") else {
+    let Some(translation) = query(&block, r"\VarFileInfo\Translation", 1) else {
         missing("its version resource declares no translation");
     };
-    if len < 4 {
+    // A `Translation` value is a run of (language, codepage) pairs; the first is the one to use.
+    if translation.len() < 2 {
         missing("its translation table is shorter than one language/codepage pair");
     }
-    // SAFETY: a `Translation` value is a run of (language, codepage) `u16` pairs, and `len` has
-    // just been checked to cover the first of them.
-    let (language, codepage) = unsafe { (*translation, *translation.add(1)) };
+    let (language, codepage) = (translation[0], translation[1]);
 
     let key = format!(r"\StringFileInfo\{language:04x}{codepage:04x}\{field}");
-    let Some((text, len)) = query(&block, &key) else {
+    let Some(text) = query(&block, &key, size_of::<u16>() as u32) else {
         missing("its version resource carries no such field");
     };
-    // SAFETY: the value is `len` UTF-16 code units, its NUL terminator included.
-    let text = unsafe { std::slice::from_raw_parts(text, len as usize) };
     String::from_utf16_lossy(text)
         .trim_end_matches('\0')
         .to_string()
