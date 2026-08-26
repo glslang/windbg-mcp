@@ -49,6 +49,14 @@ const PIPE_TIMEOUT: Duration = crate::engine::WORKER_READY_TIMEOUT.saturating_su
 /// How often to look for it. The pipe appears once, so this only costs a few wake-ups.
 const PIPE_POLL: Duration = Duration::from_millis(100);
 
+/// The whole budget for bringing a host up, however many candidates that takes.
+///
+/// Exposed so the caller arms one deadline and shares it, rather than each candidate restarting
+/// the clock the supervisor is measuring against. See [`EngineHost::start`].
+pub fn startup_budget() -> Duration {
+    PIPE_TIMEOUT
+}
+
 /// A debugging server this process started, and the connection string that reaches it.
 ///
 /// **Owned by the worker that spawned it**, which is what makes the teardown below sound: one
@@ -257,7 +265,17 @@ impl EngineHost {
     /// rather than `cdb`, since a pipe we do not create is a DACL we cannot set.
     ///
     /// The same qualifier applies to a live target, for the teardown reason in [`Self::shutdown`].
-    pub fn start(cdb: &Path, dump: &Path) -> io::Result<Self> {
+    /// `deadline` is when to give up waiting for the pipe — **shared across every candidate**, not
+    /// restarted for each. The caller has one budget (the supervisor's patience before it kills
+    /// this worker), and a per-host timeout spends it more than once: a first candidate that hangs
+    /// without publishing would leave the next too little time to start, so the fallback that
+    /// exists to reach a working host would be defeated by the broken one it is falling back from.
+    ///
+    /// This does mean a slow first candidate can starve a later one. That is the honest trade and
+    /// it costs little in practice, because the failure the fallback was added for — an engine
+    /// version the client will not talk to — is refused at *connect*, in milliseconds, not by
+    /// timing out here.
+    pub fn start(cdb: &Path, dump: &Path, deadline: Instant) -> io::Result<Self> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let pipe = format!(
             "windbg-mcp-{}-{}",
@@ -347,7 +365,7 @@ impl EngineHost {
             pipe,
             job,
         };
-        host.await_pipe()?;
+        host.await_pipe(deadline)?;
         Ok(host)
     }
 
@@ -366,8 +384,7 @@ impl EngineHost {
     /// Polling the pipe namespace rather than sleeping a fixed interval, because the two failures
     /// are different and only this tells them apart: a host that died has to be reported as a host
     /// that died, and a host that is merely slow has to be waited for.
-    fn await_pipe(&mut self) -> io::Result<()> {
-        let deadline = Instant::now() + PIPE_TIMEOUT;
+    fn await_pipe(&mut self, deadline: Instant) -> io::Result<()> {
         loop {
             // A host that exited is never going to publish anything. Checked before the namespace
             // so the error names the real problem.
@@ -381,9 +398,13 @@ impl EngineHost {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                return Err(io::Error::other(format!(
-                    "the engine host did not serve its pipe within {PIPE_TIMEOUT:?}"
-                )));
+                // Names the budget that was left, not the constant: with several candidates the
+                // deadline is shared, so a later one can be given much less than `PIPE_TIMEOUT`
+                // and reporting that constant would describe a wait nobody did.
+                return Err(io::Error::other(
+                    "the engine host did not serve its pipe before the startup budget ran out"
+                        .to_string(),
+                ));
             }
             std::thread::sleep(PIPE_POLL);
         }
@@ -600,7 +621,8 @@ mod tests {
             cdb.display()
         );
 
-        let mut host = EngineHost::start(&cdb, Path::new(&dump)).expect("the engine host starts");
+        let mut host = EngineHost::start(&cdb, Path::new(&dump), Instant::now() + startup_budget())
+            .expect("the engine host starts");
         let engine = dbgscope::dbgeng::DebugEngine::connect(host.connection())
             .expect("the engine host is reachable on its own connection string");
 

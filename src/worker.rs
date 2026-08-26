@@ -798,10 +798,15 @@ fn build_engine(
     // the WinDbg package, and only one of them may be version-compatible with the `dbgeng.dll`
     // bundled beside this server. Giving up on the first would leave SOS unavailable with a usable
     // host sitting on the disk.
+    // **One budget for all of them**, because the supervisor has one: it kills this worker if
+    // `Ready` has not arrived within `WORKER_READY_TIMEOUT`, and that clock does not restart per
+    // candidate. Giving each a fresh timeout would spend the same seconds twice and let a first
+    // candidate that hangs starve the very fallback added to get past it.
+    let deadline = Instant::now() + crate::enginehost::startup_budget();
     let mut started = Err("no engine host was tried".to_string());
     let mut used = None;
     for cdb in &candidates {
-        started = EngineHost::start(cdb, target)
+        started = EngineHost::start(cdb, target, deadline)
             .map_err(|e| e.to_string())
             .and_then(|host| {
                 match DebugEngine::connect(host.connection()) {
@@ -1198,12 +1203,20 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             |commit| {
                 // **Already open**, when this session's engine lives in a host started with
                 // `-z <dump>`: that host opened the target before this worker ever connected, and
-                // opening it again on the same session is an error rather than a no-op. The claim
-                // still has to be committed — a target is held either way, and the supervisor's
-                // teardown depends on knowing that.
+                // opening it again on the same session is an error rather than a no-op.
+                //
+                // **Confirmed first, committed second** — the opposite order to the local path
+                // below, and for the same reason it uses that one. There, `open_dump` *is* the
+                // claim, so the commit follows it. Here the claim happened in another process
+                // before this one connected, and publishing a pipe is not evidence of it: a host
+                // can serve its transport and still fail to open the file behind it. Committing on
+                // the strength of the transport alone would report `target: yes` for a session
+                // holding nothing, which tells the caller to reclaim rather than retry — the one
+                // thing that answer is for.
                 if host_opened_target() {
+                    await_hosted_target(e)?;
                     commit();
-                    return await_hosted_target(e);
+                    return Ok(());
                 }
                 // `open_dump` is the call that claims the target, so commit right after it: a
                 // load wait that times out still leaves DbgEng holding the dump.
