@@ -333,6 +333,20 @@ impl EngineOp {
                 | Self::Launch { .. }
         )
     }
+
+    /// The dump this op opens, if it opens one.
+    ///
+    /// Read by the supervisor *before* it spawns a worker, because the architecture of a dump
+    /// decides which process that worker's engine should live in and there is no undoing that
+    /// choice later — see [`crate::worker::TARGET_FLAG`]. Deliberately **not** `OpenTrace`: a
+    /// trace is not a minidump, and replaying one is a capability of the engine bundle rather
+    /// than a question about the target's architecture.
+    pub fn dump_path(&self) -> Option<&str> {
+        match self {
+            Self::OpenDump { path } => Some(path),
+            _ => None,
+        }
+    }
 }
 
 /// `reachable_from_dispatch`'s arguments, after the supervisor has applied its defaults.

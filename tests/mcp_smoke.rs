@@ -11416,3 +11416,93 @@ fn ttd_queries_answer_with_the_fields_they_promise() {
     server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
     let _ = std::fs::remove_dir_all(&out_dir);
 }
+
+/// The gate for the **32-bit managed dump** tier: a dump this repository cannot carry.
+///
+/// A full-memory capture of even a trivial .NET process is tens of megabytes — several times this
+/// whole repository — so unlike the kernel samples it is supplied rather than checked in. Produce
+/// one with `procdump.exe -ma <pid> <file>` (the **32-bit** procdump, which is what makes it a
+/// 32-bit capture) against any .NET Framework process, and point the variable at it.
+fn x86_dump_tier() -> Option<String> {
+    let Some(dump) = std::env::var_os("WINDBG_MCP_X86_DUMP") else {
+        skip("set WINDBG_MCP_X86_DUMP to a 32-bit managed dump to run the x86-host tier");
+        return None;
+    };
+    let dump = dump.to_string_lossy().into_owned();
+    if !std::path::Path::new(&dump).exists() {
+        skip(&format!("WINDBG_MCP_X86_DUMP points at nothing: {dump}"));
+        return None;
+    }
+    Some(dump)
+}
+
+/// A 32-bit managed dump is served by an engine that can load its SOS, and says so by **not**
+/// reporting a limitation.
+///
+/// This is the whole of [#234](https://github.com/glslang/windbg-mcp/issues/234) end to end, and it
+/// is the one claim no other tier makes: an extension is loaded into the debugger's own process, so
+/// a 32-bit `sos.dll` is unreachable from this server's own x64 engine and the 64-bit one refuses a
+/// 32-bit CLR. Getting `!threads` to answer therefore proves the engine is somewhere else.
+///
+/// Asserts through the **tool surface** rather than against `enginehost` directly, because the unit
+/// test beside that module already covers the mechanism. What this adds is that the routing
+/// happens at all: that opening a dump by path lands on an x86 host without the caller asking.
+#[test]
+fn a_32_bit_managed_dump_is_served_by_an_engine_that_can_load_its_sos() {
+    let Some(dump) = x86_dump_tier() else { return };
+    let mut server = Server::started();
+
+    let data = server.tool_data("open_dump", json!({ "path": &dump }), TARGET_STEP);
+    let session = data["session_id"]
+        .as_str()
+        .expect("open_dump mints a handle")
+        .to_string();
+
+    // A host was found and used, so there is nothing this session cannot do. When no x86 `cdb.exe`
+    // is on the machine this field is what carries the explanation instead — the fallback is loud
+    // by design, and a run on such a host fails here rather than passing quietly.
+    assert!(
+        data["limitation"].is_null(),
+        "this host could not give the dump an x86 engine, so SOS is unreachable: {}",
+        data["limitation"]
+    );
+
+    // The extension has to come from the target's own framework directory: it is the 32-bit build,
+    // which is exactly the file this server's own process cannot load.
+    let loaded = server.call_tool(
+        "execute",
+        json!({
+            "session_id": &session,
+            "command": r".load C:\Windows\Microsoft.NET\Framework\v4.0.30319\sos.dll",
+        }),
+        TARGET_STEP,
+    );
+    assert_no_error(&loaded, "execute .load sos");
+    let loaded = text_of(&loaded["result"]);
+    assert!(
+        !loaded.contains("0n193") && !loaded.contains("not a valid Win32 application"),
+        "the 32-bit SOS was refused, so this session's engine is not 32-bit:\n{loaded}"
+    );
+
+    // **Module-qualified, and it has to be.** `open_dump` loads `ext.dll`, which exports a
+    // `!threads` of its own — the native thread table — and a bare `!threads` resolves to that
+    // one, so it answers on any engine and would prove nothing about SOS. Same reason the
+    // crash-dump path prefers `!ext.analyze -v` over `!analyze`.
+    let threads = server.call_tool(
+        "execute",
+        json!({ "session_id": &session, "command": "!sos.threads" }),
+        TARGET_STEP,
+    );
+    assert_no_error(&threads, "execute !sos.threads");
+    let threads = text_of(&threads["result"]);
+    assert!(
+        threads.contains("ThreadCount"),
+        "SOS loaded but did not answer about managed threads:\n{threads}"
+    );
+
+    server.call_tool(
+        "end_session",
+        json!({ "session_id": &session }),
+        TARGET_STEP,
+    );
+}

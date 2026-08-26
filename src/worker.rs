@@ -37,6 +37,7 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, PipeReader, PipeWriter, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
@@ -52,6 +53,7 @@ use dbgscope::pool::{
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
 use crate::batch::{self, BatchOp, Debuggee, Ran};
+use crate::enginehost::EngineHost;
 use crate::proto::{
     EngineOp, Failed, HeapBackendFilter, HeapOp, HeapStateFilter, MAX_MODULE_ROWS, Output, PoolOp,
     ReachabilityOp, WorkerMessage, WorkerRequest,
@@ -76,6 +78,18 @@ pub const WORKER_FLAG: &str = "--engine-worker";
 /// that inherited it, so these are only ever valid in the child the supervisor spawned with them.
 pub const REQUESTS_FLAG: &str = "--requests-handle=";
 pub const MESSAGES_FLAG: &str = "--messages-handle=";
+
+/// The flag naming the dump this worker was spawned for, when it was spawned for one.
+///
+/// It exists because **the engine has to be built before the opener arrives**. A 32-bit dump wants
+/// an engine in a 32-bit process, and that cannot be decided after the fact: `Ready` means the
+/// engine exists, `INTERRUPT` is taken from it once into a `OnceLock`, and an engine swapped
+/// mid-session would leave `interrupt` pointing at a dead one. So the supervisor forwards the path
+/// it already holds and this worker decides on it — see [`build_engine`].
+///
+/// The path is a caller's, not a secret: the connection strings that *are* secret travel down the
+/// protocol pipe instead ([`crate::proto::EngineOp::AttachKernel`]), and never on a command line.
+pub const TARGET_FLAG: &str = "--engine-target=";
 
 /// Reads the two inherited handle values off the command line.
 ///
@@ -515,6 +529,13 @@ pub fn run(args: &[String]) -> ! {
     let _ = MESSAGES.set(Mutex::new(messages));
     start_log_writer();
 
+    // Optional, and absent for every opener but a dump. Unlike the two handles above, a missing
+    // one is not a fault: it means "this worker is not for a dump", which is the common case.
+    let target = args
+        .iter()
+        .find_map(|arg| arg.strip_prefix(TARGET_FLAG))
+        .map(PathBuf::from);
+
     // Each request is stamped when it is *read*, so the engine thread can tell how long it then
     // waited its turn — the half of the watchdog budget only this process can measure.
     let (tx, rx) = mpsc::channel::<Job>();
@@ -523,7 +544,7 @@ pub fn run(args: &[String]) -> ! {
     // ready" and lose the reason.
     if let Err(e) = thread::Builder::new()
         .name("dbgeng".into())
-        .spawn(move || engine_thread(rx))
+        .spawn(move || engine_thread(rx, target))
     {
         emit(&WorkerMessage::Fatal {
             message: format!("could not start the engine thread: {e}"),
@@ -682,24 +703,174 @@ fn start_log_writer() {
     }
 }
 
+/// What this worker's engine turned out to be, for the two later decisions that depend on it.
+struct HostState {
+    /// The engine host was started with `-z <dump>`, so the target is **already open** and the
+    /// opener must not open it again.
+    opened_target: bool,
+    /// What this session cannot do that a caller would otherwise assume it can. `None` is the
+    /// ordinary case and says nothing.
+    limitation: Option<String>,
+}
+
+/// Set once, by [`engine_thread`], before `Ready`.
+static HOST: OnceLock<HostState> = OnceLock::new();
+
+/// Whether the engine host opened this worker's target when it was started.
+fn host_opened_target() -> bool {
+    HOST.get().is_some_and(|state| state.opened_target)
+}
+
+/// What this session cannot do, if anything.
+fn host_limitation() -> Option<String> {
+    HOST.get().and_then(|state| state.limitation.clone())
+}
+
+/// Builds this worker's engine — in this process, or in a child of the target's architecture.
+///
+/// **Only a 32-bit user-mode dump takes the second path**, and only when this build is not itself
+/// 32-bit. Everything else — a kernel dump, a trace, an attach, a launch, an x64 dump — is opened
+/// here exactly as before, and reaching for the header read costs those a few hundred bytes off
+/// the front of a file.
+///
+/// **A failure to put the engine elsewhere is not a failure to open.** An x86 dump opens here
+/// today and native analysis of it works; that must keep working when there is no x86 `cdb.exe` on
+/// the host, or when starting one fails. So those paths fall back — but *loudly*, carrying a
+/// limitation the caller is told about rather than quietly producing a session whose SOS commands
+/// will all fail with something that names none of this.
+fn build_engine(
+    target: Option<&Path>,
+) -> Result<(DebugEngine, Option<EngineHost>, HostState), String> {
+    // `DebugEngine::new()` panics if the engine cannot be created — dbgeng.dll not discoverable,
+    // most likely.
+    let local = || -> Result<DebugEngine, String> {
+        catch_unwind(AssertUnwindSafe(DebugEngine::new))
+            .map_err(|_| "failed to initialize DbgEng (is dbgeng.dll on the search path?)".into())
+    };
+    let here = |limitation: Option<String>| {
+        local().map(|engine| {
+            (
+                engine,
+                None,
+                HostState {
+                    opened_target: false,
+                    limitation,
+                },
+            )
+        })
+    };
+
+    let Some(target) = target else {
+        return here(None);
+    };
+    match crate::dump::read(target) {
+        Ok(crate::dump::DumpTarget::UserMinidump(crate::dump::Arch::X86)) => {}
+        Ok(crate::dump::DumpTarget::UserMinidump(arch)) => {
+            tracing::debug!(
+                "worker: {} is a {} user dump; opening it in this process",
+                target.display(),
+                arch.label()
+            );
+            return here(None);
+        }
+        Ok(crate::dump::DumpTarget::Other) => return here(None),
+        Err(why) => {
+            // Not an error worth failing an open over: the engine reads the file next and will
+            // say far more about it than a header parser can.
+            tracing::debug!(
+                "worker: could not read {}'s header ({why}); opening it in this process",
+                target.display()
+            );
+            return here(None);
+        }
+    }
+    // A 32-bit build has nowhere better to put the engine than where it already is.
+    if std::env::consts::ARCH == "x86" {
+        return here(None);
+    }
+
+    let Some(cdb) = EngineHost::find(crate::ttd::Arch::X86) else {
+        return here(Some(NO_X86_HOST.to_string()));
+    };
+    let started = EngineHost::start(&cdb, target)
+        .map_err(|e| e.to_string())
+        .and_then(|host| {
+            match DebugEngine::connect(host.connection()) {
+                Ok(engine) => Ok((engine, host)),
+                // The host is dropped here, which kills it — the client it was started for is never
+                // going to arrive.
+                Err(e) => Err(e.to_string()),
+            }
+        });
+    match started {
+        Ok((engine, host)) => {
+            tracing::info!(
+                "worker: this 32-bit target is served by {} on pipe {}",
+                cdb.display(),
+                host.pipe()
+            );
+            Ok((
+                engine,
+                Some(host),
+                HostState {
+                    opened_target: true,
+                    limitation: None,
+                },
+            ))
+        }
+        Err(why) => {
+            tracing::warn!(
+                "worker: could not put this session's engine in an x86 host ({why}); opening the \
+                 dump in this process instead"
+            );
+            here(Some(format!("{X86_HOST_FAILED} The host reported: {why}")))
+        }
+    }
+}
+
+/// Told to a caller whose 32-bit dump this host cannot give an x86 engine.
+///
+/// **Names no tool**, deliberately: this is built in the worker, which owns one session and has
+/// never heard of the caller's surface (`FOLLOWUPS.md` item 43). It names a document instead,
+/// which every caller can reach.
+const NO_X86_HOST: &str = "This is a 32-bit dump and this server's engine is not, so the .NET SOS \
+                           extension cannot be loaded for it: an extension is loaded into the \
+                           debugger's own process, and from here neither the 32-bit `sos.dll` \
+                           (which will not load) nor the 64-bit one (which refuses a 32-bit CLR) \
+                           can work. Native analysis — stacks, modules, memory, disassembly — is \
+                           unaffected. To make SOS available, put `cdb.exe` and its engine DLLs \
+                           from a debugger package's `x86` payload into an `x86\\` directory \
+                           beside this server's executable; the skill's `setup.md` has the copy \
+                           block.";
+
+/// The same, where a host was found but could not be used.
+const X86_HOST_FAILED: &str = "This is a 32-bit dump, and the x86 engine host that would let the \
+                               .NET SOS extension load could not be started, so the dump was \
+                               opened by this server's own engine instead. Native analysis is \
+                               unaffected. Both engines must come from the same debugger package: \
+                               a client older than the host is refused with `0x8007053D`, \"The \
+                               server is currently disabled\", which names neither end.";
+
 /// Owns the [`DebugEngine`] for the life of the process and runs one op at a time.
-fn engine_thread(rx: mpsc::Receiver<Job>) {
-    // `DebugEngine::new()` panics if the engine can't be created (dbgeng.dll not discoverable,
-    // most likely). Report it and exit instead of accepting requests that can only fail: the
-    // supervisor is waiting for exactly one of these two messages before it registers a
-    // session, so it can report a dead engine as server machinery rather than as a debugger
-    // error the model would pointlessly retry.
-    let engine = match catch_unwind(AssertUnwindSafe(DebugEngine::new)) {
-        Ok(engine) => engine,
-        Err(_) => {
-            emit(&WorkerMessage::Fatal {
-                message: "failed to initialize DbgEng (is dbgeng.dll on the search path?)"
-                    .to_string(),
-            });
+fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<PathBuf>) {
+    // Reported and exited rather than accepted: the supervisor is waiting for exactly one of these
+    // two messages before it registers a session, so a dead engine reads as server machinery
+    // rather than as a debugger error the model would pointlessly retry.
+    let (engine, host, state) = match build_engine(target.as_deref()) {
+        Ok(built) => built,
+        Err(message) => {
+            emit(&WorkerMessage::Fatal { message });
             crate::logbridge::flush(LOG_FLUSH);
             std::process::exit(1);
         }
     };
+    // Held for the life of this thread, which is the life of the process. Dropping it kills the
+    // host, and the host must outlive every call made through it — see [`EngineHost::shutdown`]
+    // for why the teardown is a kill and why the client must never vanish first.
+    let _host = host;
+    // Read later by the opener (the host already opened the target) and by [`open`] (what to tell
+    // the caller about what this session cannot do).
+    let _ = HOST.set(state);
     // Published before `Ready`, so the request reader can never be handed work it cannot interrupt.
     let _ = INTERRUPT.set(engine.interrupt_handle());
     emit(&WorkerMessage::Ready);
@@ -965,6 +1136,15 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             e,
             id,
             |commit| {
+                // **Already open**, when this session's engine lives in a host started with
+                // `-z <dump>`: that host opened the target before this worker ever connected, and
+                // opening it again on the same session is an error rather than a no-op. The claim
+                // still has to be committed — a target is held either way, and the supervisor's
+                // teardown depends on knowing that.
+                if host_opened_target() {
+                    commit();
+                    return Ok(());
+                }
                 // `open_dump` is the call that claims the target, so commit right after it: a
                 // load wait that times out still leaves DbgEng holding the dump.
                 e.open_dump(&path).map_err(es)?;
@@ -4352,8 +4532,16 @@ where
     // Read *after* the diagnostic, and only if it worked: the diagnostic is the answer, and a
     // summary is a few facts to read it by. The supervisor finishes the typed side, because it is
     // the only side that knows the handle it minted and the state it settled the session into.
-    let summary = target_summary(e);
-    Ok(Output::opened(summary_text(&diagnostic, &summary), summary))
+    let mut summary = target_summary(e);
+    // Both halves, or it is half a warning: a structured-aware client forwards `structuredContent`
+    // and drops the text block, so a limitation stated only in the sentence is one the better
+    // clients never see (`FOLLOWUPS.md` item 43).
+    summary.limitation = host_limitation();
+    let text = appended(
+        summary_text(&diagnostic, &summary),
+        summary.limitation.clone(),
+    );
+    Ok(Output::opened(text, summary))
 }
 
 /// The post-attach diagnostic shared by both kernel openers.
@@ -4411,6 +4599,9 @@ fn target_summary(e: &DebugEngine) -> structured::TargetSummary {
             .flatten()
             .as_ref()
             .map(triage::bug_check_info),
+        // Filled by [`open`], not here: this reads the *target*, and a limitation is a fact about
+        // the engine that was built for it — known before the target existed.
+        limitation: None,
     }
 }
 
@@ -7007,6 +7198,7 @@ mod tests {
             primary_module: primary_module(modules, Some(kernel))
                 .map(|module| Box::new(structured::ModuleInfo::from(module))),
             bug_check: None,
+            limitation: None,
         }
     }
 
