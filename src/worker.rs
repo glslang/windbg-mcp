@@ -789,19 +789,41 @@ fn build_engine(
         return here(None);
     }
 
-    let Some(cdb) = EngineHost::find(crate::ttd::Arch::X86) else {
+    let candidates = EngineHost::candidates(crate::ttd::Arch::X86);
+    if candidates.is_empty() {
         return here(Some(NO_X86_HOST.to_string()));
-    };
-    let started = EngineHost::start(&cdb, target)
-        .map_err(|e| e.to_string())
-        .and_then(|host| {
-            match DebugEngine::connect(host.connection()) {
-                Ok(engine) => Ok((engine, host)),
-                // The host is dropped here, which kills it — the client it was started for is never
-                // going to arrive.
-                Err(e) => Err(e.to_string()),
+    }
+    // **Each candidate in turn.** One that will not start, or that this process's engine will not
+    // talk to, says nothing about the next: a machine can carry both the SDK's debugging tools and
+    // the WinDbg package, and only one of them may be version-compatible with the `dbgeng.dll`
+    // bundled beside this server. Giving up on the first would leave SOS unavailable with a usable
+    // host sitting on the disk.
+    let mut started = Err("no engine host was tried".to_string());
+    let mut used = None;
+    for cdb in &candidates {
+        started = EngineHost::start(cdb, target)
+            .map_err(|e| e.to_string())
+            .and_then(|host| {
+                match DebugEngine::connect(host.connection()) {
+                    Ok(engine) => Ok((engine, host)),
+                    // The host is dropped here, which kills it — the client it was started for is
+                    // never going to arrive.
+                    Err(e) => Err(e.to_string()),
+                }
+            });
+        match &started {
+            Ok(_) => {
+                used = Some(cdb.clone());
+                break;
             }
-        });
+            Err(why) => tracing::debug!(
+                "worker: {} could not serve this target ({}); trying the next candidate",
+                cdb.display(),
+                crate::kdconn::scrub(why)
+            ),
+        }
+    }
+    let cdb = used.unwrap_or_else(|| candidates[candidates.len() - 1].clone());
     match started {
         Ok((engine, host)) => {
             tracing::info!(
@@ -819,6 +841,12 @@ fn build_engine(
             ))
         }
         Err(why) => {
+            // **Scrubbed, because the connect error quotes the connection string** — dbgscope's
+            // `connect` names what it could not reach, and that string carries the transport
+            // password. Unscrubbed it would travel into a log line, a limitation a caller reads,
+            // and the transcript. `kdconn`'s scan already masks `password=`, which is why there is
+            // no second list of secret names here.
+            let why = crate::kdconn::scrub(&why);
             tracing::warn!(
                 "worker: could not put this session's engine in an x86 host ({why}); opening the \
                  dump in this process instead"
@@ -4556,11 +4584,22 @@ where
     T: FnOnce(&dyn Fn()) -> Result<(), String>,
     R: FnOnce() -> Result<String, String>,
 {
+    // **The limitation travels on the failures too.** Both `?`s below return before the summary is
+    // built, and the supervisor turns a post-commit failure into an error that still carries a live
+    // session handle — so without this, a caller who fell back to this process learns their open
+    // went wrong and never learns SOS cannot work in the session they are left holding. That is the
+    // loud fallback going quiet at exactly the moment it matters: a dump slow enough to fail the
+    // wait is a large one, which is the shape most likely to be a 32-bit service dump.
+    let with_limitation = |failed: Failed| match host_limitation() {
+        Some(limitation) => failed.and_note(&limitation),
+        None => failed,
+    };
     transition(&|| {
         emit(&WorkerMessage::Committed { id });
-    })?;
+    })
+    .map_err(|why| with_limitation(Failed::from(why)))?;
     emit(&WorkerMessage::Opened { id });
-    let diagnostic = report().map_err(Failed::from)?;
+    let diagnostic = report().map_err(Failed::from).map_err(with_limitation)?;
     // Read *after* the diagnostic, and only if it worked: the diagnostic is the answer, and a
     // summary is a few facts to read it by. The supervisor finishes the typed side, because it is
     // the only side that knows the handle it minted and the state it settled the session into.

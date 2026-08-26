@@ -93,6 +93,63 @@ impl Drop for OwnedJob {
     }
 }
 
+/// How long a transport password is. **Twelve is the protocol's ceiling**, not a choice:
+/// DbgEng documents `password=Password` as "any alphanumeric string, up to twelve characters".
+const PASSWORD_LEN: usize = 12;
+
+/// The alphabet the protocol allows. Alphanumeric only — a longer one would be rejected.
+const PASSWORD_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+/// A password for one engine host, from the system's own generator.
+///
+/// 62 characters over 12 positions is a little under 2^71, which is far more than a pipe that
+/// exists for the length of one debug session needs — the bound on this is the protocol's, and it
+/// is comfortably above anything an attacker enumerating `\\.\pipe\` could work through.
+///
+/// **Rejection sampling, not modulo.** 256 is not a multiple of 62, so folding a byte would make
+/// the first 8 letters likelier than the rest. It costs a redraw on roughly one byte in nine.
+///
+/// A failure here is fatal to the host rather than fallen back from, for `client::generate_token`'s
+/// reason: the fallback for a credential's randomness is a credential that is not random.
+fn transport_password() -> io::Result<String> {
+    use windows_sys::Win32::Security::Cryptography::{
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
+    };
+
+    let mut out = String::with_capacity(PASSWORD_LEN);
+    // Drawn in one go and topped up only if rejections exhaust it, so the common case is a single
+    // call into the generator.
+    while out.len() < PASSWORD_LEN {
+        let mut bytes = [0u8; PASSWORD_LEN * 2];
+        // SAFETY: a null algorithm handle is what `BCRYPT_USE_SYSTEM_PREFERRED_RNG` requires, and
+        // the pointer and length describe the same local array.
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                bytes.as_mut_ptr(),
+                bytes.len() as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        if status < 0 {
+            return Err(io::Error::other(format!(
+                "the system random number generator refused (NTSTATUS {status:#010x})"
+            )));
+        }
+        let ceiling = 256 - (256 % PASSWORD_ALPHABET.len());
+        for byte in bytes {
+            if out.len() == PASSWORD_LEN {
+                break;
+            }
+            // Above the ceiling the fold would be biased, so redraw instead.
+            if usize::from(byte) < ceiling {
+                out.push(PASSWORD_ALPHABET[usize::from(byte) % PASSWORD_ALPHABET.len()] as char);
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Creates a job that kills everything in it once its last handle closes.
 ///
 /// Returns `None` rather than failing the open: a host without a job still works, and the failure
@@ -149,30 +206,38 @@ impl EngineHost {
     /// subdirectory: the loader searches an executable's own directory first, so an x86 engine
     /// dropped next to the x64 `dbgeng.dll` this server already bundles would find the wrong one.
     /// The package's own `amd64\`/`x86\` layout is exactly this rule.
-    pub fn find(arch: Arch) -> Option<PathBuf> {
+    ///
+    /// **Every candidate, in preference order — not the first one found.** A machine can hold both
+    /// the SDK's Debugging Tools and the WinDbg package, and the two ship different engine
+    /// versions. If this server's own `dbgeng.dll` came from the package and the SDK's `cdb.exe` is
+    /// older, connecting to it fails with `0x8007053D` and the *only* usable host on the machine is
+    /// the one a first-match search would never have reached. So the caller tries them in turn; a
+    /// candidate that cannot be started or cannot be connected to is not evidence that the next one
+    /// cannot.
+    pub fn candidates(arch: Arch) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut add = |path: PathBuf| {
+            if path.is_file() && !found.contains(&path) {
+                found.push(path);
+            }
+        };
         if let Some(dir) = std::env::current_exe()
             .ok()
             .and_then(|exe| exe.parent().map(Path::to_path_buf))
         {
-            let beside = dir.join(arch.payload_dir()).join("cdb.exe");
-            if beside.is_file() {
-                return Some(beside);
-            }
+            add(dir.join(arch.payload_dir()).join("cdb.exe"));
             // The SDK spells x64 differently from the store package, and an operator copying from
             // one or the other will have used whichever name they found.
-            let beside = dir.join(arch.sdk_dir()).join("cdb.exe");
-            if beside.is_file() {
-                return Some(beside);
-            }
+            add(dir.join(arch.sdk_dir()).join("cdb.exe"));
         }
-        let sdk = PathBuf::from(format!(
+        add(PathBuf::from(format!(
             r"C:\Program Files (x86)\Windows Kits\10\Debuggers\{}\cdb.exe",
             arch.sdk_dir()
-        ));
-        if sdk.is_file() {
-            return Some(sdk);
+        )));
+        if let Some(package) = find_in_windowsapps(arch) {
+            add(package);
         }
-        find_in_windowsapps(arch)
+        found
     }
 
     /// Starts `cdb` as a debugging server holding `dump`, and waits for it to publish its pipe.
@@ -200,6 +265,18 @@ impl EngineHost {
             NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         );
 
+        // **A secret a client must present to connect.** DbgEng's transports take one, up to twelve
+        // alphanumeric characters, and a pipe name is not a secret — this one is a pid and a
+        // counter, and `\\.\pipe\` is enumerable by anyone regardless.
+        //
+        // What it is worth is bounded and worth stating rather than overselling. It travels on
+        // `cdb`'s command line, because `cdb` takes it no other way, so it does not defend against
+        // someone who can read another account's command line. It *does* close the case of a local
+        // user who can enumerate the pipe but not that — and it costs a random string. The
+        // documented transports that encrypt the password, `spipe` and `ssl`, both need a
+        // certificate, so neither is a drop-in. See `FOLLOWUPS.md` item 49 for what is still open.
+        let password = transport_password()?;
+
         let mut command = Command::new(cdb);
         command
             .arg("-server")
@@ -209,7 +286,7 @@ impl EngineHost {
             // is not a secret — but it is free and it is the only one of DbgEng's transport
             // options here that costs nothing. `password=` is the other, and what it would be
             // worth is an open question rather than an oversight: `FOLLOWUPS.md` item 49.
-            .arg(format!("npipe:pipe={pipe},hidden"))
+            .arg(format!("npipe:pipe={pipe},hidden,password={password}"))
             // `-noio`: the host takes input only from its client, and sends all output there.
             // Without it a server also reads its own console, which this one does not have — its
             // stdin is null — and writes banners to a stdout nothing but the log reads.
@@ -266,7 +343,7 @@ impl EngineHost {
 
         let mut host = Self {
             child,
-            connection: format!("npipe:pipe={pipe},server=localhost"),
+            connection: format!("npipe:pipe={pipe},server=localhost,password={password}"),
             pipe,
             job,
         };
@@ -399,12 +476,21 @@ fn find_in_windowsapps(arch: Arch) -> Option<PathBuf> {
 mod tests {
     use super::*;
 
-    /// `find` answers about this host, so the only thing that is true everywhere is that it does
-    /// not panic and that what it returns, if anything, exists and is named `cdb.exe`.
+    /// `candidates` answers about this host, so what is true everywhere is that it does not panic,
+    /// that everything it returns exists and is named `cdb.exe`, and that it lists no duplicates —
+    /// the last because a candidate tried twice is a startup and a connect paid twice for the same
+    /// answer, and the beside-the-exe probes can name one path two ways.
     #[test]
-    fn find_returns_an_existing_cdb_or_nothing() {
+    fn candidates_are_existing_cdbs_without_repeats() {
         for arch in [Arch::X86, Arch::X64, Arch::Arm64] {
-            if let Some(found) = EngineHost::find(arch) {
+            let found = EngineHost::candidates(arch);
+            let mut seen = std::collections::HashSet::new();
+            for found in &found {
+                assert!(
+                    seen.insert(found.clone()),
+                    "{} listed twice",
+                    found.display()
+                );
                 assert!(found.is_file(), "{} does not exist", found.display());
                 assert_eq!(
                     found.file_name().and_then(|n| n.to_str()),
@@ -502,7 +588,9 @@ mod tests {
             eprintln!("SKIPPED: set WINDBG_MCP_X86_DUMP to a 32-bit user dump to run this");
             return;
         };
-        let Some(cdb) = EngineHost::find(Arch::X86) else {
+        // The first candidate only: this test is about the module working end to end, not about
+        // the fallback across candidates, which `build_engine` owns.
+        let Some(cdb) = EngineHost::candidates(Arch::X86).into_iter().next() else {
             eprintln!("SKIPPED: this host has no x86 cdb.exe to serve a 32-bit target with");
             return;
         };

@@ -846,6 +846,20 @@ impl Failed {
             category: Some(category),
         }
     }
+
+    /// Adds something the caller needs to know *besides* why this failed, keeping the category.
+    ///
+    /// For a fact about the **session** rather than about the failure — one that is still true
+    /// afterwards and that the caller is left holding. A post-commit failure hands back a live
+    /// session handle, so "this session cannot load its SOS" has to travel with the error or it
+    /// travels nowhere: the summary that would otherwise carry it is never built.
+    pub fn and_note(mut self, note: &str) -> Self {
+        if !self.message.is_empty() && !self.message.ends_with('\n') {
+            self.message.push('\n');
+        }
+        self.message.push_str(note);
+        self
+    }
 }
 
 /// The ordinary case, so a bare `Err(message)?` keeps reading as it did.

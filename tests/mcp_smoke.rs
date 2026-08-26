@@ -11461,10 +11461,14 @@ fn a_32_bit_managed_dump_is_served_by_an_engine_that_can_load_its_sos() {
     // A host was found and used, so there is nothing this session cannot do. When no x86 `cdb.exe`
     // is on the machine this field is what carries the explanation instead — the fallback is loud
     // by design, and a run on such a host fails here rather than passing quietly.
+    // `summary.limitation`, not `limitation`: the opener's payload is an `OpenedSession` and the
+    // field lives on the `TargetSummary` inside it. Indexing the top level produced JSON null
+    // whatever the session actually reported, so this assertion passed unconditionally — it
+    // claimed to prove the routing had worked and proved nothing.
+    let limitation = &data["summary"]["limitation"];
     assert!(
-        data["limitation"].is_null(),
-        "this host could not give the dump an x86 engine, so SOS is unreachable: {}",
-        data["limitation"]
+        limitation.is_null(),
+        "this host could not give the dump an x86 engine, so SOS is unreachable: {limitation}"
     );
 
     // `.loadby`, not `.load` with a path. SOS reads CLR-internal structures and has to be the
@@ -11475,13 +11479,22 @@ fn a_32_bit_managed_dump_is_served_by_an_engine_that_can_load_its_sos() {
     //
     // It also resolves on the **host's** filesystem, which is the same machine — the point being
     // that it is the 32-bit build, which is exactly the file this server's own process cannot load.
-    let loaded = server.call_tool(
-        "execute",
-        json!({ "session_id": &session, "command": ".loadby sos clr" }),
-        TARGET_STEP,
-    );
-    assert_no_error(&loaded, "execute .loadby sos clr");
-    let loaded = text_of(&loaded["result"]);
+    //
+    // **Both runtime module names**, because the gate accepts any .NET Framework dump: 4.x loads
+    // `clr.dll` and 2.0/3.5 loads `mscorwks.dll`. Whichever does not match this target fails
+    // harmlessly — there is no such module to load beside — so running both costs one command and
+    // avoids narrowing a fixture the tier's own documentation does not narrow. Which of them
+    // worked is settled below by SOS answering, not by either of these.
+    let mut loaded = String::new();
+    for runtime in ["clr", "mscorwks"] {
+        let reply = server.call_tool(
+            "execute",
+            json!({ "session_id": &session, "command": format!(".loadby sos {runtime}") }),
+            TARGET_STEP,
+        );
+        assert_no_error(&reply, "execute .loadby sos");
+        loaded.push_str(&text_of(&reply["result"]));
+    }
     assert!(
         !loaded.contains("0n193") && !loaded.contains("not a valid Win32 application"),
         "the 32-bit SOS was refused, so this session's engine is not 32-bit:\n{loaded}"
