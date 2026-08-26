@@ -873,6 +873,13 @@ fn build_engine(
 /// Polls rather than waiting on an event, because there is no event to wait for: the engine
 /// belongs to another process and has already consumed its own initial break. `modules()` is the
 /// cheapest question that cannot be answered until a target exists.
+///
+/// **Two things now rest on that last clause**, so it was measured rather than reasoned about:
+/// inside the window this waits out, a connected client reads `DEBUG_STATUS_NO_DEBUGGEE` *and*
+/// `modules()` fails, together — so the guards keyed on that status
+/// ([`refuse_when_the_target_is_gone`], and dbgscope's own inside `Execute`) cannot fire on a
+/// hosted session that this has already let through. A `modules()` that answered early would
+/// break the `vertarget` below, not just this wait.
 fn await_hosted_target(e: &DebugEngine) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_millis(u64::from(LOAD_WAIT_MS));
     loop {
@@ -1207,6 +1214,15 @@ fn interrupt_running() -> Result<String, String> {
 ///
 /// An unreadable status is not a refusal — the same rule dbgscope's own guard follows. Refusing on
 /// a guess costs a caller a session that was working, which is the worse of the two mistakes.
+///
+/// **The status crosses the remote transport, which was worth measuring rather than assuming** —
+/// [`crate::enginehost`]'s sessions live in another process, and `GetSymbolInformation` is already
+/// known not to cross, so "a core call obviously does" is not an argument. Measured against a
+/// `cdb -server` on the ARM64 bench: a connected client reads `DEBUG_STATUS_BREAK` and runs
+/// commands normally. It *can* read no-debuggee — for the window in which the host has published
+/// its pipe and not yet opened the dump — and in that window `modules()` fails at the same
+/// instant, which is the window [`await_hosted_target`] already waits out before anything here
+/// runs. The two never disagree in the direction that would matter.
 fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Failed> {
     if matches!(
         op,
