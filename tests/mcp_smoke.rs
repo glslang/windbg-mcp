@@ -2006,7 +2006,7 @@ fn every_tool_belongs_to_exactly_one_group() {
 
 /// A narrowed surface serves fewer tools, and says so rather than pretending the rest never were.
 ///
-/// The measurement behind `--tools` is that three quarters of the 67,766-byte tool surface is
+/// The measurement behind `--tools` is that three quarters of the 67,873-byte tool surface is
 /// prose a model needs, so the only way to spend less of a caller's context is to offer fewer
 /// tools — `FOLLOWUPS.md` item 24. This asserts the three things that makes true.
 #[test]
