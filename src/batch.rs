@@ -64,7 +64,7 @@ pub const MAX_CHECKS: usize = 16;
 /// spends most of its time on the work it was asked to do.
 const ROLLBACK_RESERVE: Duration = Duration::from_secs(30);
 
-/// The smallest watchdog a step is armed with. Zero *disables* win-kexp's watchdog, so a step
+/// The smallest watchdog a step is armed with. Zero *disables* dbgscope's watchdog, so a step
 /// dequeued at or past the deadline must not round down to it.
 const MIN_STEP_BUDGET_MS: u32 = 1_000;
 
@@ -74,7 +74,7 @@ const MIN_STEP_BUDGET_MS: u32 = 1_000;
 /// moment before the deadline is still armed with [`MIN_STEP_BUDGET_MS`], because a watchdog of
 /// zero is no watchdog at all. Three of those can stack at the end of a batch — the last cleanup
 /// step's action, an assertion inside it, and the state probe, which runs unconditionally — and
-/// win-kexp's watchdog needs a moment beyond that to interrupt and unwind.
+/// dbgscope's watchdog needs a moment beyond that to interrupt and unwind.
 ///
 /// Public because it is the difference between the budget and a bound the worker can actually
 /// *keep*, and something outside is relying on that bound: a teardown is told when the batch will
@@ -138,7 +138,7 @@ const FAILED_OUTPUT_CHARS: usize = 8_000;
 /// to stop, a run-to verdict, a value this batch can bind a name to.
 ///
 /// The pool variants are the same rule reaching its other end. `pool_find_tag`, `pool_chunk` and
-/// `pool_census` are not commands at all — they are win-kexp walks over the allocator's own
+/// `pool_census` are not commands at all — they are dbgscope walks over the allocator's own
 /// descriptors, with no `!pool` text a `command` step could stand in for — so a batch without them
 /// simply cannot ask what a chunk is, which is what the MessageManager workflow found: its
 /// `@chunkt1` sat *inside* the transaction, between a code patch and its restore, so the sequence
@@ -147,7 +147,7 @@ const FAILED_OUTPUT_CHARS: usize = 8_000;
 /// to the transaction.
 ///
 /// `refresh` is what makes a pool step expensive — it re-walks every committed page — and inside a
-/// batch that walk is bounded by the *step's* share of the budget rather than by win-kexp's own
+/// batch that walk is bounded by the *step's* share of the budget rather than by dbgscope's own
 /// default, which is longer than most batches. A walk cut short says how much of the pool it
 /// covered, so the answer stays honest; see [`Debuggee::pool`].
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -757,7 +757,7 @@ pub struct Ran {
 
 // Deliberately no `Ran::whole` constructor. There was one, used at the dispatch to wrap the actions
 // whose calls returned a bare `String` — and it made "this finished" the silent default for three
-// of them, including a pool walk, which is genuinely interruptible (win-kexp's walker polls the same
+// of them, including a pool walk, which is genuinely interruptible (dbgscope's walker polls the same
 // flag). Every implementor now has to say what it saw, because there is no way to say it without
 // deciding.
 
@@ -776,7 +776,7 @@ pub trait Debuggee {
     /// but a walk over the allocator's own descriptors.
     ///
     /// `budget_ms` bounds *the walk*, not a command, and that is why it is passed rather than left
-    /// to win-kexp's own default: that default (120s) is longer than a whole ordinary batch, so a
+    /// to dbgscope's own default: that default (120s) is longer than a whole ordinary batch, so a
     /// refreshed pool step taking it could overrun the deadline the rollback depends on — and with
     /// it the bound the worker advertises to a teardown, which is what stops a worker being
     /// terminated mid-transaction. A walk stopped by the budget reports how much of the pool it
@@ -826,7 +826,7 @@ pub trait Debuggee {
 /// Runs one engine call, turning a panic into a step failure so [`run`] still reaches `always`.
 ///
 /// Needed because the only other guard is `worker::engine_thread`'s, which wraps a whole op — an
-/// unwind from a step would pass straight through the rollback. Not hypothetical: several win-kexp
+/// unwind from a step would pass straight through the rollback. Not hypothetical: several dbgscope
 /// methods use `.expect`, and a step calls into them.
 fn guarded<T>(call: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     catch_unwind(AssertUnwindSafe(call)).unwrap_or_else(|payload| {
@@ -1747,7 +1747,7 @@ mod tests {
             self
         }
 
-        /// Answers any call containing `matching` by panicking, the way several win-kexp methods
+        /// Answers any call containing `matching` by panicking, the way several dbgscope methods
         /// do (`.expect`).
         fn panics(mut self, matching: &str) -> Self {
             // Not an `answers` entry: the panic fires before the lookup, so one would only be
@@ -2140,7 +2140,7 @@ mod tests {
     /// the engine has no interruption to report for them and the worker's own record is the
     /// authority. They were wrapped as "finished" at the dispatch, which made a `run_to` cut short
     /// look like a target that had merely stopped somewhere else — and a pool walk is *genuinely*
-    /// interruptible, since win-kexp's walker polls the same flag.
+    /// interruptible, since dbgscope's walker polls the same flag.
     #[test]
     fn a_break_is_reported_by_every_shape_of_step() {
         for (action, matching) in [
@@ -2534,7 +2534,7 @@ mod tests {
     /// A panic out of the debugger is the third path that would skip the rollback, and the least
     /// visible: nothing in this module raises it, and the worker's own `catch_unwind` is around
     /// the whole op, so an unwind from a step would leave `run` without ever reaching `always`.
-    /// win-kexp methods do panic — that worker guard exists because several use `.expect`.
+    /// dbgscope methods do panic — that worker guard exists because several use `.expect`.
     #[test]
     fn a_panicking_step_fails_that_step_and_still_rolls_back() {
         let mut d = stopped()
@@ -2961,7 +2961,7 @@ mod tests {
     /// A pool step is armed with what the *batch* has left, not with the walker's own default.
     ///
     /// The one hazard these variants introduce: a refreshed walk is every committed page over the
-    /// KD wire and win-kexp bounds it at 120s, which is longer than an ordinary batch's whole
+    /// KD wire and dbgscope bounds it at 120s, which is longer than an ordinary batch's whole
     /// budget. A step that took that default could spend the reserve the rollback lives on, and
     /// overrun the bound the worker advertises to a teardown — which is a worker terminated
     /// mid-transaction, the failure the `always` block exists to prevent, arriving through the one
@@ -3559,7 +3559,7 @@ mod tests {
 
     #[test]
     fn a_step_is_never_armed_with_a_zero_watchdog() {
-        // Zero disables win-kexp's watchdog, so the floor matters more than the arithmetic.
+        // Zero disables dbgscope's watchdog, so the floor matters more than the arithmetic.
         assert_eq!(
             step_budget_ms(Duration::from_secs(90), Duration::from_secs(60)),
             0

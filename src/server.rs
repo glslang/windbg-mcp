@@ -3,7 +3,7 @@
 //! Every tool routes its work to a session's worker process via [`Sessions`] — the tool decides
 //! *what* to run ([`EngineOp`]) and *which* session runs it, and [`crate::engine`] does the rest.
 //! Most tools are thin wrappers over `execute_command` (the universal DbgEng escape hatch,
-//! returning full text); session-management tools drive the typed `win-kexp` openers.
+//! returning full text); session-management tools drive the typed `dbgscope` openers.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
@@ -2233,7 +2233,7 @@ pub(crate) fn reject_command_breakers(
 /// so the error has to carry the handle rather than swallow it.
 ///
 /// Free function so it tests without an engine, as `OpenSideEffect::failure_caveat` did
-/// before the openers were split (glslang/win-kexp#71). What it encodes is the distinction
+/// before the openers were split (glslang/dbgscope#71). What it encodes is the distinction
 /// that split bought — this text must be unreachable for a failure that created nothing,
 /// because telling a caller "your session exists" when it does not strands them exactly as
 /// badly as the advice it replaced.
@@ -3153,7 +3153,7 @@ impl WindbgServer {
         annotations(
             title = "Triage a bug check",
             // **Read-only, and earned rather than assumed.** Nothing here writes to the debuggee,
-            // but until glslang/win-kexp#98 this said `false` anyway, because `!analyze -v` moves
+            // but until glslang/dbgscope#98 this said `false` anyway, because `!analyze -v` moves
             // the session's selected scope and two identical `backtrace` calls either side of a
             // triage could therefore differ — a change to what every other tool reads.
             //
@@ -5043,7 +5043,7 @@ mod tests {
     fn summary_with_everything() -> structured::TargetSummary {
         structured::TargetSummary {
             modules_loaded: Some(233),
-            bug_check: Some(crate::triage::bug_check_info(&win_kexp::dbgeng::BugCheck {
+            bug_check: Some(crate::triage::bug_check_info(&dbgscope::dbgeng::BugCheck {
                 code: 0x9f,
                 parameters: [3, 0xffffe284ffe59060, 0, 0],
             })),
@@ -6050,7 +6050,7 @@ mod tests {
 
     /// A failure that lands after the target is open must hand the handle back and say not
     /// to re-open. "Just open again" is how a caller ends up with two processes — before the
-    /// openers were split (glslang/win-kexp#71) this server could not tell that case from a
+    /// openers were split (glslang/dbgscope#71) this server could not tell that case from a
     /// clean slate and had to hedge on every attach and launch; now it knows which it is.
     #[test]
     fn a_post_commit_failure_returns_the_handle_and_warns_against_reopening() {

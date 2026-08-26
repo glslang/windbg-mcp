@@ -9,7 +9,7 @@ workflows.
 
 `windbg-mcp` is a Rust MCP server (stdio, `rmcp`) exposing **WinDbg/DbgEng** for live user-mode,
 kernel, crash-dump, and Time Travel Debugging (TTD) work. The low-level DbgEng bindings come from
-the sibling crate [`win-kexp`](https://github.com/glslang/win-kexp) (a **path/git dependency we grow
+the sibling crate [`dbgscope`](https://github.com/glslang/dbgscope) (a **path/git dependency we grow
 ourselves** — do not add third-party DbgEng crates).
 
 **The binary has two roles.** Started normally it is the **supervisor**: MCP on stdio, no DbgEng.
@@ -54,10 +54,10 @@ To rebuild and load the new code without stopping the session:
    ```
    cargo build --release
    ```
-   This builds the `win-kexp` revision pinned in `Cargo.lock` and writes a fresh
+   This builds the `dbgscope` revision pinned in `Cargo.lock` and writes a fresh
    `target\release\windbg-mcp.exe`. If this `windbg-mcp` change depends on a newly pushed
-   `win-kexp` commit, move the pin first — edit the `rev` in `Cargo.toml`, then
-   `cargo update -p win-kexp` — and commit both with the `windbg-mcp` change (see below: the update
+   `dbgscope` commit, move the pin first — edit the `rev` in `Cargo.toml`, then
+   `cargo update -p dbgscope` — and commit both with the `windbg-mcp` change (see below: the update
    command alone does **not** move a `rev` pin). The running server keeps executing the *old* code from the
    renamed `.stale` file until its connection is recycled.
 3. **Load the new binary** by reconnecting the server: `/mcp` → reconnect `windbg` (or restart
@@ -70,32 +70,32 @@ renamed `.stale` file spawns workers from it too — old code stays consistently
 you want. It also means `.stale` can be held by more than one process: reconnecting ends the
 supervisor, and its workers exit with it, so step 4 is still just "after the reconnect".
 
-## Changing win-kexp (the DbgEng bindings)
+## Changing dbgscope (the DbgEng bindings)
 
-`win-kexp` is a **git dependency pinned to an exact `rev`**, not a path dependency — a `windbg-mcp`
-build pulls it from GitHub, so **local edits to a win-kexp checkout are invisible to a `windbg-mcp`
-build until they are pushed** and the pin is moved. Add new DbgEng primitives as typed `win-kexp`
+`dbgscope` is a **git dependency pinned to an exact `rev`**, not a path dependency — a `windbg-mcp`
+build pulls it from GitHub, so **local edits to a dbgscope checkout are invisible to a `windbg-mcp`
+build until they are pushed** and the pin is moved. Add new DbgEng primitives as typed `dbgscope`
 methods (returning `Result<_, DbgEngError>`, not `panic!`/`.expect`), not via the `execute` text
 hatch.
 
-**`cargo update -p win-kexp` does not move the pin.** `Cargo.toml` names a 40-character `rev`, so
+**`cargo update -p dbgscope` does not move the pin.** `Cargo.toml` names a 40-character `rev`, so
 the update command only re-resolves *that* revision; the pin is moved by editing the `rev` and then
-running `cargo update -p win-kexp` to refresh `Cargo.lock`. Commit both. (This file used to say the
+running `cargo update -p dbgscope` to refresh `Cargo.lock`. Commit both. (This file used to say the
 update command alone was enough, which silently leaves you building the old code.)
 
-**Develop against the feature branch, not a `[patch]`.** Push the win-kexp branch and point
+**Develop against the feature branch, not a `[patch]`.** Push the dbgscope branch and point
 `Cargo.toml`'s `rev` at that branch commit while iterating: it needs no local checkout on the build
 machine, it works identically on every machine, and it travels through git like everything else.
 Repoint to the merge commit before the dependent PR merges. A `[patch]` section still works for a
 quick local `cargo check` but must never be committed:
 
 ```toml
-[patch.'https://github.com/glslang/win-kexp']
-win-kexp = { path = "../win-kexp" }
+[patch.'https://github.com/glslang/dbgscope']
+dbgscope = { path = "../dbgscope" }
 ```
 `git checkout -- Cargo.toml Cargo.lock` afterwards.
 
-**A green win-kexp PR says nothing about Miri**, since 2026-08-22: it is by far the longest job
+**A green dbgscope PR says nothing about Miri**, since 2026-08-22: it is by far the longest job
 there (9 minutes median against `ci.yml`'s 1) and had never failed in a hundred runs, so it runs on
 the merge to `main`, weekly for nightly-toolchain drift, and on `workflow_dispatch` — **not** on
 pull requests. Dispatch it against the branch when a change touches unsafe code; the alternative is
@@ -105,9 +105,9 @@ own header says why, so it is not worth re-proposing.
 **Both repos require an approving review**, and a solo maintainer cannot self-approve, so a green
 PR still needs `gh pr merge --admin`. In this harness that call is refused by the permission
 classifier — so **the human merges**, and an agent's job ends at "green and waiting". Plan the two
-PRs around that: win-kexp first, then repoint and re-verify.
+PRs around that: dbgscope first, then repoint and re-verify.
 
-**win-kexp's `cargo clippy --all-targets -- -D warnings` fails on ARM64 with 4 pre-existing errors**
+**dbgscope's `cargo clippy --all-targets -- -D warnings` fails on ARM64 with 4 pre-existing errors**
 (`shellcode.rs`, `process.rs` — ARM64-only paths its x64 CI never lints). Check them against `main`
 before assuming they are yours.
 
@@ -117,6 +117,24 @@ For a compile/behavior check without touching the locked release exe, use the **
 (writes `target/debug`, which the registered release server never holds): `cargo test` and
 `cargo clippy --all-targets`. The release
 build differs only in optimization and is exercised by CI on a fresh runner.
+
+**And the whole crate type-checks from the Mac, which this repo believed it could not.** `cargo
+check` does not link, so `rustup target add x86_64-pc-windows-msvc` (and the `aarch64` one) is
+enough to run `cargo check --target <msvc> --all-targets` and `cargo clippy` over `src/`,
+`tests/` *and* the dependency, on a machine with no Windows anywhere. It takes seconds and needs
+no VM. What it does **not** do is run anything: a behavioural claim still wants `cargo test` on
+the VM, and the debugger tiers still want a real `dbgeng.dll`. But every mistake that is a *type*
+error — a wrong signature, a missing `windows` feature, an API that moved under a dependency bump
+— is answerable here, and that is most of what a dependency bump breaks. Doing the `dbgscope`
+split this way caught a `windows` feature trimmed by module path (`IMAGE_NT_HEADERS64` is gated
+behind `Win32_System_SystemInformation`, not the `Debug` feature its path suggests) that would
+otherwise have been a red VM build.
+
+**A `[patch]` cannot verify against a repo that does not exist yet.** Cargo resolves the original
+source *before* applying the patch, so pointing one at a local checkout still fetches the git URL
+and fails on a repo not yet created or renamed — which is exactly the middle of a rename. Swap the
+dependency itself to `path = "../dbgscope"` for the check and restore it afterwards; the `[patch]`
+recipe below works only once the remote is real.
 
 **A dependency's source can be read on the Mac, and the copy there may not be the pinned one.**
 `~/.cargo/registry/src/` holds only what this machine has *fetched*, and nothing fetches after a
@@ -137,7 +155,7 @@ cargo metadata --locked --format-version 1 |
 The fetch resolves and downloads without compiling, so the Windows-only dependencies are no
 obstacle, and it takes seconds. `--locked` on both is not decoration: bare `cargo fetch`
 re-resolves whenever `Cargo.toml` and `Cargo.lock` are out of step — which is exactly what the
-middle of a `win-kexp` `rev` bump is — and would unpack a version nobody reviewed while moving the
+middle of a `dbgscope` `rev` bump is — and would unpack a version nobody reviewed while moving the
 pin under you. Neither command touches the lock (measured).
 
 **Reading the path out of `cargo metadata` rather than assembling one is the whole point**, because
@@ -145,7 +163,7 @@ a hand-built `registry/src/*/<crate>-<ver>/` is wrong three different ways and t
 the `*` matches a copy fetched earlier as readily as the pinned one (`tokio-1.53.0` and `1.53.1`
 are both unpacked here); a crate can be in the graph twice, so a name alone does not identify a
 version (`syn` is at 2.0.117 and 3.0.3); and a **git** dependency is not under `registry/src` at
-all — `win-kexp` is at `~/.cargo/git/checkouts/win-kexp-<hash>/<short-rev>/`, which is both the
+all — `dbgscope` is at `~/.cargo/git/checkouts/dbgscope-<hash>/<short-rev>/`, which is both the
 dependency most worth reading here and the one a registry path misses silently.
 
 Anything read this way is still a claim about source, not about behaviour; `cargo test` on the VM is
@@ -311,7 +329,7 @@ the ones you meant to keep.
 
 `cargo test` includes `tests/mcp_smoke.rs`, which spawns the **dev** binary (via
 `CARGO_BIN_EXE_windbg-mcp`) and drives it over stdio — so it is also clear of the release lock.
-After a dependency bump (`rmcp`, `schemars`, `tokio`, `cargo update -p win-kexp`) or an MCP spec
+After a dependency bump (`rmcp`, `schemars`, `tokio`, `cargo update -p dbgscope`) or an MCP spec
 revision, run it and follow [`docs/smoke-test.md`](./docs/smoke-test.md).
 
 Two of its tests budget **what this server costs the model driving it** — the tool surface, paid
@@ -351,7 +369,7 @@ behind that gate. The driver-attribution test is the one that is **not** paired 
 is a table run over every checked-in driver crash on every host, because an engine with symbols
 reads either dump either way round and pairing would have cost an ARM64 runner the x64 crash it
 already read. A third tier is `#[ignore]`d because it runs commands out to a watchdog
-deadline (minutes, not seconds) — run it by hand after a win-kexp watchdog change:
+deadline (minutes, not seconds) — run it by hand after a dbgscope watchdog change:
 
 ```pwsh
 $env:WINDBG_MCP_SMOKE_DUMP = "1"
@@ -584,7 +602,7 @@ build `EngineOp::CommandAndWait` (→ `resumed` → `execute_and_wait`) and ever
 **The hatch used to wedge its session, and the fix is not a list of command names** (issue #226,
 2026-08-25). `execute { "command": "g" }` set the run state, answered with its own echo, and left
 every later `g`/`p`/`t` failing `0x80040205` while `bl`, `r` and `.lastevent` kept working — half
-alive, with no way back but `end_session`. `raw_command` now calls win-kexp's `settle` after every
+alive, with no way back but `end_session`. `raw_command` now calls dbgscope's `settle` after every
 `Execute`, which asks the **engine** (`GetExecutionStatus`) whether it was left running and pumps it
 if so. Ask the engine rather than the text: `bp X; g`, an alias, `.if (1) { g }` and
 `dx …ExecuteCommand("g")` all reach execution without saying so, and the list that would catch them
@@ -617,7 +635,7 @@ rather than passing for a stop.
 
 Two consequences worth carrying:
 
-- **The reason the finite wait looked attractive was a sleep.** Both win-kexp watchdogs polled a
+- **The reason the finite wait looked attractive was a sleep.** Both dbgscope watchdogs polled a
   flag on a fixed 200/300ms nap, so `join` waited out the rest of it and *every* bounded operation
   paid up to one interval — the tax `DECISIONS.md` (2026-08-02) measured at 200ms on a command whose
   unbounded median was 0.22ms, and routed the cheap queries around the bounded path to avoid.
@@ -1055,7 +1073,7 @@ nothing — a key that has rotted looks exactly like a model that got worse. Eac
 `WINDBG_MCP_TOKEN=<full surface> python3 tools/local_model_eval.py --verify-key` re-reads the lot.
 Five things bite when touching it. **It is a command, not a CI gate**, and that is the decision
 rather than an omission: the oracle is `present()`, so a Rust test would need a second copy of
-three rules each learned from a wrong verdict — run it after a `win-kexp` bump, a symbol-path
+three rules each learned from a wrong verdict — run it after a `dbgscope` bump, a symbol-path
 change or a new sample. **The binding grounds `expect`, it does not generate it**: two of
 `unloaded_driver`'s three groups are phrasings of a *relation* (`matched: 0` is what "not loaded"
 means), so a run reports each group as `value`, `relation` or `skipped`. **Which are relational is

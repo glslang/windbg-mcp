@@ -313,7 +313,7 @@ three rules were each learned from a wrong verdict; a Rust test in `tests/mcp_sm
 a second copy of it, and two copies drifting apart is this failure mode reached through its own
 fix. The Rust tier goes on pinning what it already pins — the bug checks, `Arg1`, the crashing
 process, each driver crash's `module`+`rva` — and this pins what the *tasks* depend on, through the
-tools a model would call. Run it after a `win-kexp` bump, a symbol-path change, or a new sample
+tools a model would call. Run it after a `dbgscope` bump, a symbol-path change, or a new sample
 replacing an old one; nothing else will.
 
 ## Running it

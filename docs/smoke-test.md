@@ -29,7 +29,7 @@ all.
 | Tier | Gate | Needs | Catches |
 | --- | --- | --- | --- |
 | **Protocol** | always | no debugger, no target, and no network off this machine — it does bind a loopback port for the listener | transport, revision negotiation, tool-surface drift, and the listener's lease up to the point a session is opened |
-| **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump, and `cmd.exe` for the two that launch one | `win-kexp` / DbgEng regressions, a lease expiry releasing a real engine worker, and driving execution on a live user-mode target |
+| **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump, and `cmd.exe` for the two that launch one | `dbgscope` / DbgEng regressions, a lease expiry releasing a real engine worker, and driving execution on a live user-mode target |
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a live kernel target you can freeze — KDNET, or serial | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
 | **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
@@ -485,7 +485,7 @@ processes, so they need real ones:
   number has no visible consequence — the pool is local memory, so every budget from 15s to 120s
   produces the identical result. That is exactly why it shipped wrong
   ([#75](https://github.com/glslang/windbg-mcp/issues/75)): the query carried no deadline at all and
-  quietly took win-kexp's 120s however long its caller was willing to wait, and nothing that looked
+  quietly took dbgscope's 120s however long its caller was willing to wait, and nothing that looked
   at results could see it. The test shrinks the call budget to 60s and checks the worker derived
   ~45s — a range, since the milliseconds already spent come off the patience, and one that contains
   neither the 15s floor nor the 120s default. The query itself is allowed to fail: the sample dump
@@ -555,7 +555,7 @@ processes, so they need real ones:
   the target running with no current process/thread, so every one of those failed and the call
   still reported success. Driven through a batch rather than `go` for the three-second bound; the
   `timed_out` field `go` itself answers with is asserted false on the test above, and its true case
-  belongs to win-kexp's own engine tests, where a two-second bound costs nothing.
+  belongs to dbgscope's own engine tests, where a two-second bound costs nothing.
 
   These two are the only tests in the suite that drive **execution** on anything but a live kernel,
   which is exactly why the bug survived: the live-kernel tier was already on the bounded wait, and
@@ -796,12 +796,12 @@ table. Adjusting one is an edit to that slice, not a re-record. See
 
 ### A dependency moved
 
-`rmcp`, `schemars`, `tokio`, or a `win-kexp` pin bump (`cargo update -p win-kexp`). Dependabot
-watches the cargo ecosystem too, so most of these arrive as a PR — including the `win-kexp` locked
+`rmcp`, `schemars`, `tokio`, or a `dbgscope` pin bump (`cargo update -p dbgscope`). Dependabot
+watches the cargo ecosystem too, so most of these arrive as a PR — including the `dbgscope` locked
 revision — and the run below is what you do on that PR, not only on a bump you made yourself.
 
 1. `cargo test` — the protocol tier plus the existing unit tests.
-2. For a `win-kexp` bump, add the debugger tier locally too — CI runs it on the PR, but a local
+2. For a `dbgscope` bump, add the debugger tier locally too — CI runs it on the PR, but a local
    run tells you sooner:
 
    ```pwsh
@@ -842,10 +842,10 @@ case.
   hours is cut short by the watchdog, and the session executes the *next* command normally. This is
   the wedge that used to need a server restart. Proof of interruption is the loop counter left in
   `$t0`, not the clock and not the "interrupted after" note (which the worker renders whenever the
-  watchdog *attempted* an interrupt, even one the engine ignored — win-kexp reports the reason as a
+  watchdog *attempted* an interrupt, even one the engine ignored — dbgscope reports the reason as a
   field, and prose for a human is this server's to add).
 - `a_bounded_command_queued_behind_another_job_still_beats_its_caller` — the same, from behind a
-  `.sleep` that occupies the session for half the call budget. This is the half win-kexp cannot
+  `.sleep` that occupies the session for half the call budget. This is the half dbgscope cannot
   cover, because the queue belongs to this crate: budgeting from the patience as sent, instead of
   from what remains after the queue wait, passes every other assertion and fails here. Two details
   the test documents because both silently void it — `.sleep` needs a `0n` prefix (the MASM
@@ -855,7 +855,7 @@ case.
 - `measure_what_the_bounded_path_costs_a_quick_command` — prints what arming the watchdog costs, as
   a distribution. It asserts nothing; it is the evidence behind which tools take the bounded path
   ([`DECISIONS.md`](../DECISIONS.md), 2026-08-02), namely that a bounded command is rounded up to a
-  multiple of 200ms. Re-run it after a win-kexp watchdog change — if that cost goes away, so does
+  multiple of 200ms. Re-run it after a dbgscope watchdog change — if that cost goes away, so does
   the reason for the split.
 
 These live with the wire tests rather than beside the arithmetic because the wiring they prove now
@@ -928,7 +928,7 @@ about. This is the other half — an attach that lands:
   many times, so a triage that came too early has to leave the session exactly as usable as it
   found it.
 - **`end_session` detaches gracefully rather than killing the worker.** This one has teeth: DbgEng
-  leaves a detached-but-halted kernel *frozen*, so win-kexp resumes and actively detaches. A run
+  leaves a detached-but-halted kernel *frozen*, so dbgscope resumes and actively detaches. A run
   that took the kill path instead would leave the guest halted with a wedged KD stub, needing a
   reboot. For the same reason the test body runs under `catch_unwind` — a failed assertion must
   still detach, or a test failure costs you the VM.
@@ -971,19 +971,19 @@ about. This is the other half — an attach that lands:
   ([#75](https://github.com/glslang/windbg-mcp/issues/75) — 285s under the default call timeout, and
   the figure to re-read if you shrink `WINDBG_MCP_CALL_TIMEOUT_SECS`), so on that target the
   coverage gap is not the deadline — which is why scoping the
-  walk to one side of the pool was closed unbuilt (glslang/win-kexp#89): it would have bought a
+  walk to one side of the pool was closed unbuilt (glslang/dbgscope#89): it would have bought a
   faster query at the cost of a cache that keys on scope, against better than two-fold headroom
   that already exists. That margin is worth re-reading rather than assuming: the same walk cost
-  ~24s and reached 437k chunks before glslang/win-kexp#92, so a walk gets *slower* as it gets more
+  ~24s and reached 437k chunks before glslang/dbgscope#92, so a walk gets *slower* as it gets more
   correct, and the next such fix spends the remaining headroom too.
   Expect INCOMPLETE on any live kernel: paged pool is
   partly on disk, so `sparse virtual range` diagnostics are physics rather than a defect, and the
   coverage caveat is doing its job. The categories that are *not* explained that way are worth
   reading, and this tier is where that paid: a run showing ~5.6k LFH subsegments rejected as
-  implausible (glslang/win-kexp#90) was not the walker being careful but the walker misreading
+  implausible (glslang/dbgscope#90) was not the walker being careful but the walker misreading
   `_HEAP_PAGE_RANGE_DESCRIPTOR.RangeFlags` bit `0x01` as "LFH subsegment" when it means ALLOCATED,
   which sent VS, large and special-pool ranges through the LFH decoder to be refused and dropped.
-  glslang/win-kexp#92 fixed the reading; that category should now be **absent**, and its return
+  glslang/dbgscope#92 fixed the reading; that category should now be **absent**, and its return
   would mean a regression rather than a busy kernel. Read the per-category counts as the volume:
   the walk keeps only a handful of messages per category verbatim, so the list of examples is a
   sample and its length
@@ -1096,14 +1096,14 @@ before a release, or when a change touches the relevant path. Drivers live in
 
 - **Live user-mode** — `examples/test_usermode.ps1`: launch `cmd.exe` under the debugger, break in,
   read registers/modules, set a breakpoint.
-- **Typed user Segment Heap** — from a sibling `win-kexp` checkout, run
+- **Typed user Segment Heap** — from a sibling `dbgscope` checkout, run
   `cargo run --example user_heap_smoke`. The helper launches an x64 child that retains known
   LFH/VS/backend/large allocations, reloads the exact `ntdll` PDB, verifies each pointer and
   backend, writes a temporary `/ma` full-memory dump, reopens it, and repeats the checks. Set
   `WIN_KEXP_USER_HEAP_SYMBOLS` (or `_NT_SYMBOL_PATH`) when the default Microsoft symbol-store path
   is not appropriate. Missing private types are a failed prerequisite; export symbols must not be
   accepted as a layout. The dump is written to the operating system temporary directory as
-  `win-kexp-user-heap-<pid>.dmp`, outside either checkout. The helper removes it after a successful
+  `dbgscope-user-heap-<pid>.dmp`, outside either checkout. The helper removes it after a successful
   run; after a failed run, delete that file from the temporary directory manually and never add it
   to version control.
 - **Ctrl+C teardown** — `examples/ctrl_c_teardown.ps1`: a console Ctrl+C must leave a worker time

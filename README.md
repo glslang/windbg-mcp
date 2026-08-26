@@ -10,7 +10,7 @@ An [MCP](https://modelcontextprotocol.io) server that exposes **WinDbg/DbgEng** 
 (Claude Code, Claude Desktop, Cursor, …) over stdio. It drives a live debugger engine for
 **user-mode**, **kernel-mode**, **crash-dump**, and **Time Travel Debugging (TTD)** workflows.
 
-The low-level engine bindings live in [`win-kexp`](https://github.com/glslang/win-kexp)
+The low-level engine bindings live in [`dbgscope`](https://github.com/glslang/dbgscope)
 (`src/dbgeng.rs`); this crate adds process-per-session engine supervision and the `rmcp` tool
 surface on top.
 

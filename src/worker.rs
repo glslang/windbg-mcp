@@ -9,7 +9,7 @@
 //! single-threaded access, and `WaitForEvent` must run on the session-owning thread — so the
 //! [`DebugEngine`] is created on, and never leaves, one dedicated thread. What changed is what
 //! happens when that thread cannot be freed: a live-kernel attach whose target never dials in
-//! blocks in `WaitForEvent(INFINITE)` with no cancellation path (win-kexp's `SetInterrupt`
+//! blocks in `WaitForEvent(INFINITE)` with no cancellation path (dbgscope's `SetInterrupt`
 //! watchdog cannot reach a wait that is still establishing the link). That used to park the
 //! server's only engine thread; here it parks this process, which the supervisor can kill.
 //!
@@ -28,7 +28,7 @@
 //! thread it would be read only once there was nothing left to interrupt. So the alternative to
 //! reaching the engine from outside is not a safer interrupt, it is no interrupt at all.
 //!
-//! It is also not new here — win-kexp's two watchdogs have always Ctrl+Broken the engine from a
+//! It is also not new here — dbgscope's two watchdogs have always Ctrl+Broken the engine from a
 //! thread of their own, on every bounded command and every go/step. What this adds is a caller who
 //! can ask for the same thing, and the binding ([`Running`]) that decides *which job* the request
 //! reaches. See `AGENTS.md` and the `DECISIONS.md` entry for the invariant and its boundary.
@@ -42,10 +42,10 @@ use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use win_kexp::dbgeng::{CommandRun, DebugEngine, InterruptHandle, Interruption, RunToOutcome};
-use win_kexp::heap::{self as heap_query, HeapAllocation, HeapBackend, HeapState, HeapWalk};
-use win_kexp::pool::query::{self, PoolPageFilter, PoolWalk};
-use win_kexp::pool::{
+use dbgscope::dbgeng::{CommandRun, DebugEngine, InterruptHandle, Interruption, RunToOutcome};
+use dbgscope::heap::{self as heap_query, HeapAllocation, HeapBackend, HeapState, HeapWalk};
+use dbgscope::pool::query::{self, PoolPageFilter, PoolWalk};
+use dbgscope::pool::{
     DiagnosticShape, PoolDiagnostics, PoolSpan, PoolState, display_is_ambiguous, parse_raw_tag,
     parse_tag, raw_tag_hex, tag_label,
 };
@@ -113,7 +113,7 @@ fn stop_inheriting(handle: RawHandle) -> std::io::Result<()> {
 /// How long to wait for a target to stop after open/attach/launch (ms).
 ///
 /// Advisory for everything but a live kernel: `attach_kernel` needs `WaitForEvent(INFINITE)`
-/// (a finite timeout returns `E_NOTIMPL` and never drives the KD link), so win-kexp's
+/// (a finite timeout returns `E_NOTIMPL` and never drives the KD link), so dbgscope's
 /// `PendingTarget::wait` ignores this for that one case. That unbounded wait is the reason
 /// sessions live in their own process.
 const LOAD_WAIT_MS: u32 = 60_000;
@@ -154,7 +154,7 @@ const TRIAGE_READ_RESERVE: Duration = WATCHDOG_HEADROOM;
 /// fire before the caller gives up regardless of queue wait.
 ///
 /// Floored at [`WATCHDOG_HEADROOM`] rather than allowed to reach zero, because zero *disables*
-/// win-kexp's watchdog: a command dequeued at or past the deadline would then be the one command
+/// dbgscope's watchdog: a command dequeued at or past the deadline would then be the one command
 /// that runs unbounded, which is exactly the wedge case. The floor overruns the caller's timeout
 /// by design — the caller has already given up by then, and freeing the worker 15s late still
 /// beats never.
@@ -180,7 +180,7 @@ fn watchdog_budget_ms(patience: Duration, queued: Duration) -> u32 {
 ///
 /// **And it really does buy nothing**, which is the part worth writing down, because the first cut
 /// of this reasoned the other way: a walk cut short by its budget clears `complete`, and
-/// win-kexp caches only complete snapshots — an incomplete one invalidates the entry instead. So a
+/// dbgscope caches only complete snapshots — an incomplete one invalidates the entry instead. So a
 /// floored walk for a caller who has gone does 15s of work that is then *discarded*, and the next
 /// query walks from scratch anyway. There is no cache to warm.
 fn walk_budget(patience: Duration, queued: Duration) -> Option<Duration> {
@@ -739,7 +739,7 @@ fn engine_thread(rx: mpsc::Receiver<Job>) {
         // Claimed around the whole op, so an interrupt arriving while it runs names *this* job.
         // Outside the `catch_unwind` below, so a panicking op gives the claim back too.
         claim(id);
-        // A panic inside a win-kexp method (several use `.expect`) must not kill the session —
+        // A panic inside a dbgscope method (several use `.expect`) must not kill the session —
         // surface it as an error for this one op. The engine survives, so this stays a
         // debugger-level failure the model can work around by trying something else.
         let result = catch_unwind(AssertUnwindSafe(|| {
@@ -1138,7 +1138,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             .map_err(Failed::from),
         // The caller's own deadline, on the same arithmetic as a pool walk's and for the same
         // reason — with one difference that makes it matter more here. A pool walk is bounded by
-        // win-kexp *as well*; this one has no command behind it, so between-node checking is the
+        // dbgscope *as well*; this one has no command behind it, so between-node checking is the
         // only bound there is.
         EngineOp::Walk(op) => {
             let patience = Duration::from_millis(u64::from(op.patience_ms));
@@ -1198,7 +1198,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             queued,
         ),
         // The caller's own deadline, on the same arithmetic as a bounded command's: a walk that
-        // outlives its caller holds this session against nobody. Taking win-kexp's default instead
+        // outlives its caller holds this session against nobody. Taking dbgscope's default instead
         // was wrong in both directions — see [`EngineOp::Pool`].
         EngineOp::Pool { query, patience_ms } => {
             let patience = Duration::from_millis(u64::from(patience_ms));
@@ -1370,7 +1370,7 @@ fn failed<E: ToString>(e: E) -> Failed {
 
 /// A command's text, with the deadline's explanation appended when there is one.
 ///
-/// The note lives here rather than in win-kexp because it is prose for whoever reads the tool's
+/// The note lives here rather than in dbgscope because it is prose for whoever reads the tool's
 /// output, and a return value is the wrong place to put prose: the caller before this one had to
 /// string-match for it. Only the deadline earns one — an interrupt *on request* is explained to
 /// the caller by [`cut_short`], and to the one who asked by their own reply.
@@ -1694,9 +1694,9 @@ fn registers(e: &DebugEngine, all: bool) -> Result<Output, Failed> {
 /// "a piece of a wider register" and appears in no register's real name, so the test is narrow — and
 /// it decides only what the *default* carries, since `all` still returns everything the engine
 /// knows.
-fn plain_integer(register: &win_kexp::dbgeng::Register) -> bool {
+fn plain_integer(register: &dbgscope::dbgeng::Register) -> bool {
     !register.subregister
-        && matches!(register.value, win_kexp::dbgeng::RegisterValue::Int(_))
+        && matches!(register.value, dbgscope::dbgeng::RegisterValue::Int(_))
         && !register.name.contains('/')
 }
 
@@ -1715,10 +1715,10 @@ fn plain_integer(register: &win_kexp::dbgeng::Register) -> bool {
 /// is listing.
 fn with_pdb_identity(
     e: &DebugEngine,
-    module: &win_kexp::dbgeng::Module,
+    module: &dbgscope::dbgeng::Module,
     mut info: structured::ModuleInfo,
 ) -> structured::ModuleInfo {
-    use win_kexp::dbgeng::SymbolKind;
+    use dbgscope::dbgeng::SymbolKind;
     if matches!(module.symbols, SymbolKind::Pdb | SymbolKind::Dia) {
         match e.module_pdb(module.base) {
             Ok(pdb) => info.pdb = pdb.map(structured::PdbInfo::from),
@@ -1733,7 +1733,7 @@ fn with_pdb_identity(
 /// The modules, as values and as a listing rendered **from those same values** — optionally
 /// narrowed to the ones whose name matches a pattern.
 ///
-/// **One list, both channels.** The records come from `IDebugSymbols3` (win-kexp's `modules()` and
+/// **One list, both channels.** The records come from `IDebugSymbols3` (dbgscope's `modules()` and
 /// `unloaded_modules()`); nothing here runs `lm`. That is the whole point of
 /// [#120](https://github.com/glslang/windbg-mcp/issues/120): while the text was DbgEng's rendering
 /// and the values were this process's match over the engine's list, one answer had two independent
@@ -1792,9 +1792,9 @@ fn modules(e: &DebugEngine, filter: Option<&str>, limit: usize) -> Result<Output
 ///
 /// [#120]: https://github.com/glslang/windbg-mcp/issues/120
 fn matching<'a>(
-    modules: &'a [win_kexp::dbgeng::Module],
+    modules: &'a [dbgscope::dbgeng::Module],
     pattern: Option<&str>,
-) -> Vec<(structured::ModuleInfo, &'a win_kexp::dbgeng::Module)> {
+) -> Vec<(structured::ModuleInfo, &'a dbgscope::dbgeng::Module)> {
     modules
         .iter()
         .map(|module| (structured::ModuleInfo::from(module), module))
@@ -1811,7 +1811,7 @@ fn matching<'a>(
 /// and one per row printed. The cap buys time here as well as context at the other end.
 fn identified(
     e: &DebugEngine,
-    matched: Vec<(structured::ModuleInfo, &win_kexp::dbgeng::Module)>,
+    matched: Vec<(structured::ModuleInfo, &dbgscope::dbgeng::Module)>,
     take: usize,
 ) -> Vec<structured::ModuleInfo> {
     matched
@@ -2148,7 +2148,7 @@ fn crash_triage(
 
     // **The scope is saved here and restored when this returns.** `!analyze -v` leaves the
     // session's scope at the target's *default*, discarding whatever the caller had selected —
-    // measured on a `0x13A`, a `0xD1`, a `0x9F` and a user-mode AV (glslang/win-kexp#98). Nothing
+    // measured on a `0x13A`, a `0xD1`, a `0x9F` and a user-mode AV (glslang/dbgscope#98). Nothing
     // is written to the debuggee, but a `.frame 3` or `.ecxr` a caller set before calling this is
     // gone afterwards, and that is a change to what every other tool on the session reads. The
     // guard is what lets this tool be annotated read-only; it restores on every path out,
@@ -2418,10 +2418,10 @@ fn disassemble(e: &DebugEngine, address: Option<&str>, count: usize) -> Result<O
     // after the first lookup every following address is almost always inside the same module — and
     // a containment test is arithmetic where `module_at` is a call into the engine. Correctness
     // does not rest on the guess: an address outside the module in hand re-asks.
-    let mut held: Option<win_kexp::dbgeng::Module> = None;
+    let mut held: Option<dbgscope::dbgeng::Module> = None;
     let mut instructions = Vec::with_capacity(decoded.len());
     for instruction in &decoded {
-        let inside = |module: &win_kexp::dbgeng::Module| {
+        let inside = |module: &dbgscope::dbgeng::Module| {
             instruction.address >= module.base && instruction.address < module.end()
         };
         let mut attribution_failed = false;
@@ -2871,7 +2871,7 @@ fn read_memory(e: &DebugEngine, address: &str, size: u32) -> Result<String, Stri
 /// **Bounded, because this one command is the one part of a walk a watchdog can reach.** Resolving
 /// a symbol can send the engine to a symbol server, and an unbounded `Execute` there outlives the
 /// caller's whole timeout with the session held — the walk's between-node deadline cannot help,
-/// since it is not polled until this returns. So the remaining budget is handed to win-kexp's
+/// since it is not polled until this returns. So the remaining budget is handed to dbgscope's
 /// watchdog, and what it costs (up to one 200ms watchdog join) is paid only by a caller who passed
 /// an expression rather than a number.
 /// The watchdog budget for [`resolve_start`]'s one command: what the walk has left, in ms.
@@ -3066,10 +3066,10 @@ impl BatchEngine<'_> {
     /// checks between steps, so a break outstanding from an earlier one would have stopped the
     /// batch before this step began.
     ///
-    /// This is the authority for the calls win-kexp cannot answer for. A command knows its own
+    /// This is the authority for the calls dbgscope cannot answer for. A command knows its own
     /// interruption — the engine clears and reads a flag around `Execute` — but a `run_to` verdict,
     /// a typed memory read and a pool walk have no such notion, and a walk in particular *is*
-    /// interruptible: win-kexp's walker polls the same Ctrl+C flag and stops. Left unasked, they
+    /// interruptible: dbgscope's walker polls the same Ctrl+C flag and stops. Left unasked, they
     /// reported every result as whole.
     fn broken(&self) -> bool {
         interrupt_pending(self.job)
@@ -3443,7 +3443,7 @@ fn render_walk_report(report: &query::PoolSnapshotReport) -> String {
 /// Answers one pool question, walking the pool if the cached snapshot will not do.
 ///
 /// `within` is the caller's own deadline for a walk that actually happens, and is **required** —
-/// win-kexp's `DEFAULT_WALK_BUDGET` is reachable from neither caller here, which is right, because
+/// dbgscope's `DEFAULT_WALK_BUDGET` is reachable from neither caller here, which is right, because
 /// neither is a human at a prompt who could Ctrl+C a walk that ran long. A [`crate::batch`] step
 /// passes its step budget; a pool *tool* call passes what is left of its caller's patience
 /// ([`walk_budget`]). For a batch the deadline is load-bearing beyond the caller: it reserves part
@@ -3455,7 +3455,7 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
     // Every answer below carries `answer.walk` — the state of the walk it was *itself* drawn
     // from, handed back by the query. Asking separately would be a second call, and an incomplete
     // walk is deliberately not cached, so that call could walk again and report the coverage of a
-    // different walk as this one's (win-kexp's `PoolAnswer`).
+    // different walk as this one's (dbgscope's `PoolAnswer`).
     let walk = |refresh: bool| PoolWalk::from(refresh).within(within);
     match args {
         PoolOp::FindTag {
@@ -3964,7 +3964,7 @@ fn heap(e: &DebugEngine, args: HeapOp, within: Duration) -> Result<Output, Faile
                 .map_err(|error| {
                     Failed::categorised(structured::ErrorCategory::InvalidArgument, error)
                 })?;
-            // Scope before win-kexp aggregates diagnostic shapes: those shapes deliberately
+            // Scope before dbgscope aggregates diagnostic shapes: those shapes deliberately
             // generalise addresses, so filtering them for the heap address afterwards loses the
             // category totals and leaves only incidental examples.
             let answer = query_heap_diagnostics(
@@ -4336,9 +4336,9 @@ fn render_census(census: &[query::PoolTagSummary], limit: usize) -> String {
 /// The supervisor infers which from the milestones that arrived before the `Done`, so the error
 /// text lives there, with the session handle it has to quote.
 ///
-/// win-kexp's openers expose the first seam as `x_begin()` returning a `PendingTarget` guard,
+/// dbgscope's openers expose the first seam as `x_begin()` returning a `PendingTarget` guard,
 /// which cannot exist unless the side effect succeeded — so `commit()` between the guard and its
-/// `wait()` is enforced by the type rather than by convention (glslang/win-kexp#71).
+/// `wait()` is enforced by the type rather than by convention (glslang/dbgscope#71).
 fn open<T, R>(e: &DebugEngine, id: u64, transition: T, report: R) -> Result<Output, Failed>
 where
     T: FnOnce(&dyn Fn()) -> Result<(), String>,
@@ -4425,9 +4425,9 @@ fn target_summary(e: &DebugEngine) -> structured::TargetSummary {
 /// every kernel target seen, and a build that ordered it differently should cost a caller a
 /// slightly odd answer, not an empty one.
 fn primary_module(
-    modules: &[win_kexp::dbgeng::Module],
+    modules: &[dbgscope::dbgeng::Module],
     kernel_mode: Option<bool>,
-) -> Option<&win_kexp::dbgeng::Module> {
+) -> Option<&dbgscope::dbgeng::Module> {
     if kernel_mode == Some(true)
         && let Some(kernel) = modules
             .iter()
@@ -4525,7 +4525,7 @@ fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, F
         msg.push_str("---- debugger output ----\n");
         msg.push_str(&res.output);
     }
-    // The verdict was a value in win-kexp and became a `VERDICT:` line here, which is what every
+    // The verdict was a value in dbgscope and became a `VERDICT:` line here, which is what every
     // caller then matched on. It travels as a value again; the line stays for the reader.
     let (verdict, stopped_at) = match res.outcome {
         RunToOutcome::Hit => (structured::RunToVerdict::Hit, Some(target)),
@@ -4612,13 +4612,13 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use win_kexp::pool::WalkStalls;
+    use dbgscope::pool::WalkStalls;
 
     use super::*;
 
     // ---- pool tags ------------------------------------------------------------------
 
-    // What `tag_label` returns for a given tag is win-kexp's own test
+    // What `tag_label` returns for a given tag is dbgscope's own test
     // (`test_raw_tag_round_trips_where_the_displayed_one_cannot`); the rule is defined there so
     // the extension's output and this server's cannot disagree. What is this crate's to prove is
     // that its two tables *use* it — `tag_columns_line_up` below.
@@ -4660,16 +4660,16 @@ mod tests {
             size: 0x70,
             requested_size: None,
             raw_tag,
-            display_tag: win_kexp::pool::tag_label(raw_tag),
-            pool_kind: win_kexp::pool::PoolKind::NonPagedNx,
+            display_tag: dbgscope::pool::tag_label(raw_tag),
+            pool_kind: dbgscope::pool::PoolKind::NonPagedNx,
             numa_node: 0,
-            heap: win_kexp::pool::HeapIdentity {
+            heap: dbgscope::pool::HeapIdentity {
                 pool_state: 0,
                 heap: 0,
                 special: false,
             },
             subsegment: None,
-            backend: win_kexp::pool::PoolBackend::Vs,
+            backend: dbgscope::pool::PoolBackend::Vs,
             state: PoolState::Allocated,
             size_class: 0x70,
         }
@@ -5381,7 +5381,7 @@ mod tests {
     }
 
     /// Past the point where any headroom is left, the budget floors instead of reaching zero —
-    /// because zero *disables* win-kexp's watchdog, which would make a command dequeued near the
+    /// because zero *disables* dbgscope's watchdog, which would make a command dequeued near the
     /// deadline the one command that runs unbounded.
     ///
     /// The floor deliberately overruns the caller's timeout: by then the caller has already given
@@ -5879,8 +5879,8 @@ mod tests {
     /// rows are the head of what matched and the counts are of what matched, which is the pairing
     /// the note and the values both rest on.
     fn capped_sample_list(filter: Option<&str>, limit: usize) -> structured::ModuleList {
-        let pdb = |name: &str, base| win_kexp::dbgeng::Module {
-            symbols: win_kexp::dbgeng::SymbolKind::Pdb,
+        let pdb = |name: &str, base| dbgscope::dbgeng::Module {
+            symbols: dbgscope::dbgeng::SymbolKind::Pdb,
             ..module(name, base)
         };
         let loaded = [
@@ -5889,7 +5889,7 @@ mod tests {
             pdb("nt", 0xfffff803_89200000),
         ];
         let unloaded = [unloaded_module("nvhda64v.sys", 0xfffff803_3d680000)];
-        let narrow = |modules: &[win_kexp::dbgeng::Module]| -> Vec<structured::ModuleInfo> {
+        let narrow = |modules: &[dbgscope::dbgeng::Module]| -> Vec<structured::ModuleInfo> {
             modules
                 .iter()
                 .map(structured::ModuleInfo::from)
@@ -6266,7 +6266,7 @@ mod tests {
     /// the budget table is measured against.
     #[test]
     fn a_default_register_set_is_the_integer_ones_and_not_the_vector_bank() {
-        use win_kexp::dbgeng::{Register, RegisterValue as Engine};
+        use dbgscope::dbgeng::{Register, RegisterValue as Engine};
         let reg = |name: &str, value, subregister| Register {
             name: name.to_string(),
             value,
@@ -6335,7 +6335,7 @@ mod tests {
     /// **A pattern that matches only unloaded modules has found something.** `lm m nvhda*` on this
     /// repo's own sample matches no *loaded* module and twenty-six unloaded `nvhda64v.sys` rows, so
     /// a bare "no module matches" would be denying the listing the caller is looking at — and,
-    /// since [`win_kexp::dbgeng::DebugEngine::unloaded_modules`], those rows are values here rather
+    /// since [`dbgscope::dbgeng::DebugEngine::unloaded_modules`], those rows are values here rather
     /// than text this can only apologise for. The note reports them as a count of what was found.
     #[test]
     fn a_pattern_that_matches_only_unloaded_modules_reports_them_as_matches() {
@@ -6951,8 +6951,8 @@ mod tests {
 
     // ---- what an opener says about the target (#105) ------------------------
 
-    fn module(name: &str, base: u64) -> win_kexp::dbgeng::Module {
-        win_kexp::dbgeng::Module {
+    fn module(name: &str, base: u64) -> dbgscope::dbgeng::Module {
+        dbgscope::dbgeng::Module {
             base,
             size: 0x1000,
             name: name.to_string(),
@@ -6960,19 +6960,19 @@ mod tests {
             loaded_image_name: String::new(),
             timestamp: 0,
             checksum: 0,
-            symbols: win_kexp::dbgeng::SymbolKind::Deferred,
+            symbols: dbgscope::dbgeng::SymbolKind::Deferred,
             user_mode: false,
             unloaded: false,
         }
     }
 
     /// An unloaded module as the engine really reports one: **no module name**, only the image's,
-    /// which the kernel has truncated to twelve characters (glslang/win-kexp#101).
-    fn unloaded_module(image: &str, base: u64) -> win_kexp::dbgeng::Module {
-        win_kexp::dbgeng::Module {
+    /// which the kernel has truncated to twelve characters (glslang/dbgscope#101).
+    fn unloaded_module(image: &str, base: u64) -> dbgscope::dbgeng::Module {
+        dbgscope::dbgeng::Module {
             name: String::new(),
             image_name: image.to_string(),
-            symbols: win_kexp::dbgeng::SymbolKind::None,
+            symbols: dbgscope::dbgeng::SymbolKind::None,
             unloaded: true,
             ..module("", base)
         }
@@ -7000,7 +7000,7 @@ mod tests {
         );
     }
 
-    fn summary_of(modules: &[win_kexp::dbgeng::Module], kernel: bool) -> structured::TargetSummary {
+    fn summary_of(modules: &[dbgscope::dbgeng::Module], kernel: bool) -> structured::TargetSummary {
         structured::TargetSummary {
             kernel_mode: Some(kernel),
             modules_loaded: Some(modules.len()),
@@ -7109,7 +7109,7 @@ mod tests {
     #[test]
     fn a_bug_check_is_named_where_a_dump_is_opened() {
         let mut summary = summary_of(&[module("nt", 0xfffff80312000000)], true);
-        summary.bug_check = Some(triage::bug_check_info(&win_kexp::dbgeng::BugCheck {
+        summary.bug_check = Some(triage::bug_check_info(&dbgscope::dbgeng::BugCheck {
             code: 0x9f,
             parameters: [3, 0xffffe284ffe59060, 0, 0],
         }));
@@ -7143,7 +7143,7 @@ mod tests {
 
     // ---- the pool walk budget (#75) ----------------------------------------
 
-    /// A pool walk is bounded by the *caller's* deadline, not by win-kexp's default.
+    /// A pool walk is bounded by the *caller's* deadline, not by dbgscope's default.
     ///
     /// Both directions matter, which is why this checks a short call budget and the default one.
     /// Taking `DEFAULT_WALK_BUDGET` (120s) meant a host configured with a 60s call timeout got a
@@ -7204,7 +7204,7 @@ mod tests {
     ///
     /// Two ways in, and both are real: a server configured with a call timeout at or under the
     /// headroom, and a query dequeued after its caller has given up. Neither can be answered, and
-    /// the work would not even leave a cache behind — win-kexp caches complete snapshots only, so a
+    /// the work would not even leave a cache behind — dbgscope caches complete snapshots only, so a
     /// budget-truncated walk is discarded and the next query walks again regardless.
     #[test]
     fn a_pool_walk_with_no_time_left_is_not_run_at_all() {

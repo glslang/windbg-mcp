@@ -3,7 +3,7 @@
 //! The unit tests in `src/server.rs` check the tool surface in-process, through the SDK's
 //! Rust API. That is the wrong altitude for the two events this file exists for:
 //!
-//! * **A dependency moved** (`rmcp`, `win-kexp`, `schemars`, `tokio`). The in-process tests
+//! * **A dependency moved** (`rmcp`, `dbgscope`, `schemars`, `tokio`). The in-process tests
 //!   still compile and pass while the bytes on the wire change underneath them — a schema
 //!   dialect switch, a crate that starts writing to stdout and corrupts the transport, a
 //!   shutdown path that leaves the process alive.
@@ -25,7 +25,7 @@
 //!   reach each other's sessions — live in the tier below.
 //! * **Target** (`WINDBG_MCP_SMOKE_DUMP=1`) — opens the sample crash dump through DbgEng, so
 //!   it needs `dbgeng.dll` and may reach a symbol server. Off by default; this is the tier
-//!   that catches a `win-kexp` regression. It also runs a `debug_batch` to both outcomes, and
+//!   that catches a `dbgscope` regression. It also runs a `debug_batch` to both outcomes, and
 //!   through both teardowns — an `end_session` and a client disconnect landing mid-transaction —
 //!   because "the rollback ran inside the worker" is a claim only a real engine can settle. And
 //!   it waits out a **lease expiry** against a parked kernel attach, which is the listener's
@@ -4360,7 +4360,7 @@ fn raw(server: &mut Server, session: &str, command: &str) -> String {
 ///
 /// Driven through a `debug_batch` rather than `go` for the bound: `go`'s own wait is a minute, and
 /// three seconds of a target that will not stop proves the same thing. The `timed_out` field `go`
-/// answers with is asserted `false` above; `true` is win-kexp's to cover, in
+/// answers with is asserted `false` above; `true` is dbgscope's to cover, in
 /// `a_go_that_never_stops_is_reported_and_leaves_the_engine_usable`, where a two-second bound
 /// costs nothing.
 #[test]
@@ -4706,7 +4706,7 @@ fn a_call_with_nothing_to_report_still_reports_that_it_is_running() {
     );
 }
 
-/// The end-to-end debugger path, which is what a `win-kexp` or DbgEng change actually moves:
+/// The end-to-end debugger path, which is what a `dbgscope` or DbgEng change actually moves:
 /// open a real dump, read state out of it through several tools, then close it. Everything
 /// here is read-only against a checked-in dump — no live target, no writes.
 #[test]
@@ -6291,7 +6291,7 @@ fn a_bug_check_is_triaged_into_its_fields() {
 
     // **The session is where it was left, which is what `read_only_hint = true` claims.** The
     // `!analyze -v` a triage runs resets the debugger's selected scope to the target's default —
-    // measured on four targets (glslang/win-kexp#98) — so a caller who had chosen a frame would
+    // measured on four targets (glslang/dbgscope#98) — so a caller who had chosen a frame would
     // silently lose it. `crash_triage` saves and restores it; this is that promise, checked the
     // only way it can be: from a scope the analysis would otherwise discard.
     //
@@ -8370,7 +8370,7 @@ fn a_pool_walk_takes_this_servers_deadline_not_the_walkers_default() {
 /// The budget borrowed the bounded command's floor at first, which is right *there* — zero disables
 /// that watchdog, so an unbounded command is the worse outcome — and wrong here, where zero merely
 /// stops the walk at its first check. Floored, a 10s call budget bought a 15s walk: #75's own
-/// complaint at the small end. And it bought nothing for it, since win-kexp caches complete
+/// complaint at the small end. And it bought nothing for it, since dbgscope caches complete
 /// snapshots only, so the truncated result is discarded and the next query walks from scratch
 /// regardless.
 ///
@@ -8423,7 +8423,7 @@ fn a_pool_query_with_no_time_to_walk_is_refused_rather_than_run() {
 /// call that started it gets its partial output back as a result, and the session takes the next
 /// call at once.
 ///
-/// This is the only place the whole mechanism exists. win-kexp proves `SetInterrupt` reaches a
+/// This is the only place the whole mechanism exists. dbgscope proves `SetInterrupt` reaches a
 /// running command; what is unproven there is everything that makes it usable from a client — that
 /// the interrupt travels on the session's queue and is *answered by the worker's request reader*
 /// rather than queued behind the very operation it means to stop, and that the binding to the
@@ -8559,7 +8559,7 @@ fn a_running_command_is_interrupted_on_request_and_frees_its_session() {
 //     $env:WINDBG_MCP_SMOKE_DUMP = "1"
 //     cargo test --test mcp_smoke -- --ignored --nocapture --test-threads=1 bounded
 //
-// win-kexp proves the primitive (`execute_command_bounded` aborts a runaway command, and the next
+// dbgscope proves the primitive (`execute_command_bounded` aborts a runaway command, and the next
 // command survives it). What is unproven *there* is this server's wiring of it, and that wiring is
 // now split across two processes: the supervisor computes the budget from what is left of the
 // caller's timeout after queue wait, and the worker arms the watchdog with it. Only the shipped
@@ -8651,7 +8651,7 @@ fn a_bounded_runaway_command_aborts_and_leaves_its_session_usable() {
     server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
 }
 
-/// The queue-aware half of the budget, which is the part that has no equivalent in win-kexp: a
+/// The queue-aware half of the budget, which is the part that has no equivalent in dbgscope: a
 /// bounded command that spent most of the call budget waiting its turn must still abort *before*
 /// its caller's timeout, not one full budget after it was dequeued.
 ///
@@ -8729,14 +8729,14 @@ fn a_bounded_command_queued_behind_another_job_still_beats_its_caller() {
 }
 
 /// What the bounded path *costs* a command that was never going to run away — the evidence behind
-/// the coverage split in `DECISIONS.md` (2026-08-02), kept as a test so a win-kexp change to the
+/// the coverage split in `DECISIONS.md` (2026-08-02), kept as a test so a dbgscope change to the
 /// watchdog can be re-measured rather than re-argued.
 ///
-/// The cost is not a constant overhead but a **quantization**: win-kexp's watchdog thread checks
+/// The cost is not a constant overhead but a **quantization**: dbgscope's watchdog thread checks
 /// its `done` flag, then sleeps 200ms, so a command takes `ceil(d / 200ms) * 200ms`. The tax on a
 /// point query is best read as: anything that takes 1–200ms now takes 200ms.
 ///
-/// Prints rather than asserts. The cost belongs to win-kexp's watchdog, not to this crate, and a
+/// Prints rather than asserts. The cost belongs to dbgscope's watchdog, not to this crate, and a
 /// threshold pinned here would fail on an unrelated host difference. Measured through the tool
 /// surface, so the numbers now include this server's own per-call overhead — one IPC round trip
 /// on top of what the in-process version measured, which is the number a caller actually sees.
@@ -8993,7 +8993,7 @@ fn owns_udp_port(pid: u32, port: u16) -> bool {
 /// * a second session works *alongside* a live kernel attach — impossible by construction before
 ///   — checked here on the target it matters most for;
 /// * `end_session` takes the **graceful** path on a live kernel. That is not tidiness: DbgEng
-///   leaves a detached-but-halted kernel frozen, so win-kexp resumes and *actively* detaches. A
+///   leaves a detached-but-halted kernel frozen, so dbgscope resumes and *actively* detaches. A
 ///   session that fell through to the worker kill instead would leave the guest halted — one CPU
 ///   stopped, the rest spinning — and its KD stub wedged until a reboot.
 ///
@@ -9402,7 +9402,7 @@ fn disconnecting_releases_a_live_kernel_session_rather_than_killing_it() {
 
 /// How long a pool query may take before the budget it carries has failed to do its job.
 ///
-/// win-kexp's `DEFAULT_WALK_BUDGET` is 120s and this server currently takes that default (#75),
+/// dbgscope's `DEFAULT_WALK_BUDGET` is 120s and this server currently takes that default (#75),
 /// so the walk is bounded there; the slack covers the reads already in flight when the deadline
 /// passes, the render, and the round trip. Deliberately well under `TARGET_STEP`, so a breach
 /// fails *here* with a diagnosis rather than as an opaque harness timeout.
@@ -9417,7 +9417,7 @@ const NOT_QUEUED: Duration = Duration::from_secs(30);
 
 /// What the pool tier's server is told its per-call timeout is, rather than inheriting one.
 ///
-/// Comfortably above win-kexp's 120s walk budget, so a walk that behaves is never cut off, and
+/// Comfortably above dbgscope's 120s walk budget, so a walk that behaves is never cut off, and
 /// below [`POOL_CALL_BUDGET`] so the server is always the one to answer first.
 const SERVER_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -9723,7 +9723,7 @@ fn assert_diagnostic_total_covers_its_categories(diagnostics: &Value) {
 
 /// A pool walk over a live kernel: the query that used to take the session with it.
 ///
-/// This is the tier the budget in glslang/win-kexp#88 was written for, and the only one that can
+/// This is the tier the budget in glslang/dbgscope#88 was written for, and the only one that can
 /// exercise it. Against the checked-in dump a walk is local memory and finishes in well under a
 /// second, so every assertion below would pass for the wrong reason. Against a live KDNET target
 /// it is every committed pool page over the wire — which is where the walk ran for minutes, the
@@ -9918,7 +9918,7 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
         println!("the census reports this walk {coverage}");
         // The gap figures, printed rather than asserted on: they are the only place a live run
         // reports what the walk could not decode, and the two issues they were built for
-        // (glslang/win-kexp#103, #104) are settled by comparing them across runs. A threshold
+        // (glslang/dbgscope#103, #104) are settled by comparing them across runs. A threshold
         // here would fail on an idle machine or pass on a busy one; a number in the log will not.
         println!("what the walk did and could not reach: {}", totals["walk"]);
         // An incomplete walk is an acceptable outcome, but "incomplete" on its own is not a
@@ -9949,7 +9949,7 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
             // they are ever produced.
             println!("verbatim samples: {}", diagnostics["examples"]);
             // Filtered, because the unfiltered sample is shared across every shape the walk met
-            // and the interesting one is crowded out. glslang/win-kexp#104 turns on which of two
+            // and the interesting one is crowded out. glslang/dbgscope#104 turns on which of two
             // answers the engine gives when it cannot advance — a region reported *behind* the
             // cursor, meaning the region is over and the page step is pointless, or a zero-length
             // region reported ahead of it, meaning the step is right. The numbers separate them

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The engine bindings are now `dbgscope`, and `win-kexp` keeps only what its name meant.**
+  The dependency had two halves with exactly one reference between them: the debugger side
+  (`dbgeng` plus the pool and heap walkers built on it), which is everything this server consumes
+  and 117 of the dependency's last 135 commits, and an exploitation side (shellcode, ROP, process
+  injection, win32k wrappers) with zero commits in three months. The debugger half keeps the
+  repository and its history under the new name; the dormant half was extracted with `git
+  filter-repo` and keeps the `win-kexp` name, which now describes all of it. Nothing this server
+  used has moved or changed shape — the update is `use win_kexp::` becoming `use dbgscope::` — but
+  the crate can now carry a version rather than a git revision, and it sheds `goblin`,
+  `byte-strings`, its build script and nine `windows` features on the way. The WinDbg extension
+  command it exposes is renamed with it: `!win_kexp.poolmap` is `!dbgscope.poolmap`, since that
+  name comes from the cdylib's filename. Entries above this one name `win-kexp` because that is
+  what the crate was called when they were written.
+
 - **The server reports the git revision it was built from**, as semver build metadata on the
   version it already reported: `0.11.0+g1a2b3c4`, and `-dirty.<digest>` where the build inputs
   differ from that commit — the digest, over the working-tree diff, so that two uncommitted

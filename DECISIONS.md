@@ -312,7 +312,7 @@ for the first failed read (`MemoryWalk.note`). A list of freed objects reads ide
 that is not broken in, or a `start` that is not where the caller thinks.
 
 **Bounded between nodes, because nothing else bounds it.** A walk is a long run of reads with no
-`Execute` behind it, so win-kexp's watchdog has nothing to interrupt. The deadline and the session's
+`Execute` behind it, so dbgscope's watchdog has nothing to interrupt. The deadline and the session's
 interrupt are polled once per node, *before* its reads — after them, a break landing during node 3
 would still buy node 4's round trips. A walk that reaches the engine with less than the reply's own
 headroom left is refused outright, as a pool query that must walk already is.
@@ -320,7 +320,7 @@ headroom left is refused outright, as a pool query that must walk already is.
 **The one exception is a command, so it takes the watchdog.** Resolving a symbolic `start` runs a
 `?`, which can send the engine to a symbol server; the between-node deadline cannot bound it,
 because it is not polled until the resolve returns. So the resolve is handed what is left of the
-walk's budget, floored at 1ms — zero *disarms* win-kexp's watchdog, which would leave the one
+walk's budget, floored at 1ms — zero *disarms* dbgscope's watchdog, which would leave the one
 blocking part of the call as the only unbounded thing in it. A resolve cut short is reported as
 `NotRun`, never as a bad expression: being stopped says nothing about whether the symbol exists.
 
@@ -360,10 +360,10 @@ Failures carry a coarse `ErrorCategory`; the categories are the distinctions tha
 caller *does*, because one nobody can act on differently will drift.
 
 **Values are built where the values are, never re-derived from a rendering** — the same rule as
-#77, pointed at results. The worker builds its half from win-kexp types while it still holds them
+#77, pointed at results. The worker builds its half from dbgscope types while it still holds them
 (`crate::structured`, carried over the pipe by `proto::Output`); the supervisor builds the session
 answers from its own registry. Where a value did not exist upstream it was added there first, which
-is why win-kexp grew `register_values`, `modules`, `breakpoints`, and a pool walk that reports *why*
+is why dbgscope grew `register_values`, `modules`, `breakpoints`, and a pool walk that reports *why*
 it stopped rather than only that it did.
 
 **Addresses are strings, in one form.** `0x`-prefixed, lowercase, 16-digit zero-padded. A JSON
@@ -379,7 +379,7 @@ text, where it belongs.
 ## An interrupt is bound to a job, not to a moment (2026-08-10, FOLLOWUPS item 7)
 
 **Context.** A runaway call had one way out: `end_session`, which ends it by discarding the target.
-The primitive for a gentler one existed but was only ever *timeout-driven* — win-kexp's watchdog
+The primitive for a gentler one existed but was only ever *timeout-driven* — dbgscope's watchdog
 threads Ctrl+Break when a deadline passes, and no caller could ask for the same. What stopped it
 being a five-line change is that `SetInterrupt` addresses an **engine**, not an operation.
 
@@ -401,7 +401,7 @@ now rather than deferred with it.
 above), and here it is the whole mechanism rather than an ordering detail: queued, the request would
 be read only once the operation it means to stop had ended.
 
-**One thing had to change in win-kexp**, and it is not the `SetInterrupt` call. The handle and the
+**One thing had to change in dbgscope**, and it is not the `SetInterrupt` call. The handle and the
 engine share a "raised" flag, so `execute_command_bounded` can tell an aborted `Execute` from a
 failed one **without being the thread that asked**. Without it an interrupt on request is a
 `CommandFailed` and the output captured up to the break goes with it — most of what an interrupted
@@ -462,7 +462,7 @@ step would ever say anything was wrong.
 And the seam has **no** "this finished" constructor, which is the part that stops the class coming
 back. There was one, used at the dispatch to wrap the three actions that are not commands — `run_to`,
 `read_memory` and the pool steps — and it made *finished* their silent default. Two of those are
-interruptible in fact (a pool walk polls the same flag win-kexp's walker does), and the engine
+interruptible in fact (a pool walk polls the same flag dbgscope's walker does), and the engine
 cannot report it for any of them, since only the worker knows a break was raised. So every method on
 the trait returns the same type and every implementor has to say what it saw: there is now no way to
 claim a call finished without deciding that it did.
@@ -479,12 +479,12 @@ on the request reader). The engine is still created on the engine thread, never 
 every other call is made there. The exception is unavoidable rather than convenient: an interrupt
 exists to stop an operation that is *running*, so the engine thread is busy by definition, and a
 request routed through it would be read only once there was nothing left to interrupt — the
-alternative is not a safer interrupt but no interrupt. It is also not new. win-kexp's two watchdogs
+alternative is not a safer interrupt but no interrupt. It is also not new. dbgscope's two watchdogs
 have Ctrl+Broken the engine from threads of their own on every bounded command and every go/step
 since the bounded path existed; what changed is that a caller can now ask for the same thing.
 
 Validated where it can be: `execute_command_bounded`'s watchdog is the same call from the same
-kind of thread and is exercised by the bounded tier; win-kexp's
+kind of thread and is exercised by the bounded tier; dbgscope's
 `test_command_interrupted_on_request_keeps_its_output` drives the new caller against a live engine;
 and the dump tier's `a_running_command_is_interrupted_on_request_and_frees_its_session` drives it
 through the shipped binary, with the session used again afterwards — which is what would fail if
@@ -611,7 +611,7 @@ flight, and Ctrl+Breaking it would turn a step that was about to succeed into a 
 **Status.** Adopted, and the two things it owed are now paid (2026-08-10). **Pool steps** (FOLLOWUPS
 item 17) landed as one `StepAction` variant per question rather than a generic "call a tool" step,
 which would have put every tool's arguments in the batch schema twice; the part nobody had
-anticipated is that a walk needs a deadline *from the batch*, because win-kexp bounds one at 120s and
+anticipated is that a walk needs a deadline *from the batch*, because dbgscope bounds one at 120s and
 an ordinary batch's whole budget is shorter — a refreshed pool step taking that default would spend
 the rollback's reserve and overrun the bound advertised to a teardown, which is the failure above
 arriving through the one step that is not a command. The pool *tools* went on taking that default
@@ -793,7 +793,7 @@ nothing shared to order. Sessions became concurrent (bounded at `MAX_SESSIONS`, 
 protocol-level error class shrank to "no worker could be started at all" — every other failure is
 now scoped to a session and has a next move, so it belongs in the tool result.
 
-**Corroborated upstream.** win-kexp reached the same conclusion from the library side while this was
+**Corroborated upstream.** dbgscope reached the same conclusion from the library side while this was
 in review, and now documents it on `attach_kernel` itself: *"Callers that must stay responsive (a
 server, an MCP endpoint) need a **separate process they can kill**. Moving the call to a worker
 thread and abandoning it is not a recovery"* — the thread, its stack, the `DebugEngine`, its COM
@@ -816,7 +816,7 @@ the design this replaced.
 > unchanged and still the rule; what changed is that a runaway command now pins one session rather
 > than the server.
 
-**Context.** `EngineHandle::run_command` (`src/engine.rs`) runs a raw command under win-kexp's
+**Context.** `EngineHandle::run_command` (`src/engine.rs`) runs a raw command under dbgscope's
 `execute_command_bounded`, whose watchdog `SetInterrupt`s the engine before the caller's timeout so
 a runaway command aborts instead of pinning the single engine thread. It was adopted (#45) for
 `execute`, `dx`, `ttd_calls`, `ttd_memory`, `ttd_events`. Every other command-executing tool —
@@ -825,7 +825,7 @@ a runaway command aborts instead of pinning the single engine thread. It was ado
 `execute_command` through plain `run`. #46 asked whether that split is principled or accidental.
 
 **The measurement that decides it.** Arming the watchdog is not free, and its cost is not a small
-constant. win-kexp spawns a thread that polls a `done` flag on a 200ms sleep and joins it after
+constant. dbgscope spawns a thread that polls a `done` flag on a 200ms sleep and joins it after
 `Execute` returns — so the join waits out the rest of that sleep, and a bounded command takes
 `ceil(d / 200ms) * 200ms`. Measured against the sample dump
 (`measure_what_the_bounded_path_costs_a_quick_command`, `src/engine.rs`):
@@ -856,7 +856,7 @@ run to run on one host). An analysis session issues these by the dozen.
   keyframe spacing rather than trace length.
 - **Already bounded elsewhere, so not routed here.** The execution-control tools (`go`, the
   `step_*` family, `reverse_go`) go through `execute_and_wait`, and `run_to_address` through
-  win-kexp's `run_to_address`; both carry their own watchdog. The openers are bounded by
+  dbgscope's `run_to_address`; both carry their own watchdog. The openers are bounded by
   `LOAD_WAIT_MS` on the wait half. A second watchdog would be redundant.
 - **`index_trace` is a deliberate exception.** `!ttdext.index -force` *is* O(trace) and can
   legitimately run for many minutes, so the criterion above would bound it — but it is the one
@@ -870,7 +870,7 @@ caller-controlled unbounded runtime, so by the criterion it should be bounded �
 bounds a single command string and cannot help a multi-command job. It needs a job-level deadline
 instead; see FOLLOWUPS.md item 13.
 
-**Status:** accepted. Revisit if win-kexp's watchdog stops quantizing to 200ms (parking on a condvar
+**Status:** accepted. Revisit if dbgscope's watchdog stops quantizing to 200ms (parking on a condvar
 instead of polling a sleep would make it ~free), at which point "bound everything except
 `index_trace`" becomes the cheaper and simpler rule — FOLLOWUPS.md item 14.
 
@@ -910,12 +910,12 @@ usermode IOCTL harness (`CreateFile` + `DeviceIoControl`). Full concolic/symboli
 ever needed); kernel state, loops, hashing, and stateful protocols make it brittle and a separate
 project.
 
-### D3 — New execution/read/write primitives live in win-kexp, not the `execute` text hatch
-`win-kexp` is the typed DbgEng foundation. New primitives (`run_to` with a structured stop reason,
+### D3 — New execution/read/write primitives live in dbgscope, not the `execute` text hatch
+`dbgscope` is the typed DbgEng foundation. New primitives (`run_to` with a structured stop reason,
 typed register read/write, `write_virtual`) are added there as typed `DebugEngine` methods over the
 COM interfaces. `windbg-mcp` stays thin: MCP tool wrappers over those methods, plus the engine-free
 analysis (directional path + recipe), which is pure text processing and correctly stays in
-`windbg-mcp`. `win-kexp` is a git dependency pinned to `777b5c2`; changes land there first (with its
+`windbg-mcp`. `dbgscope` is a git dependency pinned to `777b5c2`; changes land there first (with its
 own tests), then `windbg-mcp`'s `Cargo.toml` moves the pin forward.
 
 ### D4 — The state-injection variant is lower priority
@@ -929,7 +929,7 @@ typed **write** primitives it needs (`write_virtual`, register write, `ba` data 
 with it.
 
 ### D5 — Build order
-1. `win-kexp`: structured breakpoint / `run_to` stop-reason + typed `read_register`.
+1. `dbgscope`: structured breakpoint / `run_to` stop-reason + typed `read_register`.
 2. `windbg-mcp`: directional path extraction + `iced-x86` operand-decoded recipe (engine-free,
    unit-tested like the tests at `src/server.rs:1503+`).
 3. Usermode IOCTL harness (out-of-band helper).
@@ -950,12 +950,12 @@ Landed as one change across both repos, with two refinements to D5 confirmed dur
   symbolic path (D2) would take over. Implemented in `src/server.rs` as `path_recipe`/`format_recipe`
   (types `Direction`/`Predicate`/`IoField`/`BranchStep`/`SegmentRecipe`); the field mapping reuses
   the IO_STACK_LOCATION offsets `ioctl_trace` encodes (`+0x18`/`+0x10`/`+0x08`).
-- **D3/D5.1 `run_to` lives in win-kexp.** Added `DebugEngine::run_to_address(addr, timeout_ms)
+- **D3/D5.1 `run_to` lives in dbgscope.** Added `DebugEngine::run_to_address(addr, timeout_ms)
   -> RunToResult` (a one-shot `g <addr>` + structured `RunToOutcome::{Hit, StoppedElsewhere,
   Timeout}`), reading the instruction pointer typed via `IDebugRegisters::GetInstructionOffset`
   (new `instruction_pointer` helper). `windbg-mcp`'s `run_to_address` tool is a thin wrapper.
-  Delivered on win-kexp branch `feature/run-to-address`; `windbg-mcp`'s `Cargo.toml` tracks that
-  branch until it merges to win-kexp `main`, then the pin moves back.
+  Delivered on dbgscope branch `feature/run-to-address`; `windbg-mcp`'s `Cargo.toml` tracks that
+  branch until it merges to dbgscope `main`, then the pin moves back.
 
 Typed **read_register** (beyond the private `instruction_pointer`) and the injection/write
 primitives (D4) remain deferred.
