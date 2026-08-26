@@ -1854,6 +1854,12 @@ fn raw_command(e: &DebugEngine, command: &str, budget_ms: u32) -> Result<Command
     match result {
         Ok(mut run) => {
             run.output = appended(run.output, Some(pumped));
+            // The pump's ending belongs to the run this returns, not only to its prose. The
+            // command's own `target_gone` is false here — it was the *pump* that watched the
+            // target leave — so without this a `debug_batch` `{"op": "command", "command": "g"}`
+            // hands back an ordinary success and the batch runs on, which is the same defect
+            // this fixes for a `resume` step, on the sibling path.
+            run.target_gone |= ending;
             Ok(run)
         }
         // The command failed *and* left the target running. Both facts, in the one channel an

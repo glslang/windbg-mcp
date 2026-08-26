@@ -355,6 +355,20 @@ pub enum Check {
 }
 
 impl Check {
+    /// Whether checking this asks the *engine* a question, rather than reading the output the
+    /// step already produced.
+    ///
+    /// A `match` rather than a negation, so a check added later is a compile error here instead
+    /// of silently defaulting to "reads the output" — which is the safe-looking answer and the
+    /// wrong one: it would send the new check to an engine with no target and read its refusal
+    /// back as a failed assertion.
+    fn needs_the_engine(&self) -> bool {
+        match self {
+            Self::Contains { .. } | Self::NotContains { .. } => false,
+            Self::Eval { .. } => true,
+        }
+    }
+
     fn substituted(
         &self,
         resolve: &mut impl FnMut(&str) -> Option<String>,
@@ -1303,6 +1317,21 @@ fn run_step(
 
     let mut result = StepResult::Ok;
     for check in &checks {
+        // The action ended the target, so anything asking the engine a question now is asking a
+        // session that has none. `Check::Eval` does exactly that, and a refusal reads back as
+        // `Unmet` — a *false failed assertion* on a step whose action did what it was asked.
+        //
+        // Reported rather than skipped, and `Failed` rather than `Unmet`, for the reason the
+        // deadline case below gives in as many words: nothing was learned about the target, so
+        // calling it a failed assertion would report a verdict the batch never reached.
+        if target_gone && check.needs_the_engine() {
+            result = StepResult::Failed(
+                "this step ended the target, so its assertions could not be checked — there is \
+                 nothing left to ask"
+                    .to_string(),
+            );
+            break;
+        }
         // Re-read the clock between checks, not once for the step. An `eval` check is two engine
         // queries, and a step may carry several — arming each of them with the budget computed
         // before the *first* one would let a step's assertions run for a multiple of the time the
@@ -1486,6 +1515,17 @@ fn evaluate(
     }
 }
 
+/// Whether this step's command names the *debug target* as what it changes — `.detach`, `q`,
+/// `.opendump` and the rest of [`crate::server::changes_debug_target`]'s list.
+///
+/// Its own function because [`probe_state`] asks it twice and the two asks must not drift: once to
+/// find the step that took the target, and once to say which of the two ways it did.
+fn releases_the_target(step: &StepOutcome) -> bool {
+    step.changes
+        .as_deref()
+        .is_some_and(|changes| changes.contains("the debug target"))
+}
+
 /// Asks what the session holds now.
 ///
 /// The probe is one expression, `? @$ip`, and it is read conservatively. An answer means the
@@ -1499,30 +1539,30 @@ fn probe_state(
     always: &[StepOutcome],
     budget: Duration,
 ) -> SessionAfter {
-    let released = steps
+    // One ordered scan, not two, and the order is the point: **whichever step took the target
+    // away first is the one that did it**, because everything after it ran against nothing. Two
+    // scans, release-then-ending, read a `.detach` in the `always` block as the cause of an ending
+    // a main step had already caused — and that `.detach` never even ran, since the engine refused
+    // it. `changes` is recorded whether or not a step succeeded, deliberately, so it cannot be the
+    // tie-break on its own.
+    //
+    // Each step is then classified by *how* it took the target, and the two are not the same news:
+    // a detached or replaced process is still running somewhere and can be attached to again, and
+    // on a live kernel that is the difference between a machine that is up and one that is not.
+    // `changes` is what separates them — `.detach`, `q` and `.opendump` name the debug target,
+    // while a resume that ran a program to its end names execution. Note `.opendump` *replaces*
+    // the target, so it reaches here on `changes` alone with `target_gone` false, which is why
+    // that test cannot be dropped in favour of the typed one.
+    let took_the_target = steps
         .iter()
         .chain(always)
         .filter(|s| !matches!(s.result, StepResult::Skipped(_)))
-        .find(|s| {
-            s.changes
-                .as_deref()
-                .is_some_and(|c| c.contains("the debug target"))
-        });
-    if let Some(step) = released {
-        return SessionAfter::Detached {
-            by: format!("`{}`", step.rendered),
-        };
-    }
-
-    // **After** the release check and not before it, so a `.detach` keeps saying *detached*: both
-    // steps report `target_gone` now, and the two are not the same news — a detached process is
-    // still running and can be attached to again, and on a live kernel a machine that is still up
-    // is not one that is not. What reaches here is the ending no command name announces: a
-    // program that ran out during a resume.
-    let ended = steps.iter().chain(always).find(|step| step.target_gone);
-    if let Some(step) = ended {
-        return SessionAfter::Ended {
-            by: format!("`{}`", step.rendered),
+        .find(|s| s.target_gone || releases_the_target(s));
+    if let Some(step) = took_the_target {
+        let by = format!("`{}`", step.rendered);
+        return match releases_the_target(step) {
+            true => SessionAfter::Detached { by },
+            false => SessionAfter::Ended { by },
         };
     }
 
@@ -2090,8 +2130,8 @@ mod tests {
     /// A `.detach` keeps saying **detached**, not ended, though both now report the same terminal
     /// fact to the batch.
     ///
-    /// The two are not the same news, and the ordering inside `probe_state` is the only thing
-    /// keeping them apart: a detached process is still running somewhere.
+    /// The two are not the same news: a detached process is still running somewhere and can be
+    /// attached to again.
     #[test]
     fn a_detach_is_still_reported_as_a_detach_rather_than_an_ending() {
         let mut d = stopped()
@@ -2105,6 +2145,81 @@ mod tests {
                 by: "`.detach`".to_string()
             },
             "a released target is detached, not ended: {report:?}"
+        );
+    }
+
+    /// A cleanup step that **could not run** must not be reported as the thing that took the
+    /// target: the resume that ended it did, and it came first.
+    ///
+    /// `changes` is recorded whether or not a step succeeded — deliberately, since a command that
+    /// errors may already have written — so it cannot be the tie-break on its own. Scanning for a
+    /// release before scanning for an ending read this `.detach`, which the engine refused, as the
+    /// cause of an ending that had already happened two steps earlier.
+    #[test]
+    fn a_failed_cleanup_does_not_take_credit_for_an_ending_that_came_first() {
+        let mut d = stopped()
+            .on("g", Ok("the process exited"))
+            .on(".detach", Err("No active debuggee"))
+            .ends_the_target_on("g");
+
+        let report = run(
+            &mut d,
+            &op(
+                vec![step(StepAction::Resume {
+                    command: "g".to_string(),
+                    timeout_ms: None,
+                })],
+                vec![cmd(".detach")],
+            ),
+            BUDGET,
+        );
+        assert_eq!(
+            report.after,
+            SessionAfter::Ended {
+                by: "`g`".to_string()
+            },
+            "the resume ended the target; the refused `.detach` did nothing: {report:?}"
+        );
+    }
+
+    /// A step that ends the target does not then have its assertions checked against an engine
+    /// that has none.
+    ///
+    /// An `eval` check is engine calls, and a refused `? (...)` reads back as `Unmet` — a *false
+    /// failed assertion* on a step whose action did exactly what it was asked. Reported as a
+    /// failure with its reason rather than skipped silently, which is what the deadline case
+    /// beside it does and for the same stated reason: nothing was learned about the target.
+    #[test]
+    fn assertions_are_not_sent_to_an_engine_whose_target_has_gone() {
+        let mut d = stopped()
+            .on("g", Ok("the process exited"))
+            .ends_the_target_on("g");
+
+        let mut resume = step(StepAction::Resume {
+            command: "g".to_string(),
+            timeout_ms: None,
+        });
+        resume.expect = vec![Check::Eval {
+            expr: "@$ip".to_string(),
+            equals: "0x1000".to_string(),
+        }];
+
+        let report = run(&mut d, &op(vec![resume], vec![]), BUDGET);
+        assert!(
+            !d.ran("? (@$ip)"),
+            "the assertion was sent to an engine with no target: {:?}",
+            d.calls
+        );
+        assert!(
+            matches!(report.steps[0].result, StepResult::Failed(ref why) if why.contains("ended the target")),
+            "the step must say why its assertions could not be checked, not report them unmet: \
+             {:?}",
+            report.steps[0].result
+        );
+        assert_eq!(
+            report.outcome,
+            BatchOutcome::TargetGone { at: 1 },
+            "the ending outranks the unchecked assertion: {report:?}"
         );
     }
 
