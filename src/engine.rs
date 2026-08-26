@@ -228,18 +228,24 @@ impl fmt::Display for EngineError {
 ///
 /// The default is [`EngineError::Debugger`], because for almost every op that is what a failure
 /// is. The exceptions are the kinds the worker can tell apart and the supervisor cannot: an
-/// operation that was interrupted, one that was never started for want of budget, and one refused
-/// on its arguments before the debugger ever saw them.
+/// operation that was interrupted, one that was never started for want of budget, one refused on
+/// its arguments before the debugger ever saw them, and a session whose **target went away** —
+/// which only the worker's engine can see, and which the supervisor's own handle bookkeeping has
+/// no way to learn.
 ///
 /// Every named category gets a variant rather than being folded into the default. Folding is how
 /// a category becomes decorative: the worker went to the trouble of saying "this was the caller's
-/// mistake, not the target's", and a `_` arm here quietly restates it as the target's.
+/// mistake, not the target's", and a `_` arm here quietly restates it as the target's. That is
+/// not hypothetical — the target-gone refusal arrived here as `debugger` for exactly as long as
+/// this arm was missing, telling callers to change what they asked when nothing they could ask
+/// would work.
 fn engine_error(failed: crate::proto::Failed) -> EngineError {
     use crate::structured::ErrorCategory;
     match failed.category {
         Some(ErrorCategory::Interrupted) => EngineError::Interrupted(failed.message),
         Some(ErrorCategory::NotRun) => EngineError::NotRun(failed.message),
         Some(ErrorCategory::InvalidArgument) => EngineError::InvalidArgument(failed.message),
+        Some(ErrorCategory::StaleSession) => EngineError::Stale(failed.message),
         _ => EngineError::Debugger(failed.message),
     }
 }
