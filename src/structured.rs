@@ -237,6 +237,20 @@ pub struct TargetSummary {
     /// code with the stack and the faulting driver beside it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bug_check: Option<BugCheckInfo>,
+    /// Something this session **cannot** do that a caller would otherwise assume it can, and what
+    /// to do about it. Absent when there is nothing to say, which is the ordinary case.
+    ///
+    /// Carried as a field rather than left in the summary's prose because a structured-aware
+    /// client forwards `structuredContent` and drops the text block, so a limitation stated only
+    /// in the sentence is one half the clients never see (`FOLLOWUPS.md` item 43). It names no
+    /// tool, for the reason that item gives: this is built in the worker, which owns one session
+    /// and has never heard of the caller's surface.
+    ///
+    /// The case that exists today is a 32-bit dump opened by an engine that is not 32-bit, where
+    /// the .NET SOS extension cannot be loaded at all — an extension is loaded into the debugger's
+    /// own process, so its architecture is the host's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limitation: Option<String>,
 }
 
 /// A failed open, and the one thing a caller must know about it.

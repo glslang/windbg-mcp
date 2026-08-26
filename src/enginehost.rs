@@ -334,10 +334,7 @@ mod tests {
         // The point of the whole exercise: an extension of the *target's* architecture, loaded in
         // the host, answering about managed state.
         engine
-            .execute_command(
-                r"\.load C:\Windows\Microsoft.NET\Framework\v4.0.30319\sos.dll"
-                    .trim_start_matches('\\'),
-            )
+            .execute_command(r".load C:\Windows\Microsoft.NET\Framework\v4.0.30319\sos.dll")
             .expect("the 32-bit SOS loads into an x86 host");
         let threads = engine
             .execute_command("!threads")

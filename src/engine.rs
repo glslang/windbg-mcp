@@ -39,7 +39,7 @@ use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
 use crate::kdconn;
 use crate::proto::{EngineOp, Output, WorkerMessage, WorkerRequest};
-use crate::worker::{MESSAGES_FLAG, REQUESTS_FLAG, WORKER_FLAG};
+use crate::worker::{MESSAGES_FLAG, REQUESTS_FLAG, TARGET_FLAG, WORKER_FLAG};
 
 /// How many sessions may be open at once.
 ///
@@ -1279,7 +1279,9 @@ impl Sessions {
         let slot = self.take_slot().map_err(OpenError::NoRoom)?;
 
         let id = mint_session_id();
-        let session = match self.spawn(&id, kind, what).await {
+        // Read before the worker exists, because the architecture of a dump decides which process
+        // that worker's engine lives in — see `worker::TARGET_FLAG`.
+        let session = match self.spawn(&id, kind, what, op.dump_path()).await {
             Ok(session) => session,
             // The slot goes back and no existing session was touched: a worker that would not
             // start must not cost the caller a target they already had.
@@ -1983,9 +1985,10 @@ impl Sessions {
         id: &str,
         kind: SessionKind,
         what: String,
+        target: Option<&str>,
     ) -> Result<Arc<Session>, String> {
         let exe = worker_exe()?;
-        let (mut child, channel) = spawn_worker(&exe)
+        let (mut child, channel) = spawn_worker(&exe, target)
             .map_err(|e| format!("could not start an engine worker ({}): {e}", exe.display()))?;
 
         let stdout = child.stdout.take().ok_or("engine worker has no stdout")?;
@@ -2409,7 +2412,7 @@ fn inheritable(handle: &impl AsRawHandle) -> std::io::Result<()> {
 /// request side would mean the worker never sees the EOF that tells it the supervisor is gone,
 /// and one left open on the message side would mean the supervisor never sees the EOF that tells
 /// it the worker exited.
-fn spawn_worker(exe: &Path) -> std::io::Result<(Child, Channel)> {
+fn spawn_worker(exe: &Path, target: Option<&str>) -> std::io::Result<(Child, Channel)> {
     let (their_requests, our_requests) = std::io::pipe()?;
     let (our_messages, their_messages) = std::io::pipe()?;
 
@@ -2429,6 +2432,14 @@ fn spawn_worker(exe: &Path) -> std::io::Result<(Child, Channel)> {
     // inheriting it could dial the listener on loopback, wait for the holder to go quiet, and take
     // over the very sessions being used to debug it. The credential does not cross this boundary.
     crate::client::strip_credentials(&mut command);
+    // The dump this worker is for, when it is for one. It travels on the command line rather than
+    // down the channel because the worker has to act on it *before* the channel carries its first
+    // op: the engine must exist by `Ready`, and which process it exists in is what this decides
+    // (`worker::TARGET_FLAG`). A path is not a secret; the connection strings that are never come
+    // this way.
+    if let Some(target) = target {
+        command.arg(format!("{TARGET_FLAG}{target}"));
+    }
     let child = command
         .arg(WORKER_FLAG)
         .arg(format!(
@@ -2933,7 +2944,7 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         let (mut child, channel) =
-            spawn_worker(Path::new("cmd.exe")).expect("spawn a stand-in worker");
+            spawn_worker(Path::new("cmd.exe"), None).expect("spawn a stand-in worker");
         let mut stdout = child.stdout.take().expect("a worker's stdout is piped");
         let mut printed = String::new();
         tokio::time::timeout(Duration::from_secs(10), stdout.read_to_string(&mut printed))
