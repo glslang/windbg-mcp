@@ -1697,11 +1697,21 @@ pub fn render(report: &BatchReport) -> String {
         ),
         BatchOutcome::TargetGone { at } => format!(
             "BATCH: TARGET GONE at step {at} of {total} — that step ended the target (it ran to \
-             completion, or released it), so the steps after it were not attempted. Nothing \
-             failed: the step did what it was asked. But this session has no target left, so its \
-             mutations have nothing to stand in and the `always` block below ran against a target \
-             that was not there — read it for what could not be undone. Open a new session; this \
-             one only wants ending.\n"
+             completion, or released it), so the steps after it were not attempted. {} But this \
+             session has no target left, so its mutations have nothing to stand in and the \
+             `always` block below ran against a target that was not there — read it for what \
+             could not be undone. Open a new session; this one only wants ending.\n",
+            // **Conditional, because the two can both be true of one step.** The action ended the
+            // target *and* an expectation on it did not hold — or could not be checked at all,
+            // once there was nothing left to ask. Saying "nothing failed" over the top of a step
+            // the list shows as FAILED is a headline contradicting its own report, and the
+            // assertion contract is the whole reason a caller reached for a batch.
+            match report.steps.get(at - 1) {
+                Some(step) if !step.ok() =>
+                    "Its own expectation did not hold, or could not be checked once the target \
+                     was gone — the step list says which.",
+                _ => "Nothing failed: the step did what it was asked.",
+            }
         ),
     };
 
@@ -2221,6 +2231,41 @@ mod tests {
             BatchOutcome::TargetGone { at: 1 },
             "the ending outranks the unchecked assertion: {report:?}"
         );
+        // And the headline must not then claim nothing failed, over the top of a step list that
+        // shows this one FAILED. Both facts are true of the same step, and only one of them fits
+        // in the outcome.
+        let text = render(&report);
+        assert!(
+            !text.contains("Nothing failed"),
+            "the headline contradicts its own step list: {text}"
+        );
+        assert!(
+            text.contains("could not be checked once the target was gone"),
+            "{text}"
+        );
+    }
+
+    /// The other half of the same sentence: a step that ended the target and *did* do everything
+    /// asked of it still says so.
+    #[test]
+    fn a_clean_ending_still_says_nothing_failed() {
+        let mut d = stopped()
+            .on("g", Ok("the process exited"))
+            .ends_the_target_on("g");
+
+        let report = run(
+            &mut d,
+            &op(
+                vec![step(StepAction::Resume {
+                    command: "g".to_string(),
+                    timeout_ms: None,
+                })],
+                vec![],
+            ),
+            BUDGET,
+        );
+        let text = render(&report);
+        assert!(text.contains("Nothing failed"), "{text}");
     }
 
     /// An assertion that does not hold stops the batch *and* runs the rollback — the case a
