@@ -126,6 +126,20 @@ split this way caught a `windows` feature trimmed by module path (`IMAGE_NT_HEAD
 behind `Win32_System_SystemInformation`, not the `Debug` feature its path suggests) that would
 otherwise have been a red VM build.
 
+**One warning from that check is expected and is not a break.** `build.rs` compiles the binary's PE
+version resource (item 50 — an empty `FileVersion`/`CompanyName`/`ProductName` is half of why
+Defender scored this project's own exe as `Bearfoos.B!ml`), and that needs `rc.exe`, which no Mac
+has. The script prints `cargo::warning=no PE version resource was embedded: …` and carries on,
+because failing there would cost this whole workflow for the sake of metadata. Which means the
+warning is the *only* thing between a Windows build that quietly lost its resource and a release, so
+the assertion is a test instead — `mcp_smoke::the_binary_carries_a_pe_version_resource`, which reads
+the resource back through `GetFileVersionInfoW` on the one host that can build one. To check that
+test still catches what it is for, break the compiler rather than the code:
+`$env:RC_PATH = "C:\nope\rc.exe"`, touch `build.rs`, re-run it, then unset and touch again. And note
+the resource is composed **in `build.rs`** from `CARGO_PKG_*` and literals for a reason: an `.rc`
+template or an icon file would be a new build input, and `INPUTS` is one const precisely so the
+watch list and the dirty check cannot disagree about what a clean build is.
+
 **A `[patch]` cannot verify against a repo that does not exist yet.** Cargo resolves the original
 source *before* applying the patch, so pointing one at a local checkout still fetches the git URL
 and fails on a repo not yet created or renamed — which is exactly the middle of a rename. Swap the
@@ -186,14 +200,15 @@ It checks *same-file* fragments only, so a cross-file `../README.md#some-heading
 verify by hand.
 
 **The pass count does not say which tiers ran.** Each gate is inside its test, so the `mcp_smoke`
-harness reports the same **83 passed** with the debugger tier off as with it on — that harness's own
+harness reports the same **85 passed** with the debugger tier off as with it on — that harness's own
 result line, since a plain `cargo test` runs the crate's several hundred unit tests beside it and
 prints a result line per binary. What differs between the two runs is the runtime (measured on the
 ARM64 bench 2026-08-23: **1.6s against 61s** for `cargo test --test mcp_smoke`) and the `SKIPPED`
 lines, which only `--nocapture` prints. Read one of those two before believing a run covered a
 debugger claim. The count moves whenever a test is added — it was 69 until #195 and #196, 75
-until item 37, and 79 until the TTD tier — so
-re-derive it rather than trusting this sentence.
+until item 37, 79 until the TTD tier and 84 until item 50's version-resource test — and it
+said 83 while it was 84, which is the usual state of it, so re-derive it rather than trusting this
+sentence.
 
 **The dev exe can be locked too, and the failure is quiet.** A worker left running — a driver
 script that died mid-session, a debugger tier killed partway — holds `target\debug\windbg-mcp.exe`,

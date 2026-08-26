@@ -75,7 +75,10 @@ structured half needed a second verb, and the ratchet is the coverage rule rathe
 **Item 46 has landed** (2026-08-25) and is kept for the decision it deferred and the entry now
 records: this server *does* report a build revision, stamped by a `build.rs` whose watch list and
 dirty check have to be one list or they disagree — which is the sort of thing an entry proposing
-"record a build SHA" cannot see from where it is written.
+"record a build SHA" cannot see from where it is written. **Item 50 has half landed** (2026-08-26):
+the PE version resource is in, and what is left is the half the entry always said needed a decision
+rather than a patch — a signing certificate — so the entry now records what building the first half
+taught and is otherwise narrowed to the second.
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -2764,7 +2767,7 @@ cannot exercise them — and the user-mode heap walker, which is in scope for x8
 operator half is *32-bit .NET dumps need an x86 engine host* in
 `skills/windbg-debugging/setup.md`.
 
-## 50. [windbg-mcp] The released binary is unsigned and carries no PE metadata, and Defender acts on that
+## 50. [windbg-mcp] The released binary is unsigned — the metadata half has landed
 
 **What happened.** On 2026-08-26 Windows Defender quarantined a freshly built
 `target\debug\windbg-mcp.exe` as `Trojan:Win32/Bearfoos.B!ml`, blocking every smoke test that
@@ -2775,37 +2778,51 @@ it is a machine-learning score with a cloud lookup behind it, not a signature ma
 source can land either side of the line.
 
 **Why this is not a local curiosity.** The released binary has the same profile as the one that was
-quarantined, so a user downloading the release zip can hit it, and nothing in the project mitigates
-it today. `microsoft/apm#487` is the **same detection name on Microsoft's own shipped binary**, and
-the causes it lists that apply here are both true of this project:
+quarantined, so a user downloading the release zip can hit it. `microsoft/apm#487` is the **same
+detection name on Microsoft's own shipped binary**, and two of the causes it lists applied here.
+(Its other two — UPX compression and a stock PyInstaller bootloader — do not.)
 
-- **No PE version resource at all** — measured: `FileVersion`, `CompanyName` and `ProductName` are
-  all empty on both the debug and release binaries. Rust embeds none by default.
-- **Unsigned.** `release.yml` produces a Sigstore build-provenance attestation, which is a supply
-  chain claim a user verifies deliberately with `gh attestation verify`. It is not Authenticode, and
-  nothing on the machine reads it — so it does nothing for Defender or for SmartScreen's "unknown
-  publisher" prompt.
+**What has landed.** The **PE version resource**, via a `winresource` build-dependency in
+`build.rs`: `FileVersion`, `CompanyName` and `ProductName` were all empty, measured, on both the
+debug and the release binary, because Rust embeds none by default. They are now filled in, along
+with `FileDescription`, `LegalCopyright`, `OriginalFilename`, `InternalName` and `Comments`, and
+`ProductVersion` carries the git-stamped identity so Explorer's properties dialog answers the same
+question `serverInfo.version` does. Four things that entry did not see:
 
-(Its other two causes — UPX compression and a stock PyInstaller bootloader — do not apply.)
+- **`INPUTS` needed no change, because the resource has no file.** The warning this entry carried
+  was about adding a resource input to the watch list and not to the dirty check; the way to not
+  have that problem is to compose the resource in `build.rs` from `CARGO_PKG_*` and literals, with
+  no `.rc` template and no icon beside it. An icon *would* be a new input, and is the thing to think
+  about `INPUTS` for if one is ever added.
+- **`[package]` gained `description`, `repository` and `license`**, which it had never carried. The
+  resource is what wanted them; nothing else in this repo did, and the crate is not published.
+- **The build must not fail when there is no resource compiler**, because `cargo check --target
+  x86_64-pc-windows-msvc` from the Mac has neither `rc.exe` nor `llvm-rc`, and that is a documented
+  routine workflow. So `build.rs` warns and carries on — which means the assertion has to live
+  somewhere that only runs where a resource *can* be built:
+  `mcp_smoke::the_binary_carries_a_pe_version_resource` reads it back through
+  `GetFileVersionInfoW`. Point `RC_PATH` at nothing and touch `build.rs` to check that test still
+  catches the case it is for; it was verified that way rather than by assuming.
+- **Reading it back is not the same as finding the string in the file.** The test asks the API
+  Explorer and the reputation systems ask, so a resource Windows itself refuses to parse fails it.
 
-**What would close it**, cheapest first:
+**What is left, and it needs a decision rather than a patch:**
 
-- **A PE version resource**, via a `winresource` build-dependency in `build.rs`. Free, immediate,
-  and it also makes Explorer's properties dialog useful. **Careful with `INPUTS`**: `build.rs`'s
-  watch list and its dirty check are deliberately one const, because emitting any `rerun-if-changed`
-  replaces Cargo's default of watching the whole package — a resource input added to one and not the
-  other makes clean builds disagree about what is dirty.
-- **Submit the current release for false-positive review** at Microsoft's file submission portal.
-  Free, and it is what `microsoft/apm#487` does between releases.
-- **Authenticode signing** in `release.yml`. This is the part that needs a decision rather than a
-  patch, because it needs a certificate: Azure Trusted Signing is the CI-friendly route and
-  SignPath has a free tier for open source; an EV certificate earns SmartScreen reputation at once
-  where an OV one accumulates it. Worth stating plainly that signing **does not guarantee** an `!ml`
-  detection goes away — Microsoft's own issue files it under a later tier than the metadata — but
-  it is what the reputation systems above Defender actually read, and it is the fix for the
-  SmartScreen prompt regardless.
+- **Authenticode signing** in `release.yml`, which needs a certificate. Azure Trusted Signing is the
+  CI-friendly route and SignPath has a free tier for open source; an EV certificate earns SmartScreen
+  reputation at once where an OV one accumulates it. Worth stating plainly that signing **does not
+  guarantee** an `!ml` detection goes away — Microsoft's own issue files it under a later tier than
+  the metadata — but it is what the reputation systems above Defender actually read, and it is the
+  fix for the SmartScreen "unknown publisher" prompt regardless. Note what the release *does* carry
+  and why it does not help here: `release.yml` produces a Sigstore build-provenance attestation,
+  which is a supply-chain claim a user verifies deliberately with `gh attestation verify`. Nothing
+  on the machine reads it.
+- **Submitting the current release for false-positive review** at Microsoft's file submission
+  portal. Free, and it is what `microsoft/apm#487` does between releases — but it is a per-release
+  human action with an account behind it, so it belongs in the release checklist rather than in a
+  workflow. `skills/windbg-debugging/setup.md` now tells a user who hits this what to verify first
+  and points at the same portal.
 
-**Where it picks up.** `build.rs` (and its `INPUTS` const), the *Build & publish binary* job in
-`.github/workflows/release.yml`, and `skills/windbg-debugging/setup.md`, whose Option A download
-block already tells a user to `Unblock-File` the zip and would be where any "if Defender quarantines
-it" note belongs.
+**Where it picks up.** The *Build & publish binary* job in `.github/workflows/release.yml`, and
+[`docs/releasing.md`](./docs/releasing.md) if the submission becomes a step.
+

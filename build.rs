@@ -28,6 +28,29 @@
 //!
 //! Absent git, an unpacked tarball, or a `git` that fails for any reason: the variable is empty and
 //! the reported version is the bare crate version. A build must never fail over telemetry.
+//!
+//! # And stamps the PE version resource
+//!
+//! Rust embeds none by default, so `FileVersion`, `CompanyName` and `ProductName` were all empty on
+//! every binary this project has ever shipped — which is one of the two causes
+//! [`microsoft/apm#487`](https://github.com/microsoft/apm/issues/487) lists for the
+//! `Trojan:Win32/Bearfoos.B!ml` verdict Defender handed a freshly built `windbg-mcp.exe` on
+//! 2026-08-26 (`FOLLOWUPS.md` item 50). An `!ml` verdict is a machine-learning score rather than a
+//! signature match, so a binary with no metadata at all is scored on what little there is; filling
+//! the resource in is the free half of the fix, and the half that also makes Explorer's properties
+//! dialog answer *which build is this*.
+//!
+//! **No new build input.** The resource is composed here from `CARGO_PKG_*` and literals, with no
+//! `.rc` template and no icon file beside it, so [`INPUTS`] is unchanged and still names every file
+//! that reaches the binary. A resource input added to the watch list and not to the dirty check (or
+//! the reverse) would make two builds of one tree disagree about whether it is clean — the two are
+//! one const precisely so they cannot.
+//!
+//! **A missing resource compiler warns rather than fails**, for the same reason the git stamp falls
+//! back: `cargo check --target x86_64-pc-windows-msvc` from a Mac has no `rc.exe` and no `llvm-rc`,
+//! and that check is a routine workflow here. What keeps the warning from being a silent release is
+//! that the assertion lives where it can run — `mcp_smoke::the_binary_carries_a_pe_version_resource`
+//! reads the resource back off the built exe, on Windows, which is the only host that builds one.
 
 use std::process::Command;
 
@@ -56,10 +79,56 @@ fn main() {
     {
         println!("cargo::rerun-if-changed={path}");
     }
-    println!(
-        "cargo::rustc-env=WINDBG_MCP_BUILD={}",
-        revision().unwrap_or_default()
-    );
+    let revision = revision().unwrap_or_default();
+    println!("cargo::rustc-env=WINDBG_MCP_BUILD={revision}");
+    version_resource(&revision);
+}
+
+/// Compose and compile the `VS_VERSION_INFO` resource — see the module comment for why.
+///
+/// The numeric `FILEVERSION`/`PRODUCTVERSION` and the `FileVersion`/`ProductName` strings come free
+/// from `CARGO_PKG_*`; what is set here is the rest, and one override. **`ProductVersion` carries
+/// the stamped identity** (`0.12.1+g1a2b3c4`) where `FileVersion` stays the bare release, which is
+/// semver's own split between a release and the build metadata under it — so the properties dialog
+/// answers the same question `serverInfo.version` does, and the field anything numeric compares is
+/// left alone. **`FileDescription` is deliberately short**: Windows uses it as the application name
+/// in Task Manager and in dialogs, where the package description would not fit; that goes in
+/// `Comments`.
+fn version_resource(revision: &str) {
+    // Not `cfg!(windows)`: this is a question about the artefact, and a Mac cross-checking a
+    // Windows target should take this path and report what it finds, not skip it silently.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
+    let product_version = if revision.is_empty() {
+        version
+    } else {
+        format!("{version}+{revision}")
+    };
+
+    let mut resource = winresource::WindowsResource::new();
+    resource
+        // The repo owner, which is also the registry namespace (`io.github.glslang/windbg-mcp`)
+        // and the account an `Authenticode` certificate would eventually name — so a reader has
+        // one identity to check rather than two that have to be reconciled.
+        .set("CompanyName", "glslang")
+        .set("FileDescription", "WinDbg MCP server")
+        // Tracks `LICENSE`, which is where the year and the holder are authoritative.
+        .set(
+            "LegalCopyright",
+            "Copyright (c) 2026 Gonçalo Carvalho. MIT.",
+        )
+        .set("OriginalFilename", "windbg-mcp.exe")
+        .set("InternalName", "windbg-mcp.exe")
+        .set("ProductVersion", &product_version);
+    if let Ok(description) = std::env::var("CARGO_PKG_DESCRIPTION") {
+        resource.set("Comments", &description);
+    }
+    if let Err(err) = resource.compile() {
+        // Never fatal — see the module comment. The test is what makes this loud where it matters.
+        println!("cargo::warning=no PE version resource was embedded: {err}");
+    }
 }
 
 /// Where git keeps one of its own files, if that file exists.
@@ -100,11 +169,12 @@ fn revision() -> Option<String> {
 /// A 32-bit FNV-1a of the working-tree diff — an identity tag, not a digest anybody should trust
 /// against an adversary.
 ///
-/// Hand-rolled because this crate has no build dependencies and a build script is the wrong place
-/// to gain one for eight lines. `DefaultHasher` would have been the obvious alternative and is
-/// wrong here for a reason worth writing down: its output is explicitly not stable across Rust
-/// releases, so two machines on different toolchains would tag one working tree two ways — which
-/// is the failure this is meant to remove rather than relocate.
+/// Hand-rolled because a build script is the wrong place to gain a dependency for eight lines —
+/// which the `winresource` above does not change, since that one buys a resource compiler rather
+/// than arithmetic. `DefaultHasher` would have been the obvious alternative and is wrong here for a
+/// reason worth writing down: its output is explicitly not stable across Rust releases, so two
+/// machines on different toolchains would tag one working tree two ways — which is the failure this
+/// is meant to remove rather than relocate.
 fn fingerprint(text: &str) -> u32 {
     let mut hash: u32 = 0x811c_9dc5;
     for byte in text.as_bytes() {

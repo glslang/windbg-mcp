@@ -767,6 +767,144 @@ fn a_malformed_line_does_not_kill_the_server() {
     );
 }
 
+// ---- tier 1: the artefact itself ----------------------------------------------
+
+/// What this build calls itself, exactly as `main::BUILD_VERSION` composes it: the crate version,
+/// plus the git revision `build.rs` stamped when there was one to stamp.
+///
+/// Read from `WINDBG_MCP_BUILD` — the build script's own answer — rather than from whether a `.git`
+/// is present, because the fallback to a bare crate version is deliberate and a `.git`-exists proxy
+/// would fail a perfectly good build that git declined to describe. It also means a `build.rs` that
+/// stopped running fails to compile this rather than passing it.
+fn stamped_version() -> String {
+    let stamp = env!("WINDBG_MCP_BUILD");
+    if stamp.is_empty() {
+        env!("CARGO_PKG_VERSION").to_string()
+    } else {
+        format!("{}+{}", env!("CARGO_PKG_VERSION"), stamp)
+    }
+}
+
+/// The binary has to carry a PE version resource, and `build.rs` will not fail the build if it
+/// cannot produce one — so this is the only place that says whether it did.
+///
+/// **Why the resource matters at all.** Defender quarantined a freshly built `windbg-mcp.exe` as
+/// `Trojan:Win32/Bearfoos.B!ml` on 2026-08-26, blocking every test that spawns the server. That is
+/// a machine-learning verdict rather than a signature match — the same source lands either side of
+/// the line on different days — and an empty `FileVersion`/`CompanyName`/`ProductName` is one of
+/// the two causes Microsoft names for exactly that detection on its own shipped binaries
+/// (`microsoft/apm#487`, `FOLLOWUPS.md` item 50). A Rust binary carries none by default.
+///
+/// **Why it is a test and not a hard failure in `build.rs`.** The resource needs `rc.exe`, and the
+/// `cargo check --target x86_64-pc-windows-msvc` this repo runs from a Mac has none — a workflow
+/// `CLAUDE.md` documents and that must not start failing over metadata. So the build script warns
+/// and carries on, and the check moves here, where it only ever runs on the host that can build one.
+///
+/// The split in what is pinned is deliberate: the fields a *checker* compares are pinned to their
+/// values, and the ones a human reads are asserted non-empty, so rewording the prose is not a test
+/// edit while renaming the product is.
+#[test]
+fn the_binary_carries_a_pe_version_resource() {
+    let pinned = [
+        ("CompanyName", "glslang".to_string()),
+        ("ProductName", "windbg-mcp".to_string()),
+        ("OriginalFilename", "windbg-mcp.exe".to_string()),
+        ("InternalName", "windbg-mcp.exe".to_string()),
+        // The release, and — separately — the build under it, which is semver's own split and
+        // makes the properties dialog answer the question `serverInfo.version` answers.
+        ("FileVersion", env!("CARGO_PKG_VERSION").to_string()),
+        ("ProductVersion", stamped_version()),
+    ];
+    for (field, want) in pinned {
+        assert_eq!(read_version_field(field), want, "{field} in {EXE}");
+    }
+    for field in ["FileDescription", "LegalCopyright", "Comments"] {
+        assert!(
+            !read_version_field(field).is_empty(),
+            "{field} must not be empty in {EXE}"
+        );
+    }
+}
+
+/// One `StringFileInfo` value out of the binary's own version resource, read through the API
+/// Explorer's properties dialog reads it through — rather than by scanning the file for the string,
+/// which would pass on a resource Windows itself refuses to parse.
+///
+/// Panics rather than returning an `Option`, because there is exactly one caller and every way this
+/// can answer nothing is the same failure: no resource was embedded.
+fn read_version_field(field: &str) -> String {
+    use std::ffi::OsStr;
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+    };
+
+    fn wide(text: &str) -> Vec<u16> {
+        OsStr::new(text)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    /// One sub-block of a version-info block, or `None` where it holds no such key.
+    fn query(block: &[u8], sub: &str) -> Option<(*const u16, u32)> {
+        let sub = wide(sub);
+        let mut value: *mut core::ffi::c_void = std::ptr::null_mut();
+        let mut len: u32 = 0;
+        // SAFETY: `block` holds a version-info block written by `GetFileVersionInfoW`, and `sub`
+        // is NUL-terminated. `value` and `len` are written only on success. The pointer handed back
+        // points *into* `block` and carries no lifetime saying so, which is the one thing a caller
+        // has to honour: both callers here read it before `block` goes out of scope.
+        let found =
+            unsafe { VerQueryValueW(block.as_ptr().cast(), sub.as_ptr(), &mut value, &mut len) };
+        (found != 0 && len > 0).then(|| (value.cast::<u16>().cast_const(), len))
+    }
+
+    let missing = |what: &str| -> ! {
+        panic!(
+            "{EXE} carries no `{field}` in a PE version resource ({what}). A Rust binary has none \
+             by default, so this is what a `build.rs` that could not run a resource compiler \
+             leaves behind — the build printed a `cargo::warning` saying why."
+        )
+    };
+
+    let path = wide(EXE);
+    // SAFETY: `path` is NUL-terminated and outlives the call. The handle out-parameter is
+    // documented as ignorable, and a null pointer is how that is spelled.
+    let size = unsafe { GetFileVersionInfoSizeW(path.as_ptr(), std::ptr::null_mut()) };
+    if size == 0 {
+        missing("the file has no version resource at all");
+    }
+    let mut block = vec![0u8; size as usize];
+    // SAFETY: `block` is exactly the `size` bytes the call above asked for.
+    if unsafe { GetFileVersionInfoW(path.as_ptr(), 0, size, block.as_mut_ptr().cast()) } == 0 {
+        missing("its version resource would not load");
+    }
+
+    // A value's key is qualified by language and codepage, and the block says which pair it wrote:
+    // `winresource` emits the *language-neutral* `000004b0`, so the `040904b0` a hard-coded key
+    // would name reads nothing at all.
+    let Some((translation, len)) = query(&block, r"\VarFileInfo\Translation") else {
+        missing("its version resource declares no translation");
+    };
+    if len < 4 {
+        missing("its translation table is shorter than one language/codepage pair");
+    }
+    // SAFETY: a `Translation` value is a run of (language, codepage) `u16` pairs, and `len` has
+    // just been checked to cover the first of them.
+    let (language, codepage) = unsafe { (*translation, *translation.add(1)) };
+
+    let key = format!(r"\StringFileInfo\{language:04x}{codepage:04x}\{field}");
+    let Some((text, len)) = query(&block, &key) else {
+        missing("its version resource carries no such field");
+    };
+    // SAFETY: the value is `len` UTF-16 code units, its NUL terminator included.
+    let text = unsafe { std::slice::from_raw_parts(text, len as usize) };
+    String::from_utf16_lossy(text)
+        .trim_end_matches('\0')
+        .to_string()
+}
+
 // ---- tier 1: protocol revisions -----------------------------------------------
 
 /// `docs/architecture.md` names the revisions this server speaks. When the spec revs, this is the
@@ -809,14 +947,9 @@ fn every_documented_protocol_revision_is_served() {
         // build. `WINDBG_MCP_BUILD` is the build script's own answer, so this asserts the served
         // version *is* the one it produced — and a `build.rs` that stopped running fails to
         // compile this rather than passing it.
-        let stamp = env!("WINDBG_MCP_BUILD");
-        let expected = if stamp.is_empty() {
-            env!("CARGO_PKG_VERSION").to_string()
-        } else {
-            format!("{}+{}", env!("CARGO_PKG_VERSION"), stamp)
-        };
         assert_eq!(
-            reported, expected,
+            reported,
+            stamped_version(),
             "the served version must be the one this build stamped (on {revision})"
         );
 

@@ -27,3 +27,20 @@ gh attestation verify <zip> --repo glslang/windbg-mcp `
 
 (`--repo` alone only proves the attestation came from *some* workflow in this repo;
 `--signer-workflow` pins it to the release workflow.)
+
+## What the release is not
+
+**It is not Authenticode signed**, so SmartScreen shows an "unknown publisher" prompt and Defender
+may quarantine it — `Trojan:Win32/Bearfoos.B!ml` is the verdict this project has actually drawn, on
+a locally built binary. That suffix marks a machine-learning score rather than a signature match, so
+the same file lands either side of the line on different days. The attestation above does not help:
+it is a supply-chain claim a user verifies deliberately, and nothing on the machine reads it. The
+binary does carry a full PE version resource, which is the other cause Microsoft names for that
+detection on its own binaries, but the metadata is the cheap half rather than the fix
+([`FOLLOWUPS.md`](../FOLLOWUPS.md) item 50 is the certificate decision that remains).
+
+So if a release is reported as quarantined, the two things to do are to point the reporter at
+[`skills/windbg-debugging/setup.md`](../skills/windbg-debugging/setup.md)'s note — verify the
+SHA-256 and the attestation *first*, since those answer a question the verdict does not — and to
+submit the artifact to [Microsoft's file submission portal](https://www.microsoft.com/wdsi/filesubmission)
+as a false positive. That submission is per artifact, so a new release needs a new one.
