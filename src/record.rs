@@ -669,6 +669,16 @@ pub enum Event {
         /// wanted longer. Defaulted, so a transcript written before this field reads back.
         #[serde(default)]
         timed_out: bool,
+        /// Whether the target **ended** rather than stopping — it ran to completion, or the
+        /// command released it.
+        ///
+        /// The one stop that is terminal, and without it a transcript cannot tell it from an
+        /// ordinary one: it carries no position, like a module-load break, and both flags above
+        /// are false, like an ordinary stop. A reader would see a locationless stop followed by
+        /// every later call being refused, with nothing joining the two. Defaulted, so a
+        /// transcript written before this field reads back.
+        #[serde(default)]
+        target_gone: bool,
     },
     /// A `run_to_address` verdict.
     RunTo {
@@ -764,6 +774,7 @@ fn derived(call: &InFlight, data: &Value, limit: usize) -> Vec<Event> {
                 stopped_at: stop.stopped_at,
                 interrupted: stop.interrupted,
                 timed_out: stop.timed_out,
+                target_gone: stop.target_gone,
             }]
         }
         "run_to_address" => {
@@ -1132,16 +1143,27 @@ mod tests {
         assert!(!interrupted);
     }
 
-    /// A stop the target did not reach is recorded as one, and the two reasons are kept apart.
+    /// A stop the target did not reach is recorded as one, and the three reasons are kept apart.
     ///
     /// The transcript is values about the session, and this is the value most worth having: a
     /// `go` broken in at its own bound reports a real position that is **not** where the target
     /// was going. Copying `interrupted` alone recorded that as an ordinary stop, which is the
     /// same "a fact that exists in one channel and not another" this whole change is about.
+    ///
+    /// **`target_gone` is the third, and it went missing here the same way** (issue #242): a stop
+    /// that ended the target carries no position — like a module-load break — with both other
+    /// flags false, like an ordinary stop. A reader would see a locationless stop followed by
+    /// every later call on that session being refused, with nothing joining the two.
     #[test]
-    fn a_stop_records_which_of_the_two_reasons_it_did_not_reach() {
+    fn a_stop_records_which_of_the_three_reasons_it_did_not_reach() {
         let (rec, path) = recorder("stop-reasons");
-        for (interrupted, timed_out) in [(false, true), (true, false), (false, false)] {
+        let cases = [
+            (false, true, false),
+            (true, false, false),
+            (false, false, true),
+            (false, false, false),
+        ];
+        for (interrupted, timed_out, target_gone) in cases {
             let call = rec.tool_request("go", Some(&serde_json::json!({ "session_id": "s" })));
             rec.tool_result(
                 call,
@@ -1153,25 +1175,26 @@ mod tests {
                     "stopped_at": "0xfffff8031ab10000",
                     "interrupted": interrupted,
                     "timed_out": timed_out,
+                    "target_gone": target_gone,
                     "output": "stopped",
                 })),
             );
         }
 
-        let stops: Vec<(bool, bool)> = records(&path)
+        let stops: Vec<(bool, bool, bool)> = records(&path)
             .into_iter()
             .filter_map(|r| match r.event {
                 Event::Stop {
                     interrupted,
                     timed_out,
+                    target_gone,
                     ..
-                } => Some((interrupted, timed_out)),
+                } => Some((interrupted, timed_out, target_gone)),
                 _ => None,
             })
             .collect();
         assert_eq!(
-            stops,
-            [(false, true), (true, false), (false, false)],
+            stops, cases,
             "each stop must record its own reason, not the first one's"
         );
     }

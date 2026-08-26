@@ -2121,8 +2121,8 @@ pub struct DebugBatchArgs {
     /// The steps to run, in order. Each is one flat object with an `op` field:
     /// `{"op": "command", "command": "bp nt!NtCreateFile"}` runs a raw command;
     /// `{"op": "resume", "command": "g"}` moves the target and waits for the next stop;
-    /// `{"op": "run_to", "address": "hevd!Trigger"}` reports a HIT/STOPPED ELSEWHERE/TIMEOUT
-    /// verdict; `{"op": "eval", "expr": "@rcx"}` reads a value; `{"op": "read_memory",
+    /// `{"op": "run_to", "address": "hevd!Trigger"}` reports a HIT/STOPPED ELSEWHERE/TIMEOUT/
+    /// TARGET GONE verdict; `{"op": "eval", "expr": "@rcx"}` reads a value; `{"op": "read_memory",
     /// "address": "0xfffff8000012c000", "size": 64}` hex-dumps memory — this one takes a *number*
     /// (decimal or `0x`-hex), not an expression, so for `@rsp` or `poi(...)` put an `eval` step in
     /// front of it and read the capture. Three more ask the kernel pool the same questions the
@@ -4048,8 +4048,8 @@ impl WindbgServer {
 
     /// Run the target until it reaches `address` (a one-shot `g <addr>` that doesn't
     /// disturb existing breakpoints) and report a structured verdict: HIT (reached it),
-    /// STOPPED ELSEWHERE (another breakpoint/exception fired first), or TIMEOUT (not
-    /// reached in time). Confirms *live* that the current input/state drives execution to
+    /// STOPPED ELSEWHERE (another breakpoint/exception fired first), TIMEOUT (not
+    /// reached in time), or TARGET GONE (it ended first — this session is over). Confirms *live* that the current input/state drives execution to
     /// a block. Needs a real KDNET/VM kernel target (a local kernel can't set code
     /// breakpoints).
     #[rmcp::tool(

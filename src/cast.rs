@@ -492,6 +492,18 @@ fn frame(record: &Record, max_lines: usize) -> Option<String> {
                 false => format!("session {session}: an interrupt was not acknowledged"),
             },
         ),
+        // The ending first, because it is the one stop with no position to render: without this
+        // it read as "`g` stopped at an unknown position", which is what a module-load break also
+        // reads as and is the misreading this whole distinction exists to end.
+        Event::Stop {
+            command,
+            target_gone: true,
+            ..
+        } => note(
+            &mut out,
+            STOP,
+            &format!("`{command}` ran the target to its end; this session is over"),
+        ),
         Event::Stop {
             command,
             stopped_at,

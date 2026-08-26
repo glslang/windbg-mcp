@@ -167,8 +167,9 @@ pub enum StepAction {
         #[serde(default)]
         timeout_ms: Option<u32>,
     },
-    /// Run until `address` and report a verdict: HIT, STOPPED ELSEWHERE, or TIMEOUT. The verdict
-    /// is text in the step's output, so assert on it with `contains`.
+    /// Run until `address` and report a verdict: HIT, STOPPED ELSEWHERE, TIMEOUT, or TARGET GONE
+    /// (the target ended first). The verdict is text in the step's output, so assert on it with
+    /// `contains`.
     RunTo {
         address: String,
         #[serde(default)]
