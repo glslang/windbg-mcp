@@ -2820,14 +2820,28 @@ question `serverInfo.version` does. Four things that entry did not see:
   detection goes away — Microsoft's own issue files signing under a later tier than the metadata —
   and it is not a prerequisite for the submission above; what it buys is a *stable identity for
   reputation to attach to*, so the submission stops starting from nothing each release, plus the fix
-  for SmartScreen's "unknown publisher" prompt, which nothing else addresses. And **it need not be
-  expensive**, which is the assumption worth checking before deferring it again: SignPath's
-  Foundation programme signs open-source projects for free and is the obvious first ask here; Azure
-  Trusted Signing is the CI-friendly route at roughly ten dollars a month, gated on an identity
-  check rather than on price; Certum's open-source certificates are around a hundred euros for
-  several years. Only **EV** — the one that earns SmartScreen reputation immediately rather than
-  accumulating it — is genuinely a few hundred a year. Prices move; treat these as the shape of the
-  choice, not as quotes. Note also what the release *does* carry and why it does not help here:
+  for SmartScreen's "unknown publisher" prompt, which nothing else addresses. And **price is not
+  what is blocking it — eligibility is**, which is the distinction to get right before deferring it
+  again on the wrong ground:
+
+  - **Azure Trusted Signing** is the CI-friendly route and is the obvious suggestion, at roughly ten
+    dollars a month. It is **not available here**: individual subscribers must be legally based in
+    the United States or Canada, and this project's maintainer is not. Cross it off rather than
+    re-proposing it.
+  - **An EV certificate** is the only thing that earns SmartScreen reputation *immediately* rather
+    than accumulating it, and it is also the one a solo maintainer cannot buy: EV issuance requires
+    a registered legal entity, so it is a company-formation decision before it is a few hundred a
+    year.
+  - **SignPath's Foundation programme** signs open-source projects for free and has no such
+    geographic or entity bar, which makes it the first ask.
+  - **Certum's open-source code-signing certificates** are the paid fallback — aimed at EU
+    individual developers, around a hundred euros for several years, on a token or their cloud
+    signing.
+
+  So the reachable options are both OV-class, and reputation accumulates rather than arriving — which
+  is an argument for doing the per-release submission above *regardless* of what gets signed, not
+  for treating signing as the thing that makes it unnecessary. Prices and programme terms move;
+  treat these as the shape of the choice, not as quotes. Note also what the release *does* carry and why it does not help here:
   `release.yml` produces a Sigstore build-provenance attestation, which is a supply-chain claim a
   user verifies deliberately with `gh attestation verify`. Nothing on the machine reads it, and it
   establishes provenance rather than benignity — a compromised dependency or runner would be
