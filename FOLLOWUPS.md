@@ -2677,11 +2677,37 @@ the state probe, the transcript and the tool description each had to be told sep
 what a terminal fact costs when it is added to a system that had no notion of one. The session is
 **not** retired on the supervisor's side — see below.
 
-**What is left, and it is deliberate.** `session_status` still reports such a session as `open`.
-Telling the supervisor would need a new `WorkerMessage` and a `SessionState` for it (`Retired`
-means "the worker still holds a target", which is the opposite of this), and the caller already has
-the fact: every call is refused with it, and `end_session` works. Worth doing when something else
-needs a worker→supervisor state channel; not worth inventing one for a status string.
+**What is left, and it is deliberate — but the reason is not the one first written here.** The
+supervisor never learns that a target went away, so the session stays `Open`. The first draft of
+this paragraph called that a wrong status string and left it there. Review (Codex, on
+[#243](https://github.com/glslang/windbg-mcp/pull/243)) supplied the consequence that makes it more
+than one, and it is worth having in writing:
+
+**a dead session is still the default route.** `Registry::current` takes the most recent session
+whose state `accepts_default`, and `Open` does — so every call that names no `session_id` goes to
+the session with no target, and a perfectly good older session of the same client is shadowed by
+it. `session_status` lists it as live beside the working one.
+
+**It is pre-existing, and that is why it is still deferred rather than fixed here.** On `main` the
+only transitions are `Closed` (teardown, worker death, the sweep), `Failed` (an open that created
+nothing), `Retired` (a target-changing *command*, decided from its text) and the opening pair —
+nothing has ever watched a target leave. A session whose process exited was already `Open` and
+already the default route before any of this; what changed is that it now says so on every call
+instead of failing with `0x80040205`.
+
+**What would close it.** A `WorkerMessage` milestone beside `Committed`/`Opened` — the worker
+already asks `has_target` once per op in `refuse_when_the_target_is_gone`, so there is one place to
+emit it from — and a `SessionState::Ended` that refuses both `accepts_handle` and `accepts_default`
+while staying `is_live` (the worker exists, owes an `end_session`, and counts against the
+four-session cap until it gets one). `Retired` cannot be reused: it means "the worker still holds a
+target", which is the opposite. Mind the promotion rule at `engine.rs`'s opener settle, which
+already has to protect `Retired` from being promoted back to `Open` by a late result and would have
+to protect this the same way.
+
+**Why not in the PR that found it.** It is session lifecycle, which is the part of this server
+where a mistake costs a *target* rather than a call — a live kernel left halted — and it is
+orthogonal to the ending this change is about. It wants its own change, its own tier run, and a
+reviewer looking at nothing else.
 
 <details>
 <summary>The original entry, as written on 2026-08-25</summary>
