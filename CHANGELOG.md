@@ -63,6 +63,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   name, since `.kill` is measured *not* to be in that group: it leaves a target that still reads a
   stack and goes away on the next resume.
 
+  A `debug_batch` stops there rather than running on: a resume that ends the target **succeeds**,
+  so nothing about the step's result would otherwise halt the batch, and one whose last step ended
+  the target would have reported `committed` with its mutations no longer standing in anything and
+  its `always` block unable to execute. The outcome is `target_gone` naming the step, the steps
+  after it are not attempted, the `always` block is still attempted (the fail-safe direction: a
+  misread ending must not drop cleanup that could have run), and `after` is `ended` rather than
+  `detached` — a detached process is still running somewhere, and on a live kernel that is the
+  difference between a machine that is up and one that is not.
+
 - **Execution control with no debuggee no longer takes the worker down**, which is the same defect's
   other half and was a `STATUS_ACCESS_VIOLATION` inside DbgEng — a structured exception, so no
   `catch_unwind` traps it. `execute 'g'` on a session whose target had exited hit it; so does a raw

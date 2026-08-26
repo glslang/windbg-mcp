@@ -753,6 +753,16 @@ pub struct Ran {
     /// doing its job, the output says so, and the step's assertions are the right place to judge
     /// it. This is the one a caller outside the batch caused.
     pub interrupted: bool,
+    /// The step ended the target: the process ran to completion, or the step released it.
+    ///
+    /// **Terminal, and it has to be a value rather than a sentence in `output`.** The step
+    /// *succeeded* — running a program to its end is what a resume is for — so without this the
+    /// batch reads an ordinary `Ok`, runs every later step against a session that has nothing to
+    /// run them on, and can report `committed` for a batch whose mutations no longer have a
+    /// target to stand in and whose rollback could not execute. That is the shape
+    /// [issue #242](https://github.com/glslang/windbg-mcp/issues/242) took here, one layer up
+    /// from where it was reported.
+    pub target_gone: bool,
 }
 
 // Deliberately no `Ran::whole` constructor. There was one, used at the dispatch to wrap the actions
@@ -897,6 +907,10 @@ pub struct StepOutcome {
     /// it on the value means every reader of the step has it — the outcome classification, the
     /// renderer, and whatever comes next — instead of each having to remember to ask.
     pub cut_short: bool,
+    /// This step ended the target. See [`Ran::target_gone`]: it travels on the step for the same
+    /// reason `cut_short` does — a step that ended the target *succeeded*, so every reader that
+    /// had to infer it from the text would sooner or later not.
+    pub target_gone: bool,
 }
 
 impl StepOutcome {
@@ -909,6 +923,7 @@ impl StepOutcome {
             result: StepResult::Skipped(why.into()),
             output: String::new(),
             cut_short: false,
+            target_gone: false,
         }
     }
 
@@ -943,6 +958,16 @@ pub enum BatchOutcome {
     /// is still open and still holds its target — so this batch can be resubmitted as it stands, on
     /// the same session, once whatever prompted the interrupt has been dealt with.
     Interrupted { at: usize },
+    /// A step ended the target — the process ran to completion, or the step released it — so the
+    /// steps from `at` were not attempted. `at` is the 1-based position of the step that ended it.
+    ///
+    /// Its own outcome, and the reason is the next move again. Nothing failed: the step did what
+    /// it was asked. But unlike [`Self::Interrupted`] the session cannot be resubmitted to — it
+    /// has no target — and unlike [`Self::Committed`] the batch's mutations have nothing left to
+    /// stand in and its `always` block ran against a target that was not there. Open a new
+    /// session; `after` says what happened and the `always` block says which cleanup could not
+    /// run.
+    TargetGone { at: usize },
 }
 
 /// What the session holds once the batch is done — the question a caller cannot answer from the
@@ -956,6 +981,11 @@ pub enum SessionAfter {
     Running { why: String },
     /// A step released or replaced the target.
     Detached { by: String },
+    /// The target *ended* — it ran to completion. Kept apart from [`Self::Detached`], which is a
+    /// debugger verb: a detached process is still running somewhere and could be attached to
+    /// again, and on a live kernel the difference is the difference between a machine that is
+    /// still up and one that is not.
+    Ended { by: String },
     /// The probe failed and nothing in the batch explains it.
     Uncertain { why: String },
 }
@@ -1052,6 +1082,17 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
                 ));
                 continue;
             }
+            BatchOutcome::TargetGone { at } => {
+                steps.push(StepOutcome::skipped(
+                    position,
+                    step,
+                    format!(
+                        "step {at} ended the target, so there was nothing left to run this \
+                         against"
+                    ),
+                ));
+                continue;
+            }
         }
         // Before the deadline check, because the two are not the same news and this one is the
         // more urgent: something is tearing this session down and the rollback is what is left
@@ -1097,7 +1138,14 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
         // which no between-steps check can ever see), and one whose assertions stopped holding
         // *because* the output was truncated — which would otherwise read as `FAILED` and send the
         // caller to debug a step that was fine.
-        if done.cut_short {
+        if done.target_gone {
+            // Outranks every other reading of the same step, because it is the only one that is
+            // terminal: a break can be resubmitted to the same session and a teardown to a fresh
+            // one, while a target that has ended leaves nothing for either to be true of. The
+            // step itself succeeded — running a program to its end is what a resume is for — so
+            // nothing below would otherwise stop the batch.
+            outcome = BatchOutcome::TargetGone { at: position };
+        } else if done.cut_short {
             // A teardown outranks a break that reached the same step: the session is going away,
             // so "resubmit on a fresh session" is the advice, and `Interrupted` would send the
             // caller back to one that will not be there. Only asked here, where both can be true
@@ -1234,8 +1282,8 @@ fn run_step(
         }
     });
 
-    let (output, mut cut_short) = match ran {
-        Ok(ran) => (ran.output, ran.interrupted),
+    let (output, mut cut_short, target_gone) = match ran {
+        Ok(ran) => (ran.output, ran.interrupted, ran.target_gone),
         Err(why) => {
             return StepOutcome {
                 position,
@@ -1245,6 +1293,9 @@ fn run_step(
                 result: StepResult::Failed(why),
                 output: String::new(),
                 cut_short: false,
+                // A step that failed did not end the target. If the target is nevertheless gone,
+                // the failure is the engine saying so, and `probe_state` is what reads that.
+                target_gone: false,
             };
         }
     };
@@ -1316,6 +1367,7 @@ fn run_step(
         result,
         output: clip(&output, cap),
         cut_short,
+        target_gone,
     }
 }
 
@@ -1461,6 +1513,18 @@ fn probe_state(
         };
     }
 
+    // **After** the release check and not before it, so a `.detach` keeps saying *detached*: both
+    // steps report `target_gone` now, and the two are not the same news — a detached process is
+    // still running and can be attached to again, and on a live kernel a machine that is still up
+    // is not one that is not. What reaches here is the ending no command name announces: a
+    // program that ran out during a resume.
+    let ended = steps.iter().chain(always).find(|step| step.target_gone);
+    if let Some(step) = ended {
+        return SessionAfter::Ended {
+            by: format!("`{}`", step.rendered),
+        };
+    }
+
     // Told to run and never reported a stop: the target may still be running, and the probe below
     // cannot distinguish that from a target that is gone.
     let ran_on = steps.iter().chain(always).any(|s| {
@@ -1590,6 +1654,14 @@ pub fn render(report: &BatchReport) -> String {
              budget, and the session is still open and still holds its target; resubmit the whole \
              batch on it once whatever prompted the interrupt is dealt with.\n"
         ),
+        BatchOutcome::TargetGone { at } => format!(
+            "BATCH: TARGET GONE at step {at} of {total} — that step ended the target (it ran to \
+             completion, or released it), so the steps after it were not attempted. Nothing \
+             failed: the step did what it was asked. But this session has no target left, so its \
+             mutations have nothing to stand in and the `always` block below ran against a target \
+             that was not there — read it for what could not be undone. Open a new session; this \
+             one only wants ending.\n"
+        ),
     };
 
     let mutations = report.mutations();
@@ -1647,6 +1719,10 @@ pub fn render(report: &BatchReport) -> String {
             SessionAfter::Running { why } => format!("RUNNING (or gone) — {why}"),
             SessionAfter::Detached { by } =>
                 format!("DETACHED/REPLACED by {by}; this session's handle is retired"),
+            SessionAfter::Ended { by } => format!(
+                "ENDED by {by} — the target ran to completion; this session has nothing left to \
+                 run against"
+            ),
             SessionAfter::Uncertain { why } => format!("UNCERTAIN — {why}"),
         }
     );
@@ -1695,6 +1771,10 @@ mod tests {
         sealed: bool,
         /// What the engine answers about its own run state; see [`Script::left_running`].
         running: Option<bool>,
+        /// Which call ends the target; see [`Script::ends_the_target_on`]. Keyed on the call
+        /// rather than on a count, because *which step* ended it is the whole of what the report
+        /// has to name.
+        ends_target_on: Option<String>,
     }
 
     /// The message a scripted panic carries, so the report can be asserted to have kept it.
@@ -1718,6 +1798,7 @@ mod tests {
                 cut_short_after: None,
                 sealed: false,
                 running: Some(false),
+                ends_target_on: None,
             }
         }
 
@@ -1775,6 +1856,18 @@ mod tests {
             self
         }
 
+        /// Makes the call containing `matching` report that it **ended the target** — the scripted
+        /// stand-in for a `g` whose process runs to completion, or a `.detach`.
+        ///
+        /// Expressed as a successful call, not a failing one, and that is the whole point: the
+        /// step did what it was asked, so nothing about its result stops the batch. Scripting it
+        /// as an `Err` would exercise the failure path, which already worked, and would miss the
+        /// case this exists for.
+        fn ends_the_target_on(mut self, matching: &str) -> Self {
+            self.ends_target_on = Some(matching.to_string());
+            self
+        }
+
         /// A break that lands in the gap *between* calls: the host knows, but no call carries it.
         /// The narrow case `Debuggee::interrupted` still exists for, now that a break during a call
         /// travels back on the call.
@@ -1825,9 +1918,14 @@ mod tests {
             let interrupted = self
                 .cut_short_after
                 .is_some_and(|after| self.calls.len() >= after);
+            let target_gone = self
+                .ends_target_on
+                .as_deref()
+                .is_some_and(|matching| call.contains(matching));
             Ok(Ran {
                 output,
                 interrupted,
+                target_gone,
             })
         }
 
@@ -1912,6 +2010,102 @@ mod tests {
     const EVAL_ONE: &str = "Evaluate expression: 1 = 00000000`00000001";
 
     // ---- the four paths the issue asks for --------------------------------
+
+    /// A step that **ends the target** stops the batch, and the report says so rather than
+    /// calling it committed.
+    ///
+    /// Issue [#242](https://github.com/glslang/windbg-mcp/issues/242), one layer up from where it
+    /// was reported. Once a resume whose process runs to completion returns `Ok` — which it must,
+    /// since running a program to its end is what a resume is for — nothing in the step's *result*
+    /// stops the batch: it would run every later step against a session with nothing to run them
+    /// on, and a batch whose last step ended the target would report `COMMITTED` with its
+    /// mutations no longer standing in anything and its rollback unable to execute.
+    ///
+    /// Asserted through the whole chain, because each link was separately capable of dropping it:
+    /// the outcome, the steps that were not attempted, `committed` being false, and `after`
+    /// naming the step. `ENDED` rather than `DETACHED` — a detached process is still running and
+    /// can be attached to again, and on a live kernel that is a machine that is up against one
+    /// that is not.
+    #[test]
+    fn a_step_that_ends_the_target_stops_the_batch_rather_than_committing() {
+        let mut d = stopped()
+            .on("bp nt!Foo", Ok(""))
+            .on("g", Ok("the process exited"))
+            .on("lm", Ok("modules"))
+            .on("bc *", Ok(""))
+            .ends_the_target_on("g");
+
+        let report = run(
+            &mut d,
+            &op(
+                vec![
+                    cmd("bp nt!Foo"),
+                    step(StepAction::Resume {
+                        command: "g".to_string(),
+                        timeout_ms: None,
+                    }),
+                    cmd("lm"),
+                ],
+                vec![cmd("bc *")],
+            ),
+            BUDGET,
+        );
+
+        assert_eq!(
+            report.outcome,
+            BatchOutcome::TargetGone { at: 2 },
+            "a resume that ended the target must stop the batch and name the step: {report:?}"
+        );
+        assert!(
+            !report.committed(),
+            "a batch whose target went away has nothing left for its changes to stand in"
+        );
+        assert!(
+            matches!(report.steps[2].result, StepResult::Skipped(_)),
+            "the step after the ending must not be attempted: {:?}",
+            report.steps[2].result
+        );
+        assert!(
+            report.steps[1].target_gone,
+            "the ending travels on the step, so every reader has it: {:?}",
+            report.steps[1]
+        );
+        assert_eq!(
+            report.after,
+            SessionAfter::Ended {
+                by: "`g`".to_string()
+            },
+            "the session state must name the ending, not report it as uncertain"
+        );
+        // The rollback is still attempted rather than skipped, which is the fail-safe direction:
+        // if the ending were misread, cleanup that could have run would otherwise be dropped.
+        assert!(d.ran("bc *"), "the `always` block must still be attempted");
+
+        let text = render(&report);
+        assert!(text.contains("TARGET GONE at step 2"), "{text}");
+        assert!(text.contains("ENDED by `g`"), "{text}");
+    }
+
+    /// A `.detach` keeps saying **detached**, not ended, though both now report the same terminal
+    /// fact to the batch.
+    ///
+    /// The two are not the same news, and the ordering inside `probe_state` is the only thing
+    /// keeping them apart: a detached process is still running somewhere.
+    #[test]
+    fn a_detach_is_still_reported_as_a_detach_rather_than_an_ending() {
+        let mut d = stopped()
+            .on(".detach", Ok("Detached"))
+            .ends_the_target_on(".detach");
+
+        let report = run(&mut d, &op(vec![cmd(".detach")], vec![]), BUDGET);
+        assert_eq!(
+            report.after,
+            SessionAfter::Detached {
+                by: "`.detach`".to_string()
+            },
+            "a released target is detached, not ended: {report:?}"
+        );
+    }
 
     /// An assertion that does not hold stops the batch *and* runs the rollback — the case a
     /// client-side loop gets right only when it is still there to notice.

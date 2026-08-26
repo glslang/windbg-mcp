@@ -1997,6 +1997,11 @@ pub enum BatchOutcomeName {
     /// `interrupt` was called on this batch's session. The session still holds its target, so
     /// this batch can be resubmitted as it stands.
     Interrupted,
+    /// A step ended the target — it ran to completion, or the step released it — so the steps
+    /// after it were not attempted. Nothing failed, but this session has nothing left to run
+    /// against and its `always` block ran against a target that was not there: read `always` for
+    /// what could not be undone, and open a new session.
+    TargetGone,
 }
 
 /// One step, as the report tells it.
@@ -2020,6 +2025,12 @@ pub struct BatchStepInfo {
     /// A break landed while this step was running, so its output is what it had reached rather
     /// than what it would have produced.
     pub cut_short: bool,
+    /// This step ended the target: it ran to completion, or the step released it. Terminal — the
+    /// steps after it were not attempted, and nothing further will run on this session.
+    ///
+    /// Defaulted so a record written before this field existed still reads.
+    #[serde(default)]
+    pub target_gone: bool,
 }
 
 /// How one step ended. [`crate::batch::StepResult`] without its message, which is
@@ -2046,6 +2057,10 @@ pub enum SessionAfterInfo {
     Running { why: String },
     /// A step released or replaced the target.
     Detached { by: String },
+    /// The target ran to completion. Kept apart from [`Self::Detached`], which is a debugger verb:
+    /// a detached process is still running somewhere and can be attached to again, and on a live
+    /// kernel that is the difference between a machine that is up and one that is not.
+    Ended { by: String },
     /// The probe failed and nothing in the batch explains it. Reported as not knowing, never
     /// guessed at.
     Uncertain { why: String },
@@ -2060,6 +2075,7 @@ impl From<&crate::batch::BatchReport> for BatchReportInfo {
             BatchOutcome::TimedOut { at } => (BatchOutcomeName::TimedOut, Some(at as u32)),
             BatchOutcome::Abandoned { at } => (BatchOutcomeName::Abandoned, Some(at as u32)),
             BatchOutcome::Interrupted { at } => (BatchOutcomeName::Interrupted, Some(at as u32)),
+            BatchOutcome::TargetGone { at } => (BatchOutcomeName::TargetGone, Some(at as u32)),
         };
         Self {
             outcome,
@@ -2094,6 +2110,7 @@ impl From<&crate::batch::StepOutcome> for BatchStepInfo {
             detail,
             changes: step.changes.clone(),
             cut_short: step.cut_short,
+            target_gone: step.target_gone,
         }
     }
 }
@@ -2105,6 +2122,7 @@ impl From<&crate::batch::SessionAfter> for SessionAfterInfo {
             SessionAfter::Stopped { ip } => Self::Stopped { ip: ip.clone() },
             SessionAfter::Running { why } => Self::Running { why: why.clone() },
             SessionAfter::Detached { by } => Self::Detached { by: by.clone() },
+            SessionAfter::Ended { by } => Self::Ended { by: by.clone() },
             SessionAfter::Uncertain { why } => Self::Uncertain { why: why.clone() },
         }
     }

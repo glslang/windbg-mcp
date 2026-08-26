@@ -3471,8 +3471,19 @@ impl BatchEngine<'_> {
     fn ran_told(&self, run: CommandRun, note: fn(CommandRun) -> String) -> Ran {
         Ran {
             interrupted: matches!(run.cut_short, Some(Interruption::OnRequest)) || self.broken(),
+            target_gone: run.target_gone,
             output: note(run),
         }
+    }
+
+    /// Whether the engine has lost its target, for the one step whose call does not say.
+    ///
+    /// `command` and `resume` are told on the value, by dbgscope. `run_to` drops its typed half by
+    /// design — a batch's product is its own report — so it asks instead. `read_memory` and `pool`
+    /// cannot end a target and answer `false` without asking: an engine round trip per step, on a
+    /// path whose answer is fixed, is a cost with no reader.
+    fn target_gone(&self) -> bool {
+        !self.e.has_target().unwrap_or(true)
     }
 }
 
@@ -3502,6 +3513,7 @@ impl Debuggee for BatchEngine<'_> {
         Ok(Ran {
             output: output.text,
             interrupted: self.broken(),
+            target_gone: self.target_gone(),
         })
     }
 
@@ -3510,6 +3522,7 @@ impl Debuggee for BatchEngine<'_> {
         Ok(Ran {
             output,
             interrupted: self.broken(),
+            target_gone: false,
         })
     }
 
@@ -3527,6 +3540,7 @@ impl Debuggee for BatchEngine<'_> {
         Ok(Ran {
             output: output.text,
             interrupted: self.broken(),
+            target_gone: false,
         })
     }
 
