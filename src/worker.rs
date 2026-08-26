@@ -828,6 +828,38 @@ fn build_engine(
     }
 }
 
+/// Waits until an engine host's target is actually loaded, the way the in-process path waits on
+/// `wait_for_event`.
+///
+/// **The host publishes its pipe before it has opened the dump**, not after — `cdb` prints
+/// `Server started with '<transport>'` ahead of its load output, so a client can connect while the
+/// target is still being read. Without this, the opener's diagnostic and its summary would race a
+/// dump load, which on a large file off a slow disk is a race that is lost intermittently and
+/// reported as a target with no modules.
+///
+/// Polls rather than waiting on an event, because there is no event to wait for: the engine
+/// belongs to another process and has already consumed its own initial break. `modules()` is the
+/// cheapest question that cannot be answered until a target exists.
+fn await_hosted_target(e: &DebugEngine) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_millis(u64::from(LOAD_WAIT_MS));
+    loop {
+        // Why the target is not ready *yet*, kept only long enough to explain a timeout. Scoped to
+        // the iteration, so the message a caller reads is the last state actually observed.
+        let state = match e.modules() {
+            // A loaded target always has at least its own image.
+            Ok(modules) if !modules.is_empty() => return Ok(()),
+            Ok(_) => "the host reports no modules yet".to_string(),
+            Err(why) => why.to_string(),
+        };
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "the engine host did not finish opening the dump within {LOAD_WAIT_MS} ms ({state})"
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// Told to a caller whose 32-bit dump this host cannot give an x86 engine.
 ///
 /// **Names no tool**, deliberately: this is built in the worker, which owns one session and has
@@ -1143,7 +1175,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
                 // teardown depends on knowing that.
                 if host_opened_target() {
                     commit();
-                    return Ok(());
+                    return await_hosted_target(e);
                 }
                 // `open_dump` is the call that claims the target, so commit right after it: a
                 // load wait that times out still leaves DbgEng holding the dump.

@@ -21,13 +21,30 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+use std::os::windows::io::AsRawHandle;
+
+use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject,
+};
+
 use crate::ttd::Arch;
 
 /// How long to wait for a freshly started host to publish its pipe.
 ///
-/// Generous because the host has to open the target before it serves anything, and that target is
-/// a full-memory dump — tens or hundreds of megabytes, off whatever disk it lives on.
-const PIPE_TIMEOUT: Duration = Duration::from_secs(60);
+/// **Bounded by the supervisor's patience, not by ours.** This wait happens before the worker
+/// emits `Ready`, and the supervisor gives a worker [`crate::engine::WORKER_READY_TIMEOUT`] to get
+/// there before killing it — so anything longer than that is unreachable, and a host still opening
+/// its dump at the bound would be killed mid-open with the timeout below never reported. The
+/// margin leaves room for the rest of a worker's startup to still fit inside the supervisor's
+/// window; `the_pipe_wait_fits_inside_the_supervisors_patience` is the assertion, so the two
+/// cannot drift apart silently.
+const PIPE_TIMEOUT: Duration = crate::engine::WORKER_READY_TIMEOUT.saturating_sub(
+    // Enough for engine creation, the connect, and the worker's own startup either side of them.
+    Duration::from_secs(5),
+);
 
 /// How often to look for it. The pipe appears once, so this only costs a few wake-ups.
 const PIPE_POLL: Duration = Duration::from_millis(100);
@@ -42,6 +59,77 @@ pub struct EngineHost {
     /// Kept for diagnostics — a log line naming the pipe is how two concurrent sessions are told
     /// apart.
     pipe: String,
+    /// The job object the host is assigned to, held open for exactly as long as this process is.
+    ///
+    /// **This, and not [`Drop`], is what guarantees the host dies with its client.** A destructor
+    /// would be enough only if this process always unwound, and it never does: the worker leaves
+    /// through `std::process::exit` on every one of its own paths, and the supervisor ends it with
+    /// `TerminateProcess` ([`crate::engine::Session::kill`]). Rust runs no destructor for either.
+    /// A job with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is enforced by the kernel instead: when the
+    /// last handle to it closes — which a dying process does however it dies, including a crash —
+    /// everything in it is terminated.
+    ///
+    /// That matters more here than the usual tidiness argument. A `cdb -server` whose client has
+    /// gone does not idle; it spins on the broken transport without bound, which is a measured way
+    /// to take a machine down (see [`Self::shutdown`]).
+    ///
+    /// Never read, and that is the whole design: its value is its `Drop`, and the kernel's
+    /// behaviour when the handle closes for reasons no `Drop` would survive.
+    #[allow(dead_code, reason = "held for the kill-on-close guarantee, never read")]
+    job: Option<OwnedJob>,
+}
+
+/// A job object handle, closed when this is dropped **or when the process dies**.
+struct OwnedJob(HANDLE);
+
+// SAFETY: a job handle is just a kernel handle; it has no thread affinity.
+unsafe impl Send for OwnedJob {}
+unsafe impl Sync for OwnedJob {}
+
+impl Drop for OwnedJob {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from `CreateJobObjectW` and is owned solely by this value.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Creates a job that kills everything in it once its last handle closes.
+///
+/// Returns `None` rather than failing the open: a host without a job still works, and the failure
+/// this guards against — an orphaned spinning `cdb` — is worth a warning rather than refusing to
+/// debug. The warning is the point, because the alternative is losing the property silently.
+fn kill_on_close_job() -> Option<OwnedJob> {
+    // SAFETY: a null name creates an anonymous job owned by this process.
+    let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if handle.is_null() {
+        tracing::warn!(
+            "worker: could not create a job object ({}); an engine host could outlive this worker \
+             if it is terminated rather than shut down",
+            io::Error::last_os_error()
+        );
+        return None;
+    }
+    let job = OwnedJob(handle);
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    // SAFETY: `limits` matches the class being set and outlives the call.
+    let ok = unsafe {
+        SetInformationJobObject(
+            job.0,
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        )
+    };
+    if ok == 0 {
+        tracing::warn!(
+            "worker: could not set kill-on-close on the job object ({}); an engine host could \
+             outlive this worker",
+            io::Error::last_os_error()
+        );
+        return None;
+    }
+    Some(job)
 }
 
 impl EngineHost {
@@ -138,10 +226,29 @@ impl EngineHost {
             std::thread::spawn(move || drain(&pipe, "stderr", Streams::Err(err)));
         }
 
+        // Assigned **after** the spawn rather than through `CREATE_SUSPENDED`, which is what a
+        // hand-rolled `CreateProcess` would allow: `std` gives no hook between creation and
+        // resumption. The window is a few instructions of a process that has not yet opened
+        // anything, and losing the race costs the kill-on-close property for that host alone —
+        // against a `CREATE_SUSPENDED` path that would mean owning process creation here.
+        let job = kill_on_close_job().filter(|job| {
+            // SAFETY: both handles are live and owned — the job by `job`, the process by `child`.
+            let ok = unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) };
+            if ok == 0 {
+                tracing::warn!(
+                    "worker: could not put the engine host in a job ({}); it could outlive this \
+                     worker if this process is terminated rather than shut down",
+                    io::Error::last_os_error()
+                );
+            }
+            ok != 0
+        });
+
         let mut host = Self {
             child,
             connection: format!("npipe:pipe={pipe},server=localhost"),
             pipe,
+            job,
         };
         host.await_pipe()?;
         Ok(host)
@@ -296,6 +403,71 @@ mod tests {
         assert!(!pipe_exists("windbg-mcp-no-such-pipe-4f21a90c"));
     }
 
+    /// **The job kills what is in it when its last handle closes** — which is what a dying process
+    /// does to its handles however it dies, including the `TerminateProcess` the supervisor uses
+    /// and the `process::exit` this worker uses. That is the whole reason the host is put in one:
+    /// neither of those runs a `Drop`, so a destructor-based teardown would leave a `cdb -server`
+    /// behind, and one whose client has gone spins on the broken transport without bound.
+    ///
+    /// Tested on a stand-in child rather than a real host, because what is being asserted is the
+    /// kernel's behaviour and not `cdb`'s: any process that outlives its parent will do.
+    #[test]
+    fn a_job_kills_its_children_when_its_last_handle_closes() {
+        let job = kill_on_close_job().expect("a job object can be created");
+        let mut child = {
+            let _one_spawn_at_a_time = crate::engine::spawn_guard();
+            Command::new("cmd.exe")
+                .args(["/c", "ping -n 30 127.0.0.1"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("a stand-in child starts")
+        };
+        // SAFETY: both handles are live and owned here.
+        let assigned =
+            unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as HANDLE) } != 0;
+        assert!(assigned, "{}", io::Error::last_os_error());
+
+        assert!(
+            child.try_wait().expect("the child can be polled").is_none(),
+            "the stand-in exited on its own, so this proves nothing"
+        );
+        drop(job);
+
+        // The kill is not instantaneous, so give it a bounded moment rather than asserting on a
+        // race. A second is orders of magnitude more than the kernel needs and far less than the
+        // thirty the stand-in would otherwise run for.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline {
+            if child.try_wait().expect("the child can be polled").is_some() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        panic!("closing the job's last handle did not kill the process in it");
+    }
+
+    /// This wait happens **before** the worker says `Ready`, so the supervisor's patience is the
+    /// real bound: a pipe timeout at or past `WORKER_READY_TIMEOUT` is unreachable, and a host
+    /// still opening its dump when it expires is killed with this timeout never reported — a
+    /// failure that would read as "the worker died" rather than "the dump took too long".
+    ///
+    /// Pinned because the two constants live in different modules and nothing else ties them
+    /// together. Raising one without the other is the silent way to reintroduce it.
+    #[test]
+    fn the_pipe_wait_fits_inside_the_supervisors_patience() {
+        assert!(
+            PIPE_TIMEOUT < crate::engine::WORKER_READY_TIMEOUT,
+            "a {PIPE_TIMEOUT:?} pipe wait cannot finish inside the supervisor's {:?}",
+            crate::engine::WORKER_READY_TIMEOUT
+        );
+        // And not so short that it is the ordinary case that fails: opening a full-memory dump off
+        // a slow disk is the thing being waited for.
+        assert!(PIPE_TIMEOUT >= Duration::from_secs(20), "{PIPE_TIMEOUT:?}");
+    }
+
     /// **The whole module against a real host**, which is the only thing that shows `find`,
     /// `start`, `await_pipe`, the connection string and `shutdown` agree with each other: serve a
     /// real 32-bit dump from an x86 `cdb`, drive it from this x64 process, and load the 32-bit
@@ -334,7 +506,12 @@ mod tests {
         // The point of the whole exercise: an extension of the *target's* architecture, loaded in
         // the host, answering about managed state.
         engine
-            .execute_command(r".load C:\Windows\Microsoft.NET\Framework\v4.0.30319\sos.dll")
+            // `.loadby`, not `.load` with a path: SOS reads CLR-internal structures and has to be
+            // the build that shipped with the runtime in the target. `.loadby sos clr` takes it
+            // from the directory the loaded `clr.dll` came from, so it is version-matched by
+            // construction, where a hardcoded `v4.0.30319` pins one .NET Framework 4.x servicing
+            // level and names a directory that does not exist for a 2.0/3.5 target at all.
+            .execute_command(".loadby sos clr")
             .expect("the 32-bit SOS loads into an x86 host");
         let threads = engine
             .execute_command("!threads")

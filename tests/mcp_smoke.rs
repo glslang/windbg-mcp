@@ -11467,17 +11467,20 @@ fn a_32_bit_managed_dump_is_served_by_an_engine_that_can_load_its_sos() {
         data["limitation"]
     );
 
-    // The extension has to come from the target's own framework directory: it is the 32-bit build,
-    // which is exactly the file this server's own process cannot load.
+    // `.loadby`, not `.load` with a path. SOS reads CLR-internal structures and has to be the
+    // build that shipped with the runtime in the *target*, so this takes it from wherever the
+    // loaded `clr.dll` came from — version-matched by construction. A hardcoded
+    // `Framework\v4.0.30319\sos.dll` would pin one .NET Framework 4.x servicing level, and would
+    // name a directory a 2.0/3.5 target (which loads `mscorwks.dll`) does not have at all.
+    //
+    // It also resolves on the **host's** filesystem, which is the same machine — the point being
+    // that it is the 32-bit build, which is exactly the file this server's own process cannot load.
     let loaded = server.call_tool(
         "execute",
-        json!({
-            "session_id": &session,
-            "command": r".load C:\Windows\Microsoft.NET\Framework\v4.0.30319\sos.dll",
-        }),
+        json!({ "session_id": &session, "command": ".loadby sos clr" }),
         TARGET_STEP,
     );
-    assert_no_error(&loaded, "execute .load sos");
+    assert_no_error(&loaded, "execute .loadby sos clr");
     let loaded = text_of(&loaded["result"]);
     assert!(
         !loaded.contains("0n193") && !loaded.contains("not a valid Win32 application"),
