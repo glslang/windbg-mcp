@@ -4,7 +4,7 @@ version = "0.11.0"
 edition = "2024"
 
 [dependencies]
-dbgscope = { git = "https://github.com/glslang/dbgscope", rev = "b8129971f6ae0b0c393f6288d7127ecc0c864b5b" }
+dbgscope = { git = "https://github.com/glslang/dbgscope", rev = "6e36dcf01f0664692dbb6c797fc7320d6d1176ab" }
 # 3.1.1 is a floor, not a preference: every 3.x before it generates a `tools/list` that omits
 # SEP-2549's required `ttlMs`/`cacheScope`, which a spec-strict `2026-07-28` client rejects
 # outright — the server connects and appears to expose no tools at all (upstream issue #1114).
