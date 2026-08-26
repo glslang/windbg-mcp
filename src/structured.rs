@@ -147,7 +147,9 @@ pub enum ErrorCategory {
     /// raise the server's call timeout.
     NotRun,
     /// The handle named no session this server will run the call against: it was ended, its
-    /// target was replaced under it, it never existed, or nothing is open at all.
+    /// target was replaced under it, **its target went away** — the process ran to completion, or
+    /// a command released it — it never existed, or nothing is open at all. Release it and open
+    /// again; no change to what was asked will help.
     StaleSession,
     /// The engine process holding this session is gone. The session is unrecoverable; opening
     /// again gets a fresh one.
@@ -461,6 +463,10 @@ pub enum RunToVerdict {
     StoppedElsewhere,
     /// It did not stop within the wait — the current input/state does not drive execution here.
     Timeout,
+    /// The target went away before it reached anything: it ran to completion, or the session was
+    /// released. Terminal — this session has nothing left to run — and it says nothing about
+    /// whether the address was reachable.
+    TargetGone,
 }
 
 /// Where a target ended up after a command that moves it (`g`, `p`, `t`, and the TTD reverses).
@@ -485,6 +491,18 @@ pub struct StopReport {
     /// Defaulted so a record written before this field existed still reads.
     #[serde(default)]
     pub timed_out: bool,
+    /// Whether the target **went away** rather than stopping: the process ran to completion, or
+    /// the command released it. Terminal, and not a failure — running a program to its end is
+    /// what a `go` is for.
+    ///
+    /// Its own field rather than an absent [`Self::stopped_at`], which a target with no thread
+    /// context also produces, and rather than an error, which would discard [`Self::output`] —
+    /// the only copy of what the run printed on its way there. When this is true the session has
+    /// nothing left to run and every later call is refused; `end_session` releases it.
+    ///
+    /// Defaulted so a record written before this field existed still reads.
+    #[serde(default)]
+    pub target_gone: bool,
     /// The debugger's own output for the command.
     pub output: String,
 }

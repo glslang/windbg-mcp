@@ -4564,6 +4564,171 @@ fn a_resume_that_reaches_no_stop_says_so_and_leaves_the_session_usable() {
     );
 }
 
+/// A live target that ends the moment it is resumed, so its exit races whatever is pumping it.
+///
+/// The other half of [`LIVE_TARGET`], and the difference is the whole point: one never stops on
+/// its own and the other is over on the first `go`.
+const SHORT_TARGET: &str = "cmd.exe /c exit";
+
+/// Issue #242 and `FOLLOWUPS.md` item 48: a target that **ends** during a resume is an ending, not
+/// a failure — and the session says so afterwards instead of half-answering.
+///
+/// What it did before, measured on both waits so it was never #226's doing: `go` on a debuggee
+/// that ran to completion came back `Debug command failed: Catastrophic failure (0x8000FFFF)`,
+/// which is the raw `E_UNEXPECTED` DbgEng answers once the wait ends with no debuggee left. The
+/// output the run had captured went with it. The session then answered `.echo` and `.lastevent`
+/// normally while `k`, `r` and `registers` failed `0x80040205` — indistinguishable, from a
+/// caller's side, from the wedged session of #226, which needs the opposite response.
+///
+/// Both halves are asserted, because either alone is satisfiable by something wrong: reporting the
+/// ending while leaving the chain in place fixes a message, and refusing everything afterwards
+/// without reporting it turns a program finishing into a call that failed.
+#[test]
+fn a_target_that_ends_during_a_resume_is_an_ending_and_the_session_says_so() {
+    if !launch_tier() {
+        return;
+    }
+    let mut server = Server::started();
+    let session = server.open_session(
+        "launch",
+        json!({ "command_line": SHORT_TARGET }),
+        TARGET_STEP,
+    );
+
+    // Not `tool_data`: the whole claim is that this is *not* a tool error, so the assertion has to
+    // be able to see one rather than panicking on it with a message about something else.
+    let resumed = server.call_tool("go", json!({ "session_id": &session }), TARGET_STEP);
+    let rendered = text_of(&resumed["result"]);
+    assert!(
+        !is_tool_error(&resumed),
+        "a target running to completion was reported as a failed call: {rendered}"
+    );
+    let stop = &resumed["result"]["structuredContent"];
+    assert_eq!(
+        stop["target_gone"],
+        json!(true),
+        "the target ended and the stop report does not say so: {stop}"
+    );
+    assert!(
+        stop["stopped_at"].is_null(),
+        "a target that is gone has no position, and naming one would invent a stop: {stop}"
+    );
+    assert!(
+        rendered.contains("the target is gone"),
+        "the text half must carry the ending too — a structured-aware client forwards \
+         `structuredContent` and drops the text, and every other client sees only this: {rendered}"
+    );
+
+    // The chain. A typed tool and the raw hatch, because they fail by different roads — `backtrace`
+    // through the engine's own interfaces, `execute` through `Execute` — and before this each said
+    // something different about one fact.
+    for (tool, args) in [
+        ("backtrace", json!({ "session_id": &session })),
+        ("registers", json!({ "session_id": &session })),
+        (
+            "execute",
+            json!({ "session_id": &session, "command": "k 3" }),
+        ),
+    ] {
+        let refused = server.call_tool(tool, args, TARGET_STEP);
+        let said = text_of(&refused["result"]);
+        assert!(
+            is_tool_error(&refused),
+            "`{tool}` answered on a session with no target: {said}"
+        );
+        assert!(
+            said.contains("no target left"),
+            "`{tool}` refused without saying why, which is the half-dead session again: {said}"
+        );
+        assert_eq!(
+            refused["result"]["structuredContent"]["error"]["category"],
+            json!("stale_session"),
+            "a caller branching on the category must be told to release this session, not to \
+             change what it asked: {refused}"
+        );
+    }
+
+    // And the one thing that must still work, since it is what every refusal above points at.
+    let ended = server.call_tool(
+        "end_session",
+        json!({ "session_id": &session }),
+        TARGET_STEP,
+    );
+    assert!(
+        !is_tool_error(&ended),
+        "`end_session` is the answer this session's refusals give, and it failed: {}",
+        text_of(&ended["result"])
+    );
+}
+
+/// The minimal repro from issue #242, which reaches the same ending through the **raw hatch**: the
+/// exit races `settle`'s pump rather than a typed resume's wait.
+///
+/// `execute 'g'` sets the run state and returns its own echo; the pump that #226 added is what
+/// moves the target, and it is there that the process runs out. That pump's capture used to be
+/// discarded with the wait's error — which is the case where it matters most, since nothing will
+/// print those lines again — and the session was left answering `.echo` while `k 3` failed
+/// `0x80040205`.
+///
+/// The output is asserted only to have *survived*. Which lines a `cmd.exe` prints on its way out
+/// belongs to the host; that anything crossed at all is the fix.
+#[test]
+fn a_target_that_ends_during_the_raw_hatchs_pump_reports_it_with_what_the_pump_captured() {
+    if !launch_tier() {
+        return;
+    }
+    let mut server = Server::started();
+    let session = server.open_session(
+        "launch",
+        json!({ "command_line": SHORT_TARGET }),
+        TARGET_STEP,
+    );
+
+    let ran = server.call_tool(
+        "execute",
+        json!({ "session_id": &session, "command": "g" }),
+        TARGET_STEP,
+    );
+    let rendered = text_of(&ran["result"]);
+    assert!(
+        !is_tool_error(&ran),
+        "the raw hatch reported a target running to completion as a failure: {rendered}"
+    );
+    assert!(
+        rendered.contains("the target is gone"),
+        "`execute 'g'` moved the target off the end and did not say so: {rendered}"
+    );
+    // The note is appended to the pump's own output, so anything ahead of it is what was captured
+    // across the ending — and the echo `Execute` puts at the front is always part of it.
+    let captured = rendered.split("[windbg-mcp]").next().unwrap_or("").trim();
+    assert!(
+        !captured.is_empty(),
+        "the pump's output was discarded with the ending, which is the reported bug: {rendered}"
+    );
+    // And the sentence the *other* endings get must not appear: there is no position to name.
+    assert!(
+        !rendered.contains("now stopped"),
+        "a target that is gone is not stopped anywhere: {rendered}"
+    );
+
+    let refused = server.call_tool(
+        "execute",
+        json!({ "session_id": &session, "command": "k 3" }),
+        TARGET_STEP,
+    );
+    assert!(
+        is_tool_error(&refused),
+        "`k 3` answered on a session whose target had exited: {}",
+        text_of(&refused["result"])
+    );
+
+    server.call_tool(
+        "end_session",
+        json!({ "session_id": &session }),
+        TARGET_STEP,
+    );
+}
+
 /// The same gate for a test that reads a **target's memory** rather than the structure of the dump
 /// around it: [`NATIVE_SAMPLE`], the crash paired with this host's architecture.
 fn native_sample_tier() -> Option<&'static KernelSample> {

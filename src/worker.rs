@@ -1189,9 +1189,57 @@ fn interrupt_running() -> Result<String, String> {
     )
 }
 
+/// Refuses work on a session whose target has gone away — in one place, with one message.
+///
+/// dbgscope refuses *raw commands* itself, because text driven into an engine with no debuggee
+/// faults the process. Without this, the typed tools would be the inconsistent half: `registers`,
+/// `modules` and `backtrace` go through the engine's own interfaces, which answer `E_UNEXPECTED`
+/// there — so a caller would get a different failure per tool for one fact about the session, and
+/// none of them would say what it was.
+///
+/// Three groups are exempt, each for its own reason. The **openers** run on an engine that has no
+/// target *yet*, which is the same state read from outside — and a worker is sent exactly one of
+/// them, as its first op, so exempting them cannot let later work through.
+/// [`EngineOp::EndSession`] is the answer to this refusal and must not be refused by it.
+/// [`EngineOp::Interrupt`] never reaches here at all (it is answered ahead of the queue, so the
+/// engine thread can be busy), and is named so that giving it a route later does not silently
+/// acquire a gate.
+///
+/// An unreadable status is not a refusal — the same rule dbgscope's own guard follows. Refusing on
+/// a guess costs a caller a session that was working, which is the worse of the two mistakes.
+fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Failed> {
+    if matches!(
+        op,
+        EngineOp::OpenDump { .. }
+            | EngineOp::OpenTrace { .. }
+            | EngineOp::AttachKernelLocal
+            | EngineOp::AttachKernel { .. }
+            | EngineOp::AttachProcess { .. }
+            | EngineOp::Launch { .. }
+            | EngineOp::EndSession
+            | EngineOp::Interrupt
+    ) {
+        return None;
+    }
+    match e.has_target() {
+        // `StaleSession` rather than `Debugger`, because no change to what is asked will help and
+        // the next move is the one that category already means: release this handle and open
+        // again. The worker stays alive until `end_session` is called, exactly as a retired
+        // session's does.
+        Ok(false) => Some(Failed::categorised(
+            structured::ErrorCategory::StaleSession,
+            NO_TARGET_LEFT.to_string(),
+        )),
+        Ok(true) | Err(_) => None,
+    }
+}
+
 /// Runs one op against this worker's engine. `queued` is how long it waited its turn here, which
 /// only the bounded-command path cares about.
 fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<Output, Failed> {
+    if let Some(refusal) = refuse_when_the_target_is_gone(e, &op) {
+        return Err(refusal);
+    }
     match op {
         // ---- openers ----
         //
@@ -1650,6 +1698,11 @@ fn told(run: CommandRun) -> String {
 /// callers not served them (`FOLLOWUPS.md` item 43). The fact goes on the wire; a pointer, if one
 /// is ever wanted, belongs where `self.surface` is.
 fn told_moving(run: CommandRun) -> String {
+    // Checked before `cut_short`, because the two cannot both be acted on and only one of them
+    // is terminal: a target that is gone is not somewhere a caller can run it on from.
+    if run.target_gone {
+        return appended(run.output, Some(TARGET_GONE.to_string()));
+    }
     let note = match run.cut_short {
         Some(Interruption::Deadline { after_ms }) => Some(format!(
             "[windbg-mcp] the target had not stopped after {after_ms} ms, so the debugger broke in \
@@ -1660,6 +1713,32 @@ fn told_moving(run: CommandRun) -> String {
     };
     appended(run.output, note)
 }
+
+/// What a caller is told when the target ended rather than stopped.
+///
+/// **Not a failure**, and the wording has to carry that: running a program to completion is what a
+/// `go` is for, and the output above this line is what the run printed on its way there — the only
+/// copy there will be. Before this, DbgEng's own `E_UNEXPECTED` was reported unchanged, so an
+/// ordinary ending read as `Debug command failed: Catastrophic failure (0x8000FFFF)` and the output
+/// went with it (`FOLLOWUPS.md` item 48).
+///
+/// It names `end_session` and nothing else. That is the one tool every surface serves
+/// (`crate::toolset`'s `ALWAYS`), so a worker — which owns one session and has never heard of the
+/// caller's surface — may point at it and at no other (`FOLLOWUPS.md` item 43).
+const TARGET_GONE: &str = "[windbg-mcp] the target is gone: it ran to completion, or this command \
+     released it. That is an ending rather than a failure, and the output above is what the run \
+     captured on the way there. Nothing further will run against this session — `end_session` \
+     releases it, and opening again gets a fresh one.";
+
+/// The same fact told to a call that arrives *after* the ending, where there is no output above it
+/// and no command of the caller's that caused it.
+///
+/// Split from [`TARGET_GONE`] rather than shared, because one sentence cannot be true of both: the
+/// observing call did release the target and does have output to point at, and a later call did
+/// neither. A single wording would have to drop the halves that make each one actionable.
+const NO_TARGET_LEFT: &str = "This session has no target left: the process ran to completion, or a \
+     command released it, so there is nothing here to run against. This is not a failure of the \
+     call — `end_session` releases the session, and opening again gets a fresh target.";
 
 /// `text` with `note` on a line of its own, when there is one.
 fn appended(mut text: String, note: Option<String>) -> String {
@@ -1689,6 +1768,12 @@ fn appended(mut text: String, note: Option<String>) -> String {
 /// It runs on the error path too: a command that failed part-way may still have run an earlier
 /// segment that resumed the target, and a wedged engine after a failed command is no better than
 /// one after a successful command.
+///
+/// **A target can leave by either half, and each is reported.** The pump is where a program that
+/// runs to completion ends (issue #242 — an exit racing the settle used to come back as a failure
+/// with the pump's output discarded); the command itself is where `.detach`, `q` and `qd` end it,
+/// leaving nothing for a pump to find. One note covers both, because from the caller's side there
+/// is one fact: this session has no target left.
 fn raw_command(e: &DebugEngine, command: &str, budget_ms: u32) -> Result<CommandRun, String> {
     let started = Instant::now();
     let result = e.execute_command_bounded(command, budget_ms).map_err(es);
@@ -1709,6 +1794,17 @@ fn raw_command(e: &DebugEngine, command: &str, budget_ms: u32) -> Result<Command
         0 => EXEC_WAIT_MS,
         budget => budget.saturating_sub(elapsed_ms(started)).min(EXEC_WAIT_MS),
     };
+    // The command may have taken the target away *itself* — `.detach`, `q` and `qd` return with
+    // the engine already holding nothing, so there is nothing left to pump and the settle below
+    // would report the ending to nobody. Measured, and `.kill` is deliberately not in that group:
+    // it leaves a target that still reads a stack and goes away on the next resume, which is why
+    // this is read off the run rather than off the command's name.
+    if result.as_ref().is_ok_and(|run| run.target_gone) {
+        return result.map(|mut run| {
+            run.output = appended(run.output, Some(TARGET_GONE.to_string()));
+            run
+        });
+    }
     let settled = match e.settle(settle_ms) {
         Ok(settled) => settled,
         Err(why) => return settle_failed(e, result, &es(why)),
@@ -1731,7 +1827,14 @@ fn raw_command(e: &DebugEngine, command: &str, budget_ms: u32) -> Result<Command
     // from the command's own completion rather than from the wait. Without the sentence, `execute`
     // with `t` would move the target and still answer with nothing but its own echo — which is
     // exactly the reading that made the bug this fixes look like a swallow.
-    let pumped = appended(told_moving(settled), Some(moved_note(e, forced)));
+    // `told_moving` has already said the target is gone, and `moved_note` must not then claim it
+    // is "now stopped" somewhere: there is no position to read, and the sentence would describe a
+    // session that no longer exists.
+    let ending = settled.target_gone;
+    let pumped = match ending {
+        true => told_moving(settled),
+        false => appended(told_moving(settled), Some(moved_note(e, forced))),
+    };
     match result {
         Ok(mut run) => {
             run.output = appended(run.output, Some(pumped));
@@ -1866,6 +1969,11 @@ fn elapsed_ms(started: Instant) -> u32 {
 /// A position that cannot be read is reported as absent, never as zero: after a `g` that left the
 /// target running, or on a module-load break with no thread context, there is no instruction
 /// pointer to report and saying `0` would name the null page as the answer.
+///
+/// **A target that ends rather than stops is one of the answers here**, not an error
+/// (`FOLLOWUPS.md` item 48). It carries no position, for the reason above, and the debugger text
+/// it does carry is the only copy of what the run printed — which is why it must not travel as an
+/// `Err`, whose one channel is a message.
 fn resumed(e: &DebugEngine, command: &str, timeout_ms: u32) -> Result<Output, Failed> {
     let run = e.execute_and_wait(command, timeout_ms).map_err(failed)?;
     query::invalidate_allocator_snapshots();
@@ -1877,6 +1985,7 @@ fn resumed(e: &DebugEngine, command: &str, timeout_ms: u32) -> Result<Output, Fa
     // flag is how "the target had not stopped" comes to be read as "it stopped here".
     let interrupted = matches!(run.cut_short, Some(Interruption::OnRequest));
     let timed_out = matches!(run.cut_short, Some(Interruption::Deadline { .. }));
+    let target_gone = run.target_gone;
     let text = told_moving(run.clone());
     Ok(Output::typed(
         text,
@@ -1885,6 +1994,7 @@ fn resumed(e: &DebugEngine, command: &str, timeout_ms: u32) -> Result<Output, Fa
             stopped_at,
             interrupted,
             timed_out,
+            target_gone,
             output: run.output,
         },
     ))
@@ -4795,6 +4905,14 @@ fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, F
              (the current input/state likely does not drive execution to this block)\n",
             fmt_addr(target)
         ),
+        // Says nothing about reachability, and must not be read as a timeout: the run ended
+        // because the target did, so `address` was never ruled out.
+        RunToOutcome::TargetGone => format!(
+            "VERDICT: TARGET GONE — the target ended before reaching {}\n  \
+             (it ran to completion or was released; this says nothing about whether the address \
+             is reachable)\n{TARGET_GONE}\n",
+            fmt_addr(target)
+        ),
     };
     if !res.output.trim().is_empty() {
         msg.push_str("---- debugger output ----\n");
@@ -4808,6 +4926,9 @@ fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, F
             (structured::RunToVerdict::StoppedElsewhere, Some(stopped_at))
         }
         RunToOutcome::Timeout => (structured::RunToVerdict::Timeout, None),
+        // No position: the engine has no target to read one from, and reporting the address asked
+        // for would say execution got there.
+        RunToOutcome::TargetGone => (structured::RunToVerdict::TargetGone, None),
     };
     Ok(Output::typed(
         msg,
@@ -7604,6 +7725,7 @@ mod tests {
             Ok(CommandRun {
                 output: "0:000> the command said this".to_string(),
                 cut_short: None,
+                target_gone: false,
             })
         };
 
