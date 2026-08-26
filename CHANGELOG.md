@@ -35,8 +35,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and a backslash run before a quote halves the way Windows says it does. An **unquoted** path that
   exists exactly as written is still one program: that is what handing the whole string over got
   right, `C:\Program Files\…` is where programs live, and splitting it on whitespace would have
-  taken the case away from callers relying on it without an error to show for it. An empty `target`
-  is refused before the output directory and log are created, beside the existing `env` validation.
+  taken the case away from callers relying on it without an error to show for it. That check asks
+  the directory the *recorder* will run in — `working_dir` when the caller set one, since the
+  recorder resolves a relative program against its own cwd and this process's is a different
+  directory. Asking the wrong one is not a refusal: measured on `TTD.exe` 1.01.11, a target of
+  `.\a program.exe` under a `working_dir` holding that file split into `.\a` and `program.exe` and
+  recorded **`a.exe`** — a different program — into a 29 MB trace reported as a complete recording.
+  An empty `target` is refused before the output directory and log are created, beside the existing
+  `env` validation.
   Measured: `record_trace { "target": "cmd.exe /c dir C:\\Windows\\System32\\ntdll.dll" }` records
   and the recorder's own echo is now `Launching 'cmd.exe /c dir …'` rather than the quoted single
   token it used to be.
