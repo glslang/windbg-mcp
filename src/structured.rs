@@ -20,13 +20,13 @@
 //!
 //! # Where the values come from
 //!
-//! Nothing here is parsed out of debugger output. Each type is built from a value: win-kexp's
+//! Nothing here is parsed out of debugger output. Each type is built from a value: dbgscope's
 //! `RunToOutcome`, `Register`, `Module`, `BreakpointInfo`, `PoolSpan` and `WalkCoverage` on the
 //! worker side, and this server's own `SessionSnapshot`/`Release` on the supervisor side. That is
 //! the rule the counts in [#77](https://github.com/glslang/windbg-mcp/issues/77) were fixed by,
 //! pointed at results instead of at counts: a figure re-derived from a rendering measures the
 //! rendering. Where a value did not exist upstream it was added there first — this is why
-//! `win-kexp` grew `register_values`, `modules`, `breakpoints` and `WalkCoverage`.
+//! `dbgscope` grew `register_values`, `modules`, `breakpoints` and `WalkCoverage`.
 //!
 //! # One address representation
 //!
@@ -542,9 +542,9 @@ pub enum NonFinite {
     NegativeInfinity,
 }
 
-impl From<&win_kexp::dbgeng::RegisterValue> for RegisterValue {
-    fn from(value: &win_kexp::dbgeng::RegisterValue) -> Self {
-        use win_kexp::dbgeng::RegisterValue as Engine;
+impl From<&dbgscope::dbgeng::RegisterValue> for RegisterValue {
+    fn from(value: &dbgscope::dbgeng::RegisterValue) -> Self {
+        use dbgscope::dbgeng::RegisterValue as Engine;
         match value {
             Engine::Int(v) => Self::Int { value: addr(*v) },
             Engine::Float(v) if v.is_finite() => Self::Float { value: *v },
@@ -625,7 +625,7 @@ impl ModuleInfo {
     /// One definition for both, because a filter that matched on something other than what the
     /// listing prints is exactly the disagreement
     /// [#120](https://github.com/glslang/windbg-mcp/issues/120) removed. An unloaded module has no
-    /// module name at all (glslang/win-kexp#101): there is nothing left to qualify a symbol with,
+    /// module name at all (glslang/dbgscope#101): there is nothing left to qualify a symbol with,
     /// so the image name is the only name it has.
     pub fn listed_name(&self) -> &str {
         if self.name.is_empty() {
@@ -702,8 +702,8 @@ pub struct PdbInfo {
     pub unmatched: bool,
 }
 
-impl From<win_kexp::dbgeng::PdbIdentity> for PdbInfo {
-    fn from(pdb: win_kexp::dbgeng::PdbIdentity) -> Self {
+impl From<dbgscope::dbgeng::PdbIdentity> for PdbInfo {
+    fn from(pdb: dbgscope::dbgeng::PdbIdentity) -> Self {
         Self {
             key: format!("{}{:X}", pdb.guid, pdb.age),
             guid: pdb.guid,
@@ -740,9 +740,9 @@ pub enum SymbolState {
     },
 }
 
-impl From<win_kexp::dbgeng::SymbolKind> for SymbolState {
-    fn from(kind: win_kexp::dbgeng::SymbolKind) -> Self {
-        use win_kexp::dbgeng::SymbolKind as Engine;
+impl From<dbgscope::dbgeng::SymbolKind> for SymbolState {
+    fn from(kind: dbgscope::dbgeng::SymbolKind) -> Self {
+        use dbgscope::dbgeng::SymbolKind as Engine;
         match kind {
             Engine::None => Self::None,
             Engine::Deferred => Self::Deferred,
@@ -783,8 +783,8 @@ impl std::fmt::Display for SymbolState {
     }
 }
 
-impl From<&win_kexp::dbgeng::Module> for ModuleInfo {
-    fn from(module: &win_kexp::dbgeng::Module) -> Self {
+impl From<&dbgscope::dbgeng::Module> for ModuleInfo {
+    fn from(module: &dbgscope::dbgeng::Module) -> Self {
         Self {
             name: module.name.clone(),
             image_name: module.image_name.clone(),
@@ -875,9 +875,9 @@ pub enum BreakpointKind {
     Other { kind_code: u32 },
 }
 
-impl From<&win_kexp::dbgeng::BreakpointInfo> for BreakpointInfo {
-    fn from(bp: &win_kexp::dbgeng::BreakpointInfo) -> Self {
-        use win_kexp::dbgeng::BreakpointKind as Engine;
+impl From<&dbgscope::dbgeng::BreakpointInfo> for BreakpointInfo {
+    fn from(bp: &dbgscope::dbgeng::BreakpointInfo) -> Self {
+        use dbgscope::dbgeng::BreakpointKind as Engine;
         Self {
             id: bp.id,
             kind: match bp.kind {
@@ -929,9 +929,9 @@ pub enum AllocatorSemanticFamily {
     AffinitySlotVs,
 }
 
-impl From<&win_kexp::allocator::LayoutProvenance> for AllocatorLayoutInfo {
-    fn from(layout: &win_kexp::allocator::LayoutProvenance) -> Self {
-        use win_kexp::allocator::VsSemanticFamily;
+impl From<&dbgscope::allocator::LayoutProvenance> for AllocatorLayoutInfo {
+    fn from(layout: &dbgscope::allocator::LayoutProvenance) -> Self {
+        use dbgscope::allocator::VsSemanticFamily;
         Self {
             module: AllocatorModuleInfo {
                 name: layout.module.name.clone(),
@@ -986,9 +986,9 @@ impl AllocatorCoverage {
     }
 }
 
-impl From<win_kexp::pool::query::WalkCoverage> for AllocatorCoverage {
-    fn from(coverage: win_kexp::pool::query::WalkCoverage) -> Self {
-        use win_kexp::pool::query::WalkCoverage as Engine;
+impl From<dbgscope::pool::query::WalkCoverage> for AllocatorCoverage {
+    fn from(coverage: dbgscope::pool::query::WalkCoverage) -> Self {
+        use dbgscope::pool::query::WalkCoverage as Engine;
         match coverage {
             Engine::Complete => Self::Complete,
             Engine::BudgetExpired => Self::DeadlineTruncated,
@@ -1058,16 +1058,16 @@ pub struct WalkGaps {
 
 impl WalkGaps {
     /// `None` when the walk met none of this, so the ordinary answer does not carry five zeroes.
-    pub(crate) fn of(report: &win_kexp::pool::query::PoolSnapshotReport) -> Option<Self> {
+    pub(crate) fn of(report: &dbgscope::pool::query::PoolSnapshotReport) -> Option<Self> {
         Self::from_measurements(report.stalls, report.refused_chunks, report.unplaced_bytes)
     }
 
-    pub(crate) fn of_heap(report: &win_kexp::heap::HeapWalkReport) -> Option<Self> {
+    pub(crate) fn of_heap(report: &dbgscope::heap::HeapWalkReport) -> Option<Self> {
         Self::from_measurements(report.stalls, report.refused_headers, report.unplaced_bytes)
     }
 
     fn from_measurements(
-        stalls: win_kexp::pool::WalkStalls,
+        stalls: dbgscope::pool::WalkStalls,
         refused_chunks: u64,
         unplaced_bytes: u64,
     ) -> Option<Self> {
@@ -1137,9 +1137,9 @@ pub enum PoolBackendName {
     Large,
 }
 
-impl From<&win_kexp::pool::PoolSpan> for PoolChunkInfo {
-    fn from(span: &win_kexp::pool::PoolSpan) -> Self {
-        use win_kexp::pool::{PoolBackend, PoolKind, PoolState};
+impl From<&dbgscope::pool::PoolSpan> for PoolChunkInfo {
+    fn from(span: &dbgscope::pool::PoolSpan) -> Self {
+        use dbgscope::pool::{PoolBackend, PoolKind, PoolState};
         Self {
             address: addr(span.usable_address),
             header_address: addr(span.header_address),
@@ -1151,7 +1151,7 @@ impl From<&win_kexp::pool::PoolSpan> for PoolChunkInfo {
                 PoolState::Unreadable => PoolChunkState::Unreadable,
             },
             tag: span.display_tag.clone(),
-            raw_tag: win_kexp::pool::raw_tag_hex(span.raw_tag),
+            raw_tag: dbgscope::pool::raw_tag_hex(span.raw_tag),
             pool: match span.pool_kind {
                 PoolKind::NonPagedExecutable => PoolKindName::NonPagedExecutable,
                 PoolKind::NonPagedNx => PoolKindName::NonPagedNx,
@@ -1319,9 +1319,9 @@ pub struct HeapRootInfo {
     pub reason: Option<String>,
 }
 
-impl From<&win_kexp::heap::HeapRoot> for HeapRootInfo {
-    fn from(root: &win_kexp::heap::HeapRoot) -> Self {
-        use win_kexp::heap::HeapKind;
+impl From<&dbgscope::heap::HeapRoot> for HeapRootInfo {
+    fn from(root: &dbgscope::heap::HeapRoot) -> Self {
+        use dbgscope::heap::HeapKind;
         Self {
             index: root.index,
             address: addr(root.address),
@@ -1352,9 +1352,9 @@ pub struct HeapAllocationInfo {
     pub size_class: u32,
 }
 
-impl From<&win_kexp::heap::HeapAllocation> for HeapAllocationInfo {
-    fn from(allocation: &win_kexp::heap::HeapAllocation) -> Self {
-        use win_kexp::heap::{HeapBackend, HeapState};
+impl From<&dbgscope::heap::HeapAllocation> for HeapAllocationInfo {
+    fn from(allocation: &dbgscope::heap::HeapAllocation) -> Self {
+        use dbgscope::heap::{HeapBackend, HeapState};
         Self {
             heap: addr(allocation.heap),
             backend: match allocation.backend {
@@ -1387,8 +1387,8 @@ pub struct HeapScopeInfo {
     pub unreadable_heaps_skipped: Vec<String>,
 }
 
-impl From<&win_kexp::heap::HeapScope> for HeapScopeInfo {
-    fn from(scope: &win_kexp::heap::HeapScope) -> Self {
+impl From<&dbgscope::heap::HeapScope> for HeapScopeInfo {
+    fn from(scope: &dbgscope::heap::HeapScope) -> Self {
         Self {
             segment_heaps_walked: scope
                 .segment_heaps_walked
@@ -1425,8 +1425,8 @@ pub struct HeapWalkInfo {
     pub gaps: Option<WalkGaps>,
 }
 
-impl From<&win_kexp::heap::HeapWalkReport> for HeapWalkInfo {
-    fn from(walk: &win_kexp::heap::HeapWalkReport) -> Self {
+impl From<&dbgscope::heap::HeapWalkReport> for HeapWalkInfo {
+    fn from(walk: &dbgscope::heap::HeapWalkReport) -> Self {
         Self {
             coverage: walk.coverage.into(),
             chunks_walked: walk.total_chunks,
@@ -2188,7 +2188,7 @@ mod tests {
     /// string is a number or bytes.
     #[test]
     fn a_register_value_says_what_kind_of_value_it_is() {
-        use win_kexp::dbgeng::RegisterValue as Engine;
+        use dbgscope::dbgeng::RegisterValue as Engine;
         let int = RegisterValue::from(&Engine::Int(0xffff_8000_dead_beef));
         let json = serde_json::to_value(&int).unwrap();
         assert_eq!(json["kind"], "int");
@@ -2216,7 +2216,7 @@ mod tests {
     /// exact bits beside the name.
     #[test]
     fn a_register_that_json_cannot_express_says_so_rather_than_saying_null() {
-        use win_kexp::dbgeng::RegisterValue as Engine;
+        use dbgscope::dbgeng::RegisterValue as Engine;
         let wire = |v: f64| serde_json::to_value(RegisterValue::from(&Engine::Float(v))).unwrap();
 
         let nan = wire(f64::NAN);
@@ -2247,7 +2247,7 @@ mod tests {
     /// thing that would.
     #[test]
     fn pool_coverage_keeps_the_walks_own_reason() {
-        use win_kexp::pool::query::WalkCoverage as Engine;
+        use dbgscope::pool::query::WalkCoverage as Engine;
         for (engine, expected, wire) in [
             (Engine::Complete, AllocatorCoverage::Complete, "complete"),
             (
@@ -2265,20 +2265,20 @@ mod tests {
 
     #[test]
     fn allocator_layout_keeps_exact_image_pdb_and_structural_family() {
-        let engine = win_kexp::allocator::LayoutProvenance {
-            module: win_kexp::dbgeng::ModuleIdentity {
+        let engine = dbgscope::allocator::LayoutProvenance {
+            module: dbgscope::dbgeng::ModuleIdentity {
                 name: "ntdll".into(),
                 image_name: "ntdll.dll".into(),
                 loaded_image_name: r"C:\Windows\System32\ntdll.dll".into(),
                 symbol_file: r"C:\symbols\ntdll.pdb".into(),
-                symbols: win_kexp::dbgeng::SymbolKind::Pdb,
+                symbols: dbgscope::dbgeng::SymbolKind::Pdb,
                 base: 0x7ffb_1234_0000,
                 size: 0x234000,
                 timestamp: 0x1234_5678,
                 checksum: 0xabcdef,
             },
             fingerprint: "fnv1a64:0123456789abcdef".into(),
-            semantic_family: win_kexp::allocator::VsSemanticFamily::AffinitySlots,
+            semantic_family: dbgscope::allocator::VsSemanticFamily::AffinitySlots,
         };
 
         let wire = serde_json::to_value(AllocatorLayoutInfo::from(&engine)).unwrap();
@@ -2292,10 +2292,10 @@ mod tests {
 
     #[test]
     fn heap_requested_size_is_optional_rather_than_inferred_from_capacity() {
-        let allocation = |requested_size| win_kexp::heap::HeapAllocation {
+        let allocation = |requested_size| dbgscope::heap::HeapAllocation {
             heap: 0x10000,
-            backend: win_kexp::heap::HeapBackend::Large,
-            state: win_kexp::heap::HeapState::Allocated,
+            backend: dbgscope::heap::HeapBackend::Large,
+            state: dbgscope::heap::HeapState::Allocated,
             header_address: 0x20000,
             user_address: 0x20000,
             capacity: 0x20000,
@@ -2316,12 +2316,12 @@ mod tests {
     /// count beside a shape counts occurrences of *that shape*, not bytes or chunks.
     #[test]
     fn walk_gaps_carry_what_the_diagnostics_cannot() {
-        let report = |stalls, refused_chunks| win_kexp::pool::query::PoolSnapshotReport {
+        let report = |stalls, refused_chunks| dbgscope::pool::query::PoolSnapshotReport {
             layout: Default::default(),
             total_chunks: 0,
             allocated_chunks: 0,
-            coverage: win_kexp::pool::query::WalkCoverage::Partial,
-            diagnostics: win_kexp::pool::PoolDiagnostics::default(),
+            coverage: dbgscope::pool::query::WalkCoverage::Partial,
+            diagnostics: dbgscope::pool::PoolDiagnostics::default(),
             stalls,
             refused_chunks,
             unplaced_bytes: 0,
@@ -2330,12 +2330,12 @@ mod tests {
         // The ordinary walk meets none of this, and says so by saying nothing: five zeroes on
         // every pool answer would be noise on the answers that are fine.
         assert_eq!(
-            WalkGaps::of(&report(win_kexp::pool::WalkStalls::default(), 0)),
+            WalkGaps::of(&report(dbgscope::pool::WalkStalls::default(), 0)),
             None
         );
 
         let gaps = WalkGaps::of(&report(
-            win_kexp::pool::WalkStalls {
+            dbgscope::pool::WalkStalls {
                 pages: 3,
                 skipped_bytes: 0x3000,
                 recovered_bytes: 0x40000,
@@ -2352,7 +2352,7 @@ mod tests {
 
         // Any one of them alone is still worth reporting — a walk can refuse chunks without
         // ever stalling, and reporting nothing there would hide the refusals entirely.
-        assert!(WalkGaps::of(&report(win_kexp::pool::WalkStalls::default(), 1)).is_some());
+        assert!(WalkGaps::of(&report(dbgscope::pool::WalkStalls::default(), 1)).is_some());
 
         // The omission has to be asserted where it happens, on `WalkInfo`. `of` returning
         // `None` says nothing about whether the field then serialises as `"gaps": null`, which
@@ -2374,8 +2374,8 @@ mod tests {
 
     #[test]
     fn heap_walk_gaps_use_the_shared_optional_shape() {
-        let report = |stalls, refused_headers| win_kexp::heap::HeapWalkReport {
-            coverage: win_kexp::pool::query::WalkCoverage::Complete,
+        let report = |stalls, refused_headers| dbgscope::heap::HeapWalkReport {
+            coverage: dbgscope::pool::query::WalkCoverage::Complete,
             total_chunks: 0,
             allocated_chunks: 0,
             diagnostic_count: 0,
@@ -2386,14 +2386,14 @@ mod tests {
         };
 
         let quiet = serde_json::to_value(HeapWalkInfo::from(&report(
-            win_kexp::pool::WalkStalls::default(),
+            dbgscope::pool::WalkStalls::default(),
             0,
         )))
         .unwrap();
         assert!(quiet.get("gaps").is_none(), "{quiet}");
 
         let wire = serde_json::to_value(HeapWalkInfo::from(&report(
-            win_kexp::pool::WalkStalls {
+            dbgscope::pool::WalkStalls {
                 pages: 2,
                 skipped_bytes: 0x2000,
                 recovered_bytes: 0x8000,
@@ -2422,7 +2422,7 @@ mod tests {
     #[test]
     fn a_pdb_identity_is_spelled_the_way_a_symbol_server_path_is() {
         let identity = |age, unmatched| {
-            serde_json::to_value(PdbInfo::from(win_kexp::dbgeng::PdbIdentity {
+            serde_json::to_value(PdbInfo::from(dbgscope::dbgeng::PdbIdentity {
                 guid: "FE3F58BDA39D2FC13C370618D1DBDF22".into(),
                 age,
                 unmatched,

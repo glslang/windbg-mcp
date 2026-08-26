@@ -140,7 +140,7 @@ gh attestation verify $zip --repo glslang/windbg-mcp `
 cargo build --release
 ```
 
-[`win-kexp`](https://github.com/glslang/win-kexp) is fetched automatically as a git
+[`dbgscope`](https://github.com/glslang/dbgscope) is fetched automatically as a git
 dependency — no sibling checkout needed.
 
 > **Developing from the repo? Disconnect the `windbg` MCP server before a release build.**

@@ -10,7 +10,7 @@
 //!
 //! * **A session that cannot be unwound costs a process, not the server.** A live-kernel attach
 //!   whose target never dials in blocks in `WaitForEvent(INFINITE)` with no cancellation path
-//!   (win-kexp's `SetInterrupt` watchdog cannot reach a wait that is still establishing the
+//!   (dbgscope's `SetInterrupt` watchdog cannot reach a wait that is still establishing the
 //!   link). Confined to its own process, that is one worker the supervisor can kill —
 //!   `end_session` does exactly that — instead of the one engine thread every tool queued on.
 //! * **`session_id` routes rather than merely detects.** The old handle existed to notice that

@@ -1009,7 +1009,7 @@ def verify_against(drive, suite, tasks):
               f"way, so run it where symbols resolve.")
     else:
         print(f"\nOK: every fact {len(tasks)} tasks are graded against still reads off the dumps. "
-              f"CI does not run this - re-run it after a win-kexp bump, a symbol-path change or a "
+              f"CI does not run this - re-run it after a dbgscope bump, a symbol-path change or a "
               f"new sample.")
     if leaked:
         # **Retried once, then said out loud.** A target this run opened and could not release is

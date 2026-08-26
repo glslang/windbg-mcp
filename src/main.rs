@@ -68,7 +68,7 @@ const ENGINE_CALL_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Overrides [`ENGINE_CALL_TIMEOUT`], in whole seconds.
 ///
-/// Exists because the budget is also what arms win-kexp's watchdog on the bounded-command path,
+/// Exists because the budget is also what arms dbgscope's watchdog on the bounded-command path,
 /// so the only honest way to exercise that arithmetic end to end is to shrink it — a test that
 /// waits out the 300s default is a test nobody runs. Operationally it is the knob for a host
 /// where the default is wrong in either direction (a slow symbol server, or an operator who

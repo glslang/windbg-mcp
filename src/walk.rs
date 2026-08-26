@@ -154,7 +154,7 @@ pub struct FieldArg {
 ///
 /// `patience_ms` is filled in by the supervisor's pump like every other deadline-carrying op — the
 /// value a caller constructs is ignored. A walk is a long run of reads with no *command* behind
-/// it, so win-kexp's watchdog cannot cut it short; the deadline it checks between nodes is the
+/// it, so dbgscope's watchdog cannot cut it short; the deadline it checks between nodes is the
 /// only thing keeping it from outliving the caller who asked for it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WalkOp {

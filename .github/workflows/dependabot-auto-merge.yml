@@ -10,7 +10,7 @@ name: Dependabot auto-merge
 # than descriptive: a job CI runs but the ruleset does not require is one this
 # workflow will merge straight past, green or red. The debugger tier was in that
 # position until it was made required — which matters most for the case that put
-# it there, a `win-kexp` revision bump, whose regressions are exactly the ones
+# it there, a `dbgscope` revision bump, whose regressions are exactly the ones
 # that compile cleanly and only show up once DbgEng opens a target. Anything
 # added to ci.yml as a real gate has to be added to the ruleset too.
 

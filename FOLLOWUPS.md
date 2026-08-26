@@ -3,7 +3,7 @@
 Deferred work, in twenty-five clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
-(glslang/win-kexp#71, 2026-08-01), items 13–14 from the bounded-command coverage review
+(glslang/dbgscope#71, 2026-08-01), items 13–14 from the bounded-command coverage review
 (#46, 2026-08-02), item 15 from the private worker channel (#65 / #72, 2026-08-04), items 16–18
 from transactional batches (#82, 2026-08-09/10 — item 17 is what validating the tool against the CTF
 session's own transcript turned up, and item 18 what reviewing it did), item 19 from
@@ -73,13 +73,13 @@ records: this server *does* report a build revision, stamped by a `build.rs` who
 dirty check have to be one list or they disagree — which is the sort of thing an entry proposing
 "record a build SHA" cannot see from where it is written.
 
-## 1. [win-kexp] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
+## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
 `run_to_address` used a one-shot `g <addr>` (WinDbg's temporary breakpoint), which DbgEng does **not**
 hand back a handle for, so every exit but a hit could leave it armed.
 
-Fixed in win-kexp (`05df6b7`, closing
-[glslang/win-kexp#63](https://github.com/glslang/win-kexp/issues/63)) and picked up here by the pin
+Fixed in dbgscope (`05df6b7`, closing
+[glslang/dbgscope#63](https://github.com/glslang/dbgscope/issues/63)) and picked up here by the pin
 bump. Building it surfaced two further defects on the same path, both of which mattered more than
 the stale breakpoint this item was filed for: the `Timeout` outcome was **unreachable** (it tested
 `GetExecutionStatus() == DEBUG_STATUS_GO`, but an expired finite wait reports `DEBUG_STATUS_BREAK`),
@@ -92,16 +92,16 @@ Nothing changed in this crate: `run_to_address` is a thin wrapper and its `RunTo
 branch simply became reachable. The verdict text it renders was already correct for a target that
 ends up broken in.
 
-## 2. [win-kexp] Typed write primitives
+## 2. [dbgscope] Typed write primitives
 
 `write_virtual`, a typed register **write**, and `ba` (data) breakpoints. Today only the `execute` raw
 text path exists (`eb`/`ed`/`r reg=`).
 
 - **Why deferred:** primarily needed by the state-injection path (item 3); no consumer without it.
-- **Note:** win-kexp is the right home for these (DECISIONS.md D3 — typed `DebugEngine` methods, not the
+- **Note:** dbgscope is the right home for these (DECISIONS.md D3 — typed `DebugEngine` methods, not the
   text hatch), mirroring how `run_to_address`/`instruction_pointer` were added.
 
-## 3. [windbg-mcp + win-kexp] State-injection confirmation path (DECISIONS.md D4)
+## 3. [windbg-mcp + dbgscope] State-injection confirmation path (DECISIONS.md D4)
 
 Alternative to driving a real IOCTL client: break at the dispatch entry, craft an IRP +
 IO_STACK_LOCATION + SystemBuffer in memory, set `rcx`/`rdx`, and run to the target block.
@@ -112,7 +112,7 @@ IO_STACK_LOCATION + SystemBuffer in memory, set `rcx`/`rdx`, and run to the targ
 - **Depends on:** item 2 (typed write primitives) and the item-1 breakpoint work; the same path-recipe
   data the drive path uses. Prefer a snapshot-restorable VM when building it.
 
-## 4. [win-kexp] Typed `read_register`
+## 4. [dbgscope] Typed `read_register`
 
 Generalize the private `instruction_pointer` helper (added for `run_to_address`) into a public typed
 register read, per DECISIONS.md D5 step 1. Only the instruction pointer is implemented today.
@@ -133,9 +133,9 @@ than the human/LLM-readable recipe emitted today.
   debugger memory snapshot rather than building an in-house solver — kernel state modeling, loops,
   hashing, and stateful protocols make it brittle and a separate project.
 
-## 7. [win-kexp + windbg-mcp] On-demand engine interrupt — **done** (2026-08-10)
+## 7. [dbgscope + windbg-mcp] On-demand engine interrupt — **done** (2026-08-10)
 
-Expose `SetInterrupt` as a public win-kexp method (and a `Send` handle obtainable from a
+Expose `SetInterrupt` as a public dbgscope method (and a `Send` handle obtainable from a
 `&DebugEngine`), then plumb it through to a per-session `interrupt()`. The primitive existed but was
 only ever *timeout-driven*: `execute_command_bounded` and `wait_for_event_bounded` each spawn a
 watchdog thread holding an `InterruptHandle` and Ctrl+Break the engine when a deadline passes, and
@@ -153,7 +153,7 @@ because the reader was never blocked.
 
 Landed as the `interrupt` tool. What each half turned out to be:
 
-- **win-kexp:** `InterruptHandle` is public, `Send + Sync`, and holds an owned `IDebugControl4`
+- **dbgscope:** `InterruptHandle` is public, `Send + Sync`, and holds an owned `IDebugControl4`
   rather than a borrowed pointer — a handle a host can keep would otherwise dangle past the engine
   it came from. Both watchdogs now go through it, which is what makes the second part work: the
   handle and the engine share a `raised` flag, so `execute_command_bounded` can tell an aborted
@@ -187,7 +187,7 @@ Landed as the `interrupt` tool. What each half turned out to be:
   wants cancelling — is not cancellable this way; only tearing down the process ends it, which
   item 10 made an in-band operation (`end_session`). The tool says so rather than reporting a
   success that does nothing.
-- **Proof:** win-kexp's `test_command_interrupted_on_request_keeps_its_output` (live, `#[ignore]`d)
+- **Proof:** dbgscope's `test_command_interrupted_on_request_keeps_its_output` (live, `#[ignore]`d)
   holds the partial-output-as-`Ok` claim the shared flag exists for; `src/worker.rs` unit-tests the
   binding against a local `Running` (both orderings of the race, staged — which against the real
   one would mean interrupting an engine at an exact instant); and `tests/mcp_smoke.rs`'s
@@ -259,10 +259,10 @@ Fast, pure tools (`decode_ioctl`, `registers`, `read_memory`, `modules`, `thread
 - **Note:** tasks are client-negotiated (`supports_tasks()`), so every converted tool keeps its
   synchronous path. This is additive, never a replacement.
 
-## 9. [win-kexp + windbg-mcp] Incremental output from a running command
+## 9. [dbgscope + windbg-mcp] Incremental output from a running command
 
 A second `IDebugClient` (via `IDebugClient::CreateClient`, already wrapped as
-`create_from_windbg_client`, win-kexp `src/dbgeng.rs:197`) can own its own `IDebugOutputCallbacks`.
+`create_from_windbg_client`, dbgscope `src/dbgeng.rs:197`) can own its own `IDebugOutputCallbacks`.
 That is the route to partial output from a long `g` or `execute` — a task's `statusMessage`, or a
 progress line — without the engine call returning. Today `OutputCallbacks` is installed on the one
 client for the duration of a command, so output only lands when the command ends.
@@ -275,7 +275,7 @@ client for the duration of a command, so output only lands when the command ends
 
 ## 10. [windbg-mcp] Process-per-session — **done** (2026-08-02, issue #61)
 
-dbgeng.dll holds **one debuggee session per process**. That is not a win-kexp limitation — it is why
+dbgeng.dll holds **one debuggee session per process**. That is not a dbgscope limitation — it is why
 `.opendump` *replaces* the target, and why the `session_id` design existed at all (a handle that
 detects the swap, because there was nothing to swap *between*).
 
@@ -295,7 +295,7 @@ What moved, for anyone picking up the items that referenced this:
 - The `opens` ledger became the session registry, and `session_status` reports session *state* —
   including how long an open has been waiting, which is what distinguishes a KDNET link that is
   coming up from one that never will.
-- `unsafe impl Send/Sync for DebugEngine` (win-kexp `src/dbgeng.rs:164-165`) is still sound for the
+- `unsafe impl Send/Sync for DebugEngine` (dbgscope `src/dbgeng.rs:164-165`) is still sound for the
   same reason as before: `src/worker.rs` confines the engine to one thread *inside* the worker. The
   supervisor never touches a `DebugEngine` at all, which is a stronger position than the one that
   claim was written for.
@@ -340,15 +340,15 @@ iframe host.
   same reason they were the candidates for Apps. The plumbing they would need now exists
   (`src/structured.rs`, `proto::Output`), so the remaining work is their shapes, not the seam.
 
-## 12. [win-kexp] Validate the opener split against a live KDNET target — **done** (2026-08-02)
+## 12. [dbgscope] Validate the opener split against a live KDNET target — **done** (2026-08-02)
 
-The split that made per-opener handle commits possible (glslang/win-kexp#71) was validated on
+The split that made per-opener handle commits possible (glslang/dbgscope#71) was validated on
 user-mode targets only — split launch, fused launch, split attach, via `examples/split_open.rs`.
 The two **kernel** halves ran on no hardware: `attach_local_kernel_begin`/`wait` and
 `attach_kernel_begin`/`wait`.
 
 `attach_kernel_begin`/`wait` then ran against a Windows Server 26100 guest over KDNET, from the
-harness added in win-kexp#77 (`examples/kdtest.rs` now drives the split path beside the fused one),
+harness added in dbgscope#77 (`examples/kdtest.rs` now drives the split path beside the fused one),
 and passes on both counts. `attach_local_kernel_begin` shares `wait_for_kernel_break_in` and differs
 only in its begin half; on a host with local KD off it can exercise nothing but that half's
 `E_NOTIMPL`, which is not evidence about the wait.
@@ -373,7 +373,7 @@ only reaches a wait whose target has **connected**, so the bound covers a connec
 guest and nothing else. `KernelBreakTimeout` is reachable only from a target that connects and
 *then* fails to break in — wedged, or spinning at high IRQL — and stays unexercised. It is also
 three lines the split did not touch (`wait_for_kernel_break_in` is byte-identical; only its call
-site moved), which is why win-kexp#73 closed without it.
+site moved), which is why dbgscope#73 closed without it.
 
 What that leaves this repo is not a test but a constraint, and it is the one item 10 exists for: the
 most common kernel-debugging mistake there is — a guest not booted with `/debug on` — blocks the
@@ -381,11 +381,11 @@ attaching thread with **no bound at all**, and no in-process mitigation is possi
 inability to cancel is DbgEng's. A caller that must stay responsive needs a process it can abandon.
 This server has one: the attach parks a *worker*, `session_status` reports how long it has waited,
 and `end_session` terminates it — covered end to end by the live smoke tier (a kernel attach parked
-on a dead port, reclaimed by `end_session`). win-kexp now documents the bound's real reach on
+on a dead port, reclaimed by `end_session`). dbgscope now documents the bound's real reach on
 `attach_kernel` itself ("Blocks indefinitely if the target never connects", `src/dbgeng.rs`), so the
 next caller does not have to measure it again.
 
-- **Tracked as:** [glslang/win-kexp#73](https://github.com/glslang/win-kexp/issues/73) — closed
+- **Tracked as:** [glslang/dbgscope#73](https://github.com/glslang/dbgscope/issues/73) — closed
   2026-08-14.
 
 ## 13. [windbg-mcp] A job-level deadline for `reachable_from_dispatch`
@@ -409,7 +409,7 @@ that answers nothing until the walk ends.
   DECISIONS.md (2026-08-02) rather than fixed there, because it needs a different mechanism than
   the review's subject.
 
-## 14. [win-kexp] Make arming the bounded watchdog ~free
+## 14. [dbgscope] Make arming the bounded watchdog ~free
 
 `execute_command_bounded` spawns a watchdog thread that polls a `done` flag on a
 `thread::sleep(200ms)` loop, and joins it once `Execute` returns. Because the flag is set while
@@ -424,7 +424,7 @@ wake the watchdog immediately and drop that to ~0.
 - **Why it matters here:** the cost is the *only* reason windbg-mcp's cheap point-query tools stay
   off the bounded path (DECISIONS.md, 2026-08-02). Remove it and the coverage rule simplifies to
   "bound everything except `index_trace`", with no per-call tax to weigh against a rare wedge.
-- **Why deferred:** it is a win-kexp change with its own review, and the current split is correct
+- **Why deferred:** it is a dbgscope change with its own review, and the current split is correct
   as long as the cost stands — this is an improvement to the tradeoff, not a fix to a defect.
 
 ## 15. [windbg-mcp] Make handle inheritance a property of the spawn, not of the process
@@ -491,7 +491,7 @@ Two things the writing of it settled, both worth keeping:
 
 The one gap the MessageManager transcript found in `debug_batch` (#82). Its step vocabulary reaches
 anything that is a *debugger command*, which is almost every typed tool in this server — but not the
-ones that are not commands at all. The pool tools are win-kexp walks over the allocator's own
+ones that are not commands at all. The pool tools are dbgscope walks over the allocator's own
 structures, so `pool_find_tag`, `pool_chunk` and `pool_census` had no `execute` equivalent to fall
 back on. It cost the workflow this is measured against 9 of 1,681 steps (`@chunkt1`, `@census`,
 `@find`, `@findr`) — small, but not incidental: `@chunkt1` sat *inside* the 32-step transaction,
@@ -506,7 +506,7 @@ stays engine-free, and the defaults and caps moved onto `PoolOp` constructors in
 step and a tool cannot drift apart on what `limit` means.
 
 The design question the item did *not* anticipate, and the part worth remembering: **a walk needs a
-deadline from the batch.** win-kexp bounds a walk at `DEFAULT_WALK_BUDGET` (120s), which is longer
+deadline from the batch.** dbgscope bounds a walk at `DEFAULT_WALK_BUDGET` (120s), which is longer
 than an ordinary batch's whole budget — so a `refresh` step taking that default could spend the
 reserve the rollback lives on and overrun the bound the worker advertises to a teardown (item 18),
 which is a worker terminated mid-transaction. `PoolWalk::within` already existed for exactly this
@@ -956,7 +956,7 @@ the access mask, and an empty `-InputHex` returning `$null` because the pipeline
 array. All three are fixed; a 7-only tool that documents itself as needing no compiler was not
 much use on a target that has only 5.1.
 
-## 27. [windbg-mcp + win-kexp] A deferred module reports no PDB identity — **measured and declined** (2026-08-20)
+## 27. [windbg-mcp + dbgscope] A deferred module reports no PDB identity — **measured and declined** (2026-08-20)
 
 `modules` carries `pdb` — the GUID, age and symbol-server `key` — only for a module whose symbols
 the engine has **already resolved** (`symbols: pdb` or `dia`). On a freshly opened dump that is one
@@ -982,7 +982,7 @@ returns the largest answer this server gives — needs weighing against the conv
 symbol load to populate it would be strictly worse: that is a `.reload` per module, on a listing.
 
 **Depends on nothing.** Picks up at `worker::with_pdb_identity` and
-`win_kexp::DebugEngine::module_pdb`.
+`dbgscope::DebugEngine::module_pdb`.
 
 **Built and measured, 2026-08-20 — and declined.** The parse is small and was not the problem: ~60
 lines reading the DOS stub, the optional header's data directories, the debug directory and the
@@ -1427,7 +1427,7 @@ listener ever has to start a second one to add a client, these commands are inco
 add, revoke and rotate are all in place, and all three take effect without stopping anything.
 
 
-## 35. [windbg-mcp + win-kexp] The engine's subregister flag misses the views that matter — **measured and declined** (2026-08-22)
+## 35. [windbg-mcp + dbgscope] The engine's subregister flag misses the views that matter — **measured and declined** (2026-08-22)
 
 `registers` narrows its default set with `DEBUG_REGISTER_SUB_REGISTER`, and that flag does not mean
 what the filter needs it to mean:
@@ -1438,7 +1438,7 @@ what the filter needs it to mean:
 - **ARM64**: it catches **nine** rows, all `cpsr` bits, and misses `w0`–`w30` — the 32-bit views of
   `x0`–`x28`/`fp`/`lr`, 31 of the 109 default rows, ~28% of that answer.
 
-**The question this item existed to ask has been asked**, with a win-kexp branch exposing the whole
+**The question this item existed to ask has been asked**, with a dbgscope branch exposing the whole
 `DEBUG_REGISTER_DESCRIPTION` and an example printing it for a dump (`register-descriptions`,
 unmerged). The answer is that the engine offers nothing better:
 
@@ -1455,7 +1455,7 @@ There is no derived rule to be had from the description.
 The test behind that middle row is deliberately *not* `SubregMaster != 0`: index 0 is a real
 register (`rax`, `x0`) and is precisely the master these rows would name if they named one, so
 treating zero as "unset" throws away the case the probe exists to find — reported by
-chatgpt-codex-connector on glslang/win-kexp#115. What the row counts is any of the four fields being
+chatgpt-codex-connector on glslang/dbgscope#115. What the row counts is any of the four fields being
 non-zero, and none of them is, on either architecture.
 
 **Declined rather than solved**, and the reasoning is worth keeping because it is what a future
@@ -1469,7 +1469,7 @@ asserted against whatever architecture the host is
 
 - **What would reopen it:** a DbgEng build that sets the flag for these registers, or populates
   `SubregMaster` without it. The example above is how to check in one command, and is the reason the
-  win-kexp branch is worth landing even though nothing consumes it yet — that is a judgement call
+  dbgscope branch is worth landing even though nothing consumes it yet — that is a judgement call
   left open rather than made here.
 - **What it is worth if reopened:** ~1.8 KB of a ~6.3 KB answer, on ARM64 only. Real, and smaller
   than the 6.3 KB item 24 already took off the same tool.
@@ -2276,7 +2276,7 @@ three shapes this entry weighed, and the argument for it is unchanged: the oracl
 whose three rules were each learned from a wrong verdict, so a Rust gate would need a **second copy
 of it** — and two copies drifting apart is this item's own failure mode reached through this item's
 own fix. The cost taken deliberately is that CI cannot run it: it needs a listener and a
-credential, so it is a command for after a `win-kexp` bump, a symbol-path change or a new sample,
+credential, so it is a command for after a `dbgscope` bump, a symbol-path change or a new sample,
 and the run says so on every pass. The Rust tier goes on pinning what it already pins.
 
 **The binding is per task and carries the inputs**, which is what review found this entry lacking
@@ -2331,7 +2331,7 @@ verifier quietly querying the old one.
   found that the pins themselves were laxer than their own docstring: Python's `==` accepts
   `False == 0` and `227.0 == 227`, so a `matched` turning from the integer `0` into `false` passed
   the pin *and* the relation resting on it. Types are compared now. Half of that round's remedy
-  was declined: checking `symbols` against a *recognized* set would fail on a state win-kexp
+  was declined: checking `symbols` against a *recognized* set would fail on a state dbgscope
   legitimately adds, and a new symbol state is not a rotted key.
 - **A task nothing checked is not a task that passed**, which an eighth round caught and which the
   gating design had quietly licensed. `driver_blame`'s only fact-checking step is gated, so on a
@@ -2406,7 +2406,7 @@ whatever the session has selected.
 
 **Nothing was wrong when it landed**, which is what makes this protection against future drift
 rather than a bug fix: all three dumps were re-read on 2026-08-25 and every fact the tasks depend
-on still holds. What will move it is an engine or `win-kexp` bump, a symbol-path change, or a new
+on still holds. What will move it is an engine or `dbgscope` bump, a symbol-path change, or a new
 sample replacing an old one.
 
 **Where it picks up.** `tools/local_model_eval.py` (`--verify-key` and the helpers under it),
@@ -2575,7 +2575,7 @@ bench: 540 unit tests and 76 smoke tests, no new clippy warning.
 
 ---
 
-## 47. [windbg-mcp + win-kexp] The bounded wait is unmeasured on a TTD replay target
+## 47. [windbg-mcp + dbgscope] The bounded wait is unmeasured on a TTD replay target
 
 **What changed under it.** Fixing [#226](https://github.com/glslang/windbg-mcp/issues/226) made
 `execute_and_wait` use `wait_for_event_bounded` — `WaitForEvent(INFINITE)` with a watchdog that
@@ -2628,7 +2628,7 @@ timeout path is *unreachable* on this target type rather than untested — which
 an answer rather than as a test, and is worth writing down either way. Deciding that costs one
 measurement and is what the next person should do before writing anything.
 
-**Where it picks up.** `win-kexp`'s `DebugEngine::execute_and_wait` and `wait_for_event_bounded`
+**Where it picks up.** `dbgscope`'s `DebugEngine::execute_and_wait` and `wait_for_event_bounded`
 (`src/dbgeng.rs`); `worker::resumed`; and the pair
 `a_raw_execution_control_command_moves_the_target_instead_of_wedging_the_session` /
 `a_resume_that_reaches_no_stop_says_so_and_leaves_the_session_usable` in `tests/mcp_smoke.rs`,
@@ -2636,7 +2636,7 @@ which are the shape a TTD one would copy.
 
 ---
 
-## 48. [win-kexp + windbg-mcp] A target that exits during a `go` is reported as a catastrophic failure
+## 48. [dbgscope + windbg-mcp] A target that exits during a `go` is reported as a catastrophic failure
 
 **What happens.** `go`, a step, or a `resume` whose debuggee exits while the engine is waiting comes
 back as `Debug command failed: Catastrophic failure (0x8000FFFF)`. That is the raw `E_UNEXPECTED`
@@ -2666,7 +2666,7 @@ stop, the session has to be retired the way `.detach` retires it, and `session_s
 so. Either way it wants the tier that now launches a process (`launch_tier`), where the shape is
 one line: launch `cmd.exe /c exit`, `go`, read the answer.
 
-**Where it picks up.** `DebugEngine::execute_and_wait`'s tail in win-kexp's `src/dbgeng.rs`
+**Where it picks up.** `DebugEngine::execute_and_wait`'s tail in dbgscope's `src/dbgeng.rs`
 (`waited.map_err(DbgEngError::CommandFailed)?`), `DbgEngError::NoDebuggee` beside it, and
 `worker::resumed`. The workaround in the meantime is in
 `a_raw_execution_control_command_moves_the_target_instead_of_wedging_the_session`, which asserts

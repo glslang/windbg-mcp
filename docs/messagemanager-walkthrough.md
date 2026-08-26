@@ -129,7 +129,7 @@ land next to — and under Verifier it correctly shows the adjacent **guard page
 neighbour rather than guessing.
 
 Getting these two calls to tell the truth on 26100 took **four** fixes in the underlying walker
-(`win-kexp`), each one a place where the OS had moved something and the walk failed *silently*:
+(`dbgscope`), each one a place where the OS had moved something and the walk failed *silently*:
 
 1. **VS free-chunk state moved out of `_HEAP_VS_CONTEXT`.** On 26100 that struct is 0x60 bytes and
    carries none of `FreeChunkTree`/`SubsegmentList`/`DelayFreeContext`; they live in a new

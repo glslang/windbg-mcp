@@ -16,7 +16,7 @@
   bounds. If the dispatch uses a `switch(IoControlCode)` jump table (common), pass the specific
   handler VA as `from` to scope past it, or confirm dynamically with a breakpoint + `go`.
 - The **kernel pool** tools (`pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics`) walk the allocator's own
-  descriptors through win-kexp rather than shelling out to `!pool`/`!poolused`, so all four read
+  descriptors through dbgscope rather than shelling out to `!pool`/`!poolused`, so all four read
   one snapshot and cannot disagree with each other. They need a **broken-in x64 kernel** target.
   Walking every pool page is expensive, so the snapshot is **cached per session** and reused; pass
   `refresh: true` after letting the target run, or you are reading a photograph of a target that has
@@ -74,7 +74,7 @@
   everything else. **The call leaves the session exactly as it found it**, which running the same
   `!analyze -v` through `execute` does not: the analysis resets the selected scope to the target's
   default, so a `.frame`/`.cxr` a caller had chosen would be silently discarded — `crash_triage`
-  saves that scope and restores it (`ScopeGuard`, [win-kexp#98](https://github.com/glslang/win-kexp/issues/98)),
+  saves that scope and restores it (`ScopeGuard`, [dbgscope#98](https://github.com/glslang/dbgscope/issues/98)),
   which is why the tool reports itself read-only. The stack it walks is the **default** context
   (the crash, on a crash dump) whenever the analysis ran to completion — running it is what resets
   the scope there — and whatever the session has selected when it did not: `analyze: false`, no

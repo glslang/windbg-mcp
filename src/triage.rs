@@ -38,13 +38,13 @@
 //! getting right: the two are wrong in different ways, and a caller who knows which is which can
 //! settle it from the stack in one look.
 
-use win_kexp::dbgeng::{BugCheck, Module, StackFrame};
+use dbgscope::dbgeng::{BugCheck, Module, StackFrame};
 
 use crate::structured;
 
 /// One stack frame with the module the engine placed it in.
 ///
-/// Paired here rather than inside win-kexp's own frame because "which module holds this address"
+/// Paired here rather than inside dbgscope's own frame because "which module holds this address"
 /// is a second question asked of the engine, and a stack walk that answers only the first is
 /// still a good stack walk.
 #[derive(Clone)]
@@ -319,7 +319,7 @@ pub fn frame_info(attributed: &AttributedFrame) -> structured::FrameInfo {
 /// that a consumer would read as "this frame resolved" for the one case the whole tool exists to
 /// handle: a driver with no PDB. Measured on the MessageManager crash dumps.
 ///
-/// The test is the `!` that qualifies a real symbol. win-kexp reports what the engine said, which
+/// The test is the `!` that qualifies a real symbol. dbgscope reports what the engine said, which
 /// is right for a binding; deciding that a module name does not count is this tool's judgement to
 /// make, and it has `module`/`rva` to say the same thing unambiguously.
 fn resolved_symbol(frame: &StackFrame) -> Option<String> {
@@ -812,7 +812,7 @@ mod tests {
             loaded_image_name: String::new(),
             timestamp: 0,
             checksum: 0,
-            symbols: win_kexp::dbgeng::SymbolKind::None,
+            symbols: dbgscope::dbgeng::SymbolKind::None,
             user_mode: false,
             unloaded: false,
         }

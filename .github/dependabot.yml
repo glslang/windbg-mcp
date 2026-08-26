@@ -4,10 +4,10 @@
 # far enough behind that a spec-current MCP client saw no tools at all.
 version: 2
 updates:
-  # Rust crates: Cargo.toml plus the committed Cargo.lock. This also covers `win-kexp`, the
+  # Rust crates: Cargo.toml plus the committed Cargo.lock. This also covers `dbgscope`, the
   # git dependency pinned to `main` — Dependabot bumps its locked revision, so a pushed
-  # win-kexp commit arrives as a PR instead of waiting for someone to remember
-  # `cargo update -p win-kexp`.
+  # dbgscope commit arrives as a PR instead of waiting for someone to remember
+  # `cargo update -p dbgscope`.
   - package-ecosystem: cargo
     directory: /
     schedule:

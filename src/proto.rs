@@ -67,7 +67,7 @@ pub enum EngineOp {
     Command {
         command: String,
     },
-    /// A raw command bounded by win-kexp's watchdog, which Ctrl+Breaks the engine before the
+    /// A raw command bounded by dbgscope's watchdog, which Ctrl+Breaks the engine before the
     /// caller gives up rather than letting a runaway command pin the session.
     ///
     /// What crosses the boundary is **the caller's remaining patience**, not the watchdog
@@ -164,7 +164,7 @@ pub enum EngineOp {
     /// One indivisible job for the usual reason and one of its own. The usual one: it is up to a
     /// thousand reads, and letting another call for the same session interleave would let the
     /// table describe a target that moved between its rows. Its own: the walk is a **long run of
-    /// reads with no command behind it**, so win-kexp's watchdog — which bounds an `Execute` —
+    /// reads with no command behind it**, so dbgscope's watchdog — which bounds an `Execute` —
     /// has nothing to bound. The only thing that keeps it inside its caller's wait is the
     /// deadline it checks between nodes, and that arithmetic needs the queue wait only the worker
     /// can see.
@@ -189,7 +189,7 @@ pub enum EngineOp {
     /// `patience_ms` is the caller's remaining patience, filled in and derived exactly as
     /// [`Self::BoundedCommand`]'s is, and for the same reason: a walk that outlives its caller is a
     /// walk nobody is waiting for holding a session nobody can use. Without it the walk takes
-    /// win-kexp's `DEFAULT_WALK_BUDGET`, which knows nothing about this server's deadline and is
+    /// dbgscope's `DEFAULT_WALK_BUDGET`, which knows nothing about this server's deadline and is
     /// wrong in both directions — too long for a host configured with a short
     /// `WINDBG_MCP_CALL_TIMEOUT_SECS`, and needlessly short for the default one, where it stops
     /// with minutes still to spend and hands back a partial snapshot.
@@ -287,7 +287,7 @@ impl EngineOp {
     /// because the failure it prevents is silent: a variant that grows a `patience_ms` and is not
     /// added to that `match` compiles, ships, and takes whatever the field's default happens to
     /// be. That is exactly what [`Self::Pool`] did — it carried none at all and quietly took
-    /// win-kexp's default walk budget instead of this server's deadline.
+    /// dbgscope's default walk budget instead of this server's deadline.
     pub fn patience_slot(&mut self) -> Option<&mut u32> {
         match self {
             Self::BoundedCommand { patience_ms, .. }
@@ -473,7 +473,7 @@ impl PoolOp {
     ///
     /// The distinction matters only when there is no time to walk in: a query that can be answered
     /// from the cache costs nothing and should be, while one that has to walk and cannot finish
-    /// produces a truncated snapshot that win-kexp discards rather than caches — so it is work for
+    /// produces a truncated snapshot that dbgscope discards rather than caches — so it is work for
     /// nobody, twice over. The worker refuses that one instead of doing it.
     pub fn refreshes(&self) -> bool {
         match self {
@@ -614,7 +614,7 @@ mod tests {
     /// Checked against the serialized form rather than against a second list, because that is the
     /// one thing a hand-written `match` cannot get out of step with: the field is either in the
     /// JSON this op crosses the pipe as, or it is not. `Pool` is the reason — it reached the worker
-    /// with no patience at all, and the walk took win-kexp's 120s default however long its caller
+    /// with no patience at all, and the walk took dbgscope's 120s default however long its caller
     /// was actually willing to wait ([#75](https://github.com/glslang/windbg-mcp/issues/75)).
     #[test]
     fn an_op_that_carries_a_deadline_hands_it_to_the_pump() {
