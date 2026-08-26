@@ -2718,9 +2718,30 @@ argument that waved the exposure through does not survive it. (A review found th
 deployment split was missed until it was pointed out, which is what stating a bound without naming
 where it holds costs.)
 
-**There is no fix inside this design.** A pipe this server does not create is a DACL it cannot set.
-`cdb`'s own `password=` is not one either — it would sit on a command line every local user can
-read. Closing it means hosting the engine ourselves instead of in `cdb`: an `--engine-worker` built
+**A token is available, and whether it is worth adding turns on one unmeasured fact.** DbgEng's
+transports take one: `-server npipe:pipe=X,password=P` "requires a client to supply the specified
+password in order to connect", up to twelve alphanumeric characters — the listener's shape, smaller.
+`hidden` is already passed, and is not access control: it only keeps the server out of the list
+*Searching for Debugging Servers* enumerates.
+
+What decides the password's value is **whether an unprivileged local user can read another
+account's command line**, because that is where the secret would have to live — `cdb` takes it no
+other way. If they can, it buys nothing against precisely the attacker this item is about; if they
+cannot, it closes the hole. Measuring it needs a second account, so it has not been established
+here, and adding the token before establishing it would be security by assumption. The documented
+alternatives that encrypt the password, `spipe` and `ssl`, both require a certificate
+(`certuser=`/`machuser=`), so neither is a drop-in.
+
+**And the exposure itself is unmeasured, in the other direction.** The default descriptor grants
+Everyone *read*; driving a debug session needs read **and** write, and each client gets its own
+pipe instance, so one connection cannot eavesdrop on another. Whether an unprivileged user can do
+anything at all with this pipe is therefore an open question — a review asserted the exposure and
+this item accepted it, and neither established it. **Measure that before designing anything**: if
+the answer is "nothing", the token is moot and this whole item shrinks to a documentation note.
+
+**If it is real, there is no fix inside this design.** A pipe this server does not create is a DACL
+it cannot set. Closing it means hosting the engine ourselves instead of in `cdb`: an
+`--engine-worker` built
 for `i686-pc-windows-msvc`, talking the inherited-handle protocol this server already uses, with no
 named pipe anywhere. That was the alternative weighed in
 [#234](https://github.com/glslang/windbg-mcp/issues/234) and set aside because it needs a second
