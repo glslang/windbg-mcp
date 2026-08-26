@@ -39,8 +39,18 @@ binary does carry a full PE version resource, which is the other cause Microsoft
 detection on its own binaries, but the metadata is the cheap half rather than the fix
 ([`FOLLOWUPS.md`](../FOLLOWUPS.md) item 50 is the certificate decision that remains).
 
-So if a release is reported as quarantined, the two things to do are to point the reporter at
-[`skills/windbg-debugging/setup.md`](../skills/windbg-debugging/setup.md)'s note — verify the
-SHA-256 and the attestation *first*, since those answer a question the verdict does not — and to
-submit the artifact to [Microsoft's file submission portal](https://www.microsoft.com/wdsi/filesubmission)
-as a false positive. That submission is per artifact, so a new release needs a new one.
+So if a release is reported as quarantined, the fix is a **developer submission**, and it is the
+maintainer's to make rather than the reporter's. At
+[Microsoft's file submission portal](https://www.microsoft.com/wdsi/filesubmission), submit the
+artifact as a **software developer** rather than as a customer: that route runs automated analysis
+against the file and, for a clean one, clears the detection for every machine rather than for the
+one that reported it — usually within hours, though nothing promises a turnaround. Point the
+reporter at [`skills/windbg-debugging/setup.md`](../skills/windbg-debugging/setup.md)'s note
+meanwhile: verify the SHA-256 and the attestation, and leave the file in quarantine until the
+submission is answered.
+
+Two things about that. It is **per artifact**, so every release needs its own — and the release
+before it having been cleared says nothing, since an `!ml` verdict is scored on the file in front of
+it. And it is the step that gets *shorter* once the binary is signed: a signature is a stable
+identity for the reputation to attach to, where an unsigned build starts from nothing each time.
+Worth doing pre-emptively on a release rather than waiting for the first report.

@@ -2808,20 +2808,31 @@ question `serverInfo.version` does. Four things that entry did not see:
 
 **What is left, and it needs a decision rather than a patch:**
 
-- **Authenticode signing** in `release.yml`, which needs a certificate. Azure Trusted Signing is the
-  CI-friendly route and SignPath has a free tier for open source; an EV certificate earns SmartScreen
-  reputation at once where an OV one accumulates it. Worth stating plainly that signing **does not
-  guarantee** an `!ml` detection goes away — Microsoft's own issue files it under a later tier than
-  the metadata — but it is what the reputation systems above Defender actually read, and it is the
-  fix for the SmartScreen "unknown publisher" prompt regardless. Note what the release *does* carry
-  and why it does not help here: `release.yml` produces a Sigstore build-provenance attestation,
-  which is a supply-chain claim a user verifies deliberately with `gh attestation verify`. Nothing
-  on the machine reads it.
-- **Submitting the current release for false-positive review** at Microsoft's file submission
-  portal. Free, and it is what `microsoft/apm#487` does between releases — but it is a per-release
-  human action with an account behind it, so it belongs in the release checklist rather than in a
-  workflow. `skills/windbg-debugging/setup.md` now tells a user who hits this what to verify first
-  and points at the same portal.
+- **A per-release developer submission** to Microsoft's file submission portal, which is what to do
+  *now* because it needs no certificate and costs nothing. Submitting as a **software developer**
+  rather than as a customer runs automated analysis and clears a clean file for every machine rather
+  than for the one that reported it. It is per artifact — the previous release having been cleared
+  says nothing about the next, since an `!ml` verdict is scored on the file in front of it — and it
+  is a human action with an account behind it, so it belongs in `docs/releasing.md` (where it now
+  is) rather than in a workflow.
+- **Authenticode signing** in `release.yml`, which is the standing fix and the part that needs a
+  decision. Two things about it are easy to get backwards. It **does not guarantee** an `!ml`
+  detection goes away — Microsoft's own issue files signing under a later tier than the metadata —
+  and it is not a prerequisite for the submission above; what it buys is a *stable identity for
+  reputation to attach to*, so the submission stops starting from nothing each release, plus the fix
+  for SmartScreen's "unknown publisher" prompt, which nothing else addresses. And **it need not be
+  expensive**, which is the assumption worth checking before deferring it again: SignPath's
+  Foundation programme signs open-source projects for free and is the obvious first ask here; Azure
+  Trusted Signing is the CI-friendly route at roughly ten dollars a month, gated on an identity
+  check rather than on price; Certum's open-source certificates are around a hundred euros for
+  several years. Only **EV** — the one that earns SmartScreen reputation immediately rather than
+  accumulating it — is genuinely a few hundred a year. Prices move; treat these as the shape of the
+  choice, not as quotes. Note also what the release *does* carry and why it does not help here:
+  `release.yml` produces a Sigstore build-provenance attestation, which is a supply-chain claim a
+  user verifies deliberately with `gh attestation verify`. Nothing on the machine reads it, and it
+  establishes provenance rather than benignity — a compromised dependency or runner would be
+  attested just as faithfully, which is why `skills/windbg-debugging/setup.md` no longer treats a
+  verified attestation as grounds to restore a quarantined file.
 
 **Where it picks up.** The *Build & publish binary* job in `.github/workflows/release.yml`, and
 [`docs/releasing.md`](./docs/releasing.md) if the submission becomes a step.

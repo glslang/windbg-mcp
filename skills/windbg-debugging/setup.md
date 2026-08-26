@@ -138,11 +138,17 @@ a machine-learning score rather than a signature match, so the same file lands e
 line on different days, and it is a known shape for a small unsigned Windows executable —
 Microsoft's own shipped binaries have drawn the same verdict. The release is **not** Authenticode
 signed today; what it does carry is a SHA-256 published beside it and the Sigstore build-provenance
-attestation the block above verifies, which together say the file is the one this repo's workflow
-built. Verify those first — they answer a question a scanner's verdict does not — then restore the
-file from Defender's *Protection history* and add an exclusion for the directory you extracted it
-into, or [submit it to Microsoft](https://www.microsoft.com/wdsi/filesubmission) as a false
-positive. Do not simply disable Defender.
+attestation the block above verifies.
+
+Verify both — but be clear about what they settle. They establish **provenance**: that this file is
+the one this repo's release workflow built, unmodified. They do **not** establish that it is benign,
+because a compromised dependency, workflow or runner would be attested exactly as faithfully. So a
+verdict that survives them is not thereby a false positive, and the right next step is to have it
+adjudicated rather than to wave it through:
+[submit the file to Microsoft](https://www.microsoft.com/wdsi/filesubmission) and leave it in
+quarantine until they answer, or inspect it yourself. Restoring it and excluding the directory you
+extracted it into would run the flagged file on the strength of a check that does not cover this,
+and leave that directory unscanned for everything written there afterwards. Do not disable Defender.
 
 ### Option B — build from source
 
