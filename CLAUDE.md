@@ -107,10 +107,6 @@ PR still needs `gh pr merge --admin`. In this harness that call is refused by th
 classifier — so **the human merges**, and an agent's job ends at "green and waiting". Plan the two
 PRs around that: dbgscope first, then repoint and re-verify.
 
-**dbgscope's `cargo clippy --all-targets -- -D warnings` fails on ARM64 with 4 pre-existing errors**
-(`shellcode.rs`, `process.rs` — ARM64-only paths its x64 CI never lints). Check them against `main`
-before assuming they are yours.
-
 ## Local verification (no session restart needed)
 
 For a compile/behavior check without touching the locked release exe, use the **dev profile**
