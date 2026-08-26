@@ -603,7 +603,10 @@ the engine locates with `nt`'s symbols. That symptom was read as an ARM64 engine
 while (issue #142); it is not one, and an engine with symbols reads x64 and ARM64 dumps alike. It is **not** store-package-only, which
 this repo believed for a while: Visual Studio Build Tools ships it, including an ARM64 build, at
 `…\BuildTools\DIA SDK\bin\arm64\msdia140.dll`. Copy it next to the exe (`target\release`, and
-`target\debug` for the smoke tiers). **Warm the cache once** afterwards — attach and `.reload /f nt`
+`target\debug` for the smoke tiers — **and `target\debug\deps` if a *unit* test loads the engine**,
+which is where libtest's binaries actually run from; this file said `target\debug` alone until a
+2026-08-26 test met System32's engine and failed with an error about something else entirely).
+**Warm the cache once** afterwards — attach and `.reload /f nt`
 — because the first fetch takes minutes and everything around it times out, which reads convincingly
 as the parser having made things worse.
 
@@ -685,6 +688,59 @@ to a breakpoint on ARM64 and to *process exit* on x64 — where `cmd` opens `pin
 back as `Catastrophic failure (0x8000FFFF)`, which is pre-existing (measured against both waits)
 and is `FOLLOWUPS.md` item 48. So a launch test asserts with a **step**, which completes on the
 next instruction on every architecture, unless the target's lifetime is what it is about.
+
+## An engine in another process (`src/dump.rs`, `src/enginehost.rs`)
+
+A 32-bit .NET dump cannot be read from this server's own process, and the reason is not a missing
+DLL. An extension is loaded into the debugger's process, so its architecture is the *host's*: the
+32-bit `sos.dll` will not load into an x64 host (`0n193`), and the 64-bit one loads and then fails
+on the target (`Failed to load data access DLL, 0x80004005`) because `mscordacwks` is paired to the
+**target's** architecture as well as the host's. Measured both ways — there is no in-process
+arrangement, which is why the engine moves rather than the extension
+([#234](https://github.com/glslang/windbg-mcp/issues/234)). It is also what WinDbg does; its
+package ships `EngHost.exe` under `amd64\` *and* `x86\`.
+
+**The decision has to precede the engine, not follow it.** `GetEffectiveProcessorType` answers
+authoritatively but only once a session exists, in a process whose architecture is by then fixed —
+the very thing being chosen. So `src/dump.rs` reads the architecture out of the minidump header
+before anything opens it. The same constraint rules out swapping the engine later: `worker.rs`
+takes `INTERRUPT` from the engine once, into a `OnceLock`, so an engine replaced mid-session leaves
+`interrupt` pointing at a dead one.
+
+**It answers for `MDMP` only, and that is the whole format.** Every user-mode capture on Windows
+goes through `MiniDumpWriteDump` — procdump, WER, Task Manager, DebugDiag, VS, `dotnet-dump` —
+verified against three independent writers. A kernel dump is `PAGEDU64` and reads as `Other`, which
+is right: there is no CLR in one, and the x64 engine reads x86 and ARM64 kernel dumps alike.
+`MiniDumpReadDumpStream` is the documented API for this and was considered; it needs a mapping and
+`unsafe` to read two bytes at a fixed ABI offset, and it still cannot distinguish "not a minidump"
+from "no such stream", so the signature check stays hand-written either way. Reach for it if this
+ever needs the module list.
+
+**Three things bite in `enginehost.rs`.** The x86 payload **cannot sit beside `windbg-mcp.exe`** —
+the loader searches an executable's own directory first, so an x86 `dbgeng.dll` next to the bundled
+x64 one is found by the wrong process; hence an `x86\` subdirectory, which is the package's own
+layout. **Both ends must come from the same package**: a client engine older than the host's is
+refused with `0x8007053D`, *"The server is currently disabled"*, naming neither end. And the search
+never falls back to another architecture, unlike `ttd::find_ttd`'s — an x64 `cdb.exe` cannot load
+the extension the caller came for, so a fallback would defeat the point rather than degrade
+gracefully.
+
+**Teardown is a kill, and that is deliberate.** A `cdb -server` whose transport peer has gone spins
+on the broken pipe without bound — 32,089 lines of `cdb: Could not write to pipe, 1450` in one
+measured run, which hung the whole VM and needed a hypervisor reset. So the host must never outlive
+its client, and a graceful `qq` has to be driven through the engine that has by then stopped
+answering. What makes killing safe here is that the target is a **dump**: no live process to orphan,
+no kernel to leave halted. That stops being true the day this points at a live target, and so does
+the pipe's security — it is reachable by other local users, which for a dump is bounded only
+because anyone who can open it could read the dump file anyway.
+
+**One typed call does not cross the transport**: `IDebugAdvanced2::GetSymbolInformation`, so
+`module_pdb` fails with `E_INVALIDARG` and `modules` rows carry no PDB identity on a remote session.
+Confirmed against an in-process engine on the same target *and* with both ends on the same
+architecture, so it is the transport rather than a struct size the two ends disagree about —
+`E_INVALIDARG` invites that second reading and it is wrong. `with_pdb_identity` already drops the
+field rather than failing the listing, so nothing else has to change; the fix worth making, if one
+is, is to parse GUID/age out of the image debug directory, which would close it for every transport.
 
 ## Adding a tool (`src/toolset.rs`)
 

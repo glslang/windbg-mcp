@@ -220,6 +220,52 @@ Copy-Item "$wd\winxp\kdexts.dll" "$dst\winxp" -Force   # !drvobj/!devobj/!irp �
   (Note it lives in `winxp\`, not `winext\`, and the engine already searches a `WINXP` subdir.)
 - `cargo clean` (when building from source) wipes `target\`, so re-copy after one.
 
+### 32-bit .NET dumps need an x86 engine host
+
+Only for **32-bit .NET Framework** dumps — a 32-bit process captured by 32-bit tooling, which is
+what `procdump.exe -ma` (as opposed to `procdump64.exe -ma`) produces. Native analysis of such a
+dump — stacks, modules, memory — has always worked on the x64 engine and still does. What does not
+is SOS, and no amount of configuration fixes that in one process:
+
+- the **32-bit** `sos.dll` cannot be loaded by an x64 debugger at all — `Win32 error 0n193`;
+- the **64-bit** one loads and then refuses the target — `Failed to load data access DLL,
+  0x80004005` — because `mscordacwks` is paired to the *target's* architecture as well as the
+  host's.
+
+An extension DLL is loaded into the debugger's own process, so the only way to load one that
+matches the target is to put the engine in a process that matches it too. Copy the package's
+**`x86`** payload into an `x86\` subdirectory beside `windbg-mcp.exe`:
+
+```pwsh
+# $dst is the same folder as the copy block above — the one that holds windbg-mcp.exe.
+$dst = "<folder that holds windbg-mcp.exe>"
+$wd86 = (Get-AppxPackage Microsoft.WinDbg).InstallLocation + "\x86"
+New-Item "$dst\x86" -ItemType Directory -Force | Out-Null
+Copy-Item "$wd86\cdb.exe","$wd86\dbgeng.dll","$wd86\dbghelp.dll","$wd86\dbgcore.dll",`
+          "$wd86\dbgmodel.dll","$wd86\symsrv.dll","$wd86\msdia140.dll" "$dst\x86" -Force
+Copy-Item "$wd86\winext" "$dst\x86\winext" -Recurse -Force
+```
+
+Three things about this differ from the copy block above, and each of them is a way to get it
+wrong:
+
+- **It must be a subdirectory, never beside `windbg-mcp.exe` itself.** The loader searches an
+  executable's own directory first, so an x86 `dbgeng.dll` dropped next to the x64 one would be
+  found by the wrong process and neither would work. The package's own `amd64\` / `x86\` layout is
+  this same rule.
+- **`$arch` is *not* matched to `windbg-mcp.exe` here.** Everywhere else in this document the rule
+  is "match the DLLs to the binary that loads them", and that still holds — these DLLs are loaded
+  by `cdb.exe` from the same directory, not by `windbg-mcp.exe`. This payload is x86 because the
+  *target* is.
+- **Both ends must come from the same package.** The server connects to this host with its own
+  `dbgeng.dll`, and a client older than the host is refused with `0x8007053D`, *"The server is
+  currently disabled"* — an error that names neither end and reads like a permissions problem. If
+  you copied the engine above from one source, copy this from that same one.
+
+`cdb.exe` is the host, so the SDK's *Debugging Tools for Windows* works as a source too
+(`C:\Program Files (x86)\Windows Kits\10\Debuggers\x86`). The server looks beside its own
+executable first, then the SDK, then the store package.
+
 ### When the store package will not install
 
 `Get-AppxPackage Microsoft.WinDbg` returning nothing is not always a matter of installing it. MSIX
