@@ -133,3 +133,12 @@
   What you get back is the debugger's output plus a line naming where the target ended up — there
   is no structured `stopped_at`, no typed `timed_out`, and a step prints nothing of its own, so
   that line is the only position in the answer. The typed tools are still the better call.
+- **A target that runs to completion ends the session, and that is not a failure.** A `go` (or a
+  step, or a raw `g`) whose debuggee exits reports the ending — `target_gone` in the structured
+  result, and a sentence beside it — carrying whatever the run printed on the way there, which is
+  the only copy: the command prints its own echo, while module loads, a breakpoint banner and an
+  embedded script's output all arrive during the wait. `.detach`, `q` and `qd` end it the same way.
+  Afterwards every call on that session is refused with one message and the category
+  `stale_session`; `end_session` releases it, and opening again gets a fresh target. There is no
+  way to reopen a target inside an existing session, and `session_status` still reports such a
+  session as `open`.

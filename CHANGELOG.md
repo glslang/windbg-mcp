@@ -42,6 +42,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A target that ends during a resume is an ending, not a catastrophe** (issue #242, and
+  [`FOLLOWUPS.md`](./FOLLOWUPS.md) item 48, which had held the question open since #226). A `go`, a
+  step or a raw `execute 'g'` whose debuggee ran to completion came back
+  `Debug command failed: Catastrophic failure (0x8000FFFF)` — the raw `E_UNEXPECTED` DbgEng answers
+  once the wait ends with no debuggee left — reported unchanged for a program exiting normally, and
+  the output the run had captured was discarded with it. That output is the only copy there will be:
+  the command prints its own echo, while the module loads, the breakpoint banner and anything an
+  embedded `bp X "…; g"` script printed all arrive during the wait. The ending is now an outcome
+  carrying its text, on both halves of the result — `target_gone` on the stop report, a sentence
+  beside it, and `run_to_address` gaining a `target_gone` verdict that is deliberately not a
+  timeout, since the address was never ruled out.
+
+  The session then said so, where before it half-answered: `.echo` and `.lastevent` kept working
+  while `k`, `r` and `registers` failed `0x80040205`, which from a caller's side is
+  indistinguishable from #226's wedged session and needs the opposite response. Every tool now
+  answers one refusal naming `end_session`, categorised `stale_session` rather than `debugger`
+  because no change to what is asked will help. `.detach`, `q` and `qd` take the target away
+  themselves and are reported the same way — read from the engine rather than from the command's
+  name, since `.kill` is measured *not* to be in that group: it leaves a target that still reads a
+  stack and goes away on the next resume.
+
+- **Execution control with no debuggee no longer takes the worker down**, which is the same defect's
+  other half and was a `STATUS_ACCESS_VIOLATION` inside DbgEng — a structured exception, so no
+  `catch_unwind` traps it. `execute 'g'` on a session whose target had exited hit it; so does a raw
+  `g` on an engine that never had a target, which is what says the trigger is the missing debuggee
+  rather than the departure. dbgscope now refuses every road into `Execute` when the engine holds
+  none. It cannot be narrowed to text that looks like execution control — an alias, a `.if` branch
+  and `dx …ExecuteCommand("g")` all reach it — so the few engine-level commands that do work without
+  a target (`version`, `.echo`, `.sympath`) are refused too.
+
 - **`ttd_calls` and `ttd_memory` return the fields their descriptions promise** (issue #231). Both
   ran `dx` without a recursion depth, and `dx` renders one level unless told otherwise:
   `TTD.Calls` and `TTD.Memory` return *containers of records*, so `-r1` was exactly one level short

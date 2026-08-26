@@ -4439,14 +4439,14 @@ fn a_raw_execution_control_command_moves_the_target_instead_of_wedging_the_sessi
     // And the same property through the **typed** surface, which is what a caller reaches for
     // next and what the issue reports as broken.
     //
-    // A step rather than `go`, and that is a measurement rather than a preference. `go` here runs
-    // until something stops the target — and on x64 nothing does: `cmd.exe` calls `NtCreateFile`
-    // while spawning `ping` and then waits thirty seconds for it, so the `go` outlives the target
-    // and comes back `Catastrophic failure (0x8000FFFF)`. That is what DbgEng answers for a
-    // debuggee that exited during the wait, on this branch and equally with the finite wait
-    // restored (measured both ways) — a pre-existing rough edge, `FOLLOWUPS.md` item 48, and
-    // nothing this test is about. A step always completes on the next instruction, on every
-    // architecture, and is execution control just as much as `go` is.
+    // A step rather than `go`, because the two architectures disagree about what a `go` does here:
+    // on x64 nothing stops the target — `cmd.exe` calls `NtCreateFile` while spawning `ping` and
+    // then waits thirty seconds for it — so the `go` outlives the target, while on ARM64 it stops
+    // at the breakpoint. That ending is now reported properly (issue #242,
+    // `a_target_that_ends_during_a_resume_is_an_ending_and_the_session_says_so`, which is about
+    // it); it used to be `Catastrophic failure (0x8000FFFF)`. Either way it is not what *this*
+    // test is about, and a step completes on the next instruction on every architecture while
+    // being execution control just as much as `go` is.
     //
     // Not `tool_data`: its refusal quotes the debugger's error and nothing around it, and what
     // makes a failure here readable is the state the three commands above left behind.
