@@ -37,9 +37,10 @@ server build it ran against (both 2026-08-25, and **both have since landed**, th
 items 47–48 from fixing [#226](https://github.com/glslang/windbg-mcp/issues/226) — where making
 every target take the bounded wait left one target type nobody on this bench can measure, and where
 an x64 CI failure turned out to be a pre-existing answer to an ordinary outcome (2026-08-25), and
-item 49 from moving the engine into a process of the target's architecture, so a 32-bit .NET dump
-can load the SOS no in-process arrangement can
-([#234](https://github.com/glslang/windbg-mcp/issues/234), 2026-08-26).
+items 49–50 from moving the engine into a process of the target's architecture, so a 32-bit .NET
+dump can load the SOS no in-process arrangement can
+([#234](https://github.com/glslang/windbg-mcp/issues/234), 2026-08-26) — and, while testing that,
+from Windows Defender quarantining this project's own binary.
 Each item notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -2675,42 +2676,90 @@ one line: launch `cmd.exe /c exit`, `go`, read the answer.
 `a_raw_execution_control_command_moves_the_target_instead_of_wedging_the_session`, which asserts
 with a step rather than a `go` and says why.
 
-## 49. [windbg-mcp] The x86 engine host is built but not yet routed to
+## 49. [windbg-mcp] What the x86 engine host left open — the routing itself is **done** (2026-08-26)
 
-**What it is.** `src/dump.rs` reads a dump's architecture from its header and `src/enginehost.rs`
-runs a `cdb.exe` of a chosen architecture as a debugging server, and dbgscope's
-`DebugEngine::connect` drives one. All three are tested — the host module end to end, against a
-real `procdump -ma` capture, loading the 32-bit `sos.dll` and reading `!threads`. **Nothing calls
-any of it**, so the behaviour a caller sees is unchanged and the modules are dead code.
+**What landed.** `src/dump.rs` reads a dump's architecture from its header, `src/enginehost.rs` runs
+a `cdb.exe` of that architecture as a debugging server, and dbgscope's `DebugEngine::connect` drives
+it. A 32-bit .NET dump now loads its own SOS, asserted through the tool surface by the *32-bit
+managed dump* tier in [`docs/smoke-test.md`](./docs/smoke-test.md). What follows is what it did not
+close.
 
-**Why it was deferred.** The wiring crosses the supervisor/worker seam and is where the design
-decisions are, so it is worth landing as its own change rather than tacked onto the mechanism. The
-mechanism is the part that needed proving, and it is proved.
+**`modules` rows carry no `pdb` on a remote session.**
+`IDebugAdvanced2::GetSymbolInformation` does not cross DbgEng's remote transport — measured against
+an in-process engine on the same target *and* with both ends on the same architecture, so it is the
+transport rather than a struct size the two ends disagree about, which is what its `E_INVALIDARG`
+invites you to think. `with_pdb_identity` already drops the field rather than failing the listing,
+so nothing is broken; what is lost is the GUID/age coordinate on exactly the sessions this feature
+creates. **What would close it:** parse the PDB signature out of the image's own debug directory
+rather than asking dbghelp — `read_memory` marshals fine, this repo already reads PE structures, and
+it would close the gap for every transport instead of special-casing this one.
 
-**What would close it.**
+**The fixture is supplied, not made.** The tier takes `WINDBG_MCP_X86_DUMP` and stands down without
+one, so CI never runs it and a machine without a 32-bit dump proves nothing. The TTD tier solved the
+same problem by **recording its own target**, and the ingredients are here: `csc.exe` ships on every
+stock Windows, so the tier could compile a trivial .NET program, run it, dump it with the 32-bit
+`comsvcs.dll MiniDump` (no procdump needed — measured to produce the same `MDMP`), and open that.
+Deferred because it is a second, independent piece of machinery and the routing needed proving
+first.
 
-- `Sessions::open` (`src/engine.rs`) already holds the opener op, and therefore the dump path,
-  before it calls `spawn` — so the architecture is read there and the decision travels to the
-  worker at spawn time. It cannot be made later: `worker.rs` takes `INTERRUPT` from the engine into
-  a `OnceLock`, so an engine swapped mid-session leaves `interrupt` pointing at a dead one.
-- `worker.rs` builds its engine with `connect` rather than `DebugCreate` when told to, and then
-  **must not** run `open_dump` — the host opened the target when it was started with `-z`.
-- The fallback has to be **loud**. An x86 dump opens today on the x64 worker and native analysis
-  works; where no x86 `cdb.exe` is found that must keep working, with the summary saying SOS is
-  unavailable and why. Silently degrading is the failure mode to avoid, and so is turning an open
-  that works today into one that fails.
-- `modules` rows carry no `pdb` on a remote session, because
-  `IDebugAdvanced2::GetSymbolInformation` does not cross the transport (measured; see `CLAUDE.md`).
-  `with_pdb_identity` already drops the field rather than failing, so this is a documentation
-  question unless the identity is parsed out of the image debug directory instead — which would
-  close it for every transport, not just this one.
-- A smoke tier, once there is something to drive: the shape is the TTD tier's, because the fixture
-  cannot be checked in. A full-memory 32-bit managed dump is 58 MB against a 12 MB repository, and
-  `csc.exe` ships on every stock Windows — so the tier compiles its own target, runs it, dumps it,
-  and opens it. `docs/smoke-test.md` gets its entry then, not before.
+**The pipe is reachable by other local users.** Bounded today only because the target is a dump —
+anyone who can open the pipe could read the dump file anyway — and because the teardown is a kill,
+which is safe for a dump and would not be for a live process or a halted kernel. **Both stop being
+true** if this is ever pointed at a live 32-bit target, which is the obvious next ask (a WoW64
+`attach_process`). Neither the transport's security nor the teardown should be inherited unexamined
+into that.
 
-**Where it picks up.** `src/dump.rs` and `src/enginehost.rs` (both complete, with the gated tests
-`a_real_x86_user_minidump_reads_as_x86` and `a_real_x86_host_serves_a_managed_dump`, which take
-`WINDBG_MCP_X86_DUMP`), `Sessions::open` and `spawn_worker` in `src/engine.rs`, `engine_thread` and
-the `EngineOp::OpenDump` arm in `src/worker.rs`. The operator half is already written:
-*32-bit .NET dumps need an x86 engine host* in `skills/windbg-debugging/setup.md`.
+**Untested over the transport:** execution control, breakpoint arming and event waits — a dump
+cannot exercise them — and the user-mode heap walker, which is in scope for x86 dumps and is
+`ReadVirtual`-heavy, so likely correct but chatty over a pipe.
+
+**Where it picks up.** `src/dump.rs`, `src/enginehost.rs`, `build_engine` in `src/worker.rs`, and
+`dbgscope::dbgeng::DebugEngine::connect`, whose doc comment records both transport quirks. The
+operator half is *32-bit .NET dumps need an x86 engine host* in
+`skills/windbg-debugging/setup.md`.
+
+## 50. [windbg-mcp] The released binary is unsigned and carries no PE metadata, and Defender acts on that
+
+**What happened.** On 2026-08-26 Windows Defender quarantined a freshly built
+`target\debug\windbg-mcp.exe` as `Trojan:Win32/Bearfoos.B!ml`, blocking every smoke test that
+spawns the server (`os error 225`). Three detections in one minute, the flagged artefact being the
+executable each time — no dump or other file appears in any detection's `Resources`. It stopped
+reproducing on the next rebuild without any change to the code, which is what an `!ml` verdict does:
+it is a machine-learning score with a cloud lookup behind it, not a signature match, so the same
+source can land either side of the line.
+
+**Why this is not a local curiosity.** The released binary has the same profile as the one that was
+quarantined, so a user downloading the release zip can hit it, and nothing in the project mitigates
+it today. `microsoft/apm#487` is the **same detection name on Microsoft's own shipped binary**, and
+the causes it lists that apply here are both true of this project:
+
+- **No PE version resource at all** — measured: `FileVersion`, `CompanyName` and `ProductName` are
+  all empty on both the debug and release binaries. Rust embeds none by default.
+- **Unsigned.** `release.yml` produces a Sigstore build-provenance attestation, which is a supply
+  chain claim a user verifies deliberately with `gh attestation verify`. It is not Authenticode, and
+  nothing on the machine reads it — so it does nothing for Defender or for SmartScreen's "unknown
+  publisher" prompt.
+
+(Its other two causes — UPX compression and a stock PyInstaller bootloader — do not apply.)
+
+**What would close it**, cheapest first:
+
+- **A PE version resource**, via a `winresource` build-dependency in `build.rs`. Free, immediate,
+  and it also makes Explorer's properties dialog useful. **Careful with `INPUTS`**: `build.rs`'s
+  watch list and its dirty check are deliberately one const, because emitting any `rerun-if-changed`
+  replaces Cargo's default of watching the whole package — a resource input added to one and not the
+  other makes clean builds disagree about what is dirty.
+- **Submit the current release for false-positive review** at Microsoft's file submission portal.
+  Free, and it is what `microsoft/apm#487` does between releases.
+- **Authenticode signing** in `release.yml`. This is the part that needs a decision rather than a
+  patch, because it needs a certificate: Azure Trusted Signing is the CI-friendly route and
+  SignPath has a free tier for open source; an EV certificate earns SmartScreen reputation at once
+  where an OV one accumulates it. Worth stating plainly that signing **does not guarantee** an `!ml`
+  detection goes away — Microsoft's own issue files it under a later tier than the metadata — but
+  it is what the reputation systems above Defender actually read, and it is the fix for the
+  SmartScreen prompt regardless.
+
+**Where it picks up.** `build.rs` (and its `INPUTS` const), the *Build & publish binary* job in
+`.github/workflows/release.yml`, and `skills/windbg-debugging/setup.md`, whose Option A download
+block already tells a user to `Unblock-File` the zip and would be where any "if Defender quarantines
+it" note belongs.

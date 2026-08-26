@@ -35,6 +35,7 @@ all.
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a live kernel target you can freeze — KDNET, or serial | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
 | **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
 | **TTD** | `WINDBG_MCP_SMOKE_TTD=1` | `TTD.exe`, **elevation**, and the WinDbg store engine to replay what it records | that `record_trace` records the program it was given and reports a finished recording as one, and that a TTD query returns records rather than bare indices |
+| **32-bit managed dump** | `WINDBG_MCP_X86_DUMP=<path>` | a 32-bit .NET dump you supply, and an `x86` `cdb.exe` | that such a dump is routed to an engine of *its* architecture, so its 32-bit SOS loads — which this server's own engine cannot do at all |
 | **Live (other)** | manual | a test driver on a kernel target | see [Manual checklist](#manual-checklist) |
 
 The protocol tier rides `cargo test`, so CI already runs it. The debugger tier is opt-in
@@ -1140,6 +1141,39 @@ green tier means anything: `-r1` for the depth (both queries blank, and `ttd_eve
 assertion that fires), the unconditional early-exit failure, `.arg(target)` for the whole command
 line, and the probe against this process's directory — which fails with `` `a01.run` is not a
 recording of `a program.exe` ``, the wrong-program recording exactly as it was first measured.
+
+## The 32-bit managed dump tier
+
+```pwsh
+$env:WINDBG_MCP_X86_DUMP = "C:\path\to\x86-managed.dmp"
+cargo test --test mcp_smoke -- --nocapture a_32_bit_managed_dump
+```
+
+One test, and it is the only one that asserts something **this server's own engine cannot do**. An
+extension DLL is loaded into the debugger's process, so a 32-bit `sos.dll` cannot be loaded by the
+x64 engine (`Win32 error 0n193`) and the 64-bit one refuses a 32-bit CLR — the data access DLL
+behind it is paired to the target's architecture too. So `!sos.threads` answering is not a check
+that SOS works; it is proof that the engine holding this dump is in another process
+([#234](https://github.com/glslang/windbg-mcp/issues/234)).
+
+Gated on a **path rather than a flag**, because the fixture is supplied rather than checked in: a
+full-memory capture of even a trivial .NET process is tens of megabytes, several times this whole
+repository. Make one with the **32-bit** `procdump.exe -ma <pid> <file>` against any .NET Framework
+process — the bitness of procdump is what decides whether the capture is a 32-bit one or a WoW64
+one seen from x64, and only the former is this tier's subject. Both were measured: the 32-bit
+capture reads as x86 and the 64-bit capture of the *same process* reads as x64, which is exactly
+the discrimination the routing turns on.
+
+Two assertions, and the second is the one that took a wrong answer to find:
+
+- **No `limitation` on the summary.** The fallback is deliberately loud — a host with no x86
+  `cdb.exe` still opens the dump, because native analysis of it works and always has, and says in
+  the result that SOS is unreachable. So a run on such a host fails here rather than passing
+  quietly, which is the whole point of asserting on it.
+- **`!sos.threads`, module-qualified.** A bare `!threads` resolves to `ext.dll`'s own native thread
+  table, which `open_dump` has already loaded and which answers on *any* engine — the first version
+  of this test "failed" by printing a perfectly good one. Same trap as `!analyze` versus
+  `!ext.analyze -v` elsewhere in this document.
 
 ## Manual checklist
 
