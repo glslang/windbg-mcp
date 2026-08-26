@@ -20,8 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the crate can now carry a version rather than a git revision, and it sheds `goblin`,
   `byte-strings`, its build script and nine `windows` features on the way. The WinDbg extension
   command it exposes is renamed with it: `!win_kexp.poolmap` is `!dbgscope.poolmap`, since that
-  name comes from the cdylib's filename. Entries above this one name `win-kexp` because that is
-  what the crate was called when they were written.
+  name comes from the cdylib's filename. Both crates are also **relicensed from GPL-3.0 to MIT**,
+  which removes a conflict that predates the split and was never deliberate: a GPL library
+  linked into this MIT-distributed binary made the combined work GPL. Entries above this one
+  name `win-kexp` because that is what the crate was called when they were written.
 
 - **The server reports the git revision it was built from**, as semver build metadata on the
   version it already reported: `0.11.0+g1a2b3c4`, and `-dirty.<digest>` where the build inputs
