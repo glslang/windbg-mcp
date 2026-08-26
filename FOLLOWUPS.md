@@ -2670,8 +2670,12 @@ message, and it is why the fix is a guard in dbgscope's primitives rather than a
 `RunToOutcome::TargetGone` in dbgscope, each carrying the run's output;
 `structured::StopReport::target_gone` and `RunToVerdict::TargetGone` here, on both halves of the
 result; and `worker::refuse_when_the_target_is_gone`, so every tool answers one refusal naming
-`end_session` rather than each failing its own way. The session is **not** retired on the
-supervisor's side — see below.
+`end_session` rather than each failing its own way. A `debug_batch` stops there rather than running
+on, with `BatchOutcome::TargetGone` and `SessionAfter::Ended` — reached only because review found
+the ending stopping at every seam below the tool: the raw hatch's pump, the batch's assertion loop,
+the state probe, the transcript and the tool description each had to be told separately, which is
+what a terminal fact costs when it is added to a system that had no notion of one. The session is
+**not** retired on the supervisor's side — see below.
 
 **What is left, and it is deliberate.** `session_status` still reports such a session as `open`.
 Telling the supervisor would need a new `WorkerMessage` and a `SessionState` for it (`Retired`

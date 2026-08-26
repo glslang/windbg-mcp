@@ -70,7 +70,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   after it are not attempted, the `always` block is still attempted (the fail-safe direction: a
   misread ending must not drop cleanup that could have run), and `after` is `ended` rather than
   `detached` — a detached process is still running somewhere, and on a live kernel that is the
-  difference between a machine that is up and one that is not.
+  difference between a machine that is up and one that is not. A step's `eval` assertions are not
+  checked against an engine that has no target either: they are engine calls, and a refused
+  `? (...)` used to read back as a *failed assertion* on a step whose action did exactly what it
+  was asked.
 
   The ending reaches the two channels beside the result as well: `run_to_address`'s tool
   description now names the fourth verdict (an output schema never reaches the model, so a
