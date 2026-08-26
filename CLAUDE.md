@@ -795,7 +795,7 @@ is, is to parse GUID/age out of the image debug directory, which would close it 
 
 Two files, not one. A tool is declared in `src/server.rs` as always, and its name also goes in a
 **group** in `src/toolset.rs` — the table behind `--tools`, which advertises a named subset of the
-surface because 74% of the 67,766-byte tool surface is prose a model needs and cannot be trimmed
+surface because 74% of the 67,873-byte tool surface is prose a model needs and cannot be trimmed
 (`docs/token-budget.md` finding 8).
 
 Forgetting the second half fails in the one direction nothing would notice: the *default* surface
