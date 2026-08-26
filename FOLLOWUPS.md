@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twenty-five clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty-six clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/dbgscope#71, 2026-08-01), items 13–14 from the bounded-command coverage review
@@ -36,7 +36,10 @@ it, and a run can be graded but not *compared*, because nothing records the mode
 server build it ran against (both 2026-08-25, and **both have since landed**, the same day), and
 items 47–48 from fixing [#226](https://github.com/glslang/windbg-mcp/issues/226) — where making
 every target take the bounded wait left one target type nobody on this bench can measure, and where
-an x64 CI failure turned out to be a pre-existing answer to an ordinary outcome (2026-08-25).
+an x64 CI failure turned out to be a pre-existing answer to an ordinary outcome (2026-08-25), and
+item 49 from moving the engine into a process of the target's architecture, so a 32-bit .NET dump
+can load the SOS no in-process arrangement can
+([#234](https://github.com/glslang/windbg-mcp/issues/234), 2026-08-26).
 Each item notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -2671,3 +2674,43 @@ one line: launch `cmd.exe /c exit`, `go`, read the answer.
 `worker::resumed`. The workaround in the meantime is in
 `a_raw_execution_control_command_moves_the_target_instead_of_wedging_the_session`, which asserts
 with a step rather than a `go` and says why.
+
+## 49. [windbg-mcp] The x86 engine host is built but not yet routed to
+
+**What it is.** `src/dump.rs` reads a dump's architecture from its header and `src/enginehost.rs`
+runs a `cdb.exe` of a chosen architecture as a debugging server, and dbgscope's
+`DebugEngine::connect` drives one. All three are tested — the host module end to end, against a
+real `procdump -ma` capture, loading the 32-bit `sos.dll` and reading `!threads`. **Nothing calls
+any of it**, so the behaviour a caller sees is unchanged and the modules are dead code.
+
+**Why it was deferred.** The wiring crosses the supervisor/worker seam and is where the design
+decisions are, so it is worth landing as its own change rather than tacked onto the mechanism. The
+mechanism is the part that needed proving, and it is proved.
+
+**What would close it.**
+
+- `Sessions::open` (`src/engine.rs`) already holds the opener op, and therefore the dump path,
+  before it calls `spawn` — so the architecture is read there and the decision travels to the
+  worker at spawn time. It cannot be made later: `worker.rs` takes `INTERRUPT` from the engine into
+  a `OnceLock`, so an engine swapped mid-session leaves `interrupt` pointing at a dead one.
+- `worker.rs` builds its engine with `connect` rather than `DebugCreate` when told to, and then
+  **must not** run `open_dump` — the host opened the target when it was started with `-z`.
+- The fallback has to be **loud**. An x86 dump opens today on the x64 worker and native analysis
+  works; where no x86 `cdb.exe` is found that must keep working, with the summary saying SOS is
+  unavailable and why. Silently degrading is the failure mode to avoid, and so is turning an open
+  that works today into one that fails.
+- `modules` rows carry no `pdb` on a remote session, because
+  `IDebugAdvanced2::GetSymbolInformation` does not cross the transport (measured; see `CLAUDE.md`).
+  `with_pdb_identity` already drops the field rather than failing, so this is a documentation
+  question unless the identity is parsed out of the image debug directory instead — which would
+  close it for every transport, not just this one.
+- A smoke tier, once there is something to drive: the shape is the TTD tier's, because the fixture
+  cannot be checked in. A full-memory 32-bit managed dump is 58 MB against a 12 MB repository, and
+  `csc.exe` ships on every stock Windows — so the tier compiles its own target, runs it, dumps it,
+  and opens it. `docs/smoke-test.md` gets its entry then, not before.
+
+**Where it picks up.** `src/dump.rs` and `src/enginehost.rs` (both complete, with the gated tests
+`a_real_x86_user_minidump_reads_as_x86` and `a_real_x86_host_serves_a_managed_dump`, which take
+`WINDBG_MCP_X86_DUMP`), `Sessions::open` and `spawn_worker` in `src/engine.rs`, `engine_thread` and
+the `EngineOp::OpenDump` arm in `src/worker.rs`. The operator half is already written:
+*32-bit .NET dumps need an x86 engine host* in `skills/windbg-debugging/setup.md`.
