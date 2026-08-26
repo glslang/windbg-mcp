@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-08-26
+
 ### Fixed
 
 - **`ttd_calls` and `ttd_memory` return the fields their descriptions promise** (issue #231). Both
@@ -2559,7 +2561,8 @@ Initial release, packaged as a single-plugin Claude Code marketplace.
 - Crash-dump `!analyze` support via automatic WinDbg extension DLL loading.
 - Windows CI (format, clippy, build, test) and walkthrough docs with sample dumps.
 
-[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.12.1...HEAD
+[0.12.1]: https://github.com/glslang/windbg-mcp/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/glslang/windbg-mcp/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/glslang/windbg-mcp/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/glslang/windbg-mcp/compare/v0.9.0...v0.10.0
