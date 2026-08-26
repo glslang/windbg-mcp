@@ -10,6 +10,7 @@ crate compiles against stays identical — so the unit tests keep passing and cl
 ```pwsh
 cargo test --test mcp_smoke              # protocol tier (default)
 $env:WINDBG_MCP_SMOKE_DUMP = "1"; cargo test --test mcp_smoke   # + the debugger tier
+$env:WINDBG_MCP_SMOKE_TTD  = "1"; cargo test --test mcp_smoke   # + the TTD tier (elevated)
 ```
 
 It builds and runs against `target/debug`, so it never touches the `target/release` exe a
@@ -33,7 +34,8 @@ all.
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a live kernel target you can freeze — KDNET, or serial | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
 | **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
-| **Live (other)** | manual | TTD engine, elevation, a test driver | see [Manual checklist](#manual-checklist) |
+| **TTD** | `WINDBG_MCP_SMOKE_TTD=1` | `TTD.exe`, **elevation**, and the WinDbg store engine to replay what it records | that `record_trace` records the program it was given and reports a finished recording as one, and that a TTD query returns records rather than bare indices |
+| **Live (other)** | manual | a test driver on a kernel target | see [Manual checklist](#manual-checklist) |
 
 The protocol tier rides `cargo test`, so CI already runs it. The debugger tier is opt-in
 *locally* but runs on every push and PR in CI, as the **Smoke test (debugger tier)** job — it is
@@ -1088,11 +1090,59 @@ are removed by default. If the target is halted or has crashed, cleanup cannot r
 VM, remove the named remote directory if necessary, and treat the transcript's detach warning as
 the primary failure before rerunning.
 
+## The TTD tier
+
+```pwsh
+$env:WINDBG_MCP_SMOKE_TTD = "1"; cargo test --test mcp_smoke -- --nocapture ttd
+```
+
+Four tests, and the tier they belong to exists because **all three of the defects it covers
+shipped** — `ttd_calls` and `ttd_memory` had returned blank rows since the initial commit, and
+`record_trace` could neither pass an argument nor report a short recording as anything but a
+failure. Nothing caught any of it, for a reason that is structural rather than an oversight: a
+`.run` is tens of megabytes, none is checked in, and recording one needs elevation and `TTD.exe`.
+So this is the only tier that **creates its own target** instead of opening a checked-in one.
+
+Gated on `WINDBG_MCP_SMOKE_TTD=1` and deliberately **not** `#[ignore]`d as well, unlike the two
+tiers above it. Those are double-gated because a stale variable costs a wedged VM or a run measured
+in minutes; the worst this does is leave a few tens of MB in the temp directory, and against that
+the rule that matters is the one `launch_tier` states — a gate nothing sets is a gap that stays
+open.
+
+**Elevation and a recorder are the host's business, not the gate's.** Both are read off the
+recorder's own refusal — `TTD.exe not found`, `Administrative privileges`, `0x80070005` — and
+print `SKIPPED`. Every *other* failure fails the test, which is the distinction that keeps the tier
+honest: a helper that treated any error as a skip would pass on a machine where recording is
+broken. Replay is a third stand-down, taken separately: a host can record a trace it cannot open,
+because replay needs the WinDbg store engine beside the binary, and by then the recording half has
+already been asserted.
+
+| Test | Claim | How it is read |
+| --- | --- | --- |
+| `ttd_records_a_target_that_finishes_inside_the_startup_watch_as_complete` | #233 — `hostname.exe` finishes in ~150ms against a 2.5s watch, so it exits *inside* the window, and that is a complete recording rather than a failed start | the message says "recording complete", **and** a non-empty `.run` is in the output directory — two sources for the one fact, because the old bug was a message that contradicted the disk |
+| `ttd_records_the_program_a_target_with_arguments_names` | #232 — `cmd.exe /c dir …` records, instead of TTD looking for a file with that whole name | recording at all (the old behaviour could not), plus the trace being named `cmd*`, since TTD names a trace after the program it launched |
+| `ttd_resolves_a_relative_target_against_the_recorders_working_directory` | the [#235](https://github.com/glslang/windbg-mcp/pull/235) review finding — a relative target is probed where the *recorder* runs, not where the server does | a fixture copied to `<work_dir>\a program.exe` and recorded as `.\a program.exe`; the trace must be named `a program*`, because the defect recorded **`a.exe`** and reported success |
+| `ttd_queries_answer_with_the_fields_they_promise` | #231 — a query returns records, not a column of bare indices | `ttd_events` and `ttd_memory` must render field names (`ModuleLoaded`, `AccessType`, `Value`); the address is a module base, read every time an image is mapped |
+
+**The queries are the two that need no symbols**, on purpose: the fields are then a property of the
+query rather than of what the host can resolve, so the tier does not stand down on a machine with
+no symbol server. That leaves `ttd_calls` — the tool the issue was reported against — asserted
+only by `src/server.rs`'s unit tests on the command it builds, and by hand. It is the deliberate
+gap in this tier, and the [manual checklist](#manual-checklist) carries it.
+
+**Each of the four was checked by putting its defect back**, which is the only evidence that a
+green tier means anything: `-r1` for the depth (both queries blank, and `ttd_events` is the
+assertion that fires), the unconditional early-exit failure, `.arg(target)` for the whole command
+line, and the probe against this process's directory — which fails with `` `a01.run` is not a
+recording of `a program.exe` ``, the wrong-program recording exactly as it was first measured.
+
 ## Manual checklist
 
 Not automated: no runner has a kernel target, a TTD-capable engine, or elevation. Run these by hand
 before a release, or when a change touches the relevant path. Drivers live in
-[`examples/`](../examples/README.md) and need `cargo build --release` first.
+[`examples/`](../examples/README.md) and need `cargo build --release` first. The TTD entry is the
+one that shrank — most of it is now [a tier](#the-ttd-tier), and what stays here is what that tier
+does not reach.
 
 - **Live user-mode** — `examples/test_usermode.ps1`: launch `cmd.exe` under the debugger, break in,
   read registers/modules, set a breakpoint.
@@ -1120,17 +1170,15 @@ before a release, or when a change touches the relevant path. Drivers live in
   `examples/drive_kernel_test.ps1 -Connection "net:port=<n>,key=<w.x.y.z>"`: attach,
   `bp nt!NtCreateFile`, `go` to it, resume, detach. See the KDNET gotchas in `CLAUDE.md` before
   diagnosing a hang.
-- **TTD replay** — needs the WinDbg store engine next to the binary (System32's engine rejects
-  `.run` traces with `0x80070057`). Open a trace, then exercise `ttd_calls` / `ttd_memory` /
-  `ttd_events` and reverse execution. The worked example is
+- **TTD** — recording and the two queries are the [TTD tier](#the-ttd-tier) now, which is where to
+  start; it needs the WinDbg store engine next to the binary to replay what it records (System32's
+  rejects a `.run` with `0x80070057`, and the tier stands that half down rather than failing).
+  What is left by hand is what the tier does not reach: **reverse execution** (`reverse_go`,
+  `step_back`, `step_over_back`, `goto_position`) on a trace, and `ttd_calls` against **resolved
+  symbols** — which the tier avoids deliberately, so that it does not stand down on a host with no
+  symbol server. The worked example is
   [`docs/flareauthenticator-ttd-walkthrough.md`](flareauthenticator-ttd-walkthrough.md). **Read a
-  row, do not count them**: issue #231 was two of these three tools rendering the right number of
-  rows with nothing in any of them, which a count cannot tell from a query that matched.
-- **TTD recording** — `record_trace` needs elevation and `TTD.exe` on `PATH`. Three targets, not
-  one, because each covers a case that was broken and none of the three has an automated tier: a
-  **short** one (`hostname.exe`) has to report a *complete* recording naming its `.run` rather than
-  a failure (#233), one **with arguments** (`cmd.exe /c dir C:\Windows\System32\ntdll.dll`) has to
-  record at all (#232), and a **missing** program has to still report the failure with the log's
-  own reason rather than TTD's `Launching '<target>'` banner.
+  row, do not count them**: issue #231 was two of these tools rendering the right number of rows
+  with nothing in any of them, which a count cannot tell from a query that matched.
 - **Driver IOCTL sweep** — `examples/sweep_ioctls.ps1` plus the target-side
   `examples/send_ioctls_target.ps1`; needs a benign test driver on a KDNET target.

@@ -2588,7 +2588,7 @@ and nothing recovers from that, which is the second bug that issue turned out to
 `go` that reaches no stop leaves the session usable, and left it unusable before. Live kernel was
 already on this path and the live-kernel tier exercises it. A dump cannot resume at all, so the wait
 is unreachable there. **TTD replay is the gap**: `go`, `step_back` and the rest of the reverse
-family go through this function, and TTD replay does not work on this host at all
+family go through this function, and TTD replay did not work on the bench at all
 (item 21 / [#132](https://github.com/glslang/windbg-mcp/issues/132)), so nothing here could ask
 whether `SetInterrupt` unblocks a replay wait the way it unblocks a live one.
 
@@ -2601,10 +2601,20 @@ documents it as working everywhere, but that is a doc comment rather than a meas
 "generalised from one backend" is a mistake this repo has made before (`CLAUDE.md`, *Handing the
 work over*).
 
-**What would close it.** Record a trace on a host where replay works, `go` past the end of it or
-`reverse_go` with nothing to stop at, and assert the session still answers `registers` afterwards —
-the same assertion the two new debugger-tier tests make. One test, in the tier that already needs a
-recorder.
+**The blocker is gone, and the tier it wanted now exists** (2026-08-26). The bench has the `ttd\`
+payload beside `target\debug` and `target\release` — item 21's unpack recipe — so replay works here:
+the **TTD tier** records a trace, opens it, and queries it, which is the prerequisite this item was
+deferred on. What is still unmeasured is the same thing as before, the *timeout* path, and the tier
+is now the obvious place to put it.
+
+**What would close it.** Record a trace, `go` past the end of it or `reverse_go` with nothing to
+stop at, and assert the session still answers `registers` afterwards — the same assertion the two
+debugger-tier launch tests make. One test, in the TTD tier. **Establish first that the bound is
+reachable at all**: a replay target has ends, so a `go` or a `reverse_go` with no breakpoint may
+simply stop at the trace boundary in well under the 60s bound, in which case the timeout path is
+*unreachable* on this target type rather than untested — which closes this item as an answer rather
+than as a test, and is worth writing down either way. Deciding that costs one measurement and is
+what the next person should do before writing anything.
 
 **Where it picks up.** `win-kexp`'s `DebugEngine::execute_and_wait` and `wait_for_event_bounded`
 (`src/dbgeng.rs`); `worker::resumed`; and the pair

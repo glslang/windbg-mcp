@@ -172,13 +172,13 @@ It checks *same-file* fragments only, so a cross-file `../README.md#some-heading
 verify by hand.
 
 **The pass count does not say which tiers ran.** Each gate is inside its test, so the `mcp_smoke`
-harness reports the same **79 passed** with the debugger tier off as with it on — that harness's own
+harness reports the same **83 passed** with the debugger tier off as with it on — that harness's own
 result line, since a plain `cargo test` runs the crate's several hundred unit tests beside it and
 prints a result line per binary. What differs between the two runs is the runtime (measured on the
 ARM64 bench 2026-08-23: **1.6s against 61s** for `cargo test --test mcp_smoke`) and the `SKIPPED`
 lines, which only `--nocapture` prints. Read one of those two before believing a run covered a
-debugger claim. The count moves whenever a test is added — it was 69 until #195 and #196, and 75
-until item 37 — so
+debugger claim. The count moves whenever a test is added — it was 69 until #195 and #196, 75
+until item 37, and 79 until the TTD tier — so
 re-derive it rather than trusting this sentence.
 
 **The dev exe can be locked too, and the failure is quiet.** A worker left running — a driver
@@ -394,6 +394,25 @@ of them. Only ask the user for a raw connection when no profile is configured at
 
 `--test-threads=1` is not optional: the filter matches **eight** tests, and the KD transport is
 single-owner, so in parallel the second attach fails and can leave the target halted.
+
+A fifth tier **records its own target** rather than opening a checked-in one, which is what no other
+tier does and why the three TTD defects of 2026-08-25 (#231, #232, #233) all shipped: a `.run` is
+tens of MB, none is in the repo, and recording needs `TTD.exe` and elevation.
+
+```pwsh
+$env:WINDBG_MCP_SMOKE_TTD = "1"; cargo test --test mcp_smoke -- --nocapture ttd
+```
+
+Gated on the variable **alone** — no `#[ignore]` beside it, unlike the two tiers above — because a
+stale variable here costs a few tens of MB in `%TEMP%` rather than a wedged VM, and against that the
+rule that matters is that a gate nothing sets is a gap that stays open. Two things to know before
+editing it. The host's reasons to stand down (no recorder, not elevated, a trace it cannot replay)
+are read off the **recorder's own refusal** rather than probed for, because probing would put a
+second copy of `ttd::find_ttd`'s search in a file that cannot call it; every *other* failure fails
+the test, and that split is what stops the tier passing on a machine where recording is broken. And
+its assertions read **which program was recorded**, from the trace's file name — TTD names a trace
+after the program it launched — because the defect that survived review was a recording that
+succeeded against the *wrong* program.
 
 **The transport does not have to be KDNET, and the target does not have to be x64.** The variable is
 a DbgEng connection string, passed through untouched, so `com:port=COM1,baud=115200` is as valid as
@@ -631,8 +650,15 @@ Two consequences worth carrying:
 **Why nothing caught any of it.** Every tier that drives execution was the live-kernel one, which
 was already on the bounded wait; a dump cannot `go`, and no tier launched a process. The debugger
 tier now does (`launch_tier`, two tests in `tests/mcp_smoke.rs`). The one target type still
-unmeasured on this path is **TTD replay**, because replay does not work on this host at all —
-`FOLLOWUPS.md` item 47.
+unmeasured on this path is **TTD replay** — `FOLLOWUPS.md` item 47.
+
+**Its stated blocker is gone, and that sentence was stale rather than wrong when written.** Item 47
+defers on "replay does not work on this host at all"; this bench now has the `ttd\` payload beside
+both `target\debug` and `target\release` (item 21's unpack recipe), and the TTD tier records a trace,
+opens it and queries it. So the prerequisite item 47 was waiting for is satisfied here — what it
+still wants is the *timeout* path, and note before writing that test that a `go` or `reverse_go` on
+a replay target may simply stop at the trace boundary, in which case the bound is unreachable rather
+than untested and that is itself the answer.
 
 **And a live target has a lifetime, which is what makes a launch test different from every other
 one here.** A dump does not go away mid-test; a process does. `go` on `cmd.exe /c ping -n 30` runs
