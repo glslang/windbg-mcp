@@ -203,7 +203,17 @@ impl EngineHost {
         let mut command = Command::new(cdb);
         command
             .arg("-server")
-            .arg(format!("npipe:pipe={pipe}"))
+            // `hidden` keeps this server out of the list `Searching for Debugging Servers`
+            // enumerates, so an unrelated debugger on the machine does not offer it up to whoever
+            // is running one. It is not access control — the pipe is still there under a name that
+            // is not a secret — but it is free and it is the only one of DbgEng's transport
+            // options here that costs nothing. `password=` is the other, and what it would be
+            // worth is an open question rather than an oversight: `FOLLOWUPS.md` item 49.
+            .arg(format!("npipe:pipe={pipe},hidden"))
+            // `-noio`: the host takes input only from its client, and sends all output there.
+            // Without it a server also reads its own console, which this one does not have — its
+            // stdin is null — and writes banners to a stdout nothing but the log reads.
+            .arg("-noio")
             .arg("-z")
             .arg(dump)
             // Nothing of ours is read from it, and a host that reached the worker's stdin could
