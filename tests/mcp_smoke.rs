@@ -10,7 +10,7 @@
 //! * **The MCP spec revved.** New revision, new required field, a capability the SDK now
 //!   advertises on our behalf that this server does not actually implement.
 //!
-//! Five tiers, so the cheap one can ride `cargo test` everywhere:
+//! Six tiers, so the cheap one can ride `cargo test` everywhere:
 //!
 //! * **Protocol** (default) — spawns the server, speaks JSON-RPC. No debugger target, no
 //!   symbols, no network. This tier also drives the **listener** (`--listen`) over real HTTP on a
@@ -46,6 +46,12 @@
 //!   — deploys a benign allocation fixture over WinRM, then verifies that the real driver and its
 //!   pool objects are visible through the structured MCP tools. The PowerShell orchestrator owns
 //!   the second gate so an ordinary live-kernel run never assumes this challenge is installed.
+//! * **TTD** (`WINDBG_MCP_SMOKE_TTD=1`) — records a trace with `TTD.exe` and reads it back, so it
+//!   needs the recorder and **elevation**. The only tier that creates its own target rather than
+//!   opening a checked-in one, because a `.run` is tens of MB and none is in the repo — which is
+//!   why nothing covered these calls, and why #231, #232 and #233 all shipped. Gated on the
+//!   variable alone rather than `#[ignore]`d as well: a stale variable here costs a few tens of MB
+//!   in the temp directory, not a wedged VM.
 //!
 //! See `docs/smoke-test.md` for the runbook.
 
@@ -11086,4 +11092,316 @@ fn ungraceful_detach(ended: &Value, text: &str) -> Option<String> {
         ));
     }
     None
+}
+
+// ---- tier 5: recording a TTD trace, and reading it back -----------------------
+
+/// Gate for the tier that drives the **TTD recorder** and replays what it wrote.
+///
+/// One environment variable and no `#[ignore]`, unlike the two tiers above it. Those are
+/// double-gated because a stale variable there costs something real — a wedged VM, a run measured
+/// in minutes — where the worst this does is leave a few tens of MB in the temp directory. Against
+/// that, [`launch_tier`]'s rule applies with full force: a gate nothing sets is a gap that stays
+/// open, and this tier exists because three defects shipped with nothing exercising these calls
+/// (#231, #232, #233).
+///
+/// The **host's** two reasons to stand down are deliberately not this gate's: a machine with no
+/// recorder, and a server that is not elevated, are read off the recorder's own refusal in
+/// [`recorded`]. Probing for them here would mean a second copy of `ttd::find_ttd`'s search in a
+/// file that cannot call it, which is the kind of duplicate that goes quietly out of date.
+fn ttd_tier() -> bool {
+    if std::env::var_os("WINDBG_MCP_SMOKE_TTD").is_none() {
+        skip("set WINDBG_MCP_SMOKE_TTD=1 to run the TTD recording tier");
+        return false;
+    }
+    true
+}
+
+/// A recording is generous with its clock: `TTD.exe` is located on disk, spawned, and watched for
+/// its whole startup window before the call can answer at all.
+const RECORD_STEP: Duration = Duration::from_secs(120);
+
+/// An empty directory of this tier's own to record into.
+///
+/// Per test and per process, and emptied first, because [`recorded_trace`] identifies a recording
+/// by what is in the directory — a `.run` left by an earlier run of the same test would be read as
+/// this one's, and the assertion would be about the wrong file.
+fn recording_dir(what: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "windbg-mcp-smoke-ttd-{what}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create the recording directory");
+    dir
+}
+
+/// Runs one `record_trace`, standing the tier down for the two reasons that are the **host's**
+/// rather than this server's.
+///
+/// Returns the success text, or `None` having printed a `SKIPPED` line. Every other failure fails
+/// the test, and that separation is the point: "not elevated" and "recording is broken" are
+/// indistinguishable to a helper that treats any error as a skip, which is how a tier comes to
+/// pass while covering nothing.
+fn recorded(server: &mut Server, out_dir: &std::path::Path, args: Value) -> Option<String> {
+    let mut arguments = args;
+    arguments["out_dir"] = json!(out_dir.to_string_lossy());
+    let response = server.call_tool("record_trace", arguments.clone(), RECORD_STEP);
+    assert_no_error(&response, "tools/call record_trace");
+    let text = text_of(&response["result"]);
+    if is_tool_error(&response) {
+        let lower = text.to_ascii_lowercase();
+        // No recorder installed, and not elevated — the two states a developer's machine is
+        // legitimately in. `0x80070005` is the code the un-elevated refusal carries.
+        if lower.contains("ttd.exe not found")
+            || lower.contains("administrative privileges")
+            || lower.contains("access is denied")
+            || lower.contains("0x80070005")
+        {
+            skip(&format!("this host cannot record a TTD trace: {text}"));
+            return None;
+        }
+        panic!("`record_trace {arguments}` failed for a reason that is not the host's:\n{text}");
+    }
+    Some(text)
+}
+
+/// The `.run` a recording left behind, read off the directory rather than out of the message.
+///
+/// Deliberately not parsed from `record_trace`'s prose, though the prose names it: the claim under
+/// test is that a finished recording *exists*, and a test that took the path from the sentence
+/// asserting it would be checking that sentence against itself.
+fn recorded_trace(out_dir: &std::path::Path) -> std::path::PathBuf {
+    let mut traces: Vec<std::path::PathBuf> = std::fs::read_dir(out_dir)
+        .expect("read the recording directory")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("run")))
+        .collect();
+    traces.sort();
+    assert_eq!(
+        traces.len(),
+        1,
+        "one recording should leave exactly one trace in {}, found {traces:?}",
+        out_dir.display()
+    );
+    let trace = traces.remove(0);
+    let size = std::fs::metadata(&trace).expect("stat the trace").len();
+    assert!(size > 0, "`{}` is an empty trace", trace.display());
+    trace
+}
+
+/// The lower-cased file name of a trace, which is how this tier reads *which program* was
+/// recorded: `TTD.exe` names a trace after the program it launched, so `cmd01.run` is evidence
+/// about the process that ran and not merely about the call returning.
+fn trace_name(trace: &std::path::Path) -> String {
+    trace
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default()
+}
+
+/// Issue #233: a target that finishes inside the startup watch is a **complete recording**, not a
+/// failed one.
+///
+/// `hostname.exe` runs in about 150ms against a 2.5s watch, so it exits while the recorder is
+/// still being watched for a fast failure — and every exit in that window used to be reported as
+/// one, quoting TTD's `Launching '<target>'` banner as the reason. The trace was on disk and
+/// replayed correctly the whole time, which is what makes this the worst shape of the three: the
+/// tool said the opposite of what had happened.
+#[test]
+fn ttd_records_a_target_that_finishes_inside_the_startup_watch_as_complete() {
+    if !ttd_tier() {
+        return;
+    }
+    let out_dir = recording_dir("short");
+    let mut server = Server::started();
+    let Some(text) = recorded(&mut server, &out_dir, json!({ "target": "hostname.exe" })) else {
+        return;
+    };
+
+    // The claim, and then the file — deliberately two different sources for the one fact.
+    assert!(
+        text.contains("recording complete"),
+        "a target that has already exited should be reported as complete, not as started:\n{text}"
+    );
+    let trace = recorded_trace(&out_dir);
+    assert!(
+        text.contains(trace.to_string_lossy().as_ref()),
+        "the message should name the trace it left, so a caller need not go looking for it:\n{text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// Issue #232: the arguments in `target` reach the program instead of becoming part of its name.
+///
+/// The whole string went to `TTD.exe` as one argv entry, so the recorder looked for a file called
+/// `cmd.exe /c dir …` and answered `0x80004005` — "cannot find the file specified", a message
+/// about the program when the fault was in the quoting. Recording at all is most of the claim,
+/// since the old behaviour could not; the trace's **name** is the rest, and is what would catch a
+/// split that succeeded while resolving the first token to something else.
+#[test]
+fn ttd_records_the_program_a_target_with_arguments_names() {
+    if !ttd_tier() {
+        return;
+    }
+    let out_dir = recording_dir("arguments");
+    let mut server = Server::started();
+    let target = "cmd.exe /c dir C:\\Windows\\System32\\ntdll.dll";
+    let Some(text) = recorded(&mut server, &out_dir, json!({ "target": target })) else {
+        return;
+    };
+    assert!(text.contains("recording complete"), "{text}");
+
+    let name = trace_name(&recorded_trace(&out_dir));
+    assert!(
+        name.starts_with("cmd"),
+        "`{name}` should be named after `cmd.exe`; a trace named after anything else means the \
+         first token resolved to a different program"
+    );
+
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// A relative `target` is resolved where the **recorder** runs, not where this server does.
+///
+/// The review finding on [#235](https://github.com/glslang/windbg-mcp/pull/235), and the one
+/// failure in this area that was not an error. `record_trace` probes whether `target` names an
+/// existing file before deciding it is a program rather than a command line, and that probe used
+/// this process's working directory while `TTD.exe` is given the caller's. With `working_dir`
+/// holding `a program.exe` the probe declined, the target was split on its space, and TTD recorded
+/// **`a.exe`** — a different program — into a trace reported as a complete recording.
+///
+/// The fixture is a copy of a real system binary rather than a stub, because the claim is about
+/// which program was *recorded*, and TTD has to be able to launch it.
+#[test]
+fn ttd_resolves_a_relative_target_against_the_recorders_working_directory() {
+    if !ttd_tier() {
+        return;
+    }
+    let work_dir = recording_dir("relative-work");
+    let out_dir = recording_dir("relative-out");
+    let fixture = work_dir.join("a program.exe");
+    let system = std::path::PathBuf::from(std::env::var("SystemRoot").unwrap_or_default())
+        .join("System32")
+        .join("hostname.exe");
+    if std::fs::copy(&system, &fixture).is_err() {
+        skip(&format!(
+            "could not copy {} to build the spaced-name fixture",
+            system.display()
+        ));
+        return;
+    }
+
+    let mut server = Server::started();
+    // Path-qualified, because TTD does not search its own cwd for a *bare* relative name —
+    // measured on 1.01.11, where `-launch aprogram.exe` fails and `-launch ./aprogram.exe`
+    // records. So this is the form that has to work, and the form that recorded the wrong program.
+    let Some(text) = recorded(
+        &mut server,
+        &out_dir,
+        json!({
+            "target": ".\\a program.exe",
+            "working_dir": work_dir.to_string_lossy(),
+        }),
+    ) else {
+        return;
+    };
+    assert!(text.contains("recording complete"), "{text}");
+
+    let name = trace_name(&recorded_trace(&out_dir));
+    assert!(
+        name.starts_with("a program"),
+        "`{name}` is not a recording of `a program.exe` — the target resolved to some other \
+         program and the recording succeeded anyway, which is the shape of the defect"
+    );
+
+    let _ = std::fs::remove_dir_all(&work_dir);
+    let _ = std::fs::remove_dir_all(&out_dir);
+}
+
+/// Issue #231: a TTD query answers with **records**, not with a column of bare indices.
+///
+/// `dx` renders one level unless asked for more, and these queries return containers of records,
+/// so the tools answered with the right number of rows and nothing in any of them. There is no
+/// error in that — three blank rows read as "three calls, details unavailable" — which is why it
+/// survived from the initial commit in two of the three query tools.
+///
+/// Driven through `ttd_memory` and `ttd_events`, the two that need **no symbols**: the fields are
+/// then a property of the query rather than of what this host can resolve, so the tier does not
+/// stand down on a machine with no symbol server. `ttd_events` is not redundant beside it — it is
+/// the one of the three that always carried the depth, which makes the pair diagnostic. Measured
+/// by putting each defect back: setting the shared `TTD_QUERY_DEPTH` to `-r1` blanks **both**, and
+/// this assertion is the one that fires; `ttd_memory` alone going blank is instead the original
+/// #231 shape, one query written differently from its siblings and off the constant they share.
+#[test]
+fn ttd_queries_answer_with_the_fields_they_promise() {
+    if !ttd_tier() {
+        return;
+    }
+    let out_dir = recording_dir("replay");
+    let mut server = Server::started();
+    if recorded(&mut server, &out_dir, json!({ "target": "hostname.exe" })).is_none() {
+        return;
+    }
+    let trace = recorded_trace(&out_dir);
+
+    let response = server.call_tool(
+        "open_trace",
+        json!({ "path": trace.to_string_lossy() }),
+        TARGET_STEP,
+    );
+    assert_no_error(&response, "tools/call open_trace");
+    if is_tool_error(&response) {
+        // Replay needs the WinDbg store engine beside the binary; System32's rejects a `.run`
+        // outright with `0x80070057`. A host that can record but not replay stands this half down
+        // rather than failing — the recording half has already run in the tests above.
+        skip(&format!(
+            "this host recorded a trace it cannot replay: {}",
+            text_of(&response["result"])
+        ));
+        let _ = std::fs::remove_dir_all(&out_dir);
+        return;
+    }
+    let session = maybe_session_id(&response["result"])
+        .unwrap_or_else(|| panic!("`open_trace` opened without minting a handle: {response}"));
+
+    // Events first. Module loads are in every trace, and this is the query that always rendered
+    // its fields, so a failure here is about the trace rather than about the depth.
+    let events = server.tool_text("ttd_events", json!({ "session_id": session }), TARGET_STEP);
+    assert!(
+        events.contains("ModuleLoaded") && events.contains("Position"),
+        "`ttd_events` should render each event's own fields:\n{events}"
+    );
+
+    // And then the one the issue was about. An image base is read every time it is mapped — the
+    // `MZ` of the PE header — so it is an address certain to have been accessed, and naming it
+    // needs no symbol.
+    let modules = server.tool_data(
+        "modules",
+        json!({ "session_id": session, "limit": 2000 }),
+        TARGET_STEP,
+    );
+    let base = modules["modules"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|m| address_of(&m["start"]))
+        .find(|&start| start != 0)
+        .unwrap_or_else(|| panic!("the trace should have a module with a base: {modules}"));
+
+    let memory = server.tool_text(
+        "ttd_memory",
+        json!({ "session_id": session, "address": format!("0x{base:x}"), "size": 8 }),
+        TARGET_STEP,
+    );
+    assert!(
+        memory.contains("AccessType") && memory.contains("Value"),
+        "`ttd_memory` should render each access as a record — the defect was a column of bare \
+         indices with the right count and no payload:\n{memory}"
+    );
+
+    server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
+    let _ = std::fs::remove_dir_all(&out_dir);
 }
