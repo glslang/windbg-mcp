@@ -117,7 +117,9 @@
   **recording** (`record_trace`) needs `TTD.exe` **and** Administrator. `record_trace` captures the
   recorder's startup output to `<out_dir>\ttd_record.log` and watches it briefly, so a fast failure
   (e.g. running un-elevated → `0x80070005 Access is denied`) is reported as an error rather than a
-  false "recording started".
+  false "recording started". A target that *finishes* inside that watch is the other case, and is
+  reported as a **complete** recording naming the finished `.run` — so `record_trace` answers one
+  of two things on success, and only one of them has a trace ready to open.
 - **Control-flow tools (`go`/`step*`/`reverse_*`) wait 60s for a stop, then break the target in.**
   The command is issued and the engine pumped to the next stop; if the target has not reached one
   by then the debugger raises a Ctrl+Break, so the call returns with the target *stopped where it

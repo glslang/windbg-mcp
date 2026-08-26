@@ -2357,6 +2357,41 @@ fn dx_executes_commands(expression: &str) -> bool {
     expression.to_ascii_lowercase().contains("executecommand")
 }
 
+/// The recursion depth every TTD query has to ask for, and the reason it is not a default.
+///
+/// `dx` renders one level unless told otherwise, and `TTD.Calls` / `TTD.Memory` / `TTD.Events` each
+/// return a *container of records*: at `-r1` the container's elements render as bare indices and
+/// every field the tools promise — the time, the thread, the parameters, the return value, the
+/// access type — is dropped, with the right number of rows and nothing in them. That is not an
+/// error the caller can see, which is what made it survive from the initial commit to
+/// [#231](https://github.com/glslang/windbg-mcp/issues/231): `ttd_events` carried the depth from
+/// the start and the other two never did, so two of the three TTD query tools had never returned
+/// usable output.
+///
+/// One level and no more: `-r3` would expand each record's own children (`Parameters`), multiplying
+/// a result that is already unbounded (`docs/token-budget.md` finding 6) for a caller who can ask
+/// for a specific call's arguments with `dx` when they want them.
+const TTD_QUERY_DEPTH: &str = "-r2";
+
+/// The `dx` behind `ttd_calls`, at [`TTD_QUERY_DEPTH`].
+fn ttd_calls_command(function: &str) -> String {
+    format!("dx {TTD_QUERY_DEPTH} @$cursession.TTD.Calls(\"{function}\")")
+}
+
+/// The `dx` behind `ttd_memory`, at [`TTD_QUERY_DEPTH`].
+///
+/// A blank `mode` is the same request as no mode at all — report every access — rather than a
+/// filter that matches nothing.
+fn ttd_memory_command(start: u64, end: u64, mode: Option<&str>) -> String {
+    match mode {
+        Some(m) if !m.trim().is_empty() => format!(
+            "dx {TTD_QUERY_DEPTH} @$cursession.TTD.Memory(0x{start:x}, 0x{end:x}, \"{}\")",
+            m.trim()
+        ),
+        _ => format!("dx {TTD_QUERY_DEPTH} @$cursession.TTD.Memory(0x{start:x}, 0x{end:x})"),
+    }
+}
+
 /// Does this raw `execute` command replace or release the debug target?
 ///
 /// The typed tools announce their own transitions, but `execute` is an escape hatch: a
@@ -3883,7 +3918,7 @@ impl WindbgServer {
             .run(
                 args.session_id.as_deref(),
                 EngineOp::BoundedCommand {
-                    command: format!("dx @$cursession.TTD.Calls(\"{}\")", args.function),
+                    command: ttd_calls_command(&args.function),
                     patience_ms: 0,
                 },
             )
@@ -3915,13 +3950,7 @@ impl WindbgServer {
             Err(e) => return tool_error(e),
         };
         let end = start.saturating_add(args.size as u64);
-        let cmd = match args.mode.as_deref() {
-            Some(m) if !m.trim().is_empty() => format!(
-                "dx @$cursession.TTD.Memory(0x{start:x}, 0x{end:x}, \"{}\")",
-                m.trim()
-            ),
-            _ => format!("dx @$cursession.TTD.Memory(0x{start:x}, 0x{end:x})"),
-        };
+        let cmd = ttd_memory_command(start, end, args.mode.as_deref());
         let out = self
             .run(
                 args.session_id.as_deref(),
@@ -3950,7 +3979,7 @@ impl WindbgServer {
             .run(
                 args.session_id.as_deref(),
                 EngineOp::BoundedCommand {
-                    command: "dx -r2 @$curprocess.TTD.Events".to_string(),
+                    command: format!("dx {TTD_QUERY_DEPTH} @$curprocess.TTD.Events"),
                     patience_ms: 0,
                 },
             )
@@ -5999,6 +6028,53 @@ mod tests {
                 "`{expression}` is an ordinary query and must keep the handle"
             );
         }
+    }
+
+    /// Every TTD query asks for the depth that renders a record's fields.
+    ///
+    /// The bug was silent in the one direction a caller cannot check (#231): `dx` at its default
+    /// `-r1` renders the right number of rows with nothing in any of them, so `ttd_calls` and
+    /// `ttd_memory` read as "three calls, details unavailable" rather than as a defect, and did so
+    /// from the initial commit. The three commands are asserted together because what went wrong
+    /// was one of them being written differently from the others.
+    #[test]
+    fn every_ttd_query_asks_for_the_fields_it_promises() {
+        let events = format!("dx {TTD_QUERY_DEPTH} @$curprocess.TTD.Events");
+        for command in [
+            ttd_calls_command("kernelbase!CreateFileW"),
+            ttd_memory_command(0x1000, 0x1008, None),
+            ttd_memory_command(0x1000, 0x1008, Some("w")),
+            events,
+        ] {
+            assert!(
+                command.starts_with("dx -r2 "),
+                "`{command}` renders indices without their records"
+            );
+        }
+    }
+
+    /// The rest of each query, so a depth that is present cannot be the whole assertion.
+    #[test]
+    fn a_ttd_query_names_the_object_and_the_range_it_was_asked_for() {
+        assert_eq!(
+            ttd_calls_command("ntdll!Nt*"),
+            "dx -r2 @$cursession.TTD.Calls(\"ntdll!Nt*\")"
+        );
+        assert_eq!(
+            ttd_memory_command(0x7ff7_0715_0000, 0x7ff7_0715_0008, None),
+            "dx -r2 @$cursession.TTD.Memory(0x7ff707150000, 0x7ff707150008)"
+        );
+        assert_eq!(
+            ttd_memory_command(0x1000, 0x1010, Some(" w ")),
+            "dx -r2 @$cursession.TTD.Memory(0x1000, 0x1010, \"w\")",
+            "a mode is trimmed before it is quoted"
+        );
+        // A blank mode is "every access", not a filter matching none — the argument is left off
+        // rather than passed as an empty string the data model would have to interpret.
+        assert_eq!(
+            ttd_memory_command(0x1000, 0x1010, Some("   ")),
+            ttd_memory_command(0x1000, 0x1010, None)
+        );
     }
 
     /// `execute` is the one path that can swap the target without going through a typed
