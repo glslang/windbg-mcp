@@ -2588,9 +2588,11 @@ and nothing recovers from that, which is the second bug that issue turned out to
 `go` that reaches no stop leaves the session usable, and left it unusable before. Live kernel was
 already on this path and the live-kernel tier exercises it. A dump cannot resume at all, so the wait
 is unreachable there. **TTD replay is the gap**: `go`, `step_back` and the rest of the reverse
-family go through this function, and TTD replay did not work on the bench at all
-(item 21 / [#132](https://github.com/glslang/windbg-mcp/issues/132)), so nothing here could ask
-whether `SetInterrupt` unblocks a replay wait the way it unblocks a live one.
+family go through this function, and TTD replay does not work on **that** bench at all
+(item 21 / [#132](https://github.com/glslang/windbg-mcp/issues/132)), so nothing there could ask
+whether `SetInterrupt` unblocks a replay wait the way it unblocks a live one. (Named explicitly
+because "this host" in an item whose measurements are ARM64's has already been read as the x64
+one.)
 
 **Why it is not alarming, and why it is still open.** The watchdog only ever fires at the bound, so
 for every go/step that stops in time the change is a no-op — which is every TTD navigation anyone
@@ -2601,20 +2603,30 @@ documents it as working everywhere, but that is a doc comment rather than a meas
 "generalised from one backend" is a mistake this repo has made before (`CLAUDE.md`, *Handing the
 work over*).
 
-**The blocker is gone, and the tier it wanted now exists** (2026-08-26). The bench has the `ttd\`
-payload beside `target\debug` and `target\release` — item 21's unpack recipe — so replay works here:
-the **TTD tier** records a trace, opens it, and queries it, which is the prerequisite this item was
-deferred on. What is still unmeasured is the same thing as before, the *timeout* path, and the tier
-is now the obvious place to put it.
+**The blocker moved to a different host rather than lifting, and the tier it wanted now exists**
+(2026-08-26). The deferral above is about the **ARM64 bench**, and nothing since has re-checked it.
+What changed is the **x64 bench**: it has the `ttd\` payload beside `target\debug` and
+`target\release` — item 21's unpack recipe — so replay works *there*, and the **TTD tier** records
+a trace, opens it and queries it.
+
+So the prerequisite is satisfied on a machine, just not the one this item was written on. That is
+probably enough, because the gap here is a **target type** and not an architecture — but every
+sibling measurement in this item was taken on ARM64, and an x64 answer inherits the caveat this
+item already cites against itself: "generalised from one backend" is a mistake this repo has made
+before. Whoever closes it should say which bench, and think for a moment about whether the other
+one would answer differently.
+
+(Written down because it was got wrong once already: "this host" was read as the x64 bench, on the
+strength of a TTD tier passing there, and the correction is what produced the paragraph above.)
 
 **What would close it.** Record a trace, `go` past the end of it or `reverse_go` with nothing to
 stop at, and assert the session still answers `registers` afterwards — the same assertion the two
-debugger-tier launch tests make. One test, in the TTD tier. **Establish first that the bound is
-reachable at all**: a replay target has ends, so a `go` or a `reverse_go` with no breakpoint may
-simply stop at the trace boundary in well under the 60s bound, in which case the timeout path is
-*unreachable* on this target type rather than untested — which closes this item as an answer rather
-than as a test, and is worth writing down either way. Deciding that costs one measurement and is
-what the next person should do before writing anything.
+debugger-tier launch tests make. One test, in the TTD tier, on the x64 bench. **Establish first
+that the bound is reachable at all**: a replay target has ends, so a `go` or a `reverse_go` with no
+breakpoint may simply stop at the trace boundary in well under the 60s bound, in which case the
+timeout path is *unreachable* on this target type rather than untested — which closes this item as
+an answer rather than as a test, and is worth writing down either way. Deciding that costs one
+measurement and is what the next person should do before writing anything.
 
 **Where it picks up.** `win-kexp`'s `DebugEngine::execute_and_wait` and `wait_for_event_bounded`
 (`src/dbgeng.rs`); `worker::resumed`; and the pair

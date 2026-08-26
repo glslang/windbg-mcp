@@ -652,13 +652,17 @@ was already on the bounded wait; a dump cannot `go`, and no tier launched a proc
 tier now does (`launch_tier`, two tests in `tests/mcp_smoke.rs`). The one target type still
 unmeasured on this path is **TTD replay** — `FOLLOWUPS.md` item 47.
 
-**Its stated blocker is gone, and that sentence was stale rather than wrong when written.** Item 47
-defers on "replay does not work on this host at all"; this bench now has the `ttd\` payload beside
-both `target\debug` and `target\release` (item 21's unpack recipe), and the TTD tier records a trace,
-opens it and queries it. So the prerequisite item 47 was waiting for is satisfied here — what it
-still wants is the *timeout* path, and note before writing that test that a `go` or `reverse_go` on
-a replay target may simply stop at the trace boundary, in which case the bound is unreachable rather
-than untested and that is itself the answer.
+**Its blocker moved rather than lifted, and which host it is about is the whole of the distinction.**
+Item 47 defers on "replay does not work on this host at all", and the sentence before it names the
+**ARM64 bench** — so that is the host, and nothing since has re-checked it. What is new is a
+*different* machine: the **x64 bench** has the `ttd\` payload beside `target\debug` and
+`target\release` (item 21's unpack recipe), and the TTD tier records a trace, opens it and queries
+it there. Item 47's gap is a **target type**, not an architecture, so an x64 measurement would
+answer it — but its sibling measurements were all taken on ARM64, and "generalised from one
+backend" is the mistake item 47's own text cites. Say which bench, in the item, whenever this
+moves. Before writing that test at all, note that a `go` or `reverse_go` on a replay target may
+simply stop at the trace boundary, in which case the bound is unreachable rather than untested and
+that is itself the answer.
 
 **And a live target has a lifetime, which is what makes a launch test different from every other
 one here.** A dump does not go away mid-test; a process does. `go` on `cmd.exe /c ping -n 30` runs
