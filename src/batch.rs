@@ -934,6 +934,11 @@ pub struct StepOutcome {
     /// This step ended the target. See [`Ran::target_gone`]: it travels on the step for the same
     /// reason `cut_short` does — a step that ended the target *succeeded*, so every reader that
     /// had to infer it from the text would sooner or later not.
+    ///
+    /// **At most one step in a report carries it**, and that is the whole of its value: it names
+    /// the step that *caused* the ending. Every step after it is running against a target that is
+    /// not there and fails accordingly — including the `always` block, which is still attempted —
+    /// so "the engine has no target now" is true of all of them and identifies none.
     pub target_gone: bool,
 }
 
@@ -1061,6 +1066,9 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
     let mut bound: BTreeMap<String, String> = BTreeMap::new();
     let mut steps: Vec<StepOutcome> = Vec::with_capacity(op.steps.len());
     let mut outcome = BatchOutcome::Committed;
+    // Threaded through both blocks rather than re-derived from the step list each time, because
+    // the `always` block needs the main block's answer as well as its own.
+    let mut ended = false;
 
     for (index, step) in op.steps.iter().enumerate() {
         let position = index + 1;
@@ -1156,7 +1164,8 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
             ));
             continue;
         }
-        let done = run_step(d, step, position, steps_deadline, &mut bound);
+        let done = run_step(d, step, position, steps_deadline, &mut bound, ended);
+        ended |= done.target_gone;
         // The step says whether a break reached it, so this needs no separate question and covers
         // every shape at once: a step cut short that still succeeded (including the *last* one,
         // which no between-steps check can ever see), and one whose assertions stopped holding
@@ -1219,7 +1228,9 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
         }
         // Cleanup continues past its own failures, deliberately: the steps are ordered, but a
         // patch that cannot be restored must not stop a breakpoint from being cleared.
-        always.push(run_step(d, step, position, budget, &mut bound));
+        let done = run_step(d, step, position, budget, &mut bound, ended);
+        ended |= done.target_gone;
+        always.push(done);
     }
 
     let after = probe_state(d, &steps, &always, budget);
@@ -1247,6 +1258,11 @@ fn run_step(
     position: usize,
     deadline: Duration,
     bound: &mut BTreeMap<String, String>,
+    // Whether the target had **already** gone before this step started, which is what makes
+    // "did this step end it" answerable at all. Without it every refused `always` step reports
+    // itself as the ending — each is running against a target that is not there, and asking the
+    // engine afterwards cannot tell "it went during this step" from "it was gone before".
+    already_gone: bool,
 ) -> StepOutcome {
     let budget_ms = step_budget_ms(d.elapsed(), deadline).max(MIN_STEP_BUDGET_MS);
     let mut resolve = |name: &str| bound.get(name).cloned();
@@ -1307,7 +1323,16 @@ fn run_step(
     });
 
     let (output, mut cut_short, target_gone) = match ran {
-        Ok(ran) => (ran.output, ran.interrupted, ran.target_gone),
+        // `already_gone` gates this half too, though nothing can reach it: dbgscope refuses a
+        // command outright when the engine holds no debuggee, so a *successful* call cannot have
+        // run against a target that was already absent. Gated anyway, so the invariant is one
+        // rule — at most one step is the ending — rather than one rule and an argument about why
+        // the other branch is exempt.
+        Ok(ran) => (
+            ran.output,
+            ran.interrupted,
+            !already_gone && ran.target_gone,
+        ),
         Err(why) => {
             return StepOutcome {
                 position,
@@ -1325,7 +1350,7 @@ fn run_step(
                 // unread, `probe_state` reaches its "a step resumed and did not report a stop"
                 // arm and reports the session **running** — the most wrong of the answers
                 // available, on a session that has no target at all.
-                target_gone: d.has_target() == Some(false),
+                target_gone: !already_gone && d.has_target() == Some(false),
             };
         }
     };
@@ -2313,6 +2338,56 @@ mod tests {
         // And the headline must own both halves rather than claiming nothing failed.
         let text = render(&report);
         assert!(text.contains("did not itself succeed"), "{text}");
+    }
+
+    /// Exactly one step carries the ending, and it is the one that **caused** it — not every
+    /// cleanup step that then ran against nothing.
+    ///
+    /// The `always` block is still attempted after an ending, deliberately, so each of its steps
+    /// is refused by an engine with no target. Asking the engine afterwards cannot tell "it went
+    /// during this step" from "it was gone before this step", so without the answer being carried
+    /// forward every refused cleanup step reported itself as the ending — and a consumer looking
+    /// for the step that did it found several.
+    #[test]
+    fn only_the_step_that_caused_the_ending_carries_it() {
+        let mut d = stopped()
+            .on("g", Ok("the process exited"))
+            .on("bc *", Err("No active debuggee"))
+            .on(".detach", Err("No active debuggee"))
+            .ends_the_target_on("g");
+
+        let report = run(
+            &mut d,
+            &op(
+                vec![step(StepAction::Resume {
+                    command: "g".to_string(),
+                    timeout_ms: None,
+                })],
+                vec![cmd("bc *"), cmd(".detach")],
+            ),
+            BUDGET,
+        );
+        assert!(report.steps[0].target_gone, "the resume caused it");
+        let claimed: Vec<&str> = report
+            .steps
+            .iter()
+            .chain(&report.always)
+            .filter(|s| s.target_gone)
+            .map(|s| s.rendered.as_str())
+            .collect();
+        assert_eq!(
+            claimed,
+            ["g"],
+            "only the causing step may claim the ending; the refused cleanup steps did not do it"
+        );
+        // And the one that did is still what the session state names.
+        assert_eq!(
+            report.after,
+            SessionAfter::Ended {
+                by: "`g`".to_string()
+            },
+            "{report:?}"
+        );
     }
 
     /// The other half of the same sentence: a step that ended the target and *did* do everything
