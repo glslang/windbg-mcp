@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A 32-bit .NET dump is opened by an engine that can load its SOS** (issue #234). An extension DLL
+  is loaded into the debugger's own process, so its architecture is the *host's*: the 32-bit
+  `sos.dll` will not load into this server's x64 engine (`Win32 error 0n193`) and the 64-bit one
+  loads and then fails on the target (`Failed to load data access DLL, 0x80004005`), because the
+  CLR data access DLL is paired to the target's architecture as well as the host's. Both measured —
+  there is no in-process arrangement, so the engine moves instead: an x86 dump is now served by an
+  `x86\cdb.exe` running as a debugging server, driven over DbgEng's remote transport, and
+  `!sos.threads`, `!clrstack` and the rest answer. The dump's architecture is read from its own
+  header before anything opens it, which is what makes the choice possible at all — asking the
+  engine would need a session in a process whose architecture is by then already fixed.
+  `skills/windbg-debugging/setup.md` has the one-time copy block.
+- **An opener's summary carries a `limitation`** when the session cannot do something a caller would
+  otherwise assume it can. Today that is the case above on a host with no x86 engine available:
+  rather than failing the open — native analysis of such a dump works and always has — the dump
+  opens here and the result says SOS is unreachable and what to copy. Present on both the text and
+  the structured halves, so a client that forwards `structuredContent` and drops the text still
+  sees it.
+
 ## [0.12.1] - 2026-08-26
 
 ### Fixed
