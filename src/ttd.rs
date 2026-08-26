@@ -14,7 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 /// ships `Debuggers\x64`, while the store package's payload directory for the same thing is
 /// `amd64`. Getting that crossed silently selects a recorder for the wrong architecture.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Arch {
+pub(crate) enum Arch {
     Arm64,
     X64,
     X86,
@@ -39,7 +39,7 @@ impl Arch {
     }
 
     /// The SDK's directory under `Windows Kits\10\Debuggers`.
-    fn sdk_dir(self) -> &'static str {
+    pub(crate) fn sdk_dir(self) -> &'static str {
         match self {
             Self::Arm64 => "arm64",
             Self::X64 => "x64",
@@ -48,7 +48,7 @@ impl Arch {
     }
 
     /// The store package's payload directory, which spells x64 differently.
-    fn payload_dir(self) -> &'static str {
+    pub(crate) fn payload_dir(self) -> &'static str {
         match self {
             Self::Arm64 => "arm64",
             Self::X64 => "amd64",
