@@ -17,6 +17,7 @@ mod cast;
 mod client;
 mod dump;
 mod engine;
+mod enginehost;
 mod kdconn;
 mod listen;
 mod logbridge;

@@ -283,7 +283,10 @@ mod tests {
             );
         }
         // Or the loop above asserted nothing at all, which is the way a table-driven test rots.
-        assert!(seen >= 4, "expected the checked-in kernel samples, saw {seen}");
+        assert!(
+            seen >= 4,
+            "expected the checked-in kernel samples, saw {seen}"
+        );
     }
 
     /// The parser against a **real 32-bit user minidump** — the file this whole routing exists
