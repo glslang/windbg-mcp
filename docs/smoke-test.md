@@ -1123,7 +1123,14 @@ before a release, or when a change touches the relevant path. Drivers live in
 - **TTD replay** — needs the WinDbg store engine next to the binary (System32's engine rejects
   `.run` traces with `0x80070057`). Open a trace, then exercise `ttd_calls` / `ttd_memory` /
   `ttd_events` and reverse execution. The worked example is
-  [`docs/flareauthenticator-ttd-walkthrough.md`](flareauthenticator-ttd-walkthrough.md).
-- **TTD recording** — `record_trace` needs elevation and `TTD.exe` on `PATH`.
+  [`docs/flareauthenticator-ttd-walkthrough.md`](flareauthenticator-ttd-walkthrough.md). **Read a
+  row, do not count them**: issue #231 was two of these three tools rendering the right number of
+  rows with nothing in any of them, which a count cannot tell from a query that matched.
+- **TTD recording** — `record_trace` needs elevation and `TTD.exe` on `PATH`. Three targets, not
+  one, because each covers a case that was broken and none of the three has an automated tier: a
+  **short** one (`hostname.exe`) has to report a *complete* recording naming its `.run` rather than
+  a failure (#233), one **with arguments** (`cmd.exe /c dir C:\Windows\System32\ntdll.dll`) has to
+  record at all (#232), and a **missing** program has to still report the failure with the log's
+  own reason rather than TTD's `Launching '<target>'` banner.
 - **Driver IOCTL sweep** — `examples/sweep_ioctls.ps1` plus the target-side
   `examples/send_ioctls_target.ps1`; needs a benign test driver on a KDNET target.

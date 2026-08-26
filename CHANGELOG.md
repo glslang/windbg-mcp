@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ttd_calls` and `ttd_memory` return the fields their descriptions promise** (issue #231). Both
+  ran `dx` without a recursion depth, and `dx` renders one level unless told otherwise:
+  `TTD.Calls` and `TTD.Memory` return *containers of records*, so `-r1` was exactly one level short
+  and every result came back as a bare index. The count was right and the payload absent, which
+  reads as "three calls, details unavailable" rather than as a defect — and there was no error to
+  go on. Not a regression: all three query commands are in the initial commit and only `ttd_events`
+  ever carried `-r2`, so two of the three TTD query tools had never returned usable output.
+  Measured after the fix against a trace recorded on this host: `ttd_calls` carries `TimeStart`,
+  `TimeEnd`, `Function`, `FunctionAddress`, `ReturnAddress`, `ReturnValue` and `Parameters`, and
+  `ttd_memory` carries `AccessType`, `IP`, `Address`, `Size` and `Value`. The depth is now one
+  constant the three share rather than three literals, and a test asserts that every TTD query asks
+  for it — what went wrong was one of them being written differently from its siblings, which no
+  test could see while each built its own command line.
+
+- **`record_trace` passes arguments to the target, which its schema always said it could**
+  (issue #232). `target` is documented as "Program (with optional arguments)", and the whole string
+  went to `TTD.exe` as a **single** argv entry — so the recorder looked for a file named
+  `cmd.exe /c dir C:\Windows\System32\ntdll.dll` and answered `0x80004005` with "cannot find the
+  file specified", a message pointing at the program rather than at the quoting. TTD's own help
+  requires the opposite ("`-launch` … must be the last option in the command-line, followed by the
+  program + `<arguments>`"), and `-launch` was already last, so the only thing wrong was that the
+  tail was one token instead of several. It is now split by `CommandLineToArgvW`'s rules — the ones
+  that will parse the line at the other end — so a quoted path holding spaces stays one argument
+  and a backslash run before a quote halves the way Windows says it does. An **unquoted** path that
+  exists exactly as written is still one program: that is what handing the whole string over got
+  right, `C:\Program Files\…` is where programs live, and splitting it on whitespace would have
+  taken the case away from callers relying on it without an error to show for it. An empty `target`
+  is refused before the output directory and log are created, beside the existing `env` validation.
+  Measured: `record_trace { "target": "cmd.exe /c dir C:\\Windows\\System32\\ntdll.dll" }` records
+  and the recorder's own echo is now `Launching 'cmd.exe /c dir …'` rather than the quoted single
+  token it used to be.
+
+- **`record_trace` reports a recording that already finished as a success, naming the trace**
+  (issue #233). The recorder is watched for 2.5s for a fast failure — the un-elevated refusal is
+  what that was built to surface — and **any** exit inside the window was treated as one. A target
+  that runs to completion faster than that exits inside it, so `hostname.exe` produced a 46 MB
+  trace that opened and replayed correctly and was reported as `TTD recording failed to start
+  (exit code: 0)`, with the quoted reason being TTD's `Launching '<target>'` banner: a line that
+  says nothing was wrong. An early exit means the recorder is no longer running, not why, and "the
+  target already finished" is an ordinary reason. The decision is now on the recorder's exit
+  *status* and on what it left behind: a successful exit with a finished `.run` is a **complete
+  recording**, and the message says so and names the trace — which is the more useful of the two
+  success answers, since only one of them has a file ready to open. A successful exit with no trace
+  is still an error, and a distinct one. A non-zero exit takes the path it always did, except that
+  the reason is now read past the launch banner to the line that reports the failure. The trace is
+  identified from the log's own `Full trace dumped to <path>`, falling back to a `.run` in
+  `out_dir` written since the recorder was spawned — restricted that way so a trace an earlier
+  recording left in the same directory cannot be reported as this one's.
+
 ## [0.12.0] - 2026-08-25
 
 ### Changed

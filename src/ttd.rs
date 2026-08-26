@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 /// A recorder's architecture, and the two different names the installers give it.
 ///
@@ -140,12 +140,18 @@ const STARTUP_WATCH: Duration = Duration::from_millis(2500);
 /// Starts recording a TTD trace by launching `target` under `TTD.exe`, writing the
 /// `.run`/`.idx` into `out_dir`.
 ///
-/// Recording is long-lived (it finalizes only when the recorded process exits), so
-/// this is fire-and-forget for the success path. But TTD fails *fast* on common
-/// misconfigurations — most notably "Administrative privileges are required" when the
-/// server isn't elevated — so we capture its startup output to a log file and watch
-/// the recorder briefly: if it dies during [`STARTUP_WATCH`], we surface the real
-/// error instead of falsely reporting success.
+/// Recording is usually long-lived — it finalizes only when the recorded process exits — so the
+/// ordinary success path is fire-and-forget. But TTD fails *fast* on common misconfigurations,
+/// most notably "Administrative privileges are required" when the server isn't elevated, so we
+/// capture its startup output to a log file and watch the recorder for [`STARTUP_WATCH`].
+///
+/// **Exiting inside that window is not itself a failure**, which is what the watch used to assume
+/// ([#233](https://github.com/glslang/windbg-mcp/issues/233)): a short target — `hostname.exe`
+/// finishes in 156ms — runs to completion before the watch elapses, and the recorder then exits
+/// **0** having written a finished trace. So the decision is on the recorder's exit *status* and
+/// on what it left in `out_dir`, and this returns one of three answers: recording underway, a
+/// recording already complete (naming the trace, which is the more useful answer of the two), or
+/// the failure the watch was built to surface.
 ///
 /// Requires Administrator privileges.
 pub fn record_launch(
@@ -155,12 +161,13 @@ pub fn record_launch(
     env: &[String],
     working_dir: Option<&str>,
 ) -> Result<String, String> {
-    // Validate the caller-supplied environment up front — before any filesystem side effect —
-    // so a malformed entry doesn't leave a stray log file behind.
+    // Validate the caller-supplied environment and target up front — before any filesystem side
+    // effect — so a malformed one doesn't leave a stray directory and log file behind.
     let mut parsed_env = Vec::with_capacity(env.len());
     for kv in env {
         parsed_env.push(split_env_entry(kv)?);
     }
+    let argv = split_target(target)?;
 
     // Resolve out_dir to an absolute path. When `working_dir` is set, TTD.exe would otherwise
     // resolve a relative `-out` against the *target's* cwd — mismatching where we create the
@@ -185,8 +192,15 @@ pub fn record_launch(
     cmd.arg("-accepteula")
         .arg("-out")
         .arg(&out_dir)
+        // `-launch` is last, and the program and each of its arguments follow it as separate
+        // entries. TTD.exe's own help requires both — "This must be the last option in the
+        // command-line, followed by the program + <arguments>" — and its example is
+        // `TTD.exe ping.exe msn.com`. Handing the whole line over as one `.arg` made TTD look for
+        // a file literally named `cmd.exe /c dir C:\...`, which it reported as "cannot find the
+        // file specified": a message pointing at the program rather than at the quoting
+        // ([#232](https://github.com/glslang/windbg-mcp/issues/232)).
         .arg("-launch")
-        .arg(target)
+        .args(&argv)
         .stdout(Stdio::from(log))
         .stderr(Stdio::from(log_err));
     // Configured kernel connections do not reach the recorder. TTD.exe launches `target` with
@@ -212,6 +226,10 @@ pub fn record_launch(
     if let Some(dir) = working_dir {
         cmd.current_dir(dir);
     }
+    // Read before the spawn, so a `.run` an *earlier* recording left in this same `out_dir` can
+    // never be mistaken for this one's. See [`finished_trace`].
+    let started = SystemTime::now();
+
     // Under the server's spawn lock, like every other process this server creates. Nothing here
     // wants an inherited handle — but a worker being spawned at this moment has its protocol
     // channel marked inheritable, and marking is process-wide: a recorder started inside that
@@ -226,21 +244,47 @@ pub fn record_launch(
 
     let pid = child.id();
 
-    // Watch for an early exit (a fast failure).
+    // Watch for an early exit — which is a fast failure, or a target that has already finished.
     let deadline = Instant::now() + STARTUP_WATCH;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                // Exited during startup → recording did not take. Report the captured
-                // reason (e.g. the access-denied message).
                 let log_text = std::fs::read_to_string(&log_path).unwrap_or_default();
-                let detail = first_meaningful_line(&log_text)
-                    .unwrap_or("see log for details")
-                    .to_string();
-                return Err(format!(
-                    "TTD recording failed to start ({status}): {detail}. Full log: {}",
-                    log_path.display()
-                ));
+                if !status.success() {
+                    // The case the watch was built for: the recorder refused. Report the captured
+                    // reason (e.g. the access-denied message).
+                    let detail = failure_detail(&log_text)
+                        .unwrap_or("see log for details")
+                        .to_string();
+                    return Err(format!(
+                        "TTD recording failed to start ({status}): {detail}. Full log: {}",
+                        log_path.display()
+                    ));
+                }
+                // Exited *successfully*: the target ran to completion inside the watch window, so
+                // the recording is not merely underway but done. Say so and name the trace — a
+                // caller told "recording started, finalizes when the target exits" about a target
+                // that has already exited would go looking for a file this function knows the
+                // name of.
+                return match finished_trace(&log_text, &out_dir, started) {
+                    Some(trace) => Ok(format!(
+                        "TTD recording complete (recorder pid {pid} exited successfully): \
+                         `{target}` ran to completion inside the {}ms startup watch, so the whole \
+                         run is recorded. The trace is finished and ready to `open_trace`: `{}`. \
+                         Recorder log: {}",
+                        STARTUP_WATCH.as_millis(),
+                        trace.display(),
+                        log_path.display()
+                    )),
+                    // Exit 0 and nothing on disk is neither of the two answers above, and saying
+                    // "complete" about a trace that is not there would be the same class of
+                    // mistake this arm exists to fix.
+                    None => Err(format!(
+                        "TTD.exe exited successfully but wrote no .run trace to `{}`. Full log: {}",
+                        out_dir.display(),
+                        log_path.display()
+                    )),
+                };
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
@@ -248,7 +292,7 @@ pub fn record_launch(
                     return Ok(format!(
                         "TTD recording started (recorder pid {pid}). Tracing `{target}`; \
                          output (.run/.idx) goes to `{}`. Recording finalizes when the \
-                         target exits. Recorder log: {}",
+                         target exits — there is no trace to open until then. Recorder log: {}",
                         out_dir.display(),
                         log_path.display()
                     ));
@@ -269,6 +313,203 @@ fn split_env_entry(entry: &str) -> Result<(&str, &str), String> {
     }
 }
 
+/// Splits a caller's `target` into the program to launch and its arguments.
+///
+/// `TTD.exe` takes them as separate argv entries and [`Command::arg`] makes exactly one entry per
+/// call, so the whole string in one call was a filename with spaces in it as far as the recorder
+/// was concerned (#232).
+///
+/// Refuses an empty target rather than letting `TTD.exe` report it, because at the point this runs
+/// nothing has been created yet — the same reason the environment is validated here.
+fn split_target(target: &str) -> Result<Vec<String>, String> {
+    let trimmed = target.trim();
+    if trimmed.is_empty() {
+        return Err(
+            "`target` is empty — pass the program to record, with any arguments after it".into(),
+        );
+    }
+    // A path that exists exactly as written is one program, not a command line — even when it
+    // holds spaces, and `C:\Program Files\...` is where they live. This is what passing the whole
+    // string as a single argument got right, and splitting on whitespace would look for
+    // `C:\Program`; quoting only becomes necessary once such a path is followed by arguments.
+    // Skipped when the caller has quoted anything, since then they have said how it parses.
+    if !trimmed.contains('"') && Path::new(trimmed).is_file() {
+        return Ok(vec![trimmed.to_string()]);
+    }
+    let argv = split_argv(trimmed);
+    match argv.first() {
+        Some(program) if !program.trim().is_empty() => Ok(argv),
+        // Reachable from a target that is nothing but quotes: `""` parses to one argument, and
+        // that argument is the empty program.
+        _ => Err(format!(
+            "`target` names no program to launch (`{target}` parses to no program)"
+        )),
+    }
+}
+
+/// Parses a command line into argv the way Windows does.
+///
+/// These are `CommandLineToArgvW`'s rules, and they are the right ones because the string makes a
+/// round trip: this splits it, [`Command::arg`] re-quotes each entry by the matching rules, and
+/// `TTD.exe` — then the recorded target — parse the result back. Whitespace separates (space and
+/// tab only, which is what Windows treats as a separator); double quotes group; a backslash is
+/// literal unless it runs into a quote, where `2n` backslashes are `n` backslashes plus a
+/// delimiter and `2n+1` are `n` plus a literal quote; and `""` inside a quoted argument is a
+/// literal quote that leaves it quoted.
+///
+/// Not a general shell splitter: there is no variable expansion, no globbing and no single-quote
+/// handling, because none of those is what will parse the line at the other end.
+fn split_argv(line: &str) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut argv = Vec::new();
+    let mut current = String::new();
+    // Distinct from `current.is_empty()`: `""` is an argument, and an empty one.
+    let mut in_arg = false;
+    let mut in_quotes = false;
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '\\' => {
+                let mut slashes = 0;
+                while i < chars.len() && chars[i] == '\\' {
+                    slashes += 1;
+                    i += 1;
+                }
+                if i < chars.len() && chars[i] == '"' {
+                    for _ in 0..slashes / 2 {
+                        current.push('\\');
+                    }
+                    if slashes % 2 == 1 {
+                        // The quote is escaped: consume it as a literal.
+                        current.push('"');
+                        i += 1;
+                    }
+                    // An even run leaves the quote for the arm below, where it delimits.
+                } else {
+                    for _ in 0..slashes {
+                        current.push('\\');
+                    }
+                }
+                in_arg = true;
+            }
+            '"' => {
+                i += 1;
+                if in_quotes && i < chars.len() && chars[i] == '"' {
+                    current.push('"');
+                    i += 1;
+                } else {
+                    in_quotes = !in_quotes;
+                }
+                in_arg = true;
+            }
+            ' ' | '\t' if !in_quotes => {
+                if in_arg {
+                    argv.push(std::mem::take(&mut current));
+                    in_arg = false;
+                }
+                i += 1;
+            }
+            c => {
+                current.push(c);
+                in_arg = true;
+                i += 1;
+            }
+        }
+    }
+    if in_arg {
+        argv.push(current);
+    }
+    argv
+}
+
+/// The finished `.run` this recorder wrote, if it wrote one.
+///
+/// Asked only of a recorder that has already exited **successfully**, which is what makes either
+/// answer meaningful: a trace named in the log is complete, and its absence is a real anomaly
+/// rather than a recording still in progress.
+///
+/// The log is the primary source because it names the file exactly. The directory is a fallback
+/// for a recorder whose log does not — the format of that line is TTD's, not ours — and it is
+/// restricted to a file written since the recorder was spawned, so a `.run` an earlier recording
+/// left in the same `out_dir` cannot be reported as this one's.
+fn finished_trace(log: &str, out_dir: &Path, since: SystemTime) -> Option<PathBuf> {
+    if let Some(named) = trace_named_in(log) {
+        let path = PathBuf::from(named);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    // Coarse timestamps are a real filesystem (FAT's are two-second), so the window is widened
+    // rather than compared exactly. The cost of being wrong here is bounded: at worst it names a
+    // trace from a recording seconds old, in a directory this recording also wrote to.
+    let floor = since.checked_sub(Duration::from_secs(2)).unwrap_or(since);
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(out_dir).ok()?.flatten() {
+        let path = entry.path();
+        if !path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("run"))
+        {
+            continue;
+        }
+        let Ok(written) = entry.metadata().and_then(|m| m.modified()) else {
+            continue;
+        };
+        if written >= floor && newest.as_ref().is_none_or(|(seen, _)| written > *seen) {
+            newest = Some((written, path));
+        }
+    }
+    newest.map(|(_, path)| path)
+}
+
+/// The path TTD names as the trace it finished writing.
+///
+/// Several of its lines carry the same path and they mean different things: a real log has
+/// `Initializing the recording of process (PID:N) on trace file: <path>` and
+/// `Recording has started … on trace file: <path>` before the target has run, and
+/// `Full trace dumped to <path>` once it is finished. Only the last of those is matched, so this
+/// cannot name a trace that was begun and never finalised. Read in reverse, so that if a log ever
+/// holds more than one the newest wins.
+fn trace_named_in(log: &str) -> Option<&str> {
+    const DUMPED: &str = "full trace dumped to ";
+    log.lines().rev().find_map(|line| {
+        let line = line.trim();
+        // Matched anywhere in the line rather than at its start: the log interleaves the recorded
+        // target's own stdout, so nothing guarantees this banner begins one.
+        let at = line.to_ascii_lowercase().find(DUMPED)?;
+        // `to_ascii_lowercase` maps ASCII in place, so the byte offset is the same in both.
+        let path = line[at + DUMPED.len()..].trim().trim_end_matches('.');
+        (!path.is_empty()).then_some(path)
+    })
+}
+
+/// The line of a failed recorder's log that says *why*.
+///
+/// [`first_meaningful_line`] skips the banner, which was enough for the not-elevated case it was
+/// written for, where the refusal is the first thing after it. It is not enough in general: TTD
+/// prints `Launching '<target>'` before it tries, so any failure past that point was reported with
+/// a line that says nothing was wrong — the "reason" quoted back for #232 was the banner for the
+/// launch that then failed two lines later.
+fn failure_detail(log: &str) -> Option<&str> {
+    /// Words TTD's own failures use: `Error: Failed starting the guest process ...`,
+    /// `Administrative privileges are required to record a trace.`
+    fn reports_a_failure(line: &str) -> bool {
+        let lower = line.to_ascii_lowercase();
+        ["error", "failed", "failure", "cannot ", "denied", "unable"]
+            .iter()
+            .any(|word| lower.contains(word))
+            || lower.contains("are required")
+    }
+
+    log.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .find(|l| reports_a_failure(l))
+        // A failure that named itself in none of those words still has to report something, and
+        // the first line past the banner is the best guess available.
+        .or_else(|| first_meaningful_line(log))
+}
+
 /// First non-empty, non-banner line of TTD's output — the part that usually carries
 /// the actual error (e.g. the "Administrative privileges are required" line).
 fn first_meaningful_line(log: &str) -> Option<&str> {
@@ -286,7 +527,23 @@ fn first_meaningful_line(log: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Arch, first_meaningful_line, probe_order, split_env_entry};
+    use super::{
+        Arch, failure_detail, finished_trace, first_meaningful_line, probe_order, split_argv,
+        split_env_entry, split_target, trace_named_in,
+    };
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
+
+    /// A directory of this module's own, named per test and per process so two of these can run at
+    /// once, and emptied first so a `.run` left by an earlier run of the same test cannot be
+    /// mistaken for the one under test.
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("windbg-mcp-ttd-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the scratch directory");
+        dir
+    }
 
     #[test]
     fn split_env_entry_parses_key_value() {
@@ -306,6 +563,216 @@ mod tests {
     fn split_env_entry_rejects_missing_equals_or_empty_key() {
         assert!(split_env_entry("NOEQUALS").is_err());
         assert!(split_env_entry("=value").is_err());
+    }
+
+    // ---- the target's command line (#232) -------------------------------
+
+    /// The bug, in the shape the issue reported it: a program and its arguments are separate
+    /// entries, because that is how `TTD.exe -launch` reads them.
+    #[test]
+    fn a_target_with_arguments_becomes_a_program_and_its_arguments() {
+        assert_eq!(
+            split_target("cmd.exe /c dir C:\\Windows\\System32\\ntdll.dll").unwrap(),
+            vec![
+                "cmd.exe",
+                "/c",
+                "dir",
+                // A backslash run that never reaches a quote is literal, so a Windows path
+                // survives unchanged — which is most of what a target's arguments are.
+                "C:\\Windows\\System32\\ntdll.dll"
+            ]
+        );
+        assert_eq!(split_target("hostname.exe").unwrap(), vec!["hostname.exe"]);
+    }
+
+    /// A quoted path with spaces is one entry, not three — the case the split exists to respect.
+    #[test]
+    fn a_quoted_path_holding_spaces_is_one_argument() {
+        assert_eq!(
+            split_target("\"C:\\Program Files\\App\\app.exe\" --flag \"a b\"").unwrap(),
+            vec!["C:\\Program Files\\App\\app.exe", "--flag", "a b"]
+        );
+    }
+
+    /// And an *unquoted* one still is, when it names a file that exists.
+    ///
+    /// This is what handing the whole string to `TTD.exe` as one argument got right, and it is the
+    /// property a split on whitespace would have taken away silently: `C:\Program Files\...` is
+    /// where programs live, and the caller who was relying on it gets no error, just a recorder
+    /// looking for `C:\Program`.
+    #[test]
+    fn an_unquoted_path_that_exists_is_not_split_on_its_spaces() {
+        let dir = scratch("unquoted-path");
+        let program = dir.join("a program.exe");
+        std::fs::write(&program, b"not really an exe").expect("write the fixture");
+        let target = program.to_string_lossy().to_string();
+
+        assert_eq!(
+            split_target(&target).unwrap(),
+            vec![target.clone()],
+            "an existing path is a program, whatever whitespace it holds"
+        );
+        // Once it is followed by an argument the string is no longer a path, so it parses as the
+        // command line it is — and quoting is how the caller keeps the program whole.
+        assert_eq!(
+            split_target(&format!("\"{target}\" --flag")).unwrap(),
+            vec![target, "--flag".to_string()]
+        );
+    }
+
+    /// Rejected here rather than by `TTD.exe`, which is the difference between an error and an
+    /// error plus an output directory and a log file nobody asked for.
+    #[test]
+    fn an_empty_target_is_refused_before_anything_is_created() {
+        for empty in ["", "   ", "\t\n", "\"\"", "\" \""] {
+            let refused = split_target(empty).expect_err("this target names no program");
+            assert!(refused.contains("target"), "{refused}");
+        }
+        // A quoted argument that is *followed* by something is a different case: the empty
+        // program is still the problem, and it is still the first entry.
+        assert!(split_target("\"\" --flag").is_err());
+    }
+
+    /// The backslash rules, which are the half of Windows argv parsing that is not obvious — and
+    /// they matter here because every path in a target's arguments is full of backslashes.
+    #[test]
+    fn backslashes_are_literal_until_they_reach_a_quote() {
+        // No quote in sight: every backslash is itself, doubled runs included.
+        assert_eq!(split_argv("a\\\\b c"), vec!["a\\\\b", "c"]);
+        // An even run before a quote halves, and the quote delimits.
+        assert_eq!(split_argv("\"a\\\\\" b"), vec!["a\\", "b"]);
+        // An odd run before a quote halves and the quote survives as a character.
+        assert_eq!(split_argv("a\\\"b"), vec!["a\"b"]);
+        // A trailing backslash on a quoted path is the classic one: `"C:\dir\\"` is the directory,
+        // not an unterminated string.
+        assert_eq!(
+            split_argv("\"C:\\dir\\\\\" next"),
+            vec!["C:\\dir\\", "next"]
+        );
+        // `""` inside a quoted argument is a literal quote and leaves it quoted.
+        assert_eq!(split_argv("\"say \"\"hi\"\" now\""), vec!["say \"hi\" now"]);
+        // An empty argument is an argument.
+        assert_eq!(split_argv("a \"\" b"), vec!["a", "", "b"]);
+        // Tabs separate as spaces do, and runs of either collapse.
+        assert_eq!(split_argv("a\t\t b   c"), vec!["a", "b", "c"]);
+    }
+
+    // ---- what an exited recorder wrote (#233) ---------------------------
+
+    /// The success discriminator: the log names the finished trace, and it is on disk.
+    #[test]
+    fn a_completed_recording_is_found_by_the_path_its_log_names() {
+        let dir = scratch("completed");
+        let trace = dir.join("hostname01.run");
+        std::fs::write(&trace, b"trace").expect("write the fixture trace");
+
+        let log = format!(
+            "Microsoft (R) TTD 1.01.11\n\
+             Launching 'hostname.exe'\n\
+             Recording has started of process (PID:5568) on trace file: {}\n\
+             hostname.exe(x64) (PID:5568): Process exited with exit code 0 after 156ms\n\
+             Full trace dumped to {}\n",
+            trace.display(),
+            trace.display()
+        );
+        assert_eq!(
+            finished_trace(&log, &dir, SystemTime::now()).as_deref(),
+            Some(trace.as_path())
+        );
+    }
+
+    /// And by what is in the directory when the log does not say — that line's wording is TTD's,
+    /// so the ground truth is the file.
+    #[test]
+    fn a_completed_recording_is_still_found_without_the_log_line() {
+        let dir = scratch("no-log-line");
+        let trace = dir.join("target01.run");
+        std::fs::write(&trace, b"trace").expect("write the fixture trace");
+        // Beside a file that is not a trace, and one that is only named like the index.
+        std::fs::write(dir.join("ttd_record.log"), b"log").expect("write the log");
+        std::fs::write(dir.join("target01.idx"), b"idx").expect("write the index");
+
+        assert_eq!(
+            finished_trace("nothing useful here\n", &dir, SystemTime::now()).as_deref(),
+            Some(trace.as_path())
+        );
+    }
+
+    /// A `.run` older than this recorder is somebody else's, and reporting it would be the same
+    /// false claim in the other direction — "complete", naming a trace of a different run.
+    #[test]
+    fn a_trace_an_earlier_recording_left_behind_is_not_claimed() {
+        let dir = scratch("stale");
+        std::fs::write(dir.join("older01.run"), b"trace").expect("write the fixture trace");
+
+        // As if the recorder had been spawned an hour after that file was written.
+        let spawned = SystemTime::now() + Duration::from_secs(3600);
+        assert_eq!(finished_trace("", &dir, spawned), None);
+        // Nothing at all is the same answer, and so is a directory that is not there.
+        assert_eq!(
+            finished_trace("", &scratch("empty"), SystemTime::now()),
+            None
+        );
+        assert_eq!(
+            finished_trace("", &dir.join("does-not-exist"), SystemTime::now()),
+            None
+        );
+    }
+
+    /// The started line names a trace that may never be finalised, so only the finished one counts.
+    #[test]
+    fn only_the_finished_line_names_a_trace() {
+        assert_eq!(
+            trace_named_in("Recording has started of process (PID:1) on trace file: C:\\t\\a.run"),
+            None
+        );
+        assert_eq!(
+            trace_named_in("Full trace dumped to C:\\t\\a.run"),
+            Some("C:\\t\\a.run")
+        );
+        // The last one wins: one recorder run can finish several traces.
+        assert_eq!(
+            trace_named_in("Full trace dumped to C:\\t\\a.run\nFull trace dumped to C:\\t\\b.run"),
+            Some("C:\\t\\b.run")
+        );
+        assert_eq!(trace_named_in("Full trace dumped to \n"), None);
+    }
+
+    /// The reported reason has to be the line that says what went wrong.
+    ///
+    /// `Launching '<target>'` is printed *before* the attempt, so it is the first meaningful line
+    /// of every log including the failing ones — which is how #232's failure came to be reported
+    /// with a line saying nothing was wrong.
+    #[test]
+    fn the_reason_for_a_failure_is_read_past_the_launch_banner() {
+        let log = "Microsoft (R) TTD 1.01.11\n\
+                   Launching '\"cmd.exe /c dir C:\\Windows\"'\n\
+                   Error: Failed starting the guest process \"cmd.exe /c dir C:\\Windows\"\n\
+                        : error:(2)The system cannot find the file specified.\n";
+        let detail = failure_detail(log).expect("a failing log has a reason");
+        assert!(detail.starts_with("Error: Failed starting"), "{detail}");
+        assert!(
+            first_meaningful_line(log).is_some_and(|l| l.starts_with("Launching")),
+            "the banner is what the old reading returned, which is why this test exists"
+        );
+    }
+
+    /// And the case the watch was built for still reports the same line it always did.
+    #[test]
+    fn the_not_elevated_refusal_is_still_the_reason() {
+        let log = "Microsoft (R) TTD 1.01.11\n\
+                   Release: 1.11.428.0\n\
+                   Administrative privileges are required to record a trace.\n";
+        assert_eq!(
+            failure_detail(log),
+            Some("Administrative privileges are required to record a trace.")
+        );
+        // A log with no failure word in it still has to say something.
+        assert_eq!(
+            failure_detail("Launching 'x.exe'\n"),
+            Some("Launching 'x.exe'")
+        );
+        assert_eq!(failure_detail(""), None);
     }
 
     #[test]
