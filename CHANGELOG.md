@@ -72,6 +72,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `detached` — a detached process is still running somewhere, and on a live kernel that is the
   difference between a machine that is up and one that is not.
 
+  The ending reaches the two channels beside the result as well: `run_to_address`'s tool
+  description now names the fourth verdict (an output schema never reaches the model, so a
+  description that enumerates three when there are four is the only place a model could learn
+  otherwise), and a session transcript's `stop` event carries `target_gone` — without it an ending
+  is a locationless stop with both other flags false, which is what an ordinary stop looks like,
+  followed by every later call being refused with nothing joining the two.
+
 - **Execution control with no debuggee no longer takes the worker down**, which is the same defect's
   other half and was a `STATUS_ACCESS_VIOLATION` inside DbgEng — a structured exception, so no
   `catch_unwind` traps it. `execute 'g'` on a session whose target had exited hit it; so does a raw
