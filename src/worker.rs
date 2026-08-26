@@ -3512,6 +3512,10 @@ impl Debuggee for BatchEngine<'_> {
         self.e.is_running().ok()
     }
 
+    fn has_target(&mut self) -> Option<bool> {
+        self.e.has_target().ok()
+    }
+
     fn run_to(&mut self, address: &str, timeout_ms: u32) -> Result<Ran, String> {
         // The typed half is dropped here, deliberately: a batch's product is its own report,
         // which renders every step into one narrative, and a step does not answer separately.

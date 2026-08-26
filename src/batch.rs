@@ -807,6 +807,15 @@ pub trait Debuggee {
     /// terminated mid-transaction. A walk stopped by the budget reports how much of the pool it
     /// reached, so a short step degrades to a partial answer that says so rather than to a failure.
     fn pool(&mut self, query: &PoolOp, budget_ms: u32) -> Result<Ran, String>;
+    /// Whether the session still holds a target at all. `None` when the engine could not be
+    /// asked, which is not the same as "no" and must not be read as one.
+    ///
+    /// Asked on the paths where a step's own answer cannot carry the fact — chiefly a command
+    /// that **fails** after an earlier segment resumed the target, where the pump then watches the
+    /// process exit: the failure is what the step returns, and the ending would otherwise survive
+    /// only in appended prose.
+    fn has_target(&mut self) -> Option<bool>;
+
     /// How long this batch has been running.
     fn elapsed(&self) -> Duration;
     /// Whether something outside the batch has asked it to stop early and roll back — a client
@@ -1308,9 +1317,15 @@ fn run_step(
                 result: StepResult::Failed(why),
                 output: String::new(),
                 cut_short: false,
-                // A step that failed did not end the target. If the target is nevertheless gone,
-                // the failure is the engine saying so, and `probe_state` is what reads that.
-                target_gone: false,
+                // **A step can fail and still have ended the target**, and nothing it returns can
+                // say so: `raw_command`'s own contract is that a command failing part-way may
+                // already have run an earlier segment that resumed the target, and the pump that
+                // follows is where the process then exits. The failure comes back as an error
+                // string with the ending in appended prose, so the engine is what is asked. Left
+                // unread, `probe_state` reaches its "a step resumed and did not report a stop"
+                // arm and reports the session **running** — the most wrong of the answers
+                // available, on a session that has no target at all.
+                target_gone: d.has_target() == Some(false),
             };
         }
     };
@@ -1708,8 +1723,9 @@ pub fn render(report: &BatchReport) -> String {
             // assertion contract is the whole reason a caller reached for a batch.
             match report.steps.get(at - 1) {
                 Some(step) if !step.ok() =>
-                    "Its own expectation did not hold, or could not be checked once the target \
-                     was gone — the step list says which.",
+                    "That step did not itself succeed, though — its action failed, or an \
+                     expectation on it did not hold, or one could not be checked once the target \
+                     was gone. The step list says which.",
                 _ => "Nothing failed: the step did what it was asked.",
             }
         ),
@@ -1826,6 +1842,12 @@ mod tests {
         /// rather than on a count, because *which step* ended it is the whole of what the report
         /// has to name.
         ends_target_on: Option<String>,
+        /// Whether that call has now been answered, so [`Debuggee::has_target`] can say no.
+        ///
+        /// Set from the *call*, not from its result: a command that fails can still have ended the
+        /// target, which is precisely the case a script that only marked successful calls could
+        /// not express.
+        target_ended: bool,
     }
 
     /// The message a scripted panic carries, so the report can be asserted to have kept it.
@@ -1850,6 +1872,7 @@ mod tests {
                 sealed: false,
                 running: Some(false),
                 ends_target_on: None,
+                target_ended: false,
             }
         }
 
@@ -1965,14 +1988,19 @@ mod tests {
         /// [`Self::answer`], as the call a *step* makes — carrying whether the break reached this
         /// call, which is how a real engine reports it.
         fn answer_run(&mut self, call: &str) -> Result<Ran, String> {
+            // Before the `?` below, so a call scripted to *fail* can still have ended the target.
+            if self
+                .ends_target_on
+                .as_deref()
+                .is_some_and(|matching| call.contains(matching))
+            {
+                self.target_ended = true;
+            }
             let output = self.answer(call)?;
             let interrupted = self
                 .cut_short_after
                 .is_some_and(|after| self.calls.len() >= after);
-            let target_gone = self
-                .ends_target_on
-                .as_deref()
-                .is_some_and(|matching| call.contains(matching));
+            let target_gone = self.target_ended;
             Ok(Ran {
                 output,
                 interrupted,
@@ -2017,6 +2045,9 @@ mod tests {
         }
         fn running(&mut self) -> Option<bool> {
             self.running
+        }
+        fn has_target(&mut self) -> Option<bool> {
+            Some(!self.target_ended)
         }
         fn rolling_back(&mut self) {
             // A real host seals the job against further breaks here; the script only records that
@@ -2243,6 +2274,45 @@ mod tests {
             text.contains("could not be checked once the target was gone"),
             "{text}"
         );
+    }
+
+    /// A command that **fails** and ends the target anyway is still an ending.
+    ///
+    /// `raw_command`'s own contract is that a command failing part-way may already have run an
+    /// earlier segment that resumed the target — `g; bogus` is the shape — and the pump that
+    /// follows is where the process exits. The step returns an error string with the ending only
+    /// in appended prose, so nothing it hands back can carry it, and the engine has to be asked.
+    ///
+    /// The wrong answer is not merely vaguer, which is why this is pinned: unread, `probe_state`
+    /// reaches its "a step resumed and did not report a stop" arm and reports the session
+    /// **RUNNING** — on a session that has no target at all.
+    #[test]
+    fn a_command_that_fails_after_ending_the_target_is_still_an_ending() {
+        let mut d = stopped()
+            .on("g; bogus", Err("the debugger refused `bogus`"))
+            .ends_the_target_on("g; bogus");
+
+        let report = run(&mut d, &op(vec![cmd("g; bogus")], vec![]), BUDGET);
+        assert!(
+            report.steps[0].target_gone,
+            "the ending has to reach the step even though the command failed: {:?}",
+            report.steps[0]
+        );
+        assert_eq!(
+            report.outcome,
+            BatchOutcome::TargetGone { at: 1 },
+            "a terminal ending outranks the step's own failure: {report:?}"
+        );
+        assert_eq!(
+            report.after,
+            SessionAfter::Ended {
+                by: "`g; bogus`".to_string()
+            },
+            "the session is over, not running: {report:?}"
+        );
+        // And the headline must own both halves rather than claiming nothing failed.
+        let text = render(&report);
+        assert!(text.contains("did not itself succeed"), "{text}");
     }
 
     /// The other half of the same sentence: a step that ended the target and *did* do everything
