@@ -19,11 +19,12 @@ adding the debugger tier takes it to ~50s, almost all of it two tests waiting ou
 lease grace, and a call staying silent long enough to have to report that it is still running.
 
 **The pass count is the same either way**, because each gate is inside its own test: `cargo test
---test mcp_smoke` reports 69 passed with the tier off and 69 passed with it on. (A plain `cargo test`
-runs the unit tests beside it and prints a result line per binary, so it is this harness's own line
-to read.) The runtime is what tells the two runs apart, and `--nocapture` is what prints the
-`SKIPPED` reason — a run that reports 69 green having taken a second covered no debugger claim at
-all.
+--test mcp_smoke` reports the same number passed with the tier off as with it on — 85 on 2026-08-26,
+against ~2s and ~57s respectively, but it moves whenever a test is added, so re-derive it rather
+than reading it here. (A plain `cargo test` runs the unit tests beside it and prints a result line
+per binary, so it is this harness's own line to read.) The runtime is what tells the two runs apart,
+and `--nocapture` is what prints the `SKIPPED` reason — a run that reports every test green having
+taken a second covered no debugger claim at all.
 
 ### Tiers
 
@@ -126,6 +127,17 @@ minutes, the other touches another machine; see below. Neither is automated, and
 live checklist is not either: no runner has a kernel target, a TTD engine, or elevation.
 
 ## What it asserts, and why each one is a dependency tripwire
+
+**The artefact, before it runs.** The exe carries a PE version resource, with `CompanyName`,
+`ProductName`, `OriginalFilename`, `InternalName` and `FileVersion` pinned to their values and
+`ProductVersion` pinned to the identity `build.rs` stamped — the same string `serverInfo.version`
+reports. It is read back through `GetFileVersionInfoW`, the API Explorer and the reputation systems
+read it through, rather than by scanning the file for the string, which would pass on a resource
+Windows itself refuses to parse. This is a test rather than a hard failure in `build.rs` because the
+resource needs `rc.exe` and the `cargo check --target x86_64-pc-windows-msvc` this repo runs from a
+Mac has none: the build script warns and carries on, so the only thing standing between a missing
+resource and a release is this assertion, on the one host that can build one. To check that it still
+catches the case it is for, point `RC_PATH` at nothing, touch `build.rs`, and re-run it.
 
 **Transport.** Every line the server writes to stdout parses as JSON-RPC, and the startup log
 appears on **stderr**. A dependency that prints a banner or a warning to stdout desynchronizes

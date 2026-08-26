@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The binary carries a PE version resource** — `FileVersion`, `ProductVersion`, `CompanyName`,
+  `ProductName`, `FileDescription`, `LegalCopyright`, `OriginalFilename`, `InternalName` and
+  `Comments`, where a Rust binary carries none of them by default. Explorer's properties dialog is
+  the visible half; the reason is the other one. Windows Defender quarantined a freshly built
+  `windbg-mcp.exe` as `Trojan:Win32/Bearfoos.B!ml`, and an absent version resource is one of the two
+  causes Microsoft names for that same detection on its own shipped binaries — an `!ml` verdict is a
+  machine-learning score rather than a signature match, so a binary with no metadata is scored on
+  what little there is. `ProductVersion` carries the git-stamped identity (`0.12.1+g1a2b3c4`) while
+  `FileVersion` stays the bare release, so the dialog answers the same question `serverInfo.version`
+  does. This does not make the binary signed, and signing is what the reputation systems above
+  Defender actually read: [`FOLLOWUPS.md`](./FOLLOWUPS.md) item 50 is what remains.
 - **A 32-bit .NET dump is opened by an engine that can load its SOS** (issue #234). An extension DLL
   is loaded into the debugger's own process, so its architecture is the *host's*: the 32-bit
   `sos.dll` will not load into this server's x64 engine (`Win32 error 0n193`) and the 64-bit one

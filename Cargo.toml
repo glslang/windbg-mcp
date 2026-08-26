@@ -2,6 +2,12 @@
 name = "windbg-mcp"
 version = "0.12.1"
 edition = "2024"
+# Not published to crates.io — these are here because `build.rs` stamps them into the binary's PE
+# version resource, which is what Explorer's properties dialog and Defender's ML scoring read
+# (`FOLLOWUPS.md` item 50). The description is the short one, from `server.json`.
+description = "WinDbg/DbgEng over MCP: crash dumps, live user & kernel, driver IOCTLs, and TTD."
+repository = "https://github.com/glslang/windbg-mcp"
+license = "MIT"
 
 [dependencies]
 dbgscope = { git = "https://github.com/glslang/dbgscope", rev = "19a87d80768b3c236f873898e47762696d8498ae" }
@@ -55,7 +61,20 @@ windows-sys = { version = "0.61", features = [
 # left frozen. Small and focused — it pulls in no framework behind it.
 windows-service = "0.8"
 
+[build-dependencies]
+# The PE version resource (`build.rs`), which is item 50's cheap half: a Rust binary carries none by
+# default, and an empty `FileVersion`/`CompanyName`/`ProductName` is one of the two causes Microsoft
+# names for the `Bearfoos.B!ml` verdict this binary has drawn. Default features off drops its `toml`
+# dependency, whose only job is reading a `[package.metadata.winresource]` table — the fields are
+# set from `build.rs` instead, because one of them is the git revision only that script computes.
+winresource = { version = "0.1", default-features = false }
+
 [dev-dependencies]
+# `Win32_Storage_FileSystem` for `GetFileVersionInfoW`, so `mcp_smoke` can read the PE version
+# resource back off the exe it just built. A dev-dependency rather than a feature on the entry
+# above: the edition-2024 resolver does not unify these into a normal build, so the shipped
+# binary's `windows-sys` surface is unchanged by a test wanting to check the metadata.
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 # `test-util` only, and only for the tests: `src/progress.rs` asserts on a heartbeat measured in
 # tens of seconds, and the alternative — real sleeps shrunk to milliseconds — is a test that fails
 # on a loaded runner for reasons that have nothing to do with the code. A paused clock makes the
