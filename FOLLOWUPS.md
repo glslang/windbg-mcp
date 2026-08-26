@@ -36,7 +36,10 @@ it, and a run can be graded but not *compared*, because nothing records the mode
 server build it ran against (both 2026-08-25, and **both have since landed**, the same day), and
 items 47–48 from fixing [#226](https://github.com/glslang/windbg-mcp/issues/226) — where making
 every target take the bounded wait left one target type nobody on this bench can measure, and where
-an x64 CI failure turned out to be a pre-existing answer to an ordinary outcome (2026-08-25), and
+an x64 CI failure turned out to be a pre-existing answer to an ordinary outcome (2026-08-25;
+**item 48 has since landed**, on 2026-08-26, with
+[#242](https://github.com/glslang/windbg-mcp/issues/242) reporting the same seam from the other
+end), and
 items 49–50 from moving the engine into a process of the target's architecture, so a 32-bit .NET
 dump can load the SOS no in-process arrangement can
 ([#234](https://github.com/glslang/windbg-mcp/issues/234), 2026-08-26) — and, while testing that,
@@ -2643,7 +2646,41 @@ which are the shape a TTD one would copy.
 
 ---
 
-## 48. [dbgscope + windbg-mcp] A target that exits during a `go` is reported as a catastrophic failure
+## 48. [dbgscope + windbg-mcp] A target that exits during a `go` is reported as a catastrophic failure — **landed** (2026-08-26)
+
+**Landed** with [#242](https://github.com/glslang/windbg-mcp/issues/242), which reported the same
+seam from the other end (an exit racing `settle`'s pump, and the access violation beside it). Kept
+because two of the things this entry says are wrong, and both were wrong in a way worth recording.
+
+**"The engine's output buffer holds exactly that text" — it does not.** This entry said WinDbg
+prints `cmd.exe exited with code 0` and that the `Err` path throws that away. Measured on dbgeng
+10.0.26100.1 (ARM64), the buffer across a `g` that ends the target holds the echo and the module
+loads and **no exit banner at all**; `GetExitCode` fails `E_UNEXPECTED` by then and `.lastevent`
+answers `<no event>`, so the engine will not say *how* it ended, only that there is nothing left.
+The output is still worth keeping — it is the only copy of what the run printed — but the sentence
+that justified keeping it was describing a banner this engine does not emit.
+
+**And the decision it deferred was the smaller half.** "Is an exited target an error at all" is
+answered by one field; what the work actually needed was the *other* half this entry did not
+mention, which is that execution control reaching an engine with no debuggee is a
+`STATUS_ACCESS_VIOLATION` that takes the worker down. That is what made this a fault rather than a
+message, and it is why the fix is a guard in dbgscope's primitives rather than a variant here.
+
+**What it became.** An ending, not an error: `CommandRun::target_gone` and
+`RunToOutcome::TargetGone` in dbgscope, each carrying the run's output;
+`structured::StopReport::target_gone` and `RunToVerdict::TargetGone` here, on both halves of the
+result; and `worker::refuse_when_the_target_is_gone`, so every tool answers one refusal naming
+`end_session` rather than each failing its own way. The session is **not** retired on the
+supervisor's side — see below.
+
+**What is left, and it is deliberate.** `session_status` still reports such a session as `open`.
+Telling the supervisor would need a new `WorkerMessage` and a `SessionState` for it (`Retired`
+means "the worker still holds a target", which is the opposite of this), and the caller already has
+the fact: every call is refused with it, and `end_session` works. Worth doing when something else
+needs a worker→supervisor state channel; not worth inventing one for a status string.
+
+<details>
+<summary>The original entry, as written on 2026-08-25</summary>
 
 **What happens.** `go`, a step, or a `resume` whose debuggee exits while the engine is waiting comes
 back as `Debug command failed: Catastrophic failure (0x8000FFFF)`. That is the raw `E_UNEXPECTED`
@@ -2678,6 +2715,8 @@ one line: launch `cmd.exe /c exit`, `go`, read the answer.
 `worker::resumed`. The workaround in the meantime is in
 `a_raw_execution_control_command_moves_the_target_instead_of_wedging_the_session`, which asserts
 with a step rather than a `go` and says why.
+
+</details>
 
 ## 49. [windbg-mcp] What the x86 engine host left open — the routing itself is **done** (2026-08-26)
 

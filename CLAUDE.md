@@ -200,14 +200,14 @@ It checks *same-file* fragments only, so a cross-file `../README.md#some-heading
 verify by hand.
 
 **The pass count does not say which tiers ran.** Each gate is inside its test, so the `mcp_smoke`
-harness reports the same **85 passed** with the debugger tier off as with it on — that harness's own
+harness reports the same **87 passed** with the debugger tier off as with it on — that harness's own
 result line, since a plain `cargo test` runs the crate's several hundred unit tests beside it and
 prints a result line per binary. What differs between the two runs is the runtime (measured on the
 ARM64 bench 2026-08-23: **1.6s against 61s** for `cargo test --test mcp_smoke`) and the `SKIPPED`
 lines, which only `--nocapture` prints. Read one of those two before believing a run covered a
 debugger claim. The count moves whenever a test is added — it was 69 until #195 and #196, 75
-until item 37, 79 until the TTD tier and 84 until item 50's version-resource test — and it
-said 83 while it was 84, which is the usual state of it, so re-derive it rather than trusting this
+until item 37, 79 until the TTD tier, 84 until item 50's version-resource test and 85 until
+item 48's two endings — and it said 83 while it was 84, which is the usual state of it, so re-derive it rather than trusting this
 sentence.
 
 **The dev exe can be locked too, and the failure is quiet.** A worker left running — a driver
@@ -699,10 +699,34 @@ that is itself the answer.
 **And a live target has a lifetime, which is what makes a launch test different from every other
 one here.** A dump does not go away mid-test; a process does. `go` on `cmd.exe /c ping -n 30` runs
 to a breakpoint on ARM64 and to *process exit* on x64 — where `cmd` opens `ping.exe`, hits
-`NtCreateFile` once and then waits thirty seconds — and a target that exits during the wait comes
-back as `Catastrophic failure (0x8000FFFF)`, which is pre-existing (measured against both waits)
-and is `FOLLOWUPS.md` item 48. So a launch test asserts with a **step**, which completes on the
-next instruction on every architecture, unless the target's lifetime is what it is about.
+`NtCreateFile` once and then waits thirty seconds — so the same test can be about the target's
+lifetime on one architecture and not on the other. A test that is not about it asserts with a
+**step**, which completes on the next instruction everywhere. (That used to be the workaround for
+something worse: an exit during the wait came back as `Catastrophic failure (0x8000FFFF)`, DbgEng's
+raw `E_UNEXPECTED`, reported unchanged. Fixed with [#242] — an ending is now
+`StopReport::target_gone` carrying what the run captured — so the step is a preference again rather
+than a way round a defect.)
+
+**Once a target is gone the session is over, and three places say so rather than one.** dbgscope
+refuses every raw command, because text driven into an engine with no debuggee is a
+`STATUS_ACCESS_VIOLATION` inside DbgEng that no `catch_unwind` traps — measured on a fresh engine
+as well as on one whose debuggee had just left, which is what says the trigger is the missing
+debuggee and not the departure. `worker::refuse_when_the_target_is_gone` covers the typed tools,
+which reach the engine's own interfaces rather than `Execute` and would otherwise each fail
+differently for one fact; it exempts the openers (an engine before its target reads the same),
+`end_session` (the answer every refusal gives) and `interrupt` (which never reaches the queue). And
+`raw_command` reports the ending from the **run** rather than the command's name, because
+`.detach`, `q` and `qd` take the target away as they return while `.kill` measurably does not — it
+leaves a target that still reads a stack and goes away on the next resume. A name list would have
+to get that right per engine version.
+
+Two traps if you touch this. The refusal's category is `stale_session`, and a worker's category is
+only as good as `engine::engine_error`'s match: its `_` arm folded this one into `debugger` — the
+exact failure its own doc comment warns about — until the launch-tier test asserted the category
+rather than the message. And a session whose target is gone is still reported `open` by
+`session_status`, deliberately; `FOLLOWUPS.md` item 48 says what telling the supervisor would cost.
+
+[#242]: https://github.com/glslang/windbg-mcp/issues/242
 
 ## An engine in another process (`src/dump.rs`, `src/enginehost.rs`)
 

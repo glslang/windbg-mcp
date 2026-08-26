@@ -123,8 +123,8 @@
       "inputSchema": 314,
       "modelVisible": 440,
       "name": "go",
-      "outputSchema": 1248,
-      "wire": 1837
+      "outputSchema": 1297,
+      "wire": 1886
     },
     {
       "annotations": 118,
@@ -330,8 +330,8 @@
       "inputSchema": 314,
       "modelVisible": 451,
       "name": "reverse_go",
-      "outputSchema": 1248,
-      "wire": 1853
+      "outputSchema": 1297,
+      "wire": 1902
     },
     {
       "annotations": 114,
@@ -339,8 +339,8 @@
       "inputSchema": 791,
       "modelVisible": 1320,
       "name": "run_to_address",
-      "outputSchema": 1422,
-      "wire": 2887
+      "outputSchema": 1462,
+      "wire": 2927
     },
     {
       "annotations": 75,
@@ -384,8 +384,8 @@
       "inputSchema": 314,
       "modelVisible": 438,
       "name": "step_back",
-      "outputSchema": 1248,
-      "wire": 1833
+      "outputSchema": 1297,
+      "wire": 1882
     },
     {
       "annotations": 109,
@@ -393,8 +393,8 @@
       "inputSchema": 314,
       "modelVisible": 398,
       "name": "step_into",
-      "outputSchema": 1248,
-      "wire": 1786
+      "outputSchema": 1297,
+      "wire": 1835
     },
     {
       "annotations": 109,
@@ -402,8 +402,8 @@
       "inputSchema": 314,
       "modelVisible": 410,
       "name": "step_over",
-      "outputSchema": 1248,
-      "wire": 1798
+      "outputSchema": 1297,
+      "wire": 1847
     },
     {
       "annotations": 121,
@@ -411,8 +411,8 @@
       "inputSchema": 314,
       "modelVisible": 441,
       "name": "step_over_back",
-      "outputSchema": 1248,
-      "wire": 1841
+      "outputSchema": 1297,
+      "wire": 1890
     },
     {
       "annotations": 65,
@@ -466,10 +466,10 @@
     "inputSchema": 40207,
     "instructions": 1983,
     "modelVisible": 67766,
-    "outputSchema": 103992,
-    "payload": 178618,
+    "outputSchema": 104326,
+    "payload": 178952,
     "tools": 51,
-    "wire": 178500,
+    "wire": 178834,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 9746
   }

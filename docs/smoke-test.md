@@ -19,8 +19,8 @@ adding the debugger tier takes it to ~50s, almost all of it two tests waiting ou
 lease grace, and a call staying silent long enough to have to report that it is still running.
 
 **The pass count is the same either way**, because each gate is inside its own test: `cargo test
---test mcp_smoke` reports the same number passed with the tier off as with it on — 85 on 2026-08-26,
-against ~2s and ~57s respectively, but it moves whenever a test is added, so re-derive it rather
+--test mcp_smoke` reports the same number passed with the tier off as with it on — 87 on 2026-08-26,
+against ~2s and ~55s respectively, but it moves whenever a test is added, so re-derive it rather
 than reading it here. (A plain `cargo test` runs the unit tests beside it and prints a result line
 per binary, so it is this harness's own line to read.) The runtime is what tells the two runs apart,
 and `--nocapture` is what prints the `SKIPPED` reason — a run that reports every test green having
@@ -31,7 +31,7 @@ taken a second covered no debugger claim at all.
 | Tier | Gate | Needs | Catches |
 | --- | --- | --- | --- |
 | **Protocol** | always | no debugger, no target, and no network off this machine — it does bind a loopback port for the listener | transport, revision negotiation, tool-surface drift, and the listener's lease up to the point a session is opened |
-| **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump, and `cmd.exe` for the two that launch one | `dbgscope` / DbgEng regressions, a lease expiry releasing a real engine worker, and driving execution on a live user-mode target |
+| **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump, and `cmd.exe` for the four that launch one | `dbgscope` / DbgEng regressions, a lease expiry releasing a real engine worker, and driving execution on a live user-mode target |
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a live kernel target you can freeze — KDNET, or serial | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
 | **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
@@ -572,9 +572,31 @@ processes, so they need real ones:
   `timed_out` field `go` itself answers with is asserted false on the test above, and its true case
   belongs to dbgscope's own engine tests, where a two-second bound costs nothing.
 
-  These two are the only tests in the suite that drive **execution** on anything but a live kernel,
-  which is exactly why the bug survived: the live-kernel tier was already on the bounded wait, and
-  no other tier can `go` at all.
+- *A target that ends during a resume is an ending, and the session says so.*
+  [#242](https://github.com/glslang/windbg-mcp/issues/242) and `FOLLOWUPS.md` item 48, through the
+  typed surface: `go` on a `cmd.exe /c exit` has to come back **not** a tool error, with
+  `target_gone` on the stop report, no `stopped_at` (a target that is gone has no position, and
+  naming one invents a stop), and the ending in the text as well — a structured-aware client
+  forwards `structuredContent` and drops the text, so a fact on one half is a fact half the clients
+  never see. Then the chain: `backtrace`, `registers` and `execute 'k 3'` each have to be refused
+  with the same sentence and the category `stale_session`, and `end_session` has to work, since it
+  is what every one of those refusals points at. Both halves are asserted because either alone is
+  satisfiable by something wrong — reporting the ending while leaving the half-dead chain in place
+  fixes a message, and refusing everything afterwards without reporting it turns a program
+  finishing into a call that failed. The category rather than the message, which is what caught
+  `engine_error` folding it into `debugger`.
+- *A target that ends during the raw hatch's pump reports it with what the pump captured.* The
+  minimal repro from the issue, and the corner #226's fix left open: `execute 'g'` sets the run
+  state and returns its echo, so it is `settle`'s pump that the exit races. What is asserted about
+  the output is only that it **survived** — which lines a `cmd.exe` prints on its way out belongs
+  to the host, and the buffer being discarded with the wait's error was the bug. Plus the absence
+  of "now stopped", since the sentence the *other* endings get would name a position that does not
+  exist.
+
+  These four are the only tests in the suite that drive **execution** on anything but a live
+  kernel, which is exactly why both bugs survived: the live-kernel tier was already on the bounded
+  wait, and no other tier can `go` at all. The two above use a target that never stops; these two
+  use one that is over on the first resume, and that difference is the whole of what they add.
 
 **The listener's lease.** `--listen` gives up the one property stdio has for free: a closed stdin
 means the client is definitively gone, and every target is released. Over HTTP a silent client is
