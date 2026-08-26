@@ -1113,9 +1113,14 @@ open.
 recorder's own refusal — `TTD.exe not found`, `Administrative privileges`, `0x80070005` — and
 print `SKIPPED`. Every *other* failure fails the test, which is the distinction that keeps the tier
 honest: a helper that treated any error as a skip would pass on a machine where recording is
-broken. Replay is a third stand-down, taken separately: a host can record a trace it cannot open,
-because replay needs the WinDbg store engine beside the binary, and by then the recording half has
-already been asserted.
+broken. Replay is a third stand-down, taken separately: a host can record a trace it cannot open, because
+replay needs the WinDbg store engine beside the binary, and by then the recording half has already
+been asserted. It is keyed on the **server's own diagnostic** — the sentence
+`worker::explain_trace_failure` appends when there is no `ttd\` beside the executable — and not on
+`0x80070057`, which is the engine's "the parameter is incorrect" and can equally come from a trace
+that failed to load for some other reason. Every other `open_trace` failure fails the test. A
+`ttd\` of the *wrong architecture* is deliberately not excused: it gets the engine's error with no
+such sentence, and a misconfigured bundle should be loud.
 
 | Test | Claim | How it is read |
 | --- | --- | --- |

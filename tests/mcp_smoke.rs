@@ -11354,15 +11354,26 @@ fn ttd_queries_answer_with_the_fields_they_promise() {
     );
     assert_no_error(&response, "tools/call open_trace");
     if is_tool_error(&response) {
-        // Replay needs the WinDbg store engine beside the binary; System32's rejects a `.run`
-        // outright with `0x80070057`. A host that can record but not replay stands this half down
-        // rather than failing — the recording half has already run in the tests above.
-        skip(&format!(
-            "this host recorded a trace it cannot replay: {}",
-            text_of(&response["result"])
-        ));
-        let _ = std::fs::remove_dir_all(&out_dir);
-        return;
+        let text = text_of(&response["result"]);
+        // Stand down for the **one** reason that is the host's: no replay engine beside the
+        // binary. Any other `open_trace` failure — a regression, a trace that will not load — has
+        // to fail, or this test passes having exercised neither query, which is the shape
+        // [`recorded`] exists to avoid one function above.
+        //
+        // Keyed on the server's own diagnostic, not on `0x80070057`. That code is the engine's
+        // "the parameter is incorrect" and a trace that failed to load for some other reason can
+        // carry it too; the sentence below is appended by `worker::explain_trace_failure` only
+        // when `replay_engine_bundled()` is false, which is exactly the condition being excused.
+        // A `ttd\` of the wrong architecture is deliberately *not* excused — it gets the engine's
+        // error with no such sentence, and a misconfigured bundle should be loud.
+        if text.to_ascii_lowercase().contains("cannot replay") {
+            skip(&format!(
+                "this host recorded a trace it cannot replay: {text}"
+            ));
+            let _ = std::fs::remove_dir_all(&out_dir);
+            return;
+        }
+        panic!("`open_trace` failed for a reason that is not the host's:\n{text}");
     }
     let session = maybe_session_id(&response["result"])
         .unwrap_or_else(|| panic!("`open_trace` opened without minting a handle: {response}"));
