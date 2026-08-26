@@ -167,7 +167,7 @@ pub fn record_launch(
     for kv in env {
         parsed_env.push(split_env_entry(kv)?);
     }
-    let argv = split_target(target)?;
+    let argv = split_target(target, working_dir)?;
 
     // Resolve out_dir to an absolute path. When `working_dir` is set, TTD.exe would otherwise
     // resolve a relative `-out` against the *target's* cwd — mismatching where we create the
@@ -321,7 +321,10 @@ fn split_env_entry(entry: &str) -> Result<(&str, &str), String> {
 ///
 /// Refuses an empty target rather than letting `TTD.exe` report it, because at the point this runs
 /// nothing has been created yet — the same reason the environment is validated here.
-fn split_target(target: &str) -> Result<Vec<String>, String> {
+///
+/// `working_dir` is the caller's, and is taken because the probe below has to ask about the
+/// directory the *recorder* will use — see [`names_a_file`].
+fn split_target(target: &str, working_dir: Option<&str>) -> Result<Vec<String>, String> {
     let trimmed = target.trim();
     if trimmed.is_empty() {
         return Err(
@@ -333,7 +336,7 @@ fn split_target(target: &str) -> Result<Vec<String>, String> {
     // string as a single argument got right, and splitting on whitespace would look for
     // `C:\Program`; quoting only becomes necessary once such a path is followed by arguments.
     // Skipped when the caller has quoted anything, since then they have said how it parses.
-    if !trimmed.contains('"') && Path::new(trimmed).is_file() {
+    if !trimmed.contains('"') && names_a_file(trimmed, working_dir) {
         return Ok(vec![trimmed.to_string()]);
     }
     let argv = split_argv(trimmed);
@@ -344,6 +347,32 @@ fn split_target(target: &str) -> Result<Vec<String>, String> {
         _ => Err(format!(
             "`target` names no program to launch (`{target}` parses to no program)"
         )),
+    }
+}
+
+/// Does `candidate` name a file **where `TTD.exe` will look for it**?
+///
+/// Not the same question as [`Path::is_file`], and getting it wrong does not produce an error.
+/// The recorder is spawned with the caller's `working_dir` as its cwd and resolves a relative
+/// program against that, so a probe against *this process's* cwd answers for a directory nothing
+/// in the recording is using — the probe then declines, the target is split on its spaces, and
+/// `TTD.exe` launches whatever the first token resolves to.
+///
+/// Measured on `TTD.exe` 1.01.11 with `target: ".\\a program.exe"` and a `working_dir` holding
+/// that file: the split handed it `.\a` and `program.exe`, and it recorded **`a.exe`** — a
+/// different program — into a 29 MB trace that `record_trace` then reported as a complete
+/// recording. A wrong answer rather than a refusal, which is why this asks the right directory
+/// rather than falling back to both.
+///
+/// Worth knowing for the near miss beside it: TTD does **not** search its own cwd for a *bare*
+/// relative name (`aprogram.exe` in the cwd is not found; `.\aprogram.exe` is). So a bare name is
+/// a target neither this nor the code before it could launch, and keeping it whole is still the
+/// better answer — it fails naming the program the caller asked for.
+fn names_a_file(candidate: &str, working_dir: Option<&str>) -> bool {
+    let path = Path::new(candidate);
+    match working_dir {
+        Some(dir) if path.is_relative() => Path::new(dir).join(path).is_file(),
+        _ => path.is_file(),
     }
 }
 
@@ -572,7 +601,7 @@ mod tests {
     #[test]
     fn a_target_with_arguments_becomes_a_program_and_its_arguments() {
         assert_eq!(
-            split_target("cmd.exe /c dir C:\\Windows\\System32\\ntdll.dll").unwrap(),
+            split_target("cmd.exe /c dir C:\\Windows\\System32\\ntdll.dll", None).unwrap(),
             vec![
                 "cmd.exe",
                 "/c",
@@ -582,14 +611,17 @@ mod tests {
                 "C:\\Windows\\System32\\ntdll.dll"
             ]
         );
-        assert_eq!(split_target("hostname.exe").unwrap(), vec!["hostname.exe"]);
+        assert_eq!(
+            split_target("hostname.exe", None).unwrap(),
+            vec!["hostname.exe"]
+        );
     }
 
     /// A quoted path with spaces is one entry, not three — the case the split exists to respect.
     #[test]
     fn a_quoted_path_holding_spaces_is_one_argument() {
         assert_eq!(
-            split_target("\"C:\\Program Files\\App\\app.exe\" --flag \"a b\"").unwrap(),
+            split_target("\"C:\\Program Files\\App\\app.exe\" --flag \"a b\"", None).unwrap(),
             vec!["C:\\Program Files\\App\\app.exe", "--flag", "a b"]
         );
     }
@@ -608,16 +640,45 @@ mod tests {
         let target = program.to_string_lossy().to_string();
 
         assert_eq!(
-            split_target(&target).unwrap(),
+            split_target(&target, None).unwrap(),
             vec![target.clone()],
             "an existing path is a program, whatever whitespace it holds"
         );
         // Once it is followed by an argument the string is no longer a path, so it parses as the
         // command line it is — and quoting is how the caller keeps the program whole.
         assert_eq!(
-            split_target(&format!("\"{target}\" --flag")).unwrap(),
+            split_target(&format!("\"{target}\" --flag"), None).unwrap(),
             vec![target, "--flag".to_string()]
         );
+    }
+
+    /// A *relative* one is probed against the directory the recorder will run in, not this one.
+    ///
+    /// The two are different directories whenever `working_dir` is set, and the consequence is not
+    /// an error: probing here declines, the target is split on its spaces, and `TTD.exe` launches
+    /// whatever the first token resolves to. Measured on 1.01.11 with `.\a program.exe` — it
+    /// recorded `a.exe`, a different program, into a 29 MB trace reported as a complete recording.
+    #[test]
+    fn a_relative_path_is_probed_where_the_recorder_will_look_for_it() {
+        let dir = scratch("relative-working-dir");
+        std::fs::write(dir.join("a program.exe"), b"not really an exe").expect("write the fixture");
+        let working_dir = dir.to_string_lossy().to_string();
+
+        for target in [".\\a program.exe", "a program.exe"] {
+            assert_eq!(
+                split_target(target, Some(&working_dir)).unwrap(),
+                vec![target],
+                "`{target}` is one program in the recorder's own directory"
+            );
+            // And with no `working_dir` the recorder inherits this process's, where the fixture is
+            // not — so the same string is the command line it looks like. This is the half that
+            // makes the assertion above about the *directory* rather than about the string.
+            assert_eq!(
+                split_target(target, None).unwrap().len(),
+                2,
+                "`{target}` names nothing here, so it parses as a command line"
+            );
+        }
     }
 
     /// Rejected here rather than by `TTD.exe`, which is the difference between an error and an
@@ -625,12 +686,12 @@ mod tests {
     #[test]
     fn an_empty_target_is_refused_before_anything_is_created() {
         for empty in ["", "   ", "\t\n", "\"\"", "\" \""] {
-            let refused = split_target(empty).expect_err("this target names no program");
+            let refused = split_target(empty, None).expect_err("this target names no program");
             assert!(refused.contains("target"), "{refused}");
         }
         // A quoted argument that is *followed* by something is a different case: the empty
         // program is still the problem, and it is still the first entry.
-        assert!(split_target("\"\" --flag").is_err());
+        assert!(split_target("\"\" --flag", None).is_err());
     }
 
     /// The backslash rules, which are the half of Windows argv parsing that is not obvious — and
