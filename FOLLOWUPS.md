@@ -2702,12 +2702,37 @@ stock Windows, so the tier could compile a trivial .NET program, run it, dump it
 Deferred because it is a second, independent piece of machinery and the routing needed proving
 first.
 
-**The pipe is reachable by other local users.** Bounded today only because the target is a dump —
-anyone who can open the pipe could read the dump file anyway — and because the teardown is a kill,
-which is safe for a dump and would not be for a live process or a halted kernel. **Both stop being
-true** if this is ever pointed at a live 32-bit target, which is the obvious next ask (a WoW64
-`attach_process`). Neither the transport's security nor the teardown should be inherited unexamined
-into that.
+**The pipe is readable by Everyone, and under a service that matters.** `cdb` creates it, so it
+carries the default named-pipe descriptor: full control to `SYSTEM`, administrators and the creator,
+and **read** to Everyone. What a reader gets is the transport, which carries target memory.
+
+Under **stdio** that is bounded, and the bound is the whole reason this shipped: the server runs as
+the caller, so a local user who can read the pipe could open the dump file directly, and the pipe
+discloses nothing the filesystem does not.
+
+Under **`--listen` as a service it is not bounded**, which is the follow-up. The service runs as
+`LocalSystem`, so the pipe is created by `SYSTEM` and readable by Everyone while the dump it serves
+may be readable only by `SYSTEM` — an unprivileged local user can then read target memory out of a
+dump they could not open. That is a privilege boundary the stdio case does not have, and the
+argument that waved the exposure through does not survive it. (A review found the DACL; the
+deployment split was missed until it was pointed out, which is what stating a bound without naming
+where it holds costs.)
+
+**There is no fix inside this design.** A pipe this server does not create is a DACL it cannot set.
+`cdb`'s own `password=` is not one either — it would sit on a command line every local user can
+read. Closing it means hosting the engine ourselves instead of in `cdb`: an `--engine-worker` built
+for `i686-pc-windows-msvc`, talking the inherited-handle protocol this server already uses, with no
+named pipe anywhere. That was the alternative weighed in
+[#234](https://github.com/glslang/windbg-mcp/issues/234) and set aside because it needs a second
+build target and release artefact; **the listener case is the argument that may eventually decide
+it.** Until then, the narrow mitigation is to refuse the hosted path when running as a service and
+report the limitation instead, which costs a service-hosted caller SOS and costs nobody else
+anything.
+
+**The teardown has the same shape of qualifier.** It is a kill, which is safe because the target is
+a dump — no live process to orphan, no kernel to leave halted — and would not be for a live 32-bit
+target, the obvious next ask (a WoW64 `attach_process`). Neither the transport's security nor the
+teardown should be inherited unexamined into that.
 
 **Untested over the transport:** execution control, breakpoint arming and event waits — a dump
 cannot exercise them — and the user-mode heap walker, which is in scope for x86 dumps and is

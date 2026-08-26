@@ -730,9 +730,19 @@ on the broken pipe without bound — 32,089 lines of `cdb: Could not write to pi
 measured run, which hung the whole VM and needed a hypervisor reset. So the host must never outlive
 its client, and a graceful `qq` has to be driven through the engine that has by then stopped
 answering. What makes killing safe here is that the target is a **dump**: no live process to orphan,
-no kernel to leave halted. That stops being true the day this points at a live target, and so does
-the pipe's security — it is reachable by other local users, which for a dump is bounded only
-because anyone who can open it could read the dump file anyway.
+no kernel to leave halted. That stops being true the day this points at a live target.
+
+**And the pipe's security has a qualifier that is easy to state without.** `cdb` creates the pipe,
+so it carries the default descriptor: full control to `SYSTEM`, administrators and the creator, and
+**read to Everyone** — and what a reader gets is the transport, which carries target memory. Under
+stdio that is bounded, because the reader is the caller's own account and could open the dump file
+directly, so the pipe discloses nothing the filesystem does not. **Under `--listen` as a service it
+is not**: the service runs as `LocalSystem`, so the pipe is created by `SYSTEM` and readable by
+Everyone while the dump may be readable only by `SYSTEM`, and the pipe then crosses a privilege
+boundary the dump does not. Stating the bound without naming the deployment it holds for is how
+that gets missed — it was, until it was pointed out. There is no fix inside this design: a pipe
+this server does not create is a DACL it cannot set, so closing it means hosting the engine
+ourselves rather than in `cdb`. `FOLLOWUPS.md` item 49.
 
 **One typed call does not cross the transport**: `IDebugAdvanced2::GetSymbolInformation`, so
 `module_pdb` fails with `E_INVALIDARG` and `modules` rows carry no PDB identity on a remote session.

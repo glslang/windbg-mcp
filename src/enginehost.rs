@@ -179,9 +179,19 @@ impl EngineHost {
     ///
     /// The pipe name carries this process's id and a counter rather than anything guessable being
     /// unnecessary: a name has to be unique among the sessions on this machine, and it is not a
-    /// secret — the pipe is reachable by other local users, which for a dump is bounded, since
-    /// anyone who can open it could read the dump file itself. That stops being true the day this
-    /// is pointed at a live target.
+    /// secret. `cdb` creates the pipe, not this server, so it carries the **default** named-pipe
+    /// security descriptor — full control to `SYSTEM`, administrators and the creator, and *read*
+    /// to Everyone. A local user can therefore read the transport, which carries target memory.
+    ///
+    /// **Bounded under stdio, and not under a service.** Running as the caller, the reader of that
+    /// pipe is the caller's own account, which could open the dump file directly — so the pipe
+    /// discloses nothing the filesystem does not. A service-hosted listener breaks that: it runs as
+    /// `LocalSystem`, so the pipe is created by `SYSTEM` and readable by Everyone while the dump it
+    /// serves may be readable only by `SYSTEM`. Then the pipe crosses a privilege boundary the dump
+    /// does not. `FOLLOWUPS.md` item 49 carries it; the honest fix is an engine host of our own
+    /// rather than `cdb`, since a pipe we do not create is a DACL we cannot set.
+    ///
+    /// The same qualifier applies to a live target, for the teardown reason in [`Self::shutdown`].
     pub fn start(cdb: &Path, dump: &Path) -> io::Result<Self> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let pipe = format!(
