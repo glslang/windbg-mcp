@@ -66,6 +66,16 @@ jobs:
       - name: Build
         run: cargo build --release --locked
 
+      # The 32-bit worker, shipped in an `x86\` subdirectory of both artifacts. A 32-bit user dump
+      # needs a 32-bit engine, which needs a 32-bit process; the subdirectory is the loader's rule
+      # turned into the mechanism, since an executable's own directory is searched first and this
+      # one must find the 32-bit `dbgeng.dll` the operator puts beside it rather than the 64-bit
+      # engine next to the server. See `engine::x86_worker_image`.
+      - name: Build the 32-bit worker
+        run: |
+          rustup target add i686-pc-windows-msvc
+          cargo build --release --locked --target i686-pc-windows-msvc
+
       - name: Test
         run: cargo test --locked
 
@@ -76,8 +86,14 @@ jobs:
           $name = "windbg-mcp-v$ver-windows-x64"
           New-Item dist -ItemType Directory | Out-Null
 
-          # Zip: the manual / plugin download path (setup.md, README).
-          Compress-Archive -Path target/release/windbg-mcp.exe, LICENSE -DestinationPath "dist/$name.zip"
+          # Zip: the manual / plugin download path (setup.md, README). Staged rather than
+          # zipped from source paths, because the 32-bit worker has to land under `x86\` and
+          # Compress-Archive flattens whatever it is handed.
+          $zip = "zip_stage"
+          New-Item "$zip/x86" -ItemType Directory -Force | Out-Null
+          Copy-Item target/release/windbg-mcp.exe, LICENSE $zip
+          Copy-Item target/i686-pc-windows-msvc/release/windbg-mcp.exe "$zip/x86/"
+          Compress-Archive -Path "$zip/*" -DestinationPath "dist/$name.zip"
 
           # MCPB bundle: the one-click / MCP-registry path. An .mcpb is a zip with
           # manifest.json at its root, so stamp the version into the committed
@@ -90,6 +106,8 @@ jobs:
           $m.version = $ver
           $m | ConvertTo-Json -Depth 20 | Set-Content "$stage/manifest.json"
           Copy-Item target/release/windbg-mcp.exe, LICENSE $stage
+          New-Item "$stage/x86" -ItemType Directory -Force | Out-Null
+          Copy-Item target/i686-pc-windows-msvc/release/windbg-mcp.exe "$stage/x86/"
           Compress-Archive -Path "$stage/*" -DestinationPath "dist/$name-mcpb.zip"
           Move-Item "dist/$name-mcpb.zip" "dist/$name.mcpb"
 

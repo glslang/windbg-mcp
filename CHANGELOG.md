@@ -25,14 +25,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sos.dll` will not load into this server's x64 engine (`Win32 error 0n193`) and the 64-bit one
   loads and then fails on the target (`Failed to load data access DLL, 0x80004005`), because the
   CLR data access DLL is paired to the target's architecture as well as the host's. Both measured —
-  there is no in-process arrangement, so the engine moves instead: an x86 dump is now served by an
-  `x86\cdb.exe` running as a debugging server, driven over DbgEng's remote transport, and
-  `!sos.threads`, `!clrstack` and the rest answer. The dump's architecture is read from its own
-  header before anything opens it, which is what makes the choice possible at all — asking the
-  engine would need a session in a process whose architecture is by then already fixed.
-  `skills/windbg-debugging/setup.md` has the one-time copy block.
+  there is no in-process arrangement, and a process's architecture is fixed when its image loads —
+  so the *process* moves. The release now ships a 32-bit build of this same server at
+  `x86\windbg-mcp.exe`, and a 32-bit user dump is opened by that worker rather than by a
+  re-execution of the 64-bit one; `!sos.threads`, `!clrstack` and the rest answer. None of it is
+  visible to a client — one server, one handle, one tool surface, one session registry — because a
+  worker has never spoken MCP: it talks to the supervisor over the same pair of inherited anonymous
+  pipes every other session uses. The dump's architecture is read from its own header before
+  anything opens it, which is what makes the choice possible at all: asking the engine would need a
+  session in a process whose architecture is by then already fixed.
+  `skills/windbg-debugging/setup.md` has the one-time copy block for the 32-bit engine payload that
+  worker loads.
 - **An opener's summary carries a `limitation`** when the session cannot do something a caller would
-  otherwise assume it can. Today that is the case above on a host with no x86 engine available:
+  otherwise assume it can. Today that is the case above on a host with no 32-bit worker available:
   rather than failing the open — native analysis of such a dump works and always has — the dump
   opens here and the result says SOS is unreachable and what to copy. Present on both the text and
   the structured halves, so a client that forwards `structuredContent` and drops the text still

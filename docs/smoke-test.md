@@ -36,7 +36,7 @@ taken a second covered no debugger claim at all.
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a live kernel target you can freeze — KDNET, or serial | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
 | **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
 | **TTD** | `WINDBG_MCP_SMOKE_TTD=1` | `TTD.exe`, **elevation**, and the WinDbg store engine to replay what it records | that `record_trace` records the program it was given and reports a finished recording as one, and that a TTD query returns records rather than bare indices |
-| **32-bit managed dump** | `WINDBG_MCP_X86_DUMP=<path>` | a 32-bit .NET dump you supply, and an `x86` `cdb.exe` | that such a dump is routed to an engine of *its* architecture, so its 32-bit SOS loads — which this server's own engine cannot do at all |
+| **32-bit managed dump** | `WINDBG_MCP_X86_DUMP=<path>` | a 32-bit .NET dump you supply, and `x86\windbg-mcp.exe` with a 32-bit engine beside it | that such a dump is opened by a worker of *its* architecture, so its 32-bit SOS loads — which this server's own engine cannot do at all |
 | **Live (other)** | manual | a test driver on a kernel target | see [Manual checklist](#manual-checklist) |
 
 The protocol tier rides `cargo test`, so CI already runs it. The debugger tier is opt-in
@@ -1187,8 +1187,15 @@ One test, and it is the only one that asserts something **this server's own engi
 extension DLL is loaded into the debugger's process, so a 32-bit `sos.dll` cannot be loaded by the
 x64 engine (`Win32 error 0n193`) and the 64-bit one refuses a 32-bit CLR — the data access DLL
 behind it is paired to the target's architecture too. So `!sos.threads` answering is not a check
-that SOS works; it is proof that the engine holding this dump is in another process
+that SOS works; it is proof that the engine holding this dump is in a 32-bit process
 ([#234](https://github.com/glslang/windbg-mcp/issues/234)).
+
+**What the host needs, beyond the dump**, is `x86\windbg-mcp.exe` and a 32-bit `dbgeng.dll` beside
+it, in an `x86\` directory next to the binary under test — so `target\debug\x86\` for a
+`cargo test` run. Build the worker with `cargo build --target i686-pc-windows-msvc`; the engine
+payload is the copy block in the skill's `setup.md`. Both halves are checked before the worker is
+spawned, because an image whose engine is missing fails in the *loader*, before any of this
+server's code runs.
 
 Gated on a **path rather than a flag**, because the fixture is supplied rather than checked in: a
 full-memory capture of even a trivial .NET process is tens of megabytes, several times this whole
@@ -1200,10 +1207,12 @@ the discrimination the routing turns on.
 
 Two assertions, and the second is the one that took a wrong answer to find:
 
-- **No `limitation` on the summary.** The fallback is deliberately loud — a host with no x86
-  `cdb.exe` still opens the dump, because native analysis of it works and always has, and says in
-  the result that SOS is unreachable. So a run on such a host fails here rather than passing
-  quietly, which is the whole point of asserting on it.
+- **No `limitation` on the summary.** The fallback is deliberately loud — a host with no 32-bit
+  worker still opens the dump, on the x64 build, because native analysis of it works and always
+  has, and says in the result that SOS is unreachable. So a run on such a host fails here rather
+  than passing quietly, which is the whole point of asserting on it. It is also the only place the
+  *fallback* is exercised end to end, since the supervisor's choice of image is otherwise a unit
+  test (`engine::tests`).
 - **`!sos.threads`, module-qualified.** A bare `!threads` resolves to `ext.dll`'s own native thread
   table, which `open_dump` has already loaded and which answers on *any* engine — the first version
   of this test "failed" by printing a perfectly good one. Same trap as `!analyze` versus

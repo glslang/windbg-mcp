@@ -237,7 +237,7 @@ Copy-Item "$wd\winxp\kdexts.dll" "$dst\winxp" -Force   # !drvobj/!devobj/!irp �
   (Note it lives in `winxp\`, not `winext\`, and the engine already searches a `WINXP` subdir.)
 - `cargo clean` (when building from source) wipes `target\`, so re-copy after one.
 
-### 32-bit .NET dumps need an x86 engine host
+### 32-bit .NET dumps need a 32-bit server
 
 Only for **32-bit .NET Framework** dumps — a 32-bit process captured by 32-bit tooling, which is
 what `procdump.exe -ma` (as opposed to `procdump64.exe -ma`) produces. Native analysis of such a
@@ -250,15 +250,21 @@ is SOS, and no amount of configuration fixes that in one process:
   host's.
 
 An extension DLL is loaded into the debugger's own process, so the only way to load one that
-matches the target is to put the engine in a process that matches it too. Copy the package's
-**`x86`** payload into an `x86\` subdirectory beside `windbg-mcp.exe`:
+matches the target is to put the engine in a process that matches it too — and a process's
+architecture is fixed when its image loads, so that means a second image. The release zip ships
+one: a 32-bit build of this same server, at `x86\windbg-mcp.exe`. The server spawns it instead of
+re-executing itself when the dump it is opening is a 32-bit user dump, and nothing about the
+session looks different from outside — same handle, same tools, same client.
+
+What it needs beside it is a 32-bit engine. Copy the package's **`x86`** payload into that same
+`x86\` subdirectory:
 
 ```pwsh
 # $dst is the same folder as the copy block above — the one that holds windbg-mcp.exe.
 $dst = "<folder that holds windbg-mcp.exe>"
 $wd86 = (Get-AppxPackage Microsoft.WinDbg).InstallLocation + "\x86"
 New-Item "$dst\x86" -ItemType Directory -Force | Out-Null
-Copy-Item "$wd86\cdb.exe","$wd86\dbgeng.dll","$wd86\dbghelp.dll","$wd86\dbgcore.dll",`
+Copy-Item "$wd86\dbgeng.dll","$wd86\dbghelp.dll","$wd86\dbgcore.dll",`
           "$wd86\dbgmodel.dll","$wd86\symsrv.dll","$wd86\msdia140.dll" "$dst\x86" -Force
 Copy-Item "$wd86\winext" "$dst\x86\winext" -Recurse -Force
 ```
@@ -267,21 +273,23 @@ Three things about this differ from the copy block above, and each of them is a 
 wrong:
 
 - **It must be a subdirectory, never beside `windbg-mcp.exe` itself.** The loader searches an
-  executable's own directory first, so an x86 `dbgeng.dll` dropped next to the x64 one would be
-  found by the wrong process and neither would work. The package's own `amd64\` / `x86\` layout is
-  this same rule.
-- **`$arch` is *not* matched to `windbg-mcp.exe` here.** Everywhere else in this document the rule
-  is "match the DLLs to the binary that loads them", and that still holds — these DLLs are loaded
-  by `cdb.exe` from the same directory, not by `windbg-mcp.exe`. This payload is x86 because the
+  executable's own directory first — which is exactly what makes the subdirectory work, since
+  `x86\windbg-mcp.exe` finds the engine sitting next to it. Drop an x86 `dbgeng.dll` next to the
+  x64 one instead and the wrong process finds it, and neither works. The package's own `amd64\` /
+  `x86\` layout is this same rule.
+- **`$arch` is *not* matched to the `windbg-mcp.exe` you launch.** Everywhere else in this document
+  the rule is "match the DLLs to the binary that loads them", and that still holds — these DLLs are
+  loaded by `x86\windbg-mcp.exe`, not by the one beside them. This payload is x86 because the
   *target* is.
-- **Both ends must come from the same package.** The server connects to this host with its own
-  `dbgeng.dll`, and a client older than the host is refused with `0x8007053D`, *"The server is
-  currently disabled"* — an error that names neither end and reads like a permissions problem. If
-  you copied the engine above from one source, copy this from that same one.
+- **`x86\windbg-mcp.exe` has to be there too.** The engine payload alone is not enough: without
+  the 32-bit server the dump still opens, on the x64 build, and the session reports a `limitation`
+  saying SOS is unreachable. Building from source, that image is
+  `cargo build --release --target i686-pc-windows-msvc`.
 
-`cdb.exe` is the host, so the SDK's *Debugging Tools for Windows* works as a source too
-(`C:\Program Files (x86)\Windows Kits\10\Debuggers\x86`). The server looks beside its own
-executable first, then the SDK, then the store package.
+The SDK's *Debugging Tools for Windows* works as a source for the engine payload too
+(`C:\Program Files (x86)\Windows Kits\10\Debuggers\x86`) — unlike the store package it has no
+`msdia140.dll`, which is what parses a PDB, so symbols for the 32-bit target need that file from
+elsewhere.
 
 ### When the store package will not install
 

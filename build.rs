@@ -79,6 +79,20 @@ fn main() {
     {
         println!("cargo::rerun-if-changed={path}");
     }
+    // **A 32-bit build gets the full 4 GB of user address space, not 2.** `link.exe` defaults an
+    // x86 image to 2 GB, and the x86 `cdb.exe` a debugger package ships is built the other way
+    // (`IMAGE_FILE_LARGE_ADDRESS_AWARE`, read off the header) — so the engine a 32-bit worker
+    // loads already expects the wider space. The headroom is not needed on the measurements taken:
+    // against that same `cdb`, DbgEng reads a dump on demand rather than mapping it, and peak
+    // virtual size stayed flat near 256 MB across dumps of 445 MB, 846 MB and 1,346 MB. This is
+    // here so that the margin is a decision rather than an accident of the linker's default.
+    //
+    // Emitted from the build script rather than set in `.cargo/config.toml`, because a `RUSTFLAGS`
+    // in the environment replaces that file's `rustflags` wholesale — this must not be something a
+    // shell can drop without noticing.
+    if std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("x86") {
+        println!("cargo::rustc-link-arg-bins=/LARGEADDRESSAWARE");
+    }
     let revision = revision().unwrap_or_default();
     println!("cargo::rustc-env=WINDBG_MCP_BUILD={revision}");
     version_resource(&revision);

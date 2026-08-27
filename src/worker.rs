@@ -53,7 +53,6 @@ use dbgscope::pool::{
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
 use crate::batch::{self, BatchOp, Debuggee, Ran};
-use crate::enginehost::EngineHost;
 use crate::proto::{
     EngineOp, Failed, HeapBackendFilter, HeapOp, HeapStateFilter, MAX_MODULE_ROWS, Output, PoolOp,
     ReachabilityOp, WorkerMessage, WorkerRequest,
@@ -703,249 +702,113 @@ fn start_log_writer() {
     }
 }
 
-/// What this worker's engine turned out to be, for the two later decisions that depend on it.
-struct HostState {
-    /// The engine host was started with `-z <dump>`, so the target is **already open** and the
-    /// opener must not open it again.
-    opened_target: bool,
-    /// What this session cannot do that a caller would otherwise assume it can. `None` is the
-    /// ordinary case and says nothing.
-    limitation: Option<String>,
-}
-
-/// Set once, by [`engine_thread`], before `Ready`.
-static HOST: OnceLock<HostState> = OnceLock::new();
-
-/// Whether the engine host opened this worker's target when it was started.
-fn host_opened_target() -> bool {
-    HOST.get().is_some_and(|state| state.opened_target)
-}
+/// What this session cannot do that a caller would otherwise assume it can, if anything.
+///
+/// Set once, by [`engine_thread`], before `Ready`. `None` is the ordinary case and says nothing.
+static LIMITATION: OnceLock<Option<String>> = OnceLock::new();
 
 /// What this session cannot do, if anything.
-fn host_limitation() -> Option<String> {
-    HOST.get().and_then(|state| state.limitation.clone())
+fn session_limitation() -> Option<String> {
+    LIMITATION.get().cloned().flatten()
 }
 
-/// Builds this worker's engine — in this process, or in a child of the target's architecture.
+/// Builds this worker's engine, and works out what this session will not be able to do.
 ///
-/// **Only a 32-bit user-mode dump takes the second path**, and only when this build is not itself
-/// 32-bit. Everything else — a kernel dump, a trace, an attach, a launch, an x64 dump — is opened
-/// here exactly as before, and reaching for the header read costs those a few hundred bytes off
-/// the front of a file.
+/// The engine is always created **here**: which process a target is opened in was decided by the
+/// supervisor before this one existed ([`crate::engine::worker_images`]), because a process's
+/// architecture is fixed when its image loads and so the choice cannot be made from inside the
+/// process being chosen.
 ///
-/// **A failure to put the engine elsewhere is not a failure to open.** An x86 dump opens here
-/// today and native analysis of it works; that must keep working when there is no x86 `cdb.exe` on
-/// the host, or when starting one fails. So those paths fall back — but *loudly*, carrying a
-/// limitation the caller is told about rather than quietly producing a session whose SOS commands
-/// will all fail with something that names none of this.
-fn build_engine(
-    target: Option<&Path>,
-) -> Result<(DebugEngine, Option<EngineHost>, HostState), String> {
+/// What is left for this end is the honest report. A 32-bit user dump opens perfectly well in a
+/// 64-bit worker and native analysis of it works — only the .NET SOS extension is unreachable,
+/// because an extension loads into the debugger's own process. So when this build is the wrong
+/// architecture for the target it has been given, the session comes up and says so, rather than
+/// failing or quietly producing one whose SOS commands all fail with something that names none of
+/// this. The same dump header the supervisor read answers it, which is why the two cannot
+/// disagree.
+fn build_engine(target: Option<&Path>) -> Result<(DebugEngine, Option<String>), String> {
     // `DebugEngine::new()` panics if the engine cannot be created — dbgeng.dll not discoverable,
     // most likely.
-    let local = || -> Result<DebugEngine, String> {
-        catch_unwind(AssertUnwindSafe(DebugEngine::new))
-            .map_err(|_| "failed to initialize DbgEng (is dbgeng.dll on the search path?)".into())
-    };
-    let here = |limitation: Option<String>| {
-        local().map(|engine| {
-            (
-                engine,
-                None,
-                HostState {
-                    opened_target: false,
-                    limitation,
-                },
-            )
-        })
-    };
-
-    let Some(target) = target else {
-        return here(None);
-    };
-    match crate::dump::read(target) {
-        Ok(crate::dump::DumpTarget::UserMinidump(crate::dump::Arch::X86)) => {}
-        Ok(crate::dump::DumpTarget::UserMinidump(arch)) => {
-            tracing::debug!(
-                "worker: {} is a {} user dump; opening it in this process",
-                target.display(),
-                arch.label()
-            );
-            return here(None);
-        }
-        Ok(crate::dump::DumpTarget::Other) => return here(None),
-        Err(why) => {
-            // Not an error worth failing an open over: the engine reads the file next and will
-            // say far more about it than a header parser can.
-            tracing::debug!(
-                "worker: could not read {}'s header ({why}); opening it in this process",
-                target.display()
-            );
-            return here(None);
-        }
-    }
-    // A 32-bit build has nowhere better to put the engine than where it already is.
-    if std::env::consts::ARCH == "x86" {
-        return here(None);
-    }
-
-    let candidates = EngineHost::candidates(crate::ttd::Arch::X86);
-    if candidates.is_empty() {
-        return here(Some(NO_X86_HOST.to_string()));
-    }
-    // **Each candidate in turn.** One that will not start, or that this process's engine will not
-    // talk to, says nothing about the next: a machine can carry both the SDK's debugging tools and
-    // the WinDbg package, and only one of them may be version-compatible with the `dbgeng.dll`
-    // bundled beside this server. Giving up on the first would leave SOS unavailable with a usable
-    // host sitting on the disk.
-    // **One budget for all of them**, because the supervisor has one: it kills this worker if
-    // `Ready` has not arrived within `WORKER_READY_TIMEOUT`, and that clock does not restart per
-    // candidate. Giving each a fresh timeout would spend the same seconds twice and let a first
-    // candidate that hangs starve the very fallback added to get past it.
-    let deadline = Instant::now() + crate::enginehost::startup_budget();
-    let mut started = Err("no engine host was tried".to_string());
-    let mut used = None;
-    for cdb in &candidates {
-        started = EngineHost::start(cdb, target, deadline)
-            .map_err(|e| e.to_string())
-            .and_then(|host| {
-                match DebugEngine::connect(host.connection()) {
-                    Ok(engine) => Ok((engine, host)),
-                    // The host is dropped here, which kills it — the client it was started for is
-                    // never going to arrive.
-                    Err(e) => Err(e.to_string()),
-                }
-            });
-        match &started {
-            Ok(_) => {
-                used = Some(cdb.clone());
-                break;
-            }
-            Err(why) => tracing::debug!(
-                "worker: {} could not serve this target ({}); trying the next candidate",
-                cdb.display(),
-                crate::kdconn::scrub(why)
-            ),
-        }
-    }
-    let cdb = used.unwrap_or_else(|| candidates[candidates.len() - 1].clone());
-    match started {
-        Ok((engine, host)) => {
-            tracing::info!(
-                "worker: this 32-bit target is served by {} on pipe {}",
-                cdb.display(),
-                host.pipe()
-            );
-            Ok((
-                engine,
-                Some(host),
-                HostState {
-                    opened_target: true,
-                    limitation: None,
-                },
-            ))
-        }
-        Err(why) => {
-            // **Scrubbed, because the connect error quotes the connection string** — dbgscope's
-            // `connect` names what it could not reach, and that string carries the transport
-            // password. Unscrubbed it would travel into a log line, a limitation a caller reads,
-            // and the transcript. `kdconn`'s scan already masks `password=`, which is why there is
-            // no second list of secret names here.
-            let why = crate::kdconn::scrub(&why);
-            tracing::warn!(
-                "worker: could not put this session's engine in an x86 host ({why}); opening the \
-                 dump in this process instead"
-            );
-            here(Some(format!("{X86_HOST_FAILED} The host reported: {why}")))
-        }
-    }
+    let engine = catch_unwind(AssertUnwindSafe(DebugEngine::new))
+        .map_err(|_| "failed to initialize DbgEng (is dbgeng.dll on the search path?)")?;
+    Ok((engine, limitation_for(target)))
 }
 
-/// Waits until an engine host's target is actually loaded, the way the in-process path waits on
-/// `wait_for_event`.
-///
-/// **The host publishes its pipe before it has opened the dump**, not after — `cdb` prints
-/// `Server started with '<transport>'` ahead of its load output, so a client can connect while the
-/// target is still being read. Without this, the opener's diagnostic and its summary would race a
-/// dump load, which on a large file off a slow disk is a race that is lost intermittently and
-/// reported as a target with no modules.
-///
-/// Polls rather than waiting on an event, because there is no event to wait for: the engine
-/// belongs to another process and has already consumed its own initial break. `modules()` is the
-/// cheapest question that cannot be answered until a target exists.
-///
-/// **Two things now rest on that last clause**, so it was measured rather than reasoned about:
-/// inside the window this waits out, a connected client reads `DEBUG_STATUS_NO_DEBUGGEE` *and*
-/// `modules()` fails, together — so the guards keyed on that status
-/// ([`refuse_when_the_target_is_gone`], and dbgscope's own inside `Execute`) cannot fire on a
-/// hosted session that this has already let through. A `modules()` that answered early would
-/// break the `vertarget` below, not just this wait.
-fn await_hosted_target(e: &DebugEngine) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_millis(u64::from(LOAD_WAIT_MS));
-    loop {
-        // Why the target is not ready *yet*, kept only long enough to explain a timeout. Scoped to
-        // the iteration, so the message a caller reads is the last state actually observed.
-        let state = match e.modules() {
-            // A loaded target always has at least its own image.
-            Ok(modules) if !modules.is_empty() => return Ok(()),
-            Ok(_) => "the host reports no modules yet".to_string(),
-            Err(why) => why.to_string(),
-        };
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "the engine host did not finish opening the dump within {LOAD_WAIT_MS} ms ({state})"
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-}
-
-/// Told to a caller whose 32-bit dump this host cannot give an x86 engine.
+/// Whether this worker is the wrong architecture for its target, said in a sentence a caller can
+/// act on.
 ///
 /// **Names no tool**, deliberately: this is built in the worker, which owns one session and has
 /// never heard of the caller's surface (`FOLLOWUPS.md` item 43). It names a document instead,
 /// which every caller can reach.
-const NO_X86_HOST: &str = "This is a 32-bit dump and this server's engine is not, so the .NET SOS \
-                           extension cannot be loaded for it: an extension is loaded into the \
-                           debugger's own process, and from here neither the 32-bit `sos.dll` \
-                           (which will not load) nor the 64-bit one (which refuses a 32-bit CLR) \
-                           can work. Native analysis — stacks, modules, memory, disassembly — is \
-                           unaffected. To make SOS available, put `cdb.exe` and its engine DLLs \
-                           from a debugger package's `x86` payload into an `x86\\` directory \
-                           beside this server's executable; the skill's `setup.md` has the copy \
-                           block.";
+fn limitation_for(target: Option<&Path>) -> Option<String> {
+    // A 32-bit worker is the answer, not the problem.
+    if std::env::consts::ARCH == "x86" {
+        return None;
+    }
+    let target = target?;
+    match crate::dump::read(target) {
+        Ok(crate::dump::DumpTarget::UserMinidump(crate::dump::Arch::X86)) => {
+            Some(NO_X86_WORKER.to_string())
+        }
+        Ok(crate::dump::DumpTarget::UserMinidump(arch)) => {
+            tracing::debug!(
+                "worker: {} is a {} user dump; this build can open it",
+                target.display(),
+                arch.label()
+            );
+            None
+        }
+        Ok(crate::dump::DumpTarget::Other) => None,
+        // Not worth a limitation: the engine reads the file next and will say far more about it
+        // than a header parser can.
+        Err(why) => {
+            tracing::debug!(
+                "worker: could not read {}'s header ({why}); assuming this build can open it",
+                target.display()
+            );
+            None
+        }
+    }
+}
 
-/// The same, where a host was found but could not be used.
-const X86_HOST_FAILED: &str = "This is a 32-bit dump, and the x86 engine host that would let the \
-                               .NET SOS extension load could not be started, so the dump was \
-                               opened by this server's own engine instead. Native analysis is \
-                               unaffected. Both engines must come from the same debugger package: \
-                               a client older than the host is refused with `0x8007053D`, \"The \
-                               server is currently disabled\", which names neither end.";
+/// Told to a caller whose 32-bit dump this build cannot give a 32-bit engine.
+///
+/// One sentence covers both ways of getting here — no 32-bit worker on the host, and one that
+/// would not start — because from the caller's side they are the same fact and the same remedy.
+/// Why the 32-bit worker did not start is a *server* fact, and is logged by the supervisor that
+/// tried it.
+const NO_X86_WORKER: &str = "This is a 32-bit dump and this build of the server is not, so the \
+                             .NET SOS extension cannot be loaded for it: an extension is loaded \
+                             into the debugger's own process, and from here neither the 32-bit \
+                             `sos.dll` (which will not load) nor the 64-bit one (which refuses a \
+                             32-bit CLR) can work. Native analysis — stacks, modules, memory, \
+                             disassembly — is unaffected. To make SOS available, put the 32-bit \
+                             build of this server alongside a debugger package's `x86` engine \
+                             payload in an `x86\\` directory beside this executable; the skill's \
+                             `setup.md` has the copy block.";
 
 /// Owns the [`DebugEngine`] for the life of the process and runs one op at a time.
 fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<PathBuf>) {
     // Reported and exited rather than accepted: the supervisor is waiting for exactly one of these
     // two messages before it registers a session, so a dead engine reads as server machinery
     // rather than as a debugger error the model would pointlessly retry.
-    let (engine, host, state) = match build_engine(target.as_deref()) {
+    let (engine, limitation) = match build_engine(target.as_deref()) {
         Ok(built) => built,
         Err(message) => {
-            emit(&WorkerMessage::Fatal { message });
+            emit(&WorkerMessage::Fatal {
+                message: message.to_string(),
+            });
             crate::logbridge::flush(LOG_FLUSH);
             std::process::exit(1);
         }
     };
-    // Held for the life of this thread, which is the life of the process. Dropping it kills the
-    // host, and the host must outlive every call made through it — see [`EngineHost::shutdown`]
-    // for why the teardown is a kill and why the client must never vanish first.
-    let _host = host;
-    // Read later by the opener (the host already opened the target) and by [`open`] (what to tell
-    // the caller about what this session cannot do).
-    let _ = HOST.set(state);
+    // Read later by [`open`]: what to tell the caller about what this session cannot do.
+    let _ = LIMITATION.set(limitation);
     // Published before `Ready`, so the request reader can never be handed work it cannot interrupt.
     let _ = INTERRUPT.set(engine.interrupt_handle());
-    emit(&WorkerMessage::Ready);
+    emit(&WorkerMessage::Ready {
+        build: crate::BUILD_VERSION.to_string(),
+    });
 
     while let Ok(job) = rx.recv() {
         let (arrived, request) = match job {
@@ -1214,15 +1077,6 @@ fn interrupt_running() -> Result<String, String> {
 ///
 /// An unreadable status is not a refusal — the same rule dbgscope's own guard follows. Refusing on
 /// a guess costs a caller a session that was working, which is the worse of the two mistakes.
-///
-/// **The status crosses the remote transport, which was worth measuring rather than assuming** —
-/// [`crate::enginehost`]'s sessions live in another process, and `GetSymbolInformation` is already
-/// known not to cross, so "a core call obviously does" is not an argument. Measured against a
-/// `cdb -server` on the ARM64 bench: a connected client reads `DEBUG_STATUS_BREAK` and runs
-/// commands normally. It *can* read no-debuggee — for the window in which the host has published
-/// its pipe and not yet opened the dump — and in that window `modules()` fails at the same
-/// instant, which is the window [`await_hosted_target`] already waits out before anything here
-/// runs. The two never disagree in the direction that would matter.
 fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Failed> {
     if matches!(
         op,
@@ -1277,11 +1131,6 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
                 // the strength of the transport alone would report `target: yes` for a session
                 // holding nothing, which tells the caller to reclaim rather than retry — the one
                 // thing that answer is for.
-                if host_opened_target() {
-                    await_hosted_target(e)?;
-                    commit();
-                    return Ok(());
-                }
                 // `open_dump` is the call that claims the target, so commit right after it: a
                 // load wait that times out still leaves DbgEng holding the dump.
                 e.open_dump(&path).map_err(es)?;
@@ -4753,7 +4602,7 @@ where
     // went wrong and never learns SOS cannot work in the session they are left holding. That is the
     // loud fallback going quiet at exactly the moment it matters: a dump slow enough to fail the
     // wait is a large one, which is the shape most likely to be a 32-bit service dump.
-    let with_limitation = |failed: Failed| match host_limitation() {
+    let with_limitation = |failed: Failed| match session_limitation() {
         Some(limitation) => failed.and_note(&limitation),
         None => failed,
     };
@@ -4770,7 +4619,7 @@ where
     // Both halves, or it is half a warning: a structured-aware client forwards `structuredContent`
     // and drops the text block, so a limitation stated only in the sentence is one the better
     // clients never see (`FOLLOWUPS.md` item 43).
-    summary.limitation = host_limitation();
+    summary.limitation = session_limitation();
     let text = appended(
         summary_text(&diagnostic, &summary),
         summary.limitation.clone(),

@@ -52,6 +52,16 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      # The 32-bit worker. A 32-bit user dump needs a 32-bit engine, which needs a 32-bit
+      # *process*, so the supervisor spawns this image instead of re-executing itself
+      # (`engine::worker_images`). It is the same crate with nothing but the target changed, and
+      # nothing else here would notice it stopping compiling: every other job builds the runner's
+      # own architecture.
+      - name: Build the 32-bit worker
+        run: |
+          rustup target add i686-pc-windows-msvc
+          cargo build --release --target i686-pc-windows-msvc
+
       # Includes the smoke test's protocol tier (tests/mcp_smoke.rs), which drives the built
       # binary over stdio. That tier needs no debugger, target, or network; the debugger tier
       # is gated behind WINDBG_MCP_SMOKE_DUMP and runs in the `smoke-debugger` job below.

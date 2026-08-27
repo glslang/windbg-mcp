@@ -756,7 +756,16 @@ pub struct WorkerRequest {
 pub enum WorkerMessage {
     /// The engine was created; the worker will accept requests. Sent once, before anything
     /// else, so the supervisor never registers a session behind a worker that cannot debug.
-    Ready,
+    ///
+    /// **`build` is this worker's own [`crate::BUILD_VERSION`]**, and the supervisor refuses a
+    /// worker whose build is not its own. That is not paranoia about a channel both ends of which
+    /// come from one `cargo build`: the supervisor normally re-executes *itself*, so the two could
+    /// not differ — but a 32-bit user dump is served by a *second image*
+    /// (`crate::engine::worker_images`), which an operator copies into place by hand and can
+    /// therefore leave a release behind. Nothing else in this protocol would notice: an older
+    /// worker speaks a JSON shape close enough to deserialize and wrong in ways that surface as
+    /// debugger errors much later.
+    Ready { build: String },
     /// The engine could not be created and this worker is exiting. Distinct from a failed
     /// operation: no argument the caller can change makes the next attempt work.
     Fatal { message: String },
