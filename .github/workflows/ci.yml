@@ -229,13 +229,17 @@ jobs:
       # otherwise — measured on this project's x64 bench to be enough for this tier, which loads
       # SOS and reads a managed thread table but resolves no PDB.
       #
-      # **A runner with neither is red on x64 and a stand-down on ARM64**, and the split is where
-      # this repo's confidence actually is. Neither source was measured on a GitHub image — only on
-      # this project's x64 bench, which has both — so the x64 entry is the one asked to *report* a
-      # host with no 32-bit engine, because that is the architecture whose 32-bit half is ordinary.
-      # On ARM64 an x86 engine runs under emulation and may not be shipped at all, which is new
-      # ground; issue #153 is this repo's precedent for not assuming two runner images carry the
-      # same things, so that entry stands the tier down instead of failing.
+      # **A runner with neither is red on x64 and a stand-down on ARM64.** The split was written
+      # when neither source had been measured on a GitHub image, only on this project's x64 bench:
+      # x64 is the architecture whose 32-bit half is ordinary, where ARM64 runs x86 under emulation
+      # and might ship no x86 engine at all — issue #153 being the precedent for not assuming two
+      # images carry the same things.
+      #
+      # Measured on the first run (2026-08-27): **all three images have one**, and it is the
+      # Debugging Tools' `x86` payload rather than SysWOW64 on every one of them, so both 32-bit
+      # tests ran on ARM64 as well. The ARM64 stand-down is therefore a fallback that nothing has
+      # yet taken, kept because it is what the entry is *entitled* to do — not a description of
+      # what it does.
       - name: Give the runner a 32-bit worker and engine (item 49)
         shell: pwsh
         env:

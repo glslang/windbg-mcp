@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twenty-six clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty-seven clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/dbgscope#71, 2026-08-01), items 13–14 from the bounded-command coverage review
@@ -47,7 +47,9 @@ landed in full**, on 2026-08-27: first its transport half, by measuring the expo
 and finding it bad enough to delete the `cdb` host outright, and then the two threads that left
 open — a tier that makes its own 32-bit fixture instead of waiting to be handed one, and the live
 WoW64 route a dump header cannot answer for — and, while testing that, from Windows Defender
-quarantining this project's own binary.
+quarantining this project's own binary, and item 51 from what building that live route made
+reachable: the first tier to attach to a running process found that ending its session kills it
+(2026-08-27).
 Each item notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -2869,10 +2871,14 @@ Gating on the worker instead would have put a second copy of `x86_worker_image`'
 fallback in a file that cannot call it. CI sets that gate on every debugger-tier entry, from the
 Debugging Tools' `x86` payload or from `SysWOW64` — the four DLLs there were measured on the x64
 bench to be enough for a tier that loads SOS and resolves no PDB — and a stand-down is a red build
-on the x64 entry. On the ARM64 entries it is a stand-down: an x86 engine under emulation is new
-ground, and issue #153 is this repo's precedent for not assuming two runner images ship the same
-things. **That step is the one part of this not verified against GitHub's images**, only against
-the x64 bench.
+on the x64 entry, where an ARM64 one is entitled to stand down instead, x86 under emulation being
+new ground and issue #153 the precedent for not assuming two runner images ship the same things.
+
+That step was the one part of this not verified against GitHub's images, and the first run settled
+it (2026-08-27): **all three images have a 32-bit engine, and it is the Debugging Tools' `x86`
+payload rather than `SysWOW64` on every one of them**, so both tests ran on ARM64 too. The ARM64
+stand-down is a fallback nothing has taken rather than a description of what happens — worth
+knowing before reading that entry's silence as coverage.
 
 **What the Mac plan called right, kept because being right about it was not obvious.**
 `IsWow64Process2` is behind windows-sys's `Win32_System_SystemInformation` and not the
@@ -2884,6 +2890,40 @@ cannot be reached from an x64 bench, so they are covered by a unit test over the
 which also pins the thing that mapping exists for: 9 is x64 to a minidump and nothing at all as a
 PE machine type, and 332 is the other way round, so one shared table is how a value from the wrong
 namespace becomes a plausible wrong answer.
+
+**And what it settled in [#234](https://github.com/glslang/windbg-mcp/issues/234), the bug report
+all of this came from** (x64 bench, 2026-08-27). Its two reported errors reproduce **exactly**, on
+the fallback path this build still takes when there is no 32-bit worker — the 32-bit `sos.dll`
+answers `0n193` / *"not a valid Win32 application"*, and the 64-bit one loads and then says *"SOS
+does not support the current target architecture (14c)"*, naming the same machine value. That
+matters beyond confirming the report: those two sentences are what `NO_X86_WORKER` tells a caller,
+so the limitation this server ships is now measured rather than quoted. And #234's own
+recommendation for *future* captures — take them with the 64-bit procdump so the x64 engine can use
+`!wow64exts.sw` — still routes correctly: a 64-bit capture of a WoW64 process reads as x64, stays
+on this build's worker, and reports no limitation, so nothing here has taken that path away.
+
+Two things about #234 that are **not** confirmations:
+
+- **We route on x86, where the issue proposed "x86 *and managed*".** Deliberate: "managed" is not
+  in a minidump header, and there is nothing to lose by routing every 32-bit user target to the
+  32-bit worker — native analysis is the same on either, so the narrower test would buy only a
+  second way to get the decision wrong.
+- **Its workaround's SOS half did not complete on this bench**, and that is not evidence about the
+  issue. `!wow64exts.sw` switches to guest mode; `.loadby sos clr` then resolves the **32-bit** SOS
+  beside the WoW64 `clr.dll` and fails `0n193` — so that path wants `.load <Framework64 sos>`
+  rather than `.loadby` — and the explicit load then fails on the DAC (*"path is pointing to
+  clr.dll as well"*), which is `mscordacwks` pairing and wants a symbol path this bench has not got.
+  Report it as not reproduced here, never as broken.
+
+**What neither issue weighed, and a live attach now makes real: the 32-bit worker cannot see the
+64-bit half of a WoW64 process.** Both issues are about *dumps*, where a 32-bit capture has no
+64-bit side in it to lose. A running WoW64 process has one, and the two workers see different
+things — measured on the same fixture, one attach each: this build's worker lists **36** modules
+including `ntdll`, `wow64`, `wow64base`, `wow64cpu`, `wow64con` and `wow64win`, five of them above
+4 GiB; the 32-bit worker lists **30**, none above 4 GiB, and none of the WoW64 layer. So
+`attach_process` on a WoW64 process trades the emulation layer for SOS. That is the right trade for
+the debugging this feature exists for, and it is a trade rather than a free win, so
+`skills/windbg-debugging/setup.md` says it where an operator will meet it.
 
 **What this let us go back and measure in [#240](https://github.com/glslang/windbg-mcp/issues/240),
 which argued for this design and shipped two claims it could not check.** Both now check out, and
@@ -3268,3 +3308,52 @@ question `serverInfo.version` does. Four things that entry did not see:
 **Where it picks up.** The *Build & publish binary* job in `.github/workflows/release.yml`, and
 [`docs/releasing.md`](./docs/releasing.md) if the submission becomes a step.
 
+
+## 51. [windbg-mcp + dbgscope] `end_session` on a user-mode **attach** kills the process it attached to
+
+**What was measured** (x64 bench, 2026-08-27, found while testing
+[#234](https://github.com/glslang/windbg-mcp/issues/234) against the design it asked for).
+`attach_process` on a running process, then `end_session`, and the process is **gone**: not
+suspended, not detached, terminated. Identical for a 32-bit .NET target on the 32-bit worker and a
+64-bit `cmd.exe` on this build's own, so it is nothing to do with item 49's second image — that is
+only what made it reachable, by adding the first tier that attaches to a live process at all.
+
+**Why it happens, which is two decisions meeting.** `DebugEngine::end_session` uses
+**`DEBUG_END_PASSIVE`** for every target but a live kernel, and a passive end does not detach: it
+disconnects the client and leaves the process marked as being debugged. The supervisor then
+terminates the worker — `end_session` reports `worker_terminated: true`, which it reports for a
+*dump* session too, so that half is simply how a session ends here. A debuggee whose debugger exits
+without detaching is killed by the kernel, because `DebugSetProcessKillOnExit` defaults to true.
+Neither half is wrong on its own and the combination is not written down anywhere.
+
+**Why it is worth deciding rather than leaving.** The two openers are not alike. `launch` created
+the process, so taking it away is the honest end of that session. `attach_process` did not: a
+caller attaching to a running service to look at it has no reason to expect the session's end to
+be the service's, and `end_session` is also what a *disconnect* and a lease expiry run, so a client
+that simply goes away takes the process with it. dbgscope already has the other primitive and
+already reasons about exactly this: `resume_and_detach_live_kernel` uses `DEBUG_END_ACTIVE_DETACH`
+so a kernel target is left **running** rather than frozen, with a comment saying why. The user-mode
+attach never got the same treatment.
+
+**What would close it.** Almost certainly: an active detach for a session whose target this server
+attached to rather than launched, leaving `DEBUG_END_PASSIVE` for a dump, a trace and a `launch`.
+Three things to settle first, and none is obvious from here.
+
+- **Which opener a session came from has to reach the engine.** `SessionKind` is the supervisor's,
+  and `end_session` is served in the worker; the worker knows what op opened it, so this is a
+  fact it already holds rather than a new field, but it is not one `end_session` currently reads.
+- **`launch` is genuinely the other way, and possibly not uniformly.** A `launch`ed debuggee that
+  the caller wants to *keep* running after the session is a real request, and DbgEng can do it —
+  which makes this a question about the tool surface, not only about a flag.
+- **An active detach can fail**, where a passive one is local. `.detach` on a target that has
+  already exited, or one wedged mid-break, is a call that can hang or error, and it would sit on
+  the teardown path a disconnect and a lease expiry both run. Whatever lands must degrade to the
+  present behaviour rather than to a worker that will not go.
+
+**Where it picks up.** `DebugEngine::end_session` and `resume_and_detach_live_kernel` in dbgscope's
+`src/dbgeng.rs`, `EngineOp::EndSession` in `src/worker.rs`, and `end_session`'s own description in
+`src/server.rs`, which says a session's target is "released" and does not say that for an attach
+that means terminated. The measurement is reproducible in a dozen lines: attach, `end_session`,
+poll the pid. `mcp_smoke::a_32_bit_managed_process_is_attached_by_an_engine_that_can_load_its_sos`
+is the tier that meets it, and deliberately does not assert the behaviour either way — pinning it
+would make something undecided read as decided.

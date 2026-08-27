@@ -266,6 +266,16 @@ server before the worker starts, because afterwards is too late.
 no heap tools whichever engine holds it. SOS's own `!dumpheap` and `!eeheap` are the managed
 equivalent and do work here, which is the reason to be on this page at all.
 
+**And one thing it is a trade rather than a win: `attach_process` on a running WoW64 process no
+longer shows you the 64-bit half of it.** A WoW64 process has two: the 32-bit program, and the
+emulation layer (`wow64.dll`, `wow64cpu.dll`, `wow64win.dll` and the 64-bit `ntdll`) living above
+4 GiB. The 64-bit engine sees both and switches between them with `!wow64exts.sw`; the 32-bit
+engine sees only the 32-bit one — measured on the same process, 36 modules against 30. That is the
+right trade when you are here for SOS, which is what a 32-bit .NET session is for, and the wrong
+one if you are debugging the thunk layer itself. Nothing is lost on a **dump**, where a 32-bit
+capture never held the 64-bit side to begin with; if you want both halves of a live process, take a
+capture with the 64-bit `procdump64.exe -ma` and open that instead, which routes to the x64 engine.
+
 What it needs beside it is a 32-bit engine. Copy the package's **`x86`** payload into that same
 `x86\` subdirectory:
 
