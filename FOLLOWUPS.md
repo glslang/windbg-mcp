@@ -2750,7 +2750,7 @@ with a step rather than a `go` and says why.
 
 </details>
 
-## 49. [windbg-mcp] The x86 engine host is gone — a **worker of the target's architecture** replaced it (2026-08-26, measured and closed 2026-08-27)
+## 49. [windbg-mcp] The x86 engine host is gone — a **worker of the target's architecture** replaced it (2026-08-26; the transport half measured and closed 2026-08-27, the two threads left planned the same day)
 
 **What this item was.** Routing a 32-bit .NET dump to an engine that can load its SOS landed on
 2026-08-26 by running an `x86\cdb.exe` as a debugging server and driving it over DbgEng's `npipe:`
@@ -2812,25 +2812,107 @@ What this bounds is **the engine, not this repo's walkers**: dbgscope's heap and
 structures proportional to chunk count, and in a 32-bit worker those are our code in that address
 space. The dumps measured were one large allocation, not millions of small chunks.
 
-**What is still open.**
+**What is still open, and a plan for it** (planned 2026-08-27 from the Mac; every seam named below
+was read there, and the two facts that would change the *shape* of the work were checked there
+rather than assumed).
 
 - **The fixture is supplied, not made.** The tier takes `WINDBG_MCP_X86_DUMP` and stands down
   without one, so CI never runs it and a machine without a 32-bit dump proves nothing. The TTD tier
-  solved the same problem by **recording its own target**, and the ingredients are here: `csc.exe`
-  ships on every stock Windows, so the tier could compile a trivial .NET program, run it, dump it
-  with the 32-bit `comsvcs.dll MiniDump` and open that. One caution measured while taking the
-  address-space figures above: `comsvcs.dll MiniDump` wrote a near-empty file on this bench and
-  reported nothing wrong, while `cdb -p <pid> -c ".dump /ma <path>;qd"` produced a real capture
-  every time. Whichever the tier uses, it has to assert the dump's *size*, not its existence.
+  solved the same problem by **recording its own target**, and the ingredients look similar:
+  `csc.exe` ships on every stock Windows, so the tier could compile a trivial .NET program, run it,
+  dump it and open that.
+
+  **What makes this harder than the TTD tier is that the capture has to be a *32-bit* `MDMP`, and a
+  wrong one does not announce itself.** `dump::read` classifies by the `ProcessorArchitecture` in
+  the system-info stream, so a dump written by a 64-bit writer against a WoW64 process reads as
+  x64, routes to the x64 worker, and reports **no limitation** — `limitation_for` returns `None`
+  for an x64 dump, so the tier's existing `limitation.is_null()` assertion passes and the run then
+  fails at `.loadby sos`, which is a mis-made fixture wearing the face of a broken feature. Nor can
+  the tier settle it itself: this crate has **no lib target**, so an integration test cannot call
+  `crate::dump::read`, and a header parser copied into the harness is a second copy of what
+  `src/dump.rs` is for. So the writer has to be one whose architecture is right *by construction*,
+  and the three candidates are not equivalent:
+
+  - `comsvcs.dll MiniDump` wrote a near-empty file on the ARM64 bench and reported nothing wrong.
+  - `cdb -p <pid> -c ".dump /ma <path>;qd"` produced a real capture every time — but the `x86\`
+    copy block in `setup.md` no longer copies `cdb.exe`, since the transport's deletion took it
+    out, so a tier built on the 32-bit one resurrects in a test the `cdb` search that was just
+    deleted from `src/`.
+  - The third is this server, and it is the one to prefer — see the ordering note below.
+
+  Whichever it is, assert the dump's **size**, not its existence.
+
 - **A live 32-bit target** (a WoW64 `attach_process`) is a smaller question than it was — the
-  teardown that made it dangerous is gone — but it is still unbuilt and untested, and
-  `worker_images` routes on a dump header, which an attach has none of. The architecture of a live
-  process is `IsWow64Process2`, in the supervisor, before the spawn.
+  teardown that made it dangerous is gone — but it is still unbuilt and untested, and the routing
+  input is what has to change first. `worker_images` takes `Option<&str>` and is fed by
+  `EngineOp::dump_path`, which answers for `OpenDump` alone, so a pid cannot travel that way at
+  all: widen it to a routing *question* — a dump path, a pid, or nothing — and let `worker_images`
+  ask `dump::read` or an `IsWow64Process2` helper accordingly. Everything below that decision is
+  already the right shape: `attach_process` takes a **pid** rather than a name (`PidArgs`), so the
+  supervisor holds the fact before the spawn and needs no lookup of its own, and `spawn_worker`
+  already takes the image as a parameter.
+
+  Two details are easy to get wrong. **The worker's half of the report is a second call, not a
+  field on the wire**: `limitation_for` re-reads the dump header rather than being told, and the
+  live equivalent is the same API against the same pid, which is what keeps the two from
+  disagreeing. That needs the pid to reach the worker *before* `Ready`, because `LIMITATION` is a
+  `OnceLock` set by `engine_thread` on its way there — so it travels on `TARGET_FLAG`, whose name
+  and doc comment say "the dump this worker was spawned for" and widen with it, and **not** down
+  the channel, even though `EngineOp::AttachProcess` already carries it. And **`launch` is a third
+  case with no pid to ask about**: a 32-bit debuggee named on a command line can only be
+  anticipated by reading the image's PE `Machine` field, which is `dump.rs`-shaped work and is out
+  of the scope above deliberately rather than by oversight.
+
+**Do the live half first, and the fixture is nearly free.** The address-space probes recorded below
+already had a 32-bit managed target to hand and did not have to build one: they ran an x86
+PowerShell, which on an x64 host is `%WINDIR%\SysWOW64\WindowsPowerShell\v1.0\powershell.exe` —
+stock, and .NET Framework by construction, since 5.1 is — so there is no `csc.exe` step and no
+program to write. With the live half built, the tier attaches to one and the dump is written **by a
+32-bit engine in a 32-bit process**, which is the only writer whose architecture cannot be wrong,
+through `execute { ".dump /ma /f <path>" }` rather than a second piece of machinery. That inverts
+the order these two bullets are written in. The hypothesis to check on the bench before committing
+to it is the live half's own premise — that a 32-bit DbgEng attaches to a WoW64 process and that
+its SOS loads against a live target — which nothing here has measured.
+
+**What planning it on the Mac settled, and what it could not.** Two facts, both checked there:
+
+- **`IsWow64Process2` is behind windows-sys's `Win32_System_SystemInformation` feature, not the
+  `Win32_System_Threading` one its own function lives in.** Its declaration at
+  `windows-sys-0.61.2/src/Windows/Win32/System/Threading/mod.rs:232` carries
+  `#[cfg(feature = "Win32_System_SystemInformation")]`, because its out-parameters are
+  `IMAGE_FILE_MACHINE`; `Cargo.toml` enables three features and that is not one of them. So this is
+  a dependency edit as well as a call — the same gated-by-module-path trap `CLAUDE.md` records for
+  `IMAGE_NT_HEADERS64`, and the class of mistake that check exists to catch.
+- **`cargo check --target i686-pc-windows-msvc --all-targets` is clean from the Mac and costs 1.3
+  seconds incremental**, so the second build target is a Mac check like the other two rather than a
+  reason to wait for the bench.
+
+What it cannot answer is everything behavioural, and the list is worth having in front of you
+before the bench time is booked: whether a 32-bit engine attaches to a WoW64 process and loads SOS
+live, which writer produces a 32-bit `MDMP`, and what `IsWow64Process2` answers on a given host.
+The crate does not build for macOS at all, so even the pure mapping from `IMAGE_FILE_MACHINE_*` to
+`dump::Arch` is written here and first *run* there.
+
+**The bench for this moves to x64** (2026-08-27, the maintainer's call), and that is a measurement
+decision rather than a convenience. It makes every ingredient stock rather than emulated — SysWOW64
+PowerShell, `%WINDIR%\Microsoft.NET\Framework\v4.0.30319\csc.exe`, and both architectures of
+`cdb.exe` — where the ARM64 bench runs the x86 target *and* the x86 engine under emulation, which
+is a second variable in every fixture measurement. What an x64 bench cannot measure is the ARM64
+side of the routing: `IMAGE_FILE_MACHINE_ARMNT` and ARM64EC processes do not exist on it, so those
+arms have to fall back **by construction** and be covered by a unit test over the mapping rather
+than by any tier. Say which bench a measurement came from when this moves, for the reason item 47
+gives.
 
 **Where it picks up.** `src/dump.rs`, `engine::worker_images` / `engine::x86_worker_image` /
 `engine::start_worker`, `worker::limitation_for`, and the `x86\` copy block in
-`skills/windbg-debugging/setup.md`. The tier is *32-bit managed dump* in
-[`docs/smoke-test.md`](./docs/smoke-test.md); the probes behind the measurements below were
+`skills/windbg-debugging/setup.md`. For the live half, four more: `EngineOp::dump_path` in
+`src/proto.rs` (the routing input that has to widen), `attach_process`/`PidArgs` in `src/server.rs`
+(where the pid already is), `worker::TARGET_FLAG` (how it would reach the worker before `Ready`),
+and `Cargo.toml`'s `windows-sys` features. The tier is *32-bit managed dump* in
+[`docs/smoke-test.md`](./docs/smoke-test.md), and **two** tests are gated on `WINDBG_MCP_X86_DUMP`
+rather than one — `mcp_smoke::a_32_bit_managed_dump_is_served_by_an_engine_that_can_load_its_sos`
+and `dump::tests::a_real_x86_user_minidump_reads_as_x86`, which is the only one of the two that can
+call the parser; the probes behind the measurements below were
 `pipe_probe9`–`pipe_probe12` and `addr_probe2`–`addr_probe3`, whose shape is worth reusing: start
 `cdb -server` on a sample dump, wait for the name in `\\.\pipe\`, then read, connect or squat.
 
