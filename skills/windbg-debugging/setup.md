@@ -269,6 +269,18 @@ Copy-Item "$wd86\dbgeng.dll","$wd86\dbghelp.dll","$wd86\dbgcore.dll",`
 Copy-Item "$wd86\winext" "$dst\x86\winext" -Recurse -Force
 ```
 
+**Building from source, the worker is yours to put there as well** — the release zip already
+carries it, a `cargo build` does not:
+
+```pwsh
+cargo build --release --target i686-pc-windows-msvc
+Copy-Item target\i686-pc-windows-msvc\release\windbg-mcp.exe "$dst\x86" -Force
+```
+
+The file name matters: the server looks for `x86\windbg-mcp.exe`, or for whatever the running
+image is called if that differs. Check the directory holds both halves — `windbg-mcp.exe` and
+`dbgeng.dll` — because either one alone routes nothing.
+
 Three things about this differ from the copy block above, and each of them is a way to get it
 wrong:
 
@@ -281,10 +293,10 @@ wrong:
   the rule is "match the DLLs to the binary that loads them", and that still holds — these DLLs are
   loaded by `x86\windbg-mcp.exe`, not by the one beside them. This payload is x86 because the
   *target* is.
-- **`x86\windbg-mcp.exe` has to be there too.** The engine payload alone is not enough: without
-  the 32-bit server the dump still opens, on the x64 build, and the session reports a `limitation`
-  saying SOS is unreachable. Building from source, that image is
-  `cargo build --release --target i686-pc-windows-msvc`.
+- **`x86\windbg-mcp.exe` has to be there too**, which is the block above rather than this one.
+  The engine payload alone is not enough: without the 32-bit server the dump still opens, on the
+  x64 build, and the session reports a `limitation` saying SOS is unreachable — so a half-populated
+  `x86\` fails quietly in the sense that everything works except the one thing you came for.
 
 The SDK's *Debugging Tools for Windows* works as a source for the engine payload too
 (`C:\Program Files (x86)\Windows Kits\10\Debuggers\x86`) — unlike the store package it has no
