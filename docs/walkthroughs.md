@@ -29,3 +29,12 @@
   the `\Driver\mountmgr` dispatch switch, `decode_ioctl` for the access tiers, the device DACL parsed
   from memory, and an `ioctl_trace` sweep — ending with a reachability report (which codes a standard
   user can reach vs. what the I/O manager blocks).
+- [`explorer-crash-walkthrough.md`](explorer-crash-walkthrough.md) — the server debugging **its own
+  host**: a Windows 11 shell that would not start, traced through three consecutive faults to a
+  malformed AppModel State Repository. A user-mode counterpart to the kernel walkthroughs, and the
+  one with no checked-in sample — the target was the live machine. Its subject is the fact no typed
+  tool returns: the **HRESULT thrown through `winrt::check_hresult`**, dug out of the C++ exception
+  record by hand (`.exr`, the `0x19930520` EH magic, the `0xAABBCCDD` sentinel, `!error`) three
+  times in one evening, which is the argument for making it a primitive. Also contrasts the two
+  shapes of `0xc0000409`: a CRT `abort` that hides the code in the thrown object against a WIL
+  fail-fast that puts it in a parameter.
