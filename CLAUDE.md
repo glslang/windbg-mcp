@@ -86,8 +86,20 @@ update command alone was enough, which silently leaves you building the old code
 **Develop against the feature branch, not a `[patch]`.** Push the dbgscope branch and point
 `Cargo.toml`'s `rev` at that branch commit while iterating: it needs no local checkout on the build
 machine, it works identically on every machine, and it travels through git like everything else.
-Repoint to the merge commit before the dependent PR merges. A `[patch]` section still works for a
-quick local `cargo check` but must never be committed:
+Repoint before the dependent PR merges — and **"the merge commit" may not exist**, which is how
+this was got wrong on 2026-08-27. dbgscope#120 was *rebase*-merged, so its commits landed on `main`
+under new SHAs and the branch head this repo pinned was an ancestor of nothing there. It went on
+building only because the merged branch had not been deleted yet; deleting it — the ordinary tidy —
+would have left `main` unable to resolve its own dependency. So the rule is **repoint at whatever
+`dbgscope`'s `main` now is**, and check rather than assume:
+
+```console
+git -C ../dbgscope merge-base --is-ancestor <pinned-rev> origin/main   # 0, or the pin is dangling
+```
+
+Both PRs merging together is the ordinary case, not a mistake, so the check belongs after the merge
+as well as before it. A `[patch]` section still works for a quick local `cargo check` but must never
+be committed:
 
 ```toml
 [patch.'https://github.com/glslang/dbgscope']
