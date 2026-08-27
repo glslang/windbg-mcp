@@ -131,6 +131,8 @@ Worked sessions with the real outputs and the gotchas — the long form is in
   obfuscated Qt crackme.
 - [Driver IOCTL surface](docs/driver-ioctl-walkthrough.md) — recovering a dispatch switch on a live
   KDNET kernel and deciding user-mode reachability.
+- [Explorer won't start](docs/explorer-crash-walkthrough.md) — the server debugging its own host:
+  a dead Windows shell traced through three faults to a malformed State Repository.
 - [Disassembler coordinates](docs/coordinates.md) — joining a `crash_triage` frame to a function in
   an image fetched on another machine.
 
