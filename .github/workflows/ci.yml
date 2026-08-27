@@ -300,16 +300,26 @@ jobs:
       # 32-bit worker and engine in place, and if either copy stopped landing the two 32-bit tests
       # would stand down and pass. On x64 only, because that is the entry whose engine source is
       # not optional — see the copy step.
+      #
+      # **Asserted on a marker each test prints itself**, not on `test <name> ... ok` and not on a
+      # list of its skip messages. Neither of those works. libtest reports `ok` for a stood-down
+      # test too, because `skip()` returns normally — that version of this step was written first
+      # and waved a deliberately stood-down run straight through. And a CI-side list of skip
+      # strings has to be kept in step with the test source, so it is silently wrong for one round
+      # whenever a new stand-down is added, which is the round this step is for. `ran()` cannot
+      # drift: a stand-down never reaches it.
       - name: The 32-bit tier must have run
         if: matrix.arch == 'x64'
         shell: pwsh
         run: |
-          $skip = Select-String -Path smoke.log -SimpleMatch -Pattern 'no 32-bit engine in an'
-          if ($skip) {
-            $skip | ForEach-Object { Write-Host $_.Line }
-            throw 'the 32-bit tier stood down, so nothing here covered the 32-bit worker'
+          foreach ($tier in 'the 32-bit managed dump tier', 'the 32-bit managed attach tier') {
+            if (-not (Select-String -Path smoke.log -SimpleMatch -Quiet -Pattern "RAN: $tier")) {
+              Get-Content smoke.log | Select-String -SimpleMatch -Pattern 'SKIPPED' |
+                ForEach-Object { Write-Host $_.Line }
+              throw "$tier did not run; the 32-bit worker is uncovered on this runner"
+            }
           }
-          Write-Host 'the 32-bit dump and attach tests ran'
+          Write-Host 'the 32-bit dump and attach tiers both ran'
 
   docs:
     name: Documentation lint

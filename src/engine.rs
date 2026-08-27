@@ -2390,9 +2390,16 @@ fn worker_images(target: Option<&crate::target::Opening>) -> Result<Vec<PathBuf>
         // Not an error worth failing an open over, in either arm: the engine opens the target next
         // and will say far more about it than a header parse or an `IsWow64Process2` can.
         Ok(_) => return Ok(vec![default]),
+        // **Warned, not `debug`ged**, because this is the one arm where the answer may be wrong
+        // rather than merely uninteresting: the arms above *know* the target does not want
+        // another image, and this one failed to find out. The session still opens — falling back
+        // is the whole design — but it may quietly be the session a 32-bit target should not have
+        // got, and this is the only place that will ever say so. It is the same level, and for
+        // the same reason, as the "could not come up; falling back to" line in `spawn`.
         Err(why) => {
-            tracing::debug!(
-                "could not read the architecture of {} ({why}); using this build's worker",
+            tracing::warn!(
+                "could not read the architecture of {} ({why}); using this build's worker, which \
+                 is the wrong one if that target is 32-bit",
                 target.describe()
             );
             return Ok(vec![default]);

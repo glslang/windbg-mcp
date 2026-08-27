@@ -2945,6 +2945,38 @@ tool surface at a 32-bit dump and a live WoW64 process in turn):
   run either, which is the correction recorded above. The issue's argument did not need it, but
   this entry's address-space worry did.
 
+**Why `process_arch` does not enable `SeDebugPrivilege`, since review asked twice over.** The
+worry is real in shape: `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)` is a DACL check, DbgEng
+enables `SeDebugPrivilege` before attaching and an enabled `SeDebugPrivilege` *bypasses* the DACL,
+so in principle the probe can be refused a process the attach then opens — and `worker_images`
+reads a refusal as "nothing to say" and takes this build's worker, losing the routing silently. On
+a service, which is what [#234](https://github.com/glslang/windbg-mcp/issues/234)'s reporter
+debugs, that would be the reported bug arriving by a back door.
+
+**Measured, it does not arise in the ordinary case** (x64 bench, 2026-08-27). With
+`SeDebugPrivilege` explicitly **disabled** in an elevated token, `PROCESS_QUERY_LIMITED_INFORMATION`
+still opens `services.exe` and the `System` process itself — the two most locked-down pids on the
+box. That is what the access right is *for*: it was added so a caller can ask what a process is
+without being able to read it, and the default process DACL grants it. The window that remains
+needs a **non-default** DACL denying it to a caller who nonetheless holds `SeDebugPrivilege`;
+without that privilege there is no divergence to have, because the attach fails too.
+
+Both remedies review proposed are worse than the gap:
+
+- **Enabling `SeDebugPrivilege` for the probe** buys nothing measurable and widens the
+  *supervisor's* ambient authority — the process that holds the listener's credentials and spawns
+  every worker — to improve a routing hint.
+- **"Preserve an x86 retry path when the architecture cannot be queried"** is actively harmful.
+  `worker_images` returns images *tried in order*, and a 32-bit worker starts perfectly well
+  holding a 64-bit target: the fallback is driven by a worker failing to come up, not by the
+  target being wrong for it. So an unknown-architecture retry would put 64-bit targets on a
+  32-bit engine and the session would come up broken rather than fall through.
+
+What the failed probe gets instead is a **`warn`** rather than a `debug` line, which is the honest
+mitigation: the routing may have been downgraded and this is the only place that can say so. The
+rest is the operator's — a target whose architecture cannot be read is one whose session says
+nothing about SOS either way.
+
 **Two things bite next.** The build identity on `WorkerMessage::Ready` refuses an
 `x86\windbg-mcp.exe` built from any other state of the tree, and on a dirty tree it carries a
 digest over the uncommitted diff of `build.rs`'s `INPUTS` — so `cargo fmt` invalidates it as surely
