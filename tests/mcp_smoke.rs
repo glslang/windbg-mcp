@@ -716,6 +716,23 @@ fn skip(reason: &str) {
     eprintln!("SKIPPED: {reason}");
 }
 
+/// The counterpart to [`skip`]: a tier saying it reached the end of its assertions.
+///
+/// **libtest cannot tell a tier that covered something from one that stood down**, because
+/// [`skip`] returns normally — so the test reports `test <name> ... ok` either way, and a CI step
+/// checking for that line passes over a run that asserted nothing. That is not a supposition: the
+/// step guarding the 32-bit tier was written that way first, and waving through a deliberately
+/// stood-down run is how it was found.
+///
+/// The alternative is a CI-side list of the tier's skip messages, which is a list that has to be
+/// kept in step with this file and is silently wrong for one round when a new stand-down is added.
+/// A marker the test prints itself cannot drift: a stand-down simply never reaches it.
+///
+/// Needs `--nocapture` to reach a log, exactly as `SKIPPED` does.
+fn ran(what: &str) {
+    eprintln!("RAN: {what}");
+}
+
 // ---- tier 1: transport --------------------------------------------------------
 
 /// stdout is the JSON-RPC channel. Anything else written there — a dependency's banner, a
@@ -11899,14 +11916,17 @@ fn x86_engine_tier() -> bool {
 /// the reason it covered nothing for as long as it needed a file no repository can carry. Being
 /// handed one is still honoured, because a real capture off a real application is a better target
 /// than a fixture and there is no reason to refuse it.
-fn made_x86_dump() -> Option<String> {
+fn made_x86_dump() -> Option<X86Dump> {
     if let Some(supplied) = std::env::var_os("WINDBG_MCP_X86_DUMP") {
         let supplied = supplied.to_string_lossy().into_owned();
         assert!(
             std::path::Path::new(&supplied).is_file(),
             "WINDBG_MCP_X86_DUMP points at nothing: {supplied}"
         );
-        return Some(supplied);
+        return Some(X86Dump {
+            path: supplied,
+            ours: false,
+        });
     }
     let fixture = x86_fixture()?;
     let dump = x86_fixture_dir().join("managed-x86.dmp");
@@ -11931,7 +11951,23 @@ fn made_x86_dump() -> Option<String> {
         "{} is {size} bytes, which is not a full-memory capture",
         dump.display()
     );
-    Some(dump.to_string_lossy().into_owned())
+    Some(X86Dump {
+        path: dump.to_string_lossy().into_owned(),
+        ours: true,
+    })
+}
+
+/// A 32-bit dump for the tier, and **whether this tier is allowed to delete it**.
+///
+/// The flag is the whole reason this is a struct rather than a `String`. The made dump is tens of
+/// megabytes and worth clearing; a dump the caller supplied through `WINDBG_MCP_X86_DUMP` is
+/// theirs, may be the only copy of a capture off a real incident, and must survive the run. Those
+/// two paths are indistinguishable once they are both a `String`, which is exactly how a test
+/// cleaning up after itself comes to delete somebody's evidence.
+struct X86Dump {
+    path: String,
+    /// True only for the dump [`made_x86_dump`] wrote into [`x86_fixture_dir`].
+    ours: bool,
 }
 
 /// The session an opener minted, plus the assertion that it went to a worker of the target's own
@@ -12029,7 +12065,7 @@ fn a_32_bit_managed_dump_is_served_by_an_engine_that_can_load_its_sos() {
     };
     let mut server = Server::started();
 
-    let data = server.tool_data("open_dump", json!({ "path": &dump }), TARGET_STEP);
+    let data = server.tool_data("open_dump", json!({ "path": &dump.path }), TARGET_STEP);
     let session = session_on_a_worker_of_its_own_architecture(&data);
     sos_answers_about_managed_threads(&mut server, &session);
     server.call_tool(
@@ -12039,7 +12075,13 @@ fn a_32_bit_managed_dump_is_served_by_an_engine_that_can_load_its_sos() {
     );
     // Tens of megabytes, and the only part of this tier's scratch worth clearing — the compiled
     // fixture is 4 KB and is shared with the test below, which may still be running.
-    let _ = std::fs::remove_file(&dump);
+    //
+    // **Only the dump this tier made.** A supplied `WINDBG_MCP_X86_DUMP` may be the one copy of a
+    // capture off a real incident, and deleting it is not a tidy-up this test gets to do.
+    if dump.ours {
+        let _ = std::fs::remove_file(&dump.path);
+    }
+    ran("the 32-bit managed dump tier");
 }
 
 /// A 32-bit managed **live process** is too — and it is routed on a different fact.
@@ -12098,4 +12140,5 @@ fn a_32_bit_managed_process_is_attached_by_an_engine_that_can_load_its_sos() {
     );
     let _ = child.kill();
     let _ = child.wait();
+    ran("the 32-bit managed attach tier");
 }
