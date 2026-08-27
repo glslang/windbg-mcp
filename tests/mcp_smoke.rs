@@ -12081,9 +12081,16 @@ fn a_32_bit_managed_process_is_attached_by_an_engine_that_can_load_its_sos() {
     let session = session_on_a_worker_of_its_own_architecture(&data);
     sos_answers_about_managed_threads(&mut server, &session);
 
-    // Detached first, killed second. A debugger that goes away while still attached takes its
-    // debuggee with it, so ending the session is what makes the line below the fixture's own
-    // cleanup rather than the thing that ends the session.
+    // **`end_session` is what ends the fixture, and the `kill` below is belt-and-braces.**
+    // Measured rather than assumed, because the obvious reading is the other way round: an
+    // `end_session` on a user-mode attach ends the engine's session *passively*
+    // (`DEBUG_END_PASSIVE`, dbgscope `end_session`) and then the supervisor terminates the
+    // worker — and a debuggee whose debugger dies without having detached is killed by the
+    // kernel. So the process is already gone by the time this kills it, and it goes for the same
+    // reason on a 64-bit target and this build's own worker: nothing here is about the 32-bit
+    // one. `FOLLOWUPS.md` item 51 is whether that should be an active detach instead; this test
+    // deliberately does not assert it either way, since pinning it would make a behaviour that
+    // has never been decided read as one that was.
     server.call_tool(
         "end_session",
         json!({ "session_id": &session }),
