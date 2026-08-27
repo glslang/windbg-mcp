@@ -70,11 +70,22 @@ pub fn constraints_of<T: JsonSchema + Any>() -> Arc<JsonObject> {
     let lean = Arc::new(object_rooted(strip_descriptions(
         &rmcp::handler::server::tool::schema_for_output::<T>(),
     )));
+    // **The stored one wins, always.** Two callers can miss the read above at once — the lock is
+    // dropped before the walk, deliberately, so a walk cannot block every other type's lookup —
+    // and then both arrive here with a document of their own. A plain `insert` lets the second
+    // overwrite the first, so one type has two `Arc`s alive and a caller that asked twice can be
+    // handed two different ones. `or_insert` keeps whichever landed first and hands it back, at
+    // the cost of the loser's wasted walk, which happens once per type at most.
+    //
+    // Observed as `the_same_type_is_walked_once` failing on an x64 CI runner and nowhere else:
+    // three tests in this file ask for `OpenOutcome`, plus every test that builds a `router()`,
+    // so the window is real and only ever needed the scheduling to hit it.
     CACHE
         .write()
         .expect("output schema cache poisoned")
-        .insert(TypeId::of::<T>(), lean.clone());
-    lean
+        .entry(TypeId::of::<T>())
+        .or_insert(lean)
+        .clone()
 }
 
 /// The root's `"type": "object"`, supplied where the generator emitted no `type` at all.
@@ -378,6 +389,16 @@ mod tests {
     }
 
     /// Two calls hand back the same cached document rather than two walks of the same one.
+    ///
+    /// **And that has to hold against the other tests in this binary**, which is what it did not.
+    /// Three tests here ask for `OpenOutcome` and every test that builds a `router()` asks for it
+    /// again, all in parallel; a caller that misses the read lock walks the type outside the lock
+    /// and then inserts. With a plain `insert` the second arrival overwrote the first, so this
+    /// test's two calls could straddle another test's insert and get two different `Arc`s — seen
+    /// once on an x64 CI runner, and green on every other run of the same commit.
+    ///
+    /// The fix is in `constraints_of` rather than here: a test made serial would have hidden a
+    /// cache that really can hand one type two documents.
     #[test]
     fn the_same_type_is_walked_once() {
         let first = constraints_of::<crate::structured::OpenOutcome>();
