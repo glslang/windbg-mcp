@@ -24,10 +24,13 @@
 //! property of the plumbing rather than a convention about who prints where — which is what lets
 //! the framing stay line-delimited and cheap.
 
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 use crate::batch::BatchOp;
 use crate::kdconn::Connection;
+use crate::target::Opening;
 use crate::walk::WalkOp;
 
 /// One unit of debugger work, as it crosses the process boundary.
@@ -334,16 +337,16 @@ impl EngineOp {
         )
     }
 
-    /// The dump this op opens, if it opens one.
+    /// The target this op opens, where its architecture can be read before an engine exists.
     ///
-    /// Read by the supervisor *before* it spawns a worker, because the architecture of a dump
-    /// decides which process that worker's engine should live in and there is no undoing that
-    /// choice later — see [`crate::worker::TARGET_FLAG`]. Deliberately **not** `OpenTrace`: a
-    /// trace is not a minidump, and replaying one is a capability of the engine bundle rather
-    /// than a question about the target's architecture.
-    pub fn dump_path(&self) -> Option<&str> {
+    /// Read by the supervisor *before* it spawns a worker, because that architecture decides
+    /// which process the worker's engine lives in and there is no undoing the choice later — see
+    /// [`crate::worker::TARGET_FLAG`]. Which openers are here, and which are deliberately not,
+    /// is [`Opening`]'s own doc: the ones absent from it all take this build's image.
+    pub fn opening(&self) -> Option<Opening> {
         match self {
-            Self::OpenDump { path } => Some(path),
+            Self::OpenDump { path } => Some(Opening::Dump(PathBuf::from(path))),
+            Self::AttachProcess { pid } => Some(Opening::Process(*pid)),
             _ => None,
         }
     }

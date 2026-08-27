@@ -50,6 +50,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
     "Win32_System_Threading",
+    # `IsWow64Process2`, which is how `src/target.rs` reads the architecture of a *live* process
+    # before a worker is spawned for it. The call itself is in `Win32_System_Threading` above; this
+    # feature is here for its `IMAGE_FILE_MACHINE` out-parameters, which are gated by module path
+    # rather than by subject — the same trap `CLAUDE.md` records for `IMAGE_NT_HEADERS64`.
+    "Win32_System_SystemInformation",
 ] }
 # The Windows service role (`src/service.rs`). A wrapper rather than hand-rolled SCM FFI because
 # that lifecycle is the one part of this which must not be subtly wrong: a service that mishandles

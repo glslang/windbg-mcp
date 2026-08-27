@@ -237,12 +237,12 @@ Copy-Item "$wd\winxp\kdexts.dll" "$dst\winxp" -Force   # !drvobj/!devobj/!irp �
   (Note it lives in `winxp\`, not `winext\`, and the engine already searches a `WINXP` subdir.)
 - `cargo clean` (when building from source) wipes `target\`, so re-copy after one.
 
-### 32-bit .NET dumps need a 32-bit server
+### 32-bit .NET targets need a 32-bit server
 
-Only for **32-bit .NET Framework** dumps — a 32-bit process captured by 32-bit tooling, which is
-what `procdump.exe -ma` (as opposed to `procdump64.exe -ma`) produces. Native analysis of such a
-dump — stacks, modules, memory — has always worked on the x64 engine and still does. What does not
-is SOS, and no amount of configuration fixes that in one process:
+Only for **32-bit .NET Framework** targets — a 32-bit dump, which is what `procdump.exe -ma` (as
+opposed to `procdump64.exe -ma`) produces, or an `attach_process` on a 32-bit (WoW64) process.
+Native analysis of either — stacks, modules, memory — has always worked on the x64 engine and still
+does. What does not is SOS, and no amount of configuration fixes that in one process:
 
 - the **32-bit** `sos.dll` cannot be loaded by an x64 debugger at all — `Win32 error 0n193`;
 - the **64-bit** one loads and then refuses the target — `Failed to load data access DLL,
@@ -253,8 +253,12 @@ An extension DLL is loaded into the debugger's own process, so the only way to l
 matches the target is to put the engine in a process that matches it too — and a process's
 architecture is fixed when its image loads, so that means a second image. The release zip ships
 one: a 32-bit build of this same server, at `x86\windbg-mcp.exe`. The server spawns it instead of
-re-executing itself when the dump it is opening is a 32-bit user dump, and nothing about the
-session looks different from outside — same handle, same tools, same client.
+re-executing itself when the target is a 32-bit user-mode one, and nothing about the session looks
+different from outside — same handle, same tools, same client.
+
+How it knows differs between the two, and neither needs an engine to answer: a dump carries its
+architecture in its own header, and a live process answers `IsWow64Process2`. Both are read in the
+server before the worker starts, because afterwards is too late.
 
 What it needs beside it is a 32-bit engine. Copy the package's **`x86`** payload into that same
 `x86\` subdirectory:

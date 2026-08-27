@@ -219,6 +219,51 @@ jobs:
             Write-Host "copied $dll beside the binary under test"
           }
 
+      # The 32-bit tier's gate (`FOLLOWUPS.md` item 49). It needs no variable and no supplied
+      # fixture — the tier compiles a 32-bit .NET program with the `csc.exe` every stock Windows
+      # ships and dumps it — but it does need the thing this repo's own release zip carries and a
+      # `cargo build` does not: a 32-bit worker, with a 32-bit engine beside it, in `x86\`.
+      #
+      # The engine comes from the Debugging Tools' own `x86` payload where there is one, which is
+      # exactly what `skills/windbg-debugging/setup.md` tells a reader to copy, and from SysWOW64
+      # otherwise — measured on this project's x64 bench to be enough for this tier, which loads
+      # SOS and reads a managed thread table but resolves no PDB.
+      #
+      # **A runner with neither is red on x64 and a stand-down on ARM64**, and the split is where
+      # this repo's confidence actually is. Neither source was measured on a GitHub image — only on
+      # this project's x64 bench, which has both — so the x64 entry is the one asked to *report* a
+      # host with no 32-bit engine, because that is the architecture whose 32-bit half is ordinary.
+      # On ARM64 an x86 engine runs under emulation and may not be shipped at all, which is new
+      # ground; issue #153 is this repo's precedent for not assuming two runner images carry the
+      # same things, so that entry stands the tier down instead of failing.
+      - name: Give the runner a 32-bit worker and engine (item 49)
+        shell: pwsh
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          rustup target add i686-pc-windows-msvc
+          cargo build --target i686-pc-windows-msvc
+          $x86 = 'target\debug\x86'
+          New-Item $x86 -ItemType Directory -Force | Out-Null
+          Copy-Item 'target\i686-pc-windows-msvc\debug\windbg-mcp.exe' $x86 -Force
+          $sources = @(
+            'C:\Program Files (x86)\Windows Kits\10\Debuggers\x86',
+            "$env:WINDIR\SysWOW64"
+          )
+          $from = $sources | Where-Object { Test-Path (Join-Path $_ 'dbgeng.dll') } | Select-Object -First 1
+          if (-not $from) {
+            if ($env:ARCH -eq 'x64') {
+              throw "no 32-bit dbgeng.dll in any of: $($sources -join ', ')"
+            }
+            Write-Host "no 32-bit engine on this image; the 32-bit tier will stand down"
+            exit 0
+          }
+          foreach ($dll in 'dbgeng.dll', 'dbghelp.dll', 'dbgcore.dll', 'dbgmodel.dll') {
+            $file = Join-Path $from $dll
+            if (Test-Path $file) { Copy-Item $file $x86 -Force }
+          }
+          Write-Host "32-bit engine copied from $from"
+
       - name: Smoke test against the sample dump
         env:
           WINDBG_MCP_SMOKE_DUMP: "1"
@@ -246,6 +291,21 @@ jobs:
             throw 'this runner stood down from reading a target; see the SKIPPED lines above'
           }
           Write-Host 'no target-read skips: the four assertions ran'
+
+      # Same argument one tier down, and the same failure it guards against: the step above put a
+      # 32-bit worker and engine in place, and if either copy stopped landing the two 32-bit tests
+      # would stand down and pass. On x64 only, because that is the entry whose engine source is
+      # not optional — see the copy step.
+      - name: The 32-bit tier must have run
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          $skip = Select-String -Path smoke.log -SimpleMatch -Pattern 'no 32-bit engine in an'
+          if ($skip) {
+            $skip | ForEach-Object { Write-Host $_.Line }
+            throw 'the 32-bit tier stood down, so nothing here covered the 32-bit worker'
+          }
+          Write-Host 'the 32-bit dump and attach tests ran'
 
   docs:
     name: Documentation lint

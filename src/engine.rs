@@ -1285,9 +1285,10 @@ impl Sessions {
         let slot = self.take_slot().map_err(OpenError::NoRoom)?;
 
         let id = mint_session_id();
-        // Read before the worker exists, because the architecture of a dump decides which process
-        // that worker's engine lives in — see `worker::TARGET_FLAG`.
-        let session = match self.spawn(&id, kind, what, op.dump_path()).await {
+        // Read before the worker exists, because the architecture of the target decides which
+        // process that worker's engine lives in — see `worker::TARGET_FLAG`.
+        let opening = op.opening();
+        let session = match self.spawn(&id, kind, what, opening.as_ref()).await {
             Ok(session) => session,
             // The slot goes back and no existing session was touched: a worker that would not
             // start must not cost the caller a target they already had.
@@ -1998,7 +1999,7 @@ impl Sessions {
         id: &str,
         kind: SessionKind,
         what: String,
-        target: Option<&str>,
+        target: Option<&crate::target::Opening>,
     ) -> Result<Arc<Session>, String> {
         let images = worker_images(target)?;
         let mut started = None;
@@ -2350,25 +2351,26 @@ fn worker_exe() -> Result<PathBuf, String> {
 
 /// The worker images to try for a target, in order. Never empty.
 ///
-/// **Only a 32-bit user minidump gets more than one entry.** An extension DLL is loaded into the
-/// debugger's own process, so its architecture is the *host's*: a 64-bit process cannot load the
-/// 32-bit `sos.dll` at all, and the 64-bit one refuses a 32-bit CLR because the data access DLL
-/// behind it is paired to the target as well as the host. No in-process arrangement reads a 32-bit
-/// .NET dump ([#234](https://github.com/glslang/windbg-mcp/issues/234)), so the engine has to move
-/// — and since a process's architecture is fixed when its image loads, moving the engine means
-/// moving the *process*.
+/// **Only a 32-bit user-mode target gets more than one entry.** An extension DLL is loaded into
+/// the debugger's own process, so its architecture is the *host's*: a 64-bit process cannot load
+/// the 32-bit `sos.dll` at all, and the 64-bit one refuses a 32-bit CLR because the data access
+/// DLL behind it is paired to the target as well as the host. No in-process arrangement reads a
+/// 32-bit .NET target ([#234](https://github.com/glslang/windbg-mcp/issues/234)), so the engine
+/// has to move — and since a process's architecture is fixed when its image loads, moving the
+/// engine means moving the *process*.
 ///
 /// **The decision has to precede the engine, which is why it is made here.**
 /// `IDebugControl::GetEffectiveProcessorType` would answer authoritatively, but only inside a
 /// session that already exists in a process whose architecture is by then the thing being chosen.
-/// So [`crate::dump`] reads the answer out of the file's own header, and the supervisor — which
-/// has no engine and never will — is the one place that read can change which process is started.
+/// So [`crate::target`] answers it without one — from a dump's own header, or from
+/// `IsWow64Process2` for a live process — and the supervisor, which has no engine and never will,
+/// is the one place that answer can change which process is started.
 ///
-/// **The fallback is deliberate**: an x86 dump opens perfectly well in this build, and native
+/// **The fallback is deliberate**: a 32-bit target opens perfectly well in this build, and native
 /// analysis of it works. Only SOS is lost. So a missing or unstartable 32-bit worker degrades to
-/// this one rather than failing the open, and the worker that ends up with the target reports the
-/// limitation from its own reading of the same header.
-fn worker_images(target: Option<&str>) -> Result<Vec<PathBuf>, String> {
+/// this one rather than failing the open, and the worker that ends up with the target asks the
+/// same question again and reports the limitation itself.
+fn worker_images(target: Option<&crate::target::Opening>) -> Result<Vec<PathBuf>, String> {
     let default = worker_exe()?;
     // An explicit override means *this* image and no other. It is how the tests point a server at
     // a worker that is not the harness binary they run from, and second-guessing it would make
@@ -2383,13 +2385,16 @@ fn worker_images(target: Option<&str>) -> Result<Vec<PathBuf>, String> {
     let Some(target) = target else {
         return Ok(vec![default]);
     };
-    match crate::dump::read(Path::new(target)) {
-        Ok(crate::dump::DumpTarget::UserMinidump(crate::dump::Arch::X86)) => {}
-        // Not an error worth failing an open over, in either arm: the engine reads the file next
-        // and will say far more about it than a header parser can.
+    match target.arch() {
+        Ok(Some(crate::target::Arch::X86)) => {}
+        // Not an error worth failing an open over, in either arm: the engine opens the target next
+        // and will say far more about it than a header parse or an `IsWow64Process2` can.
         Ok(_) => return Ok(vec![default]),
         Err(why) => {
-            tracing::debug!("could not read {target}'s header ({why}); using this build's worker");
+            tracing::debug!(
+                "could not read the architecture of {} ({why}); using this build's worker",
+                target.describe()
+            );
             return Ok(vec![default]);
         }
     }
@@ -2442,7 +2447,11 @@ struct StartedWorker {
 /// Every failure path kills the child before returning, because nothing has been asked of it yet:
 /// it holds no target, so killing it is the whole teardown. That is also what makes this safe to
 /// call again with the next image.
-async fn start_worker(id: &str, exe: &Path, target: Option<&str>) -> Result<StartedWorker, String> {
+async fn start_worker(
+    id: &str,
+    exe: &Path,
+    target: Option<&crate::target::Opening>,
+) -> Result<StartedWorker, String> {
     let (mut child, channel) = spawn_worker(exe, target)
         .map_err(|e| format!("could not start an engine worker ({}): {e}", exe.display()))?;
 
@@ -2564,7 +2573,10 @@ fn inheritable(handle: &impl AsRawHandle) -> std::io::Result<()> {
 /// request side would mean the worker never sees the EOF that tells it the supervisor is gone,
 /// and one left open on the message side would mean the supervisor never sees the EOF that tells
 /// it the worker exited.
-fn spawn_worker(exe: &Path, target: Option<&str>) -> std::io::Result<(Child, Channel)> {
+fn spawn_worker(
+    exe: &Path,
+    target: Option<&crate::target::Opening>,
+) -> std::io::Result<(Child, Channel)> {
     let (their_requests, our_requests) = std::io::pipe()?;
     let (our_messages, their_messages) = std::io::pipe()?;
 
@@ -2584,13 +2596,13 @@ fn spawn_worker(exe: &Path, target: Option<&str>) -> std::io::Result<(Child, Cha
     // inheriting it could dial the listener on loopback, wait for the holder to go quiet, and take
     // over the very sessions being used to debug it. The credential does not cross this boundary.
     crate::client::strip_credentials(&mut command);
-    // The dump this worker is for, when it is for one. It travels on the command line rather than
-    // down the channel because the worker has to act on it *before* the channel carries its first
-    // op: the engine must exist by `Ready`, and which process it exists in is what this decides
-    // (`worker::TARGET_FLAG`). A path is not a secret; the connection strings that are never come
-    // this way.
+    // The target this worker is for, when its architecture can be read before an engine exists.
+    // It travels on the command line rather than down the channel because the worker has to act
+    // on it *before* the channel carries its first op: the engine must exist by `Ready`, and
+    // which process it exists in is what this decides (`worker::TARGET_FLAG`). A dump path and a
+    // pid are not secrets; the connection strings that are never come this way.
     if let Some(target) = target {
-        command.arg(format!("{TARGET_FLAG}{target}"));
+        command.arg(format!("{TARGET_FLAG}{}", target.flag_value()));
     }
     let child = command
         .arg(WORKER_FLAG)
@@ -4918,21 +4930,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Only a 32-bit user minidump is offered a second image, and the list is never empty.
+    /// Only a 32-bit user-mode target is offered a second image, and the list is never empty.
     ///
     /// The negative half is the one worth pinning: a kernel dump is a different format entirely
     /// (`PAGEDU64`), has no CLR in it, and is read by this build's engine whatever architecture it
     /// was captured on — so routing one at a 32-bit worker would trade a working session for a
     /// broken one. The samples are checked in, which is what lets this assert against real files.
+    ///
+    /// The **live process** here is this test binary, which is this build's own architecture by
+    /// construction: whatever that is, it is not a reason to start a second image. A process that
+    /// *is* 32-bit is `a_wow64_process_is_read_as_x86` in `crate::target`, one layer down, and
+    /// the tool-surface end of it is the 32-bit tier in `tests/mcp_smoke.rs`.
     #[test]
-    fn only_a_32_bit_user_dump_asks_for_another_image() {
+    fn only_a_32_bit_user_target_asks_for_another_image() {
         let samples = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/samples");
         for entry in std::fs::read_dir(&samples).expect("the sample directory is checked in") {
             let path = entry.expect("a readable directory entry").path();
             if path.extension().is_none_or(|e| e != "dmp") {
                 continue;
             }
-            let images = worker_images(Some(&path.to_string_lossy()))
+            let images = worker_images(Some(&crate::target::Opening::Dump(path.clone())))
                 .expect("this executable can locate itself");
             assert_eq!(
                 images.len(),
@@ -4942,11 +4959,18 @@ mod tests {
             );
         }
         assert_eq!(
+            worker_images(Some(&crate::target::Opening::Process(std::process::id())))
+                .expect("this executable can locate itself")
+                .len(),
+            1,
+            "this test binary is this build's own architecture, so it wants no second image"
+        );
+        assert_eq!(
             worker_images(None)
                 .expect("this executable can locate itself")
                 .len(),
             1,
-            "a target-less worker (an attach, a launch) has one image and always this one"
+            "a worker told nothing (a kernel attach, a trace, a launch) has one image, this one"
         );
     }
 

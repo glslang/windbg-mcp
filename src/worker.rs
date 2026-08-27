@@ -37,7 +37,6 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, PipeReader, PipeWriter, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
@@ -63,6 +62,7 @@ use crate::server::{
     reachability,
 };
 use crate::structured;
+use crate::target::{Arch, Opening};
 use crate::triage::{self, Analysis, AttributedFrame, Attribution};
 use crate::walk;
 
@@ -78,16 +78,18 @@ pub const WORKER_FLAG: &str = "--engine-worker";
 pub const REQUESTS_FLAG: &str = "--requests-handle=";
 pub const MESSAGES_FLAG: &str = "--messages-handle=";
 
-/// The flag naming the dump this worker was spawned for, when it was spawned for one.
+/// The flag naming the target this worker was spawned for, when its architecture could be read
+/// before an engine existed — a dump or a live process ([`crate::target::Opening`]).
 ///
-/// It exists because **the engine has to be built before the opener arrives**. A 32-bit dump wants
-/// an engine in a 32-bit process, and that cannot be decided after the fact: `Ready` means the
-/// engine exists, `INTERRUPT` is taken from it once into a `OnceLock`, and an engine swapped
-/// mid-session would leave `interrupt` pointing at a dead one. So the supervisor forwards the path
-/// it already holds and this worker decides on it — see [`build_engine`].
+/// It exists because **the engine has to be built before the opener arrives**. A 32-bit target
+/// wants an engine in a 32-bit process, and that cannot be decided after the fact: `Ready` means
+/// the engine exists, `INTERRUPT` is taken from it once into a `OnceLock`, and an engine swapped
+/// mid-session would leave `interrupt` pointing at a dead one. So the supervisor forwards what it
+/// already holds and this worker asks the same question again — see [`build_engine`].
 ///
-/// The path is a caller's, not a secret: the connection strings that *are* secret travel down the
-/// protocol pipe instead ([`crate::proto::EngineOp::AttachKernel`]), and never on a command line.
+/// A dump path is a caller's and a pid is a number, neither of them secret: the connection
+/// strings that *are* travel down the protocol pipe instead
+/// ([`crate::proto::EngineOp::AttachKernel`]), and never on a command line.
 pub const TARGET_FLAG: &str = "--engine-target=";
 
 /// Reads the two inherited handle values off the command line.
@@ -528,12 +530,23 @@ pub fn run(args: &[String]) -> ! {
     let _ = MESSAGES.set(Mutex::new(messages));
     start_log_writer();
 
-    // Optional, and absent for every opener but a dump. Unlike the two handles above, a missing
-    // one is not a fault: it means "this worker is not for a dump", which is the common case.
+    // Optional, and absent for every opener whose architecture cannot be read without an engine.
+    // Unlike the two handles above, a missing one is not a fault: it means "nothing about this
+    // worker's target was decided before it started", which is the common case. A value that does
+    // not parse means the supervisor and this worker disagree about the encoding — a mismatch the
+    // handshake's build check is what actually catches — so it is logged rather than fatal, and
+    // this worker carries on as though it had been told nothing.
     let target = args
         .iter()
         .find_map(|arg| arg.strip_prefix(TARGET_FLAG))
-        .map(PathBuf::from);
+        .and_then(|value| {
+            Opening::parse(value).or_else(|| {
+                tracing::warn!(
+                    "worker: `{TARGET_FLAG}{value}` is not a target this build can read"
+                );
+                None
+            })
+        });
 
     // Each request is stamped when it is *read*, so the engine thread can tell how long it then
     // waited its turn — the half of the watchdog budget only this process can measure.
@@ -719,14 +732,14 @@ fn session_limitation() -> Option<String> {
 /// architecture is fixed when its image loads and so the choice cannot be made from inside the
 /// process being chosen.
 ///
-/// What is left for this end is the honest report. A 32-bit user dump opens perfectly well in a
+/// What is left for this end is the honest report. A 32-bit target opens perfectly well in a
 /// 64-bit worker and native analysis of it works — only the .NET SOS extension is unreachable,
 /// because an extension loads into the debugger's own process. So when this build is the wrong
 /// architecture for the target it has been given, the session comes up and says so, rather than
 /// failing or quietly producing one whose SOS commands all fail with something that names none of
-/// this. The same dump header the supervisor read answers it, which is why the two cannot
-/// disagree.
-fn build_engine(target: Option<&Path>) -> Result<(DebugEngine, Option<String>), String> {
+/// this. It is the *same question* the supervisor asked, asked again here, which is why the two
+/// cannot disagree.
+fn build_engine(target: Option<&Opening>) -> Result<(DebugEngine, Option<String>), String> {
     // `DebugEngine::new()` panics if the engine cannot be created — dbgeng.dll not discoverable,
     // most likely.
     let engine = catch_unwind(AssertUnwindSafe(DebugEngine::new))
@@ -740,44 +753,48 @@ fn build_engine(target: Option<&Path>) -> Result<(DebugEngine, Option<String>), 
 /// **Names no tool**, deliberately: this is built in the worker, which owns one session and has
 /// never heard of the caller's surface (`FOLLOWUPS.md` item 43). It names a document instead,
 /// which every caller can reach.
-fn limitation_for(target: Option<&Path>) -> Option<String> {
+///
+/// **Computed here rather than sent down the wire, on purpose.** The supervisor asked this same
+/// question to choose an image; asking it again is two reads of one fact rather than a field the
+/// two processes could come to disagree about, and it needs no new protocol to say what a session
+/// is.
+fn limitation_for(target: Option<&Opening>) -> Option<String> {
     // A 32-bit worker is the answer, not the problem.
     if std::env::consts::ARCH == "x86" {
         return None;
     }
     let target = target?;
-    match crate::dump::read(target) {
-        Ok(crate::dump::DumpTarget::UserMinidump(crate::dump::Arch::X86)) => {
-            Some(NO_X86_WORKER.to_string())
-        }
-        Ok(crate::dump::DumpTarget::UserMinidump(arch)) => {
+    match target.arch() {
+        Ok(Some(Arch::X86)) => Some(NO_X86_WORKER.to_string()),
+        Ok(Some(arch)) => {
             tracing::debug!(
-                "worker: {} is a {} user dump; this build can open it",
-                target.display(),
+                "worker: {} is {}; this build can open it",
+                target.describe(),
                 arch.label()
             );
             None
         }
-        Ok(crate::dump::DumpTarget::Other) => None,
-        // Not worth a limitation: the engine reads the file next and will say far more about it
-        // than a header parser can.
+        Ok(None) => None,
+        // Not worth a limitation: the engine opens the target next and will say far more about it
+        // than a header parse or an `IsWow64Process2` can.
         Err(why) => {
             tracing::debug!(
-                "worker: could not read {}'s header ({why}); assuming this build can open it",
-                target.display()
+                "worker: could not read the architecture of {} ({why}); assuming this build can \
+                 open it",
+                target.describe()
             );
             None
         }
     }
 }
 
-/// Told to a caller whose 32-bit dump this build cannot give a 32-bit engine.
+/// Told to a caller whose 32-bit target this build cannot give a 32-bit engine.
 ///
 /// One sentence covers both ways of getting here — no 32-bit worker on the host, and one that
 /// would not start — because from the caller's side they are the same fact and the same remedy.
 /// Why the 32-bit worker did not start is a *server* fact, and is logged by the supervisor that
 /// tried it.
-const NO_X86_WORKER: &str = "This is a 32-bit dump and this build of the server is not, so the \
+const NO_X86_WORKER: &str = "This is a 32-bit target and this build of the server is not, so the \
                              .NET SOS extension cannot be loaded for it: an extension is loaded \
                              into the debugger's own process, and from here neither the 32-bit \
                              `sos.dll` (which will not load) nor the 64-bit one (which refuses a \
@@ -788,11 +805,11 @@ const NO_X86_WORKER: &str = "This is a 32-bit dump and this build of the server 
                              `setup.md` has the copy block.";
 
 /// Owns the [`DebugEngine`] for the life of the process and runs one op at a time.
-fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<PathBuf>) {
+fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
     // Reported and exited rather than accepted: the supervisor is waiting for exactly one of these
     // two messages before it registers a session, so a dead engine reads as server machinery
     // rather than as a debugger error the model would pointlessly retry.
-    let (engine, limitation) = match build_engine(target.as_deref()) {
+    let (engine, limitation) = match build_engine(target.as_ref()) {
         Ok(built) => built,
         Err(message) => {
             emit(&WorkerMessage::Fatal {
