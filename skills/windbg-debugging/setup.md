@@ -260,6 +260,12 @@ How it knows differs between the two, and neither needs an engine to answer: a d
 architecture in its own header, and a live process answers `IsWow64Process2`. Both are read in the
 server before the worker starts, because afterwards is too late.
 
+**One thing a 32-bit worker still cannot give you, and it is not about the worker.** The five
+`heap_*` tools refuse any target that is not x64 — *"heap walking supports x64 targets only
+(machine 0x14c)"* — because the walker decodes x64 segment-heap structures, so a 32-bit target has
+no heap tools whichever engine holds it. SOS's own `!dumpheap` and `!eeheap` are the managed
+equivalent and do work here, which is the reason to be on this page at all.
+
 What it needs beside it is a 32-bit engine. Copy the package's **`x86`** payload into that same
 `x86\` subdirectory:
 

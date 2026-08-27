@@ -2814,9 +2814,15 @@ dump on demand instead of mapping it — and a full `!address`, `!heap -h 0` and
 the largest moved it no further than 238–255 MB. The ceiling is 4 GB rather than 2 because
 `x86\cdb.exe` is linked `LARGE_ADDRESS_AWARE` (`0x0122`); `build.rs` now emits
 `/LARGEADDRESSAWARE` for an x86 build so that margin is a decision rather than the linker's default.
-What this bounds is **the engine, not this repo's walkers**: dbgscope's heap and pool walks build
-structures proportional to chunk count, and in a 32-bit worker those are our code in that address
-space. The dumps measured were one large allocation, not millions of small chunks.
+What this bounds is **the engine, not this repo's walkers** — and the walkers turned out not to
+need bounding at all. This entry said dbgscope's heap and pool walks build structures proportional
+to chunk count and that in a 32-bit worker those are our code in that address space, so the
+walker's own footprint was "what is left to watch". Measured once the worker existed (x64 bench,
+2026-08-27): **neither walk runs against a 32-bit target in the first place.** `heap::validate_target`
+refuses anything but `IMAGE_FILE_MACHINE_AMD64` on the *target's* effective processor type
+(`dbgscope/src/heap.rs:695`), exactly as `pool/query.rs` does, so all five heap tools answer
+`heap walking supports x64 targets only (machine 0x14c)` on a 32-bit dump and on a live WoW64
+process alike. The address space this worker has is spent on the engine and nothing else.
 
 **What closed the rest of it** (built 2026-08-27 on the **x64 bench**, against the plan written
 that morning from the Mac; that plan is kept below where it was right about a seam, and the one
@@ -2878,6 +2884,26 @@ cannot be reached from an x64 bench, so they are covered by a unit test over the
 which also pins the thing that mapping exists for: 9 is x64 to a minidump and nothing at all as a
 PE machine type, and 332 is the other way round, so one shared table is how a value from the wrong
 namespace becomes a plausible wrong answer.
+
+**What this let us go back and measure in [#240](https://github.com/glslang/windbg-mcp/issues/240),
+which argued for this design and shipped two claims it could not check.** Both now check out, and
+one of them is stronger than the issue's own argument (x64 bench, 2026-08-27, driving the shipped
+tool surface at a 32-bit dump and a live WoW64 process in turn):
+
+- *"`cargo check --target i686-pc-windows-msvc` has not been run, so 'it compiles' is an
+  expectation rather than a measurement."* It compiles, it is clippy-clean, and the worker it
+  produces opens real targets.
+- *"The 32-bit-truncation risk reads low ... every `as usize` inspected is buffer-length shaped
+  rather than address shaped."* Measured rather than read: `0xffffffff12345678` and
+  `0x7fffffffffffffff` come back **whole** from a 32-bit worker, in the structured result and in
+  the error text alike, and `modules`, `registers`, `backtrace`, `read_memory` and `disassemble`
+  all report addresses in the target's real range with nothing truncated or sign-extended. The
+  counts the issue quoted have drifted, as counts do — `as usize` is 82 in dbgscope and 28 here
+  against its 81 and 27.
+- *"The kernel pool walkers — the most 64-bit-assuming code — never run in an x86 user-mode
+  worker."* True, and **more is true than the issue claimed**: the *user-mode heap* walker does not
+  run either, which is the correction recorded above. The issue's argument did not need it, but
+  this entry's address-space worry did.
 
 **Two things bite next.** The build identity on `WorkerMessage::Ready` refuses an
 `x86\windbg-mcp.exe` built from any other state of the tree, and on a dirty tree it carries a
@@ -3135,7 +3161,9 @@ teardown should be inherited unexamined into that.
 
 **Untested over the transport:** execution control, breakpoint arming and event waits — a dump
 cannot exercise them — and the user-mode heap walker, which is in scope for x86 dumps and is
-`ReadVirtual`-heavy, so likely correct but chatty over a pipe.
+`ReadVirtual`-heavy, so likely correct but chatty over a pipe. (That last one was **wrong**, and
+measuring it needed the worker this design was replaced by: the heap walker is *not* in scope for
+an x86 target, it refuses one outright. See the correction above the details block.)
 
 **Still unmeasured, and both are now second-order.** Whether an unprivileged local user can read
 another account's command line — the fact this entry said would decide the password's worth. The
