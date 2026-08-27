@@ -212,15 +212,15 @@ It checks *same-file* fragments only, so a cross-file `../README.md#some-heading
 verify by hand.
 
 **The pass count does not say which tiers ran.** Each gate is inside its test, so the `mcp_smoke`
-harness reports the same **87 passed** with the debugger tier off as with it on — that harness's own
+harness reports the same **88 passed** with the debugger tier off as with it on — that harness's own
 result line, since a plain `cargo test` runs the crate's several hundred unit tests beside it and
 prints a result line per binary. What differs between the two runs is the runtime (measured on the
 ARM64 bench 2026-08-23: **1.6s against 61s** for `cargo test --test mcp_smoke`) and the `SKIPPED`
 lines, which only `--nocapture` prints. Read one of those two before believing a run covered a
 debugger claim. The count moves whenever a test is added — it was 69 until #195 and #196, 75
-until item 37, 79 until the TTD tier, 84 until item 50's version-resource test and 85 until
-item 48's two endings — and it said 83 while it was 84, which is the usual state of it, so re-derive it rather than trusting this
-sentence.
+until item 37, 79 until the TTD tier, 84 until item 50's version-resource test, 85 until
+item 48's two endings and 87 until item 49's live 32-bit target — and it said 83 while it was 84,
+which is the usual state of it, so re-derive it rather than trusting this sentence.
 
 **The dev exe can be locked too, and the failure is quiet.** A worker left running — a driver
 script that died mid-session, a debugger tier killed partway — holds `target\debug\windbg-mcp.exe`,
@@ -740,9 +740,9 @@ rather than the message. And a session whose target is gone is still reported `o
 
 [#242]: https://github.com/glslang/windbg-mcp/issues/242
 
-## A worker of the target's architecture (`src/dump.rs`, `engine::worker_images`)
+## A worker of the target's architecture (`src/target.rs`, `engine::worker_images`)
 
-A 32-bit .NET dump cannot be read from this server's own process, and the reason is not a missing
+A 32-bit .NET target cannot be read from this server's own process, and the reason is not a missing
 DLL. An extension is loaded into the debugger's process, so its architecture is the *host's*: the
 32-bit `sos.dll` will not load into an x64 host (`0n193`), and the 64-bit one loads and then fails
 on the target (`Failed to load data access DLL, 0x80004005`) because `mscordacwks` is paired to the
@@ -751,7 +751,7 @@ arrangement, which is why the process moves rather than the extension
 ([#234](https://github.com/glslang/windbg-mcp/issues/234)).
 
 **It is a second worker image, not a second server.** The supervisor normally re-executes itself;
-for a 32-bit user dump it spawns `x86\windbg-mcp.exe` instead (`engine::worker_images`,
+for a 32-bit user-mode target it spawns `x86\windbg-mcp.exe` instead (`engine::worker_images`,
 `engine::x86_worker_image`). A worker has never spoken MCP — it speaks `src/proto.rs` down a pair
 of inherited anonymous pipes and has never heard of a client — so the client still sees one server,
 one `tools/list`, one session registry, one four-session cap and one transcript, and cannot tell
@@ -762,20 +762,56 @@ luck — process-per-session imposed serializability, which is the same property
 
 **The decision has to precede the engine, not follow it.** `GetEffectiveProcessorType` answers
 authoritatively but only once a session exists, in a process whose architecture is by then fixed —
-the very thing being chosen. So `src/dump.rs` reads the architecture out of the minidump header
-before anything opens it, **in the supervisor**, which is the only place a read can still change
-which process is started. The same constraint rules out swapping the engine later: `worker.rs`
-takes `INTERRUPT` from the engine once, into a `OnceLock`, so an engine replaced mid-session leaves
-`interrupt` pointing at a dead one.
+the very thing being chosen. So `src/target.rs` answers without one, **in the supervisor**, which
+is the only place a read can still change which process is started. The same constraint rules out
+swapping the engine later: `worker.rs` takes `INTERRUPT` from the engine once, into a `OnceLock`,
+so an engine replaced mid-session leaves `interrupt` pointing at a dead one.
 
-**It answers for `MDMP` only, and that is the whole format.** Every user-mode capture on Windows
-goes through `MiniDumpWriteDump` — procdump, WER, Task Manager, DebugDiag, VS, `dotnet-dump` —
-verified against three independent writers. A kernel dump is `PAGEDU64` and reads as `Other`, which
-is right: there is no CLR in one, and the x64 engine reads x86 and ARM64 kernel dumps alike.
-`MiniDumpReadDumpStream` is the documented API for this and was considered; it needs a mapping and
-`unsafe` to read two bytes at a fixed ABI offset, and it still cannot distinguish "not a minidump"
-from "no such stream", so the signature check stays hand-written either way. Reach for it if this
-ever needs the module list.
+**Two target kinds can be asked without an engine, and they are asked differently.** A dump carries
+its architecture in its own header; a live process answers `IsWow64Process2`. `target::Opening` is
+the pair — one value, built from the opener in `EngineOp::opening`, consumed by `worker_images` to
+pick the image and by `worker::limitation_for` to report. Three things about the live half. Read
+**`ProcessMachine`, falling back to `NativeMachine`**, never the native one alone: the native
+machine is the *host's*, so reading it would report an ARM64 box's x86 processes as ARM64 — the
+exact case this exists for. The two enumerations are **not one table** (`Arch::of` against
+`Arch::of_machine`): 9 is x64 to a minidump and nothing at all as a PE machine type, and 332 is the
+other way round, so a shared mapping is how a value gets a plausible wrong answer.
+`PROCESS_QUERY_LIMITED_INFORMATION` and not more — asking what a process *is* should need no more
+right than naming it, and the attach that follows is where DbgEng asks for debug privilege.
+
+**`IsWow64Process2` lives behind a feature gated by module path, not by subject.** The call is in
+`Win32_System_Threading`, its `IMAGE_FILE_MACHINE` out-parameters are in
+`Win32_System_SystemInformation`, and without the second feature the import does not resolve —
+the same trap this file records for `IMAGE_NT_HEADERS64`.
+
+**The dump half answers for `MDMP` only, and that is the whole format.** Every user-mode capture on
+Windows goes through `MiniDumpWriteDump` — procdump, WER, Task Manager, DebugDiag, VS,
+`dotnet-dump` — verified against three independent writers. A kernel dump is `PAGEDU64` and reads
+as `Other`, which is right: there is no CLR in one, and the x64 engine reads x86 and ARM64 kernel
+dumps alike. `MiniDumpReadDumpStream` is the documented API for this and was considered; it needs a
+mapping and `unsafe` to read two bytes at a fixed ABI offset, and it still cannot distinguish "not
+a minidump" from "no such stream", so the signature check stays hand-written either way. Reach for
+it if this ever needs the module list.
+
+**The flag between the two processes is tagged, and that is not decoration.** `--engine-target=`
+carries `dump:<path>` or `process:<pid>` (`Opening::flag_value`/`parse`), because a bare value
+would have to be told apart by guessing — is `1234` a pid or a file called `1234`? — in the one
+process that cannot ask anyone. A value that does not parse is logged and ignored rather than
+fatal; what actually catches a supervisor and a worker disagreeing is the build identity on
+`WorkerMessage::Ready`.
+
+**Which is also the trap while editing this on a bench.** That check refuses an
+`x86\windbg-mcp.exe` built from *any* other state of the tree, and on a dirty tree the identity
+carries a digest over the uncommitted diff of `build.rs`'s `INPUTS` — `src`, `tests`, `build.rs`
+and the two manifests — so `cargo fmt` moves it as surely as a code change does. A stale 32-bit worker is
+therefore turned away, the session falls back to this build, and the smoke tier fails saying *this
+host could not give the target a 32-bit worker* — which reads as a missing file rather than a stale
+one. After every edit, before running that tier:
+
+```pwsh
+cargo build --target i686-pc-windows-msvc
+Copy-Item target\i686-pc-windows-msvc\debug\windbg-mcp.exe target\debug\x86 -Force
+```
 
 **`x86\` is a subdirectory because the loader makes it one.** An executable's own directory is
 searched first, so a 32-bit `dbgeng.dll` dropped beside the 64-bit one would be found by the wrong
@@ -789,14 +825,26 @@ engine is an import-table dependency resolved by the loader *before `main`*, so 
 start, as a loader error with no Rust in it. `x86_worker_image` returns `None` unless both are
 there.
 
-**Falling back is deliberate and the limitation is computed twice on purpose.** An x86 dump opens
+**Falling back is deliberate and the limitation is computed twice on purpose.** An x86 target opens
 perfectly well in the x64 build and native analysis of it works; only SOS is lost. So a missing or
 unstartable 32-bit worker degrades to this build rather than failing the open, and the *worker*
-that ends up with the target reads the same header the supervisor read and reports the limitation
-itself (`worker::limitation_for`). Two reads of one file rather than a field on the wire — they
-cannot disagree, and the worker needs no new protocol to say what it is. Why the 32-bit worker did
-not start is a **server** fact and is logged by the supervisor that tried it, not put in the
-caller's summary.
+that ends up with the target asks the same question again and reports the limitation itself
+(`worker::limitation_for`). Two reads of one fact rather than a field on the wire — they cannot
+disagree, and the worker needs no new protocol to say what it is. Why the 32-bit worker did not
+start is a **server** fact and is logged by the supervisor that tried it, not put in the caller's
+summary.
+
+**The tier for it makes its own target**, which is why it now covers anything: it was gated on a
+supplied dump for as long as it existed, so CI never ran it. `csc.exe` ships with every stock
+Windows, so the two tests compile a `-platform:x86` C# program that dumps *itself* — a 32-bit
+process loads the 32-bit `dbghelp.dll`, where a 64-bit writer aimed at the same target produces a
+dump reporting the host's architecture — and the other test attaches to that same program running.
+Two things the tier learned the hard way: assert the dump's **size**, because
+`comsvcs.dll MiniDump` was measured writing a near-empty file and reporting nothing wrong; and read
+`summary.limitation`, not `limitation`, or the assertion is against JSON null and passes whatever
+happened. Its gate is the **engine** (`x86\dbgeng.dll`) and not the worker, so a half-populated
+`x86\` fails loudly rather than skipping, and so the gate is not a second copy of
+`x86_worker_image`'s renamed-image fallback.
 
 **What this replaced, and why it is worth knowing.** Until 2026-08-27 the engine moved into an
 `x86\cdb.exe` run as a debugging server and driven over DbgEng's `npipe:` transport. That worked,

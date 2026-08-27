@@ -20,28 +20,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FileVersion` stays the bare release, so the dialog answers the same question `serverInfo.version`
   does. This does not make the binary signed, and signing is what the reputation systems above
   Defender actually read: [`FOLLOWUPS.md`](./FOLLOWUPS.md) item 50 is what remains.
-- **A 32-bit .NET dump is opened by an engine that can load its SOS** (issue #234). An extension DLL
-  is loaded into the debugger's own process, so its architecture is the *host's*: the 32-bit
-  `sos.dll` will not load into this server's x64 engine (`Win32 error 0n193`) and the 64-bit one
-  loads and then fails on the target (`Failed to load data access DLL, 0x80004005`), because the
-  CLR data access DLL is paired to the target's architecture as well as the host's. Both measured —
-  there is no in-process arrangement, and a process's architecture is fixed when its image loads —
-  so the *process* moves. The release now ships a 32-bit build of this same server at
-  `x86\windbg-mcp.exe`, and a 32-bit user dump is opened by that worker rather than by a
-  re-execution of the 64-bit one; `!sos.threads`, `!clrstack` and the rest answer. None of it is
-  visible to a client — one server, one handle, one tool surface, one session registry — because a
-  worker has never spoken MCP: it talks to the supervisor over the same pair of inherited anonymous
-  pipes every other session uses. The dump's architecture is read from its own header before
-  anything opens it, which is what makes the choice possible at all: asking the engine would need a
-  session in a process whose architecture is by then already fixed.
-  `skills/windbg-debugging/setup.md` has the one-time copy block for the 32-bit engine payload that
-  worker loads.
+- **A 32-bit .NET target is opened by an engine that can load its SOS** (issue #234) — a 32-bit
+  dump, and a 32-bit (WoW64) process reached with `attach_process`. An extension DLL is loaded into
+  the debugger's own process, so its architecture is the *host's*: the 32-bit `sos.dll` will not
+  load into this server's x64 engine (`Win32 error 0n193`) and the 64-bit one loads and then fails
+  on the target (`Failed to load data access DLL, 0x80004005`), because the CLR data access DLL is
+  paired to the target's architecture as well as the host's. Both measured — there is no in-process
+  arrangement, and a process's architecture is fixed when its image loads — so the *process* moves.
+  The release now ships a 32-bit build of this same server at `x86\windbg-mcp.exe`, and a 32-bit
+  user-mode target is opened by that worker rather than by a re-execution of the 64-bit one;
+  `!sos.threads`, `!clrstack` and the rest answer. None of it is visible to a client — one server,
+  one handle, one tool surface, one session registry — because a worker has never spoken MCP: it
+  talks to the supervisor over the same pair of inherited anonymous pipes every other session uses.
+  The architecture is settled before anything opens the target, which is what makes the choice
+  possible at all — asking the engine would need a session in a process whose architecture is by
+  then already fixed — and the two kinds answer differently: a dump carries it in its own header,
+  and a live process answers `IsWow64Process2`. `skills/windbg-debugging/setup.md` has the one-time
+  copy block for the 32-bit engine payload that worker loads.
 - **An opener's summary carries a `limitation`** when the session cannot do something a caller would
   otherwise assume it can. Today that is the case above on a host with no 32-bit worker available:
-  rather than failing the open — native analysis of such a dump works and always has — the dump
-  opens here and the result says SOS is unreachable and what to copy. Present on both the text and
+  rather than failing the open — native analysis of such a target works and always has — it opens
+  here and the result says SOS is unreachable and what to copy. Present on both the text and
   the structured halves, so a client that forwards `structuredContent` and drops the text still
   sees it.
+- **The smoke test builds its own 32-bit target** rather than waiting to be handed one, so the tier
+  covering the above runs unattended and in CI. It compiles a small 32-bit C# program with the
+  `csc.exe` every stock Windows ships; one test opens the full-memory dump that program writes of
+  itself, and the other attaches to it running. `WINDBG_MCP_X86_DUMP` still overrides the made dump
+  with a real capture. The tier stands down where there is no 32-bit engine to run it against.
 
 ## [0.12.1] - 2026-08-26
 

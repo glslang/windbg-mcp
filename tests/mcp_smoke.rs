@@ -10,7 +10,7 @@
 //! * **The MCP spec revved.** New revision, new required field, a capability the SDK now
 //!   advertises on our behalf that this server does not actually implement.
 //!
-//! Six tiers, so the cheap one can ride `cargo test` everywhere:
+//! Seven tiers, so the cheap one can ride `cargo test` everywhere:
 //!
 //! * **Protocol** (default) — spawns the server, speaks JSON-RPC. No debugger target, no
 //!   symbols, no network. This tier also drives the **listener** (`--listen`) over real HTTP on a
@@ -52,6 +52,15 @@
 //!   why nothing covered these calls, and why #231, #232 and #233 all shipped. Gated on the
 //!   variable alone rather than `#[ignore]`d as well: a stale variable here costs a few tens of MB
 //!   in the temp directory, not a wedged VM.
+//! * **32-bit managed target** (a 32-bit `dbgeng.dll` in an `x86` directory beside the binary
+//!   under test) — the only tier asserting something this server's own engine *cannot do*: a
+//!   32-bit `sos.dll` will not load into a 64-bit debugger and the 64-bit one refuses a 32-bit
+//!   CLR, so `!sos.threads` answering proves the engine is in a 32-bit process. Two routes to it,
+//!   a dump and a live `attach_process`, because a dump carries its architecture in its header
+//!   and a process does not. Like the TTD tier it creates its own target — with `csc.exe`, which
+//!   every stock Windows ships — since the alternative is a supplied file no repository can carry,
+//!   which is why this covered nothing until it did. A **capability** gate rather than a variable:
+//!   a host with no 32-bit engine cannot answer the question at all.
 //!
 //! See `docs/smoke-test.md` for the runbook.
 
@@ -11728,81 +11737,247 @@ fn ttd_queries_answer_with_the_fields_they_promise() {
     let _ = std::fs::remove_dir_all(&out_dir);
 }
 
-/// The gate for the **32-bit managed dump** tier: a dump this repository cannot carry.
+// ---- tier 6: a 32-bit managed target, served by a worker of its architecture ---
+
+/// The fixture these two tests build for themselves, in the one language every stock Windows can
+/// compile with nothing installed.
 ///
-/// A full-memory capture of even a trivial .NET process is tens of megabytes — several times this
-/// whole repository — so unlike the kernel samples it is supplied rather than checked in. Produce
-/// one with `procdump.exe -ma <pid> <file>` (the **32-bit** procdump, which is what makes it a
-/// 32-bit capture) against any .NET Framework process, and point the variable at it.
-fn x86_dump_tier() -> Option<String> {
-    let Some(dump) = std::env::var_os("WINDBG_MCP_X86_DUMP") else {
-        skip("set WINDBG_MCP_X86_DUMP to a 32-bit managed dump to run the 32-bit worker tier");
-        return None;
-    };
-    let dump = dump.to_string_lossy().into_owned();
-    if !std::path::Path::new(&dump).exists() {
-        skip(&format!("WINDBG_MCP_X86_DUMP points at nothing: {dump}"));
-        return None;
+/// It does two things and nothing else. `dump <path>` writes a **full-memory** minidump of itself
+/// and exits, which is the 32-bit managed dump this tier used to have to be handed; `wait` prints
+/// a line and blocks, which is the 32-bit managed *process* the other test attaches to.
+///
+/// **It dumps itself rather than being dumped**, which is what makes the capture 32-bit with no
+/// debugger package on the host: `MiniDumpWriteDump` is in the `dbghelp.dll` this process loads,
+/// and a 32-bit process loads the 32-bit one. A 64-bit writer pointed at the same target produces
+/// a dump that reports itself as the *host's* architecture — which is why a 32-bit `procdump` was
+/// the instruction before this existed, and why `cdb -p` was the fallback once
+/// `comsvcs.dll MiniDump` had been measured writing a near-empty file and reporting nothing
+/// wrong. Whatever writes it, the **size** is the check: [`made_x86_dump`] asserts it, because
+/// "the file is there" is exactly what that failure looked like.
+const X86_FIXTURE: &str = r#"
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+
+static class Fixture
+{
+    [DllImport("dbghelp.dll", SetLastError = true)]
+    static extern bool MiniDumpWriteDump(IntPtr hProcess, uint pid, IntPtr hFile,
+                                         int dumpType, IntPtr ex, IntPtr user, IntPtr cb);
+
+    static int Main(string[] args)
+    {
+        if (args.Length == 2 && args[0] == "dump")
+        {
+            using (var file = new FileStream(args[1], FileMode.Create, FileAccess.ReadWrite))
+            {
+                var self = Process.GetCurrentProcess();
+                const int WithFullMemory = 0x2, WithHandleData = 0x4,
+                          WithFullMemoryInfo = 0x800, WithThreadInfo = 0x1000;
+                bool ok = MiniDumpWriteDump(self.Handle, (uint)self.Id,
+                                            file.SafeFileHandle.DangerousGetHandle(),
+                                            WithFullMemory | WithHandleData
+                                                | WithFullMemoryInfo | WithThreadInfo,
+                                            IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                if (!ok)
+                {
+                    Console.Error.WriteLine("MiniDumpWriteDump failed: "
+                                            + Marshal.GetLastWin32Error());
+                    return 1;
+                }
+            }
+            return 0;
+        }
+        if (args.Length == 1 && args[0] == "wait")
+        {
+            Console.WriteLine("ready");
+            Console.Out.Flush();
+            Console.In.ReadLine();
+            return 0;
+        }
+        Console.Error.WriteLine("usage: fixture dump <path> | fixture wait");
+        return 2;
     }
-    Some(dump)
+}
+"#;
+
+/// The **32-bit** `csc.exe`, which is an OS component rather than something to install.
+///
+/// `Framework`, not `Framework64`: the two are the same compiler built for different
+/// architectures, and this tier needs the one whose `-platform:x86` output is a genuine 32-bit
+/// process on every host — including an ARM64 one, where x86 runs under emulation like any other
+/// x86 program.
+///
+/// A directory scan rather than a pinned `v4.0.30319`, because that version directory is the
+/// CLR's and not the compiler's: pinning it names a path that is right today and becomes a silent
+/// skip the day it is not.
+fn csc_x86() -> Option<std::path::PathBuf> {
+    let framework = std::path::PathBuf::from(std::env::var_os("WINDIR")?)
+        .join("Microsoft.NET")
+        .join("Framework");
+    let mut candidates: Vec<std::path::PathBuf> = std::fs::read_dir(framework)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path().join("csc.exe"))
+        .filter(|csc| csc.is_file())
+        .collect();
+    candidates.sort();
+    candidates.pop()
 }
 
-/// A 32-bit managed dump is served by an engine that can load its SOS, and says so by **not**
-/// reporting a limitation.
-///
-/// This is the whole of [#234](https://github.com/glslang/windbg-mcp/issues/234) end to end, and it
-/// is the one claim no other tier makes: an extension is loaded into the debugger's own process, so
-/// a 32-bit `sos.dll` is unreachable from this server's own x64 engine and the 64-bit one refuses a
-/// 32-bit CLR. Getting `!threads` to answer therefore proves the engine is in a 32-bit *process*.
-///
-/// Asserts through the **tool surface** rather than against `engine::worker_images` directly,
-/// because the unit tests beside it already cover which image is chosen. What this adds is that
-/// the routing happens at all: that opening a dump by path lands on the 32-bit worker without the
-/// caller asking, and that everything the session then does crosses no boundary the caller can see.
-#[test]
-fn a_32_bit_managed_dump_is_served_by_an_engine_that_can_load_its_sos() {
-    let Some(dump) = x86_dump_tier() else { return };
-    let mut server = Server::started();
+/// This tier's scratch directory, per process.
+fn x86_fixture_dir() -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("windbg-mcp-smoke-x86-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("create the 32-bit fixture directory");
+    dir
+}
 
-    let data = server.tool_data("open_dump", json!({ "path": &dump }), TARGET_STEP);
-    let session = data["session_id"]
-        .as_str()
-        .expect("open_dump mints a handle")
-        .to_string();
+/// The compiled fixture, built once for however many of this tier's tests run.
+///
+/// `OnceLock` rather than a build per test: two tests want the same 4 KB program, and compiling it
+/// twice in parallel into one path is a race with a file lock in it.
+fn x86_fixture() -> Option<&'static std::path::Path> {
+    static FIXTURE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    FIXTURE
+        .get_or_init(|| {
+            let csc = csc_x86()?;
+            let dir = x86_fixture_dir();
+            let source = dir.join("fixture.cs");
+            std::fs::write(&source, X86_FIXTURE).expect("write the fixture source");
+            let exe = dir.join("fixture.exe");
+            let built = Command::new(&csc)
+                .arg("-nologo")
+                // The whole point of the fixture: `csc` here is 32-bit, but its default `anycpu`
+                // output would still run 64-bit on a 64-bit host and this tier would then be
+                // measuring nothing at all.
+                .arg("-platform:x86")
+                .arg(format!("-out:{}", exe.display()))
+                .arg(&source)
+                .output()
+                .expect("run the C# compiler");
+            assert!(
+                built.status.success() && exe.is_file(),
+                "the 32-bit C# fixture did not compile:\n{}\n{}",
+                String::from_utf8_lossy(&built.stdout),
+                String::from_utf8_lossy(&built.stderr)
+            );
+            Some(exe)
+        })
+        .as_deref()
+}
 
-    // The 32-bit worker was found and used, so there is nothing this session cannot do. When
-    // `x86\windbg-mcp.exe` and its `dbgeng.dll` are not beside the server this field carries the
-    // explanation instead — the fallback is loud by design, and a run on such a host fails here
-    // rather than passing quietly.
-    // `summary.limitation`, not `limitation`: the opener's payload is an `OpenedSession` and the
-    // field lives on the `TargetSummary` inside it. Indexing the top level produced JSON null
-    // whatever the session actually reported, so this assertion passed unconditionally — it
-    // claimed to prove the routing had worked and proved nothing.
+/// The gate for this tier: **a 32-bit engine beside the server under test**.
+///
+/// Deliberately the engine and not the worker, and that split is the whole design. A host with no
+/// 32-bit `dbgeng.dll` in its `x86` directory has no 32-bit debugger at all and cannot answer the
+/// question this tier asks, so it stands down. A host that has one but no 32-bit
+/// `windbg-mcp.exe` beside it is a *half-populated* directory — the failure `setup.md` warns
+/// fails quietly, because the target still opens and only the one thing you came for is missing —
+/// so that case is left to fail on the `limitation` assertion, loudly, rather than skipped.
+///
+/// It also keeps this from being a second copy of `engine::x86_worker_image`'s rule, which is the
+/// real hazard in gating on the worker: that rule has a fallback in it for a renamed running
+/// image, and a gate that reimplemented it would drift out of step with the code it is checking.
+fn x86_engine_tier() -> bool {
+    let beside = std::path::Path::new(EXE)
+        .parent()
+        .map(|dir| dir.join("x86").join("dbgeng.dll"));
+    if beside.as_deref().is_some_and(std::path::Path::is_file) {
+        return true;
+    }
+    skip(
+        "no 32-bit engine in an `x86` directory beside the server under test, so nothing here \
+         can open a 32-bit target — `skills/windbg-debugging/setup.md` has the copy block",
+    );
+    false
+}
+
+/// A 32-bit managed dump: the one this tier makes for itself, or one the caller supplied.
+///
+/// **Made rather than supplied is the default**, which is what lets this tier run unattended —
+/// the reason it covered nothing for as long as it needed a file no repository can carry. Being
+/// handed one is still honoured, because a real capture off a real application is a better target
+/// than a fixture and there is no reason to refuse it.
+fn made_x86_dump() -> Option<String> {
+    if let Some(supplied) = std::env::var_os("WINDBG_MCP_X86_DUMP") {
+        let supplied = supplied.to_string_lossy().into_owned();
+        assert!(
+            std::path::Path::new(&supplied).is_file(),
+            "WINDBG_MCP_X86_DUMP points at nothing: {supplied}"
+        );
+        return Some(supplied);
+    }
+    let fixture = x86_fixture()?;
+    let dump = x86_fixture_dir().join("managed-x86.dmp");
+    let _ = std::fs::remove_file(&dump);
+    let wrote = Command::new(fixture)
+        .arg("dump")
+        .arg(&dump)
+        .output()
+        .expect("run the 32-bit fixture");
+    assert!(
+        wrote.status.success(),
+        "the fixture could not dump itself:\n{}",
+        String::from_utf8_lossy(&wrote.stderr)
+    );
+    // **The size, not the existence.** A writer that produces a near-empty file and reports
+    // nothing wrong is a measured failure mode here, and it passes every check that only asks
+    // whether the dump is there. A full-memory capture of even a trivial managed process is tens
+    // of megabytes; this floor is far below that and far above anything a failed write leaves.
+    let size = std::fs::metadata(&dump).expect("stat the dump").len();
+    assert!(
+        size > 4 * 1024 * 1024,
+        "{} is {size} bytes, which is not a full-memory capture",
+        dump.display()
+    );
+    Some(dump.to_string_lossy().into_owned())
+}
+
+/// The session an opener minted, plus the assertion that it went to a worker of the target's own
+/// architecture.
+///
+/// `summary.limitation`, not `limitation`: the opener's payload is an `OpenedSession` and the
+/// field lives on the `TargetSummary` inside it. Indexing the top level produced JSON null
+/// whatever the session actually reported, so this assertion passed unconditionally — it claimed
+/// to prove the routing had worked and proved nothing.
+fn session_on_a_worker_of_its_own_architecture(data: &Value) -> String {
     let limitation = &data["summary"]["limitation"];
     assert!(
         limitation.is_null(),
-        "this host could not give the dump a 32-bit worker, so SOS is unreachable: {limitation}"
+        "this host could not give the target a 32-bit worker, so SOS is unreachable — an `x86` \
+         directory holding an engine but no 32-bit `windbg-mcp.exe` is the usual cause: \
+         {limitation}"
     );
+    data["session_id"]
+        .as_str()
+        .expect("an opener mints a handle")
+        .to_string()
+}
 
-    // `.loadby`, not `.load` with a path. SOS reads CLR-internal structures and has to be the
-    // build that shipped with the runtime in the *target*, so this takes it from wherever the
-    // loaded `clr.dll` came from — version-matched by construction. A hardcoded
-    // `Framework\v4.0.30319\sos.dll` would pin one .NET Framework 4.x servicing level, and would
-    // name a directory a 2.0/3.5 target (which loads `mscorwks.dll`) does not have at all.
-    //
-    // It also resolves on the **host's** filesystem, which is the same machine — the point being
-    // that it is the 32-bit build, which is exactly the file this server's own process cannot load.
-    //
-    // **Both runtime module names**, because the gate accepts any .NET Framework dump: 4.x loads
-    // `clr.dll` and 2.0/3.5 loads `mscorwks.dll`. Whichever does not match this target fails
-    // harmlessly — there is no such module to load beside — so running both costs one command and
-    // avoids narrowing a fixture the tier's own documentation does not narrow. Which of them
-    // worked is settled below by SOS answering, not by either of these.
+/// Loads SOS and asks it about managed threads, which is the one thing a wrong-architecture
+/// engine cannot do — and so the only assertion that settles where this session's engine lives.
+///
+/// `.loadby`, not `.load` with a path. SOS reads CLR-internal structures and has to be the build
+/// that shipped with the runtime in the *target*, so this takes it from wherever the loaded
+/// runtime came from — version-matched by construction. A hardcoded 4.x `sos.dll` path would pin
+/// one .NET Framework servicing level, and would name a directory a 2.0/3.5 target (which loads
+/// `mscorwks.dll`) does not have at all.
+///
+/// It also resolves on the **host's** filesystem, which is the same machine — the point being
+/// that it is the 32-bit build, which is exactly the file this server's own process cannot load.
+///
+/// **Both runtime module names**, because this tier accepts any .NET Framework target: 4.x loads
+/// `clr.dll` and 2.0/3.5 loads `mscorwks.dll`. Whichever does not match fails harmlessly — there
+/// is no such module to load beside — so running both costs one command and avoids narrowing a
+/// fixture nothing else here narrows. Which of them worked is settled by SOS answering, not by
+/// either of these.
+fn sos_answers_about_managed_threads(server: &mut Server, session: &str) {
     let mut loaded = String::new();
     for runtime in ["clr", "mscorwks"] {
         let reply = server.call_tool(
             "execute",
-            json!({ "session_id": &session, "command": format!(".loadby sos {runtime}") }),
+            json!({ "session_id": session, "command": format!(".loadby sos {runtime}") }),
             TARGET_STEP,
         );
         assert_no_error(&reply, "execute .loadby sos");
@@ -11813,13 +11988,13 @@ fn a_32_bit_managed_dump_is_served_by_an_engine_that_can_load_its_sos() {
         "the 32-bit SOS was refused, so this session's engine is not 32-bit:\n{loaded}"
     );
 
-    // **Module-qualified, and it has to be.** `open_dump` loads `ext.dll`, which exports a
-    // `!threads` of its own — the native thread table — and a bare `!threads` resolves to that
-    // one, so it answers on any engine and would prove nothing about SOS. Same reason the
-    // crash-dump path prefers `!ext.analyze -v` over `!analyze`.
+    // **Module-qualified, and it has to be.** An open loads `ext.dll`, which exports a `!threads`
+    // of its own — the native thread table — and a bare `!threads` resolves to that one, so it
+    // answers on any engine and would prove nothing about SOS. Same reason the crash-dump path
+    // prefers `!ext.analyze -v` over `!analyze`.
     let threads = server.call_tool(
         "execute",
-        json!({ "session_id": &session, "command": "!sos.threads" }),
+        json!({ "session_id": session, "command": "!sos.threads" }),
         TARGET_STEP,
     );
     assert_no_error(&threads, "execute !sos.threads");
@@ -11828,10 +12003,92 @@ fn a_32_bit_managed_dump_is_served_by_an_engine_that_can_load_its_sos() {
         threads.contains("ThreadCount"),
         "SOS loaded but did not answer about managed threads:\n{threads}"
     );
+}
 
+/// A 32-bit managed **dump** is served by an engine that can load its SOS.
+///
+/// This is the whole of [#234](https://github.com/glslang/windbg-mcp/issues/234) end to end, and
+/// it is the one claim no other tier makes: an extension is loaded into the debugger's own
+/// process, so a 32-bit `sos.dll` is unreachable from this server's own x64 engine and the 64-bit
+/// one refuses a 32-bit CLR. Getting `!threads` to answer therefore proves the engine is in a
+/// 32-bit *process*.
+///
+/// Asserts through the **tool surface** rather than against `engine::worker_images` directly,
+/// because the unit tests beside it already cover which image is chosen. What this adds is that
+/// the routing happens at all: that opening a dump by path lands on the 32-bit worker without the
+/// caller asking, and that everything the session then does crosses no boundary the caller can
+/// see.
+#[test]
+fn a_32_bit_managed_dump_is_served_by_an_engine_that_can_load_its_sos() {
+    if !x86_engine_tier() {
+        return;
+    }
+    let Some(dump) = made_x86_dump() else {
+        skip("this host has no 32-bit C# compiler, so this tier cannot make itself a dump");
+        return;
+    };
+    let mut server = Server::started();
+
+    let data = server.tool_data("open_dump", json!({ "path": &dump }), TARGET_STEP);
+    let session = session_on_a_worker_of_its_own_architecture(&data);
+    sos_answers_about_managed_threads(&mut server, &session);
     server.call_tool(
         "end_session",
         json!({ "session_id": &session }),
         TARGET_STEP,
     );
+    // Tens of megabytes, and the only part of this tier's scratch worth clearing — the compiled
+    // fixture is 4 KB and is shared with the test below, which may still be running.
+    let _ = std::fs::remove_file(&dump);
+}
+
+/// A 32-bit managed **live process** is too — and it is routed on a different fact.
+///
+/// A dump says what it is in its own header; an attach has no header to read, which is why this
+/// route was still unbuilt when the dump one landed. The architecture of a live process is
+/// `IsWow64Process2`, asked in the supervisor before the spawn (`target::process_arch`), and its
+/// answer feeds exactly the same image choice.
+///
+/// The fixture is the same program as the dump test's, running rather than captured, which is
+/// deliberate: the two tests then differ in the *route* and in nothing else, so a failure here
+/// while the dump test passes is about the routing rather than about the target.
+#[test]
+fn a_32_bit_managed_process_is_attached_by_an_engine_that_can_load_its_sos() {
+    if !x86_engine_tier() {
+        return;
+    }
+    let Some(fixture) = x86_fixture() else {
+        skip("this host has no 32-bit C# compiler, so this tier cannot make itself a target");
+        return;
+    };
+    let mut child = Command::new(fixture)
+        .arg("wait")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("start the 32-bit fixture");
+    // Waited for rather than slept past: the process has to be *running managed code* before the
+    // attach, or the CLR may not be loaded yet and SOS would have nothing to answer about — for a
+    // reason that has nothing to do with which architecture the engine is.
+    let mut ready = String::new();
+    BufReader::new(child.stdout.take().expect("the fixture's stdout"))
+        .read_line(&mut ready)
+        .expect("the fixture says when it is up");
+    assert_eq!(ready.trim(), "ready", "the fixture did not start");
+
+    let mut server = Server::started();
+    let data = server.tool_data("attach_process", json!({ "pid": child.id() }), TARGET_STEP);
+    let session = session_on_a_worker_of_its_own_architecture(&data);
+    sos_answers_about_managed_threads(&mut server, &session);
+
+    // Detached first, killed second. A debugger that goes away while still attached takes its
+    // debuggee with it, so ending the session is what makes the line below the fixture's own
+    // cleanup rather than the thing that ends the session.
+    server.call_tool(
+        "end_session",
+        json!({ "session_id": &session }),
+        TARGET_STEP,
+    );
+    let _ = child.kill();
+    let _ = child.wait();
 }

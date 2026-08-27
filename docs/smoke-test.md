@@ -36,7 +36,7 @@ taken a second covered no debugger claim at all.
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a live kernel target you can freeze — KDNET, or serial | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
 | **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
 | **TTD** | `WINDBG_MCP_SMOKE_TTD=1` | `TTD.exe`, **elevation**, and the WinDbg store engine to replay what it records | that `record_trace` records the program it was given and reports a finished recording as one, and that a TTD query returns records rather than bare indices |
-| **32-bit managed dump** | `WINDBG_MCP_X86_DUMP=<path>` | a 32-bit .NET dump you supply, and `x86\windbg-mcp.exe` with a 32-bit engine beside it | that such a dump is opened by a worker of *its* architecture, so its 32-bit SOS loads — which this server's own engine cannot do at all |
+| **32-bit managed target** | a 32-bit `dbgeng.dll` in an `x86` directory beside the binary under test | that engine, `x86\windbg-mcp.exe` beside it, and the `csc.exe` every stock Windows ships — it compiles and dumps its own fixture | that a 32-bit dump **and** a 32-bit live process are each opened by a worker of *their* architecture, so 32-bit SOS loads — which this server's own engine cannot do at all |
 | **Live (other)** | manual | a test driver on a kernel target | see [Manual checklist](#manual-checklist) |
 
 The protocol tier rides `cargo test`, so CI already runs it. The debugger tier is opt-in
@@ -1176,47 +1176,80 @@ assertion that fires), the unconditional early-exit failure, `.arg(target)` for 
 line, and the probe against this process's directory — which fails with `` `a01.run` is not a
 recording of `a program.exe` ``, the wrong-program recording exactly as it was first measured.
 
-## The 32-bit managed dump tier
+## The 32-bit managed target tier
 
 ```pwsh
-$env:WINDBG_MCP_X86_DUMP = "C:\path\to\x86-managed.dmp"
-cargo test --test mcp_smoke -- --nocapture a_32_bit_managed_dump
+cargo build --target i686-pc-windows-msvc
+Copy-Item target\i686-pc-windows-msvc\debug\windbg-mcp.exe target\debug\x86 -Force
+cargo test --test mcp_smoke -- --nocapture a_32_bit_managed
 ```
 
-One test, and it is the only one that asserts something **this server's own engine cannot do**. An
-extension DLL is loaded into the debugger's process, so a 32-bit `sos.dll` cannot be loaded by the
-x64 engine (`Win32 error 0n193`) and the 64-bit one refuses a 32-bit CLR — the data access DLL
-behind it is paired to the target's architecture too. So `!sos.threads` answering is not a check
-that SOS works; it is proof that the engine holding this dump is in a 32-bit process
+Two tests — a 32-bit **dump** and a 32-bit **live process** — and they are the only ones asserting
+something **this server's own engine cannot do**. An extension DLL is loaded into the debugger's
+process, so a 32-bit `sos.dll` cannot be loaded by the x64 engine (`Win32 error 0n193`) and the
+64-bit one refuses a 32-bit CLR — the data access DLL behind it is paired to the target's
+architecture too. So `!sos.threads` answering is not a check that SOS works; it is proof that the
+engine holding this target is in a 32-bit process
 ([#234](https://github.com/glslang/windbg-mcp/issues/234)).
 
-**What the host needs, beyond the dump**, is `x86\windbg-mcp.exe` and a 32-bit `dbgeng.dll` beside
-it, in an `x86\` directory next to the binary under test — so `target\debug\x86\` for a
-`cargo test` run. Build the worker with `cargo build --target i686-pc-windows-msvc`; the engine
-payload is the copy block in the skill's `setup.md`. Both halves are checked before the worker is
+**The two differ only in the route**, which is why they are a pair. A dump says what it is in its
+own header; a live process has none, so its architecture is `IsWow64Process2` — asked in the
+supervisor, before the spawn, because a process's architecture is fixed when its image loads. Both
+answers feed one image choice (`engine::worker_images`), so the same fixture program covers both:
+captured for one test, running for the other.
+
+**The tier makes its own fixture**, which is what lets it run unattended and is why the gate is no
+longer a supplied path. `csc.exe` ships with every stock Windows, so the tier compiles a small
+`-platform:x86` C# program that either dumps itself with `MiniDumpWriteDump` or prints a line and
+waits. Dumping *itself* is what makes the capture 32-bit with no debugger package on the host: a
+32-bit process loads the 32-bit `dbghelp.dll`, where a 64-bit writer pointed at the same target
+produces a dump reporting the *host's* architecture. Both were measured on this project's bench —
+the 32-bit capture reads as x86 and the 64-bit capture of the same process reads as x64, which is
+exactly the discrimination the routing turns on. `WINDBG_MCP_X86_DUMP=<path>` still overrides the
+made one, because a real capture off a real application is a better target and there is no reason
+to refuse it.
+
+The tier **asserts the dump's size, not its existence**, and that is not belt-and-braces:
+`comsvcs.dll MiniDump` was measured writing a near-empty file and reporting nothing wrong, which
+passes every check that only asks whether the file is there.
+
+**What the host needs** is `x86\windbg-mcp.exe` and a 32-bit `dbgeng.dll` beside it, in an `x86\`
+directory next to the binary under test — so `target\debug\x86\` for a `cargo test` run. Build the
+worker with `cargo build --target i686-pc-windows-msvc`; the engine payload is the copy block in
+the skill's `setup.md`, and on an x64 host the four DLLs in `SysWOW64` were measured to be enough
+for this tier, which loads SOS but resolves no PDB. Both halves are checked before the worker is
 spawned, because an image whose engine is missing fails in the *loader*, before any of this
 server's code runs.
 
-Gated on a **path rather than a flag**, because the fixture is supplied rather than checked in: a
-full-memory capture of even a trivial .NET process is tens of megabytes, several times this whole
-repository. Make one with the **32-bit** `procdump.exe -ma <pid> <file>` against any .NET Framework
-process — the bitness of procdump is what decides whether the capture is a 32-bit one or a WoW64
-one seen from x64, and only the former is this tier's subject. Both were measured: the 32-bit
-capture reads as x86 and the 64-bit capture of the *same process* reads as x64, which is exactly
-the discrimination the routing turns on.
+**The gate is the engine, and the worker is an assertion** — a split worth knowing before changing
+either. A host with no 32-bit `dbgeng.dll` has no 32-bit debugger and stands the tier down. A host
+with the engine but no 32-bit `windbg-mcp.exe` beside it is a *half-populated* directory, which
+`setup.md` warns fails quietly, so it is left to fail loudly on the `limitation` assertion instead.
+Gating on the worker would also mean a second copy of `engine::x86_worker_image`'s rule — which has
+a fallback in it for a renamed running image — in a file that cannot call it.
 
-Two assertions, and the second is the one that took a wrong answer to find:
+Two assertions per test, and the second is the one that took a wrong answer to find:
 
 - **No `limitation` on the summary.** The fallback is deliberately loud — a host with no 32-bit
-  worker still opens the dump, on the x64 build, because native analysis of it works and always
+  worker still opens the target, on the x64 build, because native analysis of it works and always
   has, and says in the result that SOS is unreachable. So a run on such a host fails here rather
   than passing quietly, which is the whole point of asserting on it. It is also the only place the
   *fallback* is exercised end to end, since the supervisor's choice of image is otherwise a unit
-  test (`engine::tests`).
+  test (`engine::tests`). Read it off `summary.limitation`: the opener's payload is an
+  `OpenedSession` and the field is on the `TargetSummary` inside it, so indexing the top level
+  produced JSON null whatever the session reported and the assertion passed unconditionally.
 - **`!sos.threads`, module-qualified.** A bare `!threads` resolves to `ext.dll`'s own native thread
-  table, which `open_dump` has already loaded and which answers on *any* engine — the first version
-  of this test "failed" by printing a perfectly good one. Same trap as `!analyze` versus
+  table, which an open has already loaded and which answers on *any* engine — the first version of
+  this test "failed" by printing a perfectly good one. Same trap as `!analyze` versus
   `!ext.analyze -v` elsewhere in this document.
+
+**A source edit invalidates the 32-bit worker, and the failure names the target rather than the
+build.** `WorkerMessage::Ready` carries the build identity and the supervisor refuses a mismatch,
+so an `x86\windbg-mcp.exe` from before your last edit is turned away and the session falls back to
+this build — reported as the `limitation` above, which reads as "this host has no 32-bit worker".
+Re-run the two commands at the top of this section after every change, `cargo fmt` included: on a
+dirty tree that identity carries a digest over the uncommitted diff of `build.rs`'s `INPUTS`, so a
+reformat moves it.
 
 ## Manual checklist
 
