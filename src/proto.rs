@@ -768,6 +768,12 @@ pub enum WorkerMessage {
     Ready { build: String },
     /// The engine could not be created and this worker is exiting. Distinct from a failed
     /// operation: no argument the caller can change makes the next attempt work.
+    ///
+    /// **Also synthesised by the supervisor**, by the thread that parses this channel, for a line
+    /// it cannot read at all — which on an anonymous pipe with one writer means a worker of a
+    /// different build rather than stray output. The worker is then not exiting, but everything
+    /// the operative clause above says of it holds, and the alternative was a handshake that
+    /// waited out its whole timeout in silence.
     Fatal { message: String },
     /// The opener's target was **created or claimed** — the dump is loaded, the process is
     /// spawned, the KD connection is taken. Everything after this point can fail without the

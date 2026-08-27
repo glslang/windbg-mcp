@@ -2723,10 +2723,38 @@ fn read_messages(
                             break;
                         }
                     }
-                    Err(e) => tracing::error!(
-                        "session {id}: unreadable message from its engine worker ({e}): {}",
-                        clipped(&line)
-                    ),
+                    // **Reported, not merely dropped, because on this channel it can only be a
+                    // build mismatch.** The pipe is anonymous and inherited, and inside the worker
+                    // nothing but `worker::emit` holds it (see [`crate::proto`]) — so unlike the
+                    // shared stdout this channel replaced, an unreadable line here is not stray
+                    // output that will be followed by good messages. It is a peer whose
+                    // `WorkerMessage` is not this build's.
+                    //
+                    // That became reachable when a session could be served by a *second image*
+                    // (`worker_images`): an `x86\\windbg-mcp.exe` left behind by a partial upgrade
+                    // is old enough to disagree about the wire and new enough to keep running.
+                    // Dropped, the handshake then waits out the whole of `WORKER_READY_TIMEOUT`
+                    // before the caller gets its fallback; synthesised as a `Fatal`, the wait ends
+                    // at the first unreadable line and the caller is told why.
+                    //
+                    // **Reported rather than closing the channel**, which would be the shorter
+                    // fix: [`reader`]'s tail reads a closed channel as the worker's *death* and
+                    // records the session as having lost its engine, which for a worker that is
+                    // merely unintelligible is a claim about a process that is still running.
+                    // Past the handshake `reader` ignores a `Fatal`, so this costs a log line and
+                    // changes nothing else.
+                    Err(e) => {
+                        let why = format!(
+                            "cannot read this engine worker's messages ({e}) — it is almost \
+                             certainly a different build of this server from the one that started \
+                             it: {}",
+                            clipped(&line)
+                        );
+                        tracing::error!("session {id}: {why}");
+                        if tx.send(WorkerMessage::Fatal { message: why }).is_err() {
+                            break;
+                        }
+                    }
                 }
             }
         })?;
@@ -4920,6 +4948,33 @@ mod tests {
             1,
             "a target-less worker (an attach, a launch) has one image and always this one"
         );
+    }
+
+    /// A message this build cannot read ends the handshake at once, instead of being dropped and
+    /// waited out.
+    ///
+    /// The input is the shape that made this reachable: a worker old enough to serialize `Ready`
+    /// as the bare string — its unit form, before the variant carried a build identity. No release
+    /// ever shipped an image that does that, so this exact line cannot arrive from one; what can,
+    /// once a session may be served by a *second* image, is any stale `x86\windbg-mcp.exe` whose
+    /// `WorkerMessage` is a version behind. Every one of those lands here, and dropping it costs
+    /// the caller the whole of `WORKER_READY_TIMEOUT` in silence before the fallback.
+    #[test]
+    fn a_worker_this_build_cannot_read_is_reported_rather_than_ignored() {
+        let (reader, mut writer) = std::io::pipe().expect("a pipe");
+        let mut messages = read_messages("test".to_string(), reader, Arc::new(Mutex::new(None)))
+            .expect("a reader thread");
+        writeln!(writer, "\"Ready\"").expect("a line the supervisor cannot read");
+        drop(writer);
+
+        match messages.blocking_recv() {
+            Some(WorkerMessage::Fatal { message }) => assert!(
+                message.contains("different build"),
+                "the reason has to name the cause, or an operator is left with a parse error: \
+                 {message}"
+            ),
+            other => panic!("expected a Fatal naming the mismatch, got {other:?}"),
+        }
     }
 
     /// A scratch directory of this test binary's own, removed by the test that made it.
