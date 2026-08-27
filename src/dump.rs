@@ -264,7 +264,7 @@ mod tests {
     /// The synthesised headers above are this parser's own idea of the format, so they cannot
     /// show it reads a file somebody else wrote. **These are real dumps**, checked in and opened
     /// by the smoke tier: every one is a kernel crash dump, and each must come back `Other` so a
-    /// kernel target is never routed at an x86 engine host that could not open it.
+    /// kernel target is never routed at a 32-bit worker that could not open it.
     #[test]
     fn the_checked_in_samples_are_all_kernel_dumps() {
         let samples = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/samples");

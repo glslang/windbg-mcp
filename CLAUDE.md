@@ -740,21 +740,31 @@ rather than the message. And a session whose target is gone is still reported `o
 
 [#242]: https://github.com/glslang/windbg-mcp/issues/242
 
-## An engine in another process (`src/dump.rs`, `src/enginehost.rs`)
+## A worker of the target's architecture (`src/dump.rs`, `engine::worker_images`)
 
 A 32-bit .NET dump cannot be read from this server's own process, and the reason is not a missing
 DLL. An extension is loaded into the debugger's process, so its architecture is the *host's*: the
 32-bit `sos.dll` will not load into an x64 host (`0n193`), and the 64-bit one loads and then fails
 on the target (`Failed to load data access DLL, 0x80004005`) because `mscordacwks` is paired to the
 **target's** architecture as well as the host's. Measured both ways — there is no in-process
-arrangement, which is why the engine moves rather than the extension
-([#234](https://github.com/glslang/windbg-mcp/issues/234)). It is also what WinDbg does; its
-package ships `EngHost.exe` under `amd64\` *and* `x86\`.
+arrangement, which is why the process moves rather than the extension
+([#234](https://github.com/glslang/windbg-mcp/issues/234)).
+
+**It is a second worker image, not a second server.** The supervisor normally re-executes itself;
+for a 32-bit user dump it spawns `x86\windbg-mcp.exe` instead (`engine::worker_images`,
+`engine::x86_worker_image`). A worker has never spoken MCP — it speaks `src/proto.rs` down a pair
+of inherited anonymous pipes and has never heard of a client — so the client still sees one server,
+one `tools/list`, one session registry, one four-session cap and one transcript, and cannot tell
+which architecture served a session. **The wire is architecture-neutral because it is JSON**: no
+pointer width, no alignment, and nothing in `src/` types a target address as `usize` (DbgEng's are
+`ULONG64`). The `usize` fields in `proto.rs` are row limits, clamped. That was not
+luck — process-per-session imposed serializability, which is the same property.
 
 **The decision has to precede the engine, not follow it.** `GetEffectiveProcessorType` answers
 authoritatively but only once a session exists, in a process whose architecture is by then fixed —
 the very thing being chosen. So `src/dump.rs` reads the architecture out of the minidump header
-before anything opens it. The same constraint rules out swapping the engine later: `worker.rs`
+before anything opens it, **in the supervisor**, which is the only place a read can still change
+which process is started. The same constraint rules out swapping the engine later: `worker.rs`
 takes `INTERRUPT` from the engine once, into a `OnceLock`, so an engine replaced mid-session leaves
 `interrupt` pointing at a dead one.
 
@@ -767,41 +777,40 @@ is right: there is no CLR in one, and the x64 engine reads x86 and ARM64 kernel 
 from "no such stream", so the signature check stays hand-written either way. Reach for it if this
 ever needs the module list.
 
-**Three things bite in `enginehost.rs`.** The x86 payload **cannot sit beside `windbg-mcp.exe`** —
-the loader searches an executable's own directory first, so an x86 `dbgeng.dll` next to the bundled
-x64 one is found by the wrong process; hence an `x86\` subdirectory, which is the package's own
-layout. **Both ends must come from the same package**: a client engine older than the host's is
-refused with `0x8007053D`, *"The server is currently disabled"*, naming neither end. And the search
-never falls back to another architecture, unlike `ttd::find_ttd`'s — an x64 `cdb.exe` cannot load
-the extension the caller came for, so a fallback would defeat the point rather than degrade
-gracefully.
+**`x86\` is a subdirectory because the loader makes it one.** An executable's own directory is
+searched first, so a 32-bit `dbgeng.dll` dropped beside the 64-bit one would be found by the wrong
+process — and putting the 32-bit *worker* inside `x86\` turns that same rule into the mechanism:
+it loads the engine sitting next to it, with no code to make it happen. It is also the layout a
+debugger package ships (`amd64\`, `x86\`).
 
-**Teardown is a kill, and that is deliberate.** A `cdb -server` whose transport peer has gone spins
-on the broken pipe without bound — 32,089 lines of `cdb: Could not write to pipe, 1450` in one
-measured run, which hung the whole VM and needed a hypervisor reset. So the host must never outlive
-its client, and a graceful `qq` has to be driven through the engine that has by then stopped
-answering. What makes killing safe here is that the target is a **dump**: no live process to orphan,
-no kernel to leave halted. That stops being true the day this points at a live target.
+**Both halves are probed before spawning**, and this is the one that is easy to leave out: the
+engine is an import-table dependency resolved by the loader *before `main`*, so an
+`x86\windbg-mcp.exe` with no `dbgeng.dll` beside it does not fail to open a dump — it fails to
+start, as a loader error with no Rust in it. `x86_worker_image` returns `None` unless both are
+there.
 
-**And the pipe's security has a qualifier that is easy to state without.** `cdb` creates the pipe,
-so it carries the default descriptor: full control to `SYSTEM`, administrators and the creator, and
-**read to Everyone** — and what a reader gets is the transport, which carries target memory. Under
-stdio that is bounded, because the reader is the caller's own account and could open the dump file
-directly, so the pipe discloses nothing the filesystem does not. **Under `--listen` as a service it
-is not**: the service runs as `LocalSystem`, so the pipe is created by `SYSTEM` and readable by
-Everyone while the dump may be readable only by `SYSTEM`, and the pipe then crosses a privilege
-boundary the dump does not. Stating the bound without naming the deployment it holds for is how
-that gets missed — it was, until it was pointed out. There is no fix inside this design: a pipe
-this server does not create is a DACL it cannot set, so closing it means hosting the engine
-ourselves rather than in `cdb`. `FOLLOWUPS.md` item 49.
+**Falling back is deliberate and the limitation is computed twice on purpose.** An x86 dump opens
+perfectly well in the x64 build and native analysis of it works; only SOS is lost. So a missing or
+unstartable 32-bit worker degrades to this build rather than failing the open, and the *worker*
+that ends up with the target reads the same header the supervisor read and reports the limitation
+itself (`worker::limitation_for`). Two reads of one file rather than a field on the wire — they
+cannot disagree, and the worker needs no new protocol to say what it is. Why the 32-bit worker did
+not start is a **server** fact and is logged by the supervisor that tried it, not put in the
+caller's summary.
 
-**One typed call does not cross the transport**: `IDebugAdvanced2::GetSymbolInformation`, so
-`module_pdb` fails with `E_INVALIDARG` and `modules` rows carry no PDB identity on a remote session.
-Confirmed against an in-process engine on the same target *and* with both ends on the same
-architecture, so it is the transport rather than a struct size the two ends disagree about —
-`E_INVALIDARG` invites that second reading and it is wrong. `with_pdb_identity` already drops the
-field rather than failing the listing, so nothing else has to change; the fix worth making, if one
-is, is to parse GUID/age out of the image debug directory, which would close it for every transport.
+**What this replaced, and why it is worth knowing.** Until 2026-08-27 the engine moved into an
+`x86\cdb.exe` run as a debugging server and driven over DbgEng's `npipe:` transport. That worked,
+and three things about it did not: `IDebugAdvanced2::GetSymbolInformation` does not cross the remote
+transport, so `modules` rows carried no PDB identity; teardown had to be a **kill**, because a
+`cdb -server` whose peer has gone spins on the broken pipe without bound (32,089 lines of
+`cdb: Could not write to pipe, 1450` in one measured run, which hung the VM and needed a hypervisor
+reset); and the pipe `cdb` creates grants **Everyone `FULL ACCESS`** — measured
+`D:(D;;WDWO;;;WD)(A;;FA;;;WD)`, with no `SYSTEM` or `Administrators` ACE at all — which made the
+transport password the only barrier, and made the name a squat target both ways (pre-create is a
+denial of service; adding an instance to a live name hands the *next* client's connection, and the
+password, to the squatter). All three are gone with the transport. `FOLLOWUPS.md` item 49 has the
+measurements and the options that were weighed.
+
 
 ## Adding a tool (`src/toolset.rs`)
 

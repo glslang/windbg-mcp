@@ -49,10 +49,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
-    # Job objects, so the engine host a worker starts cannot outlive it. A `Drop` cannot carry
-    # that: this process exits through `process::exit` on every path, and the supervisor kills it
-    # with `TerminateProcess` — neither runs a destructor. See `src/enginehost.rs`.
-    "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
 # The Windows service role (`src/service.rs`). A wrapper rather than hand-rolled SCM FFI because

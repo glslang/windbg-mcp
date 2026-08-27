@@ -42,8 +42,10 @@ an x64 CI failure turned out to be a pre-existing answer to an ordinary outcome 
 end), and
 items 49–50 from moving the engine into a process of the target's architecture, so a 32-bit .NET
 dump can load the SOS no in-process arrangement can
-([#234](https://github.com/glslang/windbg-mcp/issues/234), 2026-08-26) — and, while testing that,
-from Windows Defender quarantining this project's own binary.
+([#234](https://github.com/glslang/windbg-mcp/issues/234), 2026-08-26) — where **item 49's transport
+half has since landed**, on 2026-08-27, by measuring the exposure it deferred and finding it bad
+enough to delete the `cdb` host outright — and, while testing that, from Windows Defender
+quarantining this project's own binary.
 Each item notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -2748,13 +2750,162 @@ with a step rather than a `go` and says why.
 
 </details>
 
-## 49. [windbg-mcp] What the x86 engine host left open — the routing itself is **done** (2026-08-26)
+## 49. [windbg-mcp] The x86 engine host is gone — a **worker of the target's architecture** replaced it (2026-08-26, measured and closed 2026-08-27)
 
-**What landed.** `src/dump.rs` reads a dump's architecture from its header, `src/enginehost.rs` runs
-a `cdb.exe` of that architecture as a debugging server, and dbgscope's `DebugEngine::connect` drives
-it. A 32-bit .NET dump now loads its own SOS, asserted through the tool surface by the *32-bit
-managed dump* tier in [`docs/smoke-test.md`](./docs/smoke-test.md). What follows is what it did not
-close.
+**What this item was.** Routing a 32-bit .NET dump to an engine that can load its SOS landed on
+2026-08-26 by running an `x86\cdb.exe` as a debugging server and driving it over DbgEng's `npipe:`
+transport. This entry recorded what that left open and told whoever picked it up to **measure the
+pipe's exposure before designing anything**. Measuring it closed the question the other way: the
+transport was not worth keeping, and it is gone.
+
+**What landed instead.** The supervisor spawns a **second worker image** — `x86\windbg-mcp.exe`, a
+32-bit build of this same crate — rather than re-executing itself, when the target is a 32-bit user
+minidump. `src/enginehost.rs` is deleted: no `cdb` child, no named pipe, no transport password, no
+job object, no kill teardown. `engine::worker_images` picks the image from the dump header
+`src/dump.rs` already read, `engine::x86_worker_image` finds it, and a worker that will not come up
+falls back to this build with the limitation the *worker* computes from its own read of the same
+header.
+
+**Why that was the answer and not a mitigation.** Four findings, all measured on the ARM64 bench and
+all recorded in full below: the pipe grants **Everyone `FULL ACCESS`** with no `SYSTEM` or
+`Administrators` ACE at all, so the password was the only barrier; a non-administrative token drove
+a real DbgEng client over it; the name is a squat primitive two different ways, one of which hands
+the *next* client's connection and its password to the squatter; and there is no authenticated
+DbgEng transport to move to, `spipe:` and `ssl:` both being refused outright by this build. Two of
+those had no fix inside that design, so the design went.
+
+**What closed with it, beyond the transport.**
+
+- **`modules` rows carry a `pdb` again.** `IDebugAdvanced2::GetSymbolInformation` did not cross the
+  remote transport; there is no remote transport, and the engine is in-process for the worker that
+  holds it.
+- **Teardown is not a kill.** A 32-bit worker is an ordinary worker and exits when its request
+  channel closes. The `cdb -server` spinning on a broken pipe — 32,089 lines of
+  `Could not write to pipe, 1450`, which hung a VM — cannot happen because there is no `cdb`.
+- **"Untested over the transport"** (execution control, breakpoint arming, event waits, the
+  user-mode heap walker) is moot rather than a suite still owed.
+- The two facts left unmeasured — whether an unprivileged user can read another account's command
+  line, and whether the x86 `cdb.exe` sets the same descriptor as the ARM64 one — are moot for the
+  same reason.
+
+**Two things about the implementation that are easy to get wrong later.**
+
+- **The engine is bound by the loader, before `main`.** An `x86\windbg-mcp.exe` with no
+  `dbgeng.dll` beside it fails to *start*, as a loader error with no Rust in it — so
+  `x86_worker_image` refuses to name an image unless both are there, and the fallback stays a
+  fallback rather than a crash.
+- **`WorkerMessage::Ready` now carries the build identity, and the supervisor refuses a mismatch.**
+  It could not have differed while the supervisor re-executed itself; a second image an operator
+  copies by hand can be a release behind, and nothing else in the protocol would notice — an older
+  worker deserializes a close-enough JSON shape and goes wrong somewhere that surfaces as a debugger
+  error much later.
+
+**The address space does not bind, and was measured before any of this was built.** The
+`x86\cdb.exe` in the payload *is* a 32-bit DbgEng in a 32-bit address space, so it answered for the
+worker that did not exist yet: against full user-mode dumps of 445 MB, 846 MB and 1,346 MB its peak
+virtual size was **290, 256 and 256 MB** — flat rather than proportional, because DbgEng reads a
+dump on demand instead of mapping it — and a full `!address`, `!heap -h 0` and `!heap -a 0` against
+the largest moved it no further than 238–255 MB. The ceiling is 4 GB rather than 2 because
+`x86\cdb.exe` is linked `LARGE_ADDRESS_AWARE` (`0x0122`); `build.rs` now emits
+`/LARGEADDRESSAWARE` for an x86 build so that margin is a decision rather than the linker's default.
+What this bounds is **the engine, not this repo's walkers**: dbgscope's heap and pool walks build
+structures proportional to chunk count, and in a 32-bit worker those are our code in that address
+space. The dumps measured were one large allocation, not millions of small chunks.
+
+**What is still open.**
+
+- **The fixture is supplied, not made.** The tier takes `WINDBG_MCP_X86_DUMP` and stands down
+  without one, so CI never runs it and a machine without a 32-bit dump proves nothing. The TTD tier
+  solved the same problem by **recording its own target**, and the ingredients are here: `csc.exe`
+  ships on every stock Windows, so the tier could compile a trivial .NET program, run it, dump it
+  with the 32-bit `comsvcs.dll MiniDump` and open that. One caution measured while taking the
+  address-space figures above: `comsvcs.dll MiniDump` wrote a near-empty file on this bench and
+  reported nothing wrong, while `cdb -p <pid> -c ".dump /ma <path>;qd"` produced a real capture
+  every time. Whichever the tier uses, it has to assert the dump's *size*, not its existence.
+- **A live 32-bit target** (a WoW64 `attach_process`) is a smaller question than it was — the
+  teardown that made it dangerous is gone — but it is still unbuilt and untested, and
+  `worker_images` routes on a dump header, which an attach has none of. The architecture of a live
+  process is `IsWow64Process2`, in the supervisor, before the spawn.
+
+**Where it picks up.** `src/dump.rs`, `engine::worker_images` / `engine::x86_worker_image` /
+`engine::start_worker`, `worker::limitation_for`, and the `x86\` copy block in
+`skills/windbg-debugging/setup.md`. The tier is *32-bit managed dump* in
+[`docs/smoke-test.md`](./docs/smoke-test.md); the probes behind the measurements below were
+`pipe_probe9`–`pipe_probe12` and `addr_probe2`–`addr_probe3`, whose shape is worth reusing: start
+`cdb -server` on a sample dump, wait for the name in `\\.\pipe\`, then read, connect or squat.
+
+<details>
+<summary>The engine host this replaced, and the measurements that ended it (2026-08-26 to 27)</summary>
+
+**This entry told whoever picked it up to measure the exposure before designing anything. Measured,
+it is worse than the entry supposed in every direction.** ARM64 bench, Windows 10.0.26100.0, SDK
+`cdb.exe` 10.0.26100.1742. Everything below is a measurement, not a reading of the documentation.
+
+**The DACL is Everyone `FULL ACCESS`, not the default descriptor's Everyone *read*.**
+
+```text
+cdb's pipe         O:BAG:S-1-5-21-…-513D:(D;;WDWO;;;WD)(A;;FA;;;WD)
+a NULL-SA control  O:BAG:S-1-5-21-…-513D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;BA)(A;;FR;;;WD)(A;;FR;;;AN)
+```
+
+`cdb` sets its own descriptor rather than inheriting the default, and there is **no `SYSTEM` ACE and
+no `Administrators` ACE in it at all** — `(A;;FA;;;WD)` is the only grant, so an administrator gets
+in through the *Everyone* entry like everyone else. The one denial is `WRITE_DAC|WRITE_OWNER`: you
+may do anything with this pipe except fix it. Identical across all four combinations of `hidden` and
+`password=`, so it is DbgEng's transport code and not an effect of the options this server passes.
+
+Reading it needs `CreateFileW(READ_CONTROL)` then `GetKernelObjectSecurity` — `Get-Acl`,
+`GetNamedSecurityInfo` and `GetSecurityInfo(SE_FILE_OBJECT)` each refuse a pipe path (`win32 87`),
+which is the wall this item recorded hitting twice and is why the assertion went in unmeasured.
+
+**And an unprivileged token drives a real debug session over it.** Under a *Basic User* restricted
+token (`runas /trustlevel:0x20000` — same user SID, `Administrators` deny-only, privileges stripped
+to `SeChangeNotifyPrivilege`, `IsInRole(Administrator)` false), `cdb -remote
+npipe:server=localhost,pipe=…,password=…` connected and ran `lm` against the served dump: 18,044
+bytes, byte-identical to the administrator baseline against the same server. The branch this entry
+hoped for — "if the answer is nothing, this whole item shrinks to a documentation note" — is closed.
+
+Two things the entry therefore had the wrong way round:
+
+- **The `password` is the entire barrier, not a marginal extra.** Nothing in the DACL stops anybody.
+  Twelve characters do.
+- **The stdio bound as written is false.** *"The server runs as the caller, so a local user who can
+  read the pipe could open the dump file directly"* — the grant is to **Everyone**, not to the
+  caller, so on a multi-user machine another local account reaches a dump it has no rights to. The
+  boundary is smaller under stdio than under a service; the entry claimed it was absent.
+
+**Squatting, which this entry did not consider, and the pipe's own DACL is the primitive.** `FA`
+includes `FILE_CREATE_PIPE_INSTANCE`, and the name is `windbg-mcp-<pid>-<counter>` with the counter
+starting at 0 — predictable, and enumerable in any case (`hidden` is measured **not** to remove the
+pipe from `\\.\pipe\`, exactly as the code comment claims). Two outcomes, and they are different
+bugs:
+
+- **Own the name before `cdb` does and `cdb` refuses to start**: `StartServer failed, Win32 error
+  0n183`, then it exits. That is a **denial of service, not a hijack**, and it is handled — the
+  `try_wait()` in `await_pipe` sees the dead child and the fallback reports the limitation. But any
+  local user can hold the name and keep the hosted path unavailable, which is cheap given the name.
+  (An earlier probe reported `cdb` surviving this; that was a stale `Process` object read without
+  `Refresh()`. `cdb`'s own stdout settles it.)
+- **Add an instance to a name `cdb` is already serving, and the handout order does the rest.**
+  Measured: the first client lands on `cdb`'s instance, the **second lands on the squatter's**. So
+  an attacker parks a dummy client on `cdb`'s single instance, adds an instance of their own, and
+  receives the real client's connection — which hands over the transport password and puts a
+  hostile DbgEng *server* in front of a client that, under a service, is `SYSTEM`. The window is the
+  `PIPE_POLL` interval plus the connect, and it is retryable.
+
+**`spipe:` and `ssl:` are not the way out, and the measured reason is not the documented one.** This
+entry declined them because both "require a certificate". On this build neither starts at all: every
+spelling of `proto=` — `negotiate`, `ntlm`, `kerberos`, with and without `certuser=`/`machuser=` —
+is refused `StartServer failed, Win32 error 0n87`, and so is `ssl:proto=…,certuser=…,port=…`.
+`spipe:pipe=<name>` with **no** `proto=` does start, carries the same `(A;;FA;;;WD)` descriptor, and
+no client can reach it: `DebugConnect failed, Win32 error 0n30`, for an administrator and a
+restricted token alike. There is no authenticated transport here to reach for.
+
+**The password landed and this entry never said so.** `c1ff61f` implemented it and did not touch
+`FOLLOWUPS.md`, so this item went on describing as an open question a thing that had shipped — and
+`src/enginehost.rs`'s own comment still calls `password=`'s value "an open question rather than an
+oversight" three lines above the code that passes it. Both are wrong in the same direction now: the
+question is not whether it is worth adding, it is that it is the only thing holding.
 
 **`modules` rows carry no `pdb` on a remote session.**
 `IDebugAdvanced2::GetSymbolInformation` does not cross DbgEng's remote transport — measured against
@@ -2764,7 +2915,8 @@ invites you to think. `with_pdb_identity` already drops the field rather than fa
 so nothing is broken; what is lost is the GUID/age coordinate on exactly the sessions this feature
 creates. **What would close it:** parse the PDB signature out of the image's own debug directory
 rather than asking dbghelp — `read_memory` marshals fine, this repo already reads PE structures, and
-it would close the gap for every transport instead of special-casing this one.
+it would close the gap for every transport instead of special-casing this one. (Option 5 below
+closes it a second way, by having no transport.)
 
 **The fixture is supplied, not made.** The tier takes `WINDBG_MCP_X86_DUMP` and stands down without
 one, so CI never runs it and a machine without a 32-bit dump proves nothing. The TTD tier solved the
@@ -2774,53 +2926,146 @@ stock Windows, so the tier could compile a trivial .NET program, run it, dump it
 Deferred because it is a second, independent piece of machinery and the routing needed proving
 first.
 
-**The pipe is readable by Everyone, and under a service that matters.** `cdb` creates it, so it
-carries the default named-pipe descriptor: full control to `SYSTEM`, administrators and the creator,
-and **read** to Everyone. What a reader gets is the transport, which carries target memory.
+### What to do about the transport, priced
 
-Under **stdio** that is bounded, and the bound is the whole reason this shipped: the server runs as
-the caller, so a local user who can read the pipe could open the dump file directly, and the pipe
-discloses nothing the filesystem does not.
+1. **Give the pipe an unguessable name.** `transport_password`'s CSPRNG generator is already in the
+   same file, so this is a line. It closes the pre-create denial of service outright. Against the
+   instance-add hijack it removes *prediction* only — an attacker can still poll `\\.\pipe\`, see
+   the new name and race the connect — so it narrows the window rather than closing it. Worth doing
+   whatever else happens, and the code comment arguing an unguessable name is "unnecessary… it is
+   not a secret" has to go with it: it is true of confidentiality and false of squatting.
+2. **Refuse the hosted path under `--service` and report the limitation.** This is the deployment
+   where the boundary is a *privilege* boundary, and it is the only one no in-design mitigation
+   reaches. It costs a service-hosted caller SOS on 32-bit managed dumps and costs nobody else
+   anything. Note the plumbing: the worker is never told it is under a service (`SERVICE_FLAG` is
+   the supervisor's alone), so this is a fact to pass down, not a check to write in
+   `src/enginehost.rs`.
+3. **Say it in the operator documentation, which today says nothing.** Neither *32-bit .NET dumps
+   need an x86 engine host* in `skills/windbg-debugging/setup.md` nor `docs/remote-listener.md`
+   mentions the pipe, let alone who can reach it. Owed regardless of which of the rest happens.
+4. **Drive `x86\cdb.exe` as a plain text child over inherited anonymous pipes** instead of using
+   DbgEng's remote transport at all. It removes the named pipe and with it every finding above, and
+   it needs no new build target. **Rejected on function rather than effort**, and recorded here so
+   it is not re-proposed: everything in `worker.rs` reaches the engine through dbgscope's typed
+   interfaces, and a text child leaves text — `modules`, `backtrace` and `threads` would each need a
+   parser, which is the failure mode the `execute` hatch exists to keep out of the typed surface.
+5. **An `--engine-worker` built for `i686-pc-windows-msvc`**, talking the inherited-handle protocol
+   this server already uses, with no named pipe anywhere. The alternative weighed in
+   [#234](https://github.com/glslang/windbg-mcp/issues/234) and set aside for a second build target
+   and release artefact. It is the only close.
 
-Under **`--listen` as a service it is not bounded**, which is the follow-up. The service runs as
-`LocalSystem`, so the pipe is created by `SYSTEM` and readable by Everyone while the dump it serves
-may be readable only by `SYSTEM` — an unprivileged local user can then read target memory out of a
-dump they could not open. That is a privilege boundary the stdio case does not have, and the
-argument that waved the exposure through does not survive it. (A review found the DACL; the
-deployment split was missed until it was pointed out, which is what stating a bound without naming
-where it holds costs.)
+**On "it needs a second `.exe`", which is the objection worth answering head-on.** It does, and it
+cannot not: a process's architecture is fixed when its image loads, so an x64 or ARM64
+`windbg-mcp.exe` can never host a 32-bit `dbgeng.dll`, and there is no fat-binary escape — ARM64X
+pairs ARM64 with ARM64EC, not with i386, and an x64 host would need i386 either way. What makes it
+a smaller objection than it sounds is that **the hosted path already runs a second image — somebody
+else's**: `x86\cdb.exe`, out of a payload the operator must already have unpacked beside the
+binary, and the x86 `dbgeng.dll` an i686 worker would load is that same payload in that same `x86\`
+directory. Option 5 does not add a process to the machine. It replaces a foreign one with ours and
+deletes the named pipe between them. The rest of the objection is about the *build*, and the
+section below prices it.
 
-**A token is available, and whether it is worth adding turns on one unmeasured fact.** DbgEng's
-transports take one: `-server npipe:pipe=X,password=P` "requires a client to supply the specified
-password in order to connect", up to twelve alphanumeric characters — the listener's shape, smaller.
-`hidden` is already passed, and is not access control: it only keeps the server out of the list
-*Searching for Debugging Servers* enumerates.
+### Option 5 in detail
 
-What decides the password's value is **whether an unprivileged local user can read another
-account's command line**, because that is where the secret would have to live — `cdb` takes it no
-other way. If they can, it buys nothing against precisely the attacker this item is about; if they
-cannot, it closes the hole. Measuring it needs a second account, so it has not been established
-here, and adding the token before establishing it would be security by assumption. The documented
-alternatives that encrypt the password, `spipe` and `ssl`, both require a certificate
-(`certuser=`/`machuser=`), so neither is a drop-in.
+**One MCP server, not two — a second *worker image*, not a second server.** The MCP server is the
+supervisor: stdio or `--listen`, no DbgEng in it. A worker is not an MCP server and never speaks
+MCP; it speaks `src/proto.rs` down a pair of inherited anonymous pipes and has never heard of a
+client. So the client sees one process, one `tools/list`, one session registry, one four-session
+cap and one transcript, exactly as today, and cannot tell which architecture served a session
+except by what that session can do. It is the relationship the supervisor already has with
+`x86\cdb.exe` — with the foreign process replaced by ours, and the named pipe between them replaced
+by the inherited pair every other worker already uses.
 
-**And the exposure itself is unmeasured, in the other direction.** The default descriptor grants
-Everyone *read*; driving a debug session needs read **and** write, and each client gets its own
-pipe instance, so one connection cannot eavesdrop on another. Whether an unprivileged user can do
-anything at all with this pipe is therefore an open question — a review asserted the exposure and
-this item accepted it, and neither established it. **Measure that before designing anything**: if
-the answer is "nothing", the token is moot and this whole item shrinks to a documentation note.
+**The wire is already architecture-neutral, and that is not luck.** `src/proto.rs` is one line of
+JSON in each direction, because what process-per-session imposed was *serializability* — a closure
+cannot cross a process boundary, so the closures became `EngineOp` variants. JSON has no pointer
+width and no alignment, so a 32-bit worker deserializes the same `EngineOp` an x64 one does.
+Nothing in `src/` types a target address as `usize` (DbgEng's are `ULONG64` and stay `u64`); the
+`usize` fields in `proto.rs` are row limits, clamped to `MAX_ROWS` far below `u32::MAX`. Had this
+channel been `#[repr(C)]` structs, reconciling two pointer widths would be the expensive part of
+option 5; as it is, it is free.
 
-**If it is real, there is no fix inside this design.** A pipe this server does not create is a DACL
-it cannot set. Closing it means hosting the engine ourselves instead of in `cdb`: an
-`--engine-worker` built
-for `i686-pc-windows-msvc`, talking the inherited-handle protocol this server already uses, with no
-named pipe anywhere. That was the alternative weighed in
-[#234](https://github.com/glslang/windbg-mcp/issues/234) and set aside because it needs a second
-build target and release artefact; **the listener case is the argument that may eventually decide
-it.** Until then, the narrow mitigation is to refuse the hosted path when running as a service and
-report the limitation instead, which costs a service-hosted caller SOS and costs nobody else
-anything.
+**The seam is one function: `engine::worker_exe`.** Its doc comment states the invariant this
+breaks — *"The supervisor re-executes itself, so worker and server can never drift apart in version
+or in protocol"* — and it already carries an override for tests, so the shape is there. Three
+edits:
+
+- The supervisor reads the target's architecture **before** spawning. `crate::dump::read` answers
+  `UserMinidump(Arch::X86)` from the header with no engine and no DbgEng, which is the whole reason
+  it exists ("the decision has to precede the engine"). Today that call is at `src/worker.rs:766`,
+  inside the worker, one process too late for this; it moves up.
+- `worker_exe` takes that architecture and answers `x86\windbg-mcp.exe` for the one case,
+  `current_exe()` for the rest. `spawn_worker` already takes the image as a parameter, so nothing
+  below it changes at all — not the pipes, not the credential stripping, not `TARGET_FLAG`, whose
+  comment already says *"which process it exists in is what this decides"*.
+- `src/enginehost.rs` is **deleted**, and with it the `cdb` search and its shared deadline, the
+  transport password, `await_pipe`, `pipe_exists`, the kill teardown, and `HostState`/`limitation`
+  in `build_engine`.
+
+**Where the image goes, and why the directory does the work.** In `x86\`, beside the x86
+`dbgeng.dll` the payload already puts there. `dbgeng` is an import-table dependency resolved by the
+loader's ordinary search order, which looks in the **executable's own directory first** — the exact
+mechanism `enginehost.rs` records as the reason the x86 payload cannot sit next to
+`windbg-mcp.exe`. Put the 32-bit worker inside `x86\` and that mechanism loads the right engine
+with no code written for it, out of the same directory the operator already unpacks for
+`x86\cdb.exe`. Nothing new has to reach the host.
+
+**Two consequences of letting the loader do it.** A static import means a worker placed where there
+is no x86 `dbgeng.dll` fails to *start* — a loader error, before `main`, not a `DebugCreate`
+failure — so the supervisor has to check that the image and its engine are both present before
+spawning and report the same limitation the fallback reports today; `EngineHost::candidates` is
+that check already, in a shape that can be reused. And the worker never chooses an engine, so the
+search-and-fallback across `cdb` candidates has no counterpart, which retires the shared-`deadline`
+reasoning along with it.
+
+**Version skew becomes ours, which is the point rather than the cost.** Two images built from one
+crate can be stamped by one build and checked at the handshake — the worker already reports
+`Ready`, and `build.rs` already stamps a git revision into the version, so the check is a string
+compare on a message that exists. Set that against the skew this design has now, which is between
+our `cdb` client and *somebody else's* `cdb` server: unfixable by us, and reported as
+`0x8007053D`, *"The server is currently disabled"*, naming neither end.
+
+**What building it costs.** `cargo build --release --target i686-pc-windows-msvc` on the same
+`windows-latest` runner `release.yml` already uses — the MSVC toolchain ships the x86 linker — and
+one more file in its `Compress-Archive` list. The crate type-checks for the target today, clean, in
+9.6 seconds, from a Mac. At the bench it costs a second `.stale` rename in `CLAUDE.md`'s rebuild
+dance, because a second image can be held open by a second live worker.
+
+**The address space does not bind — measured, and without an i686 build existing.** A 32-bit
+worker's ceiling is the obvious worry about option 5, and the `x86\cdb.exe` already in the payload
+answers it: that *is* a 32-bit DbgEng in a 32-bit address space. Against full user-mode dumps of
+445 MB, 846 MB and 1,346 MB it peaked at **290, 256 and 256 MB of virtual size** (33, 29 and 29 MB
+private) — flat rather than proportional, because DbgEng reads a dump on demand instead of mapping
+it — while listing 80 modules and running `!address -summary` and `!heap -s` on each. The heaviest
+enumeration to hand does not move it either: a full `!address`, `!heap -h 0` and `!heap -a 0`
+against the 1,346 MB dump peaked at 238–255 MB and finished in one to two seconds. The dumps were
+made by pointing that same `cdb` (`.dump /ma`) at an x86 PowerShell committing 260, 662 and
+1,164 MB; ARM64 Windows runs both the x86 target and the x86 engine under emulation, which is the
+configuration this bench would be using anyway.
+
+Two qualifiers. **The ceiling is 4 GB rather than 2**, because `x86\cdb.exe` is linked
+`LARGE_ADDRESS_AWARE` (characteristics `0x0122`, against `0x0102` for the SysWOW64 binaries beside
+it) — an i686 `windbg-mcp.exe` wants the same flag deliberately rather than inheriting the x86
+default, which is a `-C link-arg=/LARGEADDRESSAWARE` we control. And this bounds **the engine, not
+this repo's walkers**: dbgscope's heap and pool walks build structures proportional to chunk count,
+and in a 32-bit worker those are our code in that address space. The synthetic target measured here
+is one large allocation, not millions of small chunks, so the walker's own footprint is what is
+left to watch — measurable the day the worker exists, and not before.
+
+**What it does not buy.** Nothing for a 32-bit *live* target — that needs the teardown question
+below answered on its own terms — and nothing for the fixture problem, since the tier still has no
+dump of its own to open.
+
+**And it closes more of this item than the transport findings alone.** No named pipe means no DACL,
+no password, no squat and no hijack. `GetSymbolInformation` works again because the engine is
+in-process, which is the first open thread above. Teardown stops being a kill, because an i686
+worker is an ordinary worker that exits when its request channel closes. And *untested over the
+transport*, below, becomes moot rather than a suite to write. What it costs against that is the
+second build target, the second release artefact and the two-image skew question priced above.
+
+**Disposition.** 1, 2 and 3 are cheap and are worth doing whichever way 5 goes. 5 is the only thing
+that closes the hijack, and the objection to it is a second *artefact* rather than a second
+*process* — which is worth deciding deliberately rather than by default.
 
 **The teardown has the same shape of qualifier.** It is a kill, which is safe because the target is
 a dump — no live process to orphan, no kernel to leave halted — and would not be for a live 32-bit
@@ -2831,10 +3076,23 @@ teardown should be inherited unexamined into that.
 cannot exercise them — and the user-mode heap walker, which is in scope for x86 dumps and is
 `ReadVirtual`-heavy, so likely correct but chatty over a pipe.
 
-**Where it picks up.** `src/dump.rs`, `src/enginehost.rs`, `build_engine` in `src/worker.rs`, and
+**Still unmeasured, and both are now second-order.** Whether an unprivileged local user can read
+another account's command line — the fact this entry said would decide the password's worth. The
+restricted-token stand-in cannot answer it (WMI refuses a restricted token outright, `Access
+denied`), so it needs a real second local account; it matters less than it did, because the
+instance-add hijack recovers the password without reading any command line. And whether the **x86**
+`cdb.exe` sets the same descriptor as the ARM64 one measured here — assumed, since it is the same
+transport code, but only one architecture was probed.
+
+**Where it picks up.** `src/dump.rs`, `src/enginehost.rs` (the pipe name at `start`, the password
+comment above it, and `await_pipe`), `build_engine` in `src/worker.rs`, `engine::spawn_worker`, and
 `dbgscope::dbgeng::DebugEngine::connect`, whose doc comment records both transport quirks. The
 operator half is *32-bit .NET dumps need an x86 engine host* in
-`skills/windbg-debugging/setup.md`.
+`skills/windbg-debugging/setup.md`. The probes behind the measurements above are
+`pipe_probe9`–`pipe_probe12` plus their restricted-token halves, and their shape is worth reusing:
+start `cdb -server` on a sample dump, wait for the name in `\\.\pipe\`, then read, connect or squat.
+
+</details>
 
 ## 50. [windbg-mcp] The released binary is unsigned — the metadata half has landed
 

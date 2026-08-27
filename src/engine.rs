@@ -1986,6 +1986,13 @@ impl Sessions {
     }
 
     /// Starts a worker process and waits for it to report that its engine came up.
+    ///
+    /// **More than one image may be tried**, because a 32-bit user dump wants a 32-bit worker and
+    /// this build may not be one — see [`worker_images`]. A candidate that will not come up says
+    /// nothing about the next, so the list is walked in order and only the last one's failure is
+    /// the caller's. Falling back is not silent: the worker that does come up reads the same dump
+    /// header the supervisor did and reports the limitation itself, so a session opened by the
+    /// wrong-architecture worker says so in its summary.
     async fn spawn(
         &self,
         id: &str,
@@ -1993,54 +2000,38 @@ impl Sessions {
         what: String,
         target: Option<&str>,
     ) -> Result<Arc<Session>, String> {
-        let exe = worker_exe()?;
-        let (mut child, channel) = spawn_worker(&exe, target)
-            .map_err(|e| format!("could not start an engine worker ({}): {e}", exe.display()))?;
-
-        let stdout = child.stdout.take().ok_or("engine worker has no stdout")?;
-        let pid = child.id().unwrap_or(0);
-        // Drained from the start, before the handshake: a worker that prints during startup must
-        // not be able to block on a full pipe on its way to `Ready`.
-        tokio::spawn(log_stray_output(id.to_string(), stdout));
-        // Created before the thread that records into it, and handed to the session below: see
-        // [`Session::unwinding`] for why it is written there rather than in `reader`.
-        let unwinding: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
-        let mut messages =
-            match read_messages(id.to_string(), channel.messages, Arc::clone(&unwinding)) {
-                Ok(messages) => messages,
-                Err(e) => {
-                    // Nothing has been asked of this worker yet, so it holds no target: killing it is
-                    // the whole teardown.
-                    let _ = child.start_kill();
-                    return Err(format!(
-                        "could not start a reader for an engine worker's messages: {e}"
-                    ));
+        let images = worker_images(target)?;
+        let mut started = None;
+        let mut rest = images.iter().peekable();
+        while let Some(exe) = rest.next() {
+            match start_worker(id, exe, target).await {
+                Ok(worker) => {
+                    started = Some(worker);
+                    break;
                 }
-            };
-
-        // Nothing is registered until the worker says its engine exists. A session that cannot
-        // debug is worse than no session: it would accept calls and fail every one.
-        match tokio::time::timeout(WORKER_READY_TIMEOUT, messages.recv()).await {
-            Ok(Some(WorkerMessage::Ready)) => {}
-            Ok(Some(WorkerMessage::Fatal { message })) => {
-                let _ = child.start_kill();
-                return Err(message);
-            }
-            Ok(Some(other)) => {
-                let _ = child.start_kill();
-                return Err(format!("engine worker said {other:?} before it was ready"));
-            }
-            Ok(None) => {
-                let _ = child.start_kill();
-                return Err("the engine worker exited before it was ready".to_string());
-            }
-            Err(_) => {
-                let _ = child.start_kill();
-                return Err(format!(
-                    "the engine worker did not come up within {WORKER_READY_TIMEOUT:?}"
-                ));
+                // The last image's failure is the caller's; every earlier one is a fallback, and
+                // saying which image is being fallen back *to* is what makes the pair legible in a
+                // log where the two are otherwise the same file name.
+                Err(why) => match rest.peek() {
+                    Some(next) => tracing::warn!(
+                        "session {id}: {} could not come up ({why}); falling back to {}",
+                        exe.display(),
+                        next.display()
+                    ),
+                    None => return Err(why),
+                },
             }
         }
+        let StartedWorker {
+            child,
+            requests,
+            messages,
+            unwinding,
+            pid,
+            // Unreachable: `worker_images` never answers with an empty list, and the loop above
+            // either breaks with a worker or returns the last image's error. Answered rather than
+            // unwrapped because a panic here would take the supervisor down with it.
+        } = started.ok_or("no engine worker image to start")?;
         tracing::info!("session {id}: engine worker pid {pid} ready");
 
         let (tx, rx) = mpsc::unbounded_channel();
@@ -2077,7 +2068,7 @@ impl Sessions {
                 let session = Arc::downgrade(&session);
                 let waiters = Arc::clone(&waiters);
                 let call_timeout = self.call_timeout;
-                move || pump(session, rx, channel.requests, waiters, call_timeout)
+                move || pump(session, rx, requests, waiters, call_timeout)
             });
         if let Err(e) = pumping {
             // Nothing has been submitted yet, so this worker holds no target either. Killing it
@@ -2343,12 +2334,167 @@ fn worker_gone(id: &str) -> String {
 /// The supervisor re-executes *itself*, so worker and server can never drift apart in version or
 /// in protocol. The override exists for tests, which run from a harness binary rather than from
 /// the server.
+///
+/// **One target type does not take this image**, and [`worker_images`] is where that is decided:
+/// a 32-bit user dump needs a 32-bit engine, which needs a 32-bit *process*, which cannot be this
+/// one. The invariant above is then kept by construction rather than by identity — both images
+/// come out of one build of one crate — and checked at the handshake, which is what
+/// [`WorkerMessage::Ready`] carries a build identity for.
 fn worker_exe() -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("WINDBG_MCP_WORKER_EXE") {
         return Ok(PathBuf::from(path));
     }
     std::env::current_exe()
         .map_err(|e| format!("cannot locate this executable to spawn an engine worker: {e}"))
+}
+
+/// The worker images to try for a target, in order. Never empty.
+///
+/// **Only a 32-bit user minidump gets more than one entry.** An extension DLL is loaded into the
+/// debugger's own process, so its architecture is the *host's*: a 64-bit process cannot load the
+/// 32-bit `sos.dll` at all, and the 64-bit one refuses a 32-bit CLR because the data access DLL
+/// behind it is paired to the target as well as the host. No in-process arrangement reads a 32-bit
+/// .NET dump ([#234](https://github.com/glslang/windbg-mcp/issues/234)), so the engine has to move
+/// — and since a process's architecture is fixed when its image loads, moving the engine means
+/// moving the *process*.
+///
+/// **The decision has to precede the engine, which is why it is made here.**
+/// `IDebugControl::GetEffectiveProcessorType` would answer authoritatively, but only inside a
+/// session that already exists in a process whose architecture is by then the thing being chosen.
+/// So [`crate::dump`] reads the answer out of the file's own header, and the supervisor — which
+/// has no engine and never will — is the one place that read can change which process is started.
+///
+/// **The fallback is deliberate**: an x86 dump opens perfectly well in this build, and native
+/// analysis of it works. Only SOS is lost. So a missing or unstartable 32-bit worker degrades to
+/// this one rather than failing the open, and the worker that ends up with the target reports the
+/// limitation from its own reading of the same header.
+fn worker_images(target: Option<&str>) -> Result<Vec<PathBuf>, String> {
+    let default = worker_exe()?;
+    // An explicit override means *this* image and no other. It is how the tests point a server at
+    // a worker that is not the harness binary they run from, and second-guessing it would make
+    // that unpredictable.
+    if std::env::var_os("WINDBG_MCP_WORKER_EXE").is_some() {
+        return Ok(vec![default]);
+    }
+    // A 32-bit build has nowhere better to put the engine than where it already is.
+    if std::env::consts::ARCH == "x86" {
+        return Ok(vec![default]);
+    }
+    let Some(target) = target else {
+        return Ok(vec![default]);
+    };
+    match crate::dump::read(Path::new(target)) {
+        Ok(crate::dump::DumpTarget::UserMinidump(crate::dump::Arch::X86)) => {}
+        // Not an error worth failing an open over, in either arm: the engine reads the file next
+        // and will say far more about it than a header parser can.
+        Ok(_) => return Ok(vec![default]),
+        Err(why) => {
+            tracing::debug!("could not read {target}'s header ({why}); using this build's worker");
+            return Ok(vec![default]);
+        }
+    }
+    match x86_worker_image(&default) {
+        Some(x86) => Ok(vec![x86, default]),
+        None => Ok(vec![default]),
+    }
+}
+
+/// The 32-bit worker beside this one, if this host has a usable one.
+///
+/// **An `x86\` subdirectory, not this directory**, and that is the loader's rule rather than a
+/// tidiness choice: an executable's own directory is searched first, so a 32-bit `dbgeng.dll`
+/// dropped beside the 64-bit one this server loads would be found by the wrong process. Putting
+/// the 32-bit worker *inside* `x86\` turns that same rule into the mechanism — it loads the
+/// engine sitting next to it, with no code here to make it happen. It is also the layout a
+/// debugger package already ships (`amd64\`, `x86\`) and the one `setup.md` prescribes.
+///
+/// **Both halves are checked, because the engine is bound by the loader before `main` runs.** An
+/// image with no `dbgeng.dll` beside it does not fail to open a dump; it fails to *start*, as a
+/// loader error with no Rust in it. Probing for the pair here keeps that out of the fallback path.
+fn x86_worker_image(default: &Path) -> Option<PathBuf> {
+    let dir = default.parent()?.join("x86");
+    if !dir.join("dbgeng.dll").is_file() {
+        return None;
+    }
+    // This build's own file name first, then the released one. They are the same in a release
+    // layout; they differ while the running image has been renamed out of the way for a rebuild,
+    // and a stale 32-bit worker is worse than none.
+    let named = default.file_name().map(|name| dir.join(name));
+    named
+        .into_iter()
+        .chain(std::iter::once(dir.join("windbg-mcp.exe")))
+        .find(|image| image.is_file())
+}
+
+/// A worker process that has come up and said so.
+struct StartedWorker {
+    child: Child,
+    requests: PipeWriter,
+    messages: mpsc::UnboundedReceiver<WorkerMessage>,
+    /// Created before the thread that records into it, and handed to the session: see
+    /// [`Session::unwinding`] for why it is written there rather than in [`reader`].
+    unwinding: Arc<Mutex<Option<Instant>>>,
+    pid: u32,
+}
+
+/// Starts one worker image and waits out its handshake.
+///
+/// Every failure path kills the child before returning, because nothing has been asked of it yet:
+/// it holds no target, so killing it is the whole teardown. That is also what makes this safe to
+/// call again with the next image.
+async fn start_worker(id: &str, exe: &Path, target: Option<&str>) -> Result<StartedWorker, String> {
+    let (mut child, channel) = spawn_worker(exe, target)
+        .map_err(|e| format!("could not start an engine worker ({}): {e}", exe.display()))?;
+
+    let stdout = child.stdout.take().ok_or("engine worker has no stdout")?;
+    let pid = child.id().unwrap_or(0);
+    // Drained from the start, before the handshake: a worker that prints during startup must
+    // not be able to block on a full pipe on its way to `Ready`.
+    tokio::spawn(log_stray_output(id.to_string(), stdout));
+    let unwinding: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+    let mut messages = match read_messages(id.to_string(), channel.messages, Arc::clone(&unwinding))
+    {
+        Ok(messages) => messages,
+        Err(e) => {
+            let _ = child.start_kill();
+            return Err(format!(
+                "could not start a reader for an engine worker's messages: {e}"
+            ));
+        }
+    };
+
+    // Nothing is registered until the worker says its engine exists. A session that cannot
+    // debug is worse than no session: it would accept calls and fail every one.
+    let ready = match tokio::time::timeout(WORKER_READY_TIMEOUT, messages.recv()).await {
+        // **The one thing a second worker image can get wrong that nothing else would catch.**
+        // A stale `x86\\windbg-mcp.exe` deserializes this protocol well enough to look healthy and
+        // then differs somewhere that surfaces as a debugger error hours later, so the mismatch is
+        // refused here — where the caller still has a working fallback to be given instead.
+        Ok(Some(WorkerMessage::Ready { build })) if build == crate::BUILD_VERSION => Ok(()),
+        Ok(Some(WorkerMessage::Ready { build })) => Err(format!(
+            "the engine worker at {} is build {build}, and this server is build {}; both images \
+             come from one build of one crate, so replace the mismatched one",
+            exe.display(),
+            crate::BUILD_VERSION
+        )),
+        Ok(Some(WorkerMessage::Fatal { message })) => Err(message),
+        Ok(Some(other)) => Err(format!("engine worker said {other:?} before it was ready")),
+        Ok(None) => Err("the engine worker exited before it was ready".to_string()),
+        Err(_) => Err(format!(
+            "the engine worker did not come up within {WORKER_READY_TIMEOUT:?}"
+        )),
+    };
+    if let Err(why) = ready {
+        let _ = child.start_kill();
+        return Err(why);
+    }
+    Ok(StartedWorker {
+        child,
+        requests: channel.requests,
+        messages,
+        unwinding,
+        pid,
+    })
 }
 
 /// The supervisor's ends of one worker's protocol channel.
@@ -2897,7 +3043,9 @@ async fn reader(
             // `Ready` and `Fatal` belong to the spawn handshake, which has already happened.
             // `Log` never gets this far: it is filed by the reader thread that parsed it, which
             // is also where the session id it is tagged with lives.
-            WorkerMessage::Ready | WorkerMessage::Fatal { .. } | WorkerMessage::Log { .. } => {}
+            WorkerMessage::Ready { .. }
+            | WorkerMessage::Fatal { .. }
+            | WorkerMessage::Log { .. } => {}
         }
     }
     // The channel closed: the worker exited, for whatever reason. Nothing else can close it —
@@ -4683,5 +4831,106 @@ mod tests {
             MAX_SESSIONS + 1,
             "nothing was reclaimable, so the overage stands"
         );
+    }
+
+    /// The 32-bit worker is looked for **inside** `x86\`, and only when the engine it would load
+    /// is there too.
+    ///
+    /// Both halves matter and only one of them is obvious. The subdirectory is the loader's own
+    /// rule turned into the mechanism; the `dbgeng.dll` check is what keeps a half-populated
+    /// `x86\` out of the spawn path, because an image with no engine beside it fails *before*
+    /// `main` and there is no Rust left to report it.
+    #[test]
+    fn a_32_bit_worker_needs_its_engine_beside_it() {
+        let dir = tempdir();
+        let exe = dir.join("windbg-mcp.exe");
+        std::fs::write(&exe, b"").expect("a stand-in server image");
+        assert_eq!(x86_worker_image(&exe), None, "nothing is there yet");
+
+        let x86 = dir.join("x86");
+        std::fs::create_dir_all(&x86).expect("an x86 directory");
+        let worker = x86.join("windbg-mcp.exe");
+        std::fs::write(&worker, b"").expect("a stand-in 32-bit worker");
+        assert_eq!(
+            x86_worker_image(&exe),
+            None,
+            "a worker with no engine beside it would fail in the loader, not in this server"
+        );
+
+        std::fs::write(x86.join("dbgeng.dll"), b"").expect("a stand-in engine");
+        assert_eq!(x86_worker_image(&exe), Some(worker));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A renamed running image still finds the released worker name.
+    ///
+    /// This is the `.stale` rebuild dance: the supervisor is executing `windbg-mcp.exe.stale`, so
+    /// its own file name names nothing under `x86\`. Falling back to the released name is what
+    /// keeps a 32-bit dump routed during it — and the order matters the other way round too, so a
+    /// worker named after *this* build is preferred to one that merely shares the release's name.
+    #[test]
+    fn a_renamed_supervisor_still_finds_the_released_worker() {
+        let dir = tempdir();
+        let x86 = dir.join("x86");
+        std::fs::create_dir_all(&x86).expect("an x86 directory");
+        std::fs::write(x86.join("dbgeng.dll"), b"").expect("a stand-in engine");
+        let released = x86.join("windbg-mcp.exe");
+        std::fs::write(&released, b"").expect("a stand-in 32-bit worker");
+
+        let stale = dir.join("windbg-mcp.exe.stale");
+        assert_eq!(x86_worker_image(&stale), Some(released));
+
+        let named = x86.join("windbg-mcp.exe.stale");
+        std::fs::write(&named, b"").expect("a matching 32-bit worker");
+        assert_eq!(
+            x86_worker_image(&stale),
+            Some(named),
+            "a worker named after this build wins over one named after the release"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only a 32-bit user minidump is offered a second image, and the list is never empty.
+    ///
+    /// The negative half is the one worth pinning: a kernel dump is a different format entirely
+    /// (`PAGEDU64`), has no CLR in it, and is read by this build's engine whatever architecture it
+    /// was captured on — so routing one at a 32-bit worker would trade a working session for a
+    /// broken one. The samples are checked in, which is what lets this assert against real files.
+    #[test]
+    fn only_a_32_bit_user_dump_asks_for_another_image() {
+        let samples = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/samples");
+        for entry in std::fs::read_dir(&samples).expect("the sample directory is checked in") {
+            let path = entry.expect("a readable directory entry").path();
+            if path.extension().is_none_or(|e| e != "dmp") {
+                continue;
+            }
+            let images = worker_images(Some(&path.to_string_lossy()))
+                .expect("this executable can locate itself");
+            assert_eq!(
+                images.len(),
+                1,
+                "{} is a kernel dump and must stay on this build's worker",
+                path.display()
+            );
+        }
+        assert_eq!(
+            worker_images(None)
+                .expect("this executable can locate itself")
+                .len(),
+            1,
+            "a target-less worker (an attach, a launch) has one image and always this one"
+        );
+    }
+
+    /// A scratch directory of this test binary's own, removed by the test that made it.
+    fn tempdir() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "windbg-mcp-images-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        dir
     }
 }

@@ -11736,7 +11736,7 @@ fn ttd_queries_answer_with_the_fields_they_promise() {
 /// 32-bit capture) against any .NET Framework process, and point the variable at it.
 fn x86_dump_tier() -> Option<String> {
     let Some(dump) = std::env::var_os("WINDBG_MCP_X86_DUMP") else {
-        skip("set WINDBG_MCP_X86_DUMP to a 32-bit managed dump to run the x86-host tier");
+        skip("set WINDBG_MCP_X86_DUMP to a 32-bit managed dump to run the 32-bit worker tier");
         return None;
     };
     let dump = dump.to_string_lossy().into_owned();
@@ -11753,11 +11753,12 @@ fn x86_dump_tier() -> Option<String> {
 /// This is the whole of [#234](https://github.com/glslang/windbg-mcp/issues/234) end to end, and it
 /// is the one claim no other tier makes: an extension is loaded into the debugger's own process, so
 /// a 32-bit `sos.dll` is unreachable from this server's own x64 engine and the 64-bit one refuses a
-/// 32-bit CLR. Getting `!threads` to answer therefore proves the engine is somewhere else.
+/// 32-bit CLR. Getting `!threads` to answer therefore proves the engine is in a 32-bit *process*.
 ///
-/// Asserts through the **tool surface** rather than against `enginehost` directly, because the unit
-/// test beside that module already covers the mechanism. What this adds is that the routing
-/// happens at all: that opening a dump by path lands on an x86 host without the caller asking.
+/// Asserts through the **tool surface** rather than against `engine::worker_images` directly,
+/// because the unit tests beside it already cover which image is chosen. What this adds is that
+/// the routing happens at all: that opening a dump by path lands on the 32-bit worker without the
+/// caller asking, and that everything the session then does crosses no boundary the caller can see.
 #[test]
 fn a_32_bit_managed_dump_is_served_by_an_engine_that_can_load_its_sos() {
     let Some(dump) = x86_dump_tier() else { return };
@@ -11769,9 +11770,10 @@ fn a_32_bit_managed_dump_is_served_by_an_engine_that_can_load_its_sos() {
         .expect("open_dump mints a handle")
         .to_string();
 
-    // A host was found and used, so there is nothing this session cannot do. When no x86 `cdb.exe`
-    // is on the machine this field is what carries the explanation instead — the fallback is loud
-    // by design, and a run on such a host fails here rather than passing quietly.
+    // The 32-bit worker was found and used, so there is nothing this session cannot do. When
+    // `x86\windbg-mcp.exe` and its `dbgeng.dll` are not beside the server this field carries the
+    // explanation instead — the fallback is loud by design, and a run on such a host fails here
+    // rather than passing quietly.
     // `summary.limitation`, not `limitation`: the opener's payload is an `OpenedSession` and the
     // field lives on the `TargetSummary` inside it. Indexing the top level produced JSON null
     // whatever the session actually reported, so this assertion passed unconditionally — it
@@ -11779,7 +11781,7 @@ fn a_32_bit_managed_dump_is_served_by_an_engine_that_can_load_its_sos() {
     let limitation = &data["summary"]["limitation"];
     assert!(
         limitation.is_null(),
-        "this host could not give the dump an x86 engine, so SOS is unreachable: {limitation}"
+        "this host could not give the dump a 32-bit worker, so SOS is unreachable: {limitation}"
     );
 
     // `.loadby`, not `.load` with a path. SOS reads CLR-internal structures and has to be the
