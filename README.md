@@ -66,8 +66,9 @@ Then point a client at the binary:
 ```
 
 The client and the model do not have to run where DbgEng does: `--listen <addr>` serves the same
-tools over HTTP, one bearer token per client, so a Mac can drive a Windows VM — see
-[`docs/mcp-clients.md`](docs/mcp-clients.md) and [`docs/remote-listener.md`](docs/remote-listener.md).
+tools over HTTP, one bearer token per client, so a Mac can drive a Windows VM — and the model
+itself can be a local one. [Driving it](#driving-it--hosted-or-local-here-or-on-another-machine)
+below has the configurations.
 
 `cargo test` covers the unit tests plus an end-to-end smoke test that drives the built binary over
 stdio; run it after a dependency bump or an MCP spec revision — [`docs/smoke-test.md`](docs/smoke-test.md).
@@ -144,7 +145,58 @@ Worked sessions with the real outputs and the gotchas — the long form is in
 - [Disassembler coordinates](docs/coordinates.md) — joining a `crash_triage` frame to a function in
   an image fetched on another machine.
 
-## Driving it with a local model
+## Driving it — hosted or local, here or on another machine
+
+Anything that speaks MCP can hold this server, and **DbgEng is the only part pinned to Windows**.
+So the model may be a hosted one inside an editor, a local one in ollama, or an ollama cloud model,
+and it does not have to run on the machine being debugged.
+
+| What drives it | Where that runs | The server | Reached over |
+|---|---|---|---|
+| An MCP client — Claude Code, Cursor, Claude Desktop | the Windows machine | launched by the client | stdio |
+| An MCP client | a Mac, or any other machine | a Windows host, `--listen`, usually as a service | HTTP through an ssh forward |
+| A model in **ollama** | the Windows machine | the same machine, `--listen` on loopback | HTTP on loopback |
+| A model in **ollama** | a Mac | a Windows host, `--listen` as a service | HTTP through an ssh forward |
+| A model in **ollama's cloud** | wherever ollama runs | either of the above | unchanged — the tag is all that differs |
+
+**One machine needs no configuration at all**: the client launches the binary and talks to it over
+stdio, which is the Quick start above.
+
+**Two machines need a listener, and installing one is not starting it.** On the Windows host,
+elevated:
+
+```pwsh
+$env:WINDBG_MCP_LISTEN_TOKEN = "<a long random string>"
+windbg-mcp.exe --install-service --listen 127.0.0.1:8765
+Start-Service windbg-mcp          # --install-service only *registers* it
+```
+
+Then, from the machine you are actually working on, for as long as you want the link:
+
+```console
+ssh -N -L 8765:127.0.0.1:8765 <windows-host>
+```
+
+The listener **refuses to start without a token**, because it serves `execute`, `launch` and
+`debug_batch` — an open port here is arbitrary code on the host holding your kernel debugger. Bind
+loopback and forward over ssh rather than exposing it. Each client authenticates as itself, and can
+be served a narrower `--tools` surface than the run's default, which is how a local model and an
+editor share one listener without sharing sessions.
+[`docs/remote-listener.md`](docs/remote-listener.md) is the operator's reference.
+
+**Pointing ollama at it** needs nothing installed on either side. The repo's driver speaks MCP to
+the listener and hands the tool surface to ollama's `POST /api/chat`:
+
+```console
+WINDBG_MCP_TOKEN="<that client's own token>" python3 tools/local_model_drive.py tasks.json
+```
+
+It is a batch task runner rather than a chat client, and a local tag and a cloud tag are one route
+— the model name is the only difference. [`docs/local-model.md`](docs/local-model.md) is the
+runbook: the four arrangements, choosing a model that can actually run, and what a cloud tag can no
+longer tell you about its own run.
+
+## Whether a local model copes — the benchmark
 
 The tool surface is paid on every turn, so *"can a model that runs on a laptop actually drive
 this?"* is a question about **this server** as much as about the model. The repo ships the
@@ -154,10 +206,11 @@ three separately-budgeted clients, and the answer key is read off the checked-in
 this server's own tools before any model sees them. Claude is in the grid as the control, not as a
 competitor. [`docs/local-model-eval.md`](docs/local-model-eval.md) is the write-up.
 
-- **The context window was not the binding constraint.** A 17,300-token surface answered all six
-  tasks at a *served* 8,192-token window — multi-turn ones carrying 10,000 characters of tool
-  output included. The arithmetic that predicted otherwise is in `docs/local-model.md`, and it was
-  wrong.
+- **The context window was not the binding constraint** — on that bench's runtime, which is the
+  qualifier that matters. A 17,300-token surface answered all six tasks at a *served* 8,192-token
+  window, multi-turn ones carrying 10,000 characters of tool output included. The arithmetic that
+  predicted otherwise is in `docs/local-model.md`, and it was wrong; ask `ollama ps` what your own
+  runtime serves rather than generalising either result.
 - **Cutting 51 tools to 11 costs two of six answers.** Most facts here are reachable by more than
   one route, so a narrow surface keeps the ones that matter.
 - **It measures this server before it measures the model.** Every off-surface tool call the first
