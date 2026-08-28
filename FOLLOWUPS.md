@@ -3448,25 +3448,40 @@ debugger, and it would make the two paths disagree about what a breakpoint means
 was always there. Reopen it if a parked worker holding a live process turns out to be ordinary
 rather than exceptional.
 
-**Review found one gap and it was worth the round.** The first version recorded provenance only in
-`attach_process_begin`, so the flag was about the last *attach* rather than about the target the
-engine holds — and the sequence that exposes it needs no teardown anywhere in it: attach, lose the
-target (it exits, or a raw `.detach` takes it), then launch something else on the same engine, which
-`end_session`'s own doc invites by saying the engine is reusable. The launched process then took the
-detach branch and outlived its session. Every opener now records it, through a two-variant
-`TargetOrigin` rather than a `bool` — the question an opener answers is "which of these am I", and a
-bool invites the one that means "not that" to say nothing, which is exactly how the gap arose. Not
-reachable through *this* server, where a worker holds one target for its whole life and `EngineOp`
-has no second opener; it is a dbgscope-API bug, fixed there.
+**Two rounds of review landed on the same seam, and the second one says the shape was wrong.** The
+first version recorded one flag for the whole session, set by `attach_process_begin`. Round one:
+nothing else cleared it, so "attach, lose the target, launch something else on the same engine" —
+which needs no teardown in between, since `end_session` is documented as leaving the engine reusable
+— left the launched process taking the detach branch and outliving its session. Round two is the
+one that matters: **DbgEng holds several user-mode processes in one session**. `|` lists them and
+says `attach` or `create` against each, measured on this bench, so an engine can hold somebody
+else's running service beside a program it launched itself — and `EndSession` takes one flag for
+all of them, so *no* choice of flag is right. Both orderings were wrong, in opposite directions,
+depending on which opener ran last.
 
-**And the obvious companion check was built, measured and removed.** Guarding the detach on
-`has_target` looked necessary — an active detach with nothing to detach from ought to fail, and
-ending a session whose attached program had merely finished would then report an error to the
-caller. It does not fail: `EndSession` with `DEBUG_END_ACTIVE_DETACH` succeeds on an engine holding
-no debuggee (dbgeng 10.0.26100.1, ARM64), and both new tests pass with the guard and without it. So
-what holds the property is a test that asserts the teardown is *not* an error, rather than a
-condition that protects against nothing measurable — and if an engine ever does refuse, that test
-says so and the guard is one line away.
+So the mechanism went rather than the symptom, which is the rule this file's own header states:
+provenance is a **set of pids**, and the teardown detaches each attached process individually with
+`DetachCurrentProcess` before ending the session. Whatever is still there when the passive end runs
+is a target the engine created, and `DEBUG_END_ACTIVE_DETACH` has left the user-mode path entirely.
+None of it is reachable through *this* server — a worker holds one target for its whole life and
+`EngineOp` has no second opener — so it is a dbgscope-API bug, fixed there.
+
+**One check was built, measured and removed** on the way: guarding the detach on `has_target`
+looked necessary, since an active detach with nothing to detach from ought to fail and would then
+report an error for a program that had merely finished. It does not fail — `EndSession` with
+`DEBUG_END_ACTIVE_DETACH` succeeds on an engine holding no debuggee — so a test asserting the
+teardown is not an error holds the property instead of a condition that protects against nothing
+measurable. The same question came back in a form that *did* need answering, which is worth the
+contrast: `GetNumberProcesses` **does** fail (`E_UNEXPECTED`) with no debuggee, so the process walk
+answers empty rather than asking.
+
+**And the test for it cost a round of "the fix does not work" against a fix that did.** `@$tpid`
+answers for whichever process is *current*, and after a launch that is the launched process on a
+fresh engine and the **earlier** one on an engine that has held a target before — so the same
+assertion passed alone and failed in the full suite, naming the attached process as the launched
+one. Nothing about the ordering is documented; it was found by printing `|` and noticing which line
+carried the dot. A test that has to identify one of several processes should name it by elimination,
+not by asking which is current.
 
 **One observation not reproduced**, recorded because a flake here would be worth recognising: on
 the very first paired run after a full rebuild, the detached `ping` exited `0xC0000005` instead of
