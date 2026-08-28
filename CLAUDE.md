@@ -746,9 +746,12 @@ rather than the message. And a session whose target is gone is still reported `o
 **Three different things, and which one is decided by the opener rather than by the target type.**
 A dump or a trace is closed. A live kernel is resumed and actively detached. A process
 `attach_process` attached to is actively detached and **left running**; one `launch` created is
-terminated with the session. All of it happens inside dbgscope's `end_session`, from a flag
-`attach_process_begin` sets — DbgEng cannot be asked, since `GetDebuggeeType` answers
-`DEBUG_USER_WINDOWS_PROCESS` for a launch and an attach alike.
+terminated with the session. All of it happens inside dbgscope's `end_session`, from what the
+**opener** recorded — DbgEng cannot be asked, since `GetDebuggeeType` answers
+`DEBUG_USER_WINDOWS_PROCESS` for a launch and an attach alike. *Every* opener records it, not just
+the attach: an engine is reusable and a target can leave on its own, so "attach, lose the target,
+launch something else" needs no teardown in between, and with one setter the launched process
+survives a session that is supposed to take it. That gap was review's, on the first version.
 
 **The attach case was a kill until 2026-08-28, and the two defaults that produced it are each
 reasonable.** A passive `EndSession` destroys the debug port rather than detaching, and a debuggee
