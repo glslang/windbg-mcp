@@ -164,7 +164,7 @@ dependencies = [
 [[package]]
 name = "dbgscope"
 version = "0.1.0"
-source = "git+https://github.com/glslang/dbgscope?rev=c94957683f789fbf31d69ee2b63e3c80a143f632#c94957683f789fbf31d69ee2b63e3c80a143f632"
+source = "git+https://github.com/glslang/dbgscope?rev=ca12bd5c63b198982e8b431ce510b54276d100ab#ca12bd5c63b198982e8b431ce510b54276d100ab"
 dependencies = [
  "hex",
  "thiserror",
