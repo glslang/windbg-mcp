@@ -191,7 +191,7 @@ those clients; `ollama launch` lists them, and `ollama launch claude --model <ta
 tag and an ollama **cloud** tag are the same route, differing only in the model name.
 
 [`docs/local-model.md`](docs/local-model.md) is the runbook: the arrangements, choosing a model that
-can actually run, the lease a quiet model loses its sessions to, and what a cloud tag can no longer
+can actually run, which of two clocks a quiet model loses its sessions to, and what a cloud tag can no longer
 tell you about its own run.
 
 ## Whether a local model copes — the benchmark
