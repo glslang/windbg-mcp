@@ -54,10 +54,29 @@ protection" if you stop there.
    file unreferenced, and **Documentation lint fails on MD053** — the one gate that catches release
    prep, and it catches it after the push. Add the new `[X.Y.Z]:` definition beside it and repoint
    `[Unreleased]:` at the new tag. That section *is* the GitHub release body.
-3. **Dry-run both guards locally**, with the workflow's own regexes rather than by eye — they are
-   twenty lines into [`release.yml`](../.github/workflows/release.yml) and take a second to run in
-   `pwsh`. One compares the tag against all three manifest versions, the other requires a
-   `## [X.Y.Z]` heading in the CHANGELOG. Dry-run the lint too:
+3. **Dry-run both guards locally**, rather than by eye. They are twenty lines into
+   [`release.yml`](../.github/workflows/release.yml) and take a second in `pwsh` — but copy them
+   with one change, or the dry-run is worse than not running it. The workflow reads the tag from
+   `$env:GITHUB_REF_NAME`, which Actions supplies and your shell does not, so a **verbatim** copy
+   compares all three manifests against an empty string and reports a mismatch on a correct tree.
+   Set `$tag` yourself. The second guard needs no tag at all: like the workflow, it takes the
+   version from `Cargo.toml`, which the first guard has just pinned to the tag.
+
+   ```pwsh
+   $tag    = '0.13.1'   # the version about to be released, without the leading v
+   $cargo  = [regex]::Match((Get-Content Cargo.toml -Raw), '(?ms)^\[package\].*?^version\s*=\s*"([^"]+)"').Groups[1].Value
+   $plugin = (Get-Content .claude-plugin/plugin.json -Raw | ConvertFrom-Json).version
+   $readme = [regex]::Match((Get-Content README.md -Raw), 'img\.shields\.io/badge/release-v([^-]+)-').Groups[1].Value
+   if ($cargo -ne $tag -or $plugin -ne $tag -or $readme -ne $tag) {
+     throw "Version mismatch: tag v$tag, Cargo.toml $cargo, plugin.json $plugin, README badge $readme"
+   }
+   if ((Get-Content CHANGELOG.md -Raw) -notmatch "(?m)^## \[$([regex]::Escape($cargo))\]") {
+     throw "CHANGELOG.md has no '## [$cargo]' section"
+   }
+   "guards pass: $tag"
+   ```
+
+   Dry-run the lint too, with CI's own globs:
    `npx markdownlint-cli2@0.23.2 README.md CHANGELOG.md "docs/**/*.md" "skills/**/*.md"`.
 4. **`claude plugin validate . --strict`** — worth running, but know what it answers. In this repo
    it validates `.claude-plugin/marketplace.json` and says so in its output; it is **not** a check
