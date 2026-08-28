@@ -592,3 +592,46 @@ request carried.
 `docs/remote-listener.md` in the repository is the operator's reference for the rest — the grace
 and how to change it, what a `409` means, running behind a service, and adding, revoking or
 rotating a client while it runs.
+
+## What drives the server — there is a choice
+
+Everything above assumes an MCP client with a hosted model, over stdio or the listener. That is one
+of three arrangements, and the other two need nothing added to this server: a listener is an HTTP
+MCP endpoint, and anything that speaks MCP can hold one.
+
+- **An MCP client with a hosted model** — Claude Code, an editor. The default; nothing else in this
+  file changes.
+- **A model in ollama.** The repository's `tools/local_model_drive.py` speaks MCP to the listener,
+  hands it the tool surface, and executes the tool calls that come back from `POST /api/chat` on
+  `localhost:11434`. Nothing has to be installed on either side and nothing has to be launched
+  beyond the ollama server itself — `ollama launch claude` is a *different* arrangement, not a
+  prerequisite for this one.
+- **A model in ollama's cloud.** The same endpoint and the same script; a cloud tag changes the
+  model name and nothing else.
+
+Four things decide whether the ollama route works, and none of them is about the debugger:
+
+- **Give it a credential of its own**, never the one your editor is registered with. Two tokens are
+  two namespaces, so a run on a shared one can see, route to, and at the four-session cap cause the
+  reclamation of, the targets you are working in. `--add-listen-client <name>` mints one, and
+  `--tools <spec>` beside it serves that client a surface of its own.
+- **A `tools` capability is necessary and not sufficient.** The driver picks the first installed
+  model that declares one, because a model without it fails at the first call with an error about
+  something else. A *cloud* tag can declare it and still not be runnable — it is a registered name
+  with no local weights, and the entitlement is resolved at inference — so send it one token first
+  (`/api/generate` with `num_predict: 1`) rather than discovering it mid-run.
+- **A model that goes quiet loses its sessions**, and it reads as a broken server. A client whose
+  revision mints an `Mcp-Session-Id` holds the lease described above, and its grace is derived from
+  how long a *call* may take — on the assumption that the server is the slow party. A model
+  thinking, or a cloud request being queued, is silence with nothing in flight: past the grace the
+  sweep releases that credential's sessions and every later call answers `404`. The driver pings
+  during a long turn; anything else driving the listener needs its own equivalent.
+- **The surface is the fixed cost and a single answer is the variable one.** All 51 tools are about
+  70 kB of JSON, paid once per conversation and narrowable per client with `--tools`; one careless
+  `read_memory` is up to ~4 MiB, paid on the spot. Narrowing costs fewer *answers* than it does
+  tools — most facts here are reachable by more than one route — so it is a real option rather than
+  a mutilation.
+
+`docs/local-model.md` in the repository is the runbook for that route: the listener, the link, the
+credential, choosing a tag, and what a cloud tag can no longer tell you about its own run.
+`docs/local-model-eval.md` is the graded grid behind the claim about narrowing.

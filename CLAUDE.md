@@ -914,7 +914,7 @@ measurements and the options that were weighed.
 
 Two files, not one. A tool is declared in `src/server.rs` as always, and its name also goes in a
 **group** in `src/toolset.rs` — the table behind `--tools`, which advertises a named subset of the
-surface because 74% of the 67,873-byte tool surface is prose a model needs and cannot be trimmed
+surface because 74% of the 68,322-byte tool surface is prose a model needs and cannot be trimmed
 (`docs/token-budget.md` finding 8).
 
 Forgetting the second half fails in the one direction nothing would notice: the *default* surface
@@ -947,8 +947,8 @@ tool but the always-served ones, and `no_description_names_a_tool_the_client_can
 build if a new tool's prose points at one its own single-tool spec does not serve. Three
 consequences when you add one. The invariant is checked on `--tools <that tool>` and nowhere else,
 because that is the tightest surface it can be served on and every wider one is covered by
-construction. **Group bytes no longer add up to a surface's**: `crash` is 14,138 B against the
-15,093 its two groups sum to in `docs/token-budget.md`, since narrowing shortens what stays as well
+construction. **Group bytes no longer add up to a surface's**: `crash` is 14,587 B against the
+15,542 its two groups sum to in `docs/token-budget.md`, since narrowing shortens what stays as well
 as dropping what goes. And the check for "names a tool" is deliberately not word containment — this
 prose says frames are "attributed to modules" and that a stuck session "does not let go", while a
 TTD description quotes `dx @$cursession.TTD.Calls(...)`, which is the debugger command and not the
