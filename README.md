@@ -184,17 +184,15 @@ be served a narrower `--tools` surface than the run's default, which is how a lo
 editor share one listener without sharing sessions.
 [`docs/remote-listener.md`](docs/remote-listener.md) is the operator's reference.
 
-**Pointing ollama at it** needs nothing installed on either side. The repo's driver speaks MCP to
-the listener and hands the tool surface to ollama's `POST /api/chat`:
+**Pointing ollama at it is the client's job, not this server's.** An MCP client that drives an
+ollama model holds the listener exactly as an editor does — nothing here has to be installed, and
+this server never learns which kind of model answered. ollama ships integrations for a number of
+those clients; `ollama launch` lists them, and `ollama launch claude --model <tag>` is one. A local
+tag and an ollama **cloud** tag are the same route, differing only in the model name.
 
-```console
-WINDBG_MCP_TOKEN="<that client's own token>" python3 tools/local_model_drive.py tasks.json
-```
-
-It is a batch task runner rather than a chat client, and a local tag and a cloud tag are one route
-— the model name is the only difference. [`docs/local-model.md`](docs/local-model.md) is the
-runbook: the four arrangements, choosing a model that can actually run, and what a cloud tag can no
-longer tell you about its own run.
+[`docs/local-model.md`](docs/local-model.md) is the runbook: the arrangements, choosing a model that
+can actually run, the lease a quiet model loses its sessions to, and what a cloud tag can no longer
+tell you about its own run.
 
 ## Whether a local model copes — the benchmark
 
@@ -205,6 +203,14 @@ surface × context window, `tools/bench_listener.ps1` serves all three surfaces 
 three separately-budgeted clients, and the answer key is read off the checked-in crash dumps with
 this server's own tools before any model sees them. Claude is in the grid as the control, not as a
 competitor. [`docs/local-model-eval.md`](docs/local-model-eval.md) is the write-up.
+
+Running the grid yourself needs a **development environment rather than a release**: the release
+zip is `windbg-mcp.exe`, the `x86\` worker and `LICENSE`, so `tools/` comes from a checkout, and the
+driver and grader are Python 3. Nothing above this section needs either — driving the server with a
+local model is a client's job, and the driver here exists to *measure* that, one task list at a
+time, with no interactive mode.
+[`agent-sandbox-vm`](https://github.com/glslang/agent-sandbox-vm) is the Hyper-V / Parallels VM
+setup this project is developed and benchmarked in.
 
 - **The context window was not the binding constraint** — on that bench's runtime, which is the
   qualifier that matters. A 17,300-token surface answered all six tasks at a *served* 8,192-token

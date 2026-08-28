@@ -19,6 +19,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quiet client loses its sessions to, and the surface being the fixed cost where a single
   `read_memory` is the variable one. The depth stays in `docs/local-model.md` rather than being
   copied, so there is one place for each rule to be wrong.
+- **The benchmark's driver was being offered as the way to use a local model, and it is not.**
+  `tools/local_model_drive.py` ships in no release — the zip is `windbg-mcp.exe`, the `x86\` worker
+  and `LICENSE` — wants a checkout and Python 3, has no interactive mode, and exists to measure a
+  model rather than to debug with one. Driving this server with an ollama model is the **client's**
+  job: an MCP client that drives one holds the listener exactly as an editor does, ollama ships
+  integrations for several of them, and nothing from this repository is involved. `README.md`, the
+  skill and `docs/local-model.md` now say so, and name
+  [`agent-sandbox-vm`](https://github.com/glslang/agent-sandbox-vm) as the environment the grid is
+  actually run in.
 - **`README.md` presented driving this with a local model as a benchmark result rather than as
   something a reader can do.** Its single section on the subject was the eval — the grid, the
   axes, the findings — so someone asking whether a local model is supported at all, how the
@@ -30,7 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as its own section, backing those claims instead of standing in for them, and its context-window
   finding now carries the qualifier it always needed: it is a fact about that bench's runtime, and
   `ollama ps` is how a reader learns what theirs serves.
-- **The tool-surface figures were stale in six documents and disagreed with each other in two.**
+- **The tool-surface figures were stale in eight files and disagreed with each other in two.**
   Every current claim now comes from one re-derivation, none of which needs the eval run: the whole
   surface is `tests/golden/tool_budget.json`'s `modelVisible` total, which `cargo test` re-records
   (**68,322** — not the 67,766 five documents carried, and not the 67,873 in `README.md` and
@@ -41,6 +50,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   than 11,265, `debug_batch` 9,798 rather than 9,746, and the gap item 41 opened between a group's
   share and what a spec serves is 15,542 against 14,587. `docs/local-model.md` also says how to
   re-derive its own table, because this is the second time these numbers have gone quietly stale.
+  The developer-facing copies moved with them — `src/toolset.rs`'s module table and floor,
+  `tests/mcp_smoke.rs`'s note on why `--tools` exists, and `CLAUDE.md` — since a figure in a doc
+  comment is a current claim like any other.
   The **historical** figures are deliberately untouched: `token-budget.md`'s `67,076 → 67,766`
   before-and-after column, `local-model-eval.md`'s statement of the conditions its grid ran under,
   and this file's earlier entries each record a measured moment and would be falsified by a refresh.

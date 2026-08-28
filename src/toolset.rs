@@ -1,7 +1,7 @@
 //! Which of this server's fifty-one tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
-//! 67,873 bytes — roughly 17k tokens. Three quarters of that is prose, and the prose is what tells
+//! 68,322 bytes — roughly 17k tokens. Three quarters of that is prose, and the prose is what tells
 //! a model how to drive the tools, so there is no strip here the way there was in
 //! [`crate::schema`]: `FOLLOWUPS.md` item 24 measured it and the only honest lever left is the one
 //! this module is — **not offering every tool to every caller**.
@@ -19,7 +19,7 @@
 //!
 //! ```text
 //!   group      tools   bytes   what it is for
-//!   session       10   12,157  opening a target, ending it, and watching this server
+//!   session       10   12,606  opening a target, ending it, and watching this server
 //!   allocator     10   15,969  pool and heap walks, and `walk_memory`
 //!   inspect        9   10,215  registers, stacks, memory, modules, symbols, raw commands
 //!   ttd            9    6,829  recording, indexing and querying a Time Travel trace
@@ -30,7 +30,7 @@
 //! ```
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
-//! 14,138 bytes, not the 15,093 its two rows add to, because the eleven tools it keeps also stop
+//! 14,587 bytes, not the 15,542 its two rows add to, because the eleven tools it keeps also stop
 //! carrying the five sentences that pointed at `modules`, `debug_batch`, `go` and `backtrace`. A
 //! spec is always cheaper than its rows suggest, never dearer.
 //!
@@ -38,7 +38,7 @@
 //!
 //! Not a convenience: every other tool here routes by a `session_id`, and this server is the only
 //! thing that can issue one. A surface with `registers` and no opener cannot be used at all, so a
-//! spec that leaves one out is asking for something that does not exist. On its own it is 11,265
+//! spec that leaves one out is asking for something that does not exist. On its own it is 11,714
 //! bytes, and that is the floor of any usable surface — `--tools crash` is eleven tools, not one,
 //! and the startup line says so rather than leaving the addition to be discovered.
 //!
