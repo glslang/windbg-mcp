@@ -101,12 +101,12 @@
     },
     {
       "annotations": 116,
-      "description": 981,
+      "description": 1070,
       "inputSchema": 314,
-      "modelVisible": 1347,
+      "modelVisible": 1436,
       "name": "end_session",
       "outputSchema": 1258,
-      "wire": 2752
+      "wire": 2841
     },
     {
       "annotations": 124,
@@ -462,14 +462,14 @@
   ],
   "totals": {
     "annotations": 5449,
-    "description": 25317,
+    "description": 25406,
     "inputSchema": 40259,
     "instructions": 1983,
-    "modelVisible": 68233,
+    "modelVisible": 68322,
     "outputSchema": 104539,
-    "payload": 179632,
+    "payload": 179721,
     "tools": 51,
-    "wire": 179514,
+    "wire": 179603,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 9798
   }

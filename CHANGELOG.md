@@ -49,8 +49,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   itself, and the other attaches to it running. `WINDBG_MCP_X86_DUMP` still overrides the made dump
   with a real capture. The tier stands down where there is no 32-bit engine to run it against.
 
-## [0.12.1] - 2026-08-26
-
 ### Fixed
 
 - **Ending a session no longer kills a process this server only attached to**
@@ -67,6 +65,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [glslang/dbgscope#121](https://github.com/glslang/dbgscope/pull/121); `end_session`,
   `attach_process` and `launch` now each say in their own description what ending a session will do
   to that kind of target, which is what none of them said before.
+
+## [0.12.1] - 2026-08-26
+
+### Fixed
+
 - **A target that ends during a resume is an ending, not a catastrophe** (issue #242, and
   [`FOLLOWUPS.md`](./FOLLOWUPS.md) item 48, which had held the question open since #226). A `go`, a
   step or a raw `execute 'g'` whose debuggee ran to completion came back

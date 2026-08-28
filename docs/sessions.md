@@ -23,6 +23,20 @@ created. So a target that must survive the debugger is one to attach to, not to 
 a disconnect and a lease expiry run the same release, that holds for a client that simply goes away
 as much as for one that calls `end_session`. `end_session`'s own result says which ending it was.
 
+**With one exception, and it is the same exception as everywhere else here: a session that does not
+let go is terminated.** Releasing asks the worker to detach and then shuts it down; a worker that
+does not answer within the grace is killed while it still owns the debug port, and the kernel takes
+its debuggees with it. That is what already happens to a parked kernel attach, and it is the reason
+`end_session` exists as a recovery at all — but it means "attached processes survive" is a promise
+about a worker that answers, which is every worker that is not wedged. A disconnect and a lease
+expiry give a **shorter** grace than `end_session` does, so a session doing something long-running
+is the one to end explicitly.
+
+**And a process added through the raw `execute` hatch is not covered by any of this.**
+`execute { "command": ".attach 1234" }` reaches DbgEng without going through `attach_process`, so
+nothing records that the process was somebody else's, and ending the session takes it. Use
+`attach_process`, which opens a session of its own and is the only route that is tracked.
+
 Omit `session_id` and a call goes to the **current** session: the most recently opened one that will
 still accept work. That is the pre-handle behaviour and it still holds. What supplying the id buys
 is that the call can never land on a target you did not open — it fails loudly instead.

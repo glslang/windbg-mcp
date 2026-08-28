@@ -3438,15 +3438,32 @@ out or would have:
 `GetExitCodeProcess` separates them completely — `STILL_ACTIVE` against `STATUS_DEBUGGER_INACTIVE`,
 ten runs each way on dbgeng 10.0.26100.1 (ARM64) — and is what both repos now use.
 
-**What is deliberately still open.** A worker killed while holding an attached target still takes
-the process down: `Release::Parked` terminates a worker that never answered, so nothing runs
-`end_session` and nothing detaches. `DEBUG_PROCESS_DETACH_ON_EXIT` at attach time would close that
-gap and was weighed and rejected — it leaves the process alive with whatever breakpoints were
-patched into it, which is a target that faults minutes later with nothing connecting it to the
-debugger, and it would make the two paths disagree about what a breakpoint means. The case is rare
-(a worker that will not answer inside the grace) and the present outcome is at least the one that
-was always there. Reopen it if a parked worker holding a live process turns out to be ordinary
-rather than exceptional.
+**What is deliberately still open, and all three are now written down where a caller can read
+them rather than only here.**
+
+- **A worker killed while holding an attached target still takes the process down.**
+  `Release::Parked` terminates a worker that never answered, so nothing runs `end_session` and
+  nothing detaches. `DEBUG_PROCESS_DETACH_ON_EXIT` at attach time would close it and was weighed
+  and rejected: it leaves the process alive with whatever breakpoints were patched into it, which
+  is a target that faults minutes later with nothing connecting it to the debugger, and it would
+  make the two paths disagree about what a breakpoint means. The case is rare and the outcome is
+  the one that was always there. Review was right that the *documentation* had not said so, which
+  is the half that was fixed: `docs/sessions.md`, the skill and `end_session`'s own description now
+  carry the exception, because "attached processes survive a disconnect" read as unconditional and
+  is the sort of promise someone attaches to a production service on.
+- **A process added through the raw `execute` hatch is not tracked.** `.attach <pid>` reaches
+  DbgEng without going through `attach_process_begin`, so nothing records it and the teardown takes
+  it. Not a regression — before this it was killed like everything else — and the remedies are both
+  worse than the gap: matching command text is the "list of command names" this codebase rejects
+  wherever it has met it, and inverting the rule to *detach everything this engine did not create*
+  would make a lost record leave a launched process running instead. Documented in the two places
+  that describe the hatch, and left alone.
+- **The pid-reuse window is narrowed, not closed.** `CreateProcessWide` is deferred, so an attached
+  process that exits after the opener's prune and has its number handed to the launch is still
+  misread. The fix that would work is a **retained handle**, which also stops Windows reusing the
+  pid at all; declined because reaching the window needs an exit inside milliseconds *and* an
+  immediate reuse of that exact number, and it costs a stray process where this whole path exists
+  to stop somebody else's being killed. The reason is in `prune_dead_attachments`' doc comment.
 
 **Two rounds of review landed on the same seam, and the second one says the shape was wrong.** The
 first version recorded one flag for the whole session, set by `attach_process_begin`. Round one:

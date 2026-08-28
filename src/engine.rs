@@ -1495,8 +1495,19 @@ impl Sessions {
                 "ended by end_session".to_string(),
                 format!(
                     "{text}\n\nSession `{}` is closed and its engine worker process (pid {}) has \
-                     been shut down.",
-                    session.id, session.pid
+                     been shut down.{}",
+                    session.id,
+                    session.pid,
+                    // The other half of what the worker says about an attached process, and it is
+                    // here rather than there because **only this side knows**: the worker asks the
+                    // engine, which can tell an attached live process from anything else but not a
+                    // launch from a dump. `SessionKind` is the supervisor's, and this is the one
+                    // place it meets a rendered result.
+                    match session.kind {
+                        SessionKind::Launch =>
+                            " The process this session launched was terminated with it.",
+                        _ => "",
+                    }
                 ),
             ),
             Release::Parked { waited } => (

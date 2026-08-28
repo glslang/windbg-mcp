@@ -3472,7 +3472,8 @@ impl WindbgServer {
     ///
     /// What releasing does depends on the opener: a process this server attached to is detached
     /// and left running, one it launched is terminated, a live kernel is resumed and detached, a
-    /// dump or trace is closed. A client disconnect and a lease expiry run the same release.
+    /// dump or trace is closed. A client disconnect and a lease expiry run the same release — but
+    /// a session that will not let go is terminated instead, and that takes its target.
     ///
     /// This is also the recovery for a session that is stuck. If the session does not let go
     /// within a short grace period — a live-kernel attach whose target never dialed in cannot,
