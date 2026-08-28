@@ -3107,6 +3107,18 @@ closes it a second way, by having no transport.)
 3. **Say it in the operator documentation, which today says nothing.** Neither *32-bit .NET dumps
    need an x86 engine host* in `skills/windbg-debugging/setup.md` nor `docs/remote-listener.md`
    mentions the pipe, let alone who can reach it. Owed regardless of which of the rest happens.
+   **Paid on 2026-08-28, and only ever half a debt by then.** The pipe half went with the transport
+   — there is no pipe for `docs/remote-listener.md` to disclose. The other half outlived option 5
+   exactly as *"regardless of which of the rest happens"* predicted, and outlived the fix as well:
+   `setup.md` gained its *32-bit .NET targets need a 32-bit server* section with the implementation
+   on 2026-08-27, and every route to it stayed silent. `SKILL.md` said nothing at all, so its
+   routing table gave a model holding a 32-bit dump no reason to open `setup.md` and nothing warned
+   it that a fallback answers with a `limitation` rather than an error; `docs/install.md`'s *Wanted
+   / Needs* table — the index of what fails quietly without which files — had no row for it;
+   `docs/limitations.md` recorded neither the fallback nor what such a session loses; and
+   `README.md` did not mention the second worker image at all. All four now do. **The lesson is the
+   shape, not the four files:** a feature whose own setup page is written the day it lands still has
+   no reader, because nothing that *routes* to that page moved with it.
 4. **Drive `x86\cdb.exe` as a plain text child over inherited anonymous pipes** instead of using
    DbgEng's remote transport at all. It removes the named pipe and with it every finding above, and
    it needs no new build target. **Rejected on function rather than effort**, and recorded here so

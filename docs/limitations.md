@@ -50,6 +50,27 @@
   investigating freed memory, pass `state: reusable_free` or `state: cached_free` explicitly. Read
   `layout`, `scope`, and `walk` before treating an absent allocation as evidence. The agent workflow is in
   [`skills/windbg-debugging/heap-walking.md`](../skills/windbg-debugging/heap-walking.md).
+- **A 32-bit user-mode target is opened by a worker of its own architecture, and what that buys and
+  costs is worth knowing before you reach for either.** An extension DLL is loaded into the
+  debugger's own process, so SOS on a 32-bit .NET target is reachable only from a 32-bit host: the
+  32-bit `sos.dll` will not load into an x64 engine (`Win32 error 0n193`) and the 64-bit one loads
+  and then refuses the target (`Failed to load data access DLL, 0x80004005`), the CLR data access
+  DLL being paired to the target's architecture as well as the host's. So a 32-bit dump, and an
+  `attach_process` on a WoW64 process, are routed to an `x86\windbg-mcp.exe` worker. Nothing about
+  that is visible to a client — one server, one handle, one tool surface — and where the worker or
+  its 32-bit engine is absent the target **still opens**, on the x64 build, with an opener
+  `limitation` saying SOS is unreachable rather than a failure: native analysis of such a target
+  works and always has. Two things such a session does not have, and only one of them is about the
+  worker. The `heap_*` tools refuse any non-x64 *target* (*"heap walking supports x64 targets
+  only"*), so they are gone whichever worker holds it — SOS's own `!dumpheap`/`!eeheap` are the
+  managed equivalent. The other **is** the 32-bit worker's own trade: a live WoW64 `attach_process`
+  there sees only the 32-bit half of the process. The emulation layer above 4 GiB (`wow64.dll`,
+  `wow64cpu.dll`, `wow64win.dll` and the 64-bit `ntdll`) is what the x64 engine reaches with
+  `!wow64exts.sw` and this one cannot — measured on one process, 36 modules against 30. That is the
+  right trade when you are here for SOS and the wrong one for debugging the thunk layer itself; for
+  both halves, take a `procdump64.exe -ma` capture and open that, which routes to the x64 engine. A
+  dump loses nothing, a 32-bit capture never having held the 64-bit side. The engine payload to copy
+  is in [`setup.md`](../skills/windbg-debugging/setup.md).
 - **`crash_triage` reads a bug check two ways, and keeps them apart.** The code and its parameters
   (`ReadBugCheckData`), the stack, each frame's module, and the crashing process (out of the current
   `_EPROCESS`'s audit name — the full image name, not the 15-byte `ImageFileName` that turns

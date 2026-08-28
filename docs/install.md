@@ -102,11 +102,14 @@ and each needs files that engine does not ship:
 | Crash-dump `!analyze` | `winext\` for the extension, `triage\` for its module attribution |
 | `driver_object` / `device_object` / `irp_stack` | `winxp\kdexts.dll` |
 | `module!name` symbols anywhere | `msdia140.dll` + `symsrv.dll`, plus a symbol path |
+| SOS on a 32-bit .NET target | an `x86\` subdirectory holding a 32-bit engine **and** `x86\windbg-mcp.exe` — an extension loads into the debugger's own process, so only a 32-bit host can load a 32-bit `sos.dll` |
 
 The fix is a one-time file copy: `DebugCreate` binds to whichever `dbgeng.dll` the loader finds
 first and the app directory is searched before `System32`, so a WinDbg engine copied next to
 `windbg-mcp.exe` wins. Note the kernel row — a live-kernel-only user needs this too, even though
-the attach itself works on the System32 engine.
+the attach itself works on the System32 engine. The last row is that same loader rule rather than an
+exception to it: the 32-bit engine goes *inside* `x86\` because it is the 32-bit worker sitting
+there that has to find it, and dropping it beside the 64-bit one instead breaks both.
 
 **The copy list, what each file buys, and what to do when the store package will not install are in
 the skill's [`setup.md`](../skills/windbg-debugging/setup.md).**
