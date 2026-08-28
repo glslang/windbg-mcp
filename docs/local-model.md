@@ -39,7 +39,17 @@ on a Windows VM — and the cloud sighting comes from the third. Neither is *the
 saying which one produced a number is why they are labelled.
 
 The three pieces below assume the widest row, a listener on another machine. On one machine piece 2
-is not a step at all: leave the listener on `127.0.0.1` and skip the forward.
+loses the *forward* but not the *listener* — the ssh line there is what starts the server as well as
+tunnelling to it, so on a single box start it yourself:
+
+```pwsh
+$env:WINDBG_MCP_LISTEN_TOKEN = "<a long random string>"
+windbg-mcp.exe --listen 127.0.0.1:8765
+```
+
+`$env:` rather than piece 1's `setx`, which sets the variable for the *next* shell and not the one
+you are in — a listener started in that shell refuses to come up, and a client pointed at the port
+gets a connection refusal that looks like a server fault.
 
 ## The three pieces
 
@@ -75,14 +85,20 @@ claude mcp add windbg-vm --scope local --transport http http://127.0.0.1:8765/ \
   --header "Authorization: Bearer <the same string>"
 ```
 
-Then drive a local model against it **through ollama's server API**. No second harness is involved
-and nothing has to be launched: a session you already have runs the script, which is how every number
-further down this page was produced.
+**Which model answers is then the client's business, not this server's.** An MCP client that drives
+an ollama model holds that endpoint exactly as an editor does, and ollama ships integrations for
+several of them — `ollama launch` lists them, `ollama launch claude --model <tag>` being one. That
+is the ordinary way to do this, it needs nothing from this repository, and everything below about
+credentials, model choice and the lease applies to it unchanged.
 
+The rest of this page is the **other** way, which exists to *measure* rather than to debug.
 [`tools/local_model_drive.py`](../tools/local_model_drive.py) speaks MCP over HTTP to the listener,
 hands the whole tool surface to `POST /api/chat`, executes the tool calls that come back and feeds
-the results in. It needs a bearer token **of its own** — an environment variable rather than an
-argument, the same rule the listener's own token follows:
+the results in. It is not in a release — the zip is `windbg-mcp.exe`, the `x86\` worker and
+`LICENSE` — so it wants a checkout and Python 3 on whichever machine runs it, which for this project
+is [`agent-sandbox-vm`](https://github.com/glslang/agent-sandbox-vm). It needs a bearer token **of
+its own** — an environment variable rather than an argument, the same rule the listener's own token
+follows:
 
 ```console
 WINDBG_MCP_TOKEN="<the driver's token>" python3 tools/local_model_drive.py [tasks.json]

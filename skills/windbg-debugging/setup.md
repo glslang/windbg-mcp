@@ -601,11 +601,11 @@ MCP endpoint, and anything that speaks MCP can hold one.
 
 - **An MCP client with a hosted model** — Claude Code, an editor. The default; nothing else in this
   file changes.
-- **A model in ollama.** The repository's `tools/local_model_drive.py` speaks MCP to the listener,
-  hands it the tool surface, and executes the tool calls that come back from `POST /api/chat` on
-  `localhost:11434`. Nothing has to be installed on either side and nothing has to be launched
-  beyond the ollama server itself — `ollama launch claude` is a *different* arrangement, not a
-  prerequisite for this one.
+- **A model in ollama.** An MCP client that drives an ollama model holds the listener exactly as an
+  editor does — ollama ships integrations for several of them (`ollama launch` lists them), nothing
+  here has to be installed, and this server never learns which kind of model answered. The
+  repository's `tools/local_model_drive.py` is **not** that route: it is the benchmark's batch
+  driver, it wants a checkout and Python, and it ships in no release.
 - **A model in ollama's cloud.** The same endpoint and the same script; a cloud tag changes the
   model name and nothing else.
 

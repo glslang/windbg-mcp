@@ -926,7 +926,7 @@ test, because `Toolset::parse` resolves group names first and would decide it si
 
 Four rules worth knowing before touching it. **`session` is in every surface** whatever the spec
 says, because every other tool routes by a `session_id` this server alone issues — so `--tools
-crash` is eleven tools and 11,265 B is the floor. **Output schemas carry no prose at all**
+crash` is eleven tools and 11,714 B is the floor. **Output schemas carry no prose at all**
 (`src/schema.rs`): declare one with `schema::constraints_of`, never rmcp's `schema_for_output`, or
 the tool ships every doc comment in its `$defs` closure and the wire ceiling notices. That call is
 also what supplies the root `type: "object"` a discriminated union does not generate and rmcp does
