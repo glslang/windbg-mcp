@@ -1,8 +1,14 @@
-# Driving this server with a local model
+# Driving this server with ollama
 
-The last plane of the split-plane arrangement: the **model** on your own machine, DbgEng where it
+The last plane of the split-plane arrangement: the **model** wherever you want it, DbgEng where it
 has to live. Nothing here is a feature of this server — it is a runbook, because the pieces are a
-listener you already have, a tunnel, and a client that happens to be pointed at a local model.
+listener you already have, a link to it, and a client that happens to be pointed at ollama.
+
+**Local weights and ollama's cloud are one route, not two.** Both answer at `POST /api/chat` on
+`localhost:11434`, so a cloud tag changes the model name and nothing else — no second harness, no
+integration, and nothing to launch beyond the ollama server itself. Where the two differ is in what
+you can *ask about the run*, which is [its own section](#a-cloud-tag-changes-what-you-can-ask-about-the-run)
+below.
 
 Read [`remote-listener.md`](./remote-listener.md) first for the listener itself; this page is only
 what is different when the thing driving it is not a hosted model.
@@ -15,6 +21,26 @@ clearest case is the arithmetic under *What this server costs a model* below, wh
 the 51-tool surface cannot fit an 8k window, and the grid answers all six tasks at a served 8,192
 anyway.
 
+## Pick an arrangement first
+
+Two choices, independent of one another, and nothing in the driver can tell which you made:
+
+| Where the weights run | Where the listener runs | What links the two |
+| --- | --- | --- |
+| a local ollama instance | this machine | nothing — both are on loopback |
+| a local ollama instance | another machine | an ssh forward |
+| ollama's cloud | this machine | nothing — ollama's own uplink |
+| ollama's cloud | another machine | an ssh forward |
+
+**Only the listener is pinned.** DbgEng is Windows-only and holds one debuggee per process, so the
+Windows machine is wherever the debugging has to happen; everything on the other side of that is a
+preference. The measurements further down come from the second row — the model on a Mac, the engine
+on a Windows VM — and the cloud sighting comes from the third. Neither is *the* arrangement, and
+saying which one produced a number is why they are labelled.
+
+The three pieces below assume the widest row, a listener on another machine. On one machine piece 2
+is not a step at all: leave the listener on `127.0.0.1` and skip the forward.
+
 ## The three pieces
 
 **1 — the engine plane.** The Windows machine runs the listener, bound to loopback, with its token
@@ -24,8 +50,9 @@ in the environment rather than on a command line:
 setx WINDBG_MCP_LISTEN_TOKEN "<a long random string>"
 ```
 
-**2 — the link.** For a session you are driving anyway, one ssh channel both forwards the port and
-runs the listener, so the server lives exactly as long as the tunnel and nothing is left behind:
+**2 — the link, in the two rows that need one.** For a session you are driving anyway, one ssh
+channel both forwards the port and runs the listener, so the server lives exactly as long as the
+tunnel and nothing is left behind:
 
 ```console
 ssh -L 8765:127.0.0.1:8765 <vm> 'windbg-mcp.exe --listen 127.0.0.1:8765'
@@ -60,6 +87,69 @@ argument, the same rule the listener's own token follows:
 ```console
 WINDBG_MCP_TOKEN="<the driver's token>" python3 tools/local_model_drive.py [tasks.json]
 ```
+
+### What that driver is, and is not
+
+A **batch task runner**, and knowing so saves you hunting for what is not there. It takes a list of
+questions, gives each its own conversation and its own targets, allows `MAX_STEPS` tool-calling
+turns apiece (six by default), and prints what happened. There is no interactive mode and no way to
+follow up on an answer — for a session you talk to, you want an MCP client that speaks ollama, which
+`ollama launch claude` is one of and this script is not.
+
+It also carries the bench's knobs, and outside the bench you can ignore them: `WINDBG_MCP_EVAL_OUT`,
+`EVAL_DRAW`, `EVAL_SEED` and `EVAL_SUBSET` exist so `local_model_eval.py` can grade a grid, and with
+`WINDBG_MCP_EVAL_OUT` unset the script keeps nothing at all. The one worth knowing anyway is
+`WINDBG_MCP_SCENARIO`, below.
+
+### Pick a model, and check that it runs
+
+`LOCAL_MODEL` names the tag; with none set the driver takes the first installed model that declares
+the **`tools`** capability, because one without it fails at the first `/api/chat` with an error
+about something else entirely.
+
+**That gate is necessary and not sufficient, and a cloud tag is how you find out.** Pulling a cloud
+model registers a *name* — `ollama ls` shows it with `SIZE -`, since no weights are local — and the
+entitlement is resolved at inference instead. Measured 2026-08-28: `glm-5.3:cloud` reported
+`capabilities: ['completion', 'thinking', 'tools']` and so passed `pick_model` cleanly, and the
+first real call answered *"This model is currently being rolled out and is not yet available to
+you"*. One token settles it before a run does:
+
+```console
+curl -s localhost:11434/api/generate \
+  -d '{"model":"<tag>","prompt":"hi","stream":false,"options":{"num_predict":1}}'
+```
+
+Note also that the driver sends `"think": false`. A model whose card is written around a reasoning
+pass is being asked for something its defaults do not describe, which is worth knowing before
+reading its answers as that model's best.
+
+### A cloud tag changes what you can ask about the run
+
+Everything above this line is identical for local weights and for ollama's cloud. What is not is
+`/api/ps`, which reports the **loaded instance** — and a cloud model has none on this machine.
+Measured on `minimax-m3:cloud` immediately after a successful run: `{"models":[]}`. So
+`runtime_identity()` records `served_context: null` and `model_digest: null`, which puts a cloud row
+where `claude_code_drive.py`'s rows already are — unable to say what it was served or which weights
+answered ([`FOLLOWUPS.md`](../FOLLOWUPS.md) item 46). Two consequences:
+
+- **The served-window rule below has no instrument here**
+  ([The context your runtime serves…](#the-context-your-runtime-serves-is-not-the-models-maximum)).
+  `ollama show` still gives
+  the model's ceiling — 524,288 for that tag, against a ~16k prompt — but there is nothing to
+  confirm what the request was actually served at, so "record what was served" becomes "record that
+  nothing reported it". Do not silently substitute the advertised number for it.
+- **Nothing detects the weights moving under a mutable tag**, which is the axis a comparison of two
+  runs is entirely about. Two cloud runs a month apart can agree on every recorded field and have
+  been different models.
+
+**One sighting, for grounding rather than as a benchmark** (2026-08-28, x64 bench, all 51 tools —
+70,219 B in the function-calling shape `as_ollama` hands the runtime, which is a different
+composition from the `modelVisible` figure tabled below and not comparable with it):
+`minimax-m3:cloud` opened both checked-in x64 kernel dumps and answered
+correctly — `0x13A KERNEL_MODE_HEAP_CORRUPTION` blamed on `MessageManager.sys` at
+`MessageManager+0x1654`, and 227 loaded modules — in 10.0s and 4.2s. It reached the module count
+from `open_dump`'s own summary without calling `modules`, which is the eval's "facts here are
+reachable by more than one route" holding on a runtime it never ran on.
 
 ### Give the run its own listener, not a share of yours
 
@@ -113,7 +203,7 @@ setx WINDBG_MCP_TOOLS_DRIVER        "session,inspect,crash"
 ```
 
 The second line is what makes this work on a listener the editor also uses: the driver is served 20
-tools and 24,445 B while every other client on that listener keeps all 51. Leave it out and the
+tools and 24,894 B while every other client on that listener keeps all 51. Leave it out and the
 driver is served whatever the listener was started with, which is the older behaviour and is the
 right one when the listener is the driver's own.
 
@@ -165,19 +255,25 @@ printed for each task is the transcript growing, and scenario mode is what makes
 or newer) makes the local model *the agent* — it drives the harness itself, with these tools as its
 tools, rather than being called through the API by something else. That is the end state the
 split-plane plan is aimed at, and it is worth knowing about; it is not how anything on this page was
-measured, and it is not needed to measure it.
+measured, and **nothing on this page needs it**. The route above wants the ollama server running and
+nothing else — no integration, and no harness of the model's own.
 
 ## What this server costs a model, measured
 
 [`token-budget.md`](./token-budget.md) has the method and the golden; these are the numbers that
-decide whether a local model can hold this surface at all. Bytes of minified JSON, ≈4 B/token.
+decide whether a model can hold this surface at all. Bytes of minified JSON, ≈4 B/token.
+
+The three surface rows are re-derivable without running anything here: the full one is
+`tests/golden/tool_budget.json`'s `modelVisible` total, which `cargo test` re-records, and a
+narrowed one is the same sum over a `tools/list` served by a listener started with that `--tools`
+spec. Re-read them rather than trusting this table, which has been stale before.
 
 | | bytes | ≈tokens |
 |---|---|---|
-| The tool surface, paid once per conversation | 67,766 (51 tools) | ~17k |
-| — the same surface as `--tools session,inspect,crash` | 24,445 (20 tools) | ~6k |
-| — as `--tools crash` | 14,138 (11 tools) | ~3.5k |
-| Its worst single tool (`debug_batch`) | 9,746 | ~2.4k |
+| The tool surface, paid once per conversation | 68,322 (51 tools) | ~17k |
+| — the same surface as `--tools session,inspect,crash` | 24,894 (20 tools) | ~6k |
+| — as `--tools crash` | 14,587 (11 tools) | ~3.6k |
+| Its worst single tool (`debug_batch`) | 9,798 | ~2.4k |
 | The largest answer this server gives (`modules`) | 53,875 | ~13k |
 | `read_memory` at its design limit | ~4 MiB of hex | ~1M |
 
@@ -199,6 +295,11 @@ ollama ps                        # what the *loaded* instance is serving, under 
 so send it one prompt first — `curl -s localhost:11434/api/generate -d
 '{"model":"<tag>","prompt":"hi","stream":false,"options":{"num_predict":1}}'` is enough. Pin it with
 `OLLAMA_CONTEXT_LENGTH` if two machines have to agree.
+
+**Both lines assume a local instance**, and this whole section is about one. A cloud tag has no
+instance here, so `ollama ps` stays empty even straight after a call and the second question has no
+answer at all — not a large one, and not the number `ollama show` prints. See
+[A cloud tag changes what you can ask about the run](#a-cloud-tag-changes-what-you-can-ask-about-the-run).
 
 Worked example, measured on the bench this page was written on: `ollama show` reports
 `context length 262144` for a 27.8B nvfp4 build, and `ollama ps` reports `CONTEXT 262144` with
@@ -301,6 +402,12 @@ the re-run, and every session was released cleanly at the end. Whether the *list
 be more patient with a client whose MCP session is still connected is
 [`FOLLOWUPS.md`](../FOLLOWUPS.md) item 33.
 
+**A fast model does not retire the hazard, it just stops meeting it.** The cloud tag above answered
+whole tasks in 4 to 10 seconds, two orders off the 440.6s that produced this — but what the grace
+measures is *silence*, and a queued or rate-limited request is silent in exactly the same way a
+thinking one is. Nothing here has been throttled yet, so that is a prediction rather than a
+measurement; the keepalive costs nothing either way, which is why it stays on by default.
+
 ## What to measure
 
 The claims worth testing are about the *client's* budget, not this server's correctness, and the
@@ -329,8 +436,8 @@ budget, a text-or-data content switch. **Two of the three now exist, and neither
 client-side.**
 
 - **The tool-surface profile is `--tools`** (2026-08-22). Start the listener with
-  `--tools session,inspect,crash` and the surface is 20 tools and 24,445 B instead of 51 and
-  67,766 — `--tools crash` is 11 and 14,138 B, which is the difference between "roughly twice an 8k
+  `--tools session,inspect,crash` and the surface is 20 tools and 24,894 B instead of 51 and
+  68,322 — `--tools crash` is 11 and 14,587 B, which is the difference between "roughly twice an 8k
   window" and "half of one". The tools that remain are the tools they were, less the sentences
   pointing at ones that went (item 41).
   The whole table is in [`token-budget.md`](./token-budget.md) under finding 8, and the README has
@@ -352,7 +459,9 @@ here — only the choice to offer fewer tools.
 Four checks, in the order that fails fastest:
 
 ```console
-ollama list                                   # is the model still there
+ollama list                                   # is the model still there (a cloud tag being
+                                              # listed is not the same as being runnable —
+                                              # send it one token, above)
 claude mcp list                               # windbg-vm: connected, or ConnectionRefused?
 ssh <vm> 'powershell -c "(Get-NetTCPConnection -State Listen -LocalPort 8765).Count"'
 ssh <vm> 'powershell -c "[bool][Environment]::GetEnvironmentVariable(\"WINDBG_MCP_LISTEN_TOKEN\",\"User\")"'

@@ -35,7 +35,7 @@ This file is the map. Each topic is one document, and each document is the whole
 | [The local-model eval](docs/local-model-eval.md) | A grid of model × tool surface × context window against a verified answer key: what a laptop-sized model can drive, and the two defects it found in this server |
 
 Operator and reference material: [remote listener](docs/remote-listener.md),
-[local model](docs/local-model.md), [disassembler coordinates](docs/coordinates.md),
+[driving it with ollama](docs/local-model.md), [disassembler coordinates](docs/coordinates.md),
 [smoke test](docs/smoke-test.md), [token budget](docs/token-budget.md),
 [releasing](docs/releasing.md).
 
@@ -115,9 +115,9 @@ Fifty-one tools in eight `--tools` groups; the rows below split some of those gr
 | Structure walk | `allocator` | `walk_memory` |
 | Raw     | `inspect` | `execute` — run any debugger command, returns full text output |
 
-All of them are served unless you say otherwise, and the definitions cost the model **67,873 bytes —
+All of them are served unless you say otherwise, and the definitions cost the model **68,322 bytes —
 about 17k tokens — before it has asked anything**. `--tools session,inspect,crash` cuts that to
-24,445 B for twenty tools, and a `--listen` client can be given a narrower surface than the run's
+24,894 B for twenty tools, and a `--listen` client can be given a narrower surface than the run's
 default. [`docs/tool-surface.md`](docs/tool-surface.md) has the arithmetic, the rule that `session`
 is always included, and what a typed operand may not contain.
 

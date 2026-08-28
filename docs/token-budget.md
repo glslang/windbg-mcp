@@ -87,7 +87,7 @@ The two halves moved independently, which is the whole argument for measuring th
 fell by 55% and the model-visible column did not move at all except for what the tools themselves
 have accumulated since.
 
-Worst single tool: `debug_batch` at 9,746 model-visible bytes, because its `inputSchema` pulls the
+Worst single tool: `debug_batch` at 9,798 model-visible bytes, because its `inputSchema` pulls the
 whole `StepAction`/`Check` vocabulary out of `src/batch.rs`.
 
 The payload is measured as the **serialized result**, not as the sum of its tools, and the 118-byte
@@ -280,7 +280,7 @@ None of these is a bug. They are recorded because they were invisible, and
    even covers `w29`.
 8. **Five tools are a third of the model-visible surface**, and it is their *input* schemas rather
    than their prose — **answered** (2026-08-22) by serving fewer tools rather than smaller ones.
-   `debug_batch` alone is 9,746 B — 14% of everything a model is given before it asks anything — of
+   `debug_batch` alone is 9,798 B — 14% of everything a model is given before it asks anything — of
    which 7,980 B is the `StepAction`/`Check` vocabulary its schema pulls out of `src/batch.rs`.
    Then `walk_memory` 4,080, `crash_triage` 2,936, `reachable_from_dispatch` 2,628, `server_log`
    2,599: **21,989 B, 33%**, against a median tool of 900 B.
@@ -302,7 +302,7 @@ None of these is a bug. They are recorded because they were invisible, and
    schemars emits 109 times and which tells a model nothing an absent field does not, is 1,744 B —
    2.6%. The other candidates are not free: `$schema` is 2,850 B but is how a client picks a
    validator dialect (and `tool_schemas_declare_one_dialect_and_are_self_contained` pins it), and
-   `minimum`/`format` are constraints. **Roughly 1.7 KB of 67,766 is the whole honest total** for
+   `minimum`/`format` are constraints. **Roughly 1.7 KB of 68,322 is the whole honest total** for
    trimming the schemas.
 
    So the third lever is the one taken: `--tools` (`src/toolset.rs`) advertises a named subset. A
@@ -312,29 +312,29 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 10 | 15,969 | 23.6% |
-   | `session` | 10 | 12,157 | 17.9% |
-   | `inspect` | 9 | 10,215 | 15.1% |
-   | `batch` | 1 | 9,746 | 14.4% |
-   | `ttd` | 9 | 6,829 | 10.1% |
-   | `ioctl` | 6 | 6,494 | 9.6% |
-   | `exec` | 5 | 3,420 | 5.0% |
+   | `allocator` | 10 | 15,969 | 23.4% |
+   | `session` | 10 | 12,606 | 18.5% |
+   | `inspect` | 9 | 10,215 | 15.0% |
+   | `batch` | 1 | 9,798 | 14.3% |
+   | `ttd` | 9 | 6,829 | 10.0% |
+   | `ioctl` | 6 | 6,494 | 9.5% |
+   | `exec` | 5 | 3,475 | 5.1% |
    | `crash` | 1 | 2,936 | 4.3% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 51 | 67,766 |
-   | `session,inspect,exec,crash` | 25 | 27,807 |
-   | `session,inspect,crash` | 20 | 24,445 |
-   | `crash` | 11 | 14,138 |
+   | *(absent)* | 51 | 68,322 |
+   | `session,inspect,exec,crash` | 25 | 28,311 |
+   | `session,inspect,crash` | 20 | 24,894 |
+   | `crash` | 11 | 14,587 |
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`
-   is 14,138 rather than the 15,093 its two rows sum to, because five cross-references leave with
+   is 14,587 rather than the 15,542 its two rows sum to, because five cross-references leave with
    the tools they name.
 
    `session` is in every surface because every other tool routes by a `session_id` this server is
-   the only issuer of — 11,265 B is the floor, and `crash` is eleven tools rather than one. The
+   the only issuer of — 11,714 B is the floor, and `crash` is eleven tools rather than one. The
    flag is a **run's** choice, and on a listener it is the *default*: a named client may be
    configured with a spec of its own (`WINDBG_MCP_TOOLS_<NAME>`), so the figures above are per
    client rather than per server — which is what lets a local model and a hosted client share one
@@ -359,7 +359,7 @@ put in a group would vanish from every narrowed surface without a word — the d
 still carry it, so nothing else would notice. And
 `a_narrowed_tool_surface_serves_only_what_it_was_asked_for` starts a server with `--tools crash` and
 checks the three things that makes true: eleven tools, a refusal by name for a tool that exists and
-is not served, and a figure under half the whole surface (it prints 14,138 B).
+is not served, and a figure under half the whole surface (it prints 14,587 B).
 
 Beside them, `output_schemas_carry_constraints_not_prose` is the
 assertion that finding 1 stays fixed. It reads `tools/list` off the wire, so it catches the way that

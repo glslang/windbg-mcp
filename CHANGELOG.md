@@ -7,6 +7,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+
+- **Driving this server with ollama was supported in fact and written down nowhere a reader would
+  look.** `skills/windbg-debugging/setup.md` explained at length how to put the server on another
+  machine and never said what could drive it from there; its only mention of a local model was a
+  half-sentence about `--tools` inside the service bullet, and it linked to none of the three
+  documents that carry the subject. It now ends with *What drives the server — there is a choice*:
+  the three arrangements, and the four things that decide whether the ollama route works — a
+  credential of its own, the `tools` capability being necessary and not sufficient, the lease a
+  quiet client loses its sessions to, and the surface being the fixed cost where a single
+  `read_memory` is the variable one. The depth stays in `docs/local-model.md` rather than being
+  copied, so there is one place for each rule to be wrong.
+- **The tool-surface figures were stale in six documents and disagreed with each other in two.**
+  Every current claim now comes from one re-derivation, none of which needs the eval run: the whole
+  surface is `tests/golden/tool_budget.json`'s `modelVisible` total, which `cargo test` re-records
+  (**68,322** — not the 67,766 five documents carried, and not the 67,873 in `README.md` and
+  `CLAUDE.md`); each group's share is that golden summed over `src/toolset.rs`'s membership, which
+  reconciles to the total across all 51 tools; and what a `--tools` spec actually *serves* is the
+  same sum over a `tools/list` from a listener started with it. So `session,inspect,crash` is
+  24,894 rather than 24,445, `crash` 14,587 rather than 14,138, the `session` floor 11,714 rather
+  than 11,265, `debug_batch` 9,798 rather than 9,746, and the gap item 41 opened between a group's
+  share and what a spec serves is 15,542 against 14,587. `docs/local-model.md` also says how to
+  re-derive its own table, because this is the second time these numbers have gone quietly stale.
+  The **historical** figures are deliberately untouched: `token-budget.md`'s `67,076 → 67,766`
+  before-and-after column, `local-model-eval.md`'s statement of the conditions its grid ran under,
+  and this file's earlier entries each record a measured moment and would be falsified by a refresh.
+- **That page described one arrangement as though it were the only one — the bench's.** Where the
+  weights run and where the listener runs are independent choices, and `docs/local-model.md` opened
+  on *the three pieces* with the ssh forward baked in as piece 2, because the bench that produced
+  its numbers had the model on a Mac and the engine on a Windows VM. It now opens on the four
+  arrangements those two choices make, says that only the listener is pinned and why, labels which
+  row each measurement came from, and says outright that on a single machine piece 2 is not a step.
+  The driver is also described for what it is — a batch task runner with six tool-calling turns a
+  task, no interactive mode, and four environment variables that exist only so the grid can be
+  graded — so that a reader stops looking for the conversation it does not have.
+- **`docs/local-model.md` is about ollama, not about local weights.** A cloud tag and a local one
+  are the same route — the same endpoint, the same script, a different model name — so the page
+  says so from its title down, and `ollama launch` is now explicitly not needed rather than merely
+  "not a prerequisite". Three facts measured on 2026-08-28 are new, and a local bench could not
+  have produced any of them. A pulled cloud tag is a registered *name*: `glm-5.3:cloud` declared
+  `capabilities: ['completion', 'thinking', 'tools']`, passed the driver's model gate, and answered
+  the first real call with *"currently being rolled out and is not yet available to you"* — so the
+  gate is necessary and not sufficient, and one token is the probe. `/api/ps` is empty for a cloud
+  model even straight after a successful run, so `served_context` and `model_digest` are recorded
+  null and the served-window rule has no instrument at all — the position `claude_code_drive.py`'s
+  rows are already in. And the keepalive stays on despite turns of 4 to 10 seconds, because what
+  the lease measures is silence, and a queued request is silent the same way a thinking one is.
+
 ## [0.13.1] - 2026-08-28
 
 ### Documentation
