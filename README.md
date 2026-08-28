@@ -162,16 +162,31 @@ and it does not have to run on the machine being debugged.
 **One machine needs no configuration at all**: the client launches the binary and talks to it over
 stdio, which is the Quick start above.
 
-**Two machines need a listener, and installing one is not starting it.** On the Windows host,
-elevated:
+**Two machines need a listener.** For a session you are driving anyway, run it in the foreground on
+the Windows host — this works wherever the binary happens to live:
 
 ```pwsh
-$env:WINDBG_MCP_LISTEN_TOKEN = "<a long random string>"
-windbg-mcp.exe --install-service --listen 127.0.0.1:8765
+$env:WINDBG_MCP_LISTEN_TOKEN = "<a long random string>"   # this shell only
+windbg-mcp.exe --listen 127.0.0.1:8765
+```
+
+**For anything longer-lived, install it as a service — from a protected directory.** The SCM stores
+that exact path for a `LocalSystem` auto-start service, so whoever can write the directory, or drop
+an engine DLL beside the exe, gets their code run as SYSTEM at the next start.
+`--install-service` therefore refuses an exe outside `%ProgramFiles%`, `%ProgramFiles(x86)%` or
+`%SystemRoot%` — which a downloaded zip, a Scoop shim or a `target\release` build all are — so move
+the **whole** deployment first: the exe, the engine DLLs beside it, and `x86\`. Then, elevated:
+
+```pwsh
+$env:WINDBG_MCP_LISTEN_TOKEN = "<a long random string>"   # this shell only
+& "$env:ProgramFiles\windbg-mcp\windbg-mcp.exe" --install-service --listen 127.0.0.1:8765
 Start-Service windbg-mcp          # --install-service only *registers* it
 ```
 
-Then, from the machine you are actually working on, for as long as you want the link:
+On a machine that is entirely yours, `--allow-unprotected-path` says so out loud and installs in
+place; that is a development install, not a deployment.
+
+Either way, from the machine you are actually working on, for as long as you want the link:
 
 ```console
 ssh -N -L 8765:127.0.0.1:8765 <windows-host>

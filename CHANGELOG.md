@@ -36,7 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   five configurations — an MCP client or ollama, local weights or ollama's cloud, one machine or
   two — then the commands that install **and start** the listener as a service, the ssh forward,
   why the token is not optional, and the one line that points ollama at it. The benchmark follows
-  as its own section, backing those claims instead of standing in for them, and its context-window
+  as its own section, backing those claims instead of standing in for them. The service install is
+  stated with the prerequisite that makes it work: `--install-service` **refuses** an exe outside
+  `%ProgramFiles%`, `%ProgramFiles(x86)%` or `%SystemRoot%`, which a downloaded zip, a Scoop shim
+  and a `target\release` build all are, so the whole deployment moves first — engine DLLs and
+  `x86\` included — and `--allow-unprotected-path` is named as the development install it is. The
+  skill and `docs/mcp-clients.md` both said "elevated" as though elevation were the only
+  requirement, and now do not. Its context-window
   finding now carries the qualifier it always needed: it is a fact about that bench's runtime, and
   `ollama ps` is how a reader learns what theirs serves.
 - **The tool-surface figures were stale in eight files and disagreed with each other in two.**

@@ -28,7 +28,9 @@ claude mcp add windbg-vm --transport http http://127.0.0.1:8765/ \
   --header "Authorization: Bearer <the same string>"
 ```
 
-Install it as a **Windows service** (`--install-service --listen <addr>`, elevated) and it survives
+Install it as a **Windows service** (`--install-service --listen <addr>`, elevated, and from a
+directory Windows protects — see [Run it as a Windows
+service](remote-listener.md#run-it-as-a-windows-service)) and it survives
 logout, starts at boot, and gets a defined `PATH` and working directory — which is what decides
 whether the engine DLLs beside the exe are the ones that load. `Stop-Service` releases every debug
 target before exiting, because a live kernel that is merely killed is left frozen. Its clients are
