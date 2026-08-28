@@ -543,10 +543,16 @@ Four things decide whether that works, and each fails in a way that reads as som
   over the link from the client, and never over the KD wire from the target. A client with symbols
   configured and a server without resolves nothing.
 - **For anything longer than one session, install it as a service** (`--install-service --listen
-  <addr>`, elevated) — and then **start it**. Installing only *registers* it; "starts
-  automatically" means from the next boot, so `Start-Service windbg-mcp` is what gets you an
-  endpoint in this one. Skip that and everything keeps working until the foreground listener stops,
-  and there is nothing listening after it. Once running it survives logout, comes back at boot, and
+  <addr>`, elevated, **from a directory Windows protects**) — and then **start it**. Installing only
+  *registers* it; "starts automatically" means from the next boot, so `Start-Service windbg-mcp` is
+  what gets you an endpoint in this one. Skip that and everything keeps working until the foreground
+  listener stops, and there is nothing listening after it. The **directory** is a refusal rather
+  than advice: the SCM stores that exact path for a `LocalSystem` auto-start service, so
+  `--install-service` rejects an exe outside `%ProgramFiles%`, `%ProgramFiles(x86)%` or
+  `%SystemRoot%` — which a downloaded zip, a Scoop shim and a `target\release` build all are. Move
+  the whole deployment there first, engine DLLs and `x86\` included; `--allow-unprotected-path`
+  installs in place, and is a development install rather than a deployment.
+  Once running it survives logout, comes back at boot, and
   has a defined working directory — which is what decides whether the engine DLLs beside the exe
   are the ones that load. Note `LocalSystem` does not read *your* `%USERPROFILE%`, so kernel
   profiles have to be configured machine-wide for a service to see them. Giving it a **second
