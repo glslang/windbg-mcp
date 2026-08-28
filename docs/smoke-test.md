@@ -139,6 +139,16 @@ Mac has none: the build script warns and carries on, so the only thing standing 
 resource and a release is this assertion, on the one host that can build one. To check that it still
 catches the case it is for, point `RC_PATH` at nothing, touch `build.rs`, and re-run it.
 
+**And the same claim for the 32-bit worker**, which the assertion above does not reach: it reads the
+binary `cargo` built for the *host*, so `x86\windbg-mcp.exe` — shipped in both release artefacts —
+went unchecked on every host and in CI until this. Its fields are asserted **equal to this build's**
+rather than against literals of their own, because the two are one product from one build; pinning
+the strings twice would let the copies drift apart with both tests green. It stands down where there
+is no worker beside the server, and gates on that worker rather than on the 32-bit *engine* the rest
+of the x86 tier gates on — no engine is needed to read a file's resource, and CI builds the worker on
+runners that may carry no x86 engine payload. To check it still catches its case, put any other
+signed binary at that path and re-run: it fails on `CompanyName`.
+
 **Transport.** Every line the server writes to stdout parses as JSON-RPC, and the startup log
 appears on **stderr**. A dependency that prints a banner or a warning to stdout desynchronizes
 every client, and the client-side symptom is an unreadable parse error. Also: closing stdin exits

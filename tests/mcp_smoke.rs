@@ -842,23 +842,86 @@ fn the_binary_carries_a_pe_version_resource() {
         ("ProductVersion", stamped_version()),
     ];
     for (field, want) in pinned {
-        assert_eq!(read_version_field(field), want, "{field} in {EXE}");
+        assert_eq!(read_version_field(EXE, field), want, "{field} in {EXE}");
     }
     for field in ["FileDescription", "LegalCopyright", "Comments"] {
         assert!(
-            !read_version_field(field).is_empty(),
+            !read_version_field(EXE, field).is_empty(),
             "{field} must not be empty in {EXE}"
         );
     }
+}
+
+/// Every field of that resource, so the test below can assert the 32-bit worker agrees with this
+/// build on all of them rather than on a subset chosen by hand.
+const VERSION_FIELDS: &[&str] = &[
+    "CompanyName",
+    "ProductName",
+    "OriginalFilename",
+    "InternalName",
+    "FileVersion",
+    "ProductVersion",
+    "FileDescription",
+    "LegalCopyright",
+    "Comments",
+];
+
+/// **The 32-bit worker is a shipped binary too, and the test above does not cover it.**
+///
+/// `EXE` is this build — the host's architecture — so until this existed nothing read
+/// `x86\windbg-mcp.exe`'s resource at all, on any host or in CI. That is the same gap the test
+/// above was written to close, one binary along: `build.rs` will not fail a build it could not
+/// embed a resource into, so a 32-bit worker that quietly lost one would ship in the `.zip` and the
+/// `.mcpb` with nothing saying so. An absent version resource is one of the two causes Microsoft
+/// names for the `Bearfoos.B!ml` verdict, and a quarantined worker is a server that silently
+/// degrades to "SOS is unreachable" rather than one that fails.
+///
+/// **Asserted against this build's values rather than against literals**, which is why the pins
+/// live in the test above and not here: the two binaries are one product from one build, so the
+/// claim is that they *agree*. Pinning the strings twice would let the copies drift apart while
+/// both tests passed, and would double the edit a reworded `FileDescription` costs.
+///
+/// **Gated on the worker and not on the 32-bit engine**, unlike [`x86_engine_tier`]. The engine is
+/// what makes a 32-bit *target* openable, and none is needed to read a file's resource — CI builds
+/// the worker on runners that may carry no x86 engine payload, and gating on the engine would skip
+/// this there for a reason that has nothing to do with what it checks.
+#[test]
+fn the_32_bit_worker_carries_the_same_version_resource() {
+    let Some(worker) = std::path::Path::new(EXE)
+        .parent()
+        .map(|dir| dir.join("x86").join("windbg-mcp.exe"))
+        .filter(|p| p.is_file())
+    else {
+        skip(
+            "no `x86\\windbg-mcp.exe` beside the server under test, so there is no 32-bit worker \
+             to read a version resource from — `cargo build --target i686-pc-windows-msvc` and \
+             `skills/windbg-debugging/setup.md` have the copy block",
+        );
+        return;
+    };
+    let worker = worker.to_string_lossy().into_owned();
+
+    for field in VERSION_FIELDS {
+        assert_eq!(
+            read_version_field(&worker, field),
+            read_version_field(EXE, field),
+            "`{field}` must match this build's — the 32-bit worker is the same product from the \
+             same build, and a client cannot tell which architecture served its session"
+        );
+    }
+    ran("the 32-bit worker's version resource matches this build's");
 }
 
 /// One `StringFileInfo` value out of the binary's own version resource, read through the API
 /// Explorer's properties dialog reads it through — rather than by scanning the file for the string,
 /// which would pass on a resource Windows itself refuses to parse.
 ///
-/// Panics rather than returning an `Option`, because there is exactly one caller and every way this
-/// can answer nothing is the same failure: no resource was embedded.
-fn read_version_field(field: &str) -> String {
+/// Panics rather than returning an `Option`, because every way this can answer nothing is the same
+/// failure: no resource was embedded.
+///
+/// Takes the executable rather than reading [`EXE`], because the release ships **two** binaries
+/// that must each carry one — this build and the 32-bit worker beside it.
+fn read_version_field(exe: &str, field: &str) -> String {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -904,13 +967,13 @@ fn read_version_field(field: &str) -> String {
 
     let missing = |what: &str| -> ! {
         panic!(
-            "{EXE} carries no `{field}` in a PE version resource ({what}). A Rust binary has none \
+            "{exe} carries no `{field}` in a PE version resource ({what}). A Rust binary has none \
              by default, so this is what a `build.rs` that could not run a resource compiler \
              leaves behind — the build printed a `cargo::warning` saying why."
         )
     };
 
-    let path = wide(EXE);
+    let path = wide(exe);
     // SAFETY: `path` is NUL-terminated and outlives the call. The handle out-parameter is
     // documented as ignorable, and a null pointer is how that is spelled.
     let size = unsafe { GetFileVersionInfoSizeW(path.as_ptr(), std::ptr::null_mut()) };
