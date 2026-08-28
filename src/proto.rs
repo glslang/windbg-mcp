@@ -928,6 +928,19 @@ pub struct Output {
     /// would be [#77](https://github.com/glslang/windbg-mcp/issues/77) again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<crate::structured::TargetSummary>,
+    /// What ending the session did to a live process the engine held, for the one op that ends
+    /// one: `Some(true)` where a process this server **attached** to was detached and left
+    /// running, `Some(false)` where the target was one the session takes with it, `None` where
+    /// there was no live process — a dump, a trace, or a target that had already gone.
+    ///
+    /// Same shape and the same reason as [`Self::summary`]. Only this side can answer it — the
+    /// engine is what knows an attached live process from anything else, and it stops knowing the
+    /// moment the session ends — while only the supervisor can finish the result it belongs in,
+    /// which is keyed by a session handle this process never sees. Re-deriving it over there from
+    /// the session's *kind* would be a second source for a fact the rendered text already takes
+    /// from this one, and the two would drift.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_left_running: Option<bool>,
 }
 
 impl Output {
@@ -937,6 +950,7 @@ impl Output {
             text: text.into(),
             data: None,
             summary: None,
+            target_left_running: None,
         }
     }
 
@@ -956,6 +970,7 @@ impl Output {
                 }
             },
             summary: None,
+            target_left_running: None,
         }
     }
 
@@ -965,6 +980,17 @@ impl Output {
             text: text.into(),
             data: None,
             summary: Some(summary),
+            target_left_running: None,
+        }
+    }
+
+    /// The teardown's reply: what it said, and what became of a live process it held.
+    pub fn released(text: impl Into<String>, target_left_running: Option<bool>) -> Self {
+        Self {
+            text: text.into(),
+            data: None,
+            summary: None,
+            target_left_running,
         }
     }
 }

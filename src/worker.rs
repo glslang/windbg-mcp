@@ -1482,12 +1482,22 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             let ended = e
                 .end_session()
                 .map(|_| {
-                    Output::text(if detaching {
-                        "Session ended. The process this session attached to was detached and \
-                         left running."
-                    } else {
-                        "session ended"
-                    })
+                    // Both halves of the result, from one read of one fact. A structured-aware
+                    // client forwards `structuredContent` and drops the text, so a disposition on
+                    // the text alone is a disposition half the clients never see — the rule
+                    // `docs/smoke-test.md` states for the ending in [#242], met here by the op
+                    // that ends a session on purpose. `None` where there was no live process to
+                    // keep, which the supervisor turns into `false` for a session that takes its
+                    // target: only it knows a launch from a dump.
+                    Output::released(
+                        if detaching {
+                            "Session ended. The process this session attached to was detached and \
+                             left running."
+                        } else {
+                            "session ended"
+                        },
+                        detaching.then_some(true),
+                    )
                 })
                 .map_err(failed);
             query::invalidate_allocator_caches();

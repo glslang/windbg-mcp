@@ -851,8 +851,9 @@ impl Drop for Slot {
 /// How a worker took being told to let go of its target.
 #[derive(Debug)]
 enum Release {
-    /// It released the target and said so.
-    Released(String),
+    /// It released the target and said so — the whole reply, because what became of the target is
+    /// the worker's answer and is on the reply beside the text (`Output::target_left_running`).
+    Released(Box<Output>),
     /// It never answered inside the grace it was given — which is [`END_SESSION_TIMEOUT`] or
     /// [`SHUTDOWN_RELEASE_TIMEOUT`], plus any extension the worker asked for to unwind a
     /// transaction — and was killed. The case this whole design is for.
@@ -1487,15 +1488,33 @@ impl Sessions {
                 }
                 _ => None,
             },
+            // The worker's answer where there was one, and this side's where only this side can
+            // give one. A clean release reports what the engine actually did; a session that was
+            // *terminated* holding its target reports `false` whatever it held, because
+            // terminating a debugger is not a detach and the kernel takes the debuggee. And a
+            // clean release of a session that had no live process to keep is `false` for a
+            // `launch` — the one thing the worker cannot say, since the engine can tell an
+            // attached live process from anything else but not a launch from a dump.
+            target_left_running: match &outcome {
+                Release::Released(out) => out
+                    .target_left_running
+                    .or((session.kind == SessionKind::Launch).then_some(false)),
+                Release::Parked { .. } | Release::Refused(_) => {
+                    matches!(session.kind, SessionKind::Process | SessionKind::Launch)
+                        .then_some(false)
+                }
+                Release::AlreadyGone | Release::Stale(_) => None,
+            },
         };
         let (reason, message) = match outcome {
             // A refused handle is the mechanism working, not a session to tear down.
             Release::Stale(why) => return Err(EngineError::Stale(why)),
-            Release::Released(text) => (
+            Release::Released(out) => (
                 "ended by end_session".to_string(),
                 format!(
-                    "{text}\n\nSession `{}` is closed and its engine worker process (pid {}) has \
+                    "{}\n\nSession `{}` is closed and its engine worker process (pid {}) has \
                      been shut down.{}",
+                    out.text,
                     session.id,
                     session.pid,
                     // The other half of what the worker says about an attached process, and it is
@@ -1596,7 +1615,7 @@ impl Sessions {
         session.fail_outstanding(&format!("session `{}` was ended", session.id));
         session.kill();
         let outcome = match out {
-            Ok(out) => Release::Released(out.text),
+            Ok(out) => Release::Released(Box::new(out)),
             // Carries what it actually waited, because that is no longer one constant: a session
             // unwinding a transaction is given the extra time it asked for, and a report naming
             // the base grace would understate what was allowed before the worker was terminated.
@@ -4255,7 +4274,7 @@ mod tests {
     /// The outcomes that are already unambiguous are not touched by the flag.
     #[test]
     fn a_release_this_attempt_made_reads_the_same_either_way() {
-        let released = Release::Released("session ended".to_string());
+        let released = Release::Released(Box::new(Output::text("session ended")));
         // `true` is the normal case here: this very release is what set the flag.
         assert_eq!(shutdown_note(&released, true), ShutdownNote::Released);
         assert_eq!(shutdown_note(&released, false), ShutdownNote::Released);
