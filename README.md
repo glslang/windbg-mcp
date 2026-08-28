@@ -20,7 +20,7 @@ This file is the map. Each topic is one document, and each document is the whole
 
 | | |
 |---|---|
-| [Install and engine setup](docs/install.md) | Requirements, prebuilt binaries, Scoop, and the one-time WinDbg engine copy that TTD replay, `!analyze` and the driver tools need |
+| [Install and engine setup](docs/install.md) | Requirements, prebuilt binaries, Scoop, and the one-time WinDbg engine copy that TTD replay, `!analyze`, the driver tools and 32-bit .NET SOS need |
 | [Use with an MCP client](docs/mcp-clients.md) | Client config, running the server on another machine (`--listen`), the Claude Code plugin, the MCP registry |
 | [Architecture](docs/architecture.md) | Why a supervisor process and one engine worker per session, what each source file owns, and which MCP revisions are served |
 | [The tool surface](docs/tool-surface.md) | Serving fewer tools with `--tools`, what a typed operand may contain, and how the control-flow and TTD tools behave |
@@ -84,6 +84,14 @@ Every tool that touches a target takes the `session_id` an opener returned, and 
 the call. Omit it and the call goes to the current session. [`docs/architecture.md`](docs/architecture.md)
 has the process model and the file-by-file breakdown; [`docs/sessions.md`](docs/sessions.md) has the
 handle rules, the cap, and what to do when a session is stuck.
+
+**A 32-bit target gets a 32-bit worker.** An extension DLL is loaded into the debugger's own
+process, so .NET's SOS on a 32-bit target is reachable only from a 32-bit host — which a process
+cannot become after its image has loaded. So the release ships a second build of this same server
+at `x86\windbg-mcp.exe`, and a 32-bit dump or a WoW64 `attach_process` is opened by that worker
+instead of by a re-execution of the x64 one. A client cannot tell: one server, one handle, one tool
+surface. Where that worker or its 32-bit engine is absent the target still opens on the x64 build —
+native analysis of it works and always has — and says so in the opener's `limitation`.
 
 ## Tools
 
@@ -165,10 +173,14 @@ did and did not buy.
 ## Limitations
 
 The full list, with what each one means for a workflow, is in
-[`docs/limitations.md`](docs/limitations.md). The three that catch people first:
+[`docs/limitations.md`](docs/limitations.md). The four that catch people first:
 
 - **TTD is user-mode only** — a Microsoft limitation, so a kernel target cannot be time-travelled.
 - **One command at a time per session.** Sessions run concurrently, but each is one engine running
   operations serially: await each result before sending the next call against that session.
 - **Symbol *names* need setup on the debugger host** — `msdia140.dll` beside the binary, a symbol
   path, and (for TTD) a reload at a stopped position. Without them, address-based queries still work.
+- **The pool and heap walkers need a stopped x64 target.** They decode x64 allocator structures, so
+  a 32-bit target has no `heap_*` tools whichever worker holds it — SOS's own `!dumpheap`/`!eeheap`
+  are the managed equivalent, and reaching those is what the 32-bit worker and its `x86\` engine
+  payload ([`docs/install.md`](docs/install.md)) are for.

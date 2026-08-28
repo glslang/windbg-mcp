@@ -17,7 +17,7 @@ session of a workflow you haven't run yet in this environment.
 
 | Task | Playbook |
 |------|----------|
-| Build / engine bundling / symbols / elevation | [setup.md](setup.md) |
+| Build / engine bundling / symbols / elevation / 32-bit .NET | [setup.md](setup.md) |
 | Triage a `.dmp` crash dump | [crash-dump.md](crash-dump.md) |
 | Launch/attach a process, or debug the kernel | [live-and-kernel.md](live-and-kernel.md) |
 | Walk kernel pools or user Segment Heaps | [heap-walking.md](heap-walking.md) |
@@ -142,6 +142,21 @@ where its stderr is not on your screen.
   ([setup.md](setup.md)) **and** the module-qualified form: use `!ext.analyze -v`, not bare
   `!analyze` (which this engine resolves to *"No export analyze found"* even after `.load ext`).
   `open_dump` runs `.load ext` for you.
+- **SOS on a 32-bit .NET target needs a 32-bit engine host, and the opener tells you when it has
+  not got one.** An extension is loaded into the debugger's own process, so a 32-bit `sos.dll`
+  cannot be loaded by an x64 engine at all and the 64-bit one refuses a 32-bit CLR. The server
+  routes a 32-bit dump, or an `attach_process` on a WoW64 process, to an `x86\windbg-mcp.exe`
+  worker instead — invisibly: same handle, same tools. Where that worker or its engine is missing
+  the target still opens on the x64 build, native analysis and all, and the summary's `limitation`
+  says SOS is unreachable and what to copy — read it rather than concluding SOS is broken
+  ([setup.md](setup.md) has the copy block). Two things such a session does not have. The `heap_*`
+  tools refuse any non-x64 *target*, so they are gone whichever worker holds it — `!dumpheap` and
+  `!eeheap` are the managed equivalent and do work. And a live WoW64 attach **on the 32-bit
+  worker** sees only the 32-bit half of the process: the emulation layer above 4 GiB is what the
+  x64 engine reaches with `!wow64exts.sw`, so if you are there for the thunk layer rather than for
+  SOS, open a `procdump64.exe -ma` capture instead — that routes to the x64 engine. And qualify the
+  extension: bare `!threads` resolves to `ext.dll`'s own native thread table and answers on *any*
+  engine, so ask `!sos.threads`.
 - **`read_memory` takes a numeric/`0x`-hex address only.** For a register/symbol
   expression use `execute` with `db`/`dd` (e.g. `db @rip`).
 - **Never walk a list with a MASM `.for` loop — use `walk_memory`.** One unmapped `poi` aborts
