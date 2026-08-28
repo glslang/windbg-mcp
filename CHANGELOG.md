@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-08-28
+
+### Documentation
+
+- **The 32-bit .NET worker shipped with a setup page nothing routed to.**
+  `skills/windbg-debugging/setup.md` gained its *32-bit .NET targets need a 32-bit server* section
+  with the feature in 0.13.0 and is complete — both measured failure codes, the `x86\` copy block,
+  the build line, the three ways to get the layout wrong. Nothing that would send a reader there
+  moved with it, which is why this is a release and not a merge: the skill reaches an installed
+  plugin only when `.claude-plugin/plugin.json`'s version changes, so until this bump the routing
+  fix existed on GitHub and on nobody's machine. `skills/windbg-debugging/SKILL.md` said nothing at
+  all — a model holding a 32-bit dump had no reason to open `setup.md` from the routing table, and
+  nothing told it that a host with no 32-bit worker answers with a summary `limitation` rather than
+  an error, so the one signal the fallback exists to send read as a broken SOS. `docs/install.md`'s
+  *Wanted / Needs* table — the index of what fails quietly without which files, which is this
+  failure's exact shape — had no row for it. `docs/limitations.md` recorded neither the fallback nor
+  what such a session gives up. And `README.md` did not mention the second worker image at all; it
+  does now, under *How it works*, where the process-per-session model this follows from is stated.
+  Two facts that had been stated loosely are also separated wherever they appear: the `heap_*` tools
+  refuse on the **target's** processor type, so they are gone whichever worker owns the session,
+  while losing the WoW64 process's 64-bit half is the 32-bit worker's **own** trade and does not
+  apply to the x64 fallback.
+
 ## [0.13.0] - 2026-08-28
 
 ### Added
@@ -2697,7 +2720,8 @@ Initial release, packaged as a single-plugin Claude Code marketplace.
 - Crash-dump `!analyze` support via automatic WinDbg extension DLL loading.
 - Windows CI (format, clippy, build, test) and walkthrough docs with sample dumps.
 
-[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/glslang/windbg-mcp/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/glslang/windbg-mcp/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/glslang/windbg-mcp/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/glslang/windbg-mcp/compare/v0.11.0...v0.12.0
