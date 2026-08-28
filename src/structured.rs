@@ -438,10 +438,16 @@ pub struct SessionEnded {
     /// Whether the target process outlived the session, where the session had one.
     ///
     /// `true` for a process this server **attached** to: it was detached and left running.
-    /// `false` for one this server **launched**, which goes with the session — and for either,
-    /// where the session had to be terminated still holding its target, since terminating a
-    /// debugger is not a detach and the kernel takes the debuggee. Absent where there was no
-    /// process to keep: a dump, a trace, a kernel target, or a live target that had already gone.
+    /// `false` for one this server **launched** — a launch does not outlive its session — and for
+    /// either where the session had to be terminated still holding its target, since terminating
+    /// a debugger is not a detach and the kernel takes the debuggee. Absent where the session
+    /// never had a process to keep: a dump, a trace, or a kernel target.
+    ///
+    /// **It answers what the caller has to act on, not what caused it.** A launched process that
+    /// had already run to completion reads `false` like one the teardown took, because both mean
+    /// "nothing of yours is still running" — which is the question, and the only one this field is
+    /// asked at a moment that can answer it. Which of the two happened was reported when it
+    /// happened, by the resume that saw the target go (`StopReport::target_gone`).
     ///
     /// Here as well as in the text because a client that forwards `structuredContent` drops the
     /// text, and this is the one fact about a teardown that is not recoverable afterwards.

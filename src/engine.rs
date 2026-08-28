@@ -72,6 +72,15 @@ pub(crate) const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// gracefully, short enough that recovering a parked attach is not a wait.
 const END_SESSION_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// What a `launch` session's end says about its debuggee.
+///
+/// Deliberately not "was terminated with it", which would be a causal claim this side cannot make:
+/// a launched process that had already run to completion reaches the same teardown, and that
+/// sentence would attribute its exit to it. What is true either way is that it is not still
+/// running, which is the half a caller acts on — and which of the two happened was reported when
+/// it happened, by the resume that saw the target go.
+const LAUNCH_ENDED: &str = " The process this session launched did not outlive it.";
+
 /// How long to wait for a worker to acknowledge an interrupt.
 ///
 /// Not a bound on the operation being interrupted: that one ends when the engine next polls, and it
@@ -1523,8 +1532,7 @@ impl Sessions {
                     // launch from a dump. `SessionKind` is the supervisor's, and this is the one
                     // place it meets a rendered result.
                     match session.kind {
-                        SessionKind::Launch =>
-                            " The process this session launched was terminated with it.",
+                        SessionKind::Launch => LAUNCH_ENDED,
                         _ => "",
                     }
                 ),
