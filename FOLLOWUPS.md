@@ -3448,6 +3448,26 @@ debugger, and it would make the two paths disagree about what a breakpoint means
 was always there. Reopen it if a parked worker holding a live process turns out to be ordinary
 rather than exceptional.
 
+**Review found one gap and it was worth the round.** The first version recorded provenance only in
+`attach_process_begin`, so the flag was about the last *attach* rather than about the target the
+engine holds — and the sequence that exposes it needs no teardown anywhere in it: attach, lose the
+target (it exits, or a raw `.detach` takes it), then launch something else on the same engine, which
+`end_session`'s own doc invites by saying the engine is reusable. The launched process then took the
+detach branch and outlived its session. Every opener now records it, through a two-variant
+`TargetOrigin` rather than a `bool` — the question an opener answers is "which of these am I", and a
+bool invites the one that means "not that" to say nothing, which is exactly how the gap arose. Not
+reachable through *this* server, where a worker holds one target for its whole life and `EngineOp`
+has no second opener; it is a dbgscope-API bug, fixed there.
+
+**And the obvious companion check was built, measured and removed.** Guarding the detach on
+`has_target` looked necessary — an active detach with nothing to detach from ought to fail, and
+ending a session whose attached program had merely finished would then report an error to the
+caller. It does not fail: `EndSession` with `DEBUG_END_ACTIVE_DETACH` succeeds on an engine holding
+no debuggee (dbgeng 10.0.26100.1, ARM64), and both new tests pass with the guard and without it. So
+what holds the property is a test that asserts the teardown is *not* an error, rather than a
+condition that protects against nothing measurable — and if an engine ever does refuse, that test
+says so and the guard is one line away.
+
 **One observation not reproduced**, recorded because a flake here would be worth recognising: on
 the very first paired run after a full rebuild, the detached `ping` exited `0xC0000005` instead of
 surviving. It has not recurred in the twenty-four consecutive runs since, on either the paired or
