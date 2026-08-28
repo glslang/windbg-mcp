@@ -212,14 +212,15 @@ It checks *same-file* fragments only, so a cross-file `../README.md#some-heading
 verify by hand.
 
 **The pass count does not say which tiers ran.** Each gate is inside its test, so the `mcp_smoke`
-harness reports the same **88 passed** with the debugger tier off as with it on — that harness's own
+harness reports the same **89 passed** with the debugger tier off as with it on — that harness's own
 result line, since a plain `cargo test` runs the crate's several hundred unit tests beside it and
 prints a result line per binary. What differs between the two runs is the runtime (measured on the
 ARM64 bench 2026-08-23: **1.6s against 61s** for `cargo test --test mcp_smoke`) and the `SKIPPED`
 lines, which only `--nocapture` prints. Read one of those two before believing a run covered a
 debugger claim. The count moves whenever a test is added — it was 69 until #195 and #196, 75
 until item 37, 79 until the TTD tier, 84 until item 50's version-resource test, 85 until
-item 48's two endings and 87 until item 49's live 32-bit target — and it said 83 while it was 84,
+item 48's two endings, 87 until item 49's live 32-bit target and 88 until item 51's
+attach teardown — and it said 83 while it was 84,
 which is the usual state of it, so re-derive it rather than trusting this sentence.
 
 **The dev exe can be locked too, and the failure is quiet.** A worker left running — a driver
@@ -739,6 +740,48 @@ rather than the message. And a session whose target is gone is still reported `o
 `session_status`, deliberately; `FOLLOWUPS.md` item 48 says what telling the supervisor would cost.
 
 [#242]: https://github.com/glslang/windbg-mcp/issues/242
+
+## What ending a session does to its target (`FOLLOWUPS.md` item 51)
+
+**Three different things, and which one is decided by the opener rather than by the target type.**
+A dump or a trace is closed. A live kernel is resumed and actively detached. A process
+`attach_process` attached to is actively detached and **left running**; one `launch` created is
+terminated with the session. All of it happens inside dbgscope's `end_session`, from a flag
+`attach_process_begin` sets — DbgEng cannot be asked, since `GetDebuggeeType` answers
+`DEBUG_USER_WINDOWS_PROCESS` for a launch and an attach alike.
+
+**The attach case was a kill until 2026-08-28, and the two defaults that produced it are each
+reasonable.** A passive `EndSession` destroys the debug port rather than detaching, and a debuggee
+whose port is destroyed is killed by the kernel, because `DebugSetProcessKillOnExit` defaults to
+true. What made it worse here than in a plain debugger is that `end_session` is not the only caller:
+a **client disconnect** and a **lease expiry** run the same release, so a client that simply went
+away took the process it was looking at with it.
+
+Four things to know before touching this.
+
+- **The kill is synchronous with `end_session`**, not with the worker's later termination — which
+  is what the original report assumed, and what makes this testable at all. The exit code is
+  `0xC0000354` (`STATUS_DEBUGGER_INACTIVE`) the moment the call returns.
+- **`Child::try_wait` is the wrong probe and looks like the right one.** That exit status is set
+  while the process object is *not yet signalled*, so `try_wait` answers `Ok(None)` — "still
+  running" — for a process that is already dead. dbgscope's first version of this assertion passed
+  with the fix backed out. `CheckRemoteDebuggerPresent` is no better: it reads `false` after either
+  ending, because the passive end really does tear the port down. `GetExitCodeProcess` is the only
+  probe that separates them, and it separates them completely (ten runs each way).
+- **The detach falls back to the passive end and still reports the failure.** This teardown is on
+  the disconnect path, where a session that will not close is worse than a killed debuggee — but a
+  caller told "released" would have no reason to go and look at a target that had just been killed.
+  So the fallback is silent about the *session* and loud about the *target*.
+- **A worker killed while holding an attached target still takes it down.** `Release::Parked` — a
+  worker that never answers — is terminated without ever running `end_session`, so nothing detaches.
+  `DEBUG_PROCESS_DETACH_ON_EXIT` at attach time would close that too, and was rejected: it makes a
+  killed worker leave the process alive with whatever breakpoints were patched into it, which is a
+  target that faults minutes later with nothing connecting it to the debugger. `item 51` records
+  the trade.
+
+Keeping a `launch`ed process alive past its session is a real request and is **not** built: it is a
+question about the tool surface (an argument on `launch` or on `end_session`), not about a flag, and
+nothing has asked for it yet.
 
 ## A worker of the target's architecture (`src/target.rs`, `engine::worker_images`)
 

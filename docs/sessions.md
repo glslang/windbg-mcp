@@ -14,6 +14,15 @@ debugger process is left behind. It gives each session a shorter grace than `end
 though, so end a live kernel session explicitly if you can: one still busy at disconnect is
 terminated, and a terminated kernel session leaves its target halted.
 
+**What ending a session does to its target depends on which tool opened it.** A dump or a trace is
+simply closed. A live kernel is resumed and detached, so the machine is left running rather than
+frozen at its last break. A process `attach_process` attached to is **detached and left running** —
+it was somebody else's process before the session and it is somebody else's afterwards — while one
+`launch` started is terminated with the session, which is the honest end for a process the debugger
+created. So a target that must survive the debugger is one to attach to, not to launch; and because
+a disconnect and a lease expiry run the same release, that holds for a client that simply goes away
+as much as for one that calls `end_session`. `end_session`'s own result says which ending it was.
+
 Omit `session_id` and a call goes to the **current** session: the most recently opened one that will
 still accept work. That is the pre-handle behaviour and it still holds. What supplying the id buys
 is that the call can never land on a target you did not open — it fails loudly instead.

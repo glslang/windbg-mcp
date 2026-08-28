@@ -50,6 +50,12 @@ another, so you can keep a kernel attach live while you look at a dump. Pass the
 to route them, and `end_session { "session_id": "<id>" }` when you are done with a target (up to
 four at a time).
 
+**Ending a session ends what this server started, and nothing else.** A process you `attach_process`
+attached to is detached and left running; one you `launch`ed is terminated with the session; a
+kernel target is resumed and detached. So a running service is safe to attach to and look at — but
+it is `launch` you want if you mean the process to go away with you, and there is no way to keep a
+launched one alive past its session.
+
 ## Inspect and control
 
 1. **Survey.** `modules {}` (`lm`, 64 rows of it — `filter` for one driver, `limit` for more),

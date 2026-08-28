@@ -843,12 +843,14 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
                     Ok(Ok(_)) => tracing::info!("worker: target released"),
                     Ok(Err(e)) => tracing::error!(
                         "worker: the debugger refused to release the target ({}); a live kernel \
-                         target may be left halted",
+                         target may be left halted, and a process this session attached to may \
+                         have been killed rather than detached",
                         e
                     ),
                     Err(_) => tracing::error!(
                         "worker: releasing the target panicked; a live kernel target may be left \
-                         halted"
+                         halted, and a process this session attached to may have been killed \
+                         rather than detached"
                     ),
                 }
                 let _ = ack.send(());
@@ -1470,9 +1472,23 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         // Reaching here means any batch has already been told to stop and has finished unwinding —
         // the reader saw this request go past and said so, and this thread runs one job at a time.
         EngineOp::EndSession => {
+            // Read *before* the teardown, which is the only moment it is still true: ending a
+            // session is what clears it. And it is worth saying at all because the two endings
+            // are opposite and neither is visible from the caller's side — a process this server
+            // attached to is detached and goes on running, where one it launched goes with the
+            // session. Naming no tool, per `FOLLOWUPS.md` item 43: this is built in the worker,
+            // which has never heard of the client's surface.
+            let detaching = e.attached_to_a_live_process();
             let ended = e
                 .end_session()
-                .map(|_| Output::text("session ended"))
+                .map(|_| {
+                    Output::text(if detaching {
+                        "Session ended. The process this session attached to was detached and \
+                         left running."
+                    } else {
+                        "session ended"
+                    })
+                })
                 .map_err(failed);
             query::invalidate_allocator_caches();
             ended
