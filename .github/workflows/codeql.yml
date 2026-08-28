@@ -1,0 +1,72 @@
+name: CodeQL
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # What default setup ran on, kept: a weekly pass is what catches a query newly shipped in a
+  # CodeQL bundle against code nobody has touched since.
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze ${{ matrix.language }}
+    # No build, so no Windows runner — see `build-mode` below. This crate is Windows-only and does
+    # not compile here, which is not a gap: extraction reads source, and `ci.yml` is where a
+    # compile is claimed.
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    permissions:
+      # Writing the results is the point of the job. `packages: read` is what `init` fetches query
+      # packs with; the other two let it read the workflow and the tree.
+      security-events: write
+      packages: read
+      actions: read
+      contents: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # The three languages default setup was configured for, unchanged. `rust` is the one this
+        # workflow exists for; dropping either of the others would narrow coverage while claiming
+        # only to have moved it.
+        include:
+          - language: actions
+            build-mode: none
+          - language: python
+            build-mode: none
+          - language: rust
+            build-mode: none
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          languages: ${{ matrix.language }}
+          # `none` is required, not merely cheaper. `paths-ignore` is honoured for a *compiled*
+          # language only when it is analyzed without building; add a build step and the filter
+          # goes silently inert, taking the excluded alerts with it — a failure that looks like
+          # the config never being read.
+          build-mode: ${{ matrix.build-mode }}
+          config-file: ./.github/codeql/codeql-config.yml
+          # No `queries:` — that leaves the `default` suite, which is what default setup ran.
+          # `security-extended` is a deliberate not-yet: it would land a fresh batch of findings in
+          # the same pass as this migration, and the two would be indistinguishable.
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
+        with:
+          category: "/language:${{ matrix.language }}"
