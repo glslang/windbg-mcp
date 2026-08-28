@@ -64,7 +64,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   result says which of the two endings it was. The engine-side half is
   [glslang/dbgscope#121](https://github.com/glslang/dbgscope/pull/121); `end_session`,
   `attach_process` and `launch` now each say in their own description what ending a session will do
-  to that kind of target, which is what none of them said before.
+  to that kind of target, which is what none of them said before. `end_session`'s structured result
+  carries `target_left_running` beside the sentence, because a client that forwards
+  `structuredContent` drops the text and this is the one fact about a teardown that cannot be
+  recovered afterwards.
 
 ## [0.12.1] - 2026-08-26
 

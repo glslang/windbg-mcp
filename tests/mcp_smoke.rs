@@ -4496,10 +4496,20 @@ fn a_raw_execution_control_command_moves_the_target_instead_of_wedging_the_sessi
         "a step that completed must say where: {stop}"
     );
 
-    server.call_tool(
+    // The **other** ending, on the same field the attach tier asserts `true`: a target this server
+    // launched goes with the session, and a structured-aware client is told so. Asserted here
+    // rather than in a test of its own because this is already a clean teardown of a live launched
+    // process, which is exactly the state the claim is about.
+    let ended = server.call_tool(
         "end_session",
         json!({ "session_id": &session }),
         TARGET_STEP,
+    );
+    assert_eq!(
+        ended["result"]["structuredContent"]["target_left_running"],
+        json!(false),
+        "a launched process goes with its session, and the result does not say so: {}",
+        ended["result"]["structuredContent"]
     );
 }
 
@@ -4777,9 +4787,14 @@ fn still_running(child: &std::process::Child) -> bool {
 
 /// A process to attach to that this suite did not create through the debugger — the thing an
 /// attach test needs and a launch test cannot supply.
+///
+/// **Outlives the test by a wide margin on purpose.** Every step here is allowed `TARGET_STEP`,
+/// and a fixture that ends on its own inside that budget fails as though `end_session` had killed
+/// it — the one thing this test is about — on nothing worse than a slow runner. So the count is
+/// far past any plausible run rather than merely past a fast one; the test kills it either way.
 fn a_process_to_attach_to() -> std::process::Child {
     Command::new("ping")
-        .args(["-n", "30", "127.0.0.1"])
+        .args(["-n", "3000", "127.0.0.1"])
         .stdout(Stdio::null())
         .spawn()
         .expect("start a process to attach to")
@@ -4829,9 +4844,18 @@ fn ending_a_session_leaves_a_process_this_server_only_attached_to_running() {
         still_running(&target),
         "`end_session` killed the process this server had only attached to:\n{rendered}"
     );
+    // **Both halves say so**, because a structured-aware client forwards `structuredContent` and
+    // drops the text: a disposition on one half is a disposition half the clients never see. Same
+    // rule as #242's ending, on the op that ends a session deliberately.
     assert!(
         rendered.contains("detached and left running"),
-        "the process survived and the result does not say so:\n{rendered}"
+        "the process survived and the text does not say so:\n{rendered}"
+    );
+    assert_eq!(
+        ended["result"]["structuredContent"]["target_left_running"],
+        json!(true),
+        "the structured half does not say the target was left running: {}",
+        ended["result"]["structuredContent"]
     );
 
     let _ = target.kill();

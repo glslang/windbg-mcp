@@ -105,8 +105,8 @@
       "inputSchema": 314,
       "modelVisible": 1436,
       "name": "end_session",
-      "outputSchema": 1258,
-      "wire": 2841
+      "outputSchema": 1308,
+      "wire": 2891
     },
     {
       "annotations": 124,
@@ -466,10 +466,10 @@
     "inputSchema": 40259,
     "instructions": 1983,
     "modelVisible": 68322,
-    "outputSchema": 104539,
-    "payload": 179721,
+    "outputSchema": 104589,
+    "payload": 179771,
     "tools": 51,
-    "wire": 179603,
+    "wire": 179653,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 9798
   }

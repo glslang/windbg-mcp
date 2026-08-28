@@ -435,6 +435,18 @@ pub struct SessionEnded {
     /// How long the worker was given to let go before it was terminated, when it was.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waited_ms: Option<u64>,
+    /// Whether the target process outlived the session, where the session had one.
+    ///
+    /// `true` for a process this server **attached** to: it was detached and left running.
+    /// `false` for one this server **launched**, which goes with the session — and for either,
+    /// where the session had to be terminated still holding its target, since terminating a
+    /// debugger is not a detach and the kernel takes the debuggee. Absent where there was no
+    /// process to keep: a dump, a trace, a kernel target, or a live target that had already gone.
+    ///
+    /// Here as well as in the text because a client that forwards `structuredContent` drops the
+    /// text, and this is the one fact about a teardown that is not recoverable afterwards.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_left_running: Option<bool>,
 }
 
 // ---- execution ------------------------------------------------------------
@@ -2167,11 +2179,14 @@ mod tests {
             released: true,
             worker_terminated: false,
             waited_ms: None,
+            target_left_running: Some(true),
         }))
         .expect("serializes");
         assert_eq!(ok["status"], "ok");
         assert_eq!(ok["session_id"], "sess-1");
         assert_eq!(ok["released"], true);
+        // The teardown's one irrecoverable fact, on the half a structured-aware client keeps.
+        assert_eq!(ok["target_left_running"], true);
         // Absent rather than null: a consumer reading `waited_ms` gets "no answer", not "0ms".
         assert!(ok.get("waited_ms").is_none());
 
