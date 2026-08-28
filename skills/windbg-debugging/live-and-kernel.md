@@ -56,6 +56,11 @@ kernel target is resumed and detached. So a running service is safe to attach to
 it is `launch` you want if you mean the process to go away with you, and there is no way to keep a
 launched one alive past its session.
 
+Two limits on that. A session that will not let go within its grace is **terminated**, and the
+kernel takes its debuggee with it — the same recovery that rescues a parked kernel attach. And a
+process added with a raw `execute { "command": ".attach <pid>" }` is not tracked as an attach at
+all, so ending the session takes it; `attach_process` is the route that is.
+
 ## Inspect and control
 
 1. **Survey.** `modules {}` (`lm`, 64 rows of it — `filter` for one driver, `limit` for more),
