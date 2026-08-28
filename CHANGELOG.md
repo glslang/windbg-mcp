@@ -48,6 +48,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `csc.exe` every stock Windows ships; one test opens the full-memory dump that program writes of
   itself, and the other attaches to it running. `WINDBG_MCP_X86_DUMP` still overrides the made dump
   with a real capture. The tier stands down where there is no 32-bit engine to run it against.
+- **The 32-bit worker's PE version resource is asserted too.** The existing check reads the binary
+  built for the host, so `x86\windbg-mcp.exe` — shipped in both the `.zip` and the `.mcpb` — carried
+  its resource unchecked on every host and in CI. `build.rs` will not fail a build whose resource it
+  could not embed, so a worker that quietly lost one would ship with nothing saying so, and an
+  absent version resource is one of the two causes Microsoft names for the `Bearfoos.B!ml` verdict
+  that motivated the resource in the first place. Its fields are asserted equal to this build's
+  rather than pinned again, because the two binaries are one product from one build.
 
 ### Fixed
 

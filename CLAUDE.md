@@ -212,15 +212,15 @@ It checks *same-file* fragments only, so a cross-file `../README.md#some-heading
 verify by hand.
 
 **The pass count does not say which tiers ran.** Each gate is inside its test, so the `mcp_smoke`
-harness reports the same **89 passed** with the debugger tier off as with it on — that harness's own
+harness reports the same **90 passed** with the debugger tier off as with it on — that harness's own
 result line, since a plain `cargo test` runs the crate's several hundred unit tests beside it and
 prints a result line per binary. What differs between the two runs is the runtime (measured on the
 ARM64 bench 2026-08-23: **1.6s against 61s** for `cargo test --test mcp_smoke`) and the `SKIPPED`
 lines, which only `--nocapture` prints. Read one of those two before believing a run covered a
 debugger claim. The count moves whenever a test is added — it was 69 until #195 and #196, 75
 until item 37, 79 until the TTD tier, 84 until item 50's version-resource test, 85 until
-item 48's two endings, 87 until item 49's live 32-bit target and 88 until item 51's
-attach teardown — and it said 83 while it was 84,
+item 48's two endings, 87 until item 49's live 32-bit target, 88 until item 51's
+attach teardown and 89 until the 32-bit worker's version resource — and it said 83 while it was 84,
 which is the usual state of it, so re-derive it rather than trusting this sentence.
 
 **The dev exe can be locked too, and the failure is quiet.** A worker left running — a driver
