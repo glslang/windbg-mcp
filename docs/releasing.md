@@ -45,10 +45,20 @@ ruleset with `gh api repos/glslang/windbg-mcp/rules/branches/main`; the branch-p
 protection" if you stop there.
 
 1. **Bump four files, not three.** `Cargo.toml`, `.claude-plugin/plugin.json`, the `README.md`
-   badge — and **`Cargo.lock`**, which holds this crate's own version. `cargo update -p windbg-mcp
-   --offline` does it. The workflow builds `--locked`, so a stale lock fails the release build
-   after the guards have passed, which is the expensive place to find out. Leave `server.json` and
+   badge — and **`Cargo.lock`**, which holds this crate's own version. `cargo update -p windbg-mcp`
+   does it. The workflow builds `--locked`, so a stale lock fails the release build after the
+   guards have passed, which is the expensive place to find out. Leave `server.json` and
    `packaging/mcpb/manifest.json` alone: CI stamps both.
+
+   **Not `--offline`, and not `--locked` either** — both fail here, for opposite reasons, and the
+   flag that looks like the safe one is the one that breaks. `--offline` cannot check out the
+   pinned `dbgscope` revision on a cache that has not already got it, so on a fresh clone it exits
+   101 without touching the lock. A `cargo fetch --locked` to populate that cache first is worse:
+   at this point in the checklist `Cargo.toml` is *ahead* of `Cargo.lock` by construction — that is
+   the whole point of the step — so `--locked` refuses with *"cannot update the lock file … because
+   --locked was passed"*. What confines the update is **`-p`**, not either flag: measured on this
+   crate, the bare command reports *"45 unchanged dependencies behind latest"* and moves one line.
+   `git diff Cargo.lock` is the check, and it should show exactly that line.
 2. **Add the CHANGELOG section, and keep an empty `## [Unreleased]` above it.** *Renaming*
    `## [Unreleased]` to `## [X.Y.Z]` leaves the `[Unreleased]:` link definition at the foot of the
    file unreferenced, and **Documentation lint fails on MD053** — the one gate that catches release
