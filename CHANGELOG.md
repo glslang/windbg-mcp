@@ -19,6 +19,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quiet client loses its sessions to, and the surface being the fixed cost where a single
   `read_memory` is the variable one. The depth stays in `docs/local-model.md` rather than being
   copied, so there is one place for each rule to be wrong.
+- **`README.md` presented driving this with a local model as a benchmark result rather than as
+  something a reader can do.** Its single section on the subject was the eval — the grid, the
+  axes, the findings — so someone asking whether a local model is supported at all, how the
+  listener is configured, or whether a Mac can drive a Windows host over ssh found none of it, and
+  the answer to all three is yes. That section is now two. *Driving it* leads with a table of the
+  five configurations — an MCP client or ollama, local weights or ollama's cloud, one machine or
+  two — then the commands that install **and start** the listener as a service, the ssh forward,
+  why the token is not optional, and the one line that points ollama at it. The benchmark follows
+  as its own section, backing those claims instead of standing in for them, and its context-window
+  finding now carries the qualifier it always needed: it is a fact about that bench's runtime, and
+  `ollama ps` is how a reader learns what theirs serves.
 - **The tool-surface figures were stale in six documents and disagreed with each other in two.**
   Every current claim now comes from one re-derivation, none of which needs the eval run: the whole
   surface is `tests/golden/tool_budget.json`'s `modelVisible` total, which `cargo test` re-records
