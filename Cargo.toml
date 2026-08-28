@@ -1,6 +1,6 @@
 [package]
 name = "windbg-mcp"
-version = "0.12.1"
+version = "0.13.0"
 edition = "2024"
 # Not published to crates.io — these are here because `build.rs` stamps them into the binary's PE
 # version resource, which is what Explorer's properties dialog and Defender's ML scoring read
