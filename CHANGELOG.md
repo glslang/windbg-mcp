@@ -53,6 +53,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Ending a session no longer kills a process this server only attached to**
+  ([`FOLLOWUPS.md`](./FOLLOWUPS.md) item 51). `attach_process` on a running process and then
+  `end_session`, and the process was *gone* — not suspended, not detached, terminated. Two defaults
+  meeting: the engine ended every non-kernel session passively, which destroys the debug port rather
+  than detaching, and a debuggee whose port is destroyed is killed by the kernel, because
+  `DebugSetProcessKillOnExit` defaults to true. That is the honest end for a `launch`, which created
+  the process, and it still is; it was never right for an attach, and it was worse here than in a
+  plain debugger, because the same release runs when a client **disconnects** or its lease expires —
+  so a client that simply went away took the service it was looking at with it. A session whose
+  target this server attached to is now actively detached and left running, and `end_session`'s
+  result says which of the two endings it was. The engine-side half is
+  [glslang/dbgscope#121](https://github.com/glslang/dbgscope/pull/121); `end_session`,
+  `attach_process` and `launch` now each say in their own description what ending a session will do
+  to that kind of target, which is what none of them said before.
 - **A target that ends during a resume is an ending, not a catastrophe** (issue #242, and
   [`FOLLOWUPS.md`](./FOLLOWUPS.md) item 48, which had held the question open since #226). A `go`, a
   step or a raw `execute 'g'` whose debuggee ran to completion came back

@@ -3238,7 +3238,8 @@ impl WindbgServer {
 
     /// Attach to an existing user-mode process by PID and break in.
     /// Opens a new session in its own engine process — sessions already open are left alone —
-    /// and returns a `session_id` that routes later calls to it. End it with `end_session`.
+    /// and returns a `session_id` that routes later calls to it. End it with `end_session`, which
+    /// detaches and leaves the process running.
     #[rmcp::tool(
         annotations(
             title = "Attach to process",
@@ -3263,7 +3264,8 @@ impl WindbgServer {
 
     /// Launch a new user-mode process under the debugger, stopping at the initial breakpoint.
     /// Opens a new session in its own engine process — sessions already open are left alone —
-    /// and returns a `session_id` that routes later calls to it. End it with `end_session`.
+    /// and returns a `session_id` that routes later calls to it. End it with `end_session`, which
+    /// terminates the process this created.
     #[rmcp::tool(
         annotations(
             title = "Launch process under debugger",
@@ -3467,6 +3469,10 @@ impl WindbgServer {
 
     /// End a debug session: release its target and shut down its engine process. Pass
     /// `session_id` to be sure you are ending your own session and not another one.
+    ///
+    /// What releasing does depends on the opener: a process this server attached to is detached
+    /// and left running, one it launched is terminated, a live kernel is resumed and detached, a
+    /// dump or trace is closed. A client disconnect and a lease expiry run the same release.
     ///
     /// This is also the recovery for a session that is stuck. If the session does not let go
     /// within a short grace period — a live-kernel attach whose target never dialed in cannot,

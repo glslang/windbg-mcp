@@ -20,12 +20,12 @@
     },
     {
       "annotations": 117,
-      "description": 240,
+      "description": 288,
       "inputSchema": 204,
-      "modelVisible": 499,
+      "modelVisible": 547,
       "name": "attach_process",
       "outputSchema": 3894,
-      "wire": 4541
+      "wire": 4589
     },
     {
       "annotations": 68,
@@ -101,12 +101,12 @@
     },
     {
       "annotations": 116,
-      "description": 713,
+      "description": 981,
       "inputSchema": 314,
-      "modelVisible": 1079,
+      "modelVisible": 1347,
       "name": "end_session",
       "outputSchema": 1258,
-      "wire": 2484
+      "wire": 2752
     },
     {
       "annotations": 124,
@@ -218,12 +218,12 @@
     },
     {
       "annotations": 129,
-      "description": 266,
+      "description": 310,
       "inputSchema": 229,
-      "modelVisible": 542,
+      "modelVisible": 586,
       "name": "launch",
       "outputSchema": 3894,
-      "wire": 4596
+      "wire": 4640
     },
     {
       "annotations": 65,
@@ -462,14 +462,14 @@
   ],
   "totals": {
     "annotations": 5449,
-    "description": 24957,
+    "description": 25317,
     "inputSchema": 40259,
     "instructions": 1983,
-    "modelVisible": 67873,
+    "modelVisible": 68233,
     "outputSchema": 104539,
-    "payload": 179272,
+    "payload": 179632,
     "tools": 51,
-    "wire": 179154,
+    "wire": 179514,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 9798
   }

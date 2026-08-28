@@ -4383,7 +4383,9 @@ fn target_tier() -> Option<&'static str> {
 ///
 /// A tier of its own would be worse than either: these are the only tests in the suite that drive
 /// *execution* on anything but a live kernel, and that is exactly the gap they exist to close
-/// (issue #226). A gate nothing sets is a gap that stays open.
+/// (issue #226). A gate nothing sets is a gap that stays open. One of them drives no execution at
+/// all — it attaches to a process and ends the session — and is here because what it needs is the
+/// same thing: a live user-mode target, which is to say a real engine.
 fn launch_tier() -> bool {
     if std::env::var_os("WINDBG_MCP_SMOKE_DUMP").is_none() {
         skip("set WINDBG_MCP_SMOKE_DUMP=1 to run the debugger tier");
@@ -4753,6 +4755,88 @@ fn a_target_that_ends_during_the_raw_hatchs_pump_reports_it_with_what_the_pump_c
         json!({ "session_id": &session }),
         TARGET_STEP,
     );
+}
+
+/// Whether a process this test started is still running, asked of the kernel rather than of
+/// `Child::try_wait`.
+///
+/// `try_wait` is the wrong question and looks like the right one: a debuggee the kernel kills for
+/// having lost its debugger has its exit status set before the call that killed it returns, while
+/// its process object is not signalled yet — so `try_wait` answers "still running" for a process
+/// that is already dead, and a test built on it passes whatever happened (measured in dbgscope,
+/// where the first version of this same assertion did exactly that).
+fn still_running(child: &std::process::Child) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Threading::GetExitCodeProcess;
+    /// `STILL_ACTIVE` — what `GetExitCodeProcess` writes for a process that has not exited.
+    const STILL_ACTIVE: u32 = 259;
+    let mut code = 0u32;
+    let read = unsafe { GetExitCodeProcess(child.as_raw_handle() as _, &mut code) };
+    read != 0 && code == STILL_ACTIVE
+}
+
+/// A process to attach to that this suite did not create through the debugger — the thing an
+/// attach test needs and a launch test cannot supply.
+fn a_process_to_attach_to() -> std::process::Child {
+    Command::new("ping")
+        .args(["-n", "30", "127.0.0.1"])
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("start a process to attach to")
+}
+
+/// **`FOLLOWUPS.md` item 51: ending a session must not take a process this server only attached
+/// to.**
+///
+/// The end-to-end half of the fix, and the half no engine-level test can make: what killed the
+/// process was `end_session` ending the engine's session passively, and what makes this server's
+/// case worse than a plain debugger's is that the same release runs on a **client disconnect** and
+/// on a **lease expiry** — so a client that simply went away took the process it was looking at
+/// with it. A caller attaching to a running service to look at it has no reason to expect that.
+///
+/// Two things are asserted and the second is the one that would rot silently. The process is
+/// still there afterwards, which is the claim. And the result **says so**, because the two endings
+/// are opposite, neither is visible from the caller's side, and a model driving this has no other
+/// way to know which one it just got.
+///
+/// The launch half is not here: dbgscope pins it in-process, where the engine's own teardown is
+/// the whole mechanism, and terminating a worker on top of that can only take a target away, not
+/// keep one. What this adds over that test is the worker termination — the step the original
+/// report blamed, and the one nothing below the supervisor can exercise.
+#[test]
+fn ending_a_session_leaves_a_process_this_server_only_attached_to_running() {
+    if !launch_tier() {
+        return;
+    }
+    let mut target = a_process_to_attach_to();
+    let mut server = Server::started();
+    let session = server.open_session("attach_process", json!({ "pid": target.id() }), TARGET_STEP);
+    // A session that is really holding the process, rather than one that failed to attach and
+    // would pass this by never having been in a position to kill anything.
+    server.tool_data(
+        "registers",
+        json!({ "session_id": &session, "filter": "pc" }),
+        TARGET_STEP,
+    );
+
+    let ended = server.call_tool(
+        "end_session",
+        json!({ "session_id": &session }),
+        TARGET_STEP,
+    );
+    let rendered = text_of(&ended["result"]);
+    assert!(
+        still_running(&target),
+        "`end_session` killed the process this server had only attached to:\n{rendered}"
+    );
+    assert!(
+        rendered.contains("detached and left running"),
+        "the process survived and the result does not say so:\n{rendered}"
+    );
+
+    let _ = target.kill();
+    let _ = target.wait();
+    ran("the attach-teardown tier");
 }
 
 /// The same gate for a test that reads a **target's memory** rather than the structure of the dump
@@ -12123,20 +12207,20 @@ fn a_32_bit_managed_process_is_attached_by_an_engine_that_can_load_its_sos() {
     let session = session_on_a_worker_of_its_own_architecture(&data);
     sos_answers_about_managed_threads(&mut server, &session);
 
-    // **`end_session` is what ends the fixture, and the `kill` below is belt-and-braces.**
-    // Measured rather than assumed, because the obvious reading is the other way round: an
-    // `end_session` on a user-mode attach ends the engine's session *passively*
-    // (`DEBUG_END_PASSIVE`, dbgscope `end_session`) and then the supervisor terminates the
-    // worker — and a debuggee whose debugger dies without having detached is killed by the
-    // kernel. So the process is already gone by the time this kills it, and it goes for the same
-    // reason on a 64-bit target and this build's own worker: nothing here is about the 32-bit
-    // one. `FOLLOWUPS.md` item 51 is whether that should be an active detach instead; this test
-    // deliberately does not assert it either way, since pinning it would make a behaviour that
-    // has never been decided read as one that was.
+    // **`end_session` detaches, so the `kill` below is what actually ends the fixture.** It used
+    // to be the other way round — a passive end and then a terminated worker, which the kernel
+    // answered by killing the debuggee — and this is where that was found (`FOLLOWUPS.md` item
+    // 51). Asserted here as well as in the tier that is about it, cheaply, because the 32-bit
+    // worker is a *second image* being terminated and nothing else in this file would notice if
+    // that one alone went back to taking its target with it.
     server.call_tool(
         "end_session",
         json!({ "session_id": &session }),
         TARGET_STEP,
+    );
+    assert!(
+        still_running(&child),
+        "`end_session` on the 32-bit worker killed the process it had attached to"
     );
     let _ = child.kill();
     let _ = child.wait();

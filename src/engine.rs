@@ -1523,17 +1523,19 @@ impl Sessions {
             // session the caller believes they ended.
             //
             // What it must not do is call that clean. Terminating a debugger is not a detach —
-            // DbgEng resumes and detaches a live kernel as part of releasing it, which is the step
-            // that just failed — so the one caller who most needs to check their target was
-            // previously told there was nothing to check.
+            // DbgEng resumes and detaches a live kernel as part of releasing it, and detaches a
+            // process this server attached to, which is the step that just failed — so the one
+            // caller who most needs to check their target was previously told there was nothing
+            // to check.
             Release::Refused(why) => (
                 format!("ended after an error: {why}"),
                 format!(
                     "The debugger reported an error releasing the target:\n  {why}\n\nSession \
                      `{}` is closed and its engine worker process (pid {}) has been terminated. \
                      Terminating the debugger does not resume and detach for it, so a live kernel \
-                     target may be left halted — check the target before treating this as a clean \
-                     end. For a dump or a trace there is nothing left to clean up.",
+                     target may be left halted and a process this session attached to may have \
+                     been killed rather than detached — check the target before treating this as \
+                     a clean end. For a dump or a trace there is nothing left to clean up.",
                     session.id, session.pid
                 ),
             ),

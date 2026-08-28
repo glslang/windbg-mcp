@@ -49,7 +49,7 @@ open — a tier that makes its own 32-bit fixture instead of waiting to be hande
 WoW64 route a dump header cannot answer for — and, while testing that, from Windows Defender
 quarantining this project's own binary, and item 51 from what building that live route made
 reachable: the first tier to attach to a running process found that ending its session kills it
-(2026-08-27).
+(2026-08-27, and **landed** the next day).
 Each item notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -92,6 +92,11 @@ because the argument is not obvious and the next change to this tier will meet i
 the PE version resource is in, and what is left is the half the entry always said needed a decision
 rather than a patch — a signing certificate — so the entry now records what building the first half
 taught and is otherwise narrowed to the second.
+**Item 51 has landed** (2026-08-28) and is kept because the entry's account of *why* the process
+died was wrong in the one way that mattered: it blamed the worker's termination, a step later than
+the passive `EndSession` that actually does it — which is what let the fix be tested inside one
+process at all. It also records two probes for that fact which look correct and are not, one of
+which passed with the fix backed out.
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -3341,7 +3346,7 @@ question `serverInfo.version` does. Four things that entry did not see:
 [`docs/releasing.md`](./docs/releasing.md) if the submission becomes a step.
 
 
-## 51. [windbg-mcp + dbgscope] `end_session` on a user-mode **attach** kills the process it attached to
+## 51. [windbg-mcp + dbgscope] `end_session` on a user-mode **attach** kills the process it attached to — **done** (2026-08-28)
 
 **What was measured** (x64 bench, 2026-08-27, found while testing
 [#234](https://github.com/glslang/windbg-mcp/issues/234) against the design it asked for).
@@ -3389,3 +3394,62 @@ that means terminated. The measurement is reproducible in a dozen lines: attach,
 poll the pid. `mcp_smoke::a_32_bit_managed_process_is_attached_by_an_engine_that_can_load_its_sos`
 is the tier that meets it, and deliberately does not assert the behaviour either way — pinning it
 would make something undecided read as decided.
+
+**What landed** (2026-08-28, glslang/dbgscope#121 and the windbg-mcp change pinning it). The
+proposal above, taken as written: an active detach for a session whose target the engine attached
+to, `DEBUG_END_PASSIVE` kept for a dump, a trace and a `launch`, and `bc *` first so an `int3` this
+engine patched in does not stay patched in a process that goes on running. All three of the things
+the entry said had to be settled first were, and none of them the way it guessed:
+
+- **Which opener a session came from does not have to cross the pipe.** The entry looked for the
+  fact in the worker, which does hold it. It belongs in the *engine*, because `Drop` has to make the
+  same decision with nobody left to ask it — the same reason `resume_and_detach_live_kernel` is
+  reachable from both. So `attach_process_begin` records it and `end_session` reads it. DbgEng
+  cannot be asked: `GetDebuggeeType` answers `DEBUG_CLASS_USER_WINDOWS` /
+  `DEBUG_USER_WINDOWS_PROCESS` for a launch and an attach alike.
+- **`launch` stays the other way, and the "possibly not uniformly" half is still not built.**
+  Keeping a launched process alive past its session is a question about the tool surface — an
+  argument on `launch` or on `end_session` — and nothing has asked for it. What did change is that
+  all three tools now *say* what ending will do to their kind of target, which is the half of this
+  entry that was about prose.
+- **An active detach can fail, and it degrades to the passive end** — but it still returns the
+  error, which the entry did not consider and which matters more than the degradation: this
+  teardown is on the disconnect path, where a session that will not close is worse than a killed
+  debuggee, and a caller told "released" would have no reason to go and look at a target that had
+  just been killed.
+
+**And the mechanism the entry gave was half wrong, in the way that mattered for testing it.** It
+read the kill as the *supervisor terminating the worker*, one step after `end_session`. It is not:
+the passive `EndSession` destroys the debug port itself, and the debuggee dies there — exit code
+`0xC0000354`, `STATUS_DEBUGGER_INACTIVE`, set before the call returns. That is what makes this
+testable inside a single process, which is why dbgscope carries the mechanism test and windbg-mcp's
+tier carries only what needs a real worker to terminate.
+
+**Two probes that look right and are not**, both discarded after they passed with the fix backed
+out or would have:
+
+- **`Child::try_wait`** answers `Ok(None)` — "still running" — for a process the kernel has already
+  killed, because the exit status is set while the process object is not yet signalled. The first
+  version of the dbgscope test was built on it and passed either way.
+- **`CheckRemoteDebuggerPresent`** reads `false` after *either* ending. The passive end really does
+  tear the debug port down; that is precisely why the process dies. "Is it still being debugged"
+  cannot separate the two.
+
+`GetExitCodeProcess` separates them completely — `STILL_ACTIVE` against `STATUS_DEBUGGER_INACTIVE`,
+ten runs each way on dbgeng 10.0.26100.1 (ARM64) — and is what both repos now use.
+
+**What is deliberately still open.** A worker killed while holding an attached target still takes
+the process down: `Release::Parked` terminates a worker that never answered, so nothing runs
+`end_session` and nothing detaches. `DEBUG_PROCESS_DETACH_ON_EXIT` at attach time would close that
+gap and was weighed and rejected — it leaves the process alive with whatever breakpoints were
+patched into it, which is a target that faults minutes later with nothing connecting it to the
+debugger, and it would make the two paths disagree about what a breakpoint means. The case is rare
+(a worker that will not answer inside the grace) and the present outcome is at least the one that
+was always there. Reopen it if a parked worker holding a live process turns out to be ordinary
+rather than exceptional.
+
+**One observation not reproduced**, recorded because a flake here would be worth recognising: on
+the very first paired run after a full rebuild, the detached `ping` exited `0xC0000005` instead of
+surviving. It has not recurred in the twenty-four consecutive runs since, on either the paired or
+the single-test path, and no later run has produced it. If it comes back it is about what the
+active detach leaves in the target, not about which branch was taken.

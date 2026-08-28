@@ -31,7 +31,7 @@ taken a second covered no debugger claim at all.
 | Tier | Gate | Needs | Catches |
 | --- | --- | --- | --- |
 | **Protocol** | always | no debugger, no target, and no network off this machine — it does bind a loopback port for the listener | transport, revision negotiation, tool-surface drift, and the listener's lease up to the point a session is opened |
-| **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump, and `cmd.exe` for the four that launch one | `dbgscope` / DbgEng regressions, a lease expiry releasing a real engine worker, and driving execution on a live user-mode target |
+| **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump, and a live user-mode target for the five that want one — `cmd.exe` for the four that launch, `ping` for the one that attaches | `dbgscope` / DbgEng regressions, a lease expiry releasing a real engine worker, driving execution on a live user-mode target, and what ending a session does to it |
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a live kernel target you can freeze — KDNET, or serial | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
 | **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
@@ -597,6 +597,24 @@ processes, so they need real ones:
   kernel, which is exactly why both bugs survived: the live-kernel tier was already on the bounded
   wait, and no other tier can `go` at all. The two above use a target that never stops; these two
   use one that is over on the first resume, and that difference is the whole of what they add.
+
+- *Ending a session leaves a process this server only attached to running.* `FOLLOWUPS.md` item 51,
+  and the only test here whose live target the debugger did **not** create: a `ping` started by the
+  test, attached to with `attach_process`, and still running after `end_session` — where it used to
+  be terminated, because the engine ended the session passively and a debuggee whose debug port is
+  destroyed is killed by the kernel. What this adds over the dbgscope test that covers the same
+  fix is the step the original report blamed and no engine-level test contains: the **supervisor
+  terminating the worker** afterwards. The result's own sentence is asserted beside the process,
+  because the two endings are opposite, neither is visible from the caller's side, and a wording
+  that stopped saying which one happened would leave the caller no way to tell.
+
+  **Asked of the kernel, not of `Child::try_wait`**, and that is the trap rather than a preference:
+  a debuggee the kernel kills has its exit status set before the call that killed it returns while
+  its process object is not yet signalled, so `try_wait` answers "still running" for a process that
+  is already dead. dbgscope's first version of this assertion passed with the fix backed out for
+  exactly that reason, and `CheckRemoteDebuggerPresent` is no better — it reads `false` after either
+  ending, since the passive end really does tear the debug port down, which is *why* the process
+  dies. The exit code is the only probe that separates them, and it separates them completely.
 
 **The listener's lease.** `--listen` gives up the one property stdio has for free: a closed stdin
 means the client is definitively gone, and every target is released. Over HTTP a silent client is
@@ -1228,7 +1246,11 @@ with the engine but no 32-bit `windbg-mcp.exe` beside it is a *half-populated* d
 Gating on the worker would also mean a second copy of `engine::x86_worker_image`'s rule — which has
 a fallback in it for a renamed running image — in a file that cannot call it.
 
-Two assertions per test, and the second is the one that took a wrong answer to find:
+Two assertions per test — three on the live one, which also checks its fixture is **still running**
+after `end_session` (`FOLLOWUPS.md` item 51). That is duplication of the tier above only in
+appearance: the 32-bit worker is a *second image*, and nothing else in the suite would notice if
+that one alone went back to taking its target with it. The second of the two is the one that took a
+wrong answer to find:
 
 - **No `limitation` on the summary.** The fallback is deliberately loud — a host with no 32-bit
   worker still opens the target, on the x64 build, because native analysis of it works and always
@@ -1250,6 +1272,14 @@ this build — reported as the `limitation` above, which reads as "this host has
 Re-run the two commands at the top of this section after every change, `cargo fmt` included: on a
 dirty tree that identity carries a digest over the uncommitted diff of `build.rs`'s `INPUTS`, so a
 reformat moves it.
+
+**And check the build actually happened, rather than that you asked for one.** Running
+`cargo build --target i686-pc-windows-msvc` in the same breath as a `git checkout` or
+`git reset --hard` has been seen answering `Finished in 0.09s` against files git had just
+rewritten — Cargo's freshness is mtime-based, and a source and a target stamped within the same
+second are not ordered. The failure then names the *target* ("this host could not give the target a
+32-bit worker"), so it reads as a missing engine rather than a build that declined to run.
+`(Get-Item build.rs).LastWriteTime = Get-Date` before the build forces it.
 
 ## Manual checklist
 
