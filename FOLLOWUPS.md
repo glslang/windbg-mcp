@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twenty-seven clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty-six clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/dbgscope#71, 2026-08-01), items 13–14 from the bounded-command coverage review
