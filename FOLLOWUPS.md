@@ -3475,6 +3475,17 @@ measurable. The same question came back in a form that *did* need answering, whi
 contrast: `GetNumberProcesses` **does** fail (`E_UNEXPECTED`) with no debuggee, so the process walk
 answers empty rather than asking.
 
+**A third round found a pid-reuse alias and asked for one thing that was declined.** A pid outlives
+the process it named, so an attached process that exits leaves a record matching nothing — harmless,
+until the operating system hands that number to a process the engine then *launches*, which would be
+detached and left running. The openers now prune records the session no longer holds, pruning rather
+than clearing so a live attachment beside a launch survives. Declined in the same round: sharing the
+record across two `DebugEngine` wrappers of one client. True that they cannot see each other's, and
+equally true of `deferred_inputs` — a session belongs to the wrapper that opened it — while the
+identity registry is keyed by client because it is a **cache tag**, which is what lets it evict on
+overflow. Losing an attachment kills a process, so it must not sit behind an eviction policy. The
+reason is in the field's doc comment, where the next round will meet it rather than re-raise it.
+
 **And the test for it cost a round of "the fix does not work" against a fix that did.** `@$tpid`
 answers for whichever process is *current*, and after a launch that is the launched process on a
 fresh engine and the **earlier** one on an engine that has held a target before — so the same
