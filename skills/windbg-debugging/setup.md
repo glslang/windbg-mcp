@@ -620,12 +620,18 @@ Four things decide whether the ollama route works, and none of them is about the
   something else. A *cloud* tag can declare it and still not be runnable — it is a registered name
   with no local weights, and the entitlement is resolved at inference — so send it one token first
   (`/api/generate` with `num_predict: 1`) rather than discovering it mid-run.
-- **A model that goes quiet loses its sessions**, and it reads as a broken server. A client whose
-  revision mints an `Mcp-Session-Id` holds the lease described above, and its grace is derived from
-  how long a *call* may take — on the assumption that the server is the slow party. A model
-  thinking, or a cloud request being queued, is silence with nothing in flight: past the grace the
-  sweep releases that credential's sessions and every later call answers `404`. The driver pings
-  during a long turn; anything else driving the listener needs its own equivalent.
+- **A model that goes quiet can lose its sessions, and which of the two clocks above takes them
+  depends on the revision its client negotiated** — so the remedy is not the same one. A client
+  still minting an `Mcp-Session-Id` holds the **lease**, whose grace is derived from how long a
+  *call* may take, on the assumption that the server is the slow party; a thinking model or a queued
+  cloud request is silence with nothing in flight, and *any* admitted request renews it, which is
+  why the benchmark's driver simply pings. A client on `2026-07-28` — most of them now — is never
+  leased, and what reclaims its targets is the 30-minute **idle release** instead, which a ping
+  cannot refresh: only a call that reaches that session's engine counts, which is the same rule that
+  makes `session_status` polling useless above. So do not fit a keepalive to a stateless client. It
+  needs real work, a longer `WINDBG_MCP_SESSION_IDLE_SECS`, or nothing at all — thirty minutes of
+  thinking is a much rarer thing than the lease's grace, and a session with a call still outstanding
+  is spared either way.
 - **The surface is the fixed cost and a single answer is the variable one.** All 51 tools are about
   70 kB of JSON, paid once per conversation and narrowable per client with `--tools`; one careless
   `read_memory` is up to ~4 MiB, paid on the spot. Narrowing costs fewer *answers* than it does

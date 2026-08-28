@@ -89,7 +89,9 @@ claude mcp add windbg-vm --scope local --transport http http://127.0.0.1:8765/ \
 an ollama model holds that endpoint exactly as an editor does, and ollama ships integrations for
 several of them — `ollama launch` lists them, `ollama launch claude --model <tag>` being one. That
 is the ordinary way to do this, it needs nothing from this repository, and everything below about
-credentials, model choice and the lease applies to it unchanged.
+credentials and model choice applies to it unchanged. The **lease** is the one thing that does not:
+which clock reclaims an idle target depends on the revision a client negotiates, and the keepalive
+section says which is which.
 
 The rest of this page is the **other** way, which exists to *measure* rather than to debug.
 [`tools/local_model_drive.py`](../tools/local_model_drive.py) speaks MCP over HTTP to the listener,
@@ -423,6 +425,14 @@ whole tasks in 4 to 10 seconds, two orders off the 440.6s that produced this —
 measures is *silence*, and a queued or rate-limited request is silent in exactly the same way a
 thinking one is. Nothing here has been throttled yet, so that is a prediction rather than a
 measurement; the keepalive costs nothing either way, which is why it stays on by default.
+
+**And it is the driver's answer, not everyone's.** This whole failure is a *lease* failure, and the
+driver is leased because it negotiates `2025-06-18`. A client on `2026-07-28` is never leased at
+all: its targets are reclaimed by the 30-minute per-session idle release instead, which a ping
+cannot refresh — only a call that reaches that session's engine counts, so `session_status` polling
+does not either. A keepalive fitted to such a client keeps nothing alive.
+[`remote-listener.md`](./remote-listener.md) has both clocks, and
+`WINDBG_MCP_SESSION_IDLE_SECS` is the one that moves the second.
 
 ## What to measure
 
