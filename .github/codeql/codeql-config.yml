@@ -1,0 +1,22 @@
+# CodeQL analysis config, read by `.github/workflows/codeql.yml`.
+#
+# It exists for one property GitHub's *default* setup cannot express: a path filter. Default setup
+# takes no config file at all, so excluding a directory means owning the workflow — which is the
+# whole reason this repo has an advanced setup. The workflow's header carries that trade.
+
+name: windbg-mcp
+
+paths-ignore:
+  # `tests/mcp_smoke.rs` drives the built binary over stdio, so its assertion messages are full of
+  # session handles, ports and fake credentials — which is what an assertion is *for*, and what a
+  # taint scanner reads as a program logging a secret. Four `rust/cleartext-logging` alerts came
+  # from exactly that shape: an `assert!`/`panic!` naming the `session_id` it failed to find.
+  #
+  # A session handle is not a credential here. `engine::mint_session_id` says so in as many words
+  # — it "exists to name a worker, not to authenticate" — and `Sessions::resolve` reports a handle
+  # whose `owner != caller` as *unknown*, so holding someone else's buys nothing. The rule was
+  # wrong rather than early.
+  #
+  # The cost, stated plainly because nothing else will state it: a genuine finding in the smoke
+  # harness is now unreported. That is judged worth it for a file whose job is to print state.
+  - tests/**
