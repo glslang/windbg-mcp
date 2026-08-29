@@ -19,6 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([#131](https://github.com/glslang/windbg-mcp/issues/131)) and above the machine-wide installs,
   since the payload next to the binary is the pair to the engine the loader actually gives this
   process.
+- **A symbol path can now seed later sessions without coupling running workers
+  ([#66](https://github.com/glslang/windbg-mcp/issues/66)).** `set_symbol_path` accepts
+  `for_new_sessions`: `true` remembers the successful `path`/`append` setting for this client's
+  future opens, `false` clears it, and omission keeps the existing session-only behavior. The
+  supervisor applies that starting state on the new worker's engine thread before its opener; it
+  never broadcasts a reload or path mutation to sessions already running, and listener clients
+  cannot inherit one another's host paths.
 - **`end_session` stops accepting work when its teardown reaches the front of the session queue
   ([#64](https://github.com/glslang/windbg-mcp/issues/64)).** The pump now marks the session closed
   immediately before forwarding `EndSession`: calls already ahead of it still run, while calls

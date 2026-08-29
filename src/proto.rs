@@ -176,8 +176,7 @@ pub enum EngineOp {
     /// [`Self::BoundedCommand`]'s is.
     Walk(WalkOp),
     SymbolPath {
-        path: String,
-        append: bool,
+        setting: SymbolPathSetting,
         reload: String,
     },
     RunToAddress {
@@ -280,6 +279,19 @@ pub enum EngineOp {
     /// boundary. Interrupting the engine itself is a different mechanism (`SetInterrupt`, bound to
     /// job identity) and is not this.
     EndSession,
+}
+
+/// A symbol-path mutation that can be applied to either one session or a worker before it opens
+/// its target.
+///
+/// `reload` is deliberately not part of this value. It belongs to the session the caller changed:
+/// replaying a module-qualified reload in an unrelated future target could fail its open for a
+/// module it does not even contain. A worker given this as startup state applies it before the
+/// target is opened, so that target loads against the configured path without a replayed reload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolPathSetting {
+    pub path: String,
+    pub append: bool,
 }
 
 impl EngineOp {
@@ -752,6 +764,9 @@ mod tests {
 pub struct WorkerRequest {
     pub id: u64,
     pub op: EngineOp,
+    /// Supervisor-held starting state for an opener. Absent on every ordinary request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_symbol_path: Option<SymbolPathSetting>,
 }
 
 /// A message up the worker's stdout.

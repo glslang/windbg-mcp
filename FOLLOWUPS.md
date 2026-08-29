@@ -327,11 +327,11 @@ What moved, for anyone picking up the items that referenced this:
   supervisor never touches a `DebugEngine` at all, which is a stronger position than the one that
   claim was written for.
 
-Not done, and no longer blocking anything: **per-worker symbol state** —
-[#66](https://github.com/glslang/windbg-mcp/issues/66). Each worker has its own `.sympath` and symbol
-cache, which is correct (sessions are independent) but means a `set_symbol_path` does not carry to a
-session opened later. The fix is a supervisor-held default applied at worker startup, not shared
-state between running workers.
+Fixed since: **per-worker symbol state** —
+[#66](https://github.com/glslang/windbg-mcp/issues/66). Each worker still owns its own `.sympath`
+and symbol cache, but `set_symbol_path { "for_new_sessions": true, … }` records a client-scoped
+starting mutation in the supervisor and applies it before that client's later workers open their
+targets. Session-only overrides remain the default, and no update is pushed into a running worker.
 
 Fixed since, from the same review: [#67](https://github.com/glslang/windbg-mcp/issues/67) — workers
 were spawned with `kill_on_drop`, so a worker shutdown missed was terminated with its target still

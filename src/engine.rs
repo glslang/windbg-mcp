@@ -38,7 +38,7 @@ use tokio::sync::{mpsc, oneshot};
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
 use crate::kdconn;
-use crate::proto::{EngineOp, Output, WorkerMessage, WorkerRequest};
+use crate::proto::{EngineOp, Output, SymbolPathSetting, WorkerMessage, WorkerRequest};
 use crate::worker::{MESSAGES_FLAG, REQUESTS_FLAG, TARGET_FLAG, WORKER_FLAG};
 
 /// How many sessions may be open at once.
@@ -711,6 +711,7 @@ impl Session {
 struct Job {
     id: u64,
     op: EngineOp,
+    startup_symbol_path: Option<SymbolPathSetting>,
     submitted: Instant,
     gate: Gate,
 }
@@ -775,6 +776,7 @@ enum Wait {
 /// A call to run against a session.
 pub struct Call {
     op: EngineOp,
+    startup_symbol_path: Option<SymbolPathSetting>,
     gate: Gate,
 }
 
@@ -783,6 +785,7 @@ impl Call {
     pub fn new(op: EngineOp) -> Self {
         Self {
             op,
+            startup_symbol_path: None,
             gate: Gate {
                 on: On::Default,
                 retires: None,
@@ -804,6 +807,13 @@ impl Call {
         self
     }
 
+    /// Carries supervisor-held starting state on an opener's first worker request.
+    fn starting_with_symbols(mut self, setting: Option<SymbolPathSetting>) -> Self {
+        debug_assert!(self.op.is_opener(), "startup symbols belong on an opener");
+        self.startup_symbol_path = setting;
+        self
+    }
+
     /// Marks this call as the point where its session stops accepting work.
     fn closing(mut self, why: impl Into<String>) -> Self {
         self.gate.closes = Some(why.into());
@@ -814,6 +824,7 @@ impl Call {
     fn supervisor(op: EngineOp) -> Self {
         Self {
             op,
+            startup_symbol_path: None,
             gate: Gate {
                 on: On::Supervisor,
                 retires: None,
@@ -933,6 +944,11 @@ struct Registry {
     /// Credentials that have been **revoked**, whose sessions must stop growing for the same
     /// reason `closing` exists — see [`Sessions::revoke`].
     revoked: std::collections::HashSet<crate::client::Client>,
+    /// The symbol-path mutation each client explicitly asked future workers to start with.
+    ///
+    /// This is client state for the same reason sessions are: a listener credential is an
+    /// isolation boundary, and one caller's host paths must not change another caller's opens.
+    symbol_paths: HashMap<crate::client::Client, SymbolPathSetting>,
 }
 
 impl Registry {
@@ -1065,6 +1081,30 @@ impl Sessions {
         self.rec.clone()
     }
 
+    /// Sets or clears the calling client's starting symbol path for workers opened later.
+    ///
+    /// The tool calls this only after the same mutation succeeded in its current session, so a
+    /// path DbgEng refused can never become startup state. Existing workers are deliberately not
+    /// visited: this is a starting point, not shared engine state.
+    pub fn set_startup_symbol_path(&self, setting: Option<SymbolPathSetting>) {
+        let owner = crate::client::current();
+        let mut registry = self.registry();
+        match setting {
+            Some(setting) => {
+                registry.symbol_paths.insert(owner, setting);
+            }
+            None => {
+                registry.symbol_paths.remove(&owner);
+            }
+        }
+    }
+
+    /// Snapshots the calling client's starting symbol path for one open.
+    fn startup_symbol_path(&self) -> Option<SymbolPathSetting> {
+        let owner = crate::client::current();
+        self.registry().symbol_paths.get(&owner).cloned()
+    }
+
     fn registry(&self) -> std::sync::MutexGuard<'_, Registry> {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -1163,7 +1203,9 @@ impl Sessions {
     /// lived there. What it leaves behind is a name and a `u64` per revocation, for the life of the
     /// process.
     pub fn revoke(&self, owner: &crate::client::Client) {
-        self.registry().revoked.insert(owner.clone());
+        let mut registry = self.registry();
+        registry.revoked.insert(owner.clone());
+        registry.symbol_paths.remove(owner);
     }
 
     pub fn snapshot(&self) -> Vec<SessionSnapshot> {
@@ -1251,6 +1293,7 @@ impl Sessions {
         let queued = session.tx.send(Job {
             id,
             op: call.op,
+            startup_symbol_path: call.startup_symbol_path,
             submitted: Instant::now(),
             gate: call.gate,
         });
@@ -1329,6 +1372,9 @@ impl Sessions {
         op: EngineOp,
     ) -> Result<OpenReport, OpenError> {
         debug_assert!(op.is_opener(), "open() needs an opener op");
+        // A default belongs to the moment an open starts. One changed while this worker is being
+        // selected or spawned affects the next open, not a request already in flight.
+        let startup_symbol_path = self.startup_symbol_path();
         // Take a slot before doing anything expensive, but do **not** reclaim anything yet — see
         // `take_slot` and `reconcile_capacity` for why those are separate.
         let slot = self.take_slot().map_err(OpenError::NoRoom)?;
@@ -1391,7 +1437,7 @@ impl Sessions {
         let out = self
             .call_as(
                 &session,
-                Call::new(op),
+                Call::new(op).starting_with_symbols(startup_symbol_path),
                 self.call_timeout,
                 OPENER_JOB,
                 Wait::Fixed,
@@ -3003,7 +3049,11 @@ fn pump(
         if let Some(patience_ms) = op.patience_slot() {
             *patience_ms = remaining_patience_ms(call_timeout, job.submitted);
         }
-        let request = WorkerRequest { id: job.id, op };
+        let request = WorkerRequest {
+            id: job.id,
+            op,
+            startup_symbol_path: job.startup_symbol_path,
+        };
         let Ok(mut line) = serde_json::to_string(&request) else {
             answer(Err(EngineError::Debugger(
                 "could not encode this operation for the engine worker".to_string(),
@@ -3581,6 +3631,66 @@ mod tests {
         .await;
     }
 
+    /// A remembered symbol path is client state, not server state. Rotation keeps the same typed
+    /// identity and therefore the setting; revocation removes it, and a later holder of the same
+    /// visible name starts from nothing.
+    #[tokio::test]
+    async fn startup_symbol_paths_follow_client_identity_and_revocation() {
+        let sessions = Sessions::new(Duration::from_secs(1));
+        let original = crate::client::Client::incarnate("ci", 1);
+        let replacement = crate::client::Client::incarnate("ci", 2);
+        let other = crate::client::Client::incarnate("other", 3);
+        let first = SymbolPathSetting {
+            path: r"C:\symbols\first".to_string(),
+            append: true,
+        };
+        let second = SymbolPathSetting {
+            path: r"D:\symbols\second".to_string(),
+            append: false,
+        };
+
+        crate::client::as_client(original.clone(), async {
+            assert_eq!(sessions.startup_symbol_path(), None);
+            sessions.set_startup_symbol_path(Some(first.clone()));
+            assert_eq!(sessions.startup_symbol_path(), Some(first.clone()));
+            // The latest explicit setting replaces the earlier starting mutation.
+            sessions.set_startup_symbol_path(Some(second.clone()));
+            assert_eq!(sessions.startup_symbol_path(), Some(second.clone()));
+            sessions.set_startup_symbol_path(None);
+            assert_eq!(sessions.startup_symbol_path(), None);
+            sessions.set_startup_symbol_path(Some(second.clone()));
+        })
+        .await;
+
+        crate::client::as_client(other, async {
+            assert_eq!(
+                sessions.startup_symbol_path(),
+                None,
+                "one client inherited another client's host path"
+            );
+        })
+        .await;
+
+        // A token rotation supplies this same identity, so it still sees the setting.
+        crate::client::as_client(original.clone(), async {
+            assert_eq!(sessions.startup_symbol_path(), Some(second));
+        })
+        .await;
+        sessions.revoke(&original);
+        crate::client::as_client(original, async {
+            assert_eq!(sessions.startup_symbol_path(), None);
+        })
+        .await;
+        crate::client::as_client(replacement, async {
+            assert_eq!(
+                sessions.startup_symbol_path(),
+                None,
+                "a name given back inherited the revoked incarnation's setting"
+            );
+        })
+        .await;
+    }
+
     /// And it is not listed either. Reporting another client's sessions would hand over handles it
     /// cannot use, and say how many clients this server has and what they are debugging.
     #[tokio::test]
@@ -3816,6 +3926,51 @@ mod tests {
         (Arc::new(Session { tx, ..session }), rx)
     }
 
+    /// The starting path travels on the opener's request itself. Sending a standalone setup job
+    /// would make the worker briefly routable between setup and open, and would let another call
+    /// occupy that gap.
+    #[test]
+    fn an_opener_carries_its_starting_symbol_path_on_the_same_request() {
+        let (session, rx) = queued("sess-1", SessionState::Opening);
+        let waiters = Arc::clone(&session.waiters);
+        let (requests, worker) = std::io::pipe().expect("a pipe to stand in for the worker's");
+        let setting = SymbolPathSetting {
+            path: r"C:\symbols\driver".to_string(),
+            append: true,
+        };
+        let call = Call::new(EngineOp::OpenDump {
+            path: r"C:\dumps\sample.dmp".to_string(),
+        })
+        .starting_with_symbols(Some(setting.clone()));
+        session
+            .tx
+            .send(Job {
+                id: OPENER_JOB,
+                op: call.op,
+                startup_symbol_path: call.startup_symbol_path,
+                submitted: Instant::now(),
+                gate: call.gate,
+            })
+            .expect("the pump's queue is open");
+
+        let pumping = std::thread::spawn({
+            let session = Arc::downgrade(&session);
+            move || pump(session, rx, worker, waiters, Duration::from_secs(30))
+        });
+        let mut requests = std::io::BufReader::new(requests);
+        let mut line = String::new();
+        requests
+            .read_line(&mut line)
+            .expect("read the opener request");
+        let request: WorkerRequest =
+            serde_json::from_str(&line).expect("the worker request is JSON");
+        assert!(request.op.is_opener());
+        assert_eq!(request.startup_symbol_path, Some(setting));
+
+        drop(session);
+        pumping.join().expect("the pump stops with its session");
+    }
+
     /// Closing is a queue operation, not a caller-side state change. Work already ahead of an
     /// `EndSession` must reach the worker, while work queued behind it must be refused even though
     /// it was submitted while the session still looked open.
@@ -3848,6 +4003,7 @@ mod tests {
                     .send(Job {
                         id,
                         op: call.op,
+                        startup_symbol_path: call.startup_symbol_path,
                         submitted: Instant::now(),
                         gate: call.gate,
                     })

@@ -54,7 +54,7 @@ use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 use crate::batch::{self, BatchOp, Debuggee, Ran};
 use crate::proto::{
     EngineOp, Failed, HeapBackendFilter, HeapOp, HeapStateFilter, MAX_MODULE_ROWS, Output, PoolOp,
-    ReachabilityOp, WorkerMessage, WorkerRequest,
+    ReachabilityOp, SymbolPathSetting, WorkerMessage, WorkerRequest,
 };
 use crate::server::{
     EXEC_WAIT_MS, fmt_addr, format_recipe, format_report, hexdump, matches_module_pattern,
@@ -868,6 +868,14 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
         // surface it as an error for this one op. The engine survives, so this stays a
         // debugger-level failure the model can work around by trying something else.
         let result = catch_unwind(AssertUnwindSafe(|| {
+            if let Some(setting) = request.startup_symbol_path {
+                if !request.op.is_opener() {
+                    return Err(Failed::from(
+                        "startup symbol state was attached to a request that is not an opener",
+                    ));
+                }
+                apply_symbol_path(&engine, &setting).map_err(Failed::from)?;
+            }
             execute(&engine, id, request.op, queued)
         }))
         .unwrap_or_else(|_| Err(Failed::from("debugger operation panicked")));
@@ -1123,6 +1131,18 @@ fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Fail
     }
 }
 
+/// Applies one symbol-path mutation through DbgEng's typed API.
+///
+/// Shared by the ordinary tool and an opener's supervisor-held starting state so the two cannot
+/// drift into different interpretations of `append`.
+fn apply_symbol_path(e: &DebugEngine, setting: &SymbolPathSetting) -> Result<(), String> {
+    if setting.append {
+        e.append_symbol_path(&setting.path).map_err(es)
+    } else {
+        e.set_symbol_path(&setting.path).map_err(es)
+    }
+}
+
 /// Runs one op against this worker's engine. `queued` is how long it waited its turn here, which
 /// only the bounded-command path cares about.
 fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<Output, Failed> {
@@ -1349,16 +1369,8 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
                 )),
             }
         }
-        EngineOp::SymbolPath {
-            path,
-            append,
-            reload,
-        } => {
-            if append {
-                e.append_symbol_path(&path).map_err(es)?;
-            } else {
-                e.set_symbol_path(&path).map_err(es)?;
-            }
+        EngineOp::SymbolPath { setting, reload } => {
+            apply_symbol_path(e, &setting).map_err(Failed::from)?;
             // Reload so the new path takes effect (default: all deferred modules).
             e.reload_symbols(&reload).map_err(es)?;
             // Echo the effective path so the caller can confirm what resolved.

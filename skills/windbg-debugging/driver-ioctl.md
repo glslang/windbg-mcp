@@ -70,7 +70,9 @@ reads.
 > the engine wants with `execute { "command": "!sym noisy; .reload /f <driver>.sys" }` (it prints
 > `<pdb>\<GUID>\…`), then **ask the user for the folder holding that PDB** — it must be on *this*
 > debugger host (symbols are never pulled from the target over the KD wire) — and apply it with
-> `set_symbol_path { "path": "<folder>", "reload": "/f <driver>.sys" }`. Names like
+> `set_symbol_path { "path": "<folder>", "reload": "/f <driver>.sys", "for_new_sessions": true }`
+> when later sessions should start with the same folder; omit `for_new_sessions` for an override
+> confined to this session. Names like
 > `HEVD!IrpDeviceIoCtlHandler` / `HEVD!ArbitraryWriteIoctlHandler` then resolve.
 
 ## Static reachability — dispatch → handler (`reachable_from_dispatch`)

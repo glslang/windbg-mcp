@@ -371,12 +371,12 @@
     },
     {
       "annotations": 123,
-      "description": 465,
-      "inputSchema": 1125,
-      "modelVisible": 1646,
+      "description": 602,
+      "inputSchema": 1559,
+      "modelVisible": 2217,
       "name": "set_symbol_path",
       "outputSchema": 0,
-      "wire": 1784
+      "wire": 2355
     },
     {
       "annotations": 116,
@@ -462,14 +462,14 @@
   ],
   "totals": {
     "annotations": 5449,
-    "description": 25406,
-    "inputSchema": 40259,
+    "description": 25543,
+    "inputSchema": 40693,
     "instructions": 1983,
-    "modelVisible": 68322,
+    "modelVisible": 68893,
     "outputSchema": 104589,
-    "payload": 179771,
+    "payload": 180342,
     "tools": 51,
-    "wire": 179653,
+    "wire": 180224,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 9798
   }
