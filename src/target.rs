@@ -281,8 +281,10 @@ pub fn read(path: &Path) -> io::Result<DumpTarget> {
 
     // The system-info stream holds `ProcessorArchitecture` as its very first field.
     let system_info_rva = directory
-        .chunks_exact(DIRECTORY_ENTRY_LEN)
-        .find(|entry| u32_at(entry, 0) == SYSTEM_INFO_STREAM)
+        .as_chunks::<DIRECTORY_ENTRY_LEN>()
+        .0
+        .iter()
+        .find(|entry| u32_at(*entry, 0) == SYSTEM_INFO_STREAM)
         .map(|entry| u32_at(entry, 8))
         .ok_or_else(|| {
             io::Error::new(
