@@ -729,22 +729,31 @@ Two things that copy turned up, neither of them anticipated:
   against a supervisor sitting idle with an empty session list. Same mechanism this file already
   records for the 32-bit worker, which is why an `x86\windbg-mcp.exe` with no engine beside it
   fails to *start* rather than failing to open a dump.
-- **`find_ttd` does not look beside the executable.** It probes `PATH`, the SDK layout and
-  `WindowsApps`, so the `ttd\TTD.exe` the engine copy just delivered is *not* found by
-  `record_trace` — the recorder has to be put on `PATH` even though it is now sitting next to the
-  server. `setup.md` says so at the point of the copy. Adding `<exe dir>\ttd\TTD.exe` to the probe
-  is a one-line change and is deliberately **not** in this docs-only PR.
+- **`find_ttd` did not look beside the executable** — it probed `PATH`, the SDK layout and
+  `WindowsApps`, so the `ttd\TTD.exe` the engine copy delivers was reachable only by *also* putting
+  it on `PATH`. The probe this project's own documentation tells people to create was the one
+  layout it did not know, which meant a host bundled exactly as documented could replay a trace and
+  not record one. Fixed here (`recorder_beside`), ranked below `PATH` so the
+  [#131](https://github.com/glslang/windbg-mcp/issues/131) override still wins and above the
+  machine-wide installs, because the payload beside the executable is the pair to the engine this
+  process actually loads. Note the ARM64 bench cannot *demonstrate* the old failure: `TTD.exe` is
+  on its `PATH`, which is [#132](https://github.com/glslang/windbg-mcp/issues/132)'s own stated
+  workaround — "the recorder is a plain executable and can be extracted to any directory on
+  `PATH`". That is the workaround this removes the need for, and since `PATH` is still probed
+  first the fix changes nothing on a host that took it. The failure is covered by unit test
+  instead, which is also how item 20's ordering is covered and for the same reason.
 
 Picks up at [`setup.md`](./skills/windbg-debugging/setup.md)'s *WinDbg engine + extensions* — the
 three sources and the one copy — and its *Unpacking the `.msixbundle`* subsection, plus
 [#132](https://github.com/glslang/windbg-mcp/issues/132).
 
-**Left open.** Nothing checks that a bundled `ttd\` matches the binary's architecture:
-`worker::replay_engine_bundled` asks whether the directory is non-empty, deliberately, since the
-alternative is a PE read per file against a layout WinDbg owns. A wrong-architecture copy therefore
-still surfaces as DbgEng's bare `0x80070057`, which is the behaviour without the diagnostic rather
-than a regression from it — and `setup.md` states the rule at the point the copy is made, which is
-the only place it can be acted on.
+**Nothing left open, and one thing deliberately not done.** `worker::replay_engine_bundled` asks
+whether `ttd\` is non-empty and *not* whether its contents match the binary's architecture, which
+is a decision rather than a gap: the alternative is a PE read per file against a layout WinDbg owns
+and may change. A wrong-architecture copy therefore still surfaces as DbgEng's bare `0x80070057` —
+the behaviour without the diagnostic rather than a regression from it — and `setup.md` states the
+rule at the point the copy is made, which is the only place it can be acted on. Revisit only if
+someone actually lands a mismatched bundle; nobody has.
 
 ## 22. [windbg-mcp] Run the debugger tier on an ARM64 runner — **done** (2026-08-16, #134)
 

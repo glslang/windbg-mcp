@@ -16,8 +16,8 @@
   `.run` traces (`0x80070057`). You need the **WinDbg engine** (which bundles the TTD replay
   components) loaded next to the binary — see *Bundling the WinDbg engine* below.
 - `TTD.exe` (the standalone Time Travel Debugging recorder) for `record_trace` — it sits at
-  `ttd\TTD.exe` inside the WinDbg payload, so the engine copy below already brings it; put it on
-  `PATH`.
+  `ttd\TTD.exe` inside the WinDbg payload, so the engine copy below already brings it and the
+  server finds it there. A copy on `PATH` still wins, which is how you override the choice.
 - A reachable symbol server (e.g. `srv*https://msdl.microsoft.com/download/symbols`) for symbol-name
   queries like `ttd_calls("ucrtbase!_stdio_common_vfprintf")`. Offline, address-based queries and the
   data model still work; symbol *names* won't resolve.

@@ -76,13 +76,21 @@ fn probe_order() -> [Arch; 3] {
     }
 }
 
-/// Best-effort search for `TTD.exe` from an installed Windows debugging toolset.
+/// Best-effort search for `TTD.exe` — from `PATH`, from the engine payload bundled beside this
+/// executable, or from an installed Windows debugging toolset, in that order.
 pub fn find_ttd() -> Option<PathBuf> {
     // 1. Anything already on PATH. First, and so the way to override everything below.
     if let Some(p) = search_path("TTD.exe") {
         return Some(p);
     }
-    // 2. Classic SDK "Debugging Tools for Windows".
+    // 2. The engine payload bundled beside this executable.
+    if let Some(p) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().and_then(recorder_beside))
+    {
+        return Some(p);
+    }
+    // 3. Classic SDK "Debugging Tools for Windows".
     for arch in probe_order() {
         let p = PathBuf::from(format!(
             r"C:\Program Files (x86)\Windows Kits\10\Debuggers\{}\TTD\TTD.exe",
@@ -92,8 +100,29 @@ pub fn find_ttd() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    // 3. Modern WinDbg (MSIX) package layout.
+    // 4. Modern WinDbg (MSIX) package layout.
     find_in_windowsapps()
+}
+
+/// The recorder inside an engine payload copied next to `dir`, if there is one.
+///
+/// `setup.md`'s engine copy takes the whole `ttd\` directory, and that directory carries
+/// **`TTD.exe`** as well as the replay DLLs — so a host that bundled an engine so `open_trace`
+/// would work already has a recorder, of the payload's architecture, which is by construction the
+/// one this binary matches. Until 2026-08-29 the probe knew the two *installed* layouts and not the
+/// one this project's own documentation tells people to create, so that recorder was reachable
+/// only by also putting it on `PATH`.
+///
+/// Ranked below `PATH`, which stays the override
+/// ([#131](https://github.com/glslang/windbg-mcp/issues/131)), and above the machine-wide installs:
+/// the payload beside the executable is the pair to the engine this process actually loads, since
+/// the loader searches the application directory before `System32`.
+///
+/// Takes the directory rather than reading `current_exe` itself so it can be tested against a
+/// layout built in a scratch directory.
+fn recorder_beside(dir: &Path) -> Option<PathBuf> {
+    let candidate = dir.join("ttd").join("TTD.exe");
+    candidate.is_file().then_some(candidate)
 }
 
 fn search_path(exe: &str) -> Option<PathBuf> {
@@ -557,8 +586,8 @@ fn first_meaningful_line(log: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Arch, failure_detail, finished_trace, first_meaningful_line, probe_order, split_argv,
-        split_env_entry, split_target, trace_named_in,
+        Arch, failure_detail, finished_trace, first_meaningful_line, probe_order, recorder_beside,
+        split_argv, split_env_entry, split_target, trace_named_in,
     };
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime};
@@ -912,6 +941,40 @@ mod tests {
             };
             assert_eq!(order[0], arch);
         }
+    }
+
+    /// The recorder that arrives with the engine payload is found without also being on `PATH`.
+    ///
+    /// `setup.md`'s engine copy brings `ttd\TTD.exe` along with the replay DLLs, and until this
+    /// existed the probe knew the two *installed* layouts and not the one that copy creates — so a
+    /// host bundled exactly as documented could replay a trace and not record one.
+    #[test]
+    fn the_recorder_bundled_beside_the_binary_is_found() {
+        let dir = scratch("beside");
+        assert_eq!(
+            recorder_beside(&dir),
+            None,
+            "nothing bundled yet, so nothing to find"
+        );
+
+        std::fs::create_dir_all(dir.join("ttd")).expect("create the ttd directory");
+        assert_eq!(
+            recorder_beside(&dir),
+            None,
+            "a `ttd\\` holding replay DLLs but no recorder is the ordinary case for a payload              copied file by file, and is not a recorder"
+        );
+
+        let exe = dir.join("ttd").join("TTD.exe");
+        std::fs::write(&exe, b"MZ").expect("write the recorder");
+        assert_eq!(recorder_beside(&dir), Some(exe));
+    }
+
+    /// A directory named `TTD.exe` is not a recorder, which `is_file` is what separates.
+    #[test]
+    fn a_directory_named_like_the_recorder_is_not_one() {
+        let dir = scratch("beside-dir");
+        std::fs::create_dir_all(dir.join("ttd").join("TTD.exe")).expect("create the decoy");
+        assert_eq!(recorder_beside(&dir), None);
     }
 
     /// The two installers spell x64 differently, and crossing them selects the wrong recorder.
