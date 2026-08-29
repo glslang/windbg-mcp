@@ -17,6 +17,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   finishes, the provisional closed reason is refined with whether the target was released, the
   worker was parked, or it was already gone.
 
+### Documentation
+
+- **The WinDbg engine payload has three sources, not one, and the two that need no interactive
+  install are now first-class** (issue
+  [#132](https://github.com/glslang/windbg-mcp/issues/132)). TTD `.run` replay needs a `ttd\`
+  directory beside `windbg-mcp.exe`; System32's `dbgeng.dll` ships none of it, the SDK Debugging
+  Tools do not either, and MSIX registration fails from a non-interactive session
+  (`Add-AppxPackage` → `0x80070005`, even elevated) — so a host reached over SSH could record
+  traces and not replay them. `setup.md` had carried the way through since #133, as an appendix
+  headed *when the store package will not install*; it is now source (b) of three named up front,
+  because the store package's `InstallLocation\<arch>` and the unpacked `.msixbundle`'s `<arch>\`
+  are the **same layout** — so the three sources differ only in how they set `$wd` and the copy
+  after them is one block rather than two. What decided it was that this repository's own TTD smoke
+  tier already runs against an engine bundled that way, so the route the documentation held at
+  arm's length was the one its coverage stood on.
+- **That recipe did not work, and had not since the day it was written** (`8bd98a5`, 2026-08-16).
+  Its first line read the `.appinstaller` with `(Invoke-WebRequest …).Content` and cast it to
+  `[xml]`; under Windows PowerShell 5.1 that property is a `Byte[]` for this content type, so the
+  cast threw and nothing was downloaded at all. It now fetches to a file and reads it back with
+  `Get-Content -Raw`, which is version-proof. Found by running it end to end for the first time, on
+  the ARM64 host the issue was filed from — which also measured what the endorsement rests on: the
+  bundle verifies as `Valid` / `Authenticode` / `CN=Microsoft Corporation`, is 1,188,564,441 bytes,
+  and **all three** payload trees inside it (`amd64\`, `arm64\`, `x86\`) hold the entire copy
+  list, `msdia140.dll` included — plus `ttd\TTD.exe`, so the engine copy already brings the
+  *recorder* and not just the replay engine, which `setup.md` and `docs/install.md` now say. The
+  recipe gains a publisher check before it unpacks anything, and `setup.md` states what that
+  settles (provenance) and what it does not (that an unregistered payload is a supported Microsoft
+  configuration). That bench was then bundled from the payload and **replays**: a 40 MB trace
+  recorded with the bundled `ttd\TTD.exe`, opened by `open_trace` reporting its lifetime rather
+  than the missing-`ttd\` diagnostic, and stepped backward with `step_back`. The issue is closed
+  on the host it was filed from, and `FOLLOWUPS.md` item 47's blocker — TTD replay being
+  unavailable on that bench — goes with it.
+
 ## [0.13.2] - 2026-08-28
 
 ### Documentation

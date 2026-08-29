@@ -15,8 +15,9 @@
 - **For Time Travel Debugging (`.run`) replay**, the System32 engine is *not* enough — it rejects
   `.run` traces (`0x80070057`). You need the **WinDbg engine** (which bundles the TTD replay
   components) loaded next to the binary — see *Bundling the WinDbg engine* below.
-- `TTD.exe` (the standalone Time Travel Debugging recorder) for `record_trace` — ships with the
-  WinDbg / TTD store packages; put it on `PATH`.
+- `TTD.exe` (the standalone Time Travel Debugging recorder) for `record_trace` — it sits at
+  `ttd\TTD.exe` inside the WinDbg payload, so the engine copy below already brings it; put it on
+  `PATH`.
 - A reachable symbol server (e.g. `srv*https://msdl.microsoft.com/download/symbols`) for symbol-name
   queries like `ttd_calls("ucrtbase!_stdio_common_vfprintf")`. Offline, address-based queries and the
   data model still work; symbol *names* won't resolve.
@@ -111,8 +112,10 @@ the attach itself works on the System32 engine. The last row is that same loader
 exception to it: the 32-bit engine goes *inside* `x86\` because it is the 32-bit worker sitting
 there that has to find it, and dropping it beside the 64-bit one instead breaks both.
 
-**The copy list, what each file buys, and what to do when the store package will not install are in
-the skill's [`setup.md`](../skills/windbg-debugging/setup.md).**
+**The copy list, what each file buys, and the three sources it can come from — an installed store
+package, the same package's `.msixbundle` unpacked without installing it, or the Windows SDK
+Debugging Tools, which ship everything except `msdia140.dll` and `ttd\` — are in the skill's
+[`setup.md`](../skills/windbg-debugging/setup.md).**
 It is one document rather than two so the list cannot drift; it is also where symbols, elevation,
 kernel connection profiles and the differences an ARM64 host brings are written down.
 

@@ -43,7 +43,7 @@ of its own architecture, so an x64 binary running under emulation on an ARM64 ho
 **`amd64`** engine and cannot load the `arm64` one — it will fail to initialise the debugger rather
 than fall back. Which you need therefore depends on where the binary came from:
 
-| `windbg-mcp.exe` | Store payload | SDK directory |
+| `windbg-mcp.exe` | Package payload (store or bundle) | SDK directory |
 | --- | --- | --- |
 | Prebuilt release zip (Option A) — **always x64** | `\amd64` | `Debuggers\x64` |
 | Built from source on an ARM64 host (Option B) | `\arm64` | `Debuggers\arm64` |
@@ -52,27 +52,11 @@ The releases this repo publishes are x64 only, so downloading one onto an ARM64 
 for `arm64` DLLs — the intuitive move — is the wrong pairing. `cargo build --release` on the host
 is what gets you a native binary worth pairing with `arm64`.
 
-**The store package is not the only source.** If it will not install, the **Windows SDK Debugging
-Tools** — `winsdksetup.exe /features OptionId.WindowsDesktopDebuggers /quiet /norestart` — land in
-`C:\Program Files (x86)\Windows Kits\10\Debuggers\<arch>` and supply every file in the copy below
-**except `msdia140.dll` and `ttd\`**. So `!analyze` and the driver tools work from it and **TTD
-replay does not** ([#132](https://github.com/glslang/windbg-mcp/issues/132)).
-
-Symbols are the interesting omission. `msdia140.dll` is documented below as required for PDB
-parsing, but on the host tested here full private symbols resolved (`nt!RtlpHpVsSlotFreeList`, not
-an export) with **no `msdia140.dll` anywhere on the machine and none registered** — the SDK's own
-`dbghelp.dll` read the PDBs unaided. Treat that requirement as a property of the `dbghelp.dll` you
-bundle rather than a universal one, and check with `lm m <mod>` (`(pdb symbols)` versus
-`(export symbols)`) rather than assuming either way.
-
-That fallback matters because MSIX registration fails from a **non-interactive** session —
-`Add-AppxPackage` returns `0x80070005` even when the session is elevated, leaving the payload
-staged but unrunnable, since `WindowsApps` denies execute to an unregistered package. Install
-WinDbg from the machine's own console session rather than over SSH or a remote shell; that is also
-what makes `Get-AppxPackage Microsoft.WinDbg` resolve, which the copy below depends on.
-
-For `ttd\` specifically there is a way out that needs no install at all — see
-[*When the store package will not install*](#when-the-store-package-will-not-install) below.
+**Where the payload comes from is a separate question, and not an ARM64 one.** Three sources
+supply it and they differ in what they hold — an installed store package, the same package's
+`.msixbundle` unpacked without installing it, and the Windows SDK Debugging Tools, which ship
+everything except `msdia140.dll` and `ttd\`. See *WinDbg engine + extensions* below, which names
+all three and then runs one copy. The architecture rule above applies whichever you pick.
 
 ## Get the server binary
 
@@ -177,7 +161,7 @@ Either way, run `/reload-plugins` afterwards so Claude Code connects the `windbg
 
 ## WinDbg engine + extensions — for `.run` replay, crash-dump `!analyze`, and the kernel driver tools
 
-Drop the **WinDbg** store-package binaries next to `windbg-mcp.exe` (the `$dst` below — for a
+Drop a **WinDbg engine payload** next to `windbg-mcp.exe` (the `$dst` below — for a
 registry/MCPB install that's the client's extraction directory, **not** `target\release`) for
 three reasons:
 
@@ -190,8 +174,19 @@ three reasons:
   `winxp\` copy below, even though the attach itself works on the System32 engine).
 
 `DebugCreate` binds to whichever `dbgeng.dll` the loader finds first, and the app directory is
-searched before `System32`, so the copied engine wins. One-time, from the installed WinDbg store
-package:
+searched before `System32`, so the copied engine wins.
+
+**Three sources supply that payload**, and what separates them is what they leave out:
+
+| Source | Holds | Costs |
+| --- | --- | --- |
+| The installed **WinDbg store package** | everything below | an interactive install — MSIX will not register over SSH |
+| The same **`.msixbundle`, unpacked** | everything below | a ~1.1 GB download; no install, so it is the one source a remote session can use |
+| The **Windows SDK Debugging Tools** | everything **except `msdia140.dll` and `ttd\`** | no TTD replay and no PDB parser ([#132](https://github.com/glslang/windbg-mcp/issues/132)) |
+
+All three are the **same layout** — a directory with `dbgeng.dll` beside `ttd\`, `winext\`,
+`winxp\` and `triage\` — so they differ only in how you set `$wd`, and the copy below is the same
+copy whichever you take:
 
 ```pwsh
 # Match $arch to windbg-mcp.exe, not to the machine: a process loads DLLs of its
@@ -199,7 +194,30 @@ package:
 # See the table under "ARM64 hosts" — "amd64" is right for every x64 binary,
 # including one running under emulation.
 $arch = "amd64"
-$wd  = (Get-AppxPackage Microsoft.WinDbg).InstallLocation + "\$arch"
+
+# Then pick ONE of these three and leave the other two commented out.
+# (a) the installed store package
+$wd = (Get-AppxPackage Microsoft.WinDbg).InstallLocation + "\$arch"
+# (b) the unpacked .msixbundle — $w comes from "Unpacking the .msixbundle" below
+# $wd = "$w\p\$arch"
+# (c) the SDK Debugging Tools — "arm64" keeps its name here, but amd64 is spelled x64
+# $wd = "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64"
+```
+
+From **(c)**, drop `msdia140.dll` from the file list and skip the `ttd\` line — neither is there.
+`!analyze`, the driver tools and symbol resolution all work from it; TTD replay does not, which is
+the whole of why (b) exists.
+
+Symbols are the interesting omission in (c). `msdia140.dll` is documented below as required for PDB
+parsing, but on the ARM64 host this was tested on full private symbols resolved
+(`nt!RtlpHpVsSlotFreeList`, not an export) with **no `msdia140.dll` anywhere on the machine and none
+registered** — the SDK's own `dbghelp.dll` read the PDBs unaided. Treat that requirement as a
+property of the `dbghelp.dll` you bundle rather than a universal one, and check with `lm m <mod>`
+(`(pdb symbols)` versus `(export symbols)`) rather than assuming either way.
+
+One-time, with `$wd` set from whichever source you took:
+
+```pwsh
 # Set $dst to the folder that actually holds windbg-mcp.exe — pick the one for
 # your install (do not leave it as the placeholder):
 #   plugin / build-from-source layout      -> <plugin dir>\target\release
@@ -216,7 +234,10 @@ Copy-Item "$wd\winxp\kdexts.dll" "$dst\winxp" -Force   # !drvobj/!devobj/!irp �
 ```
 
 - The `ttd\` subdir provides the `@$cursession.TTD` / `@$curprocess.TTD` data model and the
-  `!tt` time-travel commands.
+  `!tt` time-travel commands. It also carries **`TTD.exe`** itself, at `ttd\TTD.exe` — so the copy
+  above brings the recorder `record_trace` needs along with the replay engine. Put it on `PATH`
+  anyway: the server searches `PATH`, the SDK layout and `WindowsApps`, and **not** its own
+  directory, so a recorder sitting right beside it is still not one it will find.
 - The `winext\` subdir provides `ext.dll` (which exports `!analyze`) and the other `!`-extensions.
   Required for crash-dump triage — without it `!analyze` returns *"No export analyze found"*.
   Whether the **unqualified `!analyze` then resolves is engine- and Windows-version-dependent**, so
@@ -236,6 +257,70 @@ Copy-Item "$wd\winxp\kdexts.dll" "$dst\winxp" -Force   # !drvobj/!devobj/!irp �
   `.load kdexts` automatically; without the file those tools return *"No export drvobj found"*.
   (Note it lives in `winxp\`, not `winext\`, and the engine already searches a `WINXP` subdir.)
 - `cargo clean` (when building from source) wipes `target\`, so re-copy after one.
+- **Stop the server before copying over an engine that is already there.** A running
+  `windbg-mcp.exe` holds `dbgeng.dll` open even with no session on it — the engine is an
+  import-table dependency of the image, so the loader maps it before `main` whatever role the
+  process plays — and `Copy-Item` then fails with *"being used by another process"*. An idle
+  supervisor reporting an empty session list is not idle enough; `Stop-Service windbg-mcp` (or
+  closing the client that spawned it) is. A first-time copy into a directory with no engine yet has
+  nothing to overwrite and needs none of this.
+
+### Unpacking the `.msixbundle` — source (b)
+
+A `.msixbundle` is an ordinary zip, and the one Microsoft serves from `aka.ms/windbg/download`
+holds the same `amd64\`, `arm64\` and `x86\` payload trees the installed package does. So the
+engine can be had **without installing anything**, which is the only route open to a host that
+cannot register an MSIX at all — see [*When the store package will not
+install*](#when-the-store-package-will-not-install).
+
+```pwsh
+$ProgressPreference = 'SilentlyContinue'   # or Invoke-WebRequest spends longer rendering than downloading
+$w = "$env:TEMP\wdbg"; New-Item $w -ItemType Directory -Force | Out-Null
+# -OutFile, not .Content: 5.1 hands back a Byte[] here and the [xml] cast fails.
+Invoke-WebRequest 'https://aka.ms/windbg/download' -OutFile "$w\windbg.appinstaller" -UseBasicParsing
+$uri = ([xml](Get-Content "$w\windbg.appinstaller" -Raw)).AppInstaller.MainBundle.Uri
+Invoke-WebRequest $uri -OutFile "$w\windbg.msixbundle" -UseBasicParsing      # ~1.1 GB
+
+# Verify the publisher before unpacking anything.
+$sig = Get-AuthenticodeSignature "$w\windbg.msixbundle"
+if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notlike '*O=Microsoft Corporation*') {
+  throw "unexpected signature: $($sig.Status) / $($sig.SignerCertificate.Subject)"
+}
+
+# Expand-Archive dispatches on the extension, so both hops need a .zip name.
+Copy-Item "$w\windbg.msixbundle" "$w\b.zip" -Force
+Expand-Archive "$w\b.zip" "$w\b" -Force
+# Note the two spellings: the .msix is named x64/arm64, while the payload
+# directory inside it is amd64/arm64.
+$msix = if ($arch -eq "arm64") { "windbg_win-arm64.msix" } else { "windbg_win-x64.msix" }
+Copy-Item "$w\b\$msix" "$w\p.zip" -Force
+Expand-Archive "$w\p.zip" "$w\p" -Force
+```
+
+`$w\p\$arch` is then the payload root: set `$wd` to it and run the copy block above.
+
+**What the signature check settles, and what it does not.** It establishes that the file is the one
+Microsoft signed, unmodified — which is the question that matters for a DLL you are about to load
+into the debugger. It does **not** make an unregistered payload a supported Microsoft
+configuration, and it is not a claim that the engine is fit for anything in particular. Treat it as
+this project's floor for telling you to unpack somebody else's package, not as an endorsement by
+the publisher.
+
+Three limits worth taking on knowingly:
+
+- **There is no update path.** A copied engine is a snapshot and does not follow WinDbg; re-run the
+  copy when you would have taken an update. The `.appinstaller` above always names the *current*
+  bundle, so the recipe needs no version bump — only re-running.
+- **The layout inside the bundle is Microsoft's to change.** Run on 2026-08-29 the bundle held
+  `windbg_win-arm64.msix`, `windbg_win-x64.msix` and `windbg_win-x86.msix`, and the payload inside
+  the ARM64 one carried `amd64\`, `arm64\` and `x86\` trees, each complete — `msdia140.dll`
+  included. If `Expand-Archive` produces something else, list `$w\b` and take the `.msix` matching
+  your architecture rather than editing the guess.
+- **Pick the architecture by `windbg-mcp.exe`**, exactly as the copy block says — not by the host,
+  and not by which `.msix` you happened to unpack. Each bundle carries `amd64\`, `arm64\` and
+  `x86\` (an ARM64 bundle ships all three), so there is no default to fall back on and a copy that
+  takes the first match takes the emulation build. That is the same ordering trap as
+  [#131](https://github.com/glslang/windbg-mcp/issues/131), which is easy to walk into twice.
 
 ### 32-bit .NET targets need a 32-bit server
 
@@ -331,34 +416,11 @@ when elevated — and leaves the payload staged but unrunnable, because `Windows
 to an unregistered package. So the files can be on disk and every one of them refuse to run.
 Installing from the machine's own console session is the fix and the first thing to reach for.
 
-Where that is not available, two sources cover the same files between them.
-
-**The Windows SDK Debugging Tools** — `winsdksetup.exe /features OptionId.WindowsDesktopDebuggers
-/quiet /norestart` — give a plain directory, `C:\Program Files (x86)\Windows Kits\10\Debuggers\<arch>`,
-holding every file in the copy above **except `msdia140.dll` and `ttd\`**. So `!analyze`, the driver
-tools and symbol resolution all work from it, and TTD replay does not.
-
-**The WinDbg `.msixbundle`**, for `ttd\` itself, is an ordinary zip and can be unpacked without
-being installed:
-
-```pwsh
-$w = "$env:TEMP\wdbg"; New-Item $w -ItemType Directory -Force | Out-Null
-$uri = ([xml](Invoke-WebRequest 'https://aka.ms/windbg/download' -UseBasicParsing).Content).AppInstaller.MainBundle.Uri
-Invoke-WebRequest $uri -OutFile "$w\b.zip" -UseBasicParsing      # ~1.1 GB
-Expand-Archive "$w\b.zip" "$w\b" -Force
-# Same $arch as the copy block above. Note the two spellings: the .msix is named
-# x64/arm64, while the payload directory inside it is amd64/arm64.
-$msix = if ($arch -eq "arm64") { "windbg_win-arm64.msix" } else { "windbg_win-x64.msix" }
-Copy-Item "$w\b\$msix" "$w\p.zip" -Force
-Expand-Archive "$w\p.zip" "$w\p" -Force
-Copy-Item "$w\p\$arch\ttd" "$dst\ttd" -Recurse -Force
-```
-
-**Pick the architecture by `windbg-mcp.exe`, exactly as above** — not by the host, and not by which
-`.msix` you happened to unpack. Each package carries `amd64\`, `arm64\` and `x86\` payloads (an
-ARM64 package ships all three), so there is no default to fall back on and a copy that takes the
-first match takes the emulation build. That is the same ordering trap as
-[#131](https://github.com/glslang/windbg-mcp/issues/131), which is easy to walk into twice.
+Where that is not available, **the bundle needs no install at all**: source (b) above, [*Unpacking
+the `.msixbundle`*](#unpacking-the-msixbundle--source-b), is the same payload as an ordinary zip
+download, and it is a supported path here rather than a trick — this repository's own TTD smoke
+tier runs against an engine bundled that way. The SDK Debugging Tools, source (c), are the other
+way through and stop short of TTD: they hold everything **except `msdia140.dll` and `ttd\`**.
 
 [#132](https://github.com/glslang/windbg-mcp/issues/132) is why this is written down rather than
 assumed away. Note that `open_trace` reports a missing `ttd\` explicitly instead of leaving you with
