@@ -337,11 +337,12 @@ attached. `kill_on_drop` is gone (EOF on the worker's stdin is now the only tear
 already handled), and registration re-checks the shutdown gate so the missable window is closed
 rather than merely survivable.
 
-Two ordering details the review of #62 raised and that PR deliberately left alone, both filed:
-[#64](https://github.com/glslang/windbg-mcp/issues/64) (`end_session` keeps accepting calls while it
-tears the session down — the fix wants the `Gate` treatment `retires` already has) and
-[#65](https://github.com/glslang/windbg-mcp/issues/65) (the worker protocol shares stdout with
-anything the engine prints; mitigated, not structurally prevented).
+Two ordering details the review of #62 raised and that PR deliberately left alone. The first is
+fixed since: [#64](https://github.com/glslang/windbg-mcp/issues/64) — `end_session` now closes its
+session at the teardown's exact place in the pump queue, using the same `Gate` treatment `retires`
+already had. The second remains filed: [#65](https://github.com/glslang/windbg-mcp/issues/65) (the
+worker protocol shares stdout with anything the engine prints; mitigated, not structurally
+prevented).
 
 ## 11. [windbg-mcp] MCP Apps (`ui://` resources) — scoped out
 

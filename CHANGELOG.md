@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`end_session` stops accepting work when its teardown reaches the front of the session queue
+  ([#64](https://github.com/glslang/windbg-mcp/issues/64)).** The pump now marks the session closed
+  immediately before forwarding `EndSession`: calls already ahead of it still run, while calls
+  submitted behind it are refused as `stale_session` instead of reaching a target that has been
+  released or creating a replacement target in a worker that is about to exit. Once teardown
+  finishes, the provisional closed reason is refined with whether the target was released, the
+  worker was parked, or it was already gone.
+
 ## [0.13.2] - 2026-08-28
 
 ### Documentation
