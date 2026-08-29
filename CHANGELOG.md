@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`record_trace` finds the recorder the engine copy already delivered.** `setup.md`'s one-time
+  engine bundle takes the whole `ttd\` directory, and that directory carries `TTD.exe` as well as
+  the replay DLLs — but `find_ttd` probed `PATH`, the SDK layout and `WindowsApps` and never its
+  own directory, so the one layout this project's own documentation tells people to create was the
+  one it did not know. A host bundled exactly as documented could replay a trace and not record
+  one, unless the recorder was *also* put on `PATH`. It now probes the bundle beside the
+  executable, ranked below `PATH` so that override still wins
+  ([#131](https://github.com/glslang/windbg-mcp/issues/131)) and above the machine-wide installs,
+  since the payload next to the binary is the pair to the engine the loader actually gives this
+  process.
 - **`end_session` stops accepting work when its teardown reaches the front of the session queue
   ([#64](https://github.com/glslang/windbg-mcp/issues/64)).** The pump now marks the session closed
   immediately before forwarding `EndSession`: calls already ahead of it still run, while calls

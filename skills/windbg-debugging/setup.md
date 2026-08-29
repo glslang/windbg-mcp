@@ -235,9 +235,10 @@ Copy-Item "$wd\winxp\kdexts.dll" "$dst\winxp" -Force   # !drvobj/!devobj/!irp �
 
 - The `ttd\` subdir provides the `@$cursession.TTD` / `@$curprocess.TTD` data model and the
   `!tt` time-travel commands. It also carries **`TTD.exe`** itself, at `ttd\TTD.exe` — so the copy
-  above brings the recorder `record_trace` needs along with the replay engine. Put it on `PATH`
-  anyway: the server searches `PATH`, the SDK layout and `WindowsApps`, and **not** its own
-  directory, so a recorder sitting right beside it is still not one it will find.
+  above brings the recorder `record_trace` needs along with the replay engine, and the server looks
+  there: it probes `PATH` first, then its own `ttd\` directory, then the SDK and `WindowsApps`
+  layouts. Bundling an engine therefore gets you recording as well as replay, with nothing to put
+  on `PATH`.
 - The `winext\` subdir provides `ext.dll` (which exports `!analyze`) and the other `!`-extensions.
   Required for crash-dump triage — without it `!analyze` returns *"No export analyze found"*.
   Whether the **unqualified `!analyze` then resolves is engine- and Windows-version-dependent**, so
