@@ -302,7 +302,7 @@ None of these is a bug. They are recorded because they were invisible, and
    schemars emits 109 times and which tells a model nothing an absent field does not, is 1,744 B —
    2.6%. The other candidates are not free: `$schema` is 2,850 B but is how a client picks a
    validator dialect (and `tool_schemas_declare_one_dialect_and_are_self_contained` pins it), and
-   `minimum`/`format` are constraints. **Roughly 1.7 KB of 68,322 is the whole honest total** for
+   `minimum`/`format` are constraints. **Roughly 1.7 KB of 68,893 is the whole honest total** for
    trimming the schemas.
 
    So the third lever is the one taken: `--tools` (`src/toolset.rs`) advertises a named subset. A
@@ -312,20 +312,20 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 10 | 15,969 | 23.4% |
-   | `session` | 10 | 12,606 | 18.5% |
-   | `inspect` | 9 | 10,215 | 15.0% |
-   | `batch` | 1 | 9,798 | 14.3% |
-   | `ttd` | 9 | 6,829 | 10.0% |
-   | `ioctl` | 6 | 6,494 | 9.5% |
-   | `exec` | 5 | 3,475 | 5.1% |
+   | `allocator` | 10 | 15,969 | 23.2% |
+   | `session` | 10 | 12,606 | 18.3% |
+   | `inspect` | 9 | 10,786 | 15.7% |
+   | `batch` | 1 | 9,798 | 14.2% |
+   | `ttd` | 9 | 6,829 | 9.9% |
+   | `ioctl` | 6 | 6,494 | 9.4% |
+   | `exec` | 5 | 3,475 | 5.0% |
    | `crash` | 1 | 2,936 | 4.3% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 51 | 68,322 |
-   | `session,inspect,exec,crash` | 25 | 28,311 |
-   | `session,inspect,crash` | 20 | 24,894 |
+   | *(absent)* | 51 | 68,893 |
+   | `session,inspect,exec,crash` | 25 | 28,882 |
+   | `session,inspect,crash` | 20 | 25,465 |
    | `crash` | 11 | 14,587 |
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's

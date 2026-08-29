@@ -221,7 +221,7 @@ setx WINDBG_MCP_TOOLS_DRIVER        "session,inspect,crash"
 ```
 
 The second line is what makes this work on a listener the editor also uses: the driver is served 20
-tools and 24,894 B while every other client on that listener keeps all 51. Leave it out and the
+tools and 25,465 B while every other client on that listener keeps all 51. Leave it out and the
 driver is served whatever the listener was started with, which is the older behaviour and is the
 right one when the listener is the driver's own.
 
@@ -288,8 +288,8 @@ spec. Re-read them rather than trusting this table, which has been stale before.
 
 | | bytes | ≈tokens |
 |---|---|---|
-| The tool surface, paid once per conversation | 68,322 (51 tools) | ~17k |
-| — the same surface as `--tools session,inspect,crash` | 24,894 (20 tools) | ~6k |
+| The tool surface, paid once per conversation | 68,893 (51 tools) | ~17k |
+| — the same surface as `--tools session,inspect,crash` | 25,465 (20 tools) | ~6k |
 | — as `--tools crash` | 14,587 (11 tools) | ~3.6k |
 | Its worst single tool (`debug_batch`) | 9,798 | ~2.4k |
 | The largest answer this server gives (`modules`) | 53,875 | ~13k |
@@ -462,8 +462,8 @@ budget, a text-or-data content switch. **Two of the three now exist, and neither
 client-side.**
 
 - **The tool-surface profile is `--tools`** (2026-08-22). Start the listener with
-  `--tools session,inspect,crash` and the surface is 20 tools and 24,894 B instead of 51 and
-  68,322 — `--tools crash` is 11 and 14,587 B, which is the difference between "roughly twice an 8k
+  `--tools session,inspect,crash` and the surface is 20 tools and 25,465 B instead of 51 and
+  68,893 — `--tools crash` is 11 and 14,587 B, which is the difference between "roughly twice an 8k
   window" and "half of one". The tools that remain are the tools they were, less the sentences
   pointing at ones that went (item 41).
   The whole table is in [`token-budget.md`](./token-budget.md) under finding 8, and the README has

@@ -22,6 +22,7 @@ use crate::engine::{
 use crate::kdconn;
 use crate::proto::{
     EngineOp, HeapBackendFilter, HeapOp, HeapStateFilter, Output, PoolOp, ReachabilityOp,
+    SymbolPathSetting,
 };
 use crate::schema::constraints_of;
 use crate::structured::{self, ErrorCategory, Outcome, TargetCreated};
@@ -1780,6 +1781,12 @@ pub struct SymbolPathArgs {
     /// force-load one module's symbols. Omit to reload all deferred modules.
     #[serde(default)]
     pub reload: Option<String>,
+    /// Whether this client's subsequently opened sessions should start with this path setting.
+    /// Omit to change only this session (the existing behavior), true to remember this `path` and
+    /// `append` pair, or false to clear a setting remembered earlier. The current session must
+    /// accept the change before either update takes effect. `reload` is always session-only.
+    #[serde(default)]
+    pub for_new_sessions: Option<bool>,
     /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
     /// session and be refused if its target was replaced or closed.
     #[serde(default)]
@@ -2837,7 +2844,9 @@ impl WindbgServer {
 
     /// Set or extend the symbol search path, then reload symbols, so `module!Symbol`
     /// names resolve. Use it when a driver's PDB isn't on the default path: ask the user
-    /// for the folder holding the matching PDB (by GUID) and apply it here. The path must
+    /// for the folder holding the matching PDB (by GUID) and apply it here. Set
+    /// `for_new_sessions: true` when this client should also start later sessions with the same
+    /// path; omit it for a per-session override. The path must
     /// be reachable from THIS (debugger) host — symbols are not fetched from the target
     /// over the KD wire. Goes through the DbgEng API, so it avoids the `.sympath` command
     /// quirk of swallowing the rest of the command line.
@@ -2852,16 +2861,45 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SymbolPathArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let out = self
+        let setting = SymbolPathSetting {
+            path: args.path,
+            append: args.append.unwrap_or(true),
+        };
+        let startup = args.for_new_sessions;
+        let mut out = self
             .run(
                 args.session_id.as_deref(),
                 EngineOp::SymbolPath {
-                    path: args.path,
-                    append: args.append.unwrap_or(true),
+                    setting: setting.clone(),
                     reload: args.reload.unwrap_or_default(),
                 },
             )
             .await;
+        if let Ok(output) = &mut out {
+            let note = match startup {
+                Some(true) => {
+                    self.sessions.set_startup_symbol_path(Some(setting));
+                    Some(
+                        "New sessions opened by this client will start with this symbol-path \
+                         setting. Existing sessions were not changed.",
+                    )
+                }
+                Some(false) => {
+                    self.sessions.set_startup_symbol_path(None);
+                    Some(
+                        "The remembered symbol-path setting for this client's new sessions was \
+                         cleared. Existing sessions were not changed.",
+                    )
+                }
+                None => None,
+            };
+            if let Some(note) = note {
+                if !output.text.trim().is_empty() {
+                    output.text.push_str("\n\n");
+                }
+                output.text.push_str(note);
+            }
+        }
         engine_result(out)
     }
 

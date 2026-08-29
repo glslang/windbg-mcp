@@ -2095,7 +2095,7 @@ fn every_tool_belongs_to_exactly_one_group() {
 
 /// A narrowed surface serves fewer tools, and says so rather than pretending the rest never were.
 ///
-/// The measurement behind `--tools` is that three quarters of the 68,322-byte tool surface is
+/// The measurement behind `--tools` is that three quarters of the 68,893-byte tool surface is
 /// prose a model needs, so the only way to spend less of a caller's context is to offer fewer
 /// tools — `FOLLOWUPS.md` item 24. This asserts the three things that makes true.
 #[test]
@@ -7837,6 +7837,128 @@ fn two_sessions_coexist_and_do_not_disturb_each_other() {
     );
 
     server.tool_text("end_session", json!({ "session_id": first }), TARGET_STEP);
+}
+
+/// Issue #66: a caller may make one symbol-path setting the starting point for sessions it opens
+/// later, without turning independent workers into shared mutable engine state.
+///
+/// Unique empty directories are enough to prove the path plumbing and need no symbol server or
+/// matching PDB. The contrast carries the claim: a worker that already existed is unchanged, a
+/// later worker inherits, a per-session override does not replace the remembered setting, and an
+/// explicit clear sends the following worker back to its ambient DbgEng path.
+#[test]
+fn a_symbol_path_can_seed_future_sessions_without_broadcasting_to_existing_ones() {
+    let Some(dump) = target_tier() else { return };
+    let remembered = marker_path("remembered-symbols");
+    let override_only = marker_path("session-only-symbols");
+    std::fs::create_dir_all(&remembered).expect("create the remembered symbol directory");
+    std::fs::create_dir_all(&override_only).expect("create the session-only symbol directory");
+    let remembered_text = remembered.to_string_lossy().to_string();
+    let override_text = override_only.to_string_lossy().to_string();
+    let contains_path = |output: &str, path: &str| {
+        output
+            .to_ascii_lowercase()
+            .contains(&path.to_ascii_lowercase())
+    };
+
+    let mut server = Server::started();
+    let first = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+    let existing = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+
+    let remembered_result = server.tool_text(
+        "set_symbol_path",
+        json!({
+            "session_id": first,
+            "path": remembered_text,
+            "append": false,
+            "for_new_sessions": true,
+        }),
+        TARGET_STEP,
+    );
+    assert!(
+        remembered_result.contains("New sessions opened by this client"),
+        "the caller was not told the future-session default changed:\n{remembered_result}"
+    );
+    let existing_path = server.tool_text(
+        "execute",
+        json!({ "session_id": existing, "command": ".sympath" }),
+        TARGET_STEP,
+    );
+    assert!(
+        !contains_path(&existing_path, &remembered_text),
+        "the setting was broadcast into a worker that was already running:\n{existing_path}"
+    );
+
+    let inherited = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+    let inherited_path = server.tool_text(
+        "execute",
+        json!({ "session_id": inherited, "command": ".sympath" }),
+        TARGET_STEP,
+    );
+    assert!(
+        contains_path(&inherited_path, &remembered_text),
+        "a newly opened worker did not inherit the remembered path:\n{inherited_path}"
+    );
+
+    server.tool_text(
+        "set_symbol_path",
+        json!({
+            "session_id": inherited,
+            "path": override_text,
+            "append": false,
+        }),
+        TARGET_STEP,
+    );
+    let later = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+    let later_path = server.tool_text(
+        "execute",
+        json!({ "session_id": later, "command": ".sympath" }),
+        TARGET_STEP,
+    );
+    assert!(
+        contains_path(&later_path, &remembered_text),
+        "a session-only override replaced the remembered starting path:\n{later_path}"
+    );
+    assert!(
+        !contains_path(&later_path, &override_text),
+        "a session-only override leaked into another worker:\n{later_path}"
+    );
+
+    let cleared = server.tool_text(
+        "set_symbol_path",
+        json!({
+            "session_id": inherited,
+            "path": override_text,
+            "append": false,
+            "for_new_sessions": false,
+        }),
+        TARGET_STEP,
+    );
+    assert!(
+        cleared.contains("remembered symbol-path setting") && cleared.contains("cleared"),
+        "the caller was not told the future-session default was cleared:\n{cleared}"
+    );
+    server.tool_text(
+        "end_session",
+        json!({ "session_id": existing }),
+        TARGET_STEP,
+    );
+    let after_clear = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+    let ambient = server.tool_text(
+        "execute",
+        json!({ "session_id": after_clear, "command": ".sympath" }),
+        TARGET_STEP,
+    );
+    assert!(
+        !contains_path(&ambient, &remembered_text) && !contains_path(&ambient, &override_text),
+        "clearing the default did not restore ambient startup behavior:\n{ambient}"
+    );
+
+    for session in [first, inherited, later, after_clear] {
+        server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
+    }
+    let _ = std::fs::remove_dir(&remembered);
+    let _ = std::fs::remove_dir(&override_only);
 }
 
 /// A stateless client can work while one of its own calls is parked — the same property as the

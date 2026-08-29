@@ -1268,6 +1268,7 @@
       "output": null,
       "params": [
         "append: boolean|null",
+        "for_new_sessions: boolean|null",
         "path: string",
         "reload: string|null",
         "session_id: string|null"

@@ -75,9 +75,12 @@ over the KD wire. Ask the user for the folder, then apply it with the `set_symbo
 the DbgEng `AppendSymbolPath` API, so it's immune to the `.sympath` line-eating quirk below):
 
 ```jsonc
-set_symbol_path { "path": "C:\\HEVD\\bin", "reload": "/f HEVD.sys" }
+set_symbol_path { "path": "C:\\HEVD\\bin", "reload": "/f HEVD.sys", "for_new_sessions": true }
 //   → HEVD (private pdb symbols)  c:\hevd\bin\HEVD.pdb
 ```
+
+`for_new_sessions` records the successful path for this client's later opens; it does not change
+workers that are already running. Omit it when the PDB folder belongs only to this session.
 
 > **Gotcha:** the raw `.sympath` / `.sympath+` commands swallow the *rest of the line* — they ignore
 > `;`, so anything chained after (`; .reload …`) is parsed as path text. Use `set_symbol_path`, or

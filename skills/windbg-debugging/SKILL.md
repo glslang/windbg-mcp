@@ -118,7 +118,8 @@ where its stderr is not on your screen.
 - **Symbol *names* (`module!func`) need three things together:** (a) `msdia140.dll` and
   `symsrv.dll` bundled next to the binary, (b) a symbol path — set it with the
   **`set_symbol_path`** tool (`srv*C:\ProgramData\Dbg\sym*https://msdl.microsoft.com/download/symbols`,
-  `append: true`), which goes through the DbgEng API and so avoids `.sympath` swallowing the
+  `append: true`, `for_new_sessions: true` when later sessions should inherit it), which goes
+  through the DbgEng API and so avoids `.sympath` swallowing the
   rest of the command line — and (c) a module-qualified `.reload /f <mod>` at a *stopped*
   position (bare `.reload /f` walks every loaded module, which on a live kernel is slow) (after a
   `go`/breakpoint, **not** straight off a `goto_position`/`!tt`). Without these you silently

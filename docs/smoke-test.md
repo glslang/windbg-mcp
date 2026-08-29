@@ -457,6 +457,11 @@ processes, so they need real ones:
 
 - *Two sessions coexist.* Two dumps open at once, and the first handle still works after the second
   open landed. Under the single-engine design this was impossible by construction.
+- *A symbol path can seed later sessions without becoming shared worker state.* Two workers are
+  open before `set_symbol_path` remembers a unique local directory: the other existing worker must
+  stay unchanged, the next open must inherit it, and a session-only override must not replace it.
+  Clearing the remembered setting then sends a final open back to its ambient DbgEng path. Empty
+  temporary directories prove the routing with no symbol server, matching PDB, or network.
 - *A kernel attach that never connects costs one session.* An `attach_kernel` at a dead port parks
   exactly as a guest that is not in debug mode would; the test then opens a dump **while it is
   parked** (the regression test for [#61](https://github.com/glslang/windbg-mcp/issues/61)) and

@@ -458,7 +458,9 @@ Symbol *names* fail silently without all three of:
    read a symbol-store cache.
 2. **A symbol path:** use the **`set_symbol_path`** tool with
    `srv*C:\ProgramData\Dbg\sym*https://msdl.microsoft.com/download/symbols` and
-   `append: true`. It goes through DbgEng's `Append/SetSymbolPath`, so it avoids
+   `append: true`; add `for_new_sessions: true` when later sessions opened by this client should
+   start with the same setting. Omit it for a session-only override. The tool goes through DbgEng's
+   `Append/SetSymbolPath`, so it avoids
    `.sympath`'s habit of swallowing the rest of the command line. Naming the cache
    explicitly is *recommended*, not required — `.symfix` with no argument uses the `sym`
    subdirectory of the debugger's installation directory — but an explicit path is
