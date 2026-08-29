@@ -1976,9 +1976,16 @@ impl Sessions {
                         Ok(_) => Ok(started(false)),
                     };
                 }
-                // `Err` from `changed` is the sender dropped, which cannot happen while this holds
-                // the session — answered rather than unwrapped all the same, and the loop's own
-                // two checks are what answer it.
+                // **One wait, for both signals.** The milestone does not arrive on this channel
+                // — it arrives on `resumed_rx`, read at the top — so `reader` bumps the slot when
+                // it lands. Waiting on the milestone's own channel *as well* would be a second
+                // road to the same place, and waiting on this one *alone* without that bump is
+                // what shipped in the first draft: `continue_async` slept until the run ended,
+                // which CI caught as a call that took exactly as long as its target ran.
+                //
+                // `Err` is the sender dropped, which cannot happen while this holds the session —
+                // answered rather than unwrapped all the same, and the loop's own two checks are
+                // what answer it.
                 //
                 // Cancellation-safe: `watch::Receiver::changed` is documented to be, so losing the
                 // race costs nothing on the next turn.
@@ -3741,6 +3748,13 @@ async fn reader(
                     .unwrap_or_else(|e| e.into_inner())
                     .get_mut(&id)
                     .and_then(|waiting| waiting.resumed.take());
+                // Whether or not anyone was holding the channel: the wake is what
+                // `Sessions::start_execution` is waiting on, and it waits on the *slot* rather
+                // than on the milestone's channel — one wait, so the run failing and the run
+                // starting arrive by the same road. Bumping only inside the arm below would leave
+                // `continue_async` asleep until the run *ended*, which is the one thing the tool
+                // exists not to do.
+                session.execution_moved();
                 match told {
                     Some(tx) => {
                         let _ = tx.send(());
@@ -4589,7 +4603,7 @@ mod tests {
         session: &Arc<Session>,
         mut jobs: mpsc::UnboundedReceiver<Job>,
         moved: bool,
-        reply: Result<Output, EngineError>,
+        reply: Option<Result<Output, EngineError>>,
     ) {
         let session = Arc::clone(session);
         tokio::spawn(async move {
@@ -4603,7 +4617,14 @@ mod tests {
                     .and_then(|waiting| waiting.resumed.take())
                     .expect("a resume registers somewhere to report the milestone");
                 let _ = told.send(());
+                // Where the real `reader` bumps it, and for the reason it does: the caller waits
+                // on the slot rather than on the milestone's own channel.
+                session.execution_moved();
             }
+            // `None` leaves the run going, which is the ordinary state of one — the reply is the
+            // *stop*, and for a `g` on a live target it may be an hour away. A helper that always
+            // answered could only ever stage runs that were already over.
+            let Some(reply) = reply else { return };
             let done = session
                 .waiters
                 .lock()
@@ -4626,7 +4647,12 @@ mod tests {
     async fn a_run_that_stopped_before_its_caller_looked_still_says_it_moved() {
         let sessions = Sessions::new(Duration::from_secs(300));
         let (session, jobs) = queued("sess-1", SessionState::Open);
-        answer_one_resume(&session, jobs, true, Ok(Output::text("Breakpoint 0 hit")));
+        answer_one_resume(
+            &session,
+            jobs,
+            true,
+            Some(Ok(Output::text("Breakpoint 0 hit"))),
+        );
 
         let started = sessions
             .start_execution(&session, true, "g".to_string(), Duration::from_secs(60))
@@ -4636,6 +4662,43 @@ mod tests {
             started.running,
             "the milestone said the target moved, and the reply arriving first must not overwrite \
              that with `it never started`"
+        );
+    }
+
+    /// **`continue_async` returns while the target is still moving.** The whole tool, as one
+    /// assertion.
+    ///
+    /// Stated as a *budget* rather than as a wall-clock measurement because that is what went
+    /// wrong: the first draft waited only on the execution slot, which nothing touches until the
+    /// run **ends**, so the call blocked for exactly as long as the target ran and then answered
+    /// `running: true` about a run that was over. Every other test here passed — including the one
+    /// that sends the milestone and the reply together, which is satisfied either way. CI caught
+    /// it, on a target that ran thirty seconds.
+    ///
+    /// `start_paused` makes the budget exact: no time passes unless something awaits a timer, so a
+    /// call that returns has returned without waiting for one.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_is_handed_back_while_the_target_is_still_moving() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let (session, jobs) = queued("sess-1", SessionState::Open);
+        // The milestone and **no reply**: the target is running and will go on running.
+        answer_one_resume(&session, jobs, true, None);
+
+        let started = tokio::time::Instant::now();
+        let handed = sessions
+            .start_execution(&session, true, "g".to_string(), Duration::from_secs(600))
+            .await
+            .expect("a target that is moving is not a failure");
+        assert!(handed.running, "{handed:?}");
+        assert!(
+            handed.breaks_in_ms.is_some_and(|left| left > 0),
+            "a run still going has a bound left; absent means this answered about a run that had \
+             already ended: {handed:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the call waited {:?} — it returns on the milestone, not on the stop",
+            started.elapsed()
         );
     }
 
@@ -4653,9 +4716,9 @@ mod tests {
             &session,
             jobs,
             false,
-            Err(EngineError::Stale(
+            Some(Err(EngineError::Stale(
                 "this session has no target left".to_string(),
-            )),
+            ))),
         );
 
         let refused = sessions

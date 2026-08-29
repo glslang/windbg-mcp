@@ -1747,10 +1747,21 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
     })
 }
 
-/// Ceiling on the tool surface a model is given before it has asked anything. 67,076 bytes across
-/// 51 tools today (~16k tokens), +12% headroom — sized so that rewording a description passes and
-/// a new tool arriving with a `debug_batch`-scale schema does not.
-const MODEL_VISIBLE_CEILING: usize = 76_000;
+/// Ceiling on the tool surface a model is given before it has asked anything. 73,785 bytes across
+/// 54 tools (~18k tokens), +12% headroom — sized so that rewording a description passes and a new
+/// tool arriving with a `debug_batch`-scale schema does not.
+///
+/// **Raised 76,000 → 83,000 when the three asynchronous-execution tools landed** (2026-08-29), and
+/// the raise is the point rather than a formality: those tools cost 4,892 B of model context —
+/// `continue_async` 1,987, `wait_for_stop` 1,530, `break_in` 1,375 — which is 7% of the surface,
+/// paid by every client served `exec` at the start of every conversation. `--tools` is the answer
+/// for a client that cannot afford it.
+///
+/// The figure above is **derived, not measured**: the recorded golden summed to 68,893 across 51
+/// tools and CI reported the three new rows, so it is 68,893 + 4,892. Re-recording
+/// `tests/golden/tool_budget.json` is what replaces it with a measurement — and if the two
+/// disagree, this comment is what was wrong.
+const MODEL_VISIBLE_CEILING: usize = 83_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
 /// the array's own punctuation and every result-level field are inside it. 177,460 bytes today,
@@ -2219,6 +2230,17 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
         ("step_back", json!({}), "error"),
         ("step_over_back", json!({}), "error"),
         ("reverse_go", json!({}), "error"),
+        // The asynchronous three. `continue_async` refuses on the session like every row above
+        // it; the other two carry a handle, and with no session there is nothing to resolve it
+        // against — so they take the same session refusal rather than the unknown-handle one,
+        // which needs a session to be unknown *within* and is checked in the debugger tier.
+        ("continue_async", json!({}), "error"),
+        (
+            "wait_for_stop",
+            json!({ "execution": "exec-nothing" }),
+            "error",
+        ),
+        ("break_in", json!({ "execution": "exec-nothing" }), "error"),
         ("pool_find_tag", json!({ "tag": "Tgsm" }), "error"),
         (
             "pool_chunk",
@@ -3035,7 +3057,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 11 of 51 tools (session, crash)"),
+        log.contains("serving 11 of 54 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -3067,7 +3089,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 19 of 51 tools (session, inspect) — except bench serves 11 of 51 tools \
+            "serving 19 of 54 tools (session, inspect) — except bench serves 11 of 54 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),
@@ -4665,6 +4687,16 @@ fn a_resume_that_reaches_no_stop_says_so_and_leaves_the_session_usable() {
     );
 }
 
+/// A live target that outlives anything these tests could take to drive it.
+///
+/// [`LIVE_TARGET`]'s thirty seconds is sized for a test that resumes once and asserts; the two
+/// below have to be *in* the running state across half a dozen calls, on a runner that may be
+/// bringing an engine up cold. A target that ran out mid-preamble would report `target_gone` where
+/// they assert `interrupted`, which reads as the break-in having failed rather than as the clock
+/// having. Nothing is left behind by the margin: both tests end their session, and a `launch`ed
+/// process is terminated with it — including when the test fails and the harness kills the server.
+const LONG_LIVE_TARGET: &str = "cmd.exe /c ping -n 120 127.0.0.1";
+
 /// Issue #83: a run started with `continue_async` can be waited for later, and the session says
 /// what it is doing throughout.
 ///
@@ -4695,13 +4727,13 @@ fn a_run_started_asynchronously_is_waited_for_broken_in_and_read_twice() {
     let mut server = Server::started();
     let session = server.open_session(
         "launch",
-        json!({ "command_line": LIVE_TARGET }),
+        json!({ "command_line": LONG_LIVE_TARGET }),
         TARGET_STEP,
     );
 
     let started = server.tool_data(
         "continue_async",
-        json!({ "session_id": &session, "max_run_ms": 120000 }),
+        json!({ "session_id": &session, "max_run_ms": 300000 }),
         TARGET_STEP,
     );
     assert_eq!(
@@ -4726,9 +4758,9 @@ fn a_run_started_asynchronously_is_waited_for_broken_in_and_read_twice() {
         json!({ "session_id": &session }),
         TARGET_STEP,
     );
-    assert_eq!(refused["category"], "target_running", "{refused}");
+    assert_eq!(refused["error"]["category"], "target_running", "{refused}");
     assert!(
-        refused["message"]
+        refused["error"]["message"]
             .as_str()
             .is_some_and(|m| m.contains(&execution)),
         "a refusal that does not name the run already there leaves nothing to wait for: {refused}"
@@ -4737,7 +4769,7 @@ fn a_run_started_asynchronously_is_waited_for_broken_in_and_read_twice() {
     // And nothing reads a target while it moves.
     let refused = server.tool_failure("registers", json!({ "session_id": &session }), TARGET_STEP);
     assert_eq!(
-        refused["category"], "target_running",
+        refused["error"]["category"], "target_running",
         "a read of a moving target must be refused as one, not folded into a debugger failure — a \
          caller told the debugger said no goes and looks at the target: {refused}"
     );
@@ -4852,12 +4884,12 @@ fn a_session_can_be_ended_while_its_target_is_running() {
     let mut server = Server::started();
     let session = server.open_session(
         "launch",
-        json!({ "command_line": LIVE_TARGET }),
+        json!({ "command_line": LONG_LIVE_TARGET }),
         TARGET_STEP,
     );
     let started = server.tool_data(
         "continue_async",
-        json!({ "session_id": &session, "max_run_ms": 120000 }),
+        json!({ "session_id": &session, "max_run_ms": 300000 }),
         TARGET_STEP,
     );
     assert_eq!(started["running"], json!(true), "{started}");
