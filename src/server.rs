@@ -53,6 +53,11 @@ const DEFAULT_STOP_WAIT_MS: u32 = 30_000;
 /// would have the call expire instead of returning "still running" — and from the caller's side a
 /// call that expired and a target that never stopped look the same, which is the confusion this
 /// tool exists to remove.
+///
+/// A host that sets `WINDBG_MCP_CALL_TIMEOUT_SECS` below this leaves nothing to wait in, and the
+/// saturating subtraction turns the tool into a **poll**: it answers "still running" at once. That
+/// is the right degenerate case rather than one to guard against — there is genuinely no budget,
+/// and answering is what this exists to do.
 const STOP_WAIT_MARGIN: Duration = Duration::from_secs(5);
 
 /// How long an open may sit un-landed before `session_status` stops calling it normal.
