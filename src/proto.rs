@@ -92,6 +92,25 @@ pub enum EngineOp {
         command: String,
         timeout_ms: u32,
     },
+    /// The same run as [`Self::CommandAndWait`], **split at the point the target starts moving**:
+    /// the worker reports [`WorkerMessage::Resumed`] once `Execute` has set the run state, and
+    /// this op's own reply is the *stop*, whenever that arrives.
+    ///
+    /// One op rather than two — a "start" and a later "collect" — because the engine thread must
+    /// be *inside* `WaitForEvent` for the target to move at all. `Execute` only sets the run
+    /// state; nothing happens until something pumps, so a design where the worker returns to its
+    /// queue between the two would resume a target that then sits still. The thread therefore
+    /// stays in the pump for the whole run and the milestone is what crosses the pipe early.
+    ///
+    /// `timeout_ms` is the bound the *worker* breaks the target in at, and it is not the caller's
+    /// patience: the whole point of this op is that its caller goes away and comes back, so a
+    /// deadline sized from one tool call's clock would break in on a target the caller is still
+    /// happy to leave running. It is what `continue_async` was asked for, and it is the only
+    /// thing keeping the pump from being an unbounded wait nobody knows about.
+    Resume {
+        command: String,
+        timeout_ms: u32,
+    },
     /// The target's registers, as text (`r`) *and* as values.
     ///
     /// `all` is the caller's choice between the integer registers — which is what `r` prints, and
@@ -679,6 +698,10 @@ mod tests {
                 steps: Vec::new(),
                 always: Vec::new(),
             }),
+            EngineOp::Resume {
+                command: "g".into(),
+                timeout_ms: 60_000,
+            },
             EngineOp::Interrupt,
             EngineOp::EndSession,
         ];
@@ -803,6 +826,18 @@ pub enum WorkerMessage {
     /// that report. This is also what moves a kernel attach out of the state it can park in
     /// forever.
     Opened { id: u64 },
+    /// An [`EngineOp::Resume`]'s target is moving: `Execute` returned and the engine reports it
+    /// running. The pump that will answer that op is about to start.
+    ///
+    /// A milestone rather than the reply for the same reason [`Self::Committed`] is one: it says
+    /// something the supervisor has to act on while the op it belongs to is still running — here,
+    /// that the execution handle it is holding is now real and `continue_async` may return. The
+    /// reply that follows is the stop, and it may be minutes away.
+    ///
+    /// Sent **only** when the target is actually moving. A command that failed, or that left the
+    /// engine not running, answers `Done` with the failure and never sends this — so a supervisor
+    /// that has seen this has a target that is running, rather than one that was asked to run.
+    Resumed { id: u64 },
     /// An [`EngineOp::EndSession`] found a batch in flight and told it to stop; it will be done —
     /// stopped, rolled back and reported — within `within_ms`. `id` is that request's, like every
     /// other message here.
@@ -928,7 +963,11 @@ impl From<&str> for Failed {
 ///
 /// `data` is already the *whole* structured result — `{"status": "ok", …}` — rather than a bare
 /// payload, so the supervisor forwards it untouched and never has to know which tool asked.
-#[derive(Debug, Serialize, Deserialize)]
+///
+/// `Clone` because one reply can have several readers: an asynchronous run's stop is filed on its
+/// session and read by every `wait_for_stop` that asks, rather than delivered to the first one and
+/// gone. Every field is plain data, so the clone is a few strings.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Output {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -943,6 +982,26 @@ pub struct Output {
     /// would be [#77](https://github.com/glslang/windbg-mcp/issues/77) again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub summary: Option<crate::structured::TargetSummary>,
+    /// Where an [`EngineOp::Resume`]'s run stopped, and nothing else's.
+    ///
+    /// [`Self::summary`]'s shape and [`Self::summary`]'s reason: this is the second op whose typed
+    /// answer cannot be finished here. A stop is reported to its caller inside a record keyed by
+    /// the *execution handle* the supervisor minted, which this process has never heard of — so
+    /// the worker sends the half it knows, as a value, and the supervisor folds it in.
+    ///
+    /// It travels **instead of** [`Self::data`] rather than beside it, which is the one way this
+    /// differs from `summary`. The synchronous path answers with `Outcome<StopReport>` in `data`
+    /// and is complete as it stands; this one is going to be rebuilt on the far side either way,
+    /// and a `StopReport` carries the debugger's whole output — so sending both would put a copy
+    /// of it on the wire for nobody.
+    ///
+    /// **Boxed**, which is the one thing here that is not about meaning. A `StopReport` carries a
+    /// command, three positions and the debugger's whole output, and every `WorkerMessage::Done`
+    /// pays for the largest thing any reply can hold whether or not it holds one — so an inline
+    /// field would widen every message on this channel for the benefit of one op. The allocation
+    /// happens on a path that has just pumped a target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop: Option<Box<crate::structured::StopReport>>,
     /// What ending the session did to a live process the engine held, for the one op that ends
     /// one: `Some(true)` where a process this server **attached** to was detached and left
     /// running, `Some(false)` where the target was one the session takes with it, `None` where
@@ -965,6 +1024,7 @@ impl Output {
             text: text.into(),
             data: None,
             summary: None,
+            stop: None,
             target_left_running: None,
         }
     }
@@ -985,6 +1045,19 @@ impl Output {
                 }
             },
             summary: None,
+            stop: None,
+            target_left_running: None,
+        }
+    }
+
+    /// An asynchronous run's reply: where it stopped, as text and as the value the supervisor
+    /// folds into the record its handle keys. See [`Self::stop`].
+    pub fn stopped(text: impl Into<String>, stop: crate::structured::StopReport) -> Self {
+        Self {
+            text: text.into(),
+            data: None,
+            summary: None,
+            stop: Some(Box::new(stop)),
             target_left_running: None,
         }
     }
@@ -995,6 +1068,7 @@ impl Output {
             text: text.into(),
             data: None,
             summary: Some(summary),
+            stop: None,
             target_left_running: None,
         }
     }
@@ -1005,6 +1079,7 @@ impl Output {
             text: text.into(),
             data: None,
             summary: None,
+            stop: None,
             target_left_running,
         }
     }

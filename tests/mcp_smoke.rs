@@ -4665,6 +4665,216 @@ fn a_resume_that_reaches_no_stop_says_so_and_leaves_the_session_usable() {
     );
 }
 
+/// Issue #83: a run started with `continue_async` can be waited for later, and the session says
+/// what it is doing throughout.
+///
+/// The whole lifecycle in one test, because every step here is only meaningful against the one
+/// before it and splitting them would cost a launched target apiece. What each assertion is about:
+///
+/// - **The handle is issued while the target is moving.** `running: true` is the claim `go` cannot
+///   make — it answers only once the target has stopped.
+/// - **A second run is refused.** One engine thread, one target in motion.
+/// - **A read is refused, and the refusal names the run.** This is the acceptance criterion about
+///   "a clear *target is running* response instead of queueing ambiguously behind it": queued, a
+///   `registers` here would be answered whenever the target next stopped — thirty seconds away for
+///   this target — about wherever it happened to be.
+/// - **A short wait is a poll.** Running out reports no stop and does not disturb the run, which is
+///   what makes it safe to ask again.
+/// - **`break_in` ends it**, and the stop that follows says it was broken in on request rather than
+///   pretending the target chose to stop there.
+/// - **The session takes work again afterwards**, with the stop still readable — a stop is read,
+///   not taken.
+///
+/// `ping -n 30` is what makes the middle of this observable: it runs for half a minute with nothing
+/// to stop it, so "the target is moving" is a state the test can be in rather than a race.
+#[test]
+fn a_run_started_asynchronously_is_waited_for_broken_in_and_read_twice() {
+    if !launch_tier() {
+        return;
+    }
+    let mut server = Server::started();
+    let session = server.open_session(
+        "launch",
+        json!({ "command_line": LIVE_TARGET }),
+        TARGET_STEP,
+    );
+
+    let started = server.tool_data(
+        "continue_async",
+        json!({ "session_id": &session, "max_run_ms": 120000 }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        started["running"],
+        json!(true),
+        "the handle is supposed to mean the target is moving, not that it was asked to: {started}"
+    );
+    let execution = started["execution"]
+        .as_str()
+        .expect("a started run mints a handle")
+        .to_string();
+    assert!(
+        started["breaks_in_ms"]
+            .as_u64()
+            .is_some_and(|left| left > 0),
+        "a run with no bound is a wait nobody is accounting for: {started}"
+    );
+
+    // One run per session.
+    let refused = server.tool_failure(
+        "continue_async",
+        json!({ "session_id": &session }),
+        TARGET_STEP,
+    );
+    assert_eq!(refused["category"], "target_running", "{refused}");
+    assert!(
+        refused["message"]
+            .as_str()
+            .is_some_and(|m| m.contains(&execution)),
+        "a refusal that does not name the run already there leaves nothing to wait for: {refused}"
+    );
+
+    // And nothing reads a target while it moves.
+    let refused = server.tool_failure("registers", json!({ "session_id": &session }), TARGET_STEP);
+    assert_eq!(
+        refused["category"], "target_running",
+        "a read of a moving target must be refused as one, not folded into a debugger failure — a \
+         caller told the debugger said no goes and looks at the target: {refused}"
+    );
+
+    // `session_status` is the tool that answers while everything else is refused, and it has to
+    // say what the session is doing rather than just that it is open.
+    let status = server.tool_data(
+        "session_status",
+        json!({ "session_id": &session }),
+        TARGET_STEP,
+    );
+    let running = &status["sessions"][0]["execution"];
+    assert_eq!(running["execution"], json!(execution), "{status}");
+    assert_eq!(running["stopped"], json!(false), "{status}");
+
+    // A short wait is a poll: it runs out, reports no stop, and leaves the run exactly as it was.
+    let polled = server.tool_data(
+        "wait_for_stop",
+        json!({ "session_id": &session, "execution": &execution, "timeout_ms": 1500 }),
+        TARGET_STEP,
+    );
+    assert!(
+        polled["stop"].is_null(),
+        "a wait that ran out must not report a stop: {polled}"
+    );
+    assert!(
+        polled["breaks_in_ms"].as_u64().is_some_and(|left| left > 0),
+        "the run is still going, so it still has a bound: {polled}"
+    );
+
+    // Nothing is going to stop this target on its own, so the break is what ends the run.
+    let asked = server.tool_data(
+        "break_in",
+        json!({ "session_id": &session, "execution": &execution }),
+        TARGET_STEP,
+    );
+    assert_eq!(asked["requested"], json!(true), "{asked}");
+
+    let stopped = server.tool_data(
+        "wait_for_stop",
+        json!({ "session_id": &session, "execution": &execution, "timeout_ms": 30000 }),
+        TARGET_STEP,
+    );
+    let stop = &stopped["stop"];
+    assert!(
+        !stop.is_null(),
+        "the run was broken in, so the wait after it has to find a stop: {stopped}"
+    );
+    assert_eq!(
+        stop["interrupted"],
+        json!(true),
+        "a break-in leaves the target where it happened to be, and a stop that does not say so is \
+         read as a place the target goes: {stop}"
+    );
+    // The four facts issue #83 asks a stop to carry. `processor` is deliberately not among them:
+    // a user-mode target has none, which is the answer rather than a missing field.
+    assert!(
+        stop["stopped_at"].as_str().is_some(),
+        "a stop with no instruction pointer: {stop}"
+    );
+    assert!(
+        stop["thread"].as_u64().is_some(),
+        "a position without its thread does not identify a stop: {stop}"
+    );
+    assert!(
+        stop["processor"].is_null(),
+        "a user-mode target has no processor number, and inventing one would be worse than \
+         omitting it: {stop}"
+    );
+
+    // Read twice: the stop is not consumed by the caller that collected it.
+    let again = server.tool_data(
+        "wait_for_stop",
+        json!({ "session_id": &session, "execution": &execution, "timeout_ms": 1000 }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        again["stop"]["stopped_at"], stop["stopped_at"],
+        "a second reader got a different answer: {again}"
+    );
+
+    // And the session is ordinary again, which is the other half of the refusal above.
+    let after = server.call_tool("registers", json!({ "session_id": &session }), TARGET_STEP);
+    assert!(
+        !is_tool_error(&after),
+        "the session must take reads again once its target has stopped: {after}"
+    );
+
+    server.call_tool(
+        "end_session",
+        json!({ "session_id": &session }),
+        TARGET_STEP,
+    );
+}
+
+/// Issue #83: `end_session` releases a target that is **still running**, rather than waiting for a
+/// run that has no reason to end.
+///
+/// The one teardown that cannot simply queue. Every other operation on a worker's engine thread
+/// ends on a clock that process owns; a run ends when the *target* stops, which for this target is
+/// thirty seconds and for a live kernel could be an hour — so an `end_session` queued behind one
+/// would have its grace expire against a worker that was working perfectly, and the worker would be
+/// killed still holding the target.
+///
+/// Asserted on `released` rather than on the call succeeding: a teardown that killed the worker
+/// also "succeeds", and the difference between the two is exactly what this is about.
+#[test]
+fn a_session_can_be_ended_while_its_target_is_running() {
+    if !launch_tier() {
+        return;
+    }
+    let mut server = Server::started();
+    let session = server.open_session(
+        "launch",
+        json!({ "command_line": LIVE_TARGET }),
+        TARGET_STEP,
+    );
+    let started = server.tool_data(
+        "continue_async",
+        json!({ "session_id": &session, "max_run_ms": 120000 }),
+        TARGET_STEP,
+    );
+    assert_eq!(started["running"], json!(true), "{started}");
+
+    let ended = server.tool_data(
+        "end_session",
+        json!({ "session_id": &session }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        ended["released"],
+        json!(true),
+        "the worker was killed rather than letting go, which is what a teardown that waited out a \
+         run it could not stop looks like: {ended}"
+    );
+}
+
 /// A live target that ends the moment it is resumed, so its exit races whatever is pumping it.
 ///
 /// The other half of [`LIVE_TARGET`], and the difference is the whole point: one never stops on

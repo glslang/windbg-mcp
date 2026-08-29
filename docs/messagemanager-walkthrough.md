@@ -699,9 +699,11 @@ run the race or the debugger-assisted control-flow handoff; those remain disposa
 
 ### MCP server
 
-1. **Nonblocking continue with an execution handle.** `go` currently waits for the next stop. Add
-   `continue_async`, `wait_for_stop`, and `break_in` so an agent can arm KD, launch the guest process,
-   and then await a stop without relying on guest `Sleep` or a second ad-hoc client.
+1. **Nonblocking continue with an execution handle** — **done** (2026-08-29,
+   [#83](https://github.com/glslang/windbg-mcp/issues/83)). `continue_async`, `wait_for_stop` and
+   `break_in` let an agent arm KD, launch the guest process, and then await a stop without relying on
+   guest `Sleep` or a second ad-hoc client. See
+   [Running a target asynchronously](sessions.md#running-a-target-asynchronously).
 2. **Transactional breakpoint scripts.** A tool should accept ordered steps such as “run here,
    assert `rbx == target`, patch these bytes, run there” plus a rollback block. The worker can restore
    code, clear breakpoints, and report the last completed step even if a command, transport, or client

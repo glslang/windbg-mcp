@@ -188,7 +188,11 @@ fn mint_session_id() -> String {
 /// in a JSON-RPC error. Keeping the two apart here lets [`crate::server`] render each one the
 /// right way instead of collapsing every debugger hiccup into an opaque protocol error the model
 /// never really sees.
-#[derive(Debug)]
+///
+/// `Clone` because an asynchronous run's outcome is filed on its session and read by every
+/// `wait_for_stop` that asks, rather than delivered to one waiter and gone. Every variant is a
+/// message.
+#[derive(Debug, Clone)]
 pub enum EngineError {
     /// The debugger ran the operation and it failed — an unresolvable symbol, an unreadable
     /// address, a command error, a target that never stopped. Actionable: the model can adjust
@@ -218,6 +222,19 @@ pub enum EngineError {
     /// side, and it has to read the same way from both: a caller told "the debugger failed" for a
     /// malformed argument goes looking at the target.
     InvalidArgument(String),
+    /// The session has a run in flight — `continue_async` set the target going and it has not
+    /// stopped — so this call was refused rather than queued behind it.
+    ///
+    /// Its own variant rather than a [`Self::Debugger`] failure because nothing about the call was
+    /// wrong and changing it would not help: the answer is to wait for the stop, break the target
+    /// in, or end the session. Folded into `Debugger` it would read as "the debugger said no", and
+    /// a caller acting on that goes looking at the target — which is the one thing it must not do
+    /// while the target is moving.
+    ///
+    /// It is a refusal rather than a queue for the same reason. A read queued behind the run would
+    /// be answered whenever the target next stopped, which may be an hour, and the caller would
+    /// have no way to tell that from a debugger that had hung.
+    TargetRunning(String),
 }
 
 // Note what is *not* here any more: an "engine is unusable" variant. Under process-per-session
@@ -236,7 +253,8 @@ impl fmt::Display for EngineError {
             | Self::Lost(m)
             | Self::Interrupted(m)
             | Self::NotRun(m)
-            | Self::InvalidArgument(m) => f.write_str(m),
+            | Self::InvalidArgument(m)
+            | Self::TargetRunning(m) => f.write_str(m),
         }
     }
 }
@@ -480,6 +498,20 @@ pub struct Session {
     /// it later as though it were still owed would hand a teardown the whole of a batch budget that
     /// had already been spent. A worker that finishes early retracts it by naming zero.
     unwinding: Arc<Mutex<Option<Instant>>>,
+    /// The asynchronous run this session has outstanding, if any — see [`Execution`].
+    ///
+    /// One slot rather than a map, because a session has one engine thread and DbgEng moves a
+    /// target only from inside `WaitForEvent`: a second run would have to wait for the first, so
+    /// two handles could never both be live. Refusing the second is the same fact said out loud.
+    execution: Mutex<Option<Execution>>,
+    /// Bumped whenever [`Self::execution`] changes, so waiters wake without polling.
+    ///
+    /// A `watch` rather than a `Notify` for the one property that matters here: a receiver taken
+    /// *before* the slot is read cannot miss a change made after that read. With a notify the
+    /// waiter would have to register, then check, then await, and getting that order wrong loses
+    /// a wakeup for the whole of a caller's timeout — a `wait_for_stop` reporting "still running"
+    /// about a target that stopped a minute ago.
+    execution_changed: tokio::sync::watch::Sender<u64>,
     child: Mutex<Option<Child>>,
     /// Where this session's life is recorded, when anything is. Held here rather than reached for
     /// through [`Sessions`] because the transitions worth recording happen in [`Self::update_state`],
@@ -507,6 +539,17 @@ struct Waiting {
     /// the only place both facts are in hand. The milestones themselves arrive in [`reader`], which
     /// belongs to the session rather than to any one call and can only find this by job id.
     progress: Option<crate::progress::Reporter>,
+    /// Where this job's [`WorkerMessage::Resumed`] milestone goes — the one call that returns on
+    /// a milestone rather than on its own result.
+    ///
+    /// `None` for every other call, and taken when it fires: the milestone is sent once per run,
+    /// and a second one would mean a worker reporting a target it had already reported.
+    ///
+    /// Beside [`Self::progress`] rather than in a map of its own, for that field's reason: it has
+    /// the same lifetime and the same lock, and removing the waiter must take it too — a
+    /// `continue_async` still waiting when its job is answered has to be woken by the answer, not
+    /// left holding a milestone that will never come.
+    resumed: Option<oneshot::Sender<()>>,
     /// Whether this job's transaction has already been reported as unwound.
     ///
     /// The worker's two `RollingBack` messages are emitted by *different threads* — the promise by
@@ -519,6 +562,109 @@ struct Waiting {
 }
 
 type Waiters = Arc<Mutex<HashMap<u64, Waiting>>>;
+
+/// A run started by `continue_async` and not yet replaced: the handle a caller holds, the job it
+/// is, and — once the worker has answered — the stop it ended at.
+///
+/// **Installed when the job is submitted, not when the target starts moving**, which is the
+/// property everything else here rests on. A session whose slot says nothing is running is one
+/// where every tool reads a target that is standing still; if the slot were filled only once the
+/// worker's milestone arrived, the window in between would be a target that may already be moving
+/// and a supervisor that would let reads through to it.
+///
+/// **And it is not cleared when the run stops** — only replaced by the next one. The stop has to
+/// survive the call that was waiting for it giving up, or a `continue_async` whose caller
+/// disconnects mid-run leaves an answer nobody can ever read; and it has to survive being read, or
+/// two `wait_for_stop` calls disagree about what happened.
+#[derive(Debug)]
+struct Execution {
+    /// The handle, minted here and unique across this server — see [`mint_execution_id`].
+    handle: String,
+    /// The debugger command that set the target going, echoed back on every report about it.
+    command: String,
+    /// The worker job whose reply is this run's stop.
+    job: u64,
+    started: Instant,
+    /// What the worker was told to bound its pump by, so a report can say when a run that is
+    /// going nowhere will end itself.
+    bound: Duration,
+    /// The stop, once the worker answered — `None` while the target is moving.
+    ///
+    /// `Arc` because several `wait_for_stop` calls read one answer, and the two things it holds
+    /// are both several strings; cloning per reader would copy a debugger's whole output each
+    /// time somebody asked whether the run had finished.
+    stopped: Option<Arc<Result<Output, EngineError>>>,
+}
+
+impl Execution {
+    fn running(&self) -> bool {
+        self.stopped.is_none()
+    }
+
+    /// How much longer the worker will let the target run before breaking it in — `None` once it
+    /// has stopped, and `None` again once the bound has passed with no stop reported, since a
+    /// figure that has run out is not time anybody has left.
+    fn breaks_in(&self) -> Option<Duration> {
+        self.running()
+            .then(|| self.bound.saturating_sub(self.started.elapsed()))
+            .filter(|left| !left.is_zero())
+    }
+
+    fn info(&self) -> crate::structured::ExecutionInfo {
+        crate::structured::ExecutionInfo {
+            execution: self.handle.clone(),
+            command: self.command.clone(),
+            running_for_ms: ms(self.started.elapsed()),
+            stopped: !self.running(),
+            breaks_in_ms: self.breaks_in().map(ms),
+        }
+    }
+}
+
+/// One run, read out from under its session's lock so a caller can `await` on what it says.
+struct FoundExecution {
+    running: bool,
+    stopped: Option<Arc<Result<Output, EngineError>>>,
+    running_for: Duration,
+    breaks_in: Option<Duration>,
+}
+
+/// A duration in whole milliseconds, saturating rather than wrapping.
+fn ms(d: Duration) -> u64 {
+    d.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+/// What a caller is told when the handle it presented is not the run its session is holding.
+///
+/// One answer for three cases — never issued here, issued by another session, or replaced by a
+/// later run — and deliberately so: from the caller's side they are one fact, that this handle
+/// names nothing to wait for, and each has the same next move. `session_status` is what
+/// distinguishes them, and it is in every surface.
+fn unknown_execution(session: &str, handle: &str) -> String {
+    format!(
+        "`{handle}` is not a run session `{session}` is holding. Either it was never issued here, \
+         or another run has since replaced it — a session holds one at a time, and starting a new \
+         one retires the last. `session_status` reports the run this session has, if it has one."
+    )
+}
+
+/// A handle for one asynchronous run, unique across this server rather than within its session.
+///
+/// Within the session would be enough for the lookup — every tool that takes one takes a
+/// `session_id` beside it — and is exactly why it is not done that way: `session_id` is optional
+/// everywhere here, so an `exec-1` presented without one would be matched against whichever
+/// session is current, which on a server holding four is a coin toss between "not yours" and a
+/// **different run of the same name**. Unique handles make the second impossible.
+fn mint_execution_id() -> String {
+    let n = EXECUTION_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    format!("exec-{nanos:x}-{n}")
+}
+
+static EXECUTION_SEQ: AtomicU64 = AtomicU64::new(1);
 
 impl Session {
     fn state(&self) -> SessionState {
@@ -696,6 +842,89 @@ impl Session {
         }
     }
 
+    /// This session's outstanding run, as a report — `None` when it has never had one.
+    fn execution_info(&self) -> Option<crate::structured::ExecutionInfo> {
+        self.execution
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(Execution::info)
+    }
+
+    /// The run that is **still going**, or `None` — which covers both "never started one" and
+    /// "started one and it stopped". Those two are the same answer to the only question anyone
+    /// asks this: may work reach the target?
+    fn running_execution(&self) -> Option<(String, Duration)> {
+        self.execution
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .filter(|execution| execution.running())
+            .map(|execution| (execution.handle.clone(), execution.started.elapsed()))
+    }
+
+    /// Installs a run, replacing whatever the slot held. Refuses while one is still going.
+    ///
+    /// The check and the install are one lock acquisition, which is the whole of what stops two
+    /// `continue_async` calls arriving together from both minting a handle: check-then-install
+    /// through two acquisitions leaves a window in which each sees the slot free.
+    fn claim_execution(&self, execution: Execution) -> Result<(), (String, Duration)> {
+        let mut slot = self.execution.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(running) = slot.as_ref().filter(|e| e.running()) {
+            return Err((running.handle.clone(), running.started.elapsed()));
+        }
+        *slot = Some(execution);
+        drop(slot);
+        self.execution_moved();
+        Ok(())
+    }
+
+    /// Files a run's outcome against the job that produced it.
+    ///
+    /// Keyed by **job**, not by handle, because the writer is a task that outlived its caller and
+    /// the slot may by then hold a later run: a reply filed by handle alone could land a stop from
+    /// the run before last on the one in flight. A job id is minted once per session and never
+    /// reused, so a mismatch here is exactly "this answer is about a run nobody is holding any
+    /// more" and is dropped.
+    fn finish_execution(&self, job: u64, result: Result<Output, EngineError>) {
+        {
+            let mut slot = self.execution.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(execution) = slot.as_mut().filter(|e| e.job == job) else {
+                return;
+            };
+            execution.stopped = Some(Arc::new(result));
+        }
+        // The idle clock starts now, not when the run was submitted. `last_used` is stamped on
+        // submission everywhere else, which is right for a call that answers in seconds and wrong
+        // for one that can run for an hour: a session whose run outlasted the reclamation window
+        // would be idle the instant it stopped, and could be taken before its caller had read the
+        // stop it was waiting for.
+        *self.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        self.execution_moved();
+    }
+
+    /// The run this handle names, if the slot still holds it.
+    ///
+    /// A copy rather than a guard, because every caller goes on to `await` and holding a
+    /// `std::sync::Mutex` across an await point is how a session's slot comes to be locked by a
+    /// task that has been parked.
+    fn execution_by(&self, handle: &str) -> Option<FoundExecution> {
+        let slot = self.execution.lock().unwrap_or_else(|e| e.into_inner());
+        let execution = slot.as_ref().filter(|e| e.handle == handle)?;
+        Some(FoundExecution {
+            running: execution.running(),
+            stopped: execution.stopped.clone(),
+            running_for: execution.started.elapsed(),
+            breaks_in: execution.breaks_in(),
+        })
+    }
+
+    /// Wakes everything waiting on the slot. Sent rather than compared, so a run replaced by one
+    /// that happens to look the same still wakes its waiters.
+    fn execution_moved(&self) {
+        self.execution_changed.send_modify(|seq| *seq += 1);
+    }
+
     /// Kills the worker process. Idempotent.
     fn kill(&self) {
         let child = self.child.lock().unwrap_or_else(|e| e.into_inner()).take();
@@ -849,6 +1078,8 @@ pub struct SessionSnapshot {
     pub age: Duration,
     /// Whether a call that names no session is routed here.
     pub current: bool,
+    /// The asynchronous run this session is holding, if it has ever had one.
+    pub execution: Option<crate::structured::ExecutionInfo>,
 }
 
 // ---- outcomes of an open --------------------------------------------------
@@ -1077,6 +1308,15 @@ impl Sessions {
     }
 
     /// The transcript this server is writing, so the tool surface can record against the same one.
+    /// How long a tool call waits for an engine reply before giving up.
+    ///
+    /// Read by `wait_for_stop`, which has to cap its own wait below it: a wait that ran the whole
+    /// budget would have the call expire rather than answering, and "the call expired" and "the
+    /// target never stopped" are indistinguishable to the caller.
+    pub fn call_timeout(&self) -> Duration {
+        self.call_timeout
+    }
+
     pub fn recorder(&self) -> crate::record::Recorder {
         self.rec.clone()
     }
@@ -1229,6 +1469,7 @@ impl Sessions {
                 in_state_for: s.in_state_for(),
                 age: s.created.elapsed(),
                 current: current.as_deref() == Some(s.id.as_str()),
+                execution: s.execution_info(),
             })
             .collect()
     }
@@ -1248,16 +1489,28 @@ impl Sessions {
         self.call_as(session, call, budget, id, Wait::Fixed).await
     }
 
-    /// [`Self::call_within`] with the job id chosen by the caller, which only the opener does —
-    /// see [`OPENER_JOB`] — and with how this wait answers a worker that asks for more time.
-    async fn call_as(
+    /// Registers a waiter for `id` and queues the job, without waiting for the answer.
+    ///
+    /// Split out of [`Self::call_as`] because there are now two kinds of caller: one that waits
+    /// for its own reply, and `continue_async`, whose reply is a stop that arrives long after the
+    /// call is over and is filed on the session instead. Both need the registration to happen the
+    /// same way and in the same order, and a second copy of it is how the two come to disagree
+    /// about when a session counts as busy.
+    ///
+    /// `resumed` is where [`WorkerMessage::Resumed`] is reported, for the one caller that returns
+    /// on it.
+    fn submit(
         &self,
         session: &Arc<Session>,
         call: Call,
-        budget: Duration,
         id: u64,
-        wait: Wait,
-    ) -> Result<Output, EngineError> {
+        resumed: Option<oneshot::Sender<()>>,
+    ) -> Result<oneshot::Receiver<Result<Output, EngineError>>, EngineError> {
+        // Refused rather than queued while the target is moving — see
+        // [`Sessions::refuse_while_running`].
+        if let Some(refusal) = self.refuse_while_running(session, &call.op) {
+            return Err(refusal);
+        }
         let (tx, rx) = oneshot::channel();
         // Registered before the job is queued, so the session counts as busy from the moment the
         // call is submitted rather than from the moment it is written to the worker.
@@ -1286,6 +1539,7 @@ impl Sessions {
                     Waiting {
                         done: tx,
                         progress: crate::progress::current(),
+                        resumed,
                         unwound: false,
                     },
                 );
@@ -1305,9 +1559,57 @@ impl Sessions {
                 .remove(&id);
             return Err(EngineError::Lost(worker_gone(&session.id)));
         }
+        Ok(rx)
+    }
+
+    /// Refuses a call that would read or drive a target an asynchronous run has moving — or
+    /// `None` for one that may go through.
+    ///
+    /// **A refusal rather than a queue**, which is the whole of the choice. The session's engine
+    /// thread is inside `WaitForEvent` for the length of the run, so anything queued behind it is
+    /// answered whenever the target next stops: minutes, or the bound the run was started with,
+    /// and from the caller's side indistinguishable from a debugger that has hung. Worse, the
+    /// answer when it came would describe a target at a position nobody asked about.
+    ///
+    /// Three ops go through, each for its own reason. [`EngineOp::Interrupt`] is what stops the
+    /// run — it is answered by the worker's request reader ahead of the queue, so it does not wait
+    /// for the engine thread at all. [`EngineOp::EndSession`] is the other way out, and a teardown
+    /// refused because the target is running is a session nothing can release. And
+    /// [`EngineOp::Resume`] is refused a second way, by the slot itself
+    /// ([`Session::claim_execution`]), which reports the handle already holding it rather than the
+    /// generic sentence here.
+    fn refuse_while_running(&self, session: &Arc<Session>, op: &EngineOp) -> Option<EngineError> {
+        if matches!(
+            op,
+            EngineOp::Interrupt | EngineOp::EndSession | EngineOp::Resume { .. }
+        ) {
+            return None;
+        }
+        let (handle, running_for) = session.running_execution()?;
+        Some(EngineError::TargetRunning(format!(
+            "The target on session `{}` is running: it was resumed {} ago and has not stopped. \
+             Nothing can be read from a target while it moves, so this call was refused rather \
+             than queued behind the run — queued, it would have been answered whenever the target \
+             next stopped, about wherever it happened to be. The run is `{handle}`: wait for its \
+             stop, break the target in, or end the session.",
+            session.id,
+            crate::server::fmt_duration(running_for),
+        )))
+    }
+
+    /// [`Self::call_within`] with the job id chosen by the caller, which only the opener does —
+    /// see [`OPENER_JOB`] — and with how this wait answers a worker that asks for more time.
+    async fn call_as(
+        &self,
+        session: &Arc<Session>,
+        call: Call,
+        budget: Duration,
+        id: u64,
+        wait: Wait,
+    ) -> Result<Output, EngineError> {
         // Borrowed rather than consumed, so an expired budget can be extended below without losing
         // the reply that may still be coming.
-        let mut rx = rx;
+        let mut rx = self.submit(session, call, id, None)?;
         // The sender is dropped only when the worker's reader gives up on it, which it does by
         // answering first — so `Err` here is the residual case, not the normal one.
         let settled = |reply: Result<Result<Output, EngineError>, oneshot::error::RecvError>| {
@@ -1557,6 +1859,247 @@ impl Sessions {
             )),
         });
         outcome
+    }
+
+    /// Sets the target running and hands back a handle for the run, without waiting for it to
+    /// stop.
+    ///
+    /// **The wait this replaces is the caller's, not the worker's.** The engine thread still sits
+    /// in `WaitForEvent` for the whole run — DbgEng moves a target from nowhere else — and it is
+    /// still bounded, by `bound`, in the process that owns it. What changes is that the *tool
+    /// call* returns as soon as the target is moving, so the caller can go and do the thing the
+    /// run is waiting for: start a process on the guest, send an IOCTL, trip the code the
+    /// breakpoint is on.
+    ///
+    /// So there is no hidden wait anywhere. The run is recorded on the session before the job is
+    /// even queued, `session_status` reports it, `bound` says when the debugger will end it
+    /// itself, and the reply is filed against the handle by a task that does not care whether this
+    /// caller is still here.
+    ///
+    /// Returns when the worker says the target is moving, when the run turns out to have finished
+    /// without ever moving it, or when this call's own budget runs out — which leaves the run in
+    /// place rather than abandoning it, because by then it may well be running.
+    pub async fn start_execution(
+        &self,
+        session: &Arc<Session>,
+        named: bool,
+        command: String,
+        bound: Duration,
+    ) -> Result<crate::structured::ExecutionStarted, EngineError> {
+        let handle = mint_execution_id();
+        let job = session.next_id.fetch_add(1, Ordering::Relaxed);
+        // Claimed before anything is submitted, so a session with a run in flight is one whose
+        // slot already says so — there is no window where the target may be moving and this side
+        // would let a read through. The claim is also the "one at a time" check.
+        session
+            .claim_execution(Execution {
+                handle: handle.clone(),
+                command: command.clone(),
+                job,
+                started: Instant::now(),
+                bound,
+                stopped: None,
+            })
+            .map_err(|(held, running_for)| {
+                EngineError::TargetRunning(format!(
+                    "Session `{}` already has a run in flight: `{held}`, resumed {} ago and not \
+                     yet stopped. A session has one engine thread and a target moves only while \
+                     that thread is pumping it, so a second run could not start until the first \
+                     ended — this refusal is that fact, said at the point it can still be acted \
+                     on. Wait for `{held}` to stop, break the target in, or end the session.",
+                    session.id,
+                    crate::server::fmt_duration(running_for),
+                ))
+            })?;
+        // Taken before the job is submitted so no change to the slot can be missed — including one
+        // made by the filing task below before this function gets as far as waiting.
+        let mut changed = session.execution_changed.subscribe();
+        let (resumed_tx, mut resumed_rx) = oneshot::channel();
+        let call = Call::new(EngineOp::Resume {
+            command: command.clone(),
+            timeout_ms: bound.as_millis().min(u128::from(u32::MAX)) as u32,
+        })
+        .named(named);
+        let reply = match self.submit(session, call, job, Some(resumed_tx)) {
+            Ok(reply) => reply,
+            Err(why) => {
+                // Nothing was queued, so nothing will ever answer this job — and a slot left
+                // saying "running" would refuse every later call on a session where nothing is.
+                session.finish_execution(job, Err(why.clone()));
+                return Err(why);
+            }
+        };
+        // Files the stop whenever it comes, whoever is still listening. Spawned before this
+        // function waits for anything, because the case it exists for is this caller not being
+        // here: a `continue_async` whose client disconnects mid-run must still leave the session
+        // in a state where the next caller can see what happened.
+        let filing = Arc::clone(session);
+        tokio::spawn(async move {
+            let result = reply
+                .await
+                .unwrap_or_else(|_| Err(EngineError::Lost(worker_gone(&filing.id))));
+            filing.finish_execution(job, result);
+        });
+
+        let started = |running: bool| crate::structured::ExecutionStarted {
+            session_id: session.id.clone(),
+            execution: handle.clone(),
+            command: command.clone(),
+            running,
+            breaks_in_ms: session
+                .execution_by(&handle)
+                .and_then(|found| found.breaks_in)
+                .map(ms),
+        };
+        let settled = tokio::time::timeout(self.call_timeout, async {
+            loop {
+                // **The milestone first, always.** A run can start and stop before this loop gets a
+                // turn — a `g` onto a breakpoint one instruction away — and then both facts are
+                // waiting here. Reading the stop first would answer "the target never started
+                // moving" about a target that moved and stopped, which is the one sentence here
+                // that is simply false. `try_recv` leaves the receiver usable when there is
+                // nothing yet, and a value survives the sender being dropped, so a milestone sent
+                // before the reply is never missed.
+                if resumed_rx.try_recv().is_ok() {
+                    return Ok(started(true));
+                }
+                // Then the reply, which by now can only belong to a run that never moved the
+                // target: the command completed by itself, or it was refused. A refusal is this
+                // call's failure — reported rather than dressed up as a run that finished early,
+                // which is what a `continue_async` on a session whose target has gone would
+                // otherwise come back as.
+                if let Some(found) = session.execution_by(&handle)
+                    && let Some(stopped) = found.stopped
+                {
+                    return match stopped.as_ref() {
+                        Err(why) => Err(why.clone()),
+                        Ok(_) => Ok(started(false)),
+                    };
+                }
+                // `Err` from `changed` is the sender dropped, which cannot happen while this holds
+                // the session — answered rather than unwrapped all the same, and the loop's own
+                // two checks are what answer it.
+                //
+                // Cancellation-safe: `watch::Receiver::changed` is documented to be, so losing the
+                // race costs nothing on the next turn.
+                if changed.changed().await.is_err() {
+                    return Ok(started(false));
+                }
+            }
+        })
+        .await;
+        settled.unwrap_or_else(|_| {
+            // The run stays on the session. This is the wait that gave up, and the job it was
+            // waiting on is still out there — the same rule every other call here follows, with
+            // one thing more to say, because a run nobody is holding a handle to would be a target
+            // that could be moving with no way to find out.
+            Err(EngineError::Timeout(format!(
+                "The resume on session `{}` was submitted and had not reported the target moving \
+                 before this call's budget ran out; it is `{handle}`. The run was not abandoned — \
+                 `session_status` reports it, including whether the target is moving and when the \
+                 debugger will break it in.",
+                session.id
+            )))
+        })
+    }
+
+    /// Waits for an asynchronous run to stop, for at most `wait`.
+    ///
+    /// **Nothing here touches the engine**, which is what makes a timeout free of consequences:
+    /// the run is bounded in the worker by what `continue_async` was asked for, and this waits on
+    /// a channel the filing task writes. A wait that runs out has cancelled nothing, consumed
+    /// nothing and left nothing behind — the target is still running, the handle is still good,
+    /// and waiting again carries on.
+    ///
+    /// The stop is **read, not taken**: several waits can watch one run, a caller that gave up can
+    /// come back for the answer, and two calls asking about one run must not disagree.
+    pub async fn wait_for_stop(
+        &self,
+        session: &Arc<Session>,
+        handle: &str,
+        wait: Duration,
+    ) -> Result<crate::structured::StopWait, EngineError> {
+        let mut changed = session.execution_changed.subscribe();
+        // Set when the wait expires, so the loop takes exactly one more turn — long enough to
+        // re-read the slot through the checks below, and no longer.
+        let mut ran_out = false;
+        let report = |found: FoundExecution| crate::structured::StopWait {
+            session_id: session.id.clone(),
+            execution: handle.to_string(),
+            running_for_ms: ms(found.running_for),
+            stop: None,
+            breaks_in_ms: found.breaks_in.map(ms),
+        };
+        loop {
+            let Some(found) = session.execution_by(handle) else {
+                return Err(EngineError::Stale(unknown_execution(&session.id, handle)));
+            };
+            if let Some(stopped) = &found.stopped {
+                return match stopped.as_ref() {
+                    // The run itself failed. Reported as this call's failure, keeping the kind the
+                    // worker named — a caller asking what happened to a run gets the same answer
+                    // the synchronous tool would have given it.
+                    Err(why) => Err(why.clone()),
+                    Ok(out) => Ok(crate::structured::StopWait {
+                        // The worker's own value, folded into a record keyed by a handle it has
+                        // never heard of. See `proto::Output::stop`.
+                        stop: out.stop.as_deref().cloned(),
+                        ..report(found)
+                    }),
+                };
+            }
+            // The budget is spent, and the checks above have just re-read the slot — which is
+            // the point of answering here rather than where the timeout fired. The run may have
+            // stopped while this was waiting out the last of it, and reporting a target as still
+            // moving because a figure was a second stale is the one wrong answer this tool can
+            // give.
+            if ran_out {
+                return Ok(report(found));
+            }
+            if tokio::time::timeout(wait, changed.changed()).await.is_err() {
+                ran_out = true;
+            }
+        }
+    }
+
+    /// Asks the engine to break an asynchronous run in, and answers without waiting for it to.
+    ///
+    /// The stop is not reported here on purpose: `SetInterrupt` lodges a request and returns, so
+    /// the target stops at the engine's next poll — which is the run *ending*, and belongs where
+    /// every other ending of that run is reported. Answering with a stop here would mean inventing
+    /// one from a request that had only just been made.
+    pub async fn break_in(
+        &self,
+        session: &Arc<Session>,
+        handle: &str,
+        named: bool,
+    ) -> Result<crate::structured::BreakInRequested, EngineError> {
+        let Some(found) = session.execution_by(handle) else {
+            return Err(EngineError::Stale(unknown_execution(&session.id, handle)));
+        };
+        if !found.running {
+            // Not an error: a run that stopped by itself while the caller was deciding to break it
+            // is the ordinary race, and the thing they wanted has happened.
+            return Ok(crate::structured::BreakInRequested {
+                session_id: session.id.clone(),
+                execution: handle.to_string(),
+                requested: false,
+                detail: format!(
+                    "`{handle}` had already stopped, so nothing was sent. Read where it stopped \
+                     rather than breaking it in."
+                ),
+            });
+        }
+        let outcome = self.interrupt(session, named).await;
+        Ok(crate::structured::BreakInRequested {
+            session_id: session.id.clone(),
+            execution: handle.to_string(),
+            requested: outcome.is_ok(),
+            detail: match &outcome {
+                Ok(out) => out.text.clone(),
+                Err(why) => why.to_string(),
+            },
+        })
     }
 
     /// Ends a session: asks the worker to release its target, then terminates it.
@@ -2181,6 +2724,8 @@ impl Sessions {
             phase: AtomicU8::new(OpenPhase::Started as u8),
             released: AtomicBool::new(false),
             unwinding,
+            execution: Mutex::new(None),
+            execution_changed: tokio::sync::watch::Sender::new(0),
             child: Mutex::new(Some(child)),
             rec: self.rec.clone(),
         });
@@ -3187,6 +3732,29 @@ async fn reader(
                 // the call for a client — and a narration may not contradict itself.
                 tell_rollback(&waiters, id, within);
             }
+            // The target an `EngineOp::Resume` was given is moving. Reported to the call that
+            // started it — which is waiting on exactly this and not on the result, since the
+            // result is the stop and may be an hour away.
+            WorkerMessage::Resumed { id } => {
+                let told = waiters
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_mut(&id)
+                    .and_then(|waiting| waiting.resumed.take());
+                match told {
+                    Some(tx) => {
+                        let _ = tx.send(());
+                    }
+                    // The caller gave up before the target got going, or this is a second
+                    // milestone for one job. Neither is worth failing anything over: the run is
+                    // recorded on the session either way, and `session_status` reports it.
+                    None => tracing::debug!(
+                        "session {}: job {id} reported its target running with nobody waiting on \
+                         the milestone",
+                        session.id
+                    ),
+                }
+            }
             WorkerMessage::Committed { id } | WorkerMessage::Opened { id } => {
                 tracing::warn!(
                     "session {}: job {id} reported an opener milestone",
@@ -3756,6 +4324,449 @@ mod tests {
             .unwrap_or(0)
     }
 
+    // ---- asynchronous runs ---------------------------------------------------------
+    //
+    // A run's whole life above the engine: who may hold one, what a wait does when it runs out,
+    // what a stop does to the session, and which calls are refused while a target moves. None of
+    // it needs a debugger — the engine's part is one `settle` in the worker, and the smoke tier's
+    // launch tests are where that is exercised.
+
+    /// Builds a run in the state the tests below start from, and hands back its handle.
+    fn resumed_on(session: &Arc<Session>, job: u64) -> String {
+        let handle = mint_execution_id();
+        session
+            .claim_execution(Execution {
+                handle: handle.clone(),
+                command: "g".to_string(),
+                job,
+                started: Instant::now(),
+                bound: Duration::from_secs(60),
+                stopped: None,
+            })
+            .expect("a session with no run accepts one");
+        handle
+    }
+
+    /// One run per session, and the refusal names the one already there.
+    ///
+    /// Not a policy so much as the shape of the thing: a session has one engine thread and DbgEng
+    /// moves a target only from inside `WaitForEvent`, so a second run could not start until the
+    /// first ended. Refusing says that at the point a caller can still act on it.
+    #[test]
+    fn a_session_holds_one_run_at_a_time() {
+        let session = dormant("sess-1", SessionState::Open);
+        let first = resumed_on(&session, 7);
+
+        let (held, _) = session
+            .claim_execution(Execution {
+                handle: "exec-second".to_string(),
+                command: "g".to_string(),
+                job: 8,
+                started: Instant::now(),
+                bound: Duration::from_secs(60),
+                stopped: None,
+            })
+            .expect_err("a second run started while the first was going");
+        assert_eq!(
+            held, first,
+            "the refusal has to name the run already there, or a caller cannot wait for it"
+        );
+
+        // Once it has stopped the slot is free again — and the new run *replaces* the old one
+        // rather than being refused, which is what makes a handle age out rather than accumulate.
+        session.finish_execution(7, Ok(Output::text("stopped")));
+        let second = resumed_on(&session, 8);
+        assert_ne!(second, first);
+        assert!(
+            session.execution_by(&first).is_none(),
+            "the replaced handle must stop resolving, or two handles name one slot"
+        );
+    }
+
+    /// A reply is filed against the job that produced it, never against whatever the slot holds.
+    ///
+    /// The writer is a task that outlives its caller, so by the time a stop arrives the session may
+    /// be on a later run. Filing by handle alone would land the run-before-last's stop on the one
+    /// in flight — reported as a target that had stopped when it is still moving, which is the one
+    /// answer here that gets a caller to read a moving target.
+    #[test]
+    fn a_stop_is_filed_against_its_own_job() {
+        let session = dormant("sess-1", SessionState::Open);
+        let first = resumed_on(&session, 7);
+        session.finish_execution(7, Ok(Output::text("first stop")));
+        let second = resumed_on(&session, 8);
+
+        session.finish_execution(7, Ok(Output::text("a stop from the run before last")));
+        let found = session.execution_by(&second).expect("the current run");
+        assert!(
+            found.running,
+            "a stale job's reply was filed against the run in flight"
+        );
+        assert!(session.execution_by(&first).is_none());
+    }
+
+    /// While a target is moving, everything that would read it is refused — and the three ops that
+    /// are the way out are not.
+    #[test]
+    fn a_moving_target_refuses_the_calls_that_would_read_it() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let session = dormant("sess-1", SessionState::Open);
+        let handle = resumed_on(&session, 7);
+
+        let refused = sessions
+            .refuse_while_running(&session, &EngineOp::Registers { all: false })
+            .expect("a read of a moving target was allowed through");
+        assert!(matches!(refused, EngineError::TargetRunning(_)));
+        let said = refused.to_string();
+        assert!(
+            said.contains(&handle),
+            "the refusal has to name the run, or a caller cannot wait for it: {said}"
+        );
+        assert!(
+            said.contains("refused rather than queued"),
+            "a caller told only 'no' will retry; the point is that queueing was the alternative \
+             and it is worse: {said}"
+        );
+
+        for op in [
+            EngineOp::Interrupt,
+            EngineOp::EndSession,
+            EngineOp::Resume {
+                command: "g".to_string(),
+                timeout_ms: 1_000,
+            },
+        ] {
+            assert!(
+                sessions.refuse_while_running(&session, &op).is_none(),
+                "{op:?} is a way out of a running target and must not be refused by it"
+            );
+        }
+
+        // And the refusal lifts the moment the run stops, with nothing else having to happen.
+        session.finish_execution(7, Ok(Output::text("stopped")));
+        assert!(
+            sessions
+                .refuse_while_running(&session, &EngineOp::Registers { all: false })
+                .is_none()
+        );
+    }
+
+    /// A wait that runs out is not a failure, cancels nothing, and says the target is still going.
+    ///
+    /// The distinction the whole tool rests on: a caller that reads "this wait ran out" as "the
+    /// debugger did not answer" ends a session that is working perfectly.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_that_runs_out_leaves_the_run_alone() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let session = dormant("sess-1", SessionState::Open);
+        let handle = resumed_on(&session, 7);
+
+        let waited = sessions
+            .wait_for_stop(&session, &handle, Duration::from_secs(5))
+            .await
+            .expect("running out is an answer, not an error");
+        assert!(
+            waited.stop.is_none(),
+            "a wait that ran out must not report a stop"
+        );
+        assert!(
+            waited.breaks_in_ms.is_some_and(|left| left > 0),
+            "a running target has a bound left, and it is what tells a caller how long to keep \
+             waiting"
+        );
+        assert!(
+            session.execution_by(&handle).is_some_and(|f| f.running),
+            "the wait consumed the run"
+        );
+    }
+
+    /// A stop is read, not taken: the second reader gets the same answer as the first.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_can_be_read_more_than_once() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let session = dormant("sess-1", SessionState::Open);
+        let handle = resumed_on(&session, 7);
+        session.finish_execution(
+            7,
+            Ok(Output::stopped(
+                "stopped",
+                crate::structured::StopReport {
+                    command: "g".to_string(),
+                    stopped_at: Some("0xdead".to_string()),
+                    thread: Some(4242),
+                    processor: None,
+                    interrupted: false,
+                    timed_out: false,
+                    target_gone: false,
+                    output: String::new(),
+                },
+            )),
+        );
+
+        for read in 0..2 {
+            let waited = sessions
+                .wait_for_stop(&session, &handle, Duration::from_secs(5))
+                .await
+                .expect("the stop is there");
+            let stop = waited
+                .stop
+                .unwrap_or_else(|| panic!("read {read} found no stop"));
+            assert_eq!(stop.stopped_at.as_deref(), Some("0xdead"), "read {read}");
+            assert_eq!(stop.thread, Some(4242), "read {read}");
+            assert!(
+                waited.breaks_in_ms.is_none(),
+                "a stopped run has no bound left"
+            );
+        }
+    }
+
+    /// A run that failed is reported as this call's failure, keeping the kind the worker named.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_that_failed_fails_the_wait() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let session = dormant("sess-1", SessionState::Open);
+        let handle = resumed_on(&session, 7);
+        session.finish_execution(7, Err(EngineError::Lost("the worker died".to_string())));
+
+        let failed = sessions
+            .wait_for_stop(&session, &handle, Duration::from_secs(5))
+            .await
+            .expect_err("a failed run has to fail its wait");
+        assert!(matches!(failed, EngineError::Lost(_)));
+    }
+
+    /// A handle the session is not holding is refused, and the refusal says what to ask instead.
+    #[tokio::test(start_paused = true)]
+    async fn an_unknown_handle_is_refused_rather_than_waited_on() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let session = dormant("sess-1", SessionState::Open);
+
+        let refused = sessions
+            .wait_for_stop(&session, "exec-nothing", Duration::from_secs(5))
+            .await
+            .expect_err("an unknown handle was waited on");
+        assert!(matches!(refused, EngineError::Stale(_)));
+        assert!(
+            refused.to_string().contains("session_status"),
+            "the one tool every surface has is what distinguishes the three ways a handle can be \
+             unknown: {refused}"
+        );
+
+        let refused = sessions
+            .break_in(&session, "exec-nothing", true)
+            .await
+            .expect_err("an unknown handle was broken in");
+        assert!(matches!(refused, EngineError::Stale(_)));
+    }
+
+    /// Breaking in a run that has already stopped is the ordinary race, not a failure.
+    #[tokio::test(start_paused = true)]
+    async fn breaking_in_a_run_that_already_stopped_is_not_an_error() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let session = dormant("sess-1", SessionState::Open);
+        let handle = resumed_on(&session, 7);
+        session.finish_execution(7, Ok(Output::text("stopped")));
+
+        let asked = sessions
+            .break_in(&session, &handle, true)
+            .await
+            .expect("a stopped run is a fine thing to have asked about");
+        assert!(
+            !asked.requested,
+            "nothing should have been sent to an engine with nothing to break"
+        );
+        assert!(asked.detail.contains("already stopped"));
+    }
+
+    /// Plays the worker for one queued resume: takes the job, reports the milestone if asked, and
+    /// answers with `reply`.
+    ///
+    /// Standing in for [`reader`] rather than running it, because what these tests are about is
+    /// the order `start_execution` reads two facts in — and staging that needs the two to arrive
+    /// together, which is exactly what a real worker does for a run that is over before its caller
+    /// looks and exactly what a scheduler will not reproduce on demand.
+    fn answer_one_resume(
+        session: &Arc<Session>,
+        mut jobs: mpsc::UnboundedReceiver<Job>,
+        moved: bool,
+        reply: Result<Output, EngineError>,
+    ) {
+        let session = Arc::clone(session);
+        tokio::spawn(async move {
+            let job = jobs.recv().await.expect("the resume reached the queue");
+            if moved {
+                let told = session
+                    .waiters
+                    .lock()
+                    .unwrap()
+                    .get_mut(&job.id)
+                    .and_then(|waiting| waiting.resumed.take())
+                    .expect("a resume registers somewhere to report the milestone");
+                let _ = told.send(());
+            }
+            let done = session
+                .waiters
+                .lock()
+                .unwrap()
+                .remove(&job.id)
+                .expect("the waiter is still registered")
+                .done;
+            let _ = done.send(reply);
+        });
+    }
+
+    /// A run that started **and stopped** before its caller got a turn is still a run that moved
+    /// the target.
+    ///
+    /// Both facts are waiting by then — the milestone and the reply — and reading the reply first
+    /// answers "the target never started moving" about a target that moved and stopped. That is
+    /// not a nuance: it is the difference between a `g` onto a nearby breakpoint reporting what it
+    /// did and reporting that nothing happened.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_that_stopped_before_its_caller_looked_still_says_it_moved() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let (session, jobs) = queued("sess-1", SessionState::Open);
+        answer_one_resume(&session, jobs, true, Ok(Output::text("Breakpoint 0 hit")));
+
+        let started = sessions
+            .start_execution(&session, true, "g".to_string(), Duration::from_secs(60))
+            .await
+            .expect("a run that reached a breakpoint is not a failure");
+        assert!(
+            started.running,
+            "the milestone said the target moved, and the reply arriving first must not overwrite \
+             that with `it never started`"
+        );
+    }
+
+    /// A resume the worker **refused** fails the call, rather than being dressed up as a run that
+    /// finished early.
+    ///
+    /// The refusal that reaches this is a real one: a session whose target has gone refuses every
+    /// op, this one included. Reported as an `ExecutionStarted` it would be a success carrying a
+    /// handle to a run that never existed, and the failure would only surface on a later wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_resume_the_worker_refused_fails_the_call() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let (session, jobs) = queued("sess-1", SessionState::Open);
+        answer_one_resume(
+            &session,
+            jobs,
+            false,
+            Err(EngineError::Stale(
+                "this session has no target left".to_string(),
+            )),
+        );
+
+        let refused = sessions
+            .start_execution(&session, true, "g".to_string(), Duration::from_secs(60))
+            .await
+            .expect_err("a refused resume reported a started run");
+        assert!(
+            matches!(refused, EngineError::Stale(_)),
+            "the kind the worker named has to survive, or a caller retries what cannot work: \
+             {refused}"
+        );
+    }
+
+    /// A stop filed **while** a wait is in flight wakes it, rather than being found on the next
+    /// poll.
+    ///
+    /// The property the `watch` is there for: a receiver taken before the slot is read cannot miss
+    /// a change made after that read. Got wrong, the wait sits out its whole budget and reports
+    /// "still running" about a target that stopped a moment after it started waiting.
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_filed_during_a_wait_wakes_it() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let session = dormant("sess-1", SessionState::Open);
+        let handle = resumed_on(&session, 7);
+
+        let filing = Arc::clone(&session);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            filing.finish_execution(
+                7,
+                Ok(Output::stopped(
+                    "Breakpoint 0 hit",
+                    crate::structured::StopReport {
+                        command: "g".to_string(),
+                        stopped_at: Some("0xbeef".to_string()),
+                        thread: None,
+                        processor: None,
+                        interrupted: false,
+                        timed_out: false,
+                        target_gone: false,
+                        output: String::new(),
+                    },
+                )),
+            );
+        });
+
+        let started = tokio::time::Instant::now();
+        let waited = sessions
+            .wait_for_stop(&session, &handle, Duration::from_secs(120))
+            .await
+            .expect("the run stopped");
+        assert_eq!(
+            waited
+                .stop
+                .expect("the wait found no stop")
+                .stopped_at
+                .as_deref(),
+            Some("0xbeef")
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the wait sat out its budget instead of being woken, which is what a lost wakeup looks \
+             like: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A session holding a run is busy, and stops being idle from the moment the run *ends*.
+    ///
+    /// Both halves matter and they are different mechanisms. Busy is the waiter, which keeps
+    /// reclamation off a session whose target is moving. The clock is `last_used`, stamped again
+    /// when the stop is filed — without which a run that outlasted the reclamation window would
+    /// leave the session reclaimable the instant it stopped, and the stop could be taken away
+    /// before its caller read it.
+    #[test]
+    fn a_run_keeps_its_session_from_being_reclaimed() {
+        let session = dormant("sess-1", SessionState::Open);
+        let handle = resumed_on(&session, 7);
+        session.waiters.lock().unwrap().insert(
+            7,
+            Waiting {
+                done: oneshot::channel().0,
+                progress: None,
+                resumed: None,
+                unwound: false,
+            },
+        );
+        assert!(session.busy(), "a run in flight has a reply outstanding");
+
+        session.waiters.lock().unwrap().remove(&7);
+        // Aged past the reclamation window, which is what a long run does to the stamp taken when
+        // it was *submitted* — the only stamp there was before the stop started taking one.
+        *session.last_used.lock().unwrap() = Instant::now() - Duration::from_secs(3_600);
+        assert!(
+            session.idle_for(Duration::from_secs(60)),
+            "the submission stamp is stale, which is the state this is about"
+        );
+        session.finish_execution(7, Ok(Output::text("stopped")));
+        assert!(!session.busy(), "a run that ended owes nothing");
+        assert!(
+            !session.idle_for(Duration::from_secs(60)),
+            "the idle clock has to restart when the run ends, or a long run leaves its session \
+             reclaimable the moment it stops — and the stop could be taken before its caller read \
+             it"
+        );
+        assert!(
+            session.execution_by(&handle).is_some(),
+            "the stop outlives the run so a caller who was not waiting can still read it"
+        );
+    }
+
     // ---- releasing what nobody is using -------------------------------------------
 
     /// The clock alone is not the question. A session with a call outstanding is in use however
@@ -3776,6 +4787,7 @@ mod tests {
             Waiting {
                 done: oneshot::channel().0,
                 progress: None,
+                resumed: None,
                 unwound: false,
             },
         );
@@ -3913,6 +4925,8 @@ mod tests {
             phase: AtomicU8::new(phase as u8),
             released: AtomicBool::new(false),
             unwinding: Arc::new(Mutex::new(None)),
+            execution: Mutex::new(None),
+            execution_changed: tokio::sync::watch::Sender::new(0),
             child: Mutex::new(None),
             rec,
         })
@@ -3990,6 +5004,7 @@ mod tests {
                 Waiting {
                     done,
                     progress: None,
+                    resumed: None,
                     unwound: false,
                 },
             );
@@ -4369,6 +5384,7 @@ mod tests {
             Waiting {
                 done: tx,
                 progress: Some(reporter),
+                resumed: None,
                 unwound: false,
             },
         );
@@ -4399,6 +5415,7 @@ mod tests {
             Waiting {
                 done: tx,
                 progress: Some(reporter),
+                resumed: None,
                 unwound: false,
             },
         );
@@ -4436,6 +5453,7 @@ mod tests {
                 Waiting {
                     done: tx,
                     progress: None,
+                    resumed: None,
                     unwound: false,
                 },
             );

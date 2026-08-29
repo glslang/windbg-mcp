@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twenty-six clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty-seven clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/dbgscope#71, 2026-08-01), items 13–14 from the bounded-command coverage review
@@ -51,7 +51,10 @@ open — a tier that makes its own 32-bit fixture instead of waiting to be hande
 WoW64 route a dump header cannot answer for — and, while testing that, from Windows Defender
 quarantining this project's own binary, and item 51 from what building that live route made
 reachable: the first tier to attach to a running process found that ending its session kills it
-(2026-08-27, and **landed** the next day).
+(2026-08-27, and **landed** the next day), and item 52 from
+[#83](https://github.com/glslang/windbg-mcp/issues/83)'s asynchronous execution handles, where the
+invariant that stops a description naming a tool its client cannot call turned out to cover only
+half the prose a client is served (2026-08-29).
 Each item notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -3618,3 +3621,37 @@ the very first paired run after a full rebuild, the detached `ping` exited `0xC0
 surviving. It has not recurred in the twenty-four consecutive runs since, on either the paired or
 the single-test path, and no later run has produced it. If it comes back it is about what the
 active detach leaves in the target, not about which branch was taken.
+
+## 52. [windbg-mcp] The "no description names a tool the client cannot call" invariant does not cover **input schemas**
+
+**Where it came from.** Writing #83's three tools (2026-08-29). Their argument docs wanted to say
+"the handle `continue_async` reported", which is the natural sentence — and
+`no_description_names_a_tool_the_client_cannot_call` would not have caught it, because it walks
+`descriptions_for(spec)` and an argument's doc comment ends up in the **input schema**, not the
+description. The schema is model-visible: `docs/token-budget.md` counts it inside `modelVisible`,
+and `tool_budget.json` has an `inputSchema` column of its own. So a `--tools wait_for_stop` client
+would read a pointer to a tool it is refused, which is exactly what item 41 exists to prevent, on
+the one channel item 41 did not look at.
+
+**This is pre-existing, and there is at least one live instance.** `RunToAddressArgs::address` says
+"Typically a block from `reachable_from_dispatch`" (`src/server.rs`). `run_to_address` is `exec` and
+`reachable_from_dispatch` is `ioctl`, so any surface with the first and not the second — `exec`
+alone, `session,exec,crash`, the bench's `lean` — ships that pointer to a client that cannot follow
+it. #83's own tools were reworded to name no tool rather than adding a second instance while
+reporting the first.
+
+**What would close it.** Extend the walk to the input schema — `descriptions_for` already builds a
+router per spec, so the schema is in hand beside the description and it is the same `names_tool`
+predicate over a second string. Then either move the `reachable_from_dispatch` sentence into
+`TOOL_NOTES` (which appends per-tool and already has the all-of rule) or reword it, and check
+whether the fix wants a third table for *schema* notes, since `annotate` rewrites descriptions and
+nothing today rewrites a schema.
+
+**Why it was deferred.** It is a second channel with a second mechanism, and finding it in the
+middle of a feature is the wrong moment to build one: the fix has to decide whether an argument's
+prose can carry a cross-reference at all, and that decision changes how every future argument is
+documented. The immediate hazard is one sentence, on surfaces that hold `exec` without `ioctl`.
+
+**Where it picks up.** `no_description_names_a_tool_the_client_cannot_call` and `descriptions_for`
+in `src/server.rs`'s tests, `TOOL_NOTES` and `annotate` beside them, and item 41 for the argument
+about which channels a narrowed surface has to narrow.
