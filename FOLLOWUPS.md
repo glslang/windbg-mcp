@@ -8,7 +8,9 @@ MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 from transactional batches (#82, 2026-08-09/10 — item 17 is what validating the tool against the CTF
 session's own transcript turned up, and item 18 what reviewing it did), item 19 from
 `walk_memory` (#103, 2026-08-13), items 20–22 from standing the server up on an ARM64 guest
-(#131, #132, #134, 2026-08-16), item 23 from making the listener usable rather than merely
+(#131, #132, #134, 2026-08-16 — **all three have since landed**, item 21 last, on 2026-08-29, once
+the repo's own TTD tier turned out to depend on the route its docs called a fallback), item 23 from
+making the listener usable rather than merely
 working (2026-08-17), items 24, 35 and 36 from measuring what this server costs the model driving
 it — the surface and the results first (2026-08-17), then what a `registers` answer is actually
 made of, and then `--tools` landing server-wide on a listener whose clients are already named
@@ -646,7 +648,7 @@ covered by unit tests rather than a live probe, because the ARM64 host it was fo
 a TTD in either layout — its recorder is the `PATH` copy, which is the workaround this removes the
 need for.
 
-## 21. [windbg-mcp] TTD replay on a host where the store package will not install
+## 21. [windbg-mcp] TTD replay on a host where the store package will not install — **done** (2026-08-29, #132)
 
 `open_trace` needs the replay engine — `TTDReplay*.dll`, `TtdExt.dll`, `TTDAnalyze.dll` — in a
 `ttd\` directory beside `windbg-mcp.exe`. System32's `dbgeng.dll` ships none of it and rejects every
@@ -665,13 +667,84 @@ judgement call rather than a task. `open_trace` now says *why* a trace will not 
 surfacing `0x80070057`, and `setup.md` carries a recipe for unpacking `ttd\` from the
 `.msixbundle`, which is an ordinary zip. So the failure is legible and there is a way through it.
 
-What is undecided is whether unpacking a Microsoft package by hand should be a **supported** path
-in this project's own documentation — it is currently written down as a fallback, not endorsed — or
-whether the answer is to require an interactive install and say so plainly. That is a maintainer's
-call about what this repo is willing to tell people to do, not an engineering problem.
+What was undecided is whether unpacking a Microsoft package by hand should be a **supported** path
+in this project's own documentation — it was written down as a fallback, not endorsed — or whether
+the answer is to require an interactive install and say so plainly. That is a maintainer's call
+about what this repo is willing to tell people to do, not an engineering problem.
 
-Picks up at [`setup.md`](./skills/windbg-debugging/setup.md)'s *When the store package will not
-install*, and [#132](https://github.com/glslang/windbg-mcp/issues/132).
+**Resolved as endorsed**, and the deciding evidence came from somewhere this entry was not looking:
+**item 47**. The TTD tier records a trace, opens it and queries it on the x64 bench, and that
+bench's `ttd\` came from this entry's own unpack recipe — so the path the documentation called a
+fallback was already the one this repository's own coverage stood on. A project cannot hold a route
+at arm's length and depend on it at the same time; that, rather than any argument about what MSIX
+is for, is what settled it.
+
+**Three things the entry did not anticipate**, which is why it is kept rather than deleted.
+
+The first is that endorsing removed a step instead of adding one. The store package's
+`InstallLocation\$arch` and the unpacked `.msix`'s `$arch\` are the **same layout** — same files,
+same subdirectories — so the two sources differ only in how `$wd` is set, and the copy block after
+it is one block rather than two. The old shape had the bundle copying `ttd\` *alone* into a
+payload otherwise taken from the SDK, which is the more complicated arrangement as well as the
+less supported one.
+
+The second is that **the recipe did not work, and had not since the day it was written** —
+`8bd98a5`, 2026-08-16, unchanged for the thirteen days until this. Its first line read the
+`.appinstaller` with `(Invoke-WebRequest …).Content` and cast it to `[xml]`; under Windows
+PowerShell 5.1 that property is a `Byte[]` for this content type, so the cast throws
+*"Cannot convert value \"System.Byte[]\" to type \"System.Xml.XmlDocument\""* and nothing is
+downloaded at all. Whatever it was derived from, nobody had run **that text** start to finish, and
+it read perfectly plausibly for thirteen days. Fetching to a file and reading it back with
+`Get-Content -Raw` is version-proof, and is what it does now. **A documented recipe nobody executes
+is a claim, not a procedure** — which is the general lesson, and the reason the end-to-end run
+below was worth its 1.1 GB.
+
+The third is that the honest verification step was cheap. `Get-AuthenticodeSignature` answers on a
+`.msixbundle` — `Valid`, `SignatureType Authenticode`, `CN=Microsoft Corporation` — so "unpack a
+Microsoft package by hand" could become "verify the publisher, then unpack", which is what makes it
+defensible to write down. It settles provenance and not fitness, and `setup.md` says so in those
+terms rather than letting a green check stand for more than it is.
+
+**What the end-to-end run measured** (ARM64 bench, Windows PowerShell 5.1.26100.1, 2026-08-29):
+the `.appinstaller` resolves to `windbg.download.prss.microsoft.com/.../1-2606-22001-0`; the bundle
+is 1,188,564,441 bytes and verifies as above; it holds `windbg_win-arm64.msix`, `windbg_win-x64.msix`
+and `windbg_win-x86.msix`, so the recipe's guessed name is right; and **all three** payload trees
+inside the ARM64 one — `amd64\`, `arm64\`, `x86\` — carry the entire copy list, `msdia140.dll`
+included, plus `ttd\TTD.exe`, which means the engine copy already brings the *recorder* rather than
+only the replay engine.
+
+**And then the bench was bundled from it, which closed the issue where it was filed.** The ARM64
+payload went beside `target\release\windbg-mcp.exe` and the host that could only record now
+replays: `hostname.exe` recorded to a 40 MB `.run` with the bundled `ttd\TTD.exe`, `open_trace`
+answered with the trace's lifetime (`[E:0, 7F8:EB0]`, 9 modules) rather than the missing-`ttd\`
+diagnostic it gave twenty minutes earlier, and `step_back` reached the start of the trace. So
+"an engine bundled this way replays" is measured on ARM64 as well as on the x64 tier.
+
+Two things that copy turned up, neither of them anticipated:
+
+- **The running server holds `dbgeng.dll` open**, so bundling or updating an engine needs the
+  service *stopped* — having no sessions open is not enough. The supervisor never uses DbgEng, but
+  the DLL is an import-table dependency of the image, so the loader maps it before `main` whatever
+  role the process goes on to play. `Copy-Item` fails with *"being used by another process"*
+  against a supervisor sitting idle with an empty session list. Same mechanism this file already
+  records for the 32-bit worker, which is why an `x86\windbg-mcp.exe` with no engine beside it
+  fails to *start* rather than failing to open a dump.
+- **`find_ttd` does not look beside the executable.** It probes `PATH`, the SDK layout and
+  `WindowsApps`, so the `ttd\TTD.exe` the engine copy just delivered is *not* found by
+  `record_trace` — the recorder has to be put on `PATH` even though it is now sitting next to the
+  server. `setup.md` says so at the point of the copy. Adding `<exe dir>\ttd\TTD.exe` to the probe
+  is a one-line change and is deliberately **not** in this docs-only PR.
+
+Picks up at [`setup.md`](./skills/windbg-debugging/setup.md)'s *WinDbg engine + extensions* — the
+three sources and the one copy — and its *Unpacking the `.msixbundle`* subsection, plus
+[#132](https://github.com/glslang/windbg-mcp/issues/132).
+
+**Left open.** Nothing checks that a bundled `ttd\` matches the binary's architecture:
+`worker::replay_engine_bundled` asks whether the directory is non-empty, deliberately, since the
+alternative is a PE read per file against a layout WinDbg owns. A wrong-architecture copy therefore
+still surfaces as DbgEng's bare `0x80070057`, which is the behaviour without the diagnostic rather
+than a regression from it — and `setup.md` states the rule at the point the copy is made, which is
+the only place it can be acted on.
 
 ## 22. [windbg-mcp] Run the debugger tier on an ARM64 runner — **done** (2026-08-16, #134)
 
@@ -2614,11 +2687,17 @@ and nothing recovers from that, which is the second bug that issue turned out to
 `go` that reaches no stop leaves the session usable, and left it unusable before. Live kernel was
 already on this path and the live-kernel tier exercises it. A dump cannot resume at all, so the wait
 is unreachable there. **TTD replay is the gap**: `go`, `step_back` and the rest of the reverse
-family go through this function, and TTD replay does not work on **that** bench at all
+family go through this function, and TTD replay did not work on **that** bench at all
 (item 21 / [#132](https://github.com/glslang/windbg-mcp/issues/132)), so nothing there could ask
 whether `SetInterrupt` unblocks a replay wait the way it unblocks a live one. (Named explicitly
 because "this host" in an item whose measurements are ARM64's has already been read as the x64
 one.)
+
+**That blocker is gone as of 2026-08-29**, and it is the ARM64 bench that changed: item 21 landed,
+the WinDbg payload was bundled beside its release build, and the host now records a trace, opens it
+and steps backward through it. So the gap here is no longer "no bench can ask" — it is that nobody
+has asked. The measurement this item wants can now be taken where every one of its siblings was
+taken, which removes the "generalised from one backend" caveat it raises against itself below.
 
 **Why it is not alarming, and why it is still open.** The watchdog only ever fires at the bound, so
 for every go/step that stops in time the change is a no-op — which is every TTD navigation anyone
@@ -2647,7 +2726,8 @@ strength of a TTD tier passing there, and the correction is what produced the pa
 
 **What would close it.** Record a trace, `go` past the end of it or `reverse_go` with nothing to
 stop at, and assert the session still answers `registers` afterwards — the same assertion the two
-debugger-tier launch tests make. One test, in the TTD tier, on the x64 bench. **Establish first
+debugger-tier launch tests make. One test, in the TTD tier, on either bench — the ARM64 one is now
+capable and is where this item's other measurements were taken. **Establish first
 that the bound is reachable at all**: a replay target has ends, so a `go` or a `reverse_go` with no
 breakpoint may simply stop at the trace boundary in well under the 60s bound, in which case the
 timeout path is *unreachable* on this target type rather than untested — which closes this item as

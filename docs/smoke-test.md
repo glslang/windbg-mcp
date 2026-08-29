@@ -35,7 +35,7 @@ taken a second covered no debugger claim at all.
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a live kernel target you can freeze — KDNET, or serial | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
 | **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
-| **TTD** | `WINDBG_MCP_SMOKE_TTD=1` | `TTD.exe`, **elevation**, and the WinDbg store engine to replay what it records | that `record_trace` records the program it was given and reports a finished recording as one, and that a TTD query returns records rather than bare indices |
+| **TTD** | `WINDBG_MCP_SMOKE_TTD=1` | `TTD.exe`, **elevation**, and a WinDbg engine payload beside the binary to replay what it records — both benches' came from `setup.md`'s unpacked `.msixbundle` rather than from an installed package, the ARM64 one as of 2026-08-29 | that `record_trace` records the program it was given and reports a finished recording as one, and that a TTD query returns records rather than bare indices |
 | **32-bit managed target** | a 32-bit `dbgeng.dll` in an `x86` directory beside the binary under test | that engine, `x86\windbg-mcp.exe` beside it, and the `csc.exe` every stock Windows ships — it compiles and dumps its own fixture | that a 32-bit dump **and** a 32-bit live process are each opened by a worker of *their* architecture, so 32-bit SOS loads — which this server's own engine cannot do at all |
 | **Live (other)** | manual | a test driver on a kernel target | see [Manual checklist](#manual-checklist) |
 
@@ -1177,7 +1177,7 @@ recorder's own refusal — `TTD.exe not found`, `Administrative privileges`, `0x
 print `SKIPPED`. Every *other* failure fails the test, which is the distinction that keeps the tier
 honest: a helper that treated any error as a skip would pass on a machine where recording is
 broken. Replay is a third stand-down, taken separately: a host can record a trace it cannot open, because
-replay needs the WinDbg store engine beside the binary, and by then the recording half has already
+replay needs a WinDbg engine payload beside the binary, and by then the recording half has already
 been asserted. It is keyed on the **server's own diagnostic** — the sentence
 `worker::explain_trace_failure` appends when there is no `ttd\` beside the executable — and not on
 `0x80070057`, which is the engine's "the parameter is incorrect" and can equally come from a trace
@@ -1326,7 +1326,7 @@ does not reach.
   `bp nt!NtCreateFile`, `go` to it, resume, detach. See the KDNET gotchas in `CLAUDE.md` before
   diagnosing a hang.
 - **TTD** — recording and the two queries are the [TTD tier](#the-ttd-tier) now, which is where to
-  start; it needs the WinDbg store engine next to the binary to replay what it records (System32's
+  start; it needs a WinDbg engine payload next to the binary to replay what it records (System32's
   rejects a `.run` with `0x80070057`, and the tier stands that half down rather than failing).
   What is left by hand is what the tier does not reach: **reverse execution** (`reverse_go`,
   `step_back`, `step_over_back`, `goto_position`) on a trace, and `ttd_calls` against **resolved
