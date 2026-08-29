@@ -309,9 +309,24 @@ the publisher.
 
 Three limits worth taking on knowingly:
 
-- **There is no update path.** A copied engine is a snapshot and does not follow WinDbg; re-run the
-  copy when you would have taken an update. The `.appinstaller` above always names the *current*
-  bundle, so the recipe needs no version bump — only re-running.
+- **There is no update path, and re-running alone does not give you one.** A copied engine is a
+  snapshot and does not follow WinDbg, so re-run the copy when you would have taken an update; the
+  `.appinstaller` above always names the *current* bundle, so nothing here needs a version bump.
+  But `Expand-Archive -Force` and `Copy-Item -Force` overwrite what collides and delete nothing, so
+  a second run **merges** the new payload into the old one — leaving anything the new package
+  renamed or dropped in place, a stale `TTDReplay*.dll` beside a new `dbgeng.dll` among them. Clear
+  the directories that are copied wholesale first, with the server stopped (see above — a running
+  one holds these open):
+
+  ```pwsh
+  Remove-Item "$w\b","$w\p" -Recurse -Force -ErrorAction SilentlyContinue   # staging
+  Remove-Item "$dst\ttd","$dst\winext","$dst\triage","$dst\winxp" `
+              -Recurse -Force -ErrorAction SilentlyContinue
+  ```
+
+  **Not `$dst` itself**, which holds `windbg-mcp.exe`. The six loose DLLs need no such treatment:
+  they are copied by an explicit list of fixed names, so they have no orphan to leave. The risk is
+  entirely in the four `-Recurse` directory copies.
 - **The layout inside the bundle is Microsoft's to change.** Run on 2026-08-29 the bundle held
   `windbg_win-arm64.msix`, `windbg_win-x64.msix` and `windbg_win-x86.msix`, and the payload inside
   the ARM64 one carried `amd64\`, `arm64\` and `x86\` trees, each complete — `msdia140.dll`
@@ -574,7 +589,7 @@ tell two kernel targets apart. `attach_kernel` with no arguments lists the profi
 | TTD replay (`open_trace`) | No |
 | Live user-mode (`launch` / `attach_process`) | No (unless the target requires it) |
 | Live kernel (`attach_kernel_local` / `attach_kernel`) | **Yes** |
-| TTD recording (`record_trace`) | **Yes** + `TTD.exe` on `PATH` |
+| TTD recording (`record_trace`) | **Yes** + a `TTD.exe` — the bundled `ttd\TTD.exe` will do; `PATH` only overrides it |
 
 `record_trace` captures the recorder's startup output to `<out_dir>\ttd_record.log` and
 watches it briefly, so a fast failure (e.g. un-elevated → `0x80070005 Access is denied`)

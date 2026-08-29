@@ -12,7 +12,8 @@ TTD positions are `major:minor` (a sequencing point and a step within it), not w
 
 ## 1. Get a trace
 
-- **Record** (Administrator, `TTD.exe` on `PATH`):
+- **Record** (Administrator, and a `TTD.exe` — the `ttd\TTD.exe` bundled beside the server is
+  found without `PATH`, which only overrides it):
   `record_trace { "out_dir": "C:\\traces", "target": "C:\\path\\app.exe arg" }`.
   If the target needs a specific environment or working directory to run — a Qt app's
   `QT_QPA_PLATFORM_PLUGIN_PATH`, or an anti-analysis "run me from here" guard — pass
