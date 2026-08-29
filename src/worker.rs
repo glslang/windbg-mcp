@@ -2090,8 +2090,14 @@ fn stop_report(
 ) -> (String, structured::StopReport) {
     let stopped_at = e.instruction_pointer().ok().map(structured::addr);
     // Which thread the position above belongs to, and — on a kernel target — which processor it
-    // is running on. `current_processor` answers `None` for a target with no processor number at
-    // all, which every user-mode one is, and that is not a failure to report.
+    // is running on.
+    //
+    // `current_processor` distinguishes "no processor number applies" from "the mapping could not
+    // be read", and this **deliberately collapses the two**, as it does for the two reads either
+    // side of it. A stop report is read by a model, which cannot act on the difference — there is
+    // no position either way, and a failed read's own words are in the run's output — so a third
+    // state per position would be three shapes for one answer. The distinction is kept where a
+    // caller can use it, which is the library.
     let thread = e.current_thread_system_id().ok();
     let processor = e.current_processor().ok().flatten();
     // Two different things, matched on the variant rather than on "was it cut short at all",

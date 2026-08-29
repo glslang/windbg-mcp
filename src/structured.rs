@@ -518,9 +518,14 @@ pub struct StopReport {
     /// then has to know to read the stack it walks next.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread: Option<u32>,
-    /// Which of a kernel target's processors the stop is on. Absent where no processor number
-    /// applies, which every user-mode target and every dump of one is — not a failure, and not
-    /// the same as processor 0.
+    /// Which of a kernel target's processors the stop is on. Never the same as processor 0.
+    ///
+    /// Absent covers two things, as [`Self::stopped_at`]'s and [`Self::thread`]'s do: no processor
+    /// number **applies** — every user-mode target and every dump of one, which is not a failure —
+    /// or the engine would not **answer**. They are one field here on purpose. The debugger tells
+    /// them apart and a caller cannot act on the difference: there is no position to read either
+    /// way, and what a failed read has to say is in [`Self::output`]. The library underneath does
+    /// keep them apart, for callers that are not a tool result.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub processor: Option<u32>,
     /// Whether the target was broken into **on request** rather than stopping on its own. The
