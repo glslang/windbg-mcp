@@ -233,7 +233,8 @@ setup this project is developed and benchmarked in.
   window, multi-turn ones carrying 10,000 characters of tool output included. The arithmetic that
   predicted otherwise is in `docs/local-model.md`, and it was wrong; ask `ollama ps` what your own
   runtime serves rather than generalising either result.
-- **Cutting the surface to 11 tools costs two of six answers.** Most facts here are reachable by more than
+- **Cutting 51 tools to 11 costs two of six answers** — the surface that grid measured, before
+  the three asynchronous-execution tools. Most facts here are reachable by more than
   one route, so a narrow surface keeps the ones that matter.
 - **It measures this server before it measures the model.** Every off-surface tool call the first
   grid recorded was a name this server had advertised and would then refuse — in the `instructions`
