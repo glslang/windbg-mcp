@@ -52,9 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and **all three** payload trees inside it (`amd64\`, `arm64\`, `x86\`) hold the entire copy
   list, `msdia140.dll` included — plus `ttd\TTD.exe`, so the engine copy already brings the
   *recorder* and not just the replay engine, which `setup.md` and `docs/install.md` now say. The
-  recipe gains a publisher check before it unpacks anything, and `setup.md` states what that
-  settles (provenance) and what it does not (that an unregistered payload is a supported Microsoft
-  configuration). That bench was then bundled from the payload and **replays**: a 40 MB trace
+  recipe gains a publisher check before it unpacks anything, `setup.md` states what that settles
+  (provenance) and what it does not (that an unregistered payload is a supported Microsoft
+  configuration), and the update advice now says to clear the four wholesale-copied directories
+  first — `Expand-Archive -Force` and `Copy-Item -Force` overwrite collisions and delete nothing,
+  so re-running merges a new payload into the old one rather than replacing it. That bench was then bundled from the payload and **replays**: a 40 MB trace
   recorded with the bundled `ttd\TTD.exe`, opened by `open_trace` reporting its lifetime rather
   than the missing-`ttd\` diagnostic, and stepped backward with `step_back`. The issue is closed
   on the host it was filed from, and `FOLLOWUPS.md` item 47's blocker — TTD replay being
