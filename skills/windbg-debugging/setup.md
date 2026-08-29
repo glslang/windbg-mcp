@@ -182,7 +182,7 @@ searched before `System32`, so the copied engine wins.
 | --- | --- | --- |
 | The installed **WinDbg store package** | everything below | an interactive install — MSIX will not register over SSH |
 | The same **`.msixbundle`, unpacked** | everything below | a ~1.1 GB download; no install, so it is the one source a remote session can use |
-| The **Windows SDK Debugging Tools** | everything **except `msdia140.dll` and `ttd\`** | no TTD replay and no PDB parser ([#132](https://github.com/glslang/windbg-mcp/issues/132)) |
+| The **Windows SDK Debugging Tools** | everything **except `msdia140.dll` and `ttd\`** | no TTD replay, and PDB parsing left to the `dbghelp.dll` you bundle ([#132](https://github.com/glslang/windbg-mcp/issues/132)) |
 
 All three are the **same layout** — a directory with `dbgeng.dll` beside `ttd\`, `winext\`,
 `winxp\` and `triage\` — so they differ only in how you set `$wd`, and the copy below is the same
@@ -361,13 +361,18 @@ one if you are debugging the thunk layer itself. Nothing is lost on a **dump**, 
 capture never held the 64-bit side to begin with; if you want both halves of a live process, take a
 capture with the 64-bit `procdump64.exe -ma` and open that instead, which routes to the x64 engine.
 
-What it needs beside it is a 32-bit engine. Copy the package's **`x86`** payload into that same
+What it needs beside it is a 32-bit engine. It comes from the **same three sources** as the payload
+above and from the same `x86\` tree inside each — an ARM64 or x64 package carries the 32-bit
+payload as well as its own — so pick the source you already took and copy that tree into the
 `x86\` subdirectory:
 
 ```pwsh
 # $dst is the same folder as the copy block above — the one that holds windbg-mcp.exe.
 $dst = "<folder that holds windbg-mcp.exe>"
-$wd86 = (Get-AppxPackage Microsoft.WinDbg).InstallLocation + "\x86"
+# Same three sources, x86 tree. Pick ONE, as above.
+$wd86 = (Get-AppxPackage Microsoft.WinDbg).InstallLocation + "\x86"   # (a)
+# $wd86 = "$w\p\x86"                                                 # (b) unpacked bundle
+# $wd86 = "C:\Program Files (x86)\Windows Kits\10\Debuggers\x86"      # (c) SDK — no msdia140.dll
 New-Item "$dst\x86" -ItemType Directory -Force | Out-Null
 Copy-Item "$wd86\dbgeng.dll","$wd86\dbghelp.dll","$wd86\dbgcore.dll",`
           "$wd86\dbgmodel.dll","$wd86\symsrv.dll","$wd86\msdia140.dll" "$dst\x86" -Force
@@ -403,10 +408,10 @@ wrong:
   x64 build, and the session reports a `limitation` saying SOS is unreachable — so a half-populated
   `x86\` fails quietly in the sense that everything works except the one thing you came for.
 
-The SDK's *Debugging Tools for Windows* works as a source for the engine payload too
-(`C:\Program Files (x86)\Windows Kits\10\Debuggers\x86`) — unlike the store package it has no
-`msdia140.dll`, which is what parses a PDB, so symbols for the 32-bit target need that file from
-elsewhere.
+From **(c)**, drop `msdia140.dll` from that file list as well — its `x86` tree has none, so the copy
+fails with it left in. If the `dbghelp.dll` you put there cannot then read a PDB unaided, private
+symbols for the 32-bit target need that file from elsewhere: the same caveat, and the same
+dependence on the `dbghelp.dll` you bundle, as the payload above.
 
 ### When the store package will not install
 
