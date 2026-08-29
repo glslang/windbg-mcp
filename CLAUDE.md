@@ -767,6 +767,17 @@ right.**
 - **A stop is read rather than taken, and a run is replaced rather than cleared.** Two
   `wait_for_stop` calls on one handle must agree, and a run that finished while nobody was waiting
   has to still be there. The slot is only ever overwritten by the next `continue_async`.
+- **`continue_async` waits on the *slot*, and the milestone has to bump it.** The milestone
+  arrives on its own `oneshot` (`Waiting::resumed`), read at the top of the loop; the loop then
+  waits on `Session::execution_changed`, which is what the filing task moves. Nothing touches that
+  watch when a run *starts* unless `reader` says so — so without the bump in its `Resumed` arm the
+  call sleeps until the run **ends**, answers `running: true` about a run that is over, and reports
+  no bound left. That shipped in this branch's second draft, when a `select!` over both signals
+  became "read the milestone, then wait on the slot", and **every ordering test still passed**: the
+  one that sends the milestone and the reply together is satisfied whichever wakes it. What caught
+  it was CI's debugger tier, as a call that took exactly as long as its target ran. The assertion
+  that states the property is `a_run_is_handed_back_while_the_target_is_still_moving` — it sends
+  the milestone and **no** reply, so a call that waits on the stop cannot pass it.
 
 **Filing is keyed by *job*, not by handle**, and this is the one that looks like a detail. The
 filing task outlives its caller, so by the time a reply arrives the session may be on a later run; a
