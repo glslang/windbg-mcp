@@ -72,6 +72,14 @@ pub(crate) const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// gracefully, short enough that recovering a parked attach is not a wait.
 const END_SESSION_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// What a session says while an explicit `end_session` is in flight.
+///
+/// This is written by [`pump`] when it forwards the teardown, not when the call is submitted:
+/// work already ahead of the teardown keeps its place, while anything behind it is refused. The
+/// final disposition replaces this once [`Sessions::end`] knows whether the target was released or
+/// the worker had to be terminated.
+const END_SESSION_CLOSING: &str = "end_session is releasing its target";
+
 /// What a `launch` session's end says about its debuggee.
 ///
 /// Deliberately not "was terminated with it", which would be a causal claim this side cannot make:
@@ -521,15 +529,29 @@ impl Session {
             .clone()
     }
 
-    /// Moves the session to `next` and restamps it. Refuses to resurrect a session that has
+    /// Moves a live session to `next` and restamps it. Refuses to change a session that has
     /// already stopped owning a worker, so a milestone arriving from a worker being torn down
-    /// cannot undo the teardown.
+    /// cannot undo or relabel the teardown.
     fn set_state(&self, next: SessionState) {
-        self.update_state(|_| Some(next));
+        self.update_state(|state| state.is_live().then_some(next));
+    }
+
+    /// Replaces the dispatch-time reason for an explicit `end_session` with its final outcome.
+    ///
+    /// Conditional on the placeholder so another teardown that won the race keeps its own reason.
+    fn finish_end(&self, reason: String) {
+        self.update_state(|state| match state {
+            SessionState::Closed(why) if why == END_SESSION_CLOSING => {
+                Some(SessionState::Closed(reason))
+            }
+            _ => None,
+        });
     }
 
     /// Recomputes the state *from itself*, under a single lock acquisition, and reports where it
-    /// ended up. `next` returns `None` to leave it alone.
+    /// ended up. `next` returns `None` to leave it alone. Settled states cannot move, with one
+    /// narrow exception: a `Closed` state may be refined to another `Closed` state so an
+    /// `end_session` marked closed at dispatch can later record how its teardown finished.
     ///
     /// The atomicity is the whole point, and check-then-set through two acquisitions is not good
     /// enough: `pump` retires a session from another task the instant it forwards a
@@ -549,10 +571,16 @@ impl Session {
         // session repeatedly not moving.
         let (settled, moved) = {
             let mut slot = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            if !slot.0.is_live() {
+            let proposed = next(&slot.0);
+            let allowed = slot.0.is_live()
+                || matches!(
+                    (&slot.0, &proposed),
+                    (SessionState::Closed(_), Some(SessionState::Closed(_)))
+                );
+            if !allowed {
                 return slot.0.clone();
             }
-            let moved = match next(&slot.0) {
+            let moved = match proposed {
                 Some(next) => {
                     let moved = next != slot.0;
                     *slot = (next, Instant::now());
@@ -717,6 +745,9 @@ struct Gate {
     /// command runs. A `.detach` that reports an error may still have detached, and a handle
     /// that outlives its target is the failure this ordering exists to prevent.
     retires: Option<String>,
+    /// Set for an explicit teardown, so the session stops accepting work at this call's exact
+    /// place in the queue. Everything ahead still runs; everything behind is refused as stale.
+    closes: Option<String>,
 }
 
 impl Gate {
@@ -755,6 +786,7 @@ impl Call {
             gate: Gate {
                 on: On::Default,
                 retires: None,
+                closes: None,
             },
         }
     }
@@ -772,6 +804,12 @@ impl Call {
         self
     }
 
+    /// Marks this call as the point where its session stops accepting work.
+    fn closing(mut self, why: impl Into<String>) -> Self {
+        self.gate.closes = Some(why.into());
+        self
+    }
+
     /// The supervisor's own teardown; see [`On::Supervisor`].
     fn supervisor(op: EngineOp) -> Self {
         Self {
@@ -779,6 +817,7 @@ impl Call {
             gate: Gate {
                 on: On::Supervisor,
                 retires: None,
+                closes: None,
             },
         }
     }
@@ -1481,7 +1520,9 @@ impl Sessions {
     /// otherwise hold its session forever; killing it is the only thing that ends that wait, and
     /// under process-per-session it costs nothing else.
     pub async fn end(&self, session: &Arc<Session>, named: bool) -> Result<Output, EngineError> {
-        let call = Call::new(EngineOp::EndSession).named(named);
+        let call = Call::new(EngineOp::EndSession)
+            .named(named)
+            .closing(END_SESSION_CLOSING);
         let outcome = self.release(session, call, END_SESSION_TIMEOUT).await;
         // Read before the rendering, from the outcome rather than from the message it produces:
         // "did the worker let go, or was it killed still holding the target?" is the question a
@@ -1578,7 +1619,7 @@ impl Sessions {
                 ),
             ),
         };
-        session.set_state(SessionState::Closed(reason));
+        session.finish_end(reason);
         Ok(Output::typed(message, ended))
     }
 
@@ -2950,6 +2991,9 @@ fn pump(
         if let Some(why) = &job.gate.retires {
             session.set_state(SessionState::Retired(why.clone()));
         }
+        if let Some(why) = &job.gate.closes {
+            session.set_state(SessionState::Closed(why.clone()));
+        }
 
         let mut op = job.op;
         // For the ops whose own deadline is derived from the caller's: what is written here is how
@@ -3762,6 +3806,163 @@ mod tests {
             child: Mutex::new(None),
             rec,
         })
+    }
+
+    /// A routing double whose queue still has a consumer, for tests that drive [`pump`] itself.
+    fn queued(id: &str, state: SessionState) -> (Arc<Session>, mpsc::UnboundedReceiver<Job>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let session =
+            Arc::into_inner(dormant(id, state)).expect("`dormant` hands back the only reference");
+        (Arc::new(Session { tx, ..session }), rx)
+    }
+
+    /// Closing is a queue operation, not a caller-side state change. Work already ahead of an
+    /// `EndSession` must reach the worker, while work queued behind it must be refused even though
+    /// it was submitted while the session still looked open.
+    #[tokio::test]
+    async fn end_session_closes_at_its_place_in_the_queue() {
+        let (session, rx) = queued("sess-1", SessionState::Open);
+        let waiters = Arc::clone(&session.waiters);
+        let (requests, worker) = std::io::pipe().expect("a pipe to stand in for the worker's");
+
+        let (done, answer) = oneshot::channel();
+        session
+            .waiters
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                3,
+                Waiting {
+                    done,
+                    progress: None,
+                    unwound: false,
+                },
+            );
+
+        // All three are submitted while the session is still open. Their order in this channel is
+        // the order `pump` owns, independent of how the runtime happened to schedule their callers.
+        {
+            let enqueue = |id, call: Call| {
+                session
+                    .tx
+                    .send(Job {
+                        id,
+                        op: call.op,
+                        submitted: Instant::now(),
+                        gate: call.gate,
+                    })
+                    .expect("the pump's queue is open");
+            };
+            enqueue(
+                1,
+                Call::new(EngineOp::Command {
+                    command: "before".to_string(),
+                })
+                .named(true),
+            );
+            enqueue(
+                2,
+                Call::new(EngineOp::EndSession)
+                    .named(true)
+                    .closing(END_SESSION_CLOSING),
+            );
+            enqueue(
+                3,
+                Call::new(EngineOp::Command {
+                    command: "after".to_string(),
+                })
+                .named(true),
+            );
+        }
+
+        let pumping = std::thread::spawn({
+            let session = Arc::downgrade(&session);
+            move || pump(session, rx, worker, waiters, Duration::from_secs(30))
+        });
+        let mut requests = std::io::BufReader::new(requests);
+        let mut line = String::new();
+        requests
+            .read_line(&mut line)
+            .expect("read the job ahead of the teardown");
+        let before: WorkerRequest =
+            serde_json::from_str(&line).expect("the first worker request is JSON");
+        assert_eq!(before.id, 1);
+        assert!(matches!(before.op, EngineOp::Command { .. }));
+
+        line.clear();
+        requests
+            .read_line(&mut line)
+            .expect("read the teardown request");
+        let ending: WorkerRequest =
+            serde_json::from_str(&line).expect("the second worker request is JSON");
+        assert_eq!(ending.id, 2);
+        assert!(matches!(ending.op, EngineOp::EndSession));
+        assert_eq!(
+            session.state(),
+            SessionState::Closed(END_SESSION_CLOSING.to_string()),
+            "the session must be closed before anything behind the teardown is considered"
+        );
+
+        let refused = tokio::time::timeout(Duration::from_secs(5), answer)
+            .await
+            .expect("the queued call behind the teardown was not answered")
+            .expect("the pump dropped the queued call's answer");
+        match refused {
+            Err(EngineError::Stale(why)) => {
+                assert!(why.contains("is closed"), "{why}");
+                assert!(why.contains(END_SESSION_CLOSING), "{why}");
+            }
+            Err(other) => panic!("the queued call was not refused as stale: {other}"),
+            Ok(_) => panic!("the queued call ran after EndSession"),
+        }
+
+        drop(session);
+        pumping
+            .join()
+            .expect("the pump thread exits with its queue");
+    }
+
+    /// The dispatch mark is provisional, but it is still a settled state: only that exact mark may
+    /// be refined with the teardown's outcome, and nothing may use the exception to resurrect or
+    /// relabel a session another teardown already closed.
+    #[test]
+    fn an_explicit_end_refines_only_its_own_closed_state() {
+        let session = dormant(
+            "sess-1",
+            SessionState::Closed(END_SESSION_CLOSING.to_string()),
+        );
+        session.finish_end("ended by end_session".to_string());
+        assert_eq!(
+            session.state(),
+            SessionState::Closed("ended by end_session".to_string())
+        );
+
+        session.set_state(SessionState::Open);
+        session.set_state(SessionState::Closed("a different close".to_string()));
+        assert_eq!(
+            session.state(),
+            SessionState::Closed("ended by end_session".to_string()),
+            "ordinary state writes must neither reopen nor relabel a settled session"
+        );
+
+        let shutdown = dormant(
+            "sess-2",
+            SessionState::Closed("the server is shutting down".to_string()),
+        );
+        shutdown.finish_end("ended by end_session".to_string());
+        assert_eq!(
+            shutdown.state(),
+            SessionState::Closed("the server is shutting down".to_string()),
+            "another teardown's reason won the race and must survive"
+        );
+
+        let failed = dormant("sess-3", SessionState::Failed("never opened".to_string()));
+        failed.update_state(|_| Some(SessionState::Closed("not really".to_string())));
+        assert_eq!(
+            failed.state(),
+            SessionState::Failed("never opened".to_string()),
+            "the closed-to-closed exception must not settle a different terminal state"
+        );
     }
 
     /// A transition that changes nothing still restamps the session — that is what `session_status`
