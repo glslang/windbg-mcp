@@ -62,6 +62,10 @@ authority — the tables below are a reading of it at the time of writing.
 
 ### Tool surface (51 tools)
 
+> Measured before `continue_async`, `wait_for_stop` and `break_in` were added (2026-08-29), which
+> took the surface to 54. Every figure in this section is the measurement it was, not a claim about
+> today's surface; re-recording `tests/golden/tool_budget.json` on a Windows host is what moves them.
+
 The first column is the baseline this page was written from; the second is today, and the only
 thing between them is finding 1 — the prose taken out of every `outputSchema`.
 

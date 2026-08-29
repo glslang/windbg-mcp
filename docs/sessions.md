@@ -71,6 +71,66 @@ restore cut short would come back `Ok` with partial output and be reported as a 
 completed while the target was still changed — so an `interrupt` aimed at a batch that is unwinding
 says so and sends nothing, as does one repeated while a batch is still stopping.
 
+## Running a target asynchronously
+
+`go` and the stepping tools wait for the next stop and answer with it, which is what almost every
+question wants. What they cannot express is the sequence a live target usually needs: **arm a
+breakpoint, resume, make the thing happen that trips it, then collect the stop.** With a blocking
+`go` the middle step has nowhere to go — and a guest-side `Sleep` is not a substitute, because a
+kernel halted in the debugger has a halted clock.
+
+`continue_async` resumes the target and returns at once with an **execution handle**:
+
+```jsonc
+// 1. arm it
+set_breakpoint  { "session_id": "sess-…", "expression": "HEVD!IrpDeviceIoCtlHandler" }
+// 2. resume — returns as soon as the target is moving
+continue_async  { "session_id": "sess-…", "max_run_ms": 300000 }
+//    -> { "execution": "exec-…", "running": true, "breaks_in_ms": 300000 }
+// 3. …send the IOCTL from the guest, start the process, click the button…
+// 4. collect the stop
+wait_for_stop   { "session_id": "sess-…", "execution": "exec-…", "timeout_ms": 60000 }
+```
+
+Four rules, and each of them is a thing that would otherwise have to be discovered by being caught
+by it:
+
+- **One run per session.** A session is one engine process with one engine thread, and DbgEng moves
+  a target only while that thread is pumping it, so a second run could not start until the first
+  ended. Starting one is refused, naming the run already there.
+- **While the target is moving, tools that read it are refused** — with `"category":
+  "target_running"` and the handle to wait on. They are refused rather than queued: queued, a
+  `registers` would be answered whenever the target next stopped, which could be an hour away, and
+  it would describe wherever the target happened to be. `session_status`, `server_log`, `break_in`
+  and `end_session` all keep working.
+- **A wait that runs out is a poll, not a failure.** `wait_for_stop` answers with no `stop`, the
+  target is still running, the handle is still good, and waiting again carries on. Nothing was
+  cancelled and nothing was consumed — so a short `timeout_ms` is how you check on a run without
+  disturbing it.
+- **A stop is read, not taken.** It is filed against the handle when it happens, whether or not
+  anybody is waiting, and stays there until another run replaces it. A client that disconnected
+  mid-run can reconnect and read what happened; two callers reading it get the same answer.
+
+**Every run is bounded.** `max_run_ms` is how long the debugger lets the target go before breaking
+it in itself (default 60s, maximum one hour), so a resume that reaches nothing ends rather than
+leaving an engine thread waiting for ever with nobody watching. A run that ends that way reports
+`timed_out`, and its position is where the target happened to be rather than a stop it reached.
+`break_in` ends one early; it returns as soon as the request is lodged, and the stop it produces
+arrives on the next `wait_for_stop`.
+
+**A stop says where, and whose.** `stopped_at` is the instruction pointer, `thread` the
+operating-system thread id it belongs to, and `processor` which of a kernel target's processors it
+is on — absent on a user-mode target, which has no processor number rather than processor 0. Three
+flags say *why* it stopped: `interrupted` (somebody broke it in), `timed_out` (it reached its
+bound), `target_gone` (it ran to completion, which is an ending rather than a failure). None set
+means it stopped on its own, at a breakpoint or an exception.
+
+**`end_session` works while a target is running**, and does not wait for it: the worker's request
+reader breaks the pump in as the teardown arrives, so the release is reached instead of queueing
+behind a run that has no reason to end. A **client disconnect** runs that same release — with the
+shorter grace above — so a target left running by a client that goes away is released on the same
+path as one ended explicitly, rather than being held until its bound expires.
+
 **Watching a call that is taking a while.** Put a `progressToken` in a call's `_meta` and it reports
 on itself with MCP progress notifications while it runs: the engine worker coming up, the target
 being claimed, the target being open, a teardown unwinding a transaction — and, when there is

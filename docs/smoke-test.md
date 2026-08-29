@@ -31,7 +31,7 @@ taken a second covered no debugger claim at all.
 | Tier | Gate | Needs | Catches |
 | --- | --- | --- | --- |
 | **Protocol** | always | no debugger, no target, and no network off this machine — it does bind a loopback port for the listener | transport, revision negotiation, tool-surface drift, and the listener's lease up to the point a session is opened |
-| **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump, and a live user-mode target for the five that want one — `cmd.exe` for the four that launch, `ping` for the one that attaches | `dbgscope` / DbgEng regressions, a lease expiry releasing a real engine worker, driving execution on a live user-mode target, and what ending a session does to it |
+| **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump, and a live user-mode target for the seven that want one — `cmd.exe` for the six that launch, `ping` for the one that attaches | `dbgscope` / DbgEng regressions, a lease expiry releasing a real engine worker, driving execution on a live user-mode target synchronously and asynchronously, and what ending a session does to it |
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a live kernel target you can freeze — KDNET, or serial | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
 | **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
@@ -586,6 +586,30 @@ processes, so they need real ones:
   still reported success. Driven through a batch rather than `go` for the three-second bound; the
   `timed_out` field `go` itself answers with is asserted false on the test above, and its true case
   belongs to dbgscope's own engine tests, where a two-second bound costs nothing.
+
+- *A run started asynchronously is waited for, broken in, and read twice.*
+  [#83](https://github.com/glslang/windbg-mcp/issues/83), the whole lifecycle in one test against a
+  launched `cmd.exe /c ping -n 30` — chosen because it runs for half a minute with nothing to stop
+  it, so "the target is moving" is a state the test can *be in* rather than a race it has to win.
+  Six assertions, each about a different half of the feature: `continue_async` answers
+  `running: true` (the claim `go` cannot make, since it answers only once the target has stopped); a
+  second `continue_async` is refused as `target_running` **naming the run already there**, since a
+  refusal with nothing to wait for leaves a caller stuck; `registers` is refused with the same
+  category rather than queued; `session_status` reports the run while everything else is refused, it
+  being the one tool that answers there; a 1.5s `wait_for_stop` runs out with no stop and leaves the
+  run untouched, which is what makes a short wait a poll; and after `break_in` the stop reports
+  `interrupted` — not a place the target chose to stop — with `stopped_at` and `thread` present and
+  `processor` **absent**, a user-mode target having no processor number rather than processor 0. Then
+  it reads the stop a second time and gets the same answer, and `registers` works again, which are
+  the two halves of "a stop is read rather than taken".
+- *A session can be ended while its target is running.* The teardown that cannot queue: every other
+  operation on a worker's engine thread ends on a clock that process owns, while a run ends when the
+  *target* stops — thirty seconds here, potentially an hour on a live kernel — so an `end_session`
+  queued behind one would have its grace expire against a worker doing exactly what it was told, and
+  the worker would be killed still holding the target. Asserted on `released: true` rather than on
+  the call succeeding, because a teardown that killed its worker also "succeeds" and the difference
+  between the two is the entire subject. It is the same release a **client disconnect** runs, which
+  is why this covers the disconnect policy without staging a disconnect.
 
 - *A target that ends during a resume is an ending, and the session says so.*
   [#242](https://github.com/glslang/windbg-mcp/issues/242) and `FOLLOWUPS.md` item 48, through the

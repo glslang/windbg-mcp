@@ -212,7 +212,7 @@ It checks *same-file* fragments only, so a cross-file `../README.md#some-heading
 verify by hand.
 
 **The pass count does not say which tiers ran.** Each gate is inside its test, so the `mcp_smoke`
-harness reports the same **90 passed** with the debugger tier off as with it on — that harness's own
+harness reports the same **93 passed** with the debugger tier off as with it on — that harness's own
 result line, since a plain `cargo test` runs the crate's several hundred unit tests beside it and
 prints a result line per binary. What differs between the two runs is the runtime (measured on the
 ARM64 bench 2026-08-23: **1.6s against 61s** for `cargo test --test mcp_smoke`) and the `SKIPPED`
@@ -220,8 +220,9 @@ lines, which only `--nocapture` prints. Read one of those two before believing a
 debugger claim. The count moves whenever a test is added — it was 69 until #195 and #196, 75
 until item 37, 79 until the TTD tier, 84 until item 50's version-resource test, 85 until
 item 48's two endings, 87 until item 49's live 32-bit target, 88 until item 51's
-attach teardown and 89 until the 32-bit worker's version resource — and it said 83 while it was 84,
-which is the usual state of it, so re-derive it rather than trusting this sentence.
+attach teardown, 89 until the 32-bit worker's version resource, 90 until #66's symbol-path default
+and 91 until #83's two asynchronous-execution tests — and it said 83 while it was 84, and 90 while
+it was 91, which is the usual state of it, so re-derive it rather than trusting this sentence.
 
 **The dev exe can be locked too, and the failure is quiet.** A worker left running — a driver
 script that died mid-session, a debugger tier killed partway — holds `target\debug\windbg-mcp.exe`,
@@ -740,6 +741,78 @@ rather than the message. And a session whose target is gone is still reported `o
 `session_status`, deliberately; `FOLLOWUPS.md` item 48 says what telling the supervisor would cost.
 
 [#242]: https://github.com/glslang/windbg-mcp/issues/242
+
+## A run the caller is not waiting for (`continue_async`, #83)
+
+**The wait that went away is the caller's, not DbgEng's, and confusing the two is how this gets
+rebuilt wrongly.** A target moves only while the engine thread is inside `WaitForEvent` — `Execute`
+sets the run state and returns without the target having moved, which is the same fact
+[#226](https://github.com/glslang/windbg-mcp/issues/226) turned on. So there is no arrangement in
+which the worker starts a run, goes back to its queue, and the target keeps going: it would sit
+still. What `EngineOp::Resume` changes is only *when the reply crosses the pipe*. The engine thread
+executes, reports `WorkerMessage::Resumed`, and stays in `settle` for the whole run; the milestone
+is what lets `continue_async` return.
+
+**Which makes the supervisor the owner of the whole thing, and there are three places it has to be
+right.**
+
+- **The slot is filled before the job is queued**, not when the milestone lands
+  (`Sessions::start_execution`). A session whose `execution` slot says nothing is running is one
+  where every tool may read the target, so a slot filled *after* the worker answered would leave a
+  window in which the target may already be moving and this side would let a `registers` through.
+- **The reply is filed by a task, not by the caller.** `continue_async` spawns it before it waits
+  for anything, because the case it exists for is the caller not being there — a client that
+  disconnects mid-run must still leave a stop somebody can read. A caller that times out therefore
+  leaves the run in place rather than abandoning it, which is why that error names the handle.
+- **A stop is read rather than taken, and a run is replaced rather than cleared.** Two
+  `wait_for_stop` calls on one handle must agree, and a run that finished while nobody was waiting
+  has to still be there. The slot is only ever overwritten by the next `continue_async`.
+
+**Filing is keyed by *job*, not by handle**, and this is the one that looks like a detail. The
+filing task outlives its caller, so by the time a reply arrives the session may be on a later run; a
+reply matched by handle alone could land the run-before-last's stop on the one in flight — reported
+as a target that had stopped when it is still moving, which is precisely the state that gets
+somebody to read a moving target.
+
+**The refusal is a refusal and not a queue** (`Sessions::refuse_while_running`), with its own
+`EngineError::TargetRunning` and `ErrorCategory::TargetRunning`. Queued, a `registers` behind a run
+would be answered whenever the target next stopped — up to `max_run_ms`, an hour — about wherever it
+happened to be, and from the caller's side that is indistinguishable from a hung debugger. Three ops
+go through: `Interrupt` (answered ahead of the worker's queue, so it never waits for the engine
+thread), `EndSession` (a teardown refused because the target is running is a session nothing can
+release), and `Resume` itself, which the slot refuses instead, naming the handle already there.
+
+**And `end_session` breaks the pump in rather than waiting for it** (`worker::break_any_pump`,
+called beside `announce_teardown` from the request reader; `Running::pumping` is claimed around the
+whole of `resume` — the `Execute` included — because a teardown arriving in the window before the
+flag was set would find nothing to break and queue behind the whole run). Every other job on that thread ends on a
+clock this process owns; a run ends when the *target* does. Queued behind one, a teardown's grace
+would expire against a worker that is working perfectly and the worker would be killed still holding
+the target — a live kernel left halted, an attached process taken down with the debug port. It is
+deliberately narrow: it breaks a job that is **pumping a resumed target** (`Running::pumping`) and
+nothing else, so a teardown behind a long `pool_census` still lets it finish, which is what every
+release here has always done. A client disconnect runs the same release, so the disconnect policy is
+this one and needs no separate mechanism — `a_session_can_be_ended_while_its_target_is_running` is
+what covers both.
+
+**Two smaller things that will look like bugs if you do not know them.** The bound is the caller's
+`max_run_ms` and **not** the call timeout, deliberately: the point of the tool is that the caller
+goes away, so a deadline sized from one tool call's clock would break in on a target the caller was
+still happy to leave running — but `wait_for_stop`'s own wait *is* capped below the call timeout
+(`STOP_WAIT_MARGIN`), because a wait allowed to run the whole budget would have the call expire
+instead of answering, and "the call expired" and "the target never stopped" read identically. And
+`Session::finish_execution` restamps `last_used`: everywhere else that stamp is taken on submission,
+which is right for a call that answers in seconds and wrong for one that can run for an hour — a run
+outlasting the reclamation window would leave its session reclaimable the instant it stopped, and
+the stop could be taken before its caller read it.
+
+**The stop's typed half rides on `Output::stop`, not `Output::data`.** Same shape and reason as
+`Output::summary`: the answer is keyed by a handle the worker has never heard of, so the worker
+sends the value and the supervisor folds it in. It travels *instead of* `data` rather than beside
+it, unlike `summary`, because the supervisor rebuilds the result either way and a `StopReport`
+carries the debugger's whole output — sending both would put a copy of it on the wire for nobody.
+It is `Box`ed, and that is the reason `clippy::large_enum_variant` does not fire on
+`WorkerMessage::Done`.
 
 ## What ending a session does to its target (`FOLLOWUPS.md` item 51)
 

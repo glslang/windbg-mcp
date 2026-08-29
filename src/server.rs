@@ -33,6 +33,28 @@ use crate::walk;
 /// next stop (ms).
 pub(crate) const EXEC_WAIT_MS: u32 = 60_000;
 
+/// The longest an asynchronous run may go before the debugger breaks the target in itself.
+///
+/// An hour, which is far past any orchestration a caller would drive from here and far short of
+/// "for ever". The cap exists because the bound is the *only* thing accounting for that wait: a
+/// run with no bound is an engine thread in `WaitForEvent` with nobody watching it, which is
+/// exactly the state `continue_async` is built to avoid rather than to introduce.
+const MAX_ASYNC_RUN_MS: u32 = 3_600_000;
+
+/// How long `wait_for_stop` waits when the caller does not say.
+///
+/// Comfortably inside the default call timeout, so the ordinary call answers rather than expiring,
+/// and long enough that a caller polling a run is not doing it every second.
+const DEFAULT_STOP_WAIT_MS: u32 = 30_000;
+
+/// How much of the call's budget `wait_for_stop` leaves itself to answer in.
+///
+/// The wait is capped at the call timeout *minus this*, because a wait that ran the whole budget
+/// would have the call expire instead of returning "still running" — and from the caller's side a
+/// call that expired and a target that never stopped look the same, which is the confusion this
+/// tool exists to remove.
+const STOP_WAIT_MARGIN: Duration = Duration::from_secs(5);
+
 /// How long an open may sit un-landed before `session_status` stops calling it normal.
 ///
 /// A KDNET link that is coming up resyncs in ~25s; a guest that is not booted in debug mode
@@ -176,6 +198,7 @@ fn sessions_report(
                 age_ms: ms(s.age),
                 current: s.current,
                 live: s.state.is_live(),
+                execution: s.execution.clone(),
             })
             .collect(),
         max_sessions: MAX_SESSIONS as u32,
@@ -1506,6 +1529,47 @@ pub struct SessionArgs {
     pub session_id: Option<String>,
 }
 
+/// Parameters for `continue_async`.
+#[derive(Deserialize, JsonSchema)]
+pub struct ContinueAsyncArgs {
+    /// How long the debugger may let the target run before breaking it in itself (milliseconds).
+    /// Defaults to the standard execution wait, and is capped — a run nothing is bounding is a
+    /// target this server could not account for.
+    #[serde(default)]
+    pub max_run_ms: Option<u32>,
+    /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
+    /// session and be refused if its target was replaced or closed.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// Parameters for `wait_for_stop`.
+#[derive(Deserialize, JsonSchema)]
+pub struct WaitForStopArgs {
+    /// The run to wait on: the `execution` handle the resume that started it reported.
+    pub execution: String,
+    /// How long to wait (milliseconds). Defaults to 30s and is capped below this server's own
+    /// call timeout, so the wait always answers rather than letting the call expire. Running out
+    /// cancels nothing: the target is still running and waiting again carries on.
+    #[serde(default)]
+    pub timeout_ms: Option<u32>,
+    /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
+    /// session and be refused if its target was replaced or closed.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+/// Parameters for `break_in`.
+#[derive(Deserialize, JsonSchema)]
+pub struct BreakInArgs {
+    /// The run to break in: the `execution` handle the resume that started it reported.
+    pub execution: String,
+    /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
+    /// session and be refused if its target was replaced or closed.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 /// Parameters for `server_log`.
 #[derive(Deserialize, JsonSchema)]
 pub struct LogArgs {
@@ -2344,7 +2408,143 @@ fn describe_session(s: &SessionSnapshot) -> String {
         )),
         SessionState::Closed(why) => out.push_str(&format!("  closed {waited} ago: {why}\n")),
     }
+    if let Some(execution) = &s.execution {
+        out.push_str(&describe_execution(execution));
+    }
     out
+}
+
+/// A session's asynchronous run, as `session_status` reports it.
+///
+/// Two states worth telling apart in words, because they mean opposite things for every other tool
+/// on the session: while the target is moving nothing can read it, and once it has stopped
+/// everything can — with the stop still there to be collected, since a run is replaced rather than
+/// cleared.
+fn describe_execution(e: &structured::ExecutionInfo) -> String {
+    let ran_for = fmt_duration(Duration::from_millis(e.running_for_ms));
+    if !e.stopped {
+        let bound = match e.breaks_in_ms {
+            Some(left) => format!(
+                " The debugger breaks it in itself in {}.",
+                fmt_duration(Duration::from_millis(left))
+            ),
+            // The bound has passed and no stop has been filed yet: the break has been raised and
+            // the run is on its way to reporting one. Saying "in 0.0s" would read as a stuck clock.
+            None => " Its bound has passed, so the debugger has broken it in and the stop is on \
+                     its way."
+                .to_string(),
+        };
+        return format!(
+            "  running `{}` as `{}` for {ran_for}. Tools that read the target are refused until \
+             it stops.{bound}\n",
+            e.command, e.execution
+        );
+    }
+    format!(
+        "  `{}` ran `{}` for {ran_for} and has stopped; the session takes ordinary work again, \
+         and the stop is still there to be read.\n",
+        e.execution, e.command
+    )
+}
+
+/// What `continue_async` says in words.
+fn describe_started(started: &structured::ExecutionStarted) -> String {
+    if !started.running {
+        return format!(
+            "`{}` ran `{}` on session `{}` and the target never started moving — the command \
+             completed by itself. The run is over and its stop is already recorded against the \
+             handle; read it rather than waiting for one.",
+            started.execution, started.command, started.session_id
+        );
+    }
+    let bound = started.breaks_in_ms.map_or_else(
+        || " Its bound has already passed.".to_string(),
+        |left| {
+            format!(
+                " If nothing stops it, the debugger breaks it in after {}.",
+                fmt_duration(Duration::from_millis(left))
+            )
+        },
+    );
+    format!(
+        "The target on session `{}` is running `{}`. The run is `{}` — do whatever the target is \
+         waiting for, then collect the stop.{bound}\nUntil it stops, tools that read this \
+         session's target are refused: nothing read from a moving target would mean anything.",
+        started.session_id, started.command, started.execution
+    )
+}
+
+/// What `wait_for_stop` says in words.
+///
+/// The still-running case is the one worth wording carefully: it is not a failure, nothing was
+/// cancelled, and a caller that reads it as "the debugger did not answer" would end a session that
+/// is working perfectly.
+fn describe_stop_wait(waited: &structured::StopWait) -> String {
+    let ran_for = fmt_duration(Duration::from_millis(waited.running_for_ms));
+    let Some(stop) = &waited.stop else {
+        let bound = waited.breaks_in_ms.map_or_else(
+            || {
+                " Its bound has passed, so the debugger has broken it in and a stop is on its way."
+                    .to_string()
+            },
+            |left| {
+                format!(
+                    " The debugger breaks it in itself after another {}.",
+                    fmt_duration(Duration::from_millis(left))
+                )
+            },
+        );
+        return format!(
+            "`{}` is still running after {ran_for}; this wait ran out, not the run. Nothing was \
+             cancelled and nothing was consumed — wait again to carry on.{bound}",
+            waited.execution
+        );
+    };
+    let mut out = format!("`{}` stopped after {ran_for}.\n", waited.execution);
+    out.push_str(&describe_stop(stop));
+    out.push_str(&stop.output);
+    out
+}
+
+/// Where a run ended, as a sentence, from the fields that say it.
+///
+/// Read off `StopReport` rather than kept as a second `reason` field beside its flags: the flags
+/// are the answer, and a stored summary of them is a second source for one fact that drifts the
+/// first time one of them changes meaning.
+fn describe_stop(stop: &structured::StopReport) -> String {
+    let where_ = match (&stop.stopped_at, stop.thread, stop.processor) {
+        (None, _, _) => String::new(),
+        (Some(at), thread, processor) => {
+            let mut said = format!(" at {at}");
+            if let Some(thread) = thread {
+                said.push_str(&format!(" on thread {thread}"));
+            }
+            if let Some(processor) = processor {
+                said.push_str(&format!(", processor {processor}"));
+            }
+            said
+        }
+    };
+    if stop.target_gone {
+        return "  The target is gone: it ran to completion, or the run released it. That is an \
+                ending rather than a failure, and the output below is what the run captured on \
+                the way there.\n"
+            .to_string();
+    }
+    if stop.interrupted {
+        return format!(
+            "  It was broken in on request, so it is stopped{where_} — where it happened to be, \
+             not at a stop it reached.\n"
+        );
+    }
+    if stop.timed_out {
+        return format!(
+            "  It reached its bound without stopping, so the debugger broke it in{where_} — where \
+             it happened to be, not at a stop it reached. Resume it, or allow the next run \
+             longer.\n"
+        );
+    }
+    format!("  It stopped on its own{where_}.\n")
 }
 
 /// Can this data-model expression run debugger commands?
@@ -2638,7 +2838,7 @@ impl WindbgServer {
     /// the cross-references this surface may read.
     ///
     /// Built per call, which is what `Self::tool_router()` already was — the schemas underneath it
-    /// are cached by type, so this is a map of fifty-one `Arc` clones and a `retain`.
+    /// are cached by type, so this is a map of fifty-four `Arc` clones and a `retain`.
     ///
     /// It is also the path `call_tool` takes, which pays for [`Self::annotate`] on every call and
     /// reads none of it. That is deliberate: `list_tools` and `get_tool` are the macro's and take
@@ -4091,6 +4291,140 @@ impl WindbgServer {
         engine_result_for(args.session_id.as_deref(), out)
     }
 
+    /// Resume the target (`g`) and return **immediately** with a handle for the run, instead of
+    /// waiting for the next stop.
+    ///
+    /// This is what lets a breakpoint be armed *and then* tripped: resume, go and do the thing
+    /// that makes the target reach it — start a process on the guest, send an IOCTL, click the
+    /// button — and collect the stop afterwards. Waiting for the stop first cannot express that,
+    /// and guest-side sleeps are not a substitute, because a kernel halted in the debugger has a
+    /// halted clock.
+    ///
+    /// One run per session at a time; starting a second while one is going is refused. **While
+    /// the target is moving, every tool that reads it is refused too** — nothing read from a
+    /// moving target would mean anything — so the session is unavailable for ordinary work until
+    /// the run stops. Breaking in and ending the session both still work.
+    ///
+    /// The run is bounded: `max_run_ms` is how long the debugger lets the target go before
+    /// breaking it in itself, so a resume that reaches nothing ends rather than running for ever.
+    #[rmcp::tool(
+        annotations(
+            title = "Continue without waiting",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::ExecutionStarted>>()
+    )]
+    async fn continue_async(
+        &self,
+        Parameters(args): Parameters<ContinueAsyncArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let session = match self.sessions.resolve(args.session_id.as_deref()) {
+            Ok(session) => session,
+            Err(e) => return typed_error(ErrorCategory::of(&e), e.to_string(), args.session_id),
+        };
+        let bound = Duration::from_millis(u64::from(
+            args.max_run_ms
+                .unwrap_or(EXEC_WAIT_MS)
+                .clamp(1, MAX_ASYNC_RUN_MS),
+        ));
+        let started = self
+            .sessions
+            .start_execution(&session, args.session_id.is_some(), "g".to_string(), bound)
+            .await;
+        match started {
+            Ok(started) => structured_result(describe_started(&started), started),
+            Err(e) => typed_error(ErrorCategory::of(&e), e.to_string(), args.session_id),
+        }
+    }
+
+    /// Wait for an asynchronous run to stop, and report where it stopped — the reason, the
+    /// instruction pointer, the thread, and (on a kernel target) the processor.
+    ///
+    /// Running out of time is not a failure and cancels nothing: the answer then carries no stop,
+    /// the target is still running, the handle is still good, and waiting again carries on from
+    /// where this left off. So a short wait is a poll and a long one is a wait, and neither
+    /// disturbs the target.
+    ///
+    /// The stop is read rather than taken: asking twice gives the same answer, and a run that
+    /// stopped while nobody was waiting still has its stop here to be collected.
+    #[rmcp::tool(
+        annotations(
+            title = "Wait for a run to stop",
+            read_only_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::StopWait>>()
+    )]
+    async fn wait_for_stop(
+        &self,
+        Parameters(args): Parameters<WaitForStopArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let session = match self.sessions.resolve(args.session_id.as_deref()) {
+            Ok(session) => session,
+            Err(e) => return typed_error(ErrorCategory::of(&e), e.to_string(), args.session_id),
+        };
+        // Capped below the server's own call timeout, with a margin: a wait allowed to run the
+        // whole budget would have the *call* expire instead of answering, which is the one outcome
+        // this tool exists to avoid — a caller cannot tell that from a target that never stopped.
+        let wait =
+            Duration::from_millis(u64::from(args.timeout_ms.unwrap_or(DEFAULT_STOP_WAIT_MS))).min(
+                self.sessions
+                    .call_timeout()
+                    .saturating_sub(STOP_WAIT_MARGIN),
+            );
+        match self
+            .sessions
+            .wait_for_stop(&session, &args.execution, wait)
+            .await
+        {
+            Ok(waited) => structured_result(describe_stop_wait(&waited), waited),
+            Err(e) => typed_error(ErrorCategory::of(&e), e.to_string(), args.session_id),
+        }
+    }
+
+    /// Break an asynchronous run in (Ctrl+Break), so a target that is not going to reach a
+    /// breakpoint stops now rather than at its bound.
+    ///
+    /// It returns as soon as the request is lodged with the engine, not when the target stops:
+    /// the stop is the run *ending*, and is reported where every other ending of it is. A run that
+    /// had already stopped is not an error — that is the ordinary race, and the thing you wanted
+    /// has happened.
+    ///
+    /// Two targets cannot be reached this way, both properties of `SetInterrupt` rather than of
+    /// this: a command that never polls, and a live-kernel attach whose target has never
+    /// connected. `end_session` is what ends those, at the cost of the target.
+    #[rmcp::tool(annotations(
+        title = "Break a run in",
+        read_only_hint = false,
+        destructive_hint = false,
+        // Not idempotent, for `interrupt`'s reason: a second call is a second Ctrl+Break, which
+        // lands on whatever is running by then.
+        idempotent_hint = false,
+        open_world_hint = true
+    ),
+        output_schema = constraints_of::<Outcome<structured::BreakInRequested>>()
+    )]
+    async fn break_in(
+        &self,
+        Parameters(args): Parameters<BreakInArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let session = match self.sessions.resolve(args.session_id.as_deref()) {
+            Ok(session) => session,
+            Err(e) => return typed_error(ErrorCategory::of(&e), e.to_string(), args.session_id),
+        };
+        match self
+            .sessions
+            .break_in(&session, &args.execution, args.session_id.is_some())
+            .await
+        {
+            Ok(requested) => structured_result(requested.detail.clone(), requested),
+            Err(e) => typed_error(ErrorCategory::of(&e), e.to_string(), args.session_id),
+        }
+    }
+
     /// Run the target until it reaches `address` (a one-shot `g <addr>` that doesn't
     /// disturb existing breakpoints) and report a structured verdict: HIT (reached it),
     /// STOPPED ELSEWHERE (another breakpoint/exception fired first), TIMEOUT (not
@@ -4672,7 +5006,7 @@ const GROUP_INSTRUCTIONS: &[(&[&str], &str)] = &[
 ///
 /// **Why a table and not a filter.** A description has no assembly point the way the instructions
 /// do - it is one literal per tool, shipped by the macro - so the appending is what this adds. The
-/// alternative shapes are both worse: deleting the sentences costs the fifty-one-tool client a
+/// alternative shapes are both worse: deleting the sentences costs the whole-surface client a
 /// pointer that is doing real work ("the opener does not give you the module table, `modules`
 /// does" is how the second call gets made), and saying it without the name keeps the pointer while
 /// losing the one string a model can copy into a call.
@@ -4750,6 +5084,42 @@ const SUMMARY_NOTES: &[SummaryNote] = &[
 /// served, so if the base description is clean on the tightest surface it is clean on every wider
 /// one.
 const TOOL_NOTES: &[ToolNote] = &[
+    ToolNote {
+        tool: "continue_async",
+        names: &["wait_for_stop", "break_in"],
+        note: "`wait_for_stop` collects the stop — running out of its wait is a poll, not a \
+               failure — and `break_in` stops a run that is not going to reach anything.",
+    },
+    ToolNote {
+        tool: "continue_async",
+        names: &["go"],
+        note: "Use `go` instead when nothing has to happen while the target runs: it waits for \
+               the stop and answers with it in one call.",
+    },
+    ToolNote {
+        tool: "wait_for_stop",
+        names: &["continue_async"],
+        note: "The handle comes from `continue_async`.",
+    },
+    ToolNote {
+        tool: "break_in",
+        names: &["continue_async", "wait_for_stop"],
+        note: "The handle comes from `continue_async`, and the stop it produces arrives on \
+               `wait_for_stop`.",
+    },
+    ToolNote {
+        tool: "break_in",
+        names: &["interrupt"],
+        note: "For a call that is overrunning rather than a run that is, `interrupt` is the one \
+               that stops it.",
+    },
+    ToolNote {
+        tool: "interrupt",
+        names: &["continue_async", "break_in"],
+        note: "It also breaks in a run `continue_async` started — the same Ctrl+Break — but \
+               `break_in` is the one to use there: it is bound to the run's own handle, so it \
+               cannot land on whatever the session started next.",
+    },
     ToolNote {
         tool: "open_dump",
         names: &["modules"],
@@ -4850,7 +5220,7 @@ const TOOL_NOTES: &[ToolNote] = &[
     // `list_tools` and `get_tool` come from the macro; what they list is this instance's router
     // rather than the crate-wide one, which is what makes `--tools` visible on the wire. The
     // default here is `Self::tool_router()`, and leaving it would have narrowed the calls a tool
-    // may make (`dispatch`) while still advertising all fifty-one.
+    // may make (`dispatch`) while still advertising all fifty-four.
     //
     // `name` and `instructions` used to be here too. They moved into the hand-written `get_info`
     // below, which the macro yields to - the instructions are now assembled for the client's own
@@ -5613,6 +5983,136 @@ mod tests {
         service.cancel().await.expect("shut the service down");
     }
 
+    // ---- What an asynchronous run says ---------------------------------
+    //
+    // The mechanism is `engine.rs`'s. What is checked here is the wording, because a model acts on
+    // it and three of these sentences describe a *stop that is not a stop the target reached* —
+    // read as one, the next move is wrong in a way nothing else in the answer corrects.
+
+    fn stop(f: impl FnOnce(&mut structured::StopReport)) -> structured::StopReport {
+        let mut report = structured::StopReport {
+            command: "g".to_string(),
+            stopped_at: Some("fffff800`0011c0de".to_string()),
+            thread: Some(4242),
+            processor: None,
+            interrupted: false,
+            timed_out: false,
+            target_gone: false,
+            output: String::new(),
+        };
+        f(&mut report);
+        report
+    }
+
+    /// The three endings that are not "it stopped where you were waiting for it to" each say so,
+    /// and each says what to do next.
+    #[test]
+    fn a_stop_that_is_not_a_stop_the_target_reached_says_which_it_is() {
+        let ordinary = describe_stop(&stop(|_| {}));
+        assert!(
+            ordinary.contains("stopped on its own"),
+            "the ordinary ending must not be hedged: {ordinary}"
+        );
+        assert!(
+            ordinary.contains("thread 4242"),
+            "a position without its thread does not identify a stop: {ordinary}"
+        );
+
+        let asked = describe_stop(&stop(|r| r.interrupted = true));
+        assert!(asked.contains("broken in on request"), "{asked}");
+        assert!(
+            asked.contains("not at a stop it reached"),
+            "a break-in reports a real position that is not a stop, and a caller reading it as one \
+             concludes the target goes there: {asked}"
+        );
+
+        let bound = describe_stop(&stop(|r| r.timed_out = true));
+        assert!(bound.contains("reached its bound"), "{bound}");
+        assert!(
+            bound.contains("not at a stop it reached"),
+            "the same hazard from the other cause: {bound}"
+        );
+        assert!(
+            bound.contains("allow the next run longer"),
+            "the answer to a bound is a longer one, and it is the only ending here with that \
+             remedy: {bound}"
+        );
+
+        let gone = describe_stop(&stop(|r| {
+            r.target_gone = true;
+            r.stopped_at = None;
+            r.thread = None;
+        }));
+        assert!(
+            gone.contains("ending rather than a failure"),
+            "running a program to completion is what a resume is for: {gone}"
+        );
+    }
+
+    /// On a kernel target the processor is part of the answer; on every other one there is none to
+    /// report and the sentence must not invent one.
+    #[test]
+    fn a_kernel_stop_names_its_processor_and_a_user_mode_one_does_not() {
+        let kernel = describe_stop(&stop(|r| r.processor = Some(3)));
+        assert!(kernel.contains("processor 3"), "{kernel}");
+        assert!(!describe_stop(&stop(|_| {})).contains("processor"));
+    }
+
+    /// A wait that ran out reads as a wait that ran out — not as a debugger that did not answer.
+    ///
+    /// The wording is the whole of it. A caller that reads this as a failure ends a session whose
+    /// target is running perfectly well, which is the opposite of what the tool is for.
+    #[test]
+    fn a_wait_that_ran_out_does_not_read_as_a_failure() {
+        let said = describe_stop_wait(&structured::StopWait {
+            session_id: "sess-1".to_string(),
+            execution: "exec-7".to_string(),
+            running_for_ms: 12_000,
+            stop: None,
+            breaks_in_ms: Some(48_000),
+        });
+        assert!(said.contains("still running"), "{said}");
+        assert!(
+            said.contains("this wait ran out, not the run"),
+            "the distinction is the tool: {said}"
+        );
+        assert!(
+            said.contains("Nothing was cancelled"),
+            "a caller has to know the run survived being waited on: {said}"
+        );
+        assert!(said.contains("wait again"), "and what to do next: {said}");
+    }
+
+    /// Starting a run says the session is now closed to reads, because being refused is otherwise
+    /// the only way to find out.
+    #[test]
+    fn starting_a_run_says_the_session_is_closed_to_reads() {
+        let said = describe_started(&structured::ExecutionStarted {
+            session_id: "sess-1".to_string(),
+            execution: "exec-7".to_string(),
+            command: "g".to_string(),
+            running: true,
+            breaks_in_ms: Some(60_000),
+        });
+        assert!(said.contains("exec-7"), "{said}");
+        assert!(said.contains("are refused"), "{said}");
+        assert!(said.contains("breaks it in after"), "{said}");
+
+        // The uncommon answer: the command finished without the target ever moving, so there is
+        // nothing to wait for and saying "the target is running" would be false.
+        let already = describe_started(&structured::ExecutionStarted {
+            session_id: "sess-1".to_string(),
+            execution: "exec-8".to_string(),
+            command: "g".to_string(),
+            running: false,
+            breaks_in_ms: None,
+        });
+        assert!(
+            already.contains("never started moving"),
+            "a run that never moved the target must not be reported as one that did: {already}"
+        );
+    }
+
     // ---- What `session_status` says ------------------------------------
     //
     // The routing rules themselves live in `engine.rs`, with the registry that enforces them.
@@ -5629,6 +6129,7 @@ mod tests {
             in_state_for: waited,
             age: waited,
             current: true,
+            execution: None,
         }
     }
 

@@ -5,8 +5,11 @@ how much of that surface a run serves, and three behaviours the table has no roo
 
 ## Serving fewer tools (`--tools`)
 
-All fifty-one tools are served unless you say otherwise, and their definitions cost the model
-**68,893 bytes — about 17k tokens — before it has asked anything**, once per conversation. Three
+All fifty-four tools are served unless you say otherwise, and their definitions cost the model
+**68,893 bytes — about 17k tokens — before it has asked anything**, once per conversation. (That
+figure and the table below were measured at fifty-one tools, before `continue_async`,
+`wait_for_stop` and `break_in`; re-recording `tests/golden/tool_budget.json` is what moves them, and
+only a Windows host can.) Three
 quarters of that is the prose that tells a model how to drive them, so it cannot be trimmed without
 making the tools harder to use correctly (see
 [`token-budget.md`](token-budget.md)). What *can* change is how many of them a given run
@@ -18,7 +21,7 @@ windbg-mcp.exe --tools session,inspect,crash
 
 | `--tools` | Tools | Model context |
 |---|---:|---:|
-| *(absent)* — every tool | 51 | 68,893 B |
+| *(absent)* — every tool | 54 | 68,893 B |
 | `session,inspect,exec,crash` | 25 | 28,882 B |
 | `session,inspect,crash` | 20 | 25,465 B |
 | `crash` | 11 | 14,587 B |
@@ -39,6 +42,12 @@ Two things worth knowing:
   carries its cross-references to *other* tools only when those are served too — so `open_dump` on
   a `crash` surface no longer says the module table is what `modules` lists. That is most of why a
   narrowed surface is smaller than its groups' shares add up to.
+- **`exec` carries two ways to run a target**, and they are not alternatives to be picked between
+  once. `go`, `step_over`, `step_into` and `run_to_address` wait for the stop and answer with it,
+  which is what almost every question wants. `continue_async`, `wait_for_stop` and `break_in` split
+  that in two, for the sequence where something has to *happen* while the target runs — arm a
+  breakpoint, resume, start the process on the guest that trips it, then collect the stop. See
+  [Running a target asynchronously](sessions.md#running-a-target-asynchronously).
 - **Calling a tool that exists but is not served** is refused by name — "not on the surface this
   run advertises" — rather than as an unknown tool, because the remedy is a flag on a command line
   the caller cannot see.
@@ -49,7 +58,7 @@ is written into the command line the SCM stores, and read back at every start). 
 
 A `--listen` server names its clients, and **a client may be served a surface of its own** — which
 is what lets one listener hold a local model that can fit twenty tools beside a hosted client that
-can hold fifty-one, against the same debug sessions:
+can hold fifty-four, against the same debug sessions:
 
 ```pwsh
 setx WINDBG_MCP_LISTEN_TOKEN_BENCH "<a long random string>"

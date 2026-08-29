@@ -1,4 +1,4 @@
-//! Which of this server's fifty-one tools a run advertises.
+//! Which of this server's fifty-four tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
 //! 68,893 bytes — roughly 17k tokens. Three quarters of that is prose, and the prose is what tells
@@ -24,10 +24,15 @@
 //!   inspect        9   10,786  registers, stacks, memory, modules, symbols, raw commands
 //!   ttd            9    6,829  recording, indexing and querying a Time Travel trace
 //!   ioctl          6    6,494  driver objects, IRP stacks, and dispatch reachability
-//!   exec           5    3,475  breakpoints and execution control
+//!   exec           8    3,475  breakpoints and execution control
 //!   batch          1    9,798  `debug_batch`
 //!   crash          1    2,936  `crash_triage`
 //! ```
+//!
+//! **The byte figures predate `continue_async`, `wait_for_stop` and `break_in`** (2026-08-29),
+//! which is what took `exec` from five tools to eight. They are re-measured by re-recording
+//! `tests/golden/tool_budget.json`, which only a Windows host can do; the counts above are counted
+//! from `GROUPS` and are current.
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
 //! 14,587 bytes, not the 15,542 its two rows add to, because the eleven tools it keeps also stop
@@ -50,7 +55,7 @@
 //!
 //! A listener names its clients already ([`crate::client`]), and they do not have one budget
 //! between them: the arrangement this exists for is a local model that can hold twenty tools and a
-//! hosted client that can hold fifty-one, pointed at the same Windows box and the same debug
+//! hosted client that can hold fifty-four, pointed at the same Windows box and the same debug
 //! sessions and told apart by their bearer tokens. So a client may be configured with a spec of
 //! its own — `WINDBG_MCP_TOOLS_<NAME>`, or a `tools` field in the credential file — and is served
 //! that instead of the run's. The run's `--tools` is the **default**, not a ceiling: a client's
@@ -128,6 +133,9 @@ const GROUPS: &[Group] = &[
             "step_into",
             "run_to_address",
             "set_breakpoint",
+            "continue_async",
+            "wait_for_stop",
+            "break_in",
         ],
     },
     Group {
@@ -247,7 +255,7 @@ impl Toolset {
             named_anything = true;
             if entry == ALL {
                 // Noted and carried on with, not returned on. Returning here would stop validating
-                // the rest, so `all,ttdd` served all 51 tools while `ttdd,all` was refused — the
+                // the rest, so `all,ttdd` served all 54 tools while `ttdd,all` was refused — the
                 // same spec, judged by where the typo happened to sit. A refusal that depends on
                 // entry order is worse than no refusal, because it is the one nobody reproduces.
                 everything = true;
@@ -505,7 +513,7 @@ mod tests {
         assert!(set.includes("end_session"));
         assert!(!set.includes("ttd_calls"));
         assert!(!set.includes("debug_batch"));
-        assert_eq!(set.summary(), "11 of 51 tools (session, crash)");
+        assert_eq!(set.summary(), "11 of 54 tools (session, crash)");
     }
 
     #[test]
@@ -516,7 +524,7 @@ mod tests {
         assert!(!set.includes("disassemble"));
         assert_eq!(
             set.summary(),
-            "12 of 51 tools (session, backtrace, registers)"
+            "12 of 54 tools (session, backtrace, registers)"
         );
     }
 
@@ -628,7 +636,7 @@ mod tests {
         // Both name the tool and what is served, because those do not depend on who chose it.
         for said in [&run, &own] {
             assert!(said.contains("`debug_batch`"), "{said}");
-            assert!(said.contains("11 of 51 tools (session, crash)"), "{said}");
+            assert!(said.contains("11 of 54 tools (session, crash)"), "{said}");
         }
     }
 

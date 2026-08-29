@@ -156,6 +156,10 @@ pub enum ErrorCategory {
     WorkerLost,
     /// No session slot was free, so nothing was opened. End a session and retry.
     Capacity,
+    /// The session has a run in flight: `continue_async` set the target going and it has not
+    /// stopped. Nothing about the call was wrong, and nothing read from a moving target would
+    /// mean anything — wait for the stop, break the target in, or end the session.
+    TargetRunning,
 }
 
 impl ErrorCategory {
@@ -172,6 +176,7 @@ impl ErrorCategory {
             EngineError::Interrupted(_) => Self::Interrupted,
             EngineError::NotRun(_) => Self::NotRun,
             EngineError::InvalidArgument(_) => Self::InvalidArgument,
+            EngineError::TargetRunning(_) => Self::TargetRunning,
         }
     }
 }
@@ -378,6 +383,15 @@ pub struct SessionInfo {
     pub current: bool,
     /// Whether it will still accept work.
     pub live: bool,
+    /// The run this session has outstanding, if any — started by `continue_async` and held until
+    /// something starts another.
+    ///
+    /// Here rather than in a tool of its own, because "what is this session doing" is the question
+    /// this report already answers and a second tool would be a second answer to it. While
+    /// `stopped` is false the session refuses every tool that reads the target, which is otherwise
+    /// only discoverable by being refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecutionInfo>,
 }
 
 /// A session's state, with the one derived fact a caller cannot compute for itself.
@@ -496,6 +510,19 @@ pub struct StopReport {
     /// that is running, gone, or has no thread context — which is not the same as zero.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped_at: Option<String>,
+    /// The operating-system thread id [`Self::stopped_at`] belongs to. Absent where the engine
+    /// would not answer — a target that has gone, or a stop with no thread context.
+    ///
+    /// Reported because a position on its own does not identify a stop: a `go` on a multi-threaded
+    /// target stops wherever a breakpoint was hit, and "which thread" is half of what a caller
+    /// then has to know to read the stack it walks next.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread: Option<u32>,
+    /// Which of a kernel target's processors the stop is on. Absent where no processor number
+    /// applies, which every user-mode target and every dump of one is — not a failure, and not
+    /// the same as processor 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub processor: Option<u32>,
     /// Whether the target was broken into **on request** rather than stopping on its own. The
     /// position is real either way, but it is where an `interrupt` landed rather than where the
     /// target was going, which is a different answer to "where did this stop?".
@@ -523,6 +550,96 @@ pub struct StopReport {
     pub target_gone: bool,
     /// The debugger's own output for the command.
     pub output: String,
+}
+
+// ---- asynchronous execution -----------------------------------------------
+
+/// What `continue_async` produced: a handle for a target that is now running.
+///
+/// The handle exists because the run outlives the call that started it. Every other tool here
+/// answers about a target that is stopped and will still be stopped when the answer arrives; this
+/// one hands back a name for something in flight, and the name is what later calls address.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ExecutionStarted {
+    pub session_id: String,
+    /// The handle. Good until this run stops **and** something starts another one — a stop does
+    /// not invalidate it, because the stop is exactly what it is then holding.
+    pub execution: String,
+    /// The debugger command that set the target going.
+    pub command: String,
+    /// Whether the target is actually moving.
+    ///
+    /// Almost always true, and the uncommon answer is worth having a field for: a command can
+    /// complete without ever leaving the engine running — `g` on a trace already at its end — in
+    /// which case the run is over before this call returned and its stop is already filed against
+    /// the handle, waiting to be read. There is nothing to wait for and nothing to break in.
+    pub running: bool,
+    /// How long the debugger will let the target run before breaking it in itself. Absent for a
+    /// run that is no longer going.
+    ///
+    /// Not a suggestion and not this call's timeout: it is the bound the pump is armed with in
+    /// the engine process, and it is what makes this a wait somebody can account for rather than
+    /// one nobody is watching. A run that reaches it stops where it happens to be, which the stop
+    /// reports as `timed_out`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breaks_in_ms: Option<u64>,
+}
+
+/// What `wait_for_stop` produced.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct StopWait {
+    pub session_id: String,
+    pub execution: String,
+    /// How long the target has been running in all — since the run started, not since this wait
+    /// did. Several waits can watch one run, and the run is what the number is about.
+    pub running_for_ms: u64,
+    /// Where the run stopped, or **absent while it is still going**.
+    ///
+    /// One field rather than a flag beside it, because there is one fact: a wait that came back
+    /// with no stop is a wait that ran out, not a run that did. The handle is still good and
+    /// waiting again carries on from here — nothing was consumed and nothing was cancelled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop: Option<StopReport>,
+    /// How much longer the debugger will let it run before breaking in itself. Absent once it has
+    /// stopped, where there is nothing left to bound.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breaks_in_ms: Option<u64>,
+}
+
+/// What `break_in` produced.
+///
+/// Deliberately not a stop. `SetInterrupt` lodges a request and returns; the target stops at the
+/// engine's next poll, and *that* is the run ending — so it is reported where every other ending
+/// of this run is reported, on the wait, rather than invented here from a request that had only
+/// just been made.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BreakInRequested {
+    pub session_id: String,
+    pub execution: String,
+    /// Whether the break reached the engine. `false` is not a failed call: the run may have
+    /// stopped on its own between the caller reading its handle and this arriving, which is the
+    /// ordinary race and needs no action.
+    pub requested: bool,
+    /// The debugger's own account of what it did.
+    pub detail: String,
+}
+
+/// One session's outstanding run, as `session_status` reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ExecutionInfo {
+    pub execution: String,
+    pub command: String,
+    pub running_for_ms: u64,
+    /// Whether the run has ended and its stop is waiting to be collected.
+    ///
+    /// The distinction the rest of the session's behaviour turns on: while this is `false` the
+    /// target is moving and every tool that reads it is refused, and once it is `true` the
+    /// session takes ordinary work again with the stop still there to be read.
+    pub stopped: bool,
+    /// How much longer the debugger will let it run before breaking in itself. Absent once it has
+    /// stopped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub breaks_in_ms: Option<u64>,
 }
 
 // ---- registers, modules, breakpoints --------------------------------------

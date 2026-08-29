@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Asynchronous execution control: `continue_async`, `wait_for_stop` and `break_in`**
+  ([#83](https://github.com/glslang/windbg-mcp/issues/83)). `go` waits for the next stop and answers
+  with it, which leaves no room for the sequence a live target usually needs — arm a breakpoint,
+  resume, *make the thing happen that trips it*, then collect the stop. `continue_async` resumes and
+  returns at once with an execution handle; `wait_for_stop` collects the stop whenever it comes; and
+  `break_in` ends a run that is not going to reach anything. A guest-side `Sleep` was the only way to
+  express the middle step before, and it is not a sound one: a kernel halted in the debugger has a
+  halted clock.
+
+  The wait that goes away is the **caller's**, not the debugger's. DbgEng moves a target only from
+  inside `WaitForEvent`, so the engine thread stays in the pump for the whole run — what changed is
+  that the worker reports the target moving as a milestone, and the reply that follows is the stop,
+  filed against the handle by a task that does not care whether the caller is still there. So there
+  is no hidden wait anywhere: the run is recorded on the session before the job is queued,
+  `session_status` reports it, and `max_run_ms` says when the debugger will end it itself.
+
+  Consequences worth reading before using it. **One run per session**, because a second could not
+  start until the first ended. **While the target is moving, every tool that reads it is refused**,
+  with a new `target_running` category and the handle to wait on — refused rather than queued, since
+  a queued `registers` would be answered whenever the target next stopped and would describe
+  wherever it happened to be. **A wait that runs out is a poll**: no stop, nothing cancelled, the
+  handle still good. **A stop is read rather than taken**, so a client that disconnected mid-run can
+  reconnect and read it. And `end_session` breaks the pump in as it arrives rather than queueing
+  behind a run that has no reason to end — which is the same path a client disconnect takes.
+  [`docs/sessions.md`](docs/sessions.md#running-a-target-asynchronously) has the whole of it.
+- **A stop says which thread, and which processor.** `StopReport` — what `go`, the stepping tools
+  and `wait_for_stop` all answer with — now carries `thread` (the operating-system thread id the
+  position belongs to) and `processor` (which of a kernel target's processors it is on, absent where
+  no processor number applies, which every user-mode target is). A position on its own does not
+  identify a stop on a multi-threaded target, and the alternative was parsing `~.`, whose text is
+  one shape for a thread and another for a processor. Both come from new typed `dbgscope` readers.
+
 ### Fixed
 
 - **`record_trace` finds the recorder the engine copy already delivered.** `setup.md`'s one-time
