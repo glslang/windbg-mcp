@@ -94,6 +94,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshot is still reused and stays complete, while `limit` remains the independent rendering
   cap. The `debug_batch` `pool_find_tag` step accepts the same field.
 
+- **The per-call result budget is charged against every channel a result carries, not only the
+  half this client forwards** ([#150](https://github.com/glslang/windbg-mcp/issues/150)).
+  `tool_results_stay_within_their_budget` now asserts a tool's model ceiling against
+  `content[].text` and against `structuredContent` separately, so a typed tool is checked twice
+  and the failure names which channel moved; the `wire` ceiling that landed with #149 still covers
+  the result taken together. The printed table gains a `worst` column — the larger of the two
+  halves — beside the ceiling it is compared against.
+
+  This closes the half of #150 that was deferred for want of a second client to measure. The
+  deferral had the wrong shape: a second client would say what one more implementation happens to
+  do, which is a sample and not a rule, and inferring a server's budget from a client's forwarding
+  policy is the same step that left the rendering unwatched in the first place. The text-forwarding
+  client was also already in this repo's own compatibility matrix — `structuredContent` arrived
+  with `2025-06-18`, this server serves `2025-03-26` and `2024-11-05` beneath it, and the channel
+  is not gated on the negotiated revision, so for those two the rendering is not the half a client
+  happens to forward but the only half it can read.
+
+  No ceiling moved. `session_status` is the one budgeted typed tool whose rendering is larger than
+  its typed answer (420 B against 297 B), so it is the only row now measured against a number the
+  old assertion never saw; elsewhere the typed half is the larger one and the new check restates
+  the old. Which is what a floor under a channel nothing has yet grown looks like.
+
 ### Fixed
 
 - **Documentation: `!analyze`'s module attribution is a fact about the debugging host, not about

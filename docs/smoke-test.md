@@ -916,6 +916,14 @@ result that grows within its ceiling leaves no diff anywhere and is only visible
 table. Adjusting one is an edit to that slice, not a re-record. See
 [`token-budget.md`](./token-budget.md) for the baseline, the ceilings and how to raise one.
 
+Each row carries two numbers and the first is charged **per channel**: the model ceiling holds for
+`content[].text` and for `structuredContent` separately, not only for the half this client
+forwards, so a typed tool is asserted against it twice and the failure names which channel moved.
+The `wire` ceiling then covers the result taken together. Raising the model number is therefore a
+decision about every client rather than about ours — the tool's own doc comment and
+[`token-budget.md`](./token-budget.md) carry why
+([#150](https://github.com/glslang/windbg-mcp/issues/150)).
+
 ## When to run it
 
 ### A dependency moved
