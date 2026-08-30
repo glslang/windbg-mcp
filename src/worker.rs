@@ -1270,8 +1270,14 @@ fn interrupt_running(bound: Option<u64>) -> Result<(Interrupted, String), String
     // restore command.
     //
     // Costs nothing anywhere else: a repeat only ever meant "that same operation, again", and it
-    // is already stopping. A *later* job is a different id and is interrupted normally, which is
-    // why this is not idempotence — see the tool's annotation.
+    // is already stopping.
+    //
+    // Note this is not what makes either tool idempotent or not, and the two answer differently.
+    // A *later* job is a different id and is interrupted normally — which is why `interrupt`, whose
+    // caller named a session, is `idempotentHint: false`: its retry addresses whatever is running
+    // by then. `break_in` names a run, so its retry is pinned to this same job and can only arrive
+    // here, or at a bar it has already set; it is `idempotentHint: true`. Both annotations are in
+    // `server.rs` and carry the reasoning.
     if running.interrupt_pending(job) {
         // Nothing was sent, but a break **is** lodged for this job and the target is stopping,
         // which is what `break_in` is asking about — while the transcript is asking who raised it

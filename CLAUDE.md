@@ -845,6 +845,16 @@ request being read the run may have stopped and the engine thread started the ne
 the break would be bound to *that* — a queued command, or the run after this one — and reported to
 its caller as an interruption nobody asked for. Named, the worker refuses rather than rebinds.
 
+**Which is also why the two tools carry opposite `idempotentHint`s, and copying one annotation onto
+the other is the mistake that has already been made.** `interrupt` is *not* idempotent: its caller
+named a session, so a retry after a timeout addresses whichever job is running by then and can stop
+an operation nobody aimed at. `break_in` is, for exactly the reason above — the handle pins the
+request to one job, so every repeat reaches that run and adds nothing to it: a break already lodged
+answers `AlreadyPending` and sends nothing, a bar is an insert into a set that already holds the id,
+and a handle whose run has been replaced is `Stale`. It shipped as `false` with `interrupt`'s
+comment pasted beneath it, which is a sentence that is true of the tool it was written for and
+false of the one it ended up on.
+
 **Naming the job is only half an answer, though, and the other half is `Running::barred`.** A break
 for a run that has not *started* — queued behind a `pool_census`, or simply not dequeued — has no
 pump to interrupt, and refusing to rebind leaves it to start the moment the queue drains and hold
