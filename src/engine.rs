@@ -1000,14 +1000,25 @@ impl Session {
                 return;
             };
             execution.ran_for = Some(execution.going_for());
+            // The idle clock starts now, not when the run was submitted. `last_used` is stamped
+            // on submission everywhere else, which is right for a call that answers in seconds
+            // and wrong for one that can run for an hour: a session whose run outlasted the
+            // reclamation window would be idle the instant it stopped, and could be taken before
+            // its caller had read the stop it was waiting for.
+            //
+            // **Stamped before the stop is published, and under the slot's lock**, which is what
+            // makes that true of every observer rather than of most of them. Publishing first
+            // left a window with the two facts disagreeing: `busy()` reads the slot, so a run
+            // marked stopped is no longer busy, while `last_used` still held the submission
+            // stamp — and for a run that outlasted the window, that pair is exactly "idle and
+            // stale". A sweep landing there releases the session and the stop is filed where its
+            // caller can no longer resolve it, which is the failure the restamp exists to
+            // prevent, surviving in the gap between two statements. Stamping inside the lock
+            // closes it: `stopped` cannot be seen without acquiring this lock, and by the time it
+            // can be, the new stamp is already in place.
+            *self.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
             execution.stopped = Some(Arc::new(result));
         }
-        // The idle clock starts now, not when the run was submitted. `last_used` is stamped on
-        // submission everywhere else, which is right for a call that answers in seconds and wrong
-        // for one that can run for an hour: a session whose run outlasted the reclamation window
-        // would be idle the instant it stopped, and could be taken before its caller had read the
-        // stop it was waiting for.
-        *self.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
         self.execution_moved();
     }
 
@@ -5090,6 +5101,69 @@ mod tests {
         assert!(
             session.execution_by(&handle).is_some(),
             "the stop outlives the run so a caller who was not waiting can still read it"
+        );
+    }
+
+    /// And the two facts move together, which a sequential test cannot tell from them merely both
+    /// being true at the end.
+    ///
+    /// `busy()` reads the slot and `idle_for` reads `last_used`, so "not busy" and "stale" are the
+    /// pair that gets a session released. `finish_execution` produces both, and while it published
+    /// the stop first and stamped the clock afterwards there was a window holding exactly that
+    /// pair — small, but reachable by any sweep, and only on a run that had outlasted the
+    /// reclamation window, which is the one case the restamp was added for.
+    ///
+    /// Staged by holding the clock's own lock, so the filing thread is stopped at the point of
+    /// interest rather than raced past it. With the stamp inside the slot's lock, a thread blocked
+    /// on the clock is *still holding the slot*, so the stop cannot be read at all. With it
+    /// outside, the slot has been released and already says the run stopped — the bad pair,
+    /// standing still to be looked at, and it stays that way for as long as the clock is held.
+    ///
+    /// The sampling bound is what makes a **failure** observable, not what makes a pass true: a
+    /// pass is guaranteed by the lock, so no amount of scheduling luck manufactures one. A run
+    /// starved of the CPU for the whole spell would report a false pass and never a false failure,
+    /// which is the direction to be wrong in.
+    #[test]
+    fn a_filed_stop_is_never_visible_beside_a_stale_idle_clock() {
+        let session = dormant("sess-1", SessionState::Open);
+        let _handle = resumed_on(&session, 7);
+        *session.last_used.lock().unwrap() = Instant::now() - Duration::from_secs(3_600);
+
+        let clock = session.last_used.lock().unwrap();
+        let (entered, has_entered) = std::sync::mpsc::channel();
+        let filing = {
+            let session = Arc::clone(&session);
+            std::thread::spawn(move || {
+                entered.send(()).expect("the test is still waiting");
+                session.finish_execution(7, Ok(Output::text("stopped")));
+            })
+        };
+        has_entered.recv().expect("the filing thread starts");
+
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let mut published_without_the_clock = false;
+        while Instant::now() < deadline {
+            if let Ok(slot) = session.execution.try_lock()
+                && slot.as_ref().is_some_and(|e| !e.running())
+            {
+                published_without_the_clock = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(
+            !published_without_the_clock,
+            "the stop was published while the idle clock still held the submission stamp: a sweep \
+             reading the slot here finds a session that is neither busy nor recently used, \
+             releases it, and the stop lands where its caller can no longer resolve it"
+        );
+
+        drop(clock);
+        filing.join().expect("the filing thread files the stop");
+        assert!(!session.busy(), "a run that ended owes nothing");
+        assert!(
+            !session.idle_for(Duration::from_secs(60)),
+            "and once it has, the clock says so"
         );
     }
 
