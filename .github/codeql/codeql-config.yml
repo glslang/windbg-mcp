@@ -20,3 +20,30 @@ paths-ignore:
   # The cost, stated plainly because nothing else will state it: a genuine finding in the smoke
   # harness is now unreported. That is judged worth it for a file whose job is to print state.
   - tests/**
+
+# What this file deliberately does **not** do, recorded so it is not re-litigated.
+#
+# The same false positive also fires inside `src/server.rs` — five sinks as of #257, all of them
+# `assert!(…, "{said}")` in the `#[cfg(test)] mod tests` at the bottom of the file, where `said` is
+# a rendered tool result built from a fixture's `session_id`. A path filter cannot reach them:
+# `paths-ignore` excludes whole files, and `src/server.rs` is 5,300 lines of the tool surface
+# before its tests begin. Excluding it would drop the scanner from the file it most needs to read
+# in order to buy silence in the file's last third.
+#
+# Nor can a query filter be aimed at a path. `query-filters` matches query *metadata* — `id`,
+# `tags`, `problem.severity` — and nothing else, so the only filter available is
+# `exclude: id: rust/cleartext-logging` across the whole repository. That rule is load-bearing
+# here: it is what would catch a bearer token or a KDNET debug key reaching `tracing`, which is the
+# one leak this server is written around (a worker never logs a request line because an
+# `AttachKernel` carries the key; a credential collision is refused without quoting the token).
+# Trading that away for five test-fixture alerts is the wrong way round.
+#
+# And moving the tests out of `src/` is not a smaller version of the same idea: twenty files here
+# carry an inline `#[cfg(test)]` module, which is how Rust unit tests reach the private items they
+# test. `describe_started` is private; a test in `tests/` could not call it.
+#
+# So these are dismissed in the code-scanning UI as false positives, one at a time, with the
+# rationale the repository owner recorded on 2026-08-28: a session handle is a routing name, not a
+# credential — `engine::mint_session_id` says it "exists to name a worker, not to authenticate",
+# and `Sessions::resolve` reports a handle whose owner is not the caller as *unknown*, so holding
+# someone else's grants nothing.
