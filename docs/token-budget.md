@@ -445,7 +445,8 @@ One rule is asserted rather than a number: a tool's `structuredContent` may not 
 rendering by more than 20x. A typed answer is meant to be the facts behind a rendering, so a large
 multiple means it is carrying scaffolding instead. `registers` was at 15.9x — the case the rule was
 written around — and is 5.6x since finding 7 was fixed; the rule is there to catch the next one. Being a ratio, it is only safe to read
-alongside the `wire` ceiling below: on its own, a rendering that grows satisfies it *more*.
+alongside the byte ceilings below — the `wire` one, and the model one now that a rendering is
+charged against it too: on its own, a rendering that grows satisfies it *more*.
 
 ### Why each call has two ceilings
 
@@ -465,7 +466,46 @@ client's policy affects. It is measured rather than derived from `text + structu
 result object also carries content-block scaffolding and JSON escaping — a rendered table's
 newlines cost two bytes there and one in `text`.
 
-What is still missing is per-*channel* ceilings, which would say which half moved. That needs a
-decision about which forwarding policies this server intends to be good under, and that wants
-measurements from a second client rather than a guess about one —
-[#150](https://github.com/glslang/windbg-mcp/issues/150).
+### And why the model ceiling is charged per channel
+
+`wire` closes the hole; it does not say which half opened it. A result that grows fails one
+assertion whether the rendering doubled or the typed answer did, and the two want opposite fixes.
+
+The per-channel rule ([#150](https://github.com/glslang/windbg-mcp/issues/150)) is that a tool's
+**model ceiling applies to every channel its result carries**, not only to the half this client
+forwards. A typed tool is asserted twice — once on `text`, once on `structuredContent` — and a
+text-only one once, and the failure names the channel.
+
+That is also the decision the second half of #150 was waiting on, and the wait had the wrong
+shape. It was framed as needing measurements from a second client, to settle which forwarding
+policies this server intends to be good under. But a second client would say what one more
+implementation happens to do, which is a sample and not a rule — and reasoning from what a client
+does to what the server budgets is the same inference that left the rendering unwatched in the
+first place. What a server can budget is what it *emits*, and it emits both channels.
+
+**And the text-forwarding client is not hypothetical: it is in this repo's own compatibility
+matrix.** `structuredContent` arrived with the `2025-06-18` revision, and this server serves
+`2025-03-26` and `2024-11-05` as well — both promised in
+[`docs/architecture.md`](./architecture.md), both asserted in the protocol tier
+(`SUPPORTED_REVISIONS`). The channel is not gated on the negotiated revision (`structured_result` is one function and
+does not ask), so a client on either of those is sent a field its revision does not define, must
+ignore it, and reads the rendering. For those two the rendering is not the half a client *happens*
+to forward; it is the only half it can read. So the answer is every policy, and settling it needed
+a look at the revision list rather than a second client.
+
+The table under `--nocapture` carries a **`worst`** column beside `ceiling` for the same reason:
+`model` is what this client is charged and `worst` is what the most expensive one would be. They
+differ only where a rendering is the bigger half.
+
+Which today is one row: `session_status`, the only *typed* tool here whose rendering is larger
+than its typed answer (420 B against 297 B, the 0.7x in the table above). On every other typed row
+`worst` is the typed half, and on a text-only one like `execute` there is only the one channel — so
+everywhere else the new assertion restates the one that was already there and the column reads the
+same as `model`.
+
+What it does **not** say is which ceiling a growing rendering trips first. That depends on the room
+each row has left in each, and the margins are small: growing text alone, `session_status` reaches
+its model ceiling 197 B before `wire` and `crash_triage` 1,026 B before, while `open_dump` reaches
+it 263 B after and `backtrace` 56 B after — and those last two are figures measured against a
+different dump on a different architecture, which is well inside 56 B of noise. The rule is a floor
+under a channel, not a prediction about which assertion speaks first.

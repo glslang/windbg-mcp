@@ -6005,10 +6005,32 @@ fn an_open_summarises_the_target_instead_of_listing_its_modules() {
 /// was the one that would have waved it through. Take `registers` from 618 B of text to 6,180 B and
 /// 15.9x becomes 1.59x, and every assertion here passed greener than before.
 ///
-/// Per-*channel* ceilings would say which half moved, and are not here: that needs a decision about
-/// which forwarding policies this server intends to be good under, which wants measurements from a
-/// second client rather than a guess about one
-/// ([#150](https://github.com/glslang/windbg-mcp/issues/150)).
+/// **The model ceiling is charged per channel, not per client**
+/// ([#150](https://github.com/glslang/windbg-mcp/issues/150)). `model` above is the half *this*
+/// client forwards; a client with no support for structured results forwards the other one, and
+/// spends its whole context window on it. Both are therefore a model-visible half somewhere, so
+/// the tool's budget is asserted against each channel the result carries rather than against
+/// whichever one a chosen client reads.
+///
+/// That is also the answer to the question this was deferred on — which forwarding policies the
+/// server intends to be good under — and the deferral had the wrong shape. Measuring a second
+/// client would say what one more implementation happens to do, which is a sample and not a rule;
+/// it is the same inference from client behaviour to server budget that left the text half
+/// unwatched in the first place. What a server can budget is what it *emits*, and it emits both.
+///
+/// The second client was also already here. `structuredContent` arrived with `2025-06-18`, and
+/// [`SUPPORTED_REVISIONS`] carries `2025-03-26` and `2024-11-05` beneath it — and the channel is
+/// not gated on the negotiated revision, since `structured_result` is one function and does not
+/// ask. So a client on either of those is sent a field its revision does not define, ignores it,
+/// and reads the rendering: for them the text is not the half a client happens to forward but the
+/// only half it can read. That was settled by reading the revision list, not by measuring anyone.
+///
+/// It changes what one row is measured against. `session_status` is the only typed tool here
+/// whose rendering is larger than its typed answer (420 B against 297 B when this was measured),
+/// so it is the only place the ceiling now reads a number the old assertion never saw; on every
+/// other typed row the typed half is the larger one, and a text-only tool has the one channel
+/// either way. That is what a rule stated as a floor looks like while nothing has broken it — the
+/// ratio rule beneath is the same shape, and `registers` is the row it was written for.
 #[test]
 fn tool_results_stay_within_their_budget() {
     let Some(dump) = target_tier() else { return };
@@ -6028,6 +6050,12 @@ fn tool_results_stay_within_their_budget() {
     // `wire` is not `model` plus the text: it is the whole `result` object, so it also carries the
     // content-block scaffolding and JSON escaping — a rendered table's newlines cost two bytes each
     // there and one in `text`. It is measured rather than derived for exactly that reason.
+    //
+    // The model ceiling is charged against **each** channel a result carries, so it has to be
+    // sized for the larger of the two rather than for the half this client reads. It moved no
+    // number here — `session_status` is the one row whose rendering is the bigger half, and its
+    // 600 already covers the 420 B measured — but it is why raising one of these is a decision
+    // about every client rather than about ours, and why that row is the one to watch.
     //
     // Only calls that succeed on a *kernel* dump are listed. `threads` is deliberately absent: `~`
     // is a user-mode question and answers with a tool error here, which would measure the size of
@@ -6069,25 +6097,41 @@ fn tool_results_stay_within_their_budget() {
         let model = structured.unwrap_or(text);
         rows.push((*tool, model, wire, text, structured, *model_ceiling));
 
-        assert!(
-            model <= *model_ceiling,
-            "`{tool}` answered with {model} B of model context, over its {model_ceiling} B \
-             budget. Either it started returning more than it used to, or the budget needs \
-             raising with a reason recorded in docs/token-budget.md."
-        );
+        // Once per channel the result carries, against the one budget. A tool with an output
+        // schema is asserted twice here and a text-only one once, which is the whole difference
+        // between the two kinds — not a policy about which half is read. The channel is named
+        // because that is what a failure has to say: `wire` alone reports that a result grew and
+        // cannot report which half did.
+        for (channel, bytes) in [("text", Some(text)), ("structuredContent", structured)] {
+            let Some(bytes) = bytes else { continue };
+            assert!(
+                bytes <= *model_ceiling,
+                "`{tool}`'s {channel} is {bytes} B, over its {model_ceiling} B budget for one \
+                 call. A client that forwards that channel spends every byte of it on context, \
+                 whichever half this one happens to read. Either the tool started returning more \
+                 than it used to, or the budget needs raising with a reason recorded in \
+                 docs/token-budget.md."
+            );
+        }
         assert!(
             wire <= *wire_ceiling,
-            "`{tool}` put {wire} B on the wire, over its {wire_ceiling} B budget, while its \
-             model-visible half ({model} B) is inside its own. So the half this client drops \
-             grew — which costs every client that does *not* drop it, and is the case the \
-             model-visible budget alone cannot see. See docs/token-budget.md."
+            "`{tool}` put {wire} B on the wire, over its {wire_ceiling} B budget, while each of \
+             its channels is inside the {model_ceiling} B one on its own ({text} B of text). So \
+             what grew is the result taken together — both halves at once, or the scaffolding \
+             around them — which costs every client whatever it forwards, and is the case a \
+             per-channel budget cannot see. See docs/token-budget.md."
         );
     }
 
     // The table is the deliverable when this passes — the assertions only speak up once something
     // has already gone wrong. Unlike the surface budget, this one *is* visible in CI, because the
     // debugger tier's job passes `--nocapture`; without it libtest would swallow the table.
-    eprintln!("\n  model     wire     text  struct  ratio  ceiling  tool");
+    //
+    // `worst` is the larger channel, and it sits beside `ceiling` because that is the pair the
+    // assertion above compares: `model` says what this client is charged, `worst` what the most
+    // expensive client would be. They differ on exactly the rows where a rendering is the bigger
+    // half, which is the movement the whole per-channel rule exists to make visible.
+    eprintln!("\n  model     wire     text  struct  ratio   worst  ceiling  tool");
     for (tool, model, wire, text, structured, ceiling) in &rows {
         let (shown, ratio) = match structured {
             Some(bytes) if *text > 0 => (
@@ -6097,7 +6141,10 @@ fn tool_results_stay_within_their_budget() {
             Some(bytes) => (bytes.to_string(), "-".to_string()),
             None => ("-".to_string(), "-".to_string()),
         };
-        eprintln!("{model:7} {wire:8} {text:8} {shown:>7} {ratio:>6} {ceiling:8}  {tool}");
+        let worst = (*text).max(structured.unwrap_or(0));
+        eprintln!(
+            "{model:7} {wire:8} {text:8} {shown:>7} {ratio:>6} {worst:>7} {ceiling:8}  {tool}"
+        );
     }
 
     // A rule rather than a number, and the one regression class the byte budgets cannot state: a
@@ -6106,8 +6153,9 @@ fn tool_results_stay_within_their_budget() {
     // `"subregister":false` on every row. `registers` is ~16x today and is named in
     // docs/token-budget.md rather than fixed here; this catches the *next* one, not that one.
     //
-    // It is a ratio, so it is only safe to read alongside the `wire` ceiling above: on its own, a
-    // rendering that grows satisfies it *more*. That is why the wire budget is not optional.
+    // It is a ratio, so it is only safe to read alongside the byte ceilings above — the `wire`
+    // one, and the model one now that the rendering is charged against it too: on its own, a
+    // rendering that grows satisfies it *more*. That is why neither of those is optional.
     const WORST_STRUCTURED_RATIO: f64 = 20.0;
     for (tool, _, _, text, structured, _) in &rows {
         let (Some(bytes), true) = (structured, *text > 0) else {
