@@ -6,10 +6,7 @@ how much of that surface a run serves, and three behaviours the table has no roo
 ## Serving fewer tools (`--tools`)
 
 All fifty-four tools are served unless you say otherwise, and their definitions cost the model
-**68,893 bytes — about 17k tokens — before it has asked anything**, once per conversation. (That
-figure and the table below were measured at fifty-one tools, before `continue_async`,
-`wait_for_stop` and `break_in`; re-recording `tests/golden/tool_budget.json` is what moves them, and
-only a Windows host can.) Three
+**73,996 bytes — about 18k tokens — before it has asked anything**, once per conversation. Three
 quarters of that is the prose that tells a model how to drive them, so it cannot be trimmed without
 making the tools harder to use correctly (see
 [`token-budget.md`](token-budget.md)). What *can* change is how many of them a given run
@@ -21,8 +18,8 @@ windbg-mcp.exe --tools session,inspect,crash
 
 | `--tools` | Tools | Model context |
 |---|---:|---:|
-| *(absent)* — every tool | 54 | 68,893 B |
-| `session,inspect,exec,crash` | 25 | 28,882 B |
+| *(absent)* — every tool | 54 | 73,996 B |
+| `session,inspect,exec,crash` | 28 | 33,985 B |
 | `session,inspect,crash` | 20 | 25,465 B |
 | `crash` | 11 | 14,587 B |
 

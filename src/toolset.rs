@@ -19,25 +19,21 @@
 //!
 //! ```text
 //!   group      tools   bytes   what it is for
-//!   session       10   12,606  opening a target, ending it, and watching this server
+//!   session       10   12,817  opening a target, ending it, and watching this server
 //!   allocator     10   15,969  pool and heap walks, and `walk_memory`
 //!   inspect        9   10,786  registers, stacks, memory, modules, symbols, raw commands
 //!   ttd            9    6,829  recording, indexing and querying a Time Travel trace
 //!   ioctl          6    6,494  driver objects, IRP stacks, and dispatch reachability
-//!   exec           8    3,475  breakpoints and execution control
+//!   exec           8    8,367  breakpoints and execution control
 //!   batch          1    9,798  `debug_batch`
 //!   crash          1    2,936  `crash_triage`
 //! ```
 //!
-//! **The byte figures predate `continue_async`, `wait_for_stop` and `break_in`** (2026-08-29),
-//! which is what took `exec` from five tools to eight. They are re-measured by re-recording
-//! `tests/golden/tool_budget.json`, which only a Windows host can do; the counts above are counted
-//! from `GROUPS` and are current.
-//!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
-//! 14,587 bytes, not the 15,542 its two rows add to, because the eleven tools it keeps also stop
-//! carrying the five sentences that pointed at `modules`, `debug_batch`, `go` and `backtrace`. A
-//! spec is always cheaper than its rows suggest, never dearer.
+//! 14,587 bytes, not the 15,753 its two rows add to, because the eleven tools it keeps also stop
+//! carrying the sentences that pointed at `modules`, `debug_batch`, `backtrace`, `continue_async`
+//! and `break_in` — 1,166 bytes of them. A spec is always cheaper than its rows suggest, never
+//! dearer.
 //!
 //! # `session` is always in the surface
 //!
