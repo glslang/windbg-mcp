@@ -572,13 +572,24 @@ pub struct ExecutionStarted {
     pub execution: String,
     /// The debugger command that set the target going.
     pub command: String,
-    /// Whether the target is actually moving.
+    /// Whether the target is moving **now**, as this answer is written.
     ///
-    /// Almost always true, and the uncommon answer is worth having a field for: a command can
-    /// complete without ever leaving the engine running — `g` on a trace already at its end — in
-    /// which case the run is over before this call returned and its stop is already filed against
-    /// the handle, waiting to be read. There is nothing to wait for and nothing to break in.
+    /// Almost always true, and both of the uncommon answers matter. A command can complete
+    /// without ever leaving the engine running — `g` on a trace already at its end — and a run
+    /// can start and finish before this call gets a turn, which a `g` onto a breakpoint one
+    /// instruction away does routinely. Either way the run is over, its stop is already filed
+    /// against the handle waiting to be read, and there is nothing to wait for and nothing to
+    /// break in. [`Self::moved`] is what tells the two apart.
     pub running: bool,
+    /// Whether the target ever started moving.
+    ///
+    /// A second field rather than a second meaning for [`Self::running`], because the two come
+    /// apart exactly where it matters: `running: false, moved: true` is a run that did what it
+    /// was asked and has already stopped, while `running: false, moved: false` is a command that
+    /// never set the target going at all. Reported as one bool, a caller told "not running" would
+    /// have to guess which, and the guess changes what they do next — collect a stop that says
+    /// where the target got to, or work out why the command did nothing.
+    pub moved: bool,
     /// How long the debugger will let the target run before breaking it in itself. Absent for a
     /// run that is no longer going.
     ///
@@ -622,16 +633,18 @@ pub struct StopWait {
 pub struct BreakInRequested {
     pub session_id: String,
     pub execution: String,
-    /// Whether this run is going to stop — or, if it had not started, will not start.
+    /// Whether this run is not going to keep the target moving.
     ///
-    /// `true` covers three things, because from the caller's side they are one: a Ctrl+Break was
-    /// raised, one was already lodged, or the run was still queued behind other work and has been
-    /// barred from ever setting the target going.
+    /// Phrased for what it is actually good for rather than as "a break was sent", which is a
+    /// narrower thing and is not always what happened. `true` covers a Ctrl+Break raised now, one
+    /// already lodged and stopping the target, a run still queued and barred from ever starting,
+    /// and a run that finished between the caller reading its handle and this arriving — which
+    /// the debugger cannot tell from the queued case, and which needs no action either way.
+    /// `detail` is the debugger's own account of which it was.
     ///
-    /// `false` is not a failed call and never means the request went astray. It says there was
-    /// nothing left to stop: the run had already finished — the ordinary race between a caller
-    /// reading its handle and this arriving — and `detail` says so. A break that could not be
-    /// *delivered* is an error rather than a `false` here.
+    /// `false` says the run had already stopped when this call looked, so nothing was sent. It is
+    /// not a failure. A break that could not be *delivered* is an error rather than a `false`
+    /// here.
     pub requested: bool,
     /// The debugger's own account of what it did.
     pub detail: String,

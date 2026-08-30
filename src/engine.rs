@@ -2075,15 +2075,21 @@ impl Sessions {
             filing.finish_execution(job, result);
         });
 
-        let started = |running: bool| crate::structured::ExecutionStarted {
-            session_id: session.id.clone(),
-            execution: handle.clone(),
-            command: command.clone(),
-            running,
-            breaks_in_ms: session
-                .execution_by(&handle)
-                .and_then(|found| found.breaks_in)
-                .map(ms),
+        // `moved` is what the milestone said; `running` is asked of the slot as the answer is
+        // written, because a run can be over by then — a `g` onto a breakpoint one instruction
+        // away does it routinely. Reporting the milestone as both would tell a caller to go and
+        // do the thing the run is waiting for while the session is already stopped and taking
+        // ordinary reads.
+        let started = |moved: bool| {
+            let found = session.execution_by(&handle);
+            crate::structured::ExecutionStarted {
+                session_id: session.id.clone(),
+                execution: handle.clone(),
+                command: command.clone(),
+                running: moved && found.as_ref().is_some_and(|found| found.running),
+                moved,
+                breaks_in_ms: found.and_then(|found| found.breaks_in).map(ms),
+            }
         };
         let settled = tokio::time::timeout(self.call_timeout, async {
             loop {
@@ -4829,9 +4835,15 @@ mod tests {
             .await
             .expect("a run that reached a breakpoint is not a failure");
         assert!(
-            started.running,
+            started.moved,
             "the milestone said the target moved, and the reply arriving first must not overwrite \
              that with `it never started`"
+        );
+        assert!(
+            !started.running,
+            "but it is not moving *now* — the stop is already filed. Saying otherwise tells the \
+             caller to go and do the thing the run is waiting for while the session is stopped \
+             and taking ordinary reads"
         );
     }
 
