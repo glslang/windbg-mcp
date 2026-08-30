@@ -6,8 +6,8 @@ how much of that surface a run serves, and three behaviours the table has no roo
 ## Serving fewer tools (`--tools`)
 
 All fifty-four tools are served unless you say otherwise, and their definitions cost the model
-**73,996 bytes — about 18k tokens — before it has asked anything**, once per conversation. Three
-quarters of that is the prose that tells a model how to drive them, so it cannot be trimmed without
+**75,547 bytes — about 19k tokens — before it has asked anything**, once per conversation. Seven
+tenths of that is the prose that tells a model how to drive them, so it cannot be trimmed without
 making the tools harder to use correctly (see
 [`token-budget.md`](token-budget.md)). What *can* change is how many of them a given run
 offers:
@@ -18,9 +18,9 @@ windbg-mcp.exe --tools session,inspect,crash
 
 | `--tools` | Tools | Model context |
 |---|---:|---:|
-| *(absent)* — every tool | 54 | 73,996 B |
-| `session,inspect,exec,crash` | 28 | 33,985 B |
-| `session,inspect,crash` | 20 | 25,465 B |
+| *(absent)* — every tool | 54 | 75,547 B |
+| `session,inspect,exec,crash` | 28 | 34,825 B |
+| `session,inspect,crash` | 20 | 26,305 B |
 | `crash` | 11 | 14,587 B |
 
 The spec is a comma-separated list of the group names in the [tool table](../README.md#tools), of

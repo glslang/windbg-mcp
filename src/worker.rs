@@ -1569,7 +1569,11 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             timeout_ms,
         } => resume(e, id, &command, timeout_ms),
         EngineOp::Registers { all } => registers(e, all),
-        EngineOp::Modules { filter, limit } => modules(e, filter.as_deref(), limit),
+        EngineOp::Modules {
+            filter,
+            limit,
+            refresh,
+        } => modules(e, filter.as_deref(), limit, refresh),
         EngineOp::Backtrace { frames } => backtrace(e, frames as usize),
         EngineOp::Disassemble { address, count } => {
             disassemble(e, address.as_deref(), count as usize)
@@ -2442,8 +2446,23 @@ fn with_pdb_identity(
 /// cannot squeeze out the unloaded rows and two halves cannot double the ceiling between them.
 /// What the cap must not cost is the counts: the note and the values report what *matched*, so a
 /// listing that stops short says so rather than reading as a smaller target.
-fn modules(e: &DebugEngine, filter: Option<&str>, limit: usize) -> Result<Output, Failed> {
+///
+/// **`refresh` runs before any of that**, and the ordering is the whole of it: a listing taken
+/// from an inventory the engine has not resynchronised is a listing of what the *engine* knows
+/// rather than of what the target has loaded ([`resynchronise`]).
+fn modules(
+    e: &DebugEngine,
+    filter: Option<&str>,
+    limit: usize,
+    refresh: bool,
+) -> Result<Output, Failed> {
     let pattern = filter.map(module_pattern);
+    // Asked for first, and its failure does **not** end the call: a stale listing plus a field
+    // saying the resynchronisation failed is strictly more than an error, since the rows may well
+    // be the right ones and the caller can see for themselves. What must not happen is the
+    // failure going unsaid, which is why [`refresh_note`] renders above the tables rather than
+    // into the note under them — the caveat has to arrive before the conclusion it qualifies.
+    let refreshed = refresh.then(|| resynchronise(e)).transpose()?;
     let loaded = e.modules().map_err(failed)?;
     // Unloaded modules are best-effort: not every Windows version tracks them, the ones that do
     // may have nothing to report, and a listing of what *is* loaded must not fail over what is
@@ -2468,8 +2487,85 @@ fn modules(e: &DebugEngine, filter: Option<&str>, limit: usize) -> Result<Output
         matched: total,
         unloaded: identified(e, matched_unloaded, for_unloaded),
         unloaded_matched: total_unloaded,
+        refresh: refreshed,
     };
     Ok(Output::typed(render_modules(&list), list))
+}
+
+/// Asks the engine to resynchronise its module inventory with the target, and reports what that
+/// did.
+///
+/// **The defect this closes.** DbgEng's module list is the engine's, not the target's: it is built
+/// from the module-load events the debugger *saw*, so a live kernel attach starts from whatever it
+/// can read at connect time and a driver loaded before the debugger dialled in is simply not in
+/// it. On the MessageManager regression target that was `nt` and nothing else, and a `modules`
+/// call straight after the attach read as "the challenge driver is not loaded" while the driver
+/// was open and serving IOCTLs ([#85]). Measured there on 2026-08-30, one attach: the engine held
+/// **1** module, a filter on `MessageManager` matched **0**, and the same call with `refresh`
+/// reported `before: 1` against **158** loaded and matched the driver — `deferred`, so it was
+/// found without a byte of PDB being fetched. The synchronisation existed all along — it is what the
+/// tier's `.reload /f` was doing as a side effect — and nothing said so, so finding a loaded image
+/// meant guessing that a force symbol reload was the missing step.
+///
+/// **Unqualified and unforced**, which is the argument for a separate flag rather than a wider
+/// `set_symbol_path`. `Reload("")` is the `.reload` a person types: it re-reads the target's
+/// loaded-module list and leaves every module's symbols *deferred*, so the images it discovers
+/// cost their names and nothing else. `/f` — what the symbol path's own reload takes — is a PDB
+/// fetch per module, which on a live kernel over a symbol server is minutes and is not what a
+/// caller asking whether a driver is loaded wanted to buy.
+///
+/// The one thing it does cost is that a reload *discards* the symbol information the engine had
+/// and reloads it as needed, so a module that had symbols reports `deferred` afterwards until
+/// something asks for one again (from the local cache, not the server). That cost is why this is
+/// opt-in rather than something an opener does for you, and why the tool's own prose says to
+/// refresh before loading symbols rather than after.
+///
+/// **And it is a live-target cost, which took two measurements to establish** (this bench,
+/// 2026-08-30, with the engine's `symsrv.dll`/`msdia140.dll` bundled and a store configured —
+/// without them the first attempt saw only `export` fallback and read the effect as smaller than
+/// it is):
+///
+/// * a launched `cmd.exe`, five modules. After `.reload /f`, all five `pdb`. After a refresh,
+///   `cmd`/`ucrtbase`/`KERNELBASE`/`KERNEL32` back to `deferred` and `ntdll` still `pdb` — real
+///   PDB state discarded, and *most* modules rather than all of them.
+/// * the checked-in kernel dump, 227 modules. `nt` is `pdb` and stays `pdb` across a refresh; the
+///   other 226 are `deferred` either side. **Nothing is discarded at all.**
+///
+/// Which fits what the reload is: on a live target it re-reads the module list and the entries are
+/// rebuilt, while a dump's list comes from its own header and there is nothing to re-read. So the
+/// note beside the listing says *on a live target*, and a caller reading a dump is not warned
+/// about a cost that target cannot pay.
+///
+/// **`before` is read here rather than derived**, because the count the caller needs is the one
+/// from before the reload and there is no later moment that still has it. It is the engine's own
+/// bookkeeping — `GetNumberModules` and the parameter block behind it — not a target read, so it
+/// costs the same as the listing that follows and no round trip to the debuggee.
+///
+/// A `Failed` here is a pre-count that did not work, which is the same call the listing itself is
+/// about to make: there is nothing to report a refresh against if the inventory cannot be read at
+/// all, and letting it through would only move the identical failure two lines down.
+///
+/// [#85]: https://github.com/glslang/windbg-mcp/issues/85
+fn resynchronise(e: &DebugEngine) -> Result<structured::ModuleRefresh, Failed> {
+    let before = e.modules().map_err(failed)?.len();
+    match e.reload_symbols("") {
+        Ok(()) => Ok(structured::ModuleRefresh {
+            synchronized: true,
+            before,
+            error: None,
+        }),
+        Err(why) => {
+            // Logged as well as reported, because the reported half is a field on a result that
+            // still looks like an answer, and the server's own record of a failing engine call
+            // belongs in the log whether or not the caller reads the field.
+            tracing::warn!("worker: the module inventory could not be resynchronised: {why}");
+            Ok(structured::ModuleRefresh {
+                synchronized: false,
+                before,
+                error: Some(why.to_string()),
+            })
+        }
+    }
 }
 
 /// The records a pattern matched, each still paired with the engine's own — which is what the PDB
@@ -2532,10 +2628,63 @@ fn render_modules(list: &structured::ModuleList) -> String {
         out.push_str(&fenced(&module_table(&list.unloaded, "image")));
     }
     let note = listing_note(list);
-    if out.is_empty() {
-        return note;
+    let listing = if out.is_empty() {
+        note
+    } else {
+        format!("{out}\n{note}")
+    };
+    // Above everything, including the tables — a refresh that failed makes every count below it
+    // untrustworthy, and a caveat printed under a table is read after the conclusion it was there
+    // to prevent. Composed last rather than pushed first so the two tables keep deciding their own
+    // spacing from whether *they* are empty.
+    match refresh_note(list.refresh.as_ref(), list.loaded) {
+        Some(said) => format!("{said}\n\n{listing}"),
+        None => listing,
     }
-    format!("{out}\n{note}")
+}
+
+/// The line above a listing that says what the call's `refresh` did — and nothing at all for the
+/// calls that asked for none, which is every default one.
+///
+/// Three states, because they are three different things to do next. A resynchronisation that
+/// **found something** is the case [#85] is about, and it names both counts: a caller who has just
+/// been told the driver is not loaded needs to see that the inventory it was told that from had
+/// one module in it. One that found **nothing new** is worth a line too — it is what turns "the
+/// module is absent" from a guess into an answer, and without it a caller has no way to tell a
+/// refresh that ran from one that was ignored. And one that **failed** is the only line that
+/// carries advice, because it is the only one where the listing under it may be wrong.
+///
+/// [#85]: https://github.com/glslang/windbg-mcp/issues/85
+fn refresh_note(refresh: Option<&structured::ModuleRefresh>, loaded: usize) -> Option<String> {
+    let refresh = refresh?;
+    // Keyed on `synchronized` rather than on the presence of `error`, so the sentence and the flag
+    // beside it cannot say different things: `synchronized` is the field that *means* it, and the
+    // reason is what a failure additionally carries.
+    if refresh.synchronized {
+        let found = if loaded > refresh.before {
+            format!(
+                "Inventory resynchronised with the target: {} module(s) before, {loaded} now.",
+                refresh.before
+            )
+        } else {
+            format!("Inventory resynchronised with the target; it already held all {loaded}.")
+        };
+        return Some(format!(
+            "{found} On a live target it discards the symbol information the engine had loaded \
+             (most modules come back `deferred`), so load symbols **after** refreshing rather \
+             than before."
+        ));
+    }
+    let warning = "**The inventory could not be resynchronised**, so the listing below is whatever \
+                   the engine was already holding and may be missing modules the target has \
+                   loaded — a module absent from it is not evidence it is absent from the target.";
+    // The engine's own words, escaped like every other string that came from outside this server.
+    // A failure with no reason is a state this worker does not produce, but the sentence above is
+    // the load-bearing half and must not depend on one having survived the trip.
+    Some(match &refresh.error {
+        Some(why) => format!("{warning} The engine said: {}", renderable(why)),
+        None => warning.to_string(),
+    })
 }
 
 /// One table: a header, then a row per module.
@@ -6856,6 +7005,7 @@ mod tests {
             filter: filter.map(module_pattern),
             matched: matched.len(),
             unloaded_matched: matched_unloaded.len(),
+            refresh: None,
             modules: matched.into_iter().take(for_loaded).collect(),
             unloaded: matched_unloaded.into_iter().take(for_unloaded).collect(),
         }
@@ -6980,6 +7130,7 @@ mod tests {
                 .collect(),
             unloaded: Vec::new(),
             unloaded_matched: 0,
+            refresh: None,
         };
         let text = render_modules(&list);
         assert!(text.contains(long), "a long name is printed whole:\n{text}");
@@ -7010,6 +7161,7 @@ mod tests {
                 modules: Vec::new(),
                 unloaded: Vec::new(),
                 unloaded_matched: 0,
+                refresh: None,
             })
         };
 
@@ -7096,6 +7248,7 @@ mod tests {
                 .collect(),
             unloaded: Vec::new(),
             unloaded_matched: 0,
+            refresh: None,
         };
         let text = render_modules(&list);
         assert_eq!(
@@ -7141,6 +7294,7 @@ mod tests {
                 .collect(),
             unloaded: Vec::new(),
             unloaded_matched: 0,
+            refresh: None,
         };
         let text = render_modules(&list);
 
@@ -7177,6 +7331,7 @@ mod tests {
                 .collect(),
             unloaded: Vec::new(),
             unloaded_matched: 0,
+            refresh: None,
         };
         let text = render_modules(&list);
 
@@ -7389,6 +7544,7 @@ mod tests {
                 .map(structured::ModuleInfo::from)
                 .collect(),
             unloaded_matched: 26,
+            refresh: None,
         };
         let text = render_modules(&cut_tail);
         assert!(
@@ -7428,6 +7584,7 @@ mod tests {
                 loaded: 227,
                 matched: 227,
                 unloaded_matched: 50,
+                refresh: None,
                 filter: None,
                 modules: (0..for_loaded)
                     .map(|i| structured::ModuleInfo::from(&module("drv", 0x1000 + i as u64 * 0x10)))
@@ -7467,6 +7624,115 @@ mod tests {
         assert!(
             truncation_note(&whole).is_none(),
             "nothing was cut, so nothing is said about a cut"
+        );
+    }
+
+    /// The three things a `refresh` can have done, said above the listing rather than under it.
+    ///
+    /// The ordering is the assertion that matters. A caller reads a `modules` answer top-down and
+    /// draws its conclusion from the rows; a caveat about those rows printed beneath them arrives
+    /// after the conclusion it was there to prevent — which is exactly how
+    /// [#85](https://github.com/glslang/windbg-mcp/issues/85) was read as "the driver is not
+    /// loaded" in the first place.
+    #[test]
+    fn a_refresh_says_what_it_did_before_the_listing_it_qualifies() {
+        let listing = |refresh: Option<structured::ModuleRefresh>| {
+            render_modules(&structured::ModuleList {
+                loaded: 226,
+                matched: 0,
+                unloaded_matched: 0,
+                filter: Some(module_pattern("MessageManager")),
+                modules: Vec::new(),
+                unloaded: Vec::new(),
+                refresh,
+            })
+        };
+
+        // Not asked for: not one word about it, on every default call.
+        let quiet = listing(None);
+        assert!(
+            !quiet.to_lowercase().contains("resynchronis"),
+            "a call that asked for no refresh must not be told about one:\n{quiet}"
+        );
+
+        // The case the flag exists for — the fresh-attach inventory, and what it grew to.
+        let found = listing(Some(structured::ModuleRefresh {
+            synchronized: true,
+            before: 1,
+            error: None,
+        }));
+        assert!(
+            found.contains("1 module(s) before, 226 now"),
+            "the refresh names both counts, which is the evidence it was worth asking for:\n{found}"
+        );
+        assert!(
+            found.contains("deferred"),
+            "and warns what it costs, which is the symbol state the engine had:\n{found}"
+        );
+
+        // Already current. Worth a line of its own: it is what turns "the module is absent" from
+        // a guess into an answer, and a caller cannot otherwise tell it from a refresh that was
+        // ignored.
+        let current = listing(Some(structured::ModuleRefresh {
+            synchronized: true,
+            before: 226,
+            error: None,
+        }));
+        assert!(
+            current.contains("already held all 226"),
+            "a refresh that found nothing new still says it ran:\n{current}"
+        );
+
+        // And the failure, which is the only one that may not be quietly believed. It has to be
+        // above the note that says nothing matched, or it is advice arriving after the verdict.
+        let failed = listing(Some(structured::ModuleRefresh {
+            synchronized: false,
+            before: 1,
+            error: Some("Unable to read PsLoadedModuleList".into()),
+        }));
+        let (warning, verdict) = (
+            failed.find("could not be resynchronised"),
+            failed.find("Nothing matches"),
+        );
+        assert!(
+            warning.is_some() && verdict.is_some() && warning < verdict,
+            "the caveat has to arrive before the conclusion it qualifies:\n{failed}"
+        );
+        assert!(
+            failed.contains("Unable to read PsLoadedModuleList"),
+            "and it carries the engine's own reason:\n{failed}"
+        );
+        assert!(
+            failed.contains("not evidence it is absent from the target"),
+            "…and withdraws the only conclusion the listing would otherwise support:\n{failed}"
+        );
+    }
+
+    /// The engine's failure text is a string from outside this server, and lands in the listing.
+    ///
+    /// Same rule and same escape as a module name and the caller's own filter: this rendering is
+    /// line-oriented and its rows begin with an address, so a reason carrying a line break could
+    /// otherwise print a row the values beside it do not have.
+    #[test]
+    fn a_refresh_failure_cannot_smuggle_a_row_into_the_listing() {
+        let text = render_modules(&structured::ModuleList {
+            loaded: 1,
+            matched: 0,
+            unloaded_matched: 0,
+            filter: None,
+            modules: Vec::new(),
+            unloaded: Vec::new(),
+            refresh: Some(structured::ModuleRefresh {
+                synchronized: false,
+                before: 1,
+                error: Some(
+                    "no\n0xfffff80389200000  0xfffff8038a650000  smuggled  pdb".to_string(),
+                ),
+            }),
+        });
+        assert!(
+            listed_rows(&text).is_empty(),
+            "an engine message must not be able to print a row:\n{text}"
         );
     }
 

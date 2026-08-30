@@ -104,7 +104,7 @@ Fifty-four tools in eight `--tools` groups; the rows below split some of those g
 |-------|-----------|-------|
 | Session | `session` | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `interrupt`, `end_session`, `session_status` |
 | Server   | `session` | `server_log` — the server's own log: the supervisor's records, plus those of the sessions you opened, tagged with the session each belongs to |
-| State   | `inspect` | `registers`, `read_memory`, `backtrace` (the stack as typed frames, each carrying `module`+`RVA` where the engine can place it, as well as its symbol), `modules`, `threads`, `disassemble` (instructions as records, each with its encoding and, where the engine can place it, its `RVA`), `dx`, `set_symbol_path` |
+| State   | `inspect` | `registers`, `read_memory`, `backtrace` (the stack as typed frames, each carrying `module`+`RVA` where the engine can place it, as well as its symbol), `modules` (`refresh: true` resynchronises the debugger's inventory with the target first — what a fresh kernel attach needs before "not loaded" means anything), `threads`, `disassemble` (instructions as records, each with its encoding and, where the engine can place it, its `RVA`), `dx`, `set_symbol_path` |
 | Crash   | `crash` | `crash_triage` — a bug check as fields: code and parameters, crashing process, the stack as `module+RVA`, and the faulting driver frame |
 | Control | `exec` | `go`, `step_over`, `step_into`, `set_breakpoint`, `run_to_address` |
 | Async control | `exec` | `continue_async` (resume and return a handle), `wait_for_stop` (collect the stop; running out of the wait is a poll, not a failure), `break_in` |
@@ -117,9 +117,9 @@ Fifty-four tools in eight `--tools` groups; the rows below split some of those g
 | Structure walk | `allocator` | `walk_memory` |
 | Raw     | `inspect` | `execute` — run any debugger command, returns full text output |
 
-All of them are served unless you say otherwise, and the definitions cost the model **73,996 bytes —
-about 18k tokens — before it has asked anything**. `--tools session,inspect,crash` cuts that to
-25,465 B for twenty tools, and a `--listen` client can be given a narrower surface than the run's
+All of them are served unless you say otherwise, and the definitions cost the model **75,547 bytes —
+about 19k tokens — before it has asked anything**. `--tools session,inspect,crash` cuts that to
+26,305 B for twenty tools, and a `--listen` client can be given a narrower surface than the run's
 default. [`docs/tool-surface.md`](docs/tool-surface.md) has the arithmetic, the rule that `session`
 is always included, and what a typed operand may not contain.
 

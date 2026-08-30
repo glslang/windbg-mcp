@@ -1,7 +1,7 @@
 //! Which of this server's fifty-four tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
-//! 68,893 bytes — roughly 17k tokens. Three quarters of that is prose, and the prose is what tells
+//! 75,547 bytes — roughly 19k tokens. Seven tenths of that is prose, and the prose is what tells
 //! a model how to drive the tools, so there is no strip here the way there was in
 //! [`crate::schema`]: `FOLLOWUPS.md` item 24 measured it and the only honest lever left is the one
 //! this module is — **not offering every tool to every caller**.
@@ -20,12 +20,12 @@
 //! ```text
 //!   group      tools   bytes   what it is for
 //!   session       10   12,817  opening a target, ending it, and watching this server
-//!   allocator     10   15,969  pool and heap walks, and `walk_memory`
-//!   inspect        9   10,786  registers, stacks, memory, modules, symbols, raw commands
+//!   allocator     10   16,457  pool and heap walks, and `walk_memory`
+//!   inspect        9   11,626  registers, stacks, memory, modules, symbols, raw commands
 //!   ttd            9    6,829  recording, indexing and querying a Time Travel trace
 //!   ioctl          6    6,494  driver objects, IRP stacks, and dispatch reachability
 //!   exec           8    8,367  breakpoints and execution control
-//!   batch          1    9,798  `debug_batch`
+//!   batch          1   10,021  `debug_batch`
 //!   crash          1    2,936  `crash_triage`
 //! ```
 //!

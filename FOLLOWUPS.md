@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twenty-seven clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty-eight clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/dbgscope#71, 2026-08-01), items 13–14 from the bounded-command coverage review
@@ -55,7 +55,10 @@ reachable: the first tier to attach to a running process found that ending its s
 [#83](https://github.com/glslang/windbg-mcp/issues/83)'s asynchronous execution handles, where the
 invariant that stops a description naming a tool its client cannot call turned out to cover only
 half the prose a client is served (2026-08-29), and where a break arriving in the microseconds
-after a run built its stop is recorded in that result's prose and not in its flag (2026-08-30).
+after a run built its stop is recorded in that result's prose and not in its flag (2026-08-30),
+and item 54 from
+[#85](https://github.com/glslang/windbg-mcp/issues/85)'s module-inventory refresh, whose engine
+call no watchdog in either crate can currently cut short (2026-08-30).
 Each item notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -3691,3 +3694,37 @@ other way (`|| self.broken()`), correctly for a batch, which is worth reading be
 **Where it picks up.** `run_job`'s `release`/`cut_short` block and `cut_short` itself in
 `src/worker.rs`, `stop_report` beside them, and `Ran::ran_told` for the path that already consults
 the late-break flag.
+
+## 54. [dbgscope + windbg-mcp] `modules { "refresh": true }` has no wall-clock bound
+
+**What it is.** The resynchronisation behind `refresh`
+([#85](https://github.com/glslang/windbg-mcp/issues/85)) is `IDebugSymbols::Reload("")` — a direct
+engine call, not a command — so no watchdog can cut it short and `EngineOp::Modules` carries no
+`patience_ms`. What bounds it is the caller's own call timeout and `interrupt`, which reaches the
+engine from off the engine thread. That is the same position `EngineOp::Backtrace` is in, and its
+doc comment says so for the same reason: carrying a `patience_ms` would imply a bound that does not
+exist.
+
+**Why it was deferred.** The acceptance criterion it was written against is about *symbol-server*
+cost, and that one is closed by construction: the reload is unqualified and unforced, so what it
+discovers is `deferred` and nothing is fetched. What is left is the time the reload itself takes,
+which is a walk of the target's loaded-module list. Measured on the CTF guest over KDNET on
+2026-08-30, that is imperceptible — a whole `modules { "refresh": true }` inside a test that ran in
+1.96s including attach and detach. The wire it would be slow on is the one this repo already
+documents as unusable for a pool walk: **115200-baud serial**, where a per-module round trip is
+tens of milliseconds and 158 modules is a wait with no upper bound and no way to tell it from a
+hung debugger.
+
+**What would close it.** A bounded `Reload` in dbgscope — arm the crate's `Watchdog` around the
+call, as `execute_command_bounded` and `settle` already do, and report an interruption the way they
+do rather than as an error. `SetInterrupt` is expected to reach a `Reload` (a person Ctrl+Breaks
+one in WinDbg), but that is an expectation and not a measurement: **measure it first**, because a
+bound that cannot actually break the call in is worse than no bound, and dbgscope's watchdog tests
+arm one over a counter precisely so this can be tried without a debuggee. Then give
+`EngineOp::Modules` a `patience_ms` and add it to `EngineOp::patience_slot`'s match — the arm whose
+absence silently gave `Self::Pool` dbgscope's default walk budget instead of this server's
+deadline.
+
+**Where it picks up.** `worker::resynchronise` and `EngineOp::Modules` in `src/proto.rs`,
+`DebugEngine::reload_symbols` and `Watchdog` in dbgscope's `src/dbgeng.rs`, and
+`execute_command_bounded` beside it for the shape a bounded direct call takes here.

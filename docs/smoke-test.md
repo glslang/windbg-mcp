@@ -304,6 +304,21 @@ default page, against 53933 B / 74052 B for all 227 modules` — the same dump
 [`token-budget.md`](./token-budget.md) records its baseline against, so the two can be read
 together.
 
+**A refresh is asked for as the first call on a freshly opened session**
+(`a_module_listing_can_resynchronise_the_inventory_before_it_lists_it`), which is the ordering
+[#85](https://github.com/glslang/windbg-mcp/issues/85) is about: DbgEng's inventory holds the
+module loads the debugger *saw*, so on a live kernel attach a driver loaded beforehand is in the
+target and absent from the list. A dump cannot reproduce that gap — it carries its own complete
+module list — so what this tier claims is the half that would otherwise break silently: the reload
+**runs against a real engine, succeeds, and costs the listing nothing**, reported as a
+resynchronisation that found the inventory already current (`refresh.before` equal to `loaded`, all
+227 of them), with the rows still equal to the values row for row. The default call is asserted in
+the same breath, because "cheap and backward compatible" is a claim about an *absent* field: an
+answer that carried `refresh` unasked would tell every caller a resynchronisation had happened. The
+gap itself is the live tiers' to claim — the generic one checks the reload runs over the KD wire
+and loses no modules, and the CTF one asks *before* any symbol work and requires the challenge
+driver in the answer.
+
 **`registers` gets the same treatment, and its test runs against this host's own architecture.** A
 default answer is documented as the integer registers, excluding the x87 and vector ones — and it
 carried 64 of them, because DbgEng exposes `xmm0` twice and leaves the subregister flag clear on the
@@ -1013,6 +1028,15 @@ about. This is the other half — an attach that lands:
   no longer reclaimable and the fix is undone.
 - **A second session works alongside it** — a dump opened and used while the kernel attach is held,
   with the kernel session unaffected. Impossible by construction before.
+- **`modules { "refresh": true }` resynchronises over the KD wire.** This is the only tier where
+  that call reaches a target whose module list the debugger did not watch being built. A generic
+  KDNET target carries no fixture, so what is claimed here is the mechanism rather than a find: the
+  reload runs, reports `synchronized`, and leaves a listing at least as complete as the one before
+  it — a refresh that *lost* modules would be worse than no refresh at all. The `before`/`after`
+  counts are printed under `--nocapture`, and on the bench this was written against they read
+  `1 module(s) before the refresh, 158 after` — which is the size of the gap on a fresh attach,
+  measured rather than argued. Finding a *named* module that was missing is the CTF tier's claim,
+  below.
 - **`crash_triage` refuses a kernel that has not crashed, and refuses it correctly.** This is the
   state the debugger-free exploitation loop sits in *between* fires — attached, working, nothing
   bug-checked yet — and a dump can never be in it: a dump either is a crash dump or is not, while a
@@ -1153,10 +1177,24 @@ than measuring a patch that never landed.
 turns the MessageManager challenge into a repeatable live regression fixture. It builds a benign
 mode of `mm_exploit.c`, copies it to the VM over WinRM, and waits until the process has retained real
 `Tgsm` messages. It then runs the ignored Rust test through the shipped stdio MCP transport. The
-test attaches over KDNET, checks that `MessageManager.sys` is loaded, asks for one retained
+test attaches over KDNET, checks that `MessageManager.sys` is loaded **before any symbol work**,
+asks for one retained
 allocation with `pool_find_tag { "stop_after_matches": 1 }`, verifies the result says
 `match_limit_reached` with that stop condition, verifies the session still serves a register
 request, and always attempts `end_session` before reporting an assertion failure.
+
+That "before any symbol work" is the fixture's own regression, and it is
+[#85](https://github.com/glslang/windbg-mcp/issues/85). The driver is loaded before the debugger
+dials in, so it is in the target and not in DbgEng's inventory, and a fresh attach lists `nt` and
+little else — which is how a running driver came to be reported as "not loaded". It used to be
+found only *after* the tier's `load_kernel_symbols`, whose unqualified `.reload /f` resynchronised
+the inventory as a side effect of fetching every PDB: the answer was right, and nothing said that a
+full symbol load was what made it right. The test now asks with `refresh: true` **first**, so a
+pass cannot be borrowed from the reload that follows, and asserts `refresh.synchronized` before it
+believes the listing at all. Confirmed by hand against the CTF guest on 2026-08-30, on one
+attach: `loaded: 1`, `modules { "filter": "MessageManager" }` matching **0**, and the same call
+with `refresh: true` reporting `before: 1` against `loaded: 158` and matching the driver at
+`0xfffff80343970000` with `deferred` symbols — found without fetching a PDB.
 
 Prerequisites are a disposable VM with the challenge driver installed and running, PowerShell
 remoting enabled, a working KDNET connection back to the host, the host MSVC Build Tools path used

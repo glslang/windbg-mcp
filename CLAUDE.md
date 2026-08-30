@@ -212,7 +212,7 @@ It checks *same-file* fragments only, so a cross-file `../README.md#some-heading
 verify by hand.
 
 **The pass count does not say which tiers ran.** Each gate is inside its test, so the `mcp_smoke`
-harness reports the same **93 passed** with the debugger tier off as with it on — that harness's own
+harness reports the same **94 passed** with the debugger tier off as with it on — that harness's own
 result line, since a plain `cargo test` runs the crate's several hundred unit tests beside it and
 prints a result line per binary. What differs between the two runs is the runtime (measured on the
 ARM64 bench 2026-08-23: **1.6s against 61s** for `cargo test --test mcp_smoke`) and the `SKIPPED`
@@ -220,9 +220,10 @@ lines, which only `--nocapture` prints. Read one of those two before believing a
 debugger claim. The count moves whenever a test is added — it was 69 until #195 and #196, 75
 until item 37, 79 until the TTD tier, 84 until item 50's version-resource test, 85 until
 item 48's two endings, 87 until item 49's live 32-bit target, 88 until item 51's
-attach teardown, 89 until the 32-bit worker's version resource, 90 until #66's symbol-path default
-and 91 until #83's two asynchronous-execution tests — and it said 83 while it was 84, and 90 while
-it was 91, which is the usual state of it, so re-derive it rather than trusting this sentence.
+attach teardown, 89 until the 32-bit worker's version resource, 90 until #66's symbol-path default,
+91 until #83's two asynchronous-execution tests and 93 until #85's module-inventory refresh — and
+it said 83 while it was 84, and 90 while it was 91, which is the usual state of it, so re-derive it
+rather than trusting this sentence.
 
 **The dev exe can be locked too, and the failure is quiet.** A worker left running — a driver
 script that died mid-session, a debugger tier killed partway — holds `target\debug\windbg-mcp.exe`,
@@ -404,7 +405,8 @@ cargo test --test mcp_smoke -- --ignored --nocapture --test-threads=1 bounded
 A fourth tier drives a **real KDNET target** through a full session lifecycle — attach, work
 alongside a second session, detach gracefully — separately checks that a client *disconnect*
 releases a live kernel session rather than killing its worker, covers the **pool walk**
-(`pool_find_tag`/`pool_census`), whose cost only exists over a live link, and runs a **`debug_batch`
+(`pool_find_tag`/`pool_census`) and the **module-inventory refresh**, both of which only mean
+anything over a live link, and runs a **`debug_batch`
 that patches a byte of the running kernel** and has to put it back (through a failing assertion, a
 clamped call budget, a disconnect and an `end_session`) — the one claim a crash dump cannot test,
 because a byte patched in a dump is patched in a file nobody reads again. It is gated on the
@@ -545,6 +547,34 @@ with `/GS`, so overrunning the buffer corrupts the cookie and the driver's own `
 runs `mov w0, #2; brk #0xf003` — `0x139 KERNEL_SECURITY_CHECK_FAILURE`, raised inside the driver.
 That is how `docs/samples/082126-7015-01.dmp` was made (issue #154); `docs/smoke-test.md` has the
 one-line recipe.
+
+**DbgEng's module inventory is the debugger's, not the target's, and `.reload` is two operations
+wearing one name.** A kernel attach starts from what it can read at connect time, so a driver
+loaded before the debugger dialled in is in the target and absent from `lm` — which is
+[#85](https://github.com/glslang/windbg-mcp/issues/85), where a running challenge driver read as
+"not loaded". The gap is not small: measured on the CTF guest 2026-08-30, a fresh attach held
+**1** module and a refresh found **158**. `IDebugSymbols::Reload("")` resynchronises the list and leaves symbols deferred;
+`/f` additionally fetches every PDB. `modules { "refresh": true }` is the first half on its own
+(`worker::resynchronise`). Three things bite when editing it:
+
+- **The refresh costs the symbol state, on a live target and not on a dump.** Measured both ways
+  (2026-08-30, engine DLLs bundled): a launched `cmd.exe` goes all-five-`pdb` after a `.reload /f`
+  and comes back with four `deferred` and `ntdll` still `pdb`, while the checked-in kernel dump
+  keeps `nt` at `pdb` across a refresh and discards nothing. A live reload re-reads the module
+  list and the entries are rebuilt; a dump's list is its own header. So the note says *on a live
+  target* and *most* modules, and anything that refreshes after a live symbol load has undone it.
+  **The first attempt at this measurement was taken on a host whose engine had no `symsrv.dll` or
+  `msdia140.dll`** — the five modules could only reach `export` fallback, so the effect read as
+  smaller than it is and the dump half was never asked. Check the engine is bundled before
+  measuring anything symbol-shaped here.
+- **Order is the whole of the CTF tier's claim.** `a_messagemanager_ctf_fixture_is_visible_through_mcp`
+  asks `modules { "refresh": true }` **before** `load_kernel_symbols`, deliberately: that helper's
+  unqualified `.reload /f` resynchronises the inventory as a side effect, so a `modules` call after
+  it passes whether or not `refresh` does anything at all. Moving it back below the symbol setup
+  keeps the test green and deletes what it is for.
+- **A failed refresh is reported, not raised**, and the note goes *above* the tables. A caveat
+  under a listing arrives after the conclusion it was there to prevent, which is the exact failure
+  the issue is about.
 
 **Read a driver's IOCTL codes out of its own dispatch — do not take them from a published list.**
 This build's are not the ones HEVD's widely-quoted table gives, and the code that table calls the
@@ -1133,7 +1163,7 @@ measurements and the options that were weighed.
 
 Two files, not one. A tool is declared in `src/server.rs` as always, and its name also goes in a
 **group** in `src/toolset.rs` — the table behind `--tools`, which advertises a named subset of the
-surface because 74% of the 73,996-byte tool surface is prose a model needs and cannot be trimmed
+surface because 70% of the 75,547-byte tool surface is prose a model needs and cannot be trimmed
 (`docs/token-budget.md` finding 8).
 
 Forgetting the second half fails in the one direction nothing would notice: the *default* surface
