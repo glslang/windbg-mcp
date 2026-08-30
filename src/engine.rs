@@ -4952,37 +4952,63 @@ mod tests {
     /// How long the run *ran*, not how long ago it started.
     ///
     /// The stop is deliberately kept until another run replaces it, so a handle can be read
-    /// minutes or hours after the target stopped. Deriving the figure from `started.elapsed()`
-    /// makes it grow the whole time: a stop read twice reports two different run lengths, and
+    /// minutes or hours after the target stopped. Derived from `started.elapsed()` the figure
+    /// grows the whole time: a stop read twice reports two different run lengths, and
     /// `session_status` shows a finished run getting steadily longer.
-    #[tokio::test(start_paused = true)]
+    ///
+    /// Staged by moving `started` backwards, which is what the passage of real time does to it,
+    /// because the clock these instants are on is `std::time::Instant` — tokio's paused clock does
+    /// not move it, and a test that advanced tokio's would assert nothing while appearing to.
+    #[tokio::test]
     async fn a_finished_run_reports_how_long_it_ran() {
         let sessions = Sessions::new(Duration::from_secs(300));
         let session = dormant("sess-1", SessionState::Open);
-        let handle = resumed_on(&session, 7);
-
-        tokio::time::advance(Duration::from_secs(5)).await;
+        let handle = mint_execution_id();
+        session
+            .claim_execution(Execution {
+                handle: handle.clone(),
+                command: "g".to_string(),
+                job: 7,
+                // A run that has been going five seconds when it stops.
+                started: Instant::now() - Duration::from_secs(5),
+                ran_for: None,
+                bound: Duration::from_secs(60),
+                stopped: None,
+            })
+            .expect("a session with no run accepts one");
         session.finish_execution(7, Ok(Output::text("stopped")));
-        // Long enough after the stop that a figure taken from `started` could not be mistaken for
-        // one taken at the stop.
-        tokio::time::advance(Duration::from_secs(600)).await;
 
-        let waited = sessions
-            .wait_for_stop(&session, &handle, Duration::from_secs(1))
-            .await
-            .expect("a stopped run answers at once");
+        let took = session
+            .execution_info()
+            .expect("the slot still holds it")
+            .running_for_ms;
         assert!(
-            (5_000..6_000).contains(&waited.running_for_ms),
-            "the run took five seconds and stopped; ten minutes later it still took five seconds, \
-             not {}ms",
-            waited.running_for_ms
+            (5_000..6_000).contains(&took),
+            "the run took five seconds: {took}ms"
         );
+
+        // An hour goes by with the stop still sitting there, unread. Nothing about the run has
+        // changed, so nothing about how long it took may change either.
+        {
+            let mut slot = session.execution.lock().unwrap();
+            slot.as_mut().expect("the run is there").started -= Duration::from_secs(3_600);
+        }
         assert_eq!(
             session
                 .execution_info()
                 .expect("the slot still holds it")
                 .running_for_ms,
-            waited.running_for_ms,
+            took,
+            "an hour later the run still took five seconds; a figure that keeps counting is \
+             reporting how long ago it started"
+        );
+        assert_eq!(
+            sessions
+                .wait_for_stop(&session, &handle, Duration::from_secs(1))
+                .await
+                .expect("a stopped run answers at once")
+                .running_for_ms,
+            took,
             "`session_status` and the wait have to agree about one run"
         );
     }
