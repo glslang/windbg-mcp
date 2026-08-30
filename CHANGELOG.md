@@ -32,9 +32,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wherever it happened to be. **A wait that runs out is a poll**: no stop, nothing cancelled, the
   handle still good. **A stop is read rather than taken**, so a client that disconnected mid-run can
   reconnect and read it. **A break is bound to the run it was asked about**, so one aimed at a run
-  that has since stopped is refused rather than landing on whatever the engine started next; its
-  `requested: false` means the target had already stopped, and a break that could not be delivered
-  is an error instead. And `end_session` reaches the target whether the run is pumping or still
+  that has since stopped is refused rather than landing on whatever the engine started next — and
+  one aimed at a run that has not *started*, because something else is still on the engine, bars it
+  from ever setting the target going; its `requested: false` means the run had already finished, and
+  a break that could not be delivered is an error instead. **A run's clock starts when the target
+  moves**, not when it was asked for, so one waiting its turn reports no elapsed time and its whole
+  bound rather than a bound already counted down. And `end_session` reaches the target whether the run is pumping or still
   queued — it breaks the pump in as it arrives, and bars a resume that has not started — rather than
   queueing behind a run that has no reason to end, which is the same path a client disconnect takes.
   [`docs/sessions.md`](docs/sessions.md#running-a-target-asynchronously) has the whole of it.

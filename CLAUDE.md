@@ -845,13 +845,24 @@ request being read the run may have stopped and the engine thread started the ne
 the break would be bound to *that* — a queued command, or the run after this one — and reported to
 its caller as an interruption nobody asked for. Named, the worker refuses rather than rebinds.
 
-**And `requested` is the worker's answer, not `is_ok()`.** Four of the five things an interrupt can
-do are `Ok` and raise nothing: nothing was running, the job named has moved on, a batch is sealed
-for its rollback, or a break is already pending. So the reply carries `Output::raised` — a third
-side-field on that struct, and the only one the *worker* alone can answer rather than the supervisor
-— and `false` now has one meaning: the target had already stopped, so nothing needed sending. A
-break that could not be **delivered** is an error instead, which it previously was not: a lost
-worker came back as `requested: false` and read exactly like the benign race.
+**Naming the job is only half an answer, though, and the other half is `Running::barred`.** A break
+for a run that has not *started* — queued behind a `pool_census`, or simply not dequeued — has no
+pump to interrupt, and refusing to rebind leaves it to start the moment the queue drains and hold
+the target for the bound it named. So the worker bars it, and `claim_pump` refuses it exactly as it
+refuses one during a teardown. Which of the two cases it is comes from the **id alone**: ids are
+minted in order and run in order, so above the running job is queued and below it is over. Nothing
+running counts as queued, which is not an edge case — the engine thread being between jobs with
+that resume next is precisely when barring matters.
+
+**And the outcome is a variant, not a `bool`, because its two readers ask different questions.**
+`Output::raised` carries `proto::Interrupted`. `break_in.requested` asks *is this run going to
+stop*, for which `Raised`, `AlreadyPending` and `Barred` are all yes; the transcript's `delivered`
+asks *did this request raise it*, for which only `Raised` is. One flag made those the same, and
+whichever reader lost had a plausible wrong answer — a second `break_in` reading as a run that could
+not be stopped, or a transcript crediting a cause that never happened. `false` on `requested` now
+has one meaning: the run had already finished. A break that could not be **delivered** is an error
+instead, which it previously was not: a lost worker came back as `requested: false` and read exactly
+like the benign race.
 
 **Two smaller things that will look like bugs if you do not know them.** The bound is the caller's
 `max_run_ms` and **not** the call timeout, deliberately: the point of the tool is that the caller
@@ -868,12 +879,33 @@ the stop could be taken before its caller read it.
 `Session::busy` reads the **slot** as well as the waiter map, because `reader` removes the waiter
 when the reply lands and the filing task runs after it — so in between, a session with a stale
 submission stamp looks idle, and a concurrent open could close it and leave the stop filed where
-nothing can resolve it. `Execution::ran_for` is stamped at the stop rather than derived from
-`started.elapsed()`, because a stop is kept until another run replaces it: derived, a run read an
-hour later reports an hour, and two reads of one stop disagree. And `wait_for_stop` takes **one**
-deadline before its loop, because the slot is bumped by things that are not stops — the `Resumed`
-milestone is one — and re-arming `wait` per wakeup makes `timeout_ms` a per-wakeup allowance, which
-is `STOP_WAIT_MARGIN` not holding.
+nothing can resolve it. `Execution::ran_for` is stamped at the stop rather than derived, because a
+stop is kept until another run replaces it: derived, a run read an hour later reports an hour, and
+two reads of one stop disagree. And `wait_for_stop` takes **one** deadline before its loop, because
+the slot is bumped by things that are not stops — the `Resumed` milestone is one — and re-arming
+`wait` per wakeup makes `timeout_ms` a per-wakeup allowance, which is `STOP_WAIT_MARGIN` not
+holding.
+
+**A run has a phase, and refusing to give it one generated three findings before it got one.**
+`Execution::moving_since` is `None` while the run is queued and stamped from the `Resumed`
+milestone. The slot is claimed before the job is submitted — that part is right and stays, since a
+slot filled when the worker answered would leave a window where the target may be moving and this
+side would let a `registers` through — but it makes `started` *when the caller asked*, which behind
+a long `pool_census` is minutes before the target went. Everything derived from it was then wrong
+the same way: `running_for_ms` counted time the target stood still, and `breaks_in_ms` counted down
+a bound the worker had not begun, reporting none left for a run that was about to start a
+full-length one. `running()` still does **not** read the phase — a queued run may be moving by the
+time a read arrives, and conservative is correct there. This was declined once as "the slot is
+deliberately conservative"; that was right about `running()` and wrong about everything else, and
+the tell was three findings landing on one seam.
+
+**And the `Resumed` arm publishes before it wakes.** The phase, then the milestone's channel, then
+`execution_moved()`. `start_execution` waits on the *slot* and reads the channel at the top of its
+loop, so a bump published first can wake it on another runtime thread while the channel is still
+empty — it finds nothing, sees the run still going, consumes the only notification and sleeps until
+the run **ends**. That is the same bug this branch shipped once already, arriving the second time
+through a two-line ordering rather than a missing wake. `answer_one_resume` mirrors the order for
+that reason: a double that publishes differently has stopped standing in for the thing it doubles.
 
 **The stop's typed half rides on `Output::stop`, not `Output::data`.** Same shape and reason as
 `Output::summary`: the answer is keyed by a handle the worker has never heard of, so the worker
