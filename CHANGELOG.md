@@ -34,8 +34,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reconnect and read it. **A break is bound to the run it was asked about**, so one aimed at a run
   that has since stopped is refused rather than landing on whatever the engine started next — and
   one aimed at a run that has not *started*, because something else is still on the engine, bars it
-  from ever setting the target going; its `requested: false` means the run had already finished, and
-  a break that could not be delivered is an error instead. **A run's clock starts when the target
+  from ever setting the target going. `requested` then answers the wide question — *is this run
+  going to stop* — so a break raised, one already lodged and a barred run are all `true`, as is one
+  whose run finished on its way to the engine. `false` means the run had already stopped **when the
+  call looked**, which is the ordinary race; a break that could not be *delivered* is an error
+  rather than a `false`. **A run's clock starts when the target
   moves**, not when it was asked for, so one waiting its turn reports no elapsed time and its whole
   bound rather than a bound already counted down. And `end_session` reaches the target whether the run is pumping or still
   queued — it breaks the pump in as it arrives, and bars a resume that has not started — rather than
