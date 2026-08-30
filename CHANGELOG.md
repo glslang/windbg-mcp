@@ -31,8 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a queued `registers` would be answered whenever the target next stopped and would describe
   wherever it happened to be. **A wait that runs out is a poll**: no stop, nothing cancelled, the
   handle still good. **A stop is read rather than taken**, so a client that disconnected mid-run can
-  reconnect and read it. And `end_session` breaks the pump in as it arrives rather than queueing
-  behind a run that has no reason to end — which is the same path a client disconnect takes.
+  reconnect and read it. **A break is bound to the run it was asked about**, so one aimed at a run
+  that has since stopped is refused rather than landing on whatever the engine started next; its
+  `requested: false` means the target had already stopped, and a break that could not be delivered
+  is an error instead. And `end_session` reaches the target whether the run is pumping or still
+  queued — it breaks the pump in as it arrives, and bars a resume that has not started — rather than
+  queueing behind a run that has no reason to end, which is the same path a client disconnect takes.
   [`docs/sessions.md`](docs/sessions.md#running-a-target-asynchronously) has the whole of it.
 - **A stop says which thread, and which processor.** `StopReport` — what `go`, the stepping tools
   and `wait_for_stop` all answer with — now carries `thread` (the operating-system thread id the
@@ -43,6 +47,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A transcript no longer records an interrupt that reached nothing as one that was delivered.**
+  `WINDBG_MCP_TRANSCRIPT`'s `interrupt` event took `delivered` from whether the request succeeded,
+  and four of the five things an interrupt can do succeed while raising nothing — there was no
+  operation running, a `debug_batch` was sealed for its rollback, or a break was already pending.
+  The worker now says which it was, so the transcript records a cause that happened. This matters
+  because that event exists precisely to explain a *later* truncated result; one logged against a
+  break that was never raised attributes a short answer to a request that did nothing.
 - **`record_trace` finds the recorder the engine copy already delivered.** `setup.md`'s one-time
   engine bundle takes the whole `ttd\` directory, and that directory carries `TTD.exe` as well as
   the replay DLLs — but `find_ttd` probed `PATH`, the SDK layout and `WindowsApps` and never its

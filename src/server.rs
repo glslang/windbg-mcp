@@ -3705,7 +3705,7 @@ impl WindbgServer {
         };
         engine_result(
             self.sessions
-                .interrupt(&session, session_id.is_some())
+                .interrupt(&session, session_id.is_some(), None)
                 .await,
         )
     }

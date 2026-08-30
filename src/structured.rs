@@ -595,8 +595,9 @@ pub struct ExecutionStarted {
 pub struct StopWait {
     pub session_id: String,
     pub execution: String,
-    /// How long the target has been running in all — since the run started, not since this wait
-    /// did. Several waits can watch one run, and the run is what the number is about.
+    /// How long the target has run in all — since the run started, not since this wait did.
+    /// Several waits can watch one run, and the run is what the number is about. It stops moving
+    /// once the run does, so two reads of one stop agree.
     pub running_for_ms: u64,
     /// Where the run stopped, or **absent while it is still going**.
     ///
@@ -621,9 +622,14 @@ pub struct StopWait {
 pub struct BreakInRequested {
     pub session_id: String,
     pub execution: String,
-    /// Whether the break reached the engine. `false` is not a failed call: the run may have
-    /// stopped on its own between the caller reading its handle and this arriving, which is the
-    /// ordinary race and needs no action.
+    /// Whether a break is lodged for this run, so the target is going to stop.
+    ///
+    /// `false` is not a failed call and never means the request went astray. It says the engine
+    /// had nothing to break for *this* run: it had already stopped — the ordinary race between a
+    /// caller reading its handle and this arriving — or it had stopped and the worker had moved
+    /// on to something else, which is refused rather than broken in on. Either way the thing the
+    /// caller wanted has happened, and `detail` says which it was. A break that could not be
+    /// delivered at all is an error rather than a `false` here.
     pub requested: bool,
     /// The debugger's own account of what it did.
     pub detail: String,
@@ -634,6 +640,9 @@ pub struct BreakInRequested {
 pub struct ExecutionInfo {
     pub execution: String,
     pub command: String,
+    /// How long the target ran — counting while it is moving, and frozen at the stop once it has
+    /// stopped. Not how long ago the run started: a stop is kept until another run replaces it,
+    /// so a handle read an hour later would otherwise report an hour-long run.
     pub running_for_ms: u64,
     /// Whether the run has ended and its stop is waiting to be collected.
     ///

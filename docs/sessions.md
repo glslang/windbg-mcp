@@ -116,7 +116,10 @@ it in itself (default 60s, maximum one hour), so a resume that reaches nothing e
 leaving an engine thread waiting for ever with nobody watching. A run that ends that way reports
 `timed_out`, and its position is where the target happened to be rather than a stop it reached.
 `break_in` ends one early; it returns as soon as the request is lodged, and the stop it produces
-arrives on the next `wait_for_stop`.
+arrives on the next `wait_for_stop`. It answers `requested: false` — not an error — when the run had
+already stopped and there was nothing to break, which is the ordinary race between reading a handle
+and acting on it. A break that could not be *delivered* is a failure rather than that, so the two
+are never the same answer.
 
 **A stop says where, and whose.** `stopped_at` is the instruction pointer, `thread` the
 operating-system thread id it belongs to, and `processor` which of a kernel target's processors it

@@ -386,6 +386,22 @@ struct Running {
     /// flag beside this lock, so "which job is pumping" and "which job may be interrupted" are
     /// decided together and cannot name different jobs.
     pumping: Option<u64>,
+    /// Whether this worker's session is ending, so no target of its may be set running again.
+    ///
+    /// Set by the request reader the moment a teardown is read — an [`EngineOp::EndSession`], or
+    /// the EOF that says the supervisor has gone — and never cleared, because nothing that
+    /// happens after it makes the session live again.
+    ///
+    /// **It is the other half of [`Self::pumping`], and the pair is what makes the window
+    /// between them empty.** Breaking the pump only reaches a resume that has *already started*;
+    /// a resume still sitting in the engine thread's queue — behind a long `pool_census`, or
+    /// simply not yet dequeued — has nothing to break, so a teardown would find no pump, queue
+    /// behind it, and then wait out the whole run it was too early to stop. The two facts are
+    /// therefore read and written under the one lock, in opposite orders: the reader sets this
+    /// and *then* reads `pumping`, [`resume`] claims `pumping` only after reading this. Whichever
+    /// gets there first, the other sees it — so a run is either broken in or never started, and
+    /// there is no third outcome where the teardown waits.
+    tearing_down: bool,
     /// The job that has entered a phase no break may reach — a [`crate::batch`] running its
     /// `always` block.
     ///
@@ -401,6 +417,7 @@ static RUNNING: Mutex<Running> = Mutex::new(Running {
     job: None,
     interrupted: None,
     pumping: None,
+    tearing_down: false,
     uninterruptible: None,
 });
 
@@ -441,6 +458,26 @@ impl Running {
         self.pumping = id;
     }
 
+    /// Claims the pump for `id`, unless this session is ending — see [`Self::tearing_down`].
+    ///
+    /// `false` is the answer to "may this resume set the target going at all", and it is a
+    /// refusal rather than a wait: the teardown behind it is already read, so a run started here
+    /// could only end by being broken in a moment later, having moved a target nobody will read.
+    fn claim_pump(&mut self, id: u64) -> bool {
+        if self.tearing_down {
+            return false;
+        }
+        self.pumping = Some(id);
+        true
+    }
+
+    /// Records that this session is ending, and reports the job pumping a resumed target if one
+    /// had already started. See [`Self::tearing_down`].
+    fn begin_teardown(&mut self) -> Option<u64> {
+        self.tearing_down = true;
+        self.pumping
+    }
+
     /// Ends `id`'s claim, reporting whether an interrupt was bound to it.
     ///
     /// Taken rather than read, so an interrupt is spent by the job it reached: the next job starts
@@ -479,6 +516,11 @@ fn interrupt_pending(id: u64) -> bool {
 /// [`Running::pump`] on this process's one tracker.
 fn pumping(id: Option<u64>) {
     running().pump(id);
+}
+
+/// [`Running::claim_pump`] on this process's one tracker.
+fn claim_pump(id: u64) -> bool {
+    running().claim_pump(id)
 }
 
 /// Closes `id` to further interrupts and consumes anything already pending on the engine.
@@ -602,15 +644,17 @@ pub fn run(args: &[String]) -> ! {
                 // reason the signal can arrive at all. See [`EngineOp::EndSession`].
                 if matches!(request.op, EngineOp::EndSession) {
                     announce_teardown(request.id);
-                    break_any_pump();
+                    stop_resuming();
                 }
                 // The one request that is *answered* here rather than queued. Queueing it would
                 // put it behind the operation it exists to stop, so it could only ever run once
                 // there was nothing left to interrupt. See [`EngineOp::Interrupt`].
-                if matches!(request.op, EngineOp::Interrupt) {
+                if let EngineOp::Interrupt { job } = request.op {
                     emit(&WorkerMessage::Done {
                         id: request.id,
-                        result: interrupt_running().map(Output::text).map_err(Failed::from),
+                        result: interrupt_running(job)
+                            .map(|(raised, text)| Output::interrupted(text, raised))
+                            .map_err(Failed::from),
                     });
                     continue;
                 }
@@ -661,6 +705,13 @@ pub fn run(args: &[String]) -> ! {
     // no rollback, not between finishing the batch and not.
     // No teardown request to answer here — the supervisor is gone — so the id is immaterial; what
     // matters is that the batch is told, and that this process waits for it.
+    // The same door the explicit teardown closes, and for a sharper version of its reason. A
+    // resume pumping here has up to the bound its caller named — an hour — while the release
+    // below waits `ABRUPT_EXIT_RELEASE`, so without this the wait expires against a worker that
+    // is working perfectly and this process exits with the target never released: exactly the
+    // halted live kernel the paragraph above exists to prevent, reached by the one path where
+    // nobody is left to ask again.
+    stop_resuming();
     let grace = match BATCH.abandon(0) {
         Some(within) => {
             tracing::info!(
@@ -1002,8 +1053,14 @@ fn announce_teardown(id: u64) {
     });
 }
 
-/// Breaks the engine out of an [`EngineOp::Resume`]'s pump, so a teardown queued behind it is
-/// reached — from the request reader, beside [`announce_teardown`] and for the same reason.
+/// Closes this worker to running a target, so a teardown queued behind a resume is reached —
+/// from the request reader, beside [`announce_teardown`] and for the same reason.
+///
+/// **Two halves, and neither is sufficient alone.** It records that the session is ending
+/// ([`Running::tearing_down`]), which refuses any [`EngineOp::Resume`] that has not started; and
+/// it breaks the engine out of one that has. A resume can be in either state when a teardown
+/// arrives — queued behind a long `pool_census`, or already pumping — and the halves are taken
+/// under one lock in the order that leaves no window between them.
 ///
 /// **The one job a teardown cannot simply wait for.** Every other operation on the engine thread
 /// ends on a clock this process owns: a command has a watchdog, a walk checks a deadline, a batch
@@ -1021,8 +1078,12 @@ fn announce_teardown(id: u64) {
 /// It goes through [`interrupt_running`], so the seal a [`crate::batch`] takes for its `always`
 /// block is honoured here too — a batch is never pumping, but the check costs nothing and the
 /// alternative is a second road to `SetInterrupt` with its own idea of what may be broken.
-fn break_any_pump() {
-    let pumping = running().pumping;
+fn stop_resuming() {
+    // Two statements, so the guard is unmistakably dropped before `interrupt_running` below takes
+    // the same lock. A `let ... else` over `running()` directly would leave that to the rule about
+    // when a temporary in a `let` initializer dies — correct, and not a thing to have to be right
+    // about when being wrong is a deadlock in a teardown.
+    let pumping = running().begin_teardown();
     let Some(job) = pumping else { return };
     tracing::info!(
         "worker: session ending while job {job} pumps a resumed target; breaking in so the \
@@ -1030,7 +1091,7 @@ fn break_any_pump() {
     );
     // The reply is the caller's, not this path's — an interrupt that finds nothing to stop is a
     // normal answer, and the teardown behind it is what actually reports.
-    if let Err(why) = interrupt_running() {
+    if let Err(why) = interrupt_running(Some(job)) {
         tracing::warn!("worker: could not break the target in for the teardown ({why})");
     }
 }
@@ -1083,15 +1144,34 @@ fn cut_short(result: Result<Output, Failed>) -> Result<Output, Failed> {
 /// Says which job it reached, in a reply the *interrupting* caller reads. That caller is not the
 /// one running the operation, so "an operation was interrupted" and "there was nothing to
 /// interrupt" are the two answers it needs, and they are indistinguishable from the outside.
-fn interrupt_running() -> Result<String, String> {
+fn interrupt_running(bound: Option<u64>) -> Result<(bool, String), String> {
     let mut running = running();
     let Some(job) = running.job else {
-        return Ok(
+        return Ok((
+            false,
             "Nothing was running on this session's engine, so nothing was interrupted. \
-                   Whatever you meant to stop had already finished — its own reply says how it \
-                   ended."
+             Whatever you meant to stop had already finished — its own reply says how it ended."
                 .to_string(),
-        );
+        ));
+    };
+    // A break asked for on behalf of one particular job is **refused rather than rebound** when
+    // that job is no longer the one running. The engine thread may have finished it and started
+    // the next thing — a queued command, or the run after this one — and a break raised now would
+    // cut that short instead, reported to its caller as an interruption nobody asked for. The
+    // session-scoped `interrupt` tool passes `None` and keeps the old meaning, because its caller
+    // named a session and gets whatever that session is doing.
+    if let Some(bound) = bound
+        && bound != job
+    {
+        return Ok((
+            false,
+            format!(
+                "Not interrupted. Job {bound} is no longer what this session's engine is running \
+                 — it is running job {job} now — so nothing was sent, rather than breaking in on \
+                 work that was not asked about. Whatever job {bound} was doing has finished; its \
+                 own reply says how."
+            ),
+        ));
     };
     // A batch that has reached its `always` block is closed to breaks, whether or not one has been
     // raised for it before. Cleanup is the one thing an interrupt must not reach: a restore cut
@@ -1099,8 +1179,16 @@ fn interrupt_running() -> Result<String, String> {
     // recorded as a step that worked and reported as `rollback: COMPLETE` with the patch still
     // applied.
     if running.sealed(job) {
-        return Ok(format!(
-            "Not interrupted. The operation on this session (job {job}) is a `debug_batch` that              has finished its steps and is running its rollback, which is deliberately not              interruptible — a restore stopped halfway would report success while leaving the              target changed. It is bounded by the batch's own budget and will return shortly. If              it does not, `end_session` ends the session outright, at the cost of the target."
+        return Ok((
+            false,
+            format!(
+                "Not interrupted. The operation on this session (job {job}) is a `debug_batch` \
+                 that has finished its steps and is running its rollback, which is deliberately \
+                 not interruptible — a restore stopped halfway would report success while leaving \
+                 the target changed. It is bounded by the batch's own budget and will return \
+                 shortly. If it does not, `end_session` ends the session outright, at the cost of \
+                 the target."
+            ),
         ));
     }
     // At most one break per job otherwise, for the same reason one step later: a batch told to stop
@@ -1111,12 +1199,19 @@ fn interrupt_running() -> Result<String, String> {
     // is already stopping. A *later* job is a different id and is interrupted normally, which is
     // why this is not idempotence — see the tool's annotation.
     if running.interrupt_pending(job) {
-        return Ok(format!(
-            "Already interrupted. Ctrl+Break was raised on this session's engine for the \
+        // `true`, and this is the one answer where that word is doing work. Nothing was sent, but
+        // a break **is** lodged for this job and the target is stopping — which is what the caller
+        // asked about. Reporting `false` here would have a second `break_in` read as a run that
+        // could not be stopped.
+        return Ok((
+            true,
+            format!(
+                "Already interrupted. Ctrl+Break was raised on this session's engine for the \
              operation it is running (job {job}) and it is stopping; nothing further was sent. If \
              it does not end, it is one of the cases an interrupt cannot reach — a command that \
              never polls, or a live-kernel attach whose target has not connected — and \
              `end_session` is what ends those, at the cost of the target."
+            ),
         ));
     }
     let Some(handle) = INTERRUPT.get() else {
@@ -1134,13 +1229,14 @@ fn interrupt_running() -> Result<String, String> {
     // complete result as cut short.
     running.interrupt_raised();
     tracing::info!("worker: interrupt raised for job {job}");
-    Ok(
+    Ok((
+        true,
         "Interrupted. Ctrl+Break was raised on this session's engine, so the operation it was \
          running stops at its next poll and returns whatever it had reached — to the call that \
          started it, not to this one. A command that never polls, and a live-kernel attach whose \
          target has not connected, cannot be reached this way; `end_session` is what ends those."
             .to_string(),
-    )
+    ))
 }
 
 /// Refuses work on a session whose target has gone away — in one place, with one message.
@@ -1171,7 +1267,7 @@ fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Fail
             | EngineOp::AttachProcess { .. }
             | EngineOp::Launch { .. }
             | EngineOp::EndSession
-            | EngineOp::Interrupt
+            | EngineOp::Interrupt { .. }
     ) {
         return None;
     }
@@ -1538,7 +1634,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         EngineOp::Batch(op) => run_batch(e, id, op, queued).map_err(Failed::from),
         // Answered by the request reader, which is the only way it could reach a busy engine at
         // all, so it is never queued and never arrives here. See [`EngineOp::Interrupt`].
-        EngineOp::Interrupt => Err(Failed::from(
+        EngineOp::Interrupt { .. } => Err(Failed::from(
             "an interrupt reached the engine thread, which cannot act on one; this is a bug in \
              the worker's request reader",
         )),
@@ -1989,15 +2085,30 @@ fn resumed(e: &DebugEngine, command: &str, timeout_ms: u32) -> Result<Output, Fa
 /// description of `g` on a target with nothing left to run.
 fn resume(e: &DebugEngine, id: u64, command: &str, timeout_ms: u32) -> Result<Output, Failed> {
     // Claimed around the **whole** of this, `Execute` included, and that is not tidiness. A
-    // teardown reads this flag to decide whether to break in ([`break_any_pump`]); one arriving in
+    // teardown reads this flag to decide whether to break in ([`stop_resuming`]); one arriving in
     // the window between `Execute` returning and the flag being set would find nothing to break
     // and queue behind the entire run instead — its grace would expire, and the worker would be
     // killed still holding the target. Raising a break during the `Execute` costs nothing: it
     // returns immediately either way, and the pending break lands on the pump.
     //
+    // Claimed rather than simply set, because the same lock answers the other half of that
+    // window: a teardown read *before* this job was dequeued has already barred resuming, and the
+    // claim fails. Between the two there is nowhere for a run to hide.
+    //
     // Cleared here rather than at each exit, and again in [`Running::release`], which is what
     // covers a panic.
-    pumping(Some(id));
+    if !claim_pump(id) {
+        // The teardown was read before this job was dequeued, so there is nothing to break out of
+        // and nothing worth starting: a target set running now would be broken in a moment later
+        // by the release behind it, having moved somewhere nobody will ever read. Refused as a
+        // stale session, which is what it is — the handle a caller holds is being torn down.
+        return Err(Failed::categorised(
+            crate::structured::ErrorCategory::StaleSession,
+            "This session is ending, so its target was not resumed. The teardown was already \
+             read when this run reached the engine; nothing was set running, and the target is \
+             being released as it stood.",
+        ));
+    }
     let outcome = pump_a_resume(e, id, command, timeout_ms);
     pumping(None);
     outcome
@@ -6210,6 +6321,7 @@ mod tests {
     fn idle() -> Running {
         Running {
             job: None,
+            tearing_down: false,
             interrupted: None,
             pumping: None,
             uninterruptible: None,
@@ -6244,6 +6356,65 @@ mod tests {
             running.pumping, None,
             "a claim given back must take the pump with it, or a later teardown breaks in on a \
              job that is not running a target"
+        );
+    }
+
+    /// A teardown reaches a resume in either of the two states it can be in, and there is no
+    /// third.
+    ///
+    /// Breaking the pump only reaches a run that has *already started*. A resume still in the
+    /// engine thread's queue — behind a long `pool_census`, or simply not yet dequeued — has
+    /// nothing to break, so a teardown that only looked at `pumping` would find none, queue behind
+    /// the resume, and then wait out the whole run it arrived too early to stop: the release grace
+    /// would expire against a worker that was working perfectly, and the worker would be killed
+    /// still holding the target. Both orderings are staged here because it is the *pair* that
+    /// leaves no window, not either half.
+    #[test]
+    fn a_teardown_either_breaks_a_run_or_stops_it_starting() {
+        // The resume got there first: there is a pump, and the teardown is told to break it.
+        let mut running = idle();
+        running.claim(7);
+        assert!(
+            running.claim_pump(7),
+            "nothing is ending; the run may start"
+        );
+        assert_eq!(
+            running.begin_teardown(),
+            Some(7),
+            "a teardown arriving on a pumping run has to be given the job to break"
+        );
+
+        // The teardown got there first: there is nothing to break, and the run never starts.
+        let mut running = idle();
+        assert_eq!(
+            running.begin_teardown(),
+            None,
+            "nothing was pumping, so there is nothing to break — and that is not the end of it"
+        );
+        running.claim(8);
+        assert!(
+            !running.claim_pump(8),
+            "a resume dequeued after the teardown was read must not set the target going: there \
+             is no one left to break it in, and the release behind it would wait out the whole run"
+        );
+        assert_eq!(
+            running.pumping, None,
+            "and a refused claim leaves nothing for a later teardown to break either"
+        );
+    }
+
+    /// The bar stays up. A session that is ending does not stop ending because a job finished.
+    #[test]
+    fn a_teardown_bars_every_later_resume_not_just_the_next_one() {
+        let mut running = idle();
+        running.begin_teardown();
+        running.claim(1);
+        assert!(!running.claim_pump(1));
+        running.release(1);
+        running.claim(2);
+        assert!(
+            !running.claim_pump(2),
+            "releasing a job clears what that job held, not the fact that the session is ending"
         );
     }
 

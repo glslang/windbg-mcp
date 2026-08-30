@@ -504,6 +504,22 @@ pub struct Session {
     /// target only from inside `WaitForEvent`: a second run would have to wait for the first, so
     /// two handles could never both be live. Refusing the second is the same fact said out loud.
     execution: Mutex<Option<Execution>>,
+    /// Serialises "may this call run?" against "put it in the queue", for this session.
+    ///
+    /// Both submitters read the execution slot and then send on [`Self::tx`], and between those
+    /// two steps they are not holding anything: an ordinary call could pass
+    /// [`Sessions::refuse_while_running`] with the slot empty, be descheduled, and enqueue
+    /// *behind* a `Resume` that claimed the slot in the meantime. It would then wait out the
+    /// whole run inside `WaitForEvent` instead of being told the target was running — and if the
+    /// run outlasted its call timeout, its caller would see a timeout while a command that may
+    /// mutate the target still ran when the target stopped. That is exactly the outcome the
+    /// refusal exists to prevent, arriving through the gap in the middle of it.
+    ///
+    /// A lock of its own rather than the slot's, because the enqueue also takes the registry lock
+    /// and [`Sessions::snapshot`] takes the registry lock and then the slot's — nesting the slot
+    /// outside the registry here would close the loop. This one is only ever taken first, so it
+    /// orders the two submitters against each other and nothing else.
+    submit_gate: Mutex<()>,
     /// Bumped whenever [`Self::execution`] changes, so waiters wake without polling.
     ///
     /// A `watch` rather than a `Notify` for the one property that matters here: a receiver taken
@@ -585,6 +601,15 @@ struct Execution {
     /// The worker job whose reply is this run's stop.
     job: u64,
     started: Instant,
+    /// How long the target actually ran, fixed when the stop is filed — `None` while it is still
+    /// moving.
+    ///
+    /// Recorded rather than derived, because `started.elapsed()` goes on growing after the run is
+    /// over: a stop read an hour later would report an hour-long run, and `session_status` would
+    /// show a finished run getting steadily longer. The stop is deliberately kept until another
+    /// run replaces it, so "how long ago it was filed" and "how long it ran" are different
+    /// questions and only the second is this one.
+    ran_for: Option<Duration>,
     /// What the worker was told to bound its pump by, so a report can say when a run that is
     /// going nowhere will end itself.
     bound: Duration,
@@ -601,6 +626,11 @@ impl Execution {
         self.stopped.is_none()
     }
 
+    /// How long the target ran: frozen once it stopped, and counting while it has not.
+    fn ran_for(&self) -> Duration {
+        self.ran_for.unwrap_or_else(|| self.started.elapsed())
+    }
+
     /// How much longer the worker will let the target run before breaking it in — `None` once it
     /// has stopped, and `None` again once the bound has passed with no stop reported, since a
     /// figure that has run out is not time anybody has left.
@@ -614,7 +644,7 @@ impl Execution {
         crate::structured::ExecutionInfo {
             execution: self.handle.clone(),
             command: self.command.clone(),
-            running_for_ms: ms(self.started.elapsed()),
+            running_for_ms: ms(self.ran_for()),
             stopped: !self.running(),
             breaks_in_ms: self.breaks_in().map(ms),
         }
@@ -623,6 +653,9 @@ impl Execution {
 
 /// One run, read out from under its session's lock so a caller can `await` on what it says.
 struct FoundExecution {
+    /// The worker job this run is, so a break can be bound to it rather than to whatever the
+    /// engine thread happens to be doing when the request lands.
+    job: u64,
     running: bool,
     stopped: Option<Arc<Result<Output, EngineError>>>,
     running_for: Duration,
@@ -802,6 +835,16 @@ impl Session {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_empty()
+            // A target that is moving is work in flight, whatever the waiter map says — and for
+            // most of a run it says so too, since the resume's own job is outstanding. The gap is
+            // at the end: `reader` removes the waiter when the reply lands, and the task that
+            // files the stop runs after it. In between, a session whose run had outlasted the
+            // reclamation window would look both idle and stale, and could be closed by a
+            // concurrent open — filing the stop on a session nothing can resolve any more, so the
+            // caller waiting on that handle never learns what happened. Reading the slot closes
+            // that window exactly: it is still `running()` until `finish_execution` says
+            // otherwise, and that is the same call that restamps `last_used`.
+            || self.running_execution().is_some()
             || matches!(
                 self.state(),
                 SessionState::Opening | SessionState::Attaching
@@ -892,6 +935,7 @@ impl Session {
             let Some(execution) = slot.as_mut().filter(|e| e.job == job) else {
                 return;
             };
+            execution.ran_for = Some(execution.started.elapsed());
             execution.stopped = Some(Arc::new(result));
         }
         // The idle clock starts now, not when the run was submitted. `last_used` is stamped on
@@ -912,9 +956,10 @@ impl Session {
         let slot = self.execution.lock().unwrap_or_else(|e| e.into_inner());
         let execution = slot.as_ref().filter(|e| e.handle == handle)?;
         Some(FoundExecution {
+            job: execution.job,
             running: execution.running(),
             stopped: execution.stopped.clone(),
-            running_for: execution.started.elapsed(),
+            running_for: execution.ran_for(),
             breaks_in: execution.breaks_in(),
         })
     }
@@ -1506,8 +1551,26 @@ impl Sessions {
         id: u64,
         resumed: Option<oneshot::Sender<()>>,
     ) -> Result<oneshot::Receiver<Result<Output, EngineError>>, EngineError> {
+        let _gate = session
+            .submit_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        self.submit_gated(session, call, id, resumed)
+    }
+
+    /// [`Self::submit`] with [`Session::submit_gate`] already held, for the one caller that has to
+    /// hold it across a decision of its own — [`Self::start_execution`], whose claim on the
+    /// execution slot and whose enqueue must not have another submission between them.
+    fn submit_gated(
+        &self,
+        session: &Arc<Session>,
+        call: Call,
+        id: u64,
+        resumed: Option<oneshot::Sender<()>>,
+    ) -> Result<oneshot::Receiver<Result<Output, EngineError>>, EngineError> {
         // Refused rather than queued while the target is moving — see
-        // [`Sessions::refuse_while_running`].
+        // [`Sessions::refuse_while_running`]. Under the gate above, so the answer cannot go stale
+        // between here and the enqueue below.
         if let Some(refusal) = self.refuse_while_running(session, &call.op) {
             return Err(refusal);
         }
@@ -1581,7 +1644,7 @@ impl Sessions {
     fn refuse_while_running(&self, session: &Arc<Session>, op: &EngineOp) -> Option<EngineError> {
         if matches!(
             op,
-            EngineOp::Interrupt | EngineOp::EndSession | EngineOp::Resume { .. }
+            EngineOp::Interrupt { .. } | EngineOp::EndSession | EngineOp::Resume { .. }
         ) {
             return None;
         }
@@ -1834,19 +1897,29 @@ impl Sessions {
     /// run long. The worker answers from its request reader, which is never blocked by the engine
     /// (that is what makes an interrupt deliverable at all), so anything slower than this is a
     /// worker that has stopped reading rather than one that is thinking.
+    ///
+    /// `bound` is the job the break is for, or `None` for "whatever this session is running".
+    /// Only [`Self::break_in`] names one — see [`EngineOp::Interrupt`] for why the two callers
+    /// differ.
     pub async fn interrupt(
         &self,
         session: &Arc<Session>,
         named: bool,
+        bound: Option<u64>,
     ) -> Result<Output, EngineError> {
-        let call = Call::new(EngineOp::Interrupt).named(named);
+        let call = Call::new(EngineOp::Interrupt { job: bound }).named(named);
         let outcome = self.call_within(session, call, INTERRUPT_TIMEOUT).await;
         // Recorded from this side because an interrupt is a *cause*: whatever the interrupted call
         // reports next — a short result, a batch that says `INTERRUPTED`, a walk that stopped —
         // reads as an unexplained truncation without the record that somebody asked for it.
         self.rec.write(crate::record::Event::Interrupt {
             session: session.id.clone(),
-            delivered: outcome.is_ok(),
+            // The worker's own answer, not `is_ok()`. Four of the five things this op can do are
+            // `Ok` and raise nothing — nothing was running, the job named had moved on, a batch
+            // was sealed for its rollback — and a transcript claiming a break was delivered for
+            // any of them is a record of a cause that never happened, which is the one thing this
+            // event exists to supply.
+            delivered: outcome.as_ref().is_ok_and(|out| out.raised == Some(true)),
             // Scrubbed and capped like every other debugger-supplied string that reaches the
             // transcript — this one is the engine's own words about what it stopped, and it is
             // the one path that was not going through the rule the module documents.
@@ -1888,6 +1961,14 @@ impl Sessions {
     ) -> Result<crate::structured::ExecutionStarted, EngineError> {
         let handle = mint_execution_id();
         let job = session.next_id.fetch_add(1, Ordering::Relaxed);
+        // Held across both the claim and the enqueue below, which is what makes them one decision
+        // as far as every other submitter is concerned: a call that takes this gate either sees a
+        // free slot and is queued *ahead* of the resume, or sees the claim and is refused. See
+        // [`Session::submit_gate`].
+        let gate = session
+            .submit_gate
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         // Claimed before anything is submitted, so a session with a run in flight is one whose
         // slot already says so — there is no window where the target may be moving and this side
         // would let a read through. The claim is also the "one at a time" check.
@@ -1897,6 +1978,7 @@ impl Sessions {
                 command: command.clone(),
                 job,
                 started: Instant::now(),
+                ran_for: None,
                 bound,
                 stopped: None,
             })
@@ -1920,15 +2002,18 @@ impl Sessions {
             timeout_ms: bound.as_millis().min(u128::from(u32::MAX)) as u32,
         })
         .named(named);
-        let reply = match self.submit(session, call, job, Some(resumed_tx)) {
+        let reply = match self.submit_gated(session, call, job, Some(resumed_tx)) {
             Ok(reply) => reply,
             Err(why) => {
                 // Nothing was queued, so nothing will ever answer this job — and a slot left
                 // saying "running" would refuse every later call on a session where nothing is.
+                drop(gate);
                 session.finish_execution(job, Err(why.clone()));
                 return Err(why);
             }
         };
+        // Everything below waits, and a lock held across an await is a lock held by a parked task.
+        drop(gate);
         // Files the stop whenever it comes, whoever is still listening. Spawned before this
         // function waits for anything, because the case it exists for is this caller not being
         // here: a `continue_async` whose client disconnects mid-run must still leave the session
@@ -2027,7 +2112,14 @@ impl Sessions {
         wait: Duration,
     ) -> Result<crate::structured::StopWait, EngineError> {
         let mut changed = session.execution_changed.subscribe();
-        // Set when the wait expires, so the loop takes exactly one more turn — long enough to
+        // **One deadline, taken once.** The loop can be woken by a change to the slot that is not
+        // a stop — the `Resumed` milestone bumps it, which is what a caller waiting on a handle it
+        // got from `session_status` will see — and re-arming `wait` on each turn would give each
+        // of those wakeups the whole budget again. This wait is deliberately capped below the call
+        // timeout (`STOP_WAIT_MARGIN`) so the call answers rather than expiring; a budget that can
+        // be spent twice is that cap not holding.
+        let deadline = tokio::time::Instant::now() + wait;
+        // Set when the deadline passes, so the loop takes exactly one more turn — long enough to
         // re-read the slot through the checks below, and no longer.
         let mut ran_out = false;
         let report = |found: FoundExecution| crate::structured::StopWait {
@@ -2063,7 +2155,10 @@ impl Sessions {
             if ran_out {
                 return Ok(report(found));
             }
-            if tokio::time::timeout(wait, changed.changed()).await.is_err() {
+            if tokio::time::timeout_at(deadline, changed.changed())
+                .await
+                .is_err()
+            {
                 ran_out = true;
             }
         }
@@ -2097,15 +2192,24 @@ impl Sessions {
                 ),
             });
         }
-        let outcome = self.interrupt(session, named).await;
+        // **Bound to this run's job**, so it cannot be rebound. Between the check above and this
+        // request being read, the run may have stopped and the worker started the next thing —
+        // a command that was queued, or the run after this one — and an unbound break would land
+        // on that instead, reported to *its* caller as an interruption nobody asked for.
+        //
+        // The failure is propagated rather than folded into `requested: false`, which used to
+        // make a worker that could not be reached read exactly like the benign race below. They
+        // are opposite facts: one says the target has already stopped, the other that nothing
+        // knows whether it will.
+        let out = self.interrupt(session, named, Some(found.job)).await?;
         Ok(crate::structured::BreakInRequested {
             session_id: session.id.clone(),
             execution: handle.to_string(),
-            requested: outcome.is_ok(),
-            detail: match &outcome {
-                Ok(out) => out.text.clone(),
-                Err(why) => why.to_string(),
-            },
+            // The worker's answer, which is the only thing that knows. `Ok` says the request was
+            // read; this says whether it left a break lodged for the job it was about. See
+            // [`crate::proto::Output::raised`].
+            requested: out.raised == Some(true),
+            detail: out.text,
         })
     }
 
@@ -2732,6 +2836,7 @@ impl Sessions {
             released: AtomicBool::new(false),
             unwinding,
             execution: Mutex::new(None),
+            submit_gate: Mutex::new(()),
             execution_changed: tokio::sync::watch::Sender::new(0),
             child: Mutex::new(Some(child)),
             rec: self.rec.clone(),
@@ -4354,6 +4459,7 @@ mod tests {
                 command: "g".to_string(),
                 job,
                 started: Instant::now(),
+                ran_for: None,
                 bound: Duration::from_secs(60),
                 stopped: None,
             })
@@ -4377,6 +4483,7 @@ mod tests {
                 command: "g".to_string(),
                 job: 8,
                 started: Instant::now(),
+                ran_for: None,
                 bound: Duration::from_secs(60),
                 stopped: None,
             })
@@ -4443,7 +4550,7 @@ mod tests {
         );
 
         for op in [
-            EngineOp::Interrupt,
+            EngineOp::Interrupt { job: None },
             EngineOp::EndSession,
             EngineOp::Resume {
                 command: "g".to_string(),
@@ -4788,11 +4895,16 @@ mod tests {
 
     /// A session holding a run is busy, and stops being idle from the moment the run *ends*.
     ///
-    /// Both halves matter and they are different mechanisms. Busy is the waiter, which keeps
-    /// reclamation off a session whose target is moving. The clock is `last_used`, stamped again
-    /// when the stop is filed — without which a run that outlasted the reclamation window would
-    /// leave the session reclaimable the instant it stopped, and the stop could be taken away
-    /// before its caller read it.
+    /// Three mechanisms, not one, and the middle one is the reason this test is longer than it
+    /// looks. Busy is the *waiter* for as long as the resume's own job is outstanding. Then
+    /// `reader` removes that waiter and the task that files the stop runs after it — so between
+    /// the two the waiter map is empty while the target's stop has not been recorded anywhere,
+    /// and a `last_used` stamped when a long run was submitted is by then stale. A session in
+    /// that state could be closed by a concurrent open, and the stop would be filed where nobody
+    /// could ever resolve it. Busy therefore also reads the *slot*, which still says the run is
+    /// going. And the clock is `last_used`, stamped again when the stop is filed, without which a
+    /// run that outlasted the reclamation window would leave the session reclaimable the instant
+    /// it stopped.
     #[test]
     fn a_run_keeps_its_session_from_being_reclaimed() {
         let session = dormant("sess-1", SessionState::Open);
@@ -4812,9 +4924,16 @@ mod tests {
         // Aged past the reclamation window, which is what a long run does to the stamp taken when
         // it was *submitted* — the only stamp there was before the stop started taking one.
         *session.last_used.lock().unwrap() = Instant::now() - Duration::from_secs(3_600);
+        // The window between `reader` taking the waiter and the filing task recording the stop.
+        // The stamp is stale and nothing is outstanding, so the slot is the only thing left
+        // saying this session is in use — and it has to be enough.
         assert!(
-            session.idle_for(Duration::from_secs(60)),
-            "the submission stamp is stale, which is the state this is about"
+            session.busy(),
+            "the reply has been taken but the stop is not filed yet; a session closed here files              its stop where no caller can resolve it"
+        );
+        assert!(
+            !session.idle_for(Duration::from_secs(60)),
+            "and so it is not idle either, however stale the submission stamp is"
         );
         session.finish_execution(7, Ok(Output::text("stopped")));
         assert!(!session.busy(), "a run that ended owes nothing");
@@ -4827,6 +4946,183 @@ mod tests {
         assert!(
             session.execution_by(&handle).is_some(),
             "the stop outlives the run so a caller who was not waiting can still read it"
+        );
+    }
+
+    /// How long the run *ran*, not how long ago it started.
+    ///
+    /// The stop is deliberately kept until another run replaces it, so a handle can be read
+    /// minutes or hours after the target stopped. Deriving the figure from `started.elapsed()`
+    /// makes it grow the whole time: a stop read twice reports two different run lengths, and
+    /// `session_status` shows a finished run getting steadily longer.
+    #[tokio::test(start_paused = true)]
+    async fn a_finished_run_reports_how_long_it_ran() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let session = dormant("sess-1", SessionState::Open);
+        let handle = resumed_on(&session, 7);
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        session.finish_execution(7, Ok(Output::text("stopped")));
+        // Long enough after the stop that a figure taken from `started` could not be mistaken for
+        // one taken at the stop.
+        tokio::time::advance(Duration::from_secs(600)).await;
+
+        let waited = sessions
+            .wait_for_stop(&session, &handle, Duration::from_secs(1))
+            .await
+            .expect("a stopped run answers at once");
+        assert!(
+            (5_000..6_000).contains(&waited.running_for_ms),
+            "the run took five seconds and stopped; ten minutes later it still took five seconds, \
+             not {}ms",
+            waited.running_for_ms
+        );
+        assert_eq!(
+            session
+                .execution_info()
+                .expect("the slot still holds it")
+                .running_for_ms,
+            waited.running_for_ms,
+            "`session_status` and the wait have to agree about one run"
+        );
+    }
+
+    /// A wait woken by something that is not a stop keeps the deadline it was given.
+    ///
+    /// The slot is bumped by more than the stop — the `Resumed` milestone bumps it, which is what
+    /// a caller waiting on a handle it got from `session_status` sees — and re-arming the full
+    /// budget on each wakeup makes `timeout_ms` a per-wakeup allowance rather than a deadline.
+    /// This wait is capped below the call timeout on purpose (`STOP_WAIT_MARGIN`) so the call
+    /// answers instead of expiring, and a budget that can be spent twice is that cap not holding.
+    #[tokio::test(start_paused = true)]
+    async fn a_wait_woken_by_anything_else_still_ends_on_time() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let session = dormant("sess-1", SessionState::Open);
+        let handle = resumed_on(&session, 7);
+
+        // Three wakeups that are not the stop, spread across the budget.
+        let nudging = Arc::clone(&session);
+        tokio::spawn(async move {
+            for _ in 0..3 {
+                tokio::time::sleep(Duration::from_secs(20)).await;
+                nudging.execution_moved();
+            }
+        });
+
+        let started = tokio::time::Instant::now();
+        let waited = sessions
+            .wait_for_stop(&session, &handle, Duration::from_secs(30))
+            .await
+            .expect("a wait that runs out is a poll, not a failure");
+        assert!(
+            waited.stop.is_none(),
+            "nothing stopped, so there is no stop"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(45),
+            "the wait was for 30s and took {:?}; a wakeup that is not a stop must not buy it \
+             another whole budget",
+            started.elapsed()
+        );
+    }
+
+    /// A break is bound to the run it was asked about, and cannot be rebound.
+    ///
+    /// Between `break_in` reading the slot and the worker reading the request, the run may have
+    /// stopped and the engine thread started the next thing — a queued command, or the run after
+    /// this one. An unbound interrupt is bound by the *worker* to whatever is running then, so it
+    /// would cut that short instead, reported to its caller as an interruption nobody asked for.
+    #[tokio::test]
+    async fn a_break_names_the_job_of_the_run_it_was_asked_about() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let (session, mut jobs) = queued("sess-1", SessionState::Open);
+        let handle = resumed_on(&session, 7);
+
+        let answering = Arc::clone(&session);
+        let sent = tokio::spawn(async move {
+            let job = jobs.recv().await.expect("the break reached the queue");
+            let done = answering
+                .waiters
+                .lock()
+                .unwrap()
+                .remove(&job.id)
+                .expect("the waiter is registered")
+                .done;
+            let _ = done.send(Ok(Output::interrupted("Interrupted.", true)));
+            job.op
+        });
+
+        let asked = sessions
+            .break_in(&session, &handle, true)
+            .await
+            .expect("the worker answered");
+        assert!(asked.requested, "the worker said a break is lodged");
+        assert!(
+            matches!(
+                sent.await.expect("the fake worker ran"),
+                EngineOp::Interrupt { job: Some(7) }
+            ),
+            "the break has to name the run's job, or the worker binds it to whatever it is doing"
+        );
+    }
+
+    /// `requested` is the worker's answer, not "the request went through".
+    ///
+    /// Four of the five things an interrupt can do are `Ok` and raise nothing — nothing was
+    /// running, the job named had moved on, a batch was sealed for its rollback. Reading `Ok` as
+    /// delivery reports every one of those as a target about to stop.
+    #[tokio::test]
+    async fn a_break_that_reached_nothing_says_so() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let (session, mut jobs) = queued("sess-1", SessionState::Open);
+        let handle = resumed_on(&session, 7);
+
+        let answering = Arc::clone(&session);
+        tokio::spawn(async move {
+            let job = jobs.recv().await.expect("the break reached the queue");
+            let done = answering
+                .waiters
+                .lock()
+                .unwrap()
+                .remove(&job.id)
+                .expect("the waiter is registered")
+                .done;
+            let _ = done.send(Ok(Output::interrupted(
+                "Not interrupted. Job 7 is no longer what this session's engine is running.",
+                false,
+            )));
+        });
+
+        let asked = sessions
+            .break_in(&session, &handle, true)
+            .await
+            .expect("a request that reached nothing still reached the worker");
+        assert!(
+            !asked.requested,
+            "the worker raised nothing, so nothing is going to stop"
+        );
+    }
+
+    /// A break-in that could not reach its worker is a failure, not a benign race.
+    ///
+    /// `requested: false` has one meaning — the run had already stopped, so nothing needed
+    /// sending. Folding a lost worker into it makes "the target is already stopped" and "nothing
+    /// knows whether it ever will" the same answer.
+    #[tokio::test]
+    async fn a_break_in_that_cannot_reach_its_worker_fails() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let (session, jobs) = queued("sess-1", SessionState::Open);
+        let handle = resumed_on(&session, 7);
+        // The worker is gone: the queue has no receiver, so nothing can ever answer.
+        drop(jobs);
+
+        let why = sessions
+            .break_in(&session, &handle, true)
+            .await
+            .expect_err("a break nobody can deliver is not a break that was not needed");
+        assert!(
+            matches!(why, EngineError::Lost(_)),
+            "the failure keeps its kind rather than becoming a quiet `requested: false`: {why:?}"
         );
     }
 
@@ -4989,6 +5285,7 @@ mod tests {
             released: AtomicBool::new(false),
             unwinding: Arc::new(Mutex::new(None)),
             execution: Mutex::new(None),
+            submit_gate: Mutex::new(()),
             execution_changed: tokio::sync::watch::Sender::new(0),
             child: Mutex::new(None),
             rec,
