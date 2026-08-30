@@ -5181,8 +5181,8 @@ mod tests {
                 .expect("the waiter is registered")
                 .done;
             let _ = done.send(Ok(Output::interrupted(
-                "Not interrupted. Job 7 has already finished.",
-                crate::proto::Interrupted::AlreadyFinished,
+                "Nothing was running on this session's engine.",
+                crate::proto::Interrupted::NothingRunning,
             )));
         });
 
@@ -5311,7 +5311,6 @@ mod tests {
             (Interrupted::Raised, true, true),
             (Interrupted::AlreadyPending, true, false),
             (Interrupted::Barred, true, false),
-            (Interrupted::AlreadyFinished, false, false),
             (Interrupted::NothingRunning, false, false),
             (Interrupted::Sealed, false, false),
         ] {

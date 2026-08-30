@@ -491,25 +491,30 @@ impl Running {
     /// What a break named for `named` does when that is **not** the job on the engine thread —
     /// or `None` when it is, and the ordinary path applies.
     ///
-    /// The two cases need opposite answers and are told apart by the id alone. Ids are minted in
-    /// order and the worker runs them in order, so one **above** the running job has not started:
-    /// that is the case that must not be a no-op, because doing nothing would let it start once
-    /// the queue drained and hold the target for the bound it named — the opposite of what the
-    /// break asked for. It is barred instead ([`Self::barred`]). One *below* is over, and there
-    /// is nothing left to do about it.
+    /// It bars it ([`Self::barred`]), without asking whether the job is still queued or has
+    /// already finished, **because nothing here can tell**. The first draft did ask, by comparing
+    /// ids: they are minted in order, so one above the running job looked like one that had not
+    /// started. That is not sound. `Sessions::call_within` and `Sessions::start_execution` both
+    /// allocate a job id *before* taking `Session::submit_gate`, so a task descheduled between
+    /// the two is overtaken and enqueued behind a **larger** id — and the run that most needs
+    /// barring is then read as one that has already ended, left to start when the queue drains
+    /// and hold the target for the bound it named. Ordering the ids would work and is the wrong
+    /// fix: it keeps the inference and props it up with an invariant three call sites have to
+    /// maintain, where the next one to allocate an id elsewhere breaks it silently again.
     ///
-    /// Nothing running counts as "has not started", which is not an edge case: the engine thread
-    /// being between jobs with this very resume next in the queue is precisely when barring
-    /// matters most.
+    /// Barring unconditionally needs no invariant. Ids are minted once per session and never
+    /// reused, so barring a job that has already run is a no-op that can never match anything
+    /// later — and a session holds one run at a time, so there is only ever one queued resume for
+    /// the single slot to hold.
+    ///
+    /// What it costs is the *report*: this can no longer say which of the two it was, and so it
+    /// does not. That precision was invented rather than known.
     fn break_for_other(&mut self, named: u64) -> Option<Interrupted> {
         if self.job == Some(named) {
             return None;
         }
-        if self.job.is_none_or(|current| named > current) {
-            self.barred = Some(named);
-            return Some(Interrupted::Barred);
-        }
-        Some(Interrupted::AlreadyFinished)
+        self.barred = Some(named);
+        Some(Interrupted::Barred)
     }
 
     /// Records that this session is ending, and reports the job pumping a resumed target if one
@@ -1213,19 +1218,13 @@ fn interrupt_running(bound: Option<u64>) -> Result<(Interrupted, String), String
     {
         return Ok((
             outcome,
-            match outcome {
-                Interrupted::Barred => format!(
-                    "Job {named} had not started yet — it is queued behind other work on this \
-                     session's engine — so there was no pump to interrupt and it has been barred \
-                     from starting instead. It will not set the target going, and its own reply \
-                     says so."
-                ),
-                _ => format!(
-                    "Not interrupted. Job {named} has already finished, so nothing was sent \
-                     rather than breaking in on work that was not asked about. Job {named}'s own \
-                     reply says how it ended."
-                ),
-            },
+            format!(
+                "Job {named} is not what this session's engine is running, so nothing was sent — \
+                 breaking in on work that was not asked about is the one thing naming the job \
+                 prevents. It has been barred instead: if it is still queued behind other work it \
+                 will not set the target going, and if it has already finished its own reply says \
+                 how it ended."
+            ),
         ));
     }
     let Some(job) = running.job else {
@@ -6476,57 +6475,52 @@ mod tests {
         );
     }
 
-    /// A break for a run that has not started yet bars it, rather than doing nothing.
+    /// A break for a run that is not the one on the engine bars it, rather than doing nothing.
     ///
-    /// `break_in` names its run's job so the break cannot be rebound to whatever the engine thread
-    /// is doing instead — but refusing to rebind is only half an answer. The run is still in the
-    /// queue, and left alone it starts the moment the queue drains and holds the target for the
+    /// Naming the job stops the break being rebound to whatever the engine thread is doing
+    /// instead — but refusing to rebind is only half an answer. The run may still be *in the
+    /// queue*, and left alone it starts the moment the queue drains and holds the target for the
     /// bound it named, which may be an hour: the caller asked for the target to stop and got a
     /// target that had not started yet and then did.
     ///
-    /// Which of the two it is comes from the id alone. Ids are minted in order and run in order,
-    /// so above the running job is queued and below it is over.
+    /// **Unconditionally**, in either id direction, because nothing here can tell a queued job
+    /// from a finished one — a job id is allocated before `Session::submit_gate` is taken, so a
+    /// task overtaken between the two is enqueued behind a larger id. Reading the smaller id as
+    /// "already finished" would skip barring the very run that needs it. Barring one that has
+    /// already run is a no-op, since ids are never reused.
     #[test]
-    fn a_break_for_a_run_that_has_not_started_bars_it() {
-        let mut running = idle();
-        running.claim(4);
+    fn a_break_for_a_run_that_is_not_running_bars_it_either_way() {
+        for (running_job, named) in [(4, 9), (9, 4)] {
+            let mut running = idle();
+            running.claim(running_job);
+            assert_eq!(
+                running.break_for_other(named),
+                Some(Interrupted::Barred),
+                "job {named} is not job {running_job}, and which of them is the larger says \
+                 nothing about which reaches the engine thread first"
+            );
+            running.release(running_job);
+            running.claim(named);
+            assert!(
+                matches!(running.claim_pump(named), Err(PumpRefused::BrokenIn)),
+                "and when it is dequeued it must not set the target going: the break that could \
+                 not reach it is honoured here or nowhere"
+            );
+        }
 
-        assert_eq!(
-            running.break_for_other(9),
-            Some(Interrupted::Barred),
-            "job 9 is above the running job, so it is still in the queue"
-        );
-        running.release(4);
-        running.claim(9);
-        assert!(
-            matches!(running.claim_pump(9), Err(PumpRefused::BrokenIn)),
-            "and when it is dequeued it must not set the target going: the break that could not \
-             reach it is honoured here or nowhere"
-        );
-
-        // The other direction is a job that is over, and there is nothing to do about it.
-        let mut running = idle();
-        running.claim(9);
-        assert_eq!(
-            running.break_for_other(4),
-            Some(Interrupted::AlreadyFinished),
-            "job 4 is below the running job, so it has already ended"
-        );
-        assert!(
-            running.claim_pump(9).is_ok(),
-            "and barring nothing, the job actually running is untouched — which is the whole \
-             point of naming the job on the request"
-        );
-
-        // Between jobs is "has not started", not "nothing to do": the resume may be next in the
-        // queue, which is exactly when barring matters.
+        // Between jobs is barred too, and is not an edge case: the resume may be next in the
+        // queue, which is exactly when barring matters most.
         let mut running = idle();
         assert_eq!(running.break_for_other(1), Some(Interrupted::Barred));
 
-        // And the job that *is* running takes the ordinary path rather than either of these.
+        // The job that *is* running takes the ordinary path instead — it has a pump to interrupt.
         let mut running = idle();
         running.claim(3);
         assert_eq!(running.break_for_other(3), None);
+        assert!(
+            running.claim_pump(3).is_ok(),
+            "and nothing barred it, which is the whole point of naming the job on the request"
+        );
     }
 
     /// The bar stays up. A session that is ending does not stop ending because a job finished.
