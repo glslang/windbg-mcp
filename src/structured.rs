@@ -1152,9 +1152,9 @@ impl From<&dbgscope::allocator::LayoutProvenance> for AllocatorLayoutInfo {
 /// How much of an allocator the walk behind an answer actually covered.
 ///
 /// Every allocator answer carries this, because every one of them is drawn from a snapshot and a
-/// count taken from a partial snapshot is a floor rather than a total. The three ways of falling
-/// short are separate values because they need different responses; a fourth — the walk failing
-/// outright, or being interrupted — is not a coverage state at all but the `error` branch of
+/// count taken from a partial snapshot is a floor rather than a total. The ways of falling short
+/// are separate values because they need different responses; a walk failing outright, or being
+/// interrupted, is not a coverage state at all but the `error` branch of
 /// [`Outcome`], with category [`ErrorCategory::Debugger`] or [`ErrorCategory::Interrupted`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -1170,6 +1170,10 @@ pub enum AllocatorCoverage {
     /// mid-chunk, a traversal cap. `pool_diagnostics` says which. Unlike `deadline_truncated`,
     /// more time changes nothing.
     Partial,
+    /// The caller's `stop_after_matches` threshold was reached. This is an intentional partial
+    /// answer rather than a deadline or decoder failure; `walk.stop_after_matches` names the
+    /// threshold that fired.
+    MatchLimitReached,
 }
 
 impl AllocatorCoverage {
@@ -1178,6 +1182,7 @@ impl AllocatorCoverage {
             Self::Complete => "complete",
             Self::DeadlineTruncated => "deadline_truncated",
             Self::Partial => "partial",
+            Self::MatchLimitReached => "match_limit_reached",
         }
     }
 }
@@ -1197,6 +1202,10 @@ impl From<dbgscope::pool::query::WalkCoverage> for AllocatorCoverage {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WalkInfo {
     pub coverage: AllocatorCoverage,
+    /// The requested match threshold that intentionally stopped this walk. Absent when the
+    /// threshold was not reached or a complete cached snapshot answered the query.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_after_matches: Option<usize>,
     /// Chunks the walk indexed, allocated and free.
     pub chunks_walked: usize,
     pub allocated_chunks: usize,
@@ -1382,11 +1391,14 @@ pub struct PoolTagMatches {
     pub raw_tag: String,
     pub scope: PoolScope,
     /// How many allocated chunks carry the tag. A floor rather than a total unless
-    /// `walk.coverage` is `complete`.
+    /// `walk.coverage` is `complete`; when it is `match_limit_reached`, this is the threshold
+    /// reached by the intentional early stop.
     pub matches: usize,
-    /// Their total size in bytes, over all matches — not only the ones listed.
+    /// Their total size in bytes, over every match the walk found — not only the ones listed.
+    /// This is a floor unless `walk.coverage` is `complete`.
     pub total_bytes: u64,
-    /// The matches themselves, capped by the call's `limit`; `matches` is the full count.
+    /// The matches themselves, capped by the call's rendering `limit`; `matches` is the full
+    /// count from this walk.
     pub chunks: Vec<PoolChunkInfo>,
     pub walk: WalkInfo,
 }
@@ -2459,7 +2471,7 @@ mod tests {
         assert_eq!(finite["value"], 1.5);
     }
 
-    /// The three coverage states stay distinct across the seam: collapsing `deadline_truncated`
+    /// The engine's three coverage states stay distinct across the seam: collapsing `deadline_truncated`
     /// into `partial` would tell a caller that waiting longer cannot help, when it is the one
     /// thing that would.
     #[test]
@@ -2478,6 +2490,12 @@ mod tests {
             assert_eq!(expected.as_str(), wire);
             assert_eq!(serde_json::to_value(expected).unwrap(), wire);
         }
+        let intentional = AllocatorCoverage::MatchLimitReached;
+        assert_eq!(intentional.as_str(), "match_limit_reached");
+        assert_eq!(
+            serde_json::to_value(intentional).unwrap(),
+            "match_limit_reached"
+        );
     }
 
     #[test]
@@ -2538,6 +2556,7 @@ mod tests {
             total_chunks: 0,
             allocated_chunks: 0,
             coverage: dbgscope::pool::query::WalkCoverage::Partial,
+            stopped_after_matches: None,
             diagnostics: dbgscope::pool::PoolDiagnostics::default(),
             stalls,
             refused_chunks,
@@ -2576,6 +2595,7 @@ mod tests {
         // would be a shape change on every healthy pool answer — the ones that are fine.
         let walk = |gaps| WalkInfo {
             coverage: AllocatorCoverage::Partial,
+            stop_after_matches: None,
             chunks_walked: 0,
             allocated_chunks: 0,
             diagnostics_emitted: 0,

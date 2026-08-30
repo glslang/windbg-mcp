@@ -33,6 +33,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::num::NonZeroU32;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Duration;
 
@@ -149,7 +150,8 @@ const FAILED_OUTPUT_CHARS: usize = 8_000;
 /// `refresh` is what makes a pool step expensive — it re-walks every committed page — and inside a
 /// batch that walk is bounded by the *step's* share of the budget rather than by dbgscope's own
 /// default, which is longer than most batches. A walk cut short says how much of the pool it
-/// covered, so the answer stays honest; see [`Debuggee::pool`].
+/// covered, so the answer stays honest; `pool_find_tag` may also stop deliberately at its
+/// `stop_after_matches` threshold. See [`Debuggee::pool`].
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum StepAction {
@@ -195,7 +197,7 @@ pub enum StepAction {
         #[serde(default)]
         refresh: Option<bool>,
     },
-    /// Every allocated chunk carrying `tag` — the `pool_find_tag` tool.
+    /// Allocated chunks carrying `tag` — the `pool_find_tag` tool.
     PoolFindTag {
         tag: String,
         /// true = paged only, false = nonpaged only, omitted = both.
@@ -203,6 +205,10 @@ pub enum StepAction {
         paged: Option<bool>,
         #[serde(default)]
         refresh: Option<bool>,
+        /// Stop a newly started walk after this many matches. Must be nonzero. `limit` controls
+        /// only how many rows are printed.
+        #[serde(default)]
+        stop_after_matches: Option<NonZeroU32>,
         #[serde(default)]
         limit: Option<u32>,
     },
@@ -230,7 +236,7 @@ impl StepAction {
             Self::Eval { .. } => &["expr"],
             Self::ReadMemory { .. } => &["address", "size"],
             Self::PoolChunk { .. } => &["address", "refresh"],
-            Self::PoolFindTag { .. } => &["tag", "paged", "refresh", "limit"],
+            Self::PoolFindTag { .. } => &["tag", "paged", "refresh", "stop_after_matches", "limit"],
             Self::PoolCensus { .. } => &["refresh", "limit"],
         };
         key == "op" || fields.contains(&key)
@@ -254,16 +260,22 @@ impl StepAction {
                 tag,
                 paged,
                 refresh,
+                stop_after_matches,
                 ..
-            } => format!(
-                "pool chunks tagged {tag}{}{}",
-                match paged {
-                    Some(true) => " in paged pool",
-                    Some(false) => " in nonpaged pool",
-                    None => "",
-                },
-                walk_kind(*refresh)
-            ),
+            } => {
+                let stop = stop_after_matches.map_or_else(String::new, |matches| {
+                    format!(", stop after {} match(es)", matches.get())
+                });
+                format!(
+                    "pool chunks tagged {tag}{}{stop}{}",
+                    match paged {
+                        Some(true) => " in paged pool",
+                        Some(false) => " in nonpaged pool",
+                        None => "",
+                    },
+                    walk_kind(*refresh)
+                )
+            }
             Self::PoolCensus { refresh, .. } => format!("pool census{}", walk_kind(*refresh)),
         }
     }
@@ -310,11 +322,13 @@ impl StepAction {
                 tag,
                 paged,
                 refresh,
+                stop_after_matches,
                 limit,
             } => Self::PoolFindTag {
                 tag: substitute(tag, resolve)?,
                 paged: *paged,
                 refresh: *refresh,
+                stop_after_matches: *stop_after_matches,
                 limit: *limit,
             },
             Self::PoolCensus { refresh, limit } => Self::PoolCensus {
@@ -1312,9 +1326,10 @@ fn run_step(
             tag,
             paged,
             refresh,
+            stop_after_matches,
             limit,
         } => d.pool(
-            &PoolOp::find_tag(tag.clone(), *paged, *refresh, *limit),
+            &PoolOp::find_tag(tag.clone(), *paged, *refresh, *stop_after_matches, *limit),
             budget_ms,
         ),
         StepAction::PoolCensus { refresh, limit } => {
@@ -3508,6 +3523,7 @@ mod tests {
                 tag: "{{nope}}".to_string(),
                 paged: None,
                 refresh: None,
+                stop_after_matches: None,
                 limit: None,
             },
             StepAction::PoolChunk {
@@ -3539,7 +3555,8 @@ mod tests {
             serde_json::json!({"op": "pool_chunk", "address": "0xffffc00f6ec02f90"}),
             serde_json::json!({"op": "pool_chunk", "address": "{{obj}}", "refresh": true}),
             serde_json::json!({
-                "op": "pool_find_tag", "tag": "Tgsm", "paged": false, "refresh": true, "limit": 32
+                "op": "pool_find_tag", "tag": "Tgsm", "paged": false, "refresh": true,
+                "stop_after_matches": 1, "limit": 32
             }),
             serde_json::json!({"op": "pool_census", "refresh": true, "limit": 200}),
         ] {
@@ -3550,6 +3567,28 @@ mod tests {
                 step.unknown_fields()
             );
         }
+    }
+
+    #[test]
+    fn a_pool_match_threshold_must_be_nonzero() {
+        let json = serde_json::json!({
+            "op": "pool_find_tag", "tag": "Tgsm", "stop_after_matches": 0
+        });
+        assert!(serde_json::from_value::<BatchStep>(json).is_err());
+    }
+
+    #[test]
+    fn a_pool_step_report_names_its_match_threshold() {
+        let action = StepAction::PoolFindTag {
+            tag: "Tgsm".into(),
+            paged: Some(false),
+            refresh: Some(true),
+            stop_after_matches: NonZeroU32::new(2),
+            limit: Some(1),
+        };
+        let rendered = action.rendered();
+        assert!(rendered.contains("stop after 2 match(es)"), "{rendered}");
+        assert!(rendered.contains("fresh walk"), "{rendered}");
     }
 
     /// A batch is a value that crosses a process boundary, so it has to survive its own encoding.

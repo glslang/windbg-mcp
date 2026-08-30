@@ -11880,7 +11880,8 @@ fn a_messagemanager_ctf_fixture_is_visible_through_mcp() {
                 "tag": "Tgsm",
                 "paged": false,
                 "refresh": true,
-                "limit": 32,
+                "stop_after_matches": 1,
+                "limit": 1,
                 "session_id": session,
             }),
             POOL_CALL_BUDGET,
@@ -11893,12 +11894,19 @@ fn a_messagemanager_ctf_fixture_is_visible_through_mcp() {
             symbols.transcript
         );
         let matches = call["result"]["structuredContent"].clone();
-        assert!(
-            matches["matches"].as_u64().unwrap_or_default() > 0,
+        assert_eq!(
+            matches["matches"].as_u64(),
+            Some(1),
             "the target fixture retained `Tgsm` messages, but the MCP pool snapshot did not find \
              them. Read the walk's coverage before treating an incomplete walk as an allocator \
              result: {matches}"
         );
+        assert_eq!(
+            matches["walk"]["coverage"], "match_limit_reached",
+            "an existence query must report its deliberate early stop separately from a deadline \
+             or decoder failure: {matches}"
+        );
+        assert_eq!(matches["walk"]["stop_after_matches"], 1, "{matches}");
         // Every chunk it hands back really carries the tag that was asked for, at an address in
         // this server's one representation — the two claims a caller acts on.
         for chunk in matches["chunks"].as_array().into_iter().flatten() {

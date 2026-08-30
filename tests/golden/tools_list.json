@@ -1042,6 +1042,7 @@
         "paged: boolean|null",
         "refresh: boolean|null",
         "session_id: string|null",
+        "stop_after_matches: integer|null/uint32",
         "tag: string"
       ],
       "required": [

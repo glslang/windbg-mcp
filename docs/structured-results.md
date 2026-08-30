@@ -33,11 +33,19 @@ Two conventions hold across all of them:
   past 2^53 does not survive a JSON parser that reads numbers as doubles; zero-padded so lexical
   order matches numeric order. The debugger's backtick form (``fffff803`1ab10000``) appears only in
   the text.
-- **An allocator answer says what the walk covered.** `walk.coverage` is `complete`, `deadline_truncated`
-  (the call's budget ran out — more time reaches more of the allocator) or `partial` (unreadable regions
-  or a traversal cap — more time changes nothing). Counts from anything but `complete` are floors,
-  not totals. A walk that failed outright, or was stopped by `interrupt`, is not a coverage state at
-  all: it is the error branch below, with category `debugger` or `interrupted`.
+- **An allocator answer says what the walk covered.** `walk.coverage` is `complete`,
+  `deadline_truncated` (the call's budget ran out — more time reaches more of the allocator),
+  `partial` (unreadable regions or a traversal cap — more time changes nothing), or
+  `match_limit_reached` (`pool_find_tag` deliberately stopped at the nonzero
+  `walk.stop_after_matches` threshold). Counts from anything but `complete` are floors, not totals.
+  A walk that failed outright, or was stopped by `interrupt`, is not a coverage state at all: it is
+  the error branch below, with category `debugger` or `interrupted`.
+
+For `pool_find_tag`, `stop_after_matches` and `limit` answer different questions. The first bounds
+a newly started walk and therefore makes its result intentionally partial; the second only caps
+the `chunks` rendered after the walk and never changes `matches` or `total_bytes`. If the session
+already holds a complete cached snapshot, it is reused and the answer remains exhaustive even when
+`stop_after_matches` was supplied.
 
 One caveat about "also", measured rather than assumed: a client that understands
 `structuredContent` generally forwards **it** to the model and drops the text block, rather than

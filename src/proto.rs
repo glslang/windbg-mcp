@@ -24,6 +24,7 @@
 //! property of the plumbing rather than a convention about who prints where — which is what lets
 //! the framing stay line-delimited and cheap.
 
+use std::num::NonZeroU32;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -425,12 +426,13 @@ pub struct ReachabilityOp {
 /// come to disagree about what `limit` means.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PoolOp {
-    /// Every *allocated* chunk carrying `tag`.
+    /// Allocated chunks carrying `tag`, optionally stopping a new walk at a match threshold.
     FindTag {
         tag: String,
         /// `Some(true)` paged only, `Some(false)` nonpaged only, `None` both.
         paged: Option<bool>,
         refresh: bool,
+        stop_after_matches: Option<NonZeroU32>,
         limit: usize,
     },
     /// The chunk containing `address`, with its immediate neighbours.
@@ -488,17 +490,19 @@ impl PoolOp {
     const CENSUS_ROWS: u32 = 40;
     const DIAGNOSTIC_LINES: u32 = 60;
 
-    /// Every allocated chunk carrying `tag`.
+    /// Allocated chunks carrying `tag`, optionally stopping a new walk at a match threshold.
     pub fn find_tag(
         tag: String,
         paged: Option<bool>,
         refresh: Option<bool>,
+        stop_after_matches: Option<NonZeroU32>,
         limit: Option<u32>,
     ) -> Self {
         Self::FindTag {
             tag,
             paged,
             refresh: refresh.unwrap_or(false),
+            stop_after_matches,
             limit: clamp_rows(limit, Self::FIND_TAG_ROWS),
         }
     }
@@ -735,7 +739,7 @@ mod tests {
     #[test]
     fn the_slot_the_pump_writes_is_the_one_that_crosses_the_pipe() {
         let mut op = EngineOp::Pool {
-            query: PoolOp::find_tag("Tgsm".into(), None, None, None),
+            query: PoolOp::find_tag("Tgsm".into(), None, None, None, None),
             patience_ms: 0,
         };
         *op.patience_slot().expect("a pool query carries one") = 42_000;
@@ -743,6 +747,23 @@ mod tests {
             unreachable!("still a pool query")
         };
         assert_eq!(patience_ms, 42_000);
+    }
+
+    #[test]
+    fn a_find_tag_match_threshold_does_not_change_its_rendering_limit() {
+        let Some(threshold) = NonZeroU32::new(3) else {
+            unreachable!()
+        };
+        let PoolOp::FindTag {
+            stop_after_matches,
+            limit,
+            ..
+        } = PoolOp::find_tag("Tgsm".into(), None, None, Some(threshold), Some(1))
+        else {
+            unreachable!("still a tag query")
+        };
+        assert_eq!(stop_after_matches.map(NonZeroU32::get), Some(3));
+        assert_eq!(limit, 1);
     }
 
     /// The module listing's cap is the supervisor's to apply, like the allocator ones — so a

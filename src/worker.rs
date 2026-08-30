@@ -35,6 +35,7 @@
 
 use std::collections::{BTreeSet, HashSet};
 use std::io::{BufRead, BufReader, PipeReader, PipeWriter, Write};
+use std::num::NonZeroUsize;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -4068,6 +4069,14 @@ fn diagnostic_categories(diagnostics: &PoolDiagnostics) -> Vec<&DiagnosticShape>
 /// drawn from what the walk indexed, so under partial coverage a count is a floor. Saying so
 /// is the difference between "there are three of these" and "these are the three I could see".
 fn coverage_caveat(report: &query::PoolSnapshotReport) -> Option<String> {
+    if let Some(matches) = report.stopped_after_matches {
+        return Some(format!(
+            "\n--- pool walk ---\ncoverage: MATCH LIMIT REACHED - stopped after {matches} \
+             matching allocated chunk(s), having walked {} chunk(s). What is listed above is \
+             intentionally partial; omit or raise `stop_after_matches` for more.\n",
+            report.total_chunks
+        ));
+    }
     if report.coverage.complete() {
         return None;
     }
@@ -4098,10 +4107,10 @@ fn render_walk_report(report: &query::PoolSnapshotReport) -> String {
         "\n--- pool walk ---\nchunks walked: {} ({} allocated), coverage: {}\n",
         report.total_chunks,
         report.allocated_chunks,
-        if report.coverage.complete() {
-            "complete"
-        } else {
-            "INCOMPLETE - the walk did not reach everything it set out to"
+        match report.stopped_after_matches {
+            Some(_) => "match_limit_reached - the requested match threshold stopped the walk",
+            None if report.coverage.complete() => "complete",
+            None => "INCOMPLETE - the walk did not reach everything it set out to",
         }
     );
     if report.diagnostics.is_empty() {
@@ -4167,6 +4176,7 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
             tag,
             paged,
             refresh,
+            stop_after_matches,
             limit,
         } => {
             let filter = paged.map(|paged| {
@@ -4176,7 +4186,14 @@ fn pool(e: &DebugEngine, args: PoolOp, within: Duration) -> Result<Output, Faile
                     PoolPageFilter::NonPaged
                 }
             });
-            let answer = query::find_tag(e, &tag, filter, walk(refresh)).map_err(pool_failure)?;
+            let answer = query::find_tag(
+                e,
+                &tag,
+                filter,
+                stop_after_matches.and_then(|matches| NonZeroUsize::new(matches.get() as usize)),
+                walk(refresh),
+            )
+            .map_err(pool_failure)?;
             let spans = &answer.found;
             let mut out = render_find_tag(&tag, filter, spans, limit);
             if spans.is_empty() {
@@ -4728,7 +4745,12 @@ fn heap(e: &DebugEngine, args: HeapOp, within: Duration) -> Result<Output, Faile
 /// answer, from the same snapshot. There is no "could not read the walk" case left to render.
 fn walk_info(report: &query::PoolSnapshotReport) -> structured::WalkInfo {
     structured::WalkInfo {
-        coverage: report.coverage.into(),
+        coverage: if report.stopped_after_matches.is_some() {
+            structured::AllocatorCoverage::MatchLimitReached
+        } else {
+            report.coverage.into()
+        },
+        stop_after_matches: report.stopped_after_matches,
         chunks_walked: report.total_chunks,
         allocated_chunks: report.allocated_chunks,
         diagnostics_emitted: report.diagnostics.emitted(),
@@ -5508,6 +5530,7 @@ mod tests {
             total_chunks: 0,
             allocated_chunks: 0,
             coverage: coverage(true),
+            stopped_after_matches: None,
             diagnostics: PoolDiagnostics::default(),
             stalls: WalkStalls::default(),
             refused_chunks: 0,
@@ -5544,6 +5567,14 @@ mod tests {
             ),
             (2, 0x2000, 0x8000, 7)
         );
+
+        report.stopped_after_matches = Some(2);
+        let intentional = walk_info(&report);
+        assert_eq!(
+            intentional.coverage,
+            structured::AllocatorCoverage::MatchLimitReached
+        );
+        assert_eq!(intentional.stop_after_matches, Some(2));
     }
 
     fn report_with(complete: bool, diagnostics: &[&str]) -> query::PoolSnapshotReport {
@@ -5813,6 +5844,16 @@ mod tests {
         assert!(caveat.contains("4211"), "{caveat}");
         // Not merely "incomplete": the caller has to know which way the number is wrong.
         assert!(caveat.contains("floor"), "{caveat}");
+    }
+
+    #[test]
+    fn an_intentional_match_stop_names_the_condition_instead_of_a_failure() {
+        let mut report = report(false);
+        report.stopped_after_matches = Some(1);
+        let caveat = coverage_caveat(&report).expect("an early stop must be explained");
+        assert!(caveat.contains("MATCH LIMIT REACHED"), "{caveat}");
+        assert!(caveat.contains("stopped after 1"), "{caveat}");
+        assert!(!caveat.contains("INCOMPLETE"), "{caveat}");
     }
 
     /// The other half: a complete walk must not decorate every answer with a warning, or the
@@ -8150,7 +8191,7 @@ mod tests {
     #[test]
     fn only_a_query_that_must_walk_is_refused_for_want_of_time() {
         assert!(PoolOp::census(Some(true), None).refreshes());
-        assert!(PoolOp::find_tag("Tgsm".into(), None, Some(true), None).refreshes());
+        assert!(PoolOp::find_tag("Tgsm".into(), None, Some(true), None, None).refreshes());
         assert!(PoolOp::chunk("0x1000".into(), Some(true)).refreshes());
         assert!(PoolOp::diagnostics(None, Some(true), None).refreshes());
 

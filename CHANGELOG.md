@@ -50,6 +50,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no processor number applies, which every user-mode target is). A position on its own does not
   identify a stop on a multi-threaded target, and the alternative was parsing `~.`, whose text is
   one shape for a thread and another for a processor. Both come from new typed `dbgscope` readers.
+- **`pool_find_tag` can answer existence and bounded-cardinality questions without walking the
+  entire kernel pool** ([#86](https://github.com/glslang/windbg-mcp/issues/86)). Pass the nonzero
+  `stop_after_matches` threshold to stop a newly started walk as soon as that many matching
+  allocated chunks are decoded. The result reports `walk.coverage: "match_limit_reached"` and
+  echoes the threshold in `walk.stop_after_matches`; its counts and byte total are explicitly
+  floors. These deliberately partial snapshots are never cached as exhaustive. A complete cached
+  snapshot is still reused and stays complete, while `limit` remains the independent rendering
+  cap. The `debug_batch` `pool_find_tag` step accepts the same field.
 
 ### Fixed
 
