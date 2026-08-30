@@ -298,15 +298,19 @@ None of these is a bug. They are recorded because they were invisible, and
    **Finding 1's answer does not transfer here, and that is what settled it.** Prose came out of the
    output schemas because nothing read it. Prose in an *input* schema is the opposite: it is most of
    what tells a model how to drive the tool, and `debug_batch` is the tool where getting that wrong
-   leaves a patched byte in a running kernel. Measured across all 51 tools, **74% of the
-   model-visible surface is prose** — 24,902 B of tool descriptions and 25,333 B inside the input
-   schemas — so a strip here buys context by making the tools harder to drive correctly.
+   leaves a patched byte in a running kernel. Measured across all 54 tools, **70% of the
+   model-visible surface is prose** — 28,118 B of tool descriptions and 24,015 B in the 152
+   `description` strings nested inside the input schemas — so a strip here buys context by making
+   the tools harder to drive correctly. (Re-derived 2026-08-30 by walking a `tools/list`; the
+   figures it replaces were 74%, 24,902 and 25,333, and were a percentage of **67,873** — a surface
+   total two re-derivations out of date, which is how a share can go stale without its own
+   arithmetic ever being wrong.)
 
    The structural remainder does not pay for the risk either. Dropping `"default": null`, which
-   schemars emits 109 times and which tells a model nothing an absent field does not, is 1,744 B —
-   2.6%. The other candidates are not free: `$schema` is 2,850 B but is how a client picks a
+   schemars emits 115 times and which tells a model nothing an absent field does not, is 1,725 B —
+   2.3%. The other candidates are not free: `$schema` is 3,021 B but is how a client picks a
    validator dialect (and `tool_schemas_declare_one_dialect_and_are_self_contained` pins it), and
-   `minimum`/`format` are constraints. **Roughly 1.7 KB of 68,893 is the whole honest total** for
+   `minimum`/`format` are constraints. **Roughly 1.7 KB of 73,996 is the whole honest total** for
    trimming the schemas.
 
    So the third lever is the one taken: `--tools` (`src/toolset.rs`) advertises a named subset. A
@@ -316,26 +320,27 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 10 | 15,969 | 23.2% |
-   | `session` | 10 | 12,606 | 18.3% |
-   | `inspect` | 9 | 10,786 | 15.7% |
-   | `batch` | 1 | 9,798 | 14.2% |
-   | `ttd` | 9 | 6,829 | 9.9% |
-   | `ioctl` | 6 | 6,494 | 9.4% |
-   | `exec` | 5 | 3,475 | 5.0% |
-   | `crash` | 1 | 2,936 | 4.3% |
+   | `allocator` | 10 | 15,969 | 21.6% |
+   | `session` | 10 | 12,817 | 17.3% |
+   | `inspect` | 9 | 10,786 | 14.6% |
+   | `batch` | 1 | 9,798 | 13.2% |
+   | `exec` | 8 | 8,367 | 11.3% |
+   | `ttd` | 9 | 6,829 | 9.2% |
+   | `ioctl` | 6 | 6,494 | 8.8% |
+   | `crash` | 1 | 2,936 | 4.0% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 51 | 68,893 |
-   | `session,inspect,exec,crash` | 25 | 28,882 |
+   | *(absent)* | 54 | 73,996 |
+   | `session,inspect,exec,crash` | 28 | 33,985 |
    | `session,inspect,crash` | 20 | 25,465 |
    | `crash` | 11 | 14,587 |
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`
-   is 14,587 rather than the 15,542 its two rows sum to, because five cross-references leave with
-   the tools they name.
+   is 14,587 rather than the 15,753 its two rows sum to, because the cross-references leave with
+   the tools they name — 1,166 B of them, pointing at `modules`, `debug_batch`, `backtrace`,
+   `continue_async` and `break_in`.
 
    `session` is in every surface because every other tool routes by a `session_id` this server is
    the only issuer of — 11,714 B is the floor, and `crash` is eleven tools rather than one. The

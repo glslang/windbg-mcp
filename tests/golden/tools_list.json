@@ -3,7 +3,7 @@
     "(none)",
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 51,
+  "toolCount": 54,
   "tools": [
     {
       "hints": {
@@ -142,6 +142,78 @@
       ],
       "required": [],
       "title": "Show call stack"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "break_in",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/BreakInRequested",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "execution: string",
+        "session_id: string|null"
+      ],
+      "required": [
+        "execution"
+      ],
+      "title": "Break a run in"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "continue_async",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/ExecutionStarted",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "max_run_ms: integer|null/uint32",
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Continue without waiting"
     },
     {
       "hints": {
@@ -1482,6 +1554,44 @@
         "size"
       ],
       "title": "TTD: find accesses to a memory range"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "wait_for_stop",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/StopWait",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "execution: string",
+        "session_id: string|null",
+        "timeout_ms: integer|null/uint32"
+      ],
+      "required": [
+        "execution"
+      ],
+      "title": "Wait for a run to stop"
     },
     {
       "hints": {

@@ -1747,7 +1747,7 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
     })
 }
 
-/// Ceiling on the tool surface a model is given before it has asked anything. 73,785 bytes across
+/// Ceiling on the tool surface a model is given before it has asked anything. 73,996 bytes across
 /// 54 tools (~18k tokens), +12% headroom — sized so that rewording a description passes and a new
 /// tool arriving with a `debug_batch`-scale schema does not.
 ///
@@ -1757,10 +1757,11 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// paid by every client served `exec` at the start of every conversation. `--tools` is the answer
 /// for a client that cannot afford it.
 ///
-/// The figure above is **derived, not measured**: the recorded golden summed to 68,893 across 51
-/// tools and CI reported the three new rows, so it is 68,893 + 4,892. Re-recording
-/// `tests/golden/tool_budget.json` is what replaces it with a measurement — and if the two
-/// disagree, this comment is what was wrong.
+/// **The fourth tool that raise paid for is `interrupt`**, which grew 211 B without being touched:
+/// a `TOOL_NOTES` cross-reference to `continue_async`, appended only where that tool is served.
+/// So 68,893 + 4,892 came to 73,785 and the measurement is 73,996 — the arithmetic was right and
+/// the model of it was not, which is the failure mode a derived figure has and a recorded one
+/// does not. It is why `tests/golden/tool_budget.json` is the source and this line is a ceiling.
 const MODEL_VISIBLE_CEILING: usize = 83_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
@@ -2106,9 +2107,9 @@ fn every_tool_belongs_to_exactly_one_group() {
 
 /// A narrowed surface serves fewer tools, and says so rather than pretending the rest never were.
 ///
-/// The measurement behind `--tools` is that three quarters of the 68,893-byte tool surface is
-/// prose a model needs, so the only way to spend less of a caller's context is to offer fewer
-/// tools — `FOLLOWUPS.md` item 24. This asserts the three things that makes true.
+/// The measurement behind `--tools` is that 70% of the 73,996-byte tool surface is prose a model
+/// needs, so the only way to spend less of a caller's context is to offer fewer tools —
+/// `FOLLOWUPS.md` item 24. This asserts the three things that makes true.
 #[test]
 fn a_narrowed_tool_surface_serves_only_what_it_was_asked_for() {
     let mut server = Server::started_with_args(&[], &["--tools", "crash"]);
