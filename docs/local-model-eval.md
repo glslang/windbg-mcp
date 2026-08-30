@@ -499,12 +499,13 @@ python3 tools/local_model_eval.py --compare eval-out/after-206.jsonl eval-out/af
 ```
 
 ```text
-cell                                 bugcheck  driver_blame  module_count  unloaded_driver  arm64_pc  ioctl_decode
-opus   dflt min                      Y -> Y    Y -> Y        Y -> Y        - -> -           n -> n    o -> o
-sonnet   dflt min                    Y -> Y    Y -> Y        Y -> Y        - -> -           n -> n    o -> o
-gemma4:31b-mlx 262144 min            Y -> Y    Y -> Y        Y -> Y        - -> -           n -> n    o -> -
-nemotron-3.5-lightning:3 262144 min  Y -> Y    Y -> Y        Y -> n        - -> -           n -> n    - -> -
-qwen3.8:27b-mlx 262144 min           n -> Y    Y -> Y        Y -> Y        - -> -           n -> n    o -> -
+cell                                                bugcheck         driver_blame     module_count     unloaded_driver  arm64_pc         ioctl_decode
+----------------------------------------------------------------------------------------------------------------------------------------------------------
+claude-code opus   dflt min                         Y -> Y           Y -> Y           Y -> Y           - -> -           n -> n           o -> o
+claude-code sonnet   dflt min                       Y -> Y           Y -> Y           Y -> Y           - -> -           n -> n           o -> o
+ollama gemma4:31b-mlx 262144 min                    Y -> Y           Y -> Y           Y -> Y           - -> -           n -> n           o -> -
+ollama nemotron-3.5-lightning:3 262144 min          Y -> Y           Y -> Y           Y -> n           - -> -           n -> n           - -> -
+ollama qwen3.8:27b-mlx 262144 min                   n -> Y           Y -> Y           Y -> Y           - -> -           n -> n           o -> -
 
 old -> new per cell-task; `(old)`/`(new)` is a cell only one run covered.
 ```
@@ -513,8 +514,8 @@ A per-cell move, when there is one, prints under that legend:
 
 ```text
 cells where something besides the question moved:
-  qwen3.8:27b-mlx 262144 min               surface 11 tools, 14606 B -> 11 tools, 7732 B
-  gemma4:31b-mlx 262144 min                window 262144 -> 32768
+  ollama qwen3.8:27b-mlx 262144 min                    surface 11 tools, 14606 B -> 11 tools, 7732 B
+  ollama gemma4:31b-mlx 262144 min                     window 262144 -> 32768
 ```
 
 Those two runs were recorded before the identity fields existed, so nothing above the table names a
