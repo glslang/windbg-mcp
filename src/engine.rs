@@ -642,6 +642,16 @@ impl Execution {
         self.stopped.is_none()
     }
 
+    /// Whether the target has started moving — the [`WorkerMessage::Resumed`] milestone.
+    ///
+    /// Named rather than spelled out at each use, for the reason this branch keeps rediscovering:
+    /// a meaning written twice is one that drifts once. It is not the negation of anything here —
+    /// a run can be `!moving() && running()` (claimed, still queued) and `moving() && !running()`
+    /// (went, and has stopped).
+    fn moving(&self) -> bool {
+        self.moving_since.is_some()
+    }
+
     /// How long the target ran: frozen once it stopped, counting while it has not, and zero while
     /// the run is still queued and the target has not moved at all.
     fn ran_for(&self) -> Duration {
@@ -962,12 +972,12 @@ impl Session {
                 // about a call made ten minutes ago, and quoting the claim would call a queue
                 // wait a run. So: since the target went, or since the caller asked, and the
                 // sentence says which.
-                waited: if running.moving_since.is_some() {
+                waited: if running.moving() {
                     running.ran_for()
                 } else {
                     running.started.elapsed()
                 },
-                moving: running.moving_since.is_some(),
+                moving: running.moving(),
             });
         }
         *slot = Some(execution);
