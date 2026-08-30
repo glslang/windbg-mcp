@@ -37,13 +37,13 @@
       "wire": 2782
     },
     {
-      "annotations": 115,
+      "annotations": 114,
       "description": 860,
       "inputSchema": 466,
       "modelVisible": 1375,
       "name": "break_in",
       "outputSchema": 1260,
-      "wire": 2781
+      "wire": 2780
     },
     {
       "annotations": 124,
@@ -488,15 +488,15 @@
     }
   ],
   "totals": {
-    "annotations": 5763,
+    "annotations": 5762,
     "description": 28561,
     "inputSchema": 42620,
     "instructions": 1983,
     "modelVisible": 73996,
     "outputSchema": 111705,
-    "payload": 192971,
+    "payload": 192970,
     "tools": 54,
-    "wire": 192850,
+    "wire": 192849,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 9798
   }
