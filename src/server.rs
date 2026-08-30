@@ -4414,9 +4414,14 @@ impl WindbgServer {
         title = "Break a run in",
         read_only_hint = false,
         destructive_hint = false,
-        // Not idempotent, for `interrupt`'s reason: a second call is a second Ctrl+Break, which
-        // lands on whatever is running by then.
-        idempotent_hint = false,
+        // Idempotent, which is where this parts company with `interrupt` — and the difference is
+        // the whole reason this tool exists. `interrupt` addresses whichever job is running when
+        // it arrives, so a retry can stop an operation nobody asked it to; this one names a run,
+        // the break is bound to *that* job, and the worker bars rather than rebinds. So a repeat
+        // of the same call reaches the same run and adds nothing to it: a break already lodged
+        // answers `AlreadyPending` and sends nothing, a bar is an entry already in the set, and a
+        // handle whose run has since been replaced is stale rather than a second Ctrl+Break.
+        idempotent_hint = true,
         open_world_hint = true
     ),
         output_schema = constraints_of::<Outcome<structured::BreakInRequested>>()

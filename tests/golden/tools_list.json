@@ -146,7 +146,7 @@
     {
       "hints": {
         "destructive": false,
-        "idempotent": false,
+        "idempotent": true,
         "openWorld": true,
         "readOnly": false
       },
