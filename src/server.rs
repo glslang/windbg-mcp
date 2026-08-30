@@ -2455,10 +2455,19 @@ fn describe_execution(e: &structured::ExecutionInfo) -> String {
 /// What `continue_async` says in words.
 fn describe_started(started: &structured::ExecutionStarted) -> String {
     if !started.running {
+        // Two ways to be here and they need different sentences: a run that did what it was asked
+        // and finished before this answer was written, and a command that never set the target
+        // going at all. Telling a caller the target "never started moving" about a `g` that hit a
+        // breakpoint would send them looking for a fault that is not there.
+        let what = if started.moved {
+            "the target has already stopped — a run can reach its breakpoint before this call \
+             returns"
+        } else {
+            "the target never started moving — the command completed by itself"
+        };
         return format!(
-            "`{}` ran `{}` on session `{}` and the target never started moving — the command \
-             completed by itself. The run is over and its stop is already recorded against the \
-             handle; read it rather than waiting for one.",
+            "`{}` ran `{}` on session `{}` and {what}. The run is over and its stop is already \
+             recorded against the handle; read it rather than waiting for one.",
             started.execution, started.command, started.session_id
         );
     }
@@ -6097,6 +6106,7 @@ mod tests {
             execution: "exec-7".to_string(),
             command: "g".to_string(),
             running: true,
+            moved: true,
             breaks_in_ms: Some(60_000),
         });
         assert!(said.contains("exec-7"), "{said}");
@@ -6105,16 +6115,35 @@ mod tests {
 
         // The uncommon answer: the command finished without the target ever moving, so there is
         // nothing to wait for and saying "the target is running" would be false.
-        let already = describe_started(&structured::ExecutionStarted {
+        let never = describe_started(&structured::ExecutionStarted {
             session_id: "sess-1".to_string(),
             execution: "exec-8".to_string(),
             command: "g".to_string(),
             running: false,
+            moved: false,
             breaks_in_ms: None,
         });
         assert!(
-            already.contains("never started moving"),
-            "a run that never moved the target must not be reported as one that did: {already}"
+            never.contains("never started moving"),
+            "a run that never moved the target must not be reported as one that did: {never}"
+        );
+
+        // And the other uncommon answer, which is the one a `g` onto a nearby breakpoint gives
+        // routinely: the target moved and has already stopped. It must not be told it is running
+        // — there is nothing to go and do — nor that it never moved, which would send a caller
+        // looking for a fault that is not there.
+        let done = describe_started(&structured::ExecutionStarted {
+            session_id: "sess-1".to_string(),
+            execution: "exec-9".to_string(),
+            command: "g".to_string(),
+            running: false,
+            moved: true,
+            breaks_in_ms: None,
+        });
+        assert!(
+            done.contains("already stopped") && !done.contains("never started"),
+            "a run that moved and stopped is neither still running nor one that never went: \
+             {done}"
         );
     }
 

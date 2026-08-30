@@ -120,8 +120,8 @@ leaving an engine thread waiting for ever with nobody watching. A run that ends 
 arrives on the next `wait_for_stop`. It is bound to the run you name, so it can never land on
 whatever the session started next — and a run that had not begun yet, because something else was
 still on the engine, is **barred from starting** rather than left to run once the queue drains. It
-answers `requested: false` — not an error — only when the run had already finished and there was
-nothing to stop, which is the ordinary race between reading a handle and acting on it. A break that
+answers `requested: false` — not an error — only when the run had already stopped by the time the
+call looked, which is the ordinary race between reading a handle and acting on it. A break that
 could not be *delivered* is a failure rather than that, so the two are never the same answer.
 
 **A stop says where, and whose.** `stopped_at` is the instruction pointer, `thread` the
