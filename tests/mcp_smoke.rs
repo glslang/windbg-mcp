@@ -6026,8 +6026,8 @@ fn an_open_summarises_the_target_instead_of_listing_its_modules() {
 /// only half it can read. That was settled by reading the revision list, not by measuring anyone.
 ///
 /// It changes what one row is measured against. `session_status` is the only typed tool here
-/// whose rendering is larger than its typed answer (420 B against 297 B when this was measured),
-/// so it is the only place the ceiling now reads a number the old assertion never saw; on every
+/// whose rendering is larger than its typed answer (423 B against 301 B, on both CI runners), so
+/// it is the only place the ceiling now reads a number the old assertion never saw; on every
 /// other typed row the typed half is the larger one, and a text-only tool has the one channel
 /// either way. That is what a rule stated as a floor looks like while nothing has broken it — the
 /// ratio rule beneath is the same shape, and `registers` is the row it was written for.
@@ -6054,8 +6054,9 @@ fn tool_results_stay_within_their_budget() {
     // The model ceiling is charged against **each** channel a result carries, so it has to be
     // sized for the larger of the two rather than for the half this client reads. It moved no
     // number here — `session_status` is the one row whose rendering is the bigger half, and its
-    // 600 already covers the 420 B measured — but it is why raising one of these is a decision
-    // about every client rather than about ours, and why that row is the one to watch.
+    // 600 already covers the 423 B both CI runners measure — but it is why raising one of these
+    // is a decision about every client rather than about ours, and why that row is the one to
+    // watch.
     //
     // Only calls that succeed on a *kernel* dump are listed. `threads` is deliberately absent: `~`
     // is a user-mode question and answers with a tool error here, which would measure the size of
