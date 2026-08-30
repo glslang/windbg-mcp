@@ -1438,8 +1438,10 @@ def print_matrix(order, rows):
     print("\n" + header)
     print("-" * len(header))
     for cell, marks in sorted(rows.items(), key=lambda kv: cell_order(kv[0])):
-        backend, model, ctx, surface = cell
-        label = f"{model[:24]} {str(ctx or 'dflt'):>6} {surface}"
+        # Through the shared label, which is where the **backend** is: a cell is keyed by it, and
+        # an ollama tag may be the same string as a Claude Code alias, so the three fields this
+        # wrote by hand rendered two different rows identically with nothing to tell them apart.
+        label = cell_label(cell)
         print(f"{label:<52}" + "".join(f"{marks.get(t, {}).get('mark', ' '):<{width}}"
                                        for t in order))
     print("\nY correct   n wrong   - not answerable on this surface   "
