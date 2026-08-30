@@ -508,6 +508,14 @@ Two more things that mislead here:
 - `.reload /f <mod>` fetches one module's PDB; bare `.reload /f` walks every loaded module,
   which on a live kernel is a couple of hundred of them and correspondingly slow. Reach for
   the unqualified form only to rule the module name out as the variable.
+  **And note what it also does**: any `.reload` resynchronises DbgEng's *module inventory* with
+  the target, which is a separate thing from loading symbols and is the reason a bare `.reload /f`
+  is sometimes what makes a driver appear in `lm` at all. If that is what you are after, ask for
+  it directly — `modules { "refresh": true }` does the inventory half and fetches no PDBs. Doing
+  it the other way round costs you the reload: on a **live** target a refresh discards the symbols
+  the engine has loaded, so **refresh first, then load symbols**. (A dump does not pay that — its
+  module list comes from its own header, so there is nothing to re-read and the symbol state
+  survives.)
 - `x <mod>!<symbol>` prints **nothing at all** for an unresolved name — no error, no
   diagnostic. Its silence is not confirmation. `lm m <mod>` is the check that answers.
 

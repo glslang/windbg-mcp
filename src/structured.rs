@@ -812,6 +812,54 @@ pub struct ModuleList {
     /// this is what says so. Absent when nothing was filtered.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filter: Option<String>,
+    /// What the call's `refresh` did to the engine's inventory before this listing was taken.
+    ///
+    /// **Absent means it was not asked for**, which is every default call — not "it was asked for
+    /// and did nothing". The two have to be distinguishable because the question this listing
+    /// answers most often is *is this driver loaded*, and a `matched: 0` means one thing when the
+    /// inventory was resynchronised a moment ago and something much weaker when it was whatever
+    /// the engine happened to be holding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<ModuleRefresh>,
+}
+
+/// What a `modules { "refresh": true }` did before the listing beside it was taken.
+///
+/// **Inventory, not symbols.** The engine is asked to resynchronise its module list with the
+/// target (`IDebugSymbols::Reload` with no arguments, which is the `.reload` a person types).
+/// That discovers images the engine has not heard of — the case this exists for is a live kernel
+/// attach, where a driver loaded *before* the debugger connected is in the target and not in the
+/// engine's list until something asks. It is deliberately not `.reload /f`: forcing a symbol load
+/// would put a symbol-server round trip per module behind a call whose caller asked about module
+/// *names*, and finding a loaded image should not cost a PDB download.
+///
+/// The price of that is on [`ModuleInfo::symbols`], and it is the one surprise here: **on a live
+/// target** a resynchronisation discards what the engine had loaded and reloads it as needed, so
+/// most rows that named a PDB before a refresh read `deferred` after one. Nothing was lost — the
+/// PDB is re-read from the local cache the next time a symbol is asked for — but a caller that has
+/// just run a force-reload and then refreshes has undone the state it paid for, so the order to do
+/// them in is refresh first. A **dump** pays none of it: its module list comes from its own header
+/// rather than from the target, so there is nothing to re-read and the symbol state survives
+/// (measured either way — see `worker::resynchronise`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ModuleRefresh {
+    /// Whether the engine resynchronised. When this is `false` the listing beside it is whatever
+    /// the engine was already holding, which may be stale — and is exactly the state that reads
+    /// as "the driver is not loaded" when the driver is loaded.
+    pub synchronized: bool,
+    /// How many modules the engine listed **before** the resynchronisation, against
+    /// [`ModuleList::loaded`] after it.
+    ///
+    /// Carried because it is the only evidence a caller has that the refresh was worth asking
+    /// for, and because the number this tool exists for is the difference: a fresh kernel attach
+    /// reporting `before: 1` against `loaded: 158` — measured on the CTF guest, 2026-08-30 — is
+    /// the whole of [#85](https://github.com/glslang/windbg-mcp/issues/85) in two fields. On a
+    /// target whose inventory was already current the two are equal, which is an answer rather
+    /// than a wasted call.
+    pub before: usize,
+    /// Why the resynchronisation failed, in the engine's own words. Absent when it succeeded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 impl ModuleInfo {

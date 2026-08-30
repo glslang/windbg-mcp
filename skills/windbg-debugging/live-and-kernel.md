@@ -101,6 +101,15 @@ all, so ending the session takes it; `attach_process` is the route that is.
     instead; that reclaims the session by terminating its engine process.
 
   A *connected* target that doesn't break in is bounded and returns an error.
+- **A fresh attach does not see the drivers already loaded.** DbgEng's module inventory holds the
+  loads the debugger *saw*, and a kernel attach starts from what it can read at connect time — so
+  `modules` straight afterwards often lists `nt` and little else, and a driver that is loaded and
+  serving IOCTLs reads as absent. **`modules { "refresh": true, "filter": "<driver>" }`**
+  resynchronises the inventory first; never conclude a module is not loaded from a listing that
+  did not. It finds modules and fetches no symbols — and on a live target it discards the symbols the
+  engine had loaded, so **refresh first, load symbols after**, not the other way round. A `.reload /f` also
+  resynchronises, as a side effect of downloading every module's PDB; that is the slow way to
+  answer "is this driver loaded".
 - **TTD is user-mode only** — you cannot time-travel a kernel target. For reverse
   execution, record a user-mode trace instead (see [ttd.md](ttd.md)).
 - Symbol names need the full setup (`msdia140.dll` + `.sympath` + `.reload /f` at a stop) —

@@ -821,6 +821,7 @@
       "params": [
         "filter: string|null",
         "limit: integer|null/uint32",
+        "refresh: boolean|null",
         "session_id: string|null"
       ],
       "required": [],

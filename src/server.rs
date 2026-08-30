@@ -1620,6 +1620,14 @@ pub struct ModulesArgs {
     /// so a short listing is never mistaken for the whole table.
     #[serde(default)]
     pub limit: Option<u32>,
+    /// Resynchronise the debugger's inventory with the target before listing it (default false).
+    /// The inventory holds the module loads the debugger *saw*, so a fresh kernel attach often
+    /// lists `nt` and little else and a driver loaded before it reads as absent — pass this
+    /// before concluding a module is not loaded. It finds modules **without fetching symbols**,
+    /// and on a live target discards ones already loaded, so refresh first and load symbols after.
+    /// The result's `refresh` reports it, including a resynchronisation that failed.
+    #[serde(default)]
+    pub refresh: Option<bool>,
     /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
     /// session and be refused if its target was replaced or closed.
     #[serde(default)]
@@ -4024,7 +4032,8 @@ impl WindbgServer {
     /// how many matched, so pass `filter` to ask about one driver rather than paging through a
     /// table of two hundred. The modules that have **unloaded** come back in their own
     /// `unloaded` list, narrowed by the same filter — that is what can name an address in a driver
-    /// that is no longer there.
+    /// that is no longer there. A module absent from the listing may be absent from the
+    /// *debugger's* inventory rather than from the target — `refresh: true` resynchronises them.
     #[rmcp::tool(
         annotations(
             title = "List modules",
@@ -4061,7 +4070,7 @@ impl WindbgServer {
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::modules(args.filter, args.limit),
+                EngineOp::modules(args.filter, args.limit, args.refresh.unwrap_or(false)),
             )
             .await;
         engine_result_for(args.session_id.as_deref(), out)
@@ -5214,6 +5223,12 @@ const TOOL_NOTES: &[ToolNote] = &[
         tool: "modules",
         names: &["execute"],
         note: "For the engine's own listing verbatim, `execute { \"command\": \"lm\" }`.",
+    },
+    ToolNote {
+        tool: "modules",
+        names: &["set_symbol_path"],
+        note: "`refresh` finds modules and loads no symbols; `set_symbol_path` is the one that \
+               loads them.",
     },
     ToolNote {
         tool: "disassemble",

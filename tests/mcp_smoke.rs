@@ -1747,8 +1747,8 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
     })
 }
 
-/// Ceiling on the tool surface a model is given before it has asked anything. 73,996 bytes across
-/// 54 tools (~18k tokens), +12% headroom — sized so that rewording a description passes and a new
+/// Ceiling on the tool surface a model is given before it has asked anything. 75,547 bytes across
+/// 54 tools (~19k tokens), +10% headroom — sized so that rewording a description passes and a new
 /// tool arriving with a `debug_batch`-scale schema does not.
 ///
 /// **Raised 76,000 → 83,000 when the three asynchronous-execution tools landed** (2026-08-29), and
@@ -1786,7 +1786,7 @@ const MODEL_VISIBLE_CEILING: usize = 83_000;
 /// item 24's first finding done rather than priced.
 const WIRE_CEILING: usize = 205_000;
 
-/// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 9,757
+/// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,021
 /// bytes, because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary from
 /// `src/batch.rs`. A tool costing more than this is not necessarily wrong, but it should be a
 /// decision somebody made rather than a schema that grew.
@@ -2109,7 +2109,7 @@ fn every_tool_belongs_to_exactly_one_group() {
 
 /// A narrowed surface serves fewer tools, and says so rather than pretending the rest never were.
 ///
-/// The measurement behind `--tools` is that 70% of the 73,996-byte tool surface is prose a model
+/// The measurement behind `--tools` is that 70% of the 75,547-byte tool surface is prose a model
 /// needs, so the only way to spend less of a caller's context is to offer fewer tools —
 /// `FOLLOWUPS.md` item 24. This asserts the three things that makes true.
 #[test]
@@ -6428,6 +6428,114 @@ fn a_module_filter_narrows_both_halves_of_the_answer_alike() {
     assert_eq!(after["loaded"].as_u64(), Some(loaded), "{after}");
 }
 
+/// `modules { "refresh": true }` resynchronises the debugger's inventory with the target before
+/// listing it, asked as the **first** call on a freshly opened session
+/// ([#85](https://github.com/glslang/windbg-mcp/issues/85)).
+///
+/// That ordering is the test, not decoration. DbgEng's module list is built from the loads the
+/// debugger *saw*, so on a live kernel attach it starts at whatever it can read at connect time
+/// and a driver loaded beforehand is simply absent — which read as "the challenge driver is not
+/// loaded" on the MessageManager target while the driver was serving IOCTLs. Asking on a *dump*
+/// cannot reproduce that gap (a dump carries its own complete module list), so what this tier
+/// claims is the other half, and it is the half that would break silently: the refresh **runs
+/// against a real engine, succeeds, and costs the listing nothing** — same modules, same counts,
+/// reported as a resynchronisation that found the inventory already current. The live tier below
+/// covers the gap itself, on a target that has one.
+///
+/// The default call is checked in the same breath, because "cheap and backward compatible" is a
+/// claim about the *absence* of a field: an answer that started carrying `refresh` on every call
+/// would tell every caller a refresh had happened when none had.
+#[test]
+fn a_module_listing_can_resynchronise_the_inventory_before_it_lists_it() {
+    let Some(dump) = target_tier() else { return };
+    let mut server = Server::started();
+    let session_id = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+
+    // First call on the session, before anything else has made the engine look at a module.
+    let response = server.call_tool(
+        "modules",
+        json!({ "session_id": session_id, "refresh": true, "filter": "nt" }),
+        TARGET_STEP,
+    );
+    assert_no_error(&response, "modules with refresh");
+    assert!(
+        !is_tool_error(&response),
+        "a refresh on an open target is ordinary work, not a fault: {response}"
+    );
+    let refreshed = response["result"]["structuredContent"].clone();
+    let text = text_of(&response["result"]);
+    assert_eq!(
+        refreshed["refresh"]["synchronized"],
+        json!(true),
+        "the engine resynchronised, and the field is how a caller knows:\n{text}\n{refreshed}"
+    );
+    assert!(
+        refreshed["refresh"]["error"].is_null(),
+        "a synchronisation that worked carries no reason: {refreshed}"
+    );
+    // A dump's own module list is complete when it opens, so the refresh has nothing to find —
+    // and must not *lose* anything either, which is the failure this pins.
+    let (before, loaded) = (
+        refreshed["refresh"]["before"].as_u64(),
+        refreshed["loaded"].as_u64(),
+    );
+    assert_eq!(
+        before, loaded,
+        "a dump opens with its inventory already complete, so a refresh changes nothing: \
+         {refreshed}"
+    );
+    assert!(
+        loaded.unwrap_or_default() > 20,
+        "…and that inventory is the whole table, not an empty one: {refreshed}"
+    );
+    assert!(
+        text.contains("Inventory resynchronised"),
+        "the text says a refresh ran, above the listing it qualifies:\n{text}"
+    );
+    // The rows are still the rows: a refresh is a step before the listing, not a different answer.
+    assert_eq!(
+        listed_rows(&text),
+        valued_rows(&refreshed),
+        "a refreshed listing agrees with its own values like any other:\n{text}"
+    );
+    assert!(
+        refreshed["matched"].as_u64().unwrap_or_default() > 0,
+        "`nt` matches something on this target with or without a refresh: {refreshed}"
+    );
+
+    // And the default, on the same session: the same inventory, and not one word about a refresh
+    // nobody asked for.
+    let plain = server.tool_data(
+        "modules",
+        json!({ "session_id": session_id, "filter": "nt" }),
+        TARGET_STEP,
+    );
+    assert!(
+        plain["refresh"].is_null(),
+        "a call that asked for no refresh must not report one: {plain}"
+    );
+    assert_eq!(
+        plain["loaded"].as_u64(),
+        loaded,
+        "the refresh left the engine holding what it found: {plain}"
+    );
+    assert_eq!(
+        valued_rows(&plain),
+        valued_rows(&refreshed),
+        "and the same modules, row for row"
+    );
+    println!(
+        "refresh on {dump}: {}",
+        text.lines().next().unwrap_or_default()
+    );
+
+    server.tool_data(
+        "end_session",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
+}
+
 /// **A default register set is the integer registers, on whatever architecture this host is.**
 ///
 /// The `all` argument documents the default as excluding the x87 and vector registers, and it did
@@ -9962,6 +10070,34 @@ fn a_live_kernel_session_attaches_coexists_and_detaches_cleanly() {
             listed.contains(&"nt"),
             "the kernel image should be in the module list:\n{modules}"
         );
+
+        // And the same listing asked to resynchronise the inventory first, which is the only tier
+        // where that call reaches a target whose module list the debugger did not watch being
+        // built ([#85](https://github.com/glslang/windbg-mcp/issues/85)). This target carries no
+        // fixture, so what is claimed here is the mechanism rather than a find: the reload runs
+        // over the KD wire, succeeds, and leaves a listing at least as complete as the one above
+        // — a refresh that lost modules would be worse than no refresh at all. The CTF tier makes
+        // the other claim, on a driver that is actually missing before it.
+        let refreshed = server.tool_data(
+            "modules",
+            json!({ "session_id": session, "refresh": true }),
+            TARGET_STEP,
+        );
+        assert_eq!(
+            refreshed["refresh"]["synchronized"],
+            json!(true),
+            "a live kernel is the target a resynchronisation exists for: {refreshed}"
+        );
+        let (before, after) = (
+            refreshed["refresh"]["before"].as_u64().unwrap_or_default(),
+            refreshed["loaded"].as_u64().unwrap_or_default(),
+        );
+        assert!(
+            after >= before && after > 1,
+            "the refresh left {after} module(s) where the engine held {before}: {refreshed}"
+        );
+        println!("live kernel inventory: {before} module(s) before the refresh, {after} after");
+
         let registers =
             server.tool_text("registers", json!({ "session_id": session }), TARGET_STEP);
         assert!(
@@ -11831,23 +11967,31 @@ fn a_messagemanager_ctf_fixture_is_visible_through_mcp() {
             "the CTF attach reported a tool failure:\n{report}"
         );
 
-        let symbols = load_kernel_symbols(&mut server, &session);
-        assert!(
-            symbols.loaded.contains("pdb symbols") && !symbols.probe.is_empty(),
-            "the CTF pool check needs full `nt` symbols and the pool-root global. If a known-good \
-             path exists, set {SYMBOLS_ENV}. Engine setup said: {engine}\n{}",
-            symbols.transcript
-        );
-
-        // A fresh kernel attach may initially expose only `nt`; the unqualified reload above
-        // populates DbgEng's full module inventory as well as loading the pool types.
+        // **Before any symbol work**, which is the whole of what this assertion now claims
+        // ([#85]). The driver was loaded before the debugger dialled in, so it is in the target
+        // and not yet in DbgEng's inventory — a fresh attach here lists `nt` and little else, and
+        // a `modules` call straight after one read as "the challenge driver is not loaded" while
+        // it was open and serving IOCTLs. It used to be found only *after* `load_kernel_symbols`
+        // below, whose unqualified `.reload /f` resynchronised the inventory as a side effect of
+        // fetching every PDB: the answer was right and the caller had no way to know that a full
+        // symbol load was what made it right. `refresh` is that resynchronisation on its own, and
+        // asking here means a pass cannot be borrowed from the reload that follows.
+        //
         // Matched against module *names*, not against a substring of the whole `lm` listing:
         // "messagemanager appears somewhere in that text" was true of a symbol path echoed into
         // the same output, which is the kind of accidental pass a field cannot give.
+        //
+        // [#85]: https://github.com/glslang/windbg-mcp/issues/85
         let modules = server.tool_data(
             "modules",
-            json!({ "session_id": session, "filter": "MessageManager" }),
+            json!({ "session_id": session, "filter": "MessageManager", "refresh": true }),
             TARGET_STEP,
+        );
+        assert_eq!(
+            modules["refresh"]["synchronized"],
+            json!(true),
+            "the resynchronisation itself failed, so nothing below it says anything about the \
+             fixture: {modules}"
         );
         let driver = modules["modules"]
             .as_array()
@@ -11861,8 +12005,9 @@ fn a_messagemanager_ctf_fixture_is_visible_through_mcp() {
             .cloned();
         assert!(
             driver.is_some(),
-            "the fixture reported ready, but KD does not list MessageManager.sys after the full \
-             module reload:\n{}\n\nsymbol setup said:{}",
+            "the fixture reported ready, but KD does not list MessageManager.sys after an \
+             inventory refresh the engine reports it made, from {} module(s):\n{}",
+            modules["refresh"]["before"],
             text_of(
                 &server.call_tool(
                     "modules",
@@ -11870,6 +12015,13 @@ fn a_messagemanager_ctf_fixture_is_visible_through_mcp() {
                     TARGET_STEP
                 )["result"]
             ),
+        );
+
+        let symbols = load_kernel_symbols(&mut server, &session);
+        assert!(
+            symbols.loaded.contains("pdb symbols") && !symbols.probe.is_empty(),
+            "the CTF pool check needs full `nt` symbols and the pool-root global. If a known-good \
+             path exists, set {SYMBOLS_ENV}. Engine setup said: {engine}\n{}",
             symbols.transcript
         );
 

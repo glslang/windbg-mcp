@@ -221,7 +221,7 @@ setx WINDBG_MCP_TOOLS_DRIVER        "session,inspect,crash"
 ```
 
 The second line is what makes this work on a listener the editor also uses: the driver is served 20
-tools and 25,465 B while every other client on that listener keeps all 54. Leave it out and the
+tools and 26,305 B while every other client on that listener keeps all 54. Leave it out and the
 driver is served whatever the listener was started with, which is the older behaviour and is the
 right one when the listener is the driver's own.
 
@@ -288,10 +288,10 @@ spec. Re-read them rather than trusting this table, which has been stale before.
 
 | | bytes | ≈tokens |
 |---|---|---|
-| The tool surface, paid once per conversation | 73,996 (54 tools) | ~18k |
-| — the same surface as `--tools session,inspect,crash` | 25,465 (20 tools) | ~6k |
+| The tool surface, paid once per conversation | 75,547 (54 tools) | ~19k |
+| — the same surface as `--tools session,inspect,crash` | 26,305 (20 tools) | ~6.5k |
 | — as `--tools crash` | 14,587 (11 tools) | ~3.6k |
-| Its worst single tool (`debug_batch`) | 9,798 | ~2.4k |
+| Its worst single tool (`debug_batch`) | 10,021 | ~2.5k |
 | The largest answer this server gives (`modules`) | 53,875 | ~13k |
 | `read_memory` at its design limit | ~4 MiB of hex | ~1M |
 

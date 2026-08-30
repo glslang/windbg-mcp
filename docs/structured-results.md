@@ -11,7 +11,7 @@ matching `outputSchema` in `tools/list`, so a program can read a field instead o
 | `server_log` | `records[]` as `{seq, at, level, session_id, target, message}` — `session_id` absent for the supervisor's own — plus `matched`, the buffer's `held`/`capacity`/`oldest_seq`, and a `next_since` cursor that advances even on an empty page |
 | `end_session` | `released`, `worker_terminated`, `waited_ms`, `target_left_running` |
 | `registers` | `registers[]` as `{name, kind, …}` plus `instruction_pointer` — `kind: int` and `kind: float` carry `value`, `kind: bytes` carries `bytes` (an x87 or vector register, which no number holds), `kind: non_finite` names a NaN or infinity that JSON has no literal for and carries its bits, `kind: unavailable` carries neither, and `subregister` is present only when true; pass `all: true` for the x87/vector registers and subregister views, which the default excludes — including the vector bank's 32-bit lanes (`xmm0/0`), which the engine reports as integers — a value's `kind` is how this server saw it, not the register's architectural width |
-| `modules` | `modules[]` with `start`/`end`, `size`, `timestamp` (the `TimeDateStamp`+`size` pair a symbol server is keyed by — see [`coordinates.md`](coordinates.md)), a typed `symbols` state (`deferred` is *not* `none`) and, for a module whose symbols resolved, the `pdb` identity (`guid`, `age`, and the `key` those two make) plus `unmatched` when the engine loaded a PDB that does not belong to the image; `unloaded[]` for the images that have since unloaded (listed by image name, since an unloaded module has none of its own); `loaded` (how many the target has in total), `matched` / `unloaded_matched` (how many each half would have had before `limit` cut it — default 64 rows for the whole listing, maximum 2000, the two halves sharing one budget so neither crowds the other out) and the `filter` a narrowed listing was matched by. The listing text is rendered from these same records rather than pasted from `lm`, so the two halves cannot describe different sets of modules; the filter's grammar is this server's own — a name plus `*` (any run) and `?` (exactly one), **every other character literal** — and `execute { "command": "lm m <pattern>" }` is where WinDbg's fuller wildcard syntax lives |
+| `modules` | `modules[]` with `start`/`end`, `size`, `timestamp` (the `TimeDateStamp`+`size` pair a symbol server is keyed by — see [`coordinates.md`](coordinates.md)), a typed `symbols` state (`deferred` is *not* `none`) and, for a module whose symbols resolved, the `pdb` identity (`guid`, `age`, and the `key` those two make) plus `unmatched` when the engine loaded a PDB that does not belong to the image; `unloaded[]` for the images that have since unloaded (listed by image name, since an unloaded module has none of its own); `loaded` (how many the target has in total), `matched` / `unloaded_matched` (how many each half would have had before `limit` cut it — default 64 rows for the whole listing, maximum 2000, the two halves sharing one budget so neither crowds the other out) and the `filter` a narrowed listing was matched by. The listing text is rendered from these same records rather than pasted from `lm`, so the two halves cannot describe different sets of modules; the filter's grammar is this server's own — a name plus `*` (any run) and `?` (exactly one), **every other character literal** — and `execute { "command": "lm m <pattern>" }` is where WinDbg's fuller wildcard syntax lives. `refresh: true` resynchronises the debugger's inventory with the target before the listing is taken and reports what that did as `refresh` — `synchronized`, the `before` count against `loaded` after it, and the engine's `error` where it failed, which is reported rather than raised because the stale listing under it may still be the right one. Absent when no refresh was asked for, which is not the same as one that found nothing. **Inventory, not symbols**: see [the two reloads](#inventory-refresh-against-symbol-reload) |
 | `set_breakpoint` | the ids this call `added`, and every breakpoint now set — a successful `bp` prints nothing at all |
 | `run_to_address` | `verdict` (`hit`/`stopped_elsewhere`/`timeout`/`target_gone`), `target`, `stopped_at` |
 | `go`, `step_over`, `step_into`, `step_back`, `step_over_back`, `reverse_go` | `stopped_at`, and the `thread` it belongs to plus, on a kernel target, the `processor` — absent where no processor number applies (every user-mode target, which is not a failure) or where the engine would not answer, one field because a caller cannot act on the difference. Plus `interrupted` and `timed_out` — two reasons the position is real and is *not* a stop the target reached: somebody called `interrupt`, or the wait ran out and the debugger broke the target in — and `target_gone`, the ending where there is no position at all because the target ran to completion |
@@ -52,6 +52,58 @@ One caveat about "also", measured rather than assumed: a client that understands
 sending both. So for the tools above, the typed answer is what a model reads and the rendering is
 what a program-with-a-terminal reads — they are two audiences, not one audience twice.
 [`token-budget.md`](token-budget.md) has the measurements, and what they cost.
+
+## Inventory refresh against symbol reload
+
+Two different things that have been reached through one command for as long as this server has
+existed, and telling them apart is what `modules { "refresh": true }` is for
+([#85](https://github.com/glslang/windbg-mcp/issues/85)).
+
+**The inventory** is DbgEng's list of the modules it knows the target has loaded. It is built from
+the module-load events the debugger *saw*, so it is complete for a dump (which carries its own
+list) and for a process the debugger launched, and it is emphatically not complete for a live
+kernel: an attach starts from what it can read at connect time, and a driver loaded before the
+debugger dialled in is in the target and missing from the list. A `modules` call there answers
+`nt` and little else, and "the driver is not loaded" is the conclusion a caller draws from it.
+
+**A symbol reload** is the separate business of getting a PDB in front of the engine so
+`module!Symbol` names resolve. It is what `set_symbol_path` does, and what `.reload /f` does.
+
+They have been confused because `.reload /f` does both: forcing every module's symbols also
+resynchronises the inventory, so a caller who ran one got the right module list as a side effect of
+a symbol-server download it may not have wanted. `refresh` is the inventory half on its own:
+
+| | `modules { "refresh": true }` | `set_symbol_path`, `.reload /f` |
+|---|---|---|
+| Finds a module the engine has not heard of | yes | yes, incidentally |
+| Fetches PDBs | **no** — what it discovers is `deferred` | yes, one per module |
+| Costs a symbol-server round trip | no | yes, per module |
+| Effect on symbols already loaded | on a **live** target, discards them | loads them |
+
+The last row is the one to plan around, and it is **live-target only**: on a live target a refresh
+throws away the symbol state the engine was holding and reloads it as needed, so **refresh first
+and load symbols afterwards** — doing it the other way round undoes the reload you just paid for.
+A dump pays none of it. Measured both ways on one host, with the engine's `symsrv.dll` and
+`msdia140.dll` bundled and a store configured:
+
+| target | before the refresh | after it |
+|---|---|---|
+| launched `cmd.exe`, 5 modules, after `.reload /f` | all five `pdb` | `ntdll` still `pdb`, the other four `deferred` |
+| the checked-in kernel dump, 227 modules | `nt` `pdb`, 226 `deferred` | unchanged — nothing discarded |
+
+Which fits what the reload is: on a live target it re-reads the module list and the entries are
+rebuilt, while a dump's list comes from its own header and there is nothing to re-read. So the note
+beside a listing says *on a live target*, and it says *most* modules rather than all of them.
+
+That distinction cost a measurement to find. The first attempt was made on a host whose engine had
+no `symsrv.dll` or `msdia140.dll`, where the same five modules could only reach `export` fallback —
+so the effect looked like a fallback being reset rather than real PDB state being dropped, and the
+dump half was never asked at all.
+
+A refresh that **fails** is reported in the `refresh` field and does not fail the call — the
+listing beside it may well be the right one, and a caller can see for itself. What it must not do
+is pass unnoticed, so the text says so *above* the tables rather than in the note below them: a
+caveat printed under a listing arrives after the conclusion it was there to prevent.
 
 ## Error reporting
 

@@ -130,11 +130,22 @@ pub enum EngineOp {
     /// `limit` is how many rows that listing prints in all — the loaded and unloaded halves share
     /// it — defaulted and clamped by the supervisor as every other row cap here is.
     ///
+    /// `refresh` resynchronises the engine's inventory with the target before the listing is
+    /// taken ([#85]). **It carries no `patience_ms`**, and that is the same call
+    /// [`Self::Backtrace`] makes and for the same reason: it is a direct engine call rather than
+    /// a command, so no watchdog can cut it short. What bounds it is the caller's own call
+    /// timeout and `interrupt`, which reaches the engine from off the engine thread. What it is
+    /// *not* is a symbol-server operation — the reload is unqualified and unforced, so the
+    /// modules it discovers are deferred rather than fetched.
+    ///
+    /// [#85]: https://github.com/glslang/windbg-mcp/issues/85
     /// [#120]: https://github.com/glslang/windbg-mcp/issues/120
     Modules {
         #[serde(default)]
         filter: Option<String>,
         limit: usize,
+        #[serde(default)]
+        refresh: bool,
     },
     /// The current thread's call stack, as values and as the listing rendered from them.
     ///
@@ -358,12 +369,13 @@ impl EngineOp {
     /// each half a share of anything left — so every count in the note describes rows that are
     /// actually there, *unless* the listing is allowed to carry none at all. A caller asking for
     /// counts alone is asking for `matched` and `loaded`, which one row carries as well as none.
-    pub fn modules(filter: Option<String>, limit: Option<u32>) -> Self {
+    pub fn modules(filter: Option<String>, limit: Option<u32>, refresh: bool) -> Self {
         Self::Modules {
             filter,
             limit: limit
                 .unwrap_or(DEFAULT_MODULE_ROWS)
                 .clamp(1, MAX_MODULE_ROWS) as usize,
+            refresh,
         }
     }
 
@@ -771,7 +783,12 @@ mod tests {
     /// the two roles.
     #[test]
     fn a_module_listings_row_cap_is_applied_before_crossing_the_worker_pipe() {
-        let EngineOp::Modules { limit, filter } = EngineOp::modules(Some("nt".into()), None) else {
+        let EngineOp::Modules {
+            limit,
+            filter,
+            refresh,
+        } = EngineOp::modules(Some("nt".into()), None, false)
+        else {
             unreachable!("still a module listing")
         };
         assert_eq!(limit, DEFAULT_MODULE_ROWS as usize);
@@ -780,15 +797,22 @@ mod tests {
             Some("nt"),
             "the pattern is the worker's to normalise"
         );
+        assert!(!refresh, "a caller who asked for none gets none");
 
-        let EngineOp::Modules { limit, .. } = EngineOp::modules(None, Some(u32::MAX)) else {
+        let EngineOp::Modules { limit, refresh, .. } =
+            EngineOp::modules(None, Some(u32::MAX), true)
+        else {
             unreachable!()
         };
         assert_eq!(limit, MAX_MODULE_ROWS as usize);
+        assert!(
+            refresh,
+            "the resynchronisation is the caller's to ask for and is passed through as asked"
+        );
 
         // And never nothing: a listing carrying no rows at all would leave the note counting
         // unloaded images it says are listed above it.
-        let EngineOp::Modules { limit, .. } = EngineOp::modules(None, Some(0)) else {
+        let EngineOp::Modules { limit, .. } = EngineOp::modules(None, Some(0), false) else {
             unreachable!()
         };
         assert_eq!(limit, 1);

@@ -9,6 +9,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`modules { "refresh": true }` resynchronises the debugger's module inventory before it lists
+  it** ([#85](https://github.com/glslang/windbg-mcp/issues/85)). DbgEng's inventory is the
+  *debugger's*, not the target's: it is built from the module-load events the debugger saw, so it
+  is complete for a dump and for a process the debugger launched, and it is not complete for a
+  live kernel — an attach starts from what it can read at connect time, and a driver loaded before
+  the debugger dialled in is in the target and missing from the list. On the MessageManager
+  regression target that meant `nt` and little else, and a `modules` call straight after the attach
+  read as "the challenge driver is not loaded" while the driver was open and serving IOCTLs.
+  Measured on that target on 2026-08-30, across one attach: the engine held **1** module, a
+  `modules { "filter": "MessageManager" }` matched **0**, and the same call with `refresh: true`
+  reported `before: 1` against **158** loaded and matched the driver at `0xfffff80343970000` —
+  `deferred`, so it was found without a byte of PDB being fetched.
+
+  The resynchronisation was always available — it is what an unqualified `.reload /f` was doing as
+  a side effect of fetching every module's PDB — and nothing said so, so finding a loaded image
+  meant guessing that a force symbol reload was the missing step. This is that half on its own, and
+  the tool says which half it is: it discovers modules and **fetches no symbols**, so what it finds
+  comes back `deferred` with no symbol-server round trip.
+
+  The result carries `refresh` — `synchronized`, the `before` count against `loaded` after it, and
+  the engine's own `error` where it failed. Three things worth knowing. **Absent means it was not
+  asked for**, which is not the same as one that found nothing, so a default call is unchanged in
+  both channels and still cheap. **A failure is reported, not raised**: the listing beside it may
+  well be the right one, so the answer stands and the text says so *above* the tables — a caveat
+  printed under a listing arrives after the conclusion it was there to prevent — and withdraws the
+  only inference the listing supports, that a module absent from it is absent from the target. And
+  **on a live target it costs the symbol state**: a reload discards what the engine had loaded
+  and reloads it as needed, so most modules come back `deferred` — measured on a launched
+  `cmd.exe` either side of a `.reload /f`, where four of its five modules went `pdb` → `deferred`
+  and `ntdll` kept its PDB. A **dump** pays none of it: its module list comes from its own header,
+  so there is nothing to re-read, and `nt`'s PDB survives a refresh with the other 226 modules
+  `deferred` either way. So refresh first and load symbols afterwards on anything live —
+  [`docs/structured-results.md`](docs/structured-results.md) has the two reloads side by side and
+  both measurements.
+
 - **Asynchronous execution control: `continue_async`, `wait_for_stop` and `break_in`**
   ([#83](https://github.com/glslang/windbg-mcp/issues/83)). `go` waits for the next stop and answers
   with it, which leaves no room for the sequence a live target usually needs — arm a breakpoint,
