@@ -248,47 +248,55 @@ def release_new_sessions(before):
 
 def main():
     print(f"model: claude-code/{MODEL}")
-    print("MCP revision negotiated:", drive.handshake())
-    tools = drive.mcp("tools/list")["result"]["tools"]
-    offered = drive.as_ollama(tools)
-    wire = json.dumps(offered, separators=(",", ":"))
-    surface_bytes = len(wire)
-    print(f"tools offered: {len(tools)} ({surface_bytes} B, measured as the ollama rows are)")
-
     scratch = os.environ.get("EVAL_SCRATCH", "")
     owned = not scratch
     if owned:
         scratch = tempfile.mkdtemp(prefix="windbg-eval-")
     config_path = mcp_config(scratch)
-    tasks = drive.load_tasks(sys.argv[1]) if len(sys.argv) > 1 else []
-    cell = {
-        "run": os.environ.get("EVAL_RUN", time.strftime("%Y%m%dT%H%M%S")),
-        "backend": "claude-code",
-        "model": MODEL,
-        "num_ctx": None,
-        "draw": drive.DRAW,
-        # **Null rather than absent, and it cannot be anything else here.** `claude -p` exposes no
-        # sampling seed to ask for, where the ollama rows at least ask - which is a property of
-        # this row worth recording rather than a field to leave out. It is a smaller difference
-        # than it looks: the ollama rows' seed does not reproduce a draw on this bench either
-        # (`local_model_drive.SEED`), so no row here replays one. The grader reads `draw` from
-        # both backends and `seed` from neither.
-        "seed": None,
-        # **Null rather than absent here too, and for the same kind of reason.** The ollama rows
-        # record the digest of the weights that answered; an alias resolved inside `claude` has no
-        # such address to offer, and leaving the field out would make this row's ambiguity look
-        # like a field nobody thought to record. `harness_version` is what this row *can* say.
-        "model_digest": None,
-        "harness_version": harness_version(),
-        "server": dict(drive.SERVER_INFO) or None,
-        "suite": dict(drive.SUITE) or None,
-        "surface": {"client": os.environ.get("EVAL_SURFACE", ""), "tools": len(tools),
-                    "bytes": surface_bytes, "names": sorted(t["name"] for t in tools),
-                    # Measured as the ollama rows measure it, through the same helper, so the two
-                    # backends' surfaces are comparable rather than merely similar.
-                    "digest": drive.surface_digest(wire)},
-    }
+
     try:
+        # **Inside the cleanup, because the handshake is two requests.** `initialize` mints
+        # the `Mcp-Session-Id` the server then records and `notifications/initialized`
+        # follows it, so a failure between them left an id nothing would ever `DELETE` - and
+        # a matrix run is dozens of these processes. The scratch directory and its config are
+        # made *above* this, because the same `finally` removes them: widening the block over
+        # their assignments instead would leave that cleanup meeting an unbound name and
+        # losing the exception it was raised on.
+        print("MCP revision negotiated:", drive.handshake())
+        tools = drive.mcp("tools/list")["result"]["tools"]
+        offered = drive.as_ollama(tools)
+        wire = json.dumps(offered, separators=(",", ":"))
+        surface_bytes = len(wire)
+        print(f"tools offered: {len(tools)} ({surface_bytes} B, measured as the ollama rows are)")
+
+        tasks = drive.load_tasks(sys.argv[1]) if len(sys.argv) > 1 else []
+        cell = {
+            "run": os.environ.get("EVAL_RUN", time.strftime("%Y%m%dT%H%M%S")),
+            "backend": "claude-code",
+            "model": MODEL,
+            "num_ctx": None,
+            "draw": drive.DRAW,
+            # **Null rather than absent, and it cannot be anything else here.** `claude -p`
+            # exposes no sampling seed to ask for, where the ollama rows at least ask - a
+            # property worth recording rather than a field to leave out. It is a smaller difference
+            # than it looks: the ollama rows' seed does not reproduce a draw on this bench either
+            # (`local_model_drive.SEED`), so no row here replays one. The grader reads `draw` from
+            # both backends and `seed` from neither.
+            "seed": None,
+            # **Null rather than absent here too, and for the same kind of reason.** The ollama
+            # rows record the digest of the weights that answered; an alias resolved inside
+            # `claude` has no such address to offer, and leaving the field out would make it look
+            # like a field nobody thought to record. `harness_version` is what this row *can* say.
+            "model_digest": None,
+            "harness_version": harness_version(),
+            "server": dict(drive.SERVER_INFO) or None,
+            "suite": dict(drive.SUITE) or None,
+            "surface": {"client": os.environ.get("EVAL_SURFACE", ""), "tools": len(tools),
+                        "bytes": surface_bytes, "names": sorted(t["name"] for t in tools),
+                        # Measured as the ollama rows measure it, through the same helper, so
+                        # the two backends' surfaces are comparable rather than merely similar.
+                        "digest": drive.surface_digest(wire)},
+        }
         for i, task in enumerate(tasks, 1):
             prompt = task["prompt"] if isinstance(task, dict) else task
             print(f"\n=== task {i}: {prompt[:110]}")

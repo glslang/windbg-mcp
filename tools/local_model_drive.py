@@ -738,14 +738,21 @@ def release_everything():
     credential belongs to this run alone (`docs/local-model-eval.md`). Pointed at a shared token it
     would end somebody's sessions, which is the same reason the script refuses to borrow one.
     """
-    handshake()
     try:
-        sessions = live_sessions()
-    except Exception as e:  # noqa: BLE001 - cleanup is best effort by construction
-        print(f"  could not list sessions to release: {e}")
-        sessions = []
-    kept = end_sessions(sessions)
-    close_transport_session()
+        # **Inside the cleanup, for the reason `main` gives.** The handshake is two requests and
+        # the first of them mints the id, so a failure in the second leaves one nothing will
+        # `DELETE` - on the one path whose whole job is to leave this credential's namespace
+        # clean. A `finally` rather than `verify_key`'s `except BaseException`, because that shape
+        # exists to *read* the outcome of the `DELETE` and this caller ignores it.
+        handshake()
+        try:
+            sessions = live_sessions()
+        except Exception as e:  # noqa: BLE001 - cleanup is best effort by construction
+            print(f"  could not list sessions to release: {e}")
+            sessions = []
+        kept = end_sessions(sessions)
+    finally:
+        close_transport_session()
     if kept:
         # **The one caller reads this.** A preflight that cannot clear the namespace has not made
         # the cell that follows it clean, and saying so is the whole difference between a
@@ -763,45 +770,52 @@ def main():
     print(f"model: {MODEL}")
     if DRAW != 1 or SEED is not None:
         print(f"draw {DRAW}, " + (f"seed {SEED}" if SEED is not None else "unseeded"))
-    print("MCP revision negotiated:", handshake())
-    threading.Thread(target=keepalive, daemon=True).start()
-    tools = mcp("tools/list")["result"]["tools"]
-    offered = as_ollama(tools)
-    wire = json.dumps(offered, separators=(",", ":"))
-    surface = len(wire)
-    print(f"tools offered: {len(tools)} ({surface} B of minified JSON)")
-    if NUM_CTX:
-        print(f"context requested: {NUM_CTX}")
-    if SCENARIO:
-        print("scenario: sessions are kept between tasks")
-    snapshot_existing()
-    tasks = load_tasks(sys.argv[1]) if len(sys.argv) > 1 else [
-        "What debug sessions do I currently have open on this server?"
-    ]
-    cell = {
-        "run": os.environ.get("EVAL_RUN", time.strftime("%Y%m%dT%H%M%S")),
-        "backend": "ollama",
-        "model": MODEL,
-        "num_ctx": NUM_CTX or None,
-        "draw": DRAW,
-        "seed": SEED,
-        # The two identity fields that are constant for a cell: which build was asked, and which
-        # task list it was asked from. The third - which weights answered - is read per task, since
-        # it is a property of the instance the runtime happened to have loaded.
-        "server": dict(SERVER_INFO) or None,
-        "suite": dict(SUITE) or None,
-        "surface": {"client": os.environ.get("EVAL_SURFACE", ""),
-                    "tools": len(tools), "bytes": surface,
-                    "names": sorted(t["name"] for t in tools),
-                    # **The fingerprint, rather than its length.** A byte count moves for almost
-                    # any prose change and for none reliably: a same-length reword, or an
-                    # allowlist swap of equal size, leaves both the count and the length alone
-                    # while the model is handed different tools. This is the surface as it went
-                    # over the wire, which is the thing a comparison is actually about.
-                    "digest": surface_digest(wire)},
-    }
-    transcript = None
     try:
+        # **Inside the cleanup, because the handshake is two requests.** `initialize` mints
+        # the `Mcp-Session-Id` the server then records, and `notifications/initialized`
+        # follows it - so a failure between them (a dropped connection, a listener restarted)
+        # left an id already minted that nothing would ever `DELETE`, and a matrix run is
+        # dozens of these processes. Everything after the handshake is in here for the same
+        # reason rather than for its own: `tools/list` and `load_tasks` - which exits over a
+        # subset the suite does not have - both run after the id exists.
+        print("MCP revision negotiated:", handshake())
+        threading.Thread(target=keepalive, daemon=True).start()
+        tools = mcp("tools/list")["result"]["tools"]
+        offered = as_ollama(tools)
+        wire = json.dumps(offered, separators=(",", ":"))
+        surface = len(wire)
+        print(f"tools offered: {len(tools)} ({surface} B of minified JSON)")
+        if NUM_CTX:
+            print(f"context requested: {NUM_CTX}")
+        if SCENARIO:
+            print("scenario: sessions are kept between tasks")
+        snapshot_existing()
+        tasks = load_tasks(sys.argv[1]) if len(sys.argv) > 1 else [
+            "What debug sessions do I currently have open on this server?"
+        ]
+        cell = {
+            "run": os.environ.get("EVAL_RUN", time.strftime("%Y%m%dT%H%M%S")),
+            "backend": "ollama",
+            "model": MODEL,
+            "num_ctx": NUM_CTX or None,
+            "draw": DRAW,
+            "seed": SEED,
+            # The two identity fields that are constant for a cell: which build was asked, and
+            # which task list it was asked from. The third - which weights answered - is read per
+            # task, since it is a property of the instance the runtime happened to have loaded.
+            "server": dict(SERVER_INFO) or None,
+            "suite": dict(SUITE) or None,
+            "surface": {"client": os.environ.get("EVAL_SURFACE", ""),
+                        "tools": len(tools), "bytes": surface,
+                        "names": sorted(t["name"] for t in tools),
+                        # **The fingerprint, rather than its length.** A byte count moves for
+                        # almost any prose change and for none reliably: a same-length reword, or
+                        # an allowlist swap of equal size, leaves both the count and the length
+                        # alone while the model is handed different tools. This is the surface as
+                        # it went over the wire, which is what a comparison is actually about.
+                        "digest": surface_digest(wire)},
+        }
+        transcript = None
         for i, task in enumerate(tasks, 1):
             prompt = task["prompt"] if isinstance(task, dict) else task
             print(f"\n=== task {i}: {prompt[:110]}")
