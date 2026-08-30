@@ -849,10 +849,19 @@ its caller as an interruption nobody asked for. Named, the worker refuses rather
 for a run that has not *started* — queued behind a `pool_census`, or simply not dequeued — has no
 pump to interrupt, and refusing to rebind leaves it to start the moment the queue drains and hold
 the target for the bound it named. So the worker bars it, and `claim_pump` refuses it exactly as it
-refuses one during a teardown. Which of the two cases it is comes from the **id alone**: ids are
-minted in order and run in order, so above the running job is queued and below it is over. Nothing
-running counts as queued, which is not an edge case — the engine thread being between jobs with
-that resume next is precisely when barring matters.
+refuses one during a teardown.
+
+**Barred unconditionally, and the version that asked first was wrong in an instructive way.** It
+compared ids — they are minted in order, so one above the running job looked like one still queued
+— and **a job id is allocated before `Session::submit_gate` is taken**, in `call_within` and in
+`start_execution` alike. A task descheduled between the two is overtaken and enqueued behind a
+*larger* id, so the run that most needs barring reads as one that has already ended. Ordering the
+ids would work and is the wrong fix: it keeps the inference and props it up with an invariant three
+call sites must maintain, and the next one to allocate an id elsewhere breaks it silently. Barring
+unconditionally needs no invariant — ids are never reused, so barring a job that has already run
+matches nothing later, and one run per session means one queued resume for the single slot. What it
+costs is that the reply can no longer say *which* case it was, and so it does not; that precision
+was invented rather than known.
 
 **And the outcome is a variant, not a `bool`, because its two readers ask different questions.**
 `Output::raised` carries `proto::Interrupted`. `break_in.requested` asks *is this run going to

@@ -958,17 +958,15 @@ pub enum Interrupted {
     /// At most one break per job — a [`crate::batch`] told to stop runs its rollback as part of
     /// the same job, so a second interrupt aimed at it would land on a restore command.
     AlreadyPending,
-    /// The job had not reached the engine thread yet, and has been barred from starting.
+    /// The job named is not the one on the engine thread, and has been barred from starting.
     ///
-    /// The answer to breaking in a run that is still queued behind another operation. There is no
+    /// The answer to breaking in a run that is still queued behind another operation: there is no
     /// pump to interrupt, and letting it start would set a target going that its caller has
-    /// already asked to stop — for up to the bound it named, which may be an hour.
+    /// already asked to stop, for up to the bound it named. It is also the answer where that job
+    /// has *already finished*, because the worker cannot tell the two apart — barring one that
+    /// has run is a no-op, since ids are never reused, and claiming to know which case it was
+    /// would be a precision nothing here has.
     Barred,
-    /// The job had already finished, so there was nothing to reach.
-    ///
-    /// Told apart from [`Self::Barred`] by the id alone: job ids are minted in order and the
-    /// worker runs them in order, so one below the running job is one that is over.
-    AlreadyFinished,
     /// Nothing was running on the engine at all.
     NothingRunning,
     /// The job is a [`crate::batch`] running its rollback, which no break may reach.
