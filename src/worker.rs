@@ -33,7 +33,7 @@
 //! can ask for the same thing, and the binding ([`Running`]) that decides *which job* the request
 //! reaches. See `AGENTS.md` and the `DECISIONS.md` entry for the invariant and its boundary.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::io::{BufRead, BufReader, PipeReader, PipeWriter, Write};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -386,7 +386,7 @@ struct Running {
     /// flag beside this lock, so "which job is pumping" and "which job may be interrupted" are
     /// decided together and cannot name different jobs.
     pumping: Option<u64>,
-    /// A job that was broken in before it reached the engine thread, and must not start.
+    /// Jobs that were broken in before they reached the engine thread, and must not start.
     ///
     /// The other half of what [`Self::tearing_down`] does for a teardown, for one run rather than
     /// all of them. `break_in` names the job it is for, so a break arriving while that job is
@@ -394,10 +394,20 @@ struct Running {
     /// let the run start afterwards and hold the target for up to the bound its caller named,
     /// which is the opposite of what they asked for.
     ///
-    /// One slot rather than a set: a session holds one run at a time (the supervisor's execution
-    /// slot refuses a second), so there is only ever one queued resume to bar. Job ids are minted
-    /// once per session and never reused, so a stale entry can never match a later job.
-    barred: Option<u64>,
+    /// **A set, where the first version was one slot**, and the reasoning for the slot is worth
+    /// keeping because it was the right answer to the wrong question. A session holds one run at
+    /// a time, so only one queued resume ever *needs* barring — but that is about how many bars
+    /// are wanted at once, not about how many requests can arrive. A `break_in` for a run that
+    /// has since finished still reaches here (the supervisor sent it while its slot said the run
+    /// was going), and it can be overtaken on the way: descheduled between reading the slot and
+    /// the send, it lands *after* a later `break_in` has barred a genuinely queued run, and a
+    /// single slot would overwrite that bar with a dead id. The queued run would then start.
+    ///
+    /// It grows by one `u64` per break that misses, and shrinks only in [`Self::claim_pump`],
+    /// which is the one place an entry can ever be used. A bar for a job that has already run is
+    /// therefore kept for the life of the worker — the alternative is knowing which jobs have
+    /// run, which is the same set the other way up and no smaller.
+    barred: BTreeSet<u64>,
     /// Whether this worker's session is ending, so no target of its may be set running again.
     ///
     /// Set by the request reader the moment a teardown is read — an [`EngineOp::EndSession`], or
@@ -429,7 +439,7 @@ static RUNNING: Mutex<Running> = Mutex::new(Running {
     job: None,
     interrupted: None,
     pumping: None,
-    barred: None,
+    barred: BTreeSet::new(),
     tearing_down: false,
     uninterruptible: None,
 });
@@ -481,7 +491,9 @@ impl Running {
         if self.tearing_down {
             return Err(PumpRefused::TearingDown);
         }
-        if self.barred == Some(id) {
+        // Taken rather than read: this is the only place a bar can be used, and the job it names
+        // is being refused right now and will never be dequeued again.
+        if self.barred.remove(&id) {
             return Err(PumpRefused::BrokenIn);
         }
         self.pumping = Some(id);
@@ -504,8 +516,8 @@ impl Running {
     ///
     /// Barring unconditionally needs no invariant. Ids are minted once per session and never
     /// reused, so barring a job that has already run is a no-op that can never match anything
-    /// later — and a session holds one run at a time, so there is only ever one queued resume for
-    /// the single slot to hold.
+    /// later — provided the bars are kept apart, which is what [`Self::barred`] being a set is
+    /// for.
     ///
     /// What it costs is the *report*: this can no longer say which of the two it was, and so it
     /// does not. That precision was invented rather than known.
@@ -513,7 +525,7 @@ impl Running {
         if self.job == Some(named) {
             return None;
         }
-        self.barred = Some(named);
+        self.barred.insert(named);
         Some(Interrupted::Barred)
     }
 
@@ -6392,7 +6404,7 @@ mod tests {
     fn idle() -> Running {
         Running {
             job: None,
-            barred: None,
+            barred: BTreeSet::new(),
             tearing_down: false,
             interrupted: None,
             pumping: None,
@@ -6513,6 +6525,23 @@ mod tests {
         let mut running = idle();
         assert_eq!(running.break_for_other(1), Some(Interrupted::Barred));
 
+        // **A bar for a dead job does not displace a live one.** A `break_in` for a run that has
+        // since finished still arrives here — the supervisor sent it while its slot said the run
+        // was going — and it can be overtaken on the way, landing after a later `break_in` has
+        // barred a genuinely queued run. One slot would overwrite that bar with a dead id, and
+        // the queued run would start after all.
+        let mut running = idle();
+        running.claim(20);
+        running.break_for_other(9); // the live one: queued behind job 20
+        running.break_for_other(3); // the stale one: job 3 is long gone
+        running.release(20);
+        running.claim(9);
+        assert!(
+            matches!(running.claim_pump(9), Err(PumpRefused::BrokenIn)),
+            "the bar on the queued run has to survive a break that arrives late for a run that \
+             had already ended"
+        );
+
         // The job that *is* running takes the ordinary path instead — it has a pump to interrupt.
         let mut running = idle();
         running.claim(3);
@@ -6520,6 +6549,17 @@ mod tests {
         assert!(
             running.claim_pump(3).is_ok(),
             "and nothing barred it, which is the whole point of naming the job on the request"
+        );
+
+        // A bar is spent by the job it refuses, which is the only place one can ever be used.
+        let mut running = idle();
+        running.break_for_other(5);
+        running.claim(5);
+        assert!(matches!(running.claim_pump(5), Err(PumpRefused::BrokenIn)));
+        assert!(
+            running.barred.is_empty(),
+            "the job it named has been refused and can never be dequeued again, so keeping it \
+             would only make the set grow for nothing"
         );
     }
 
