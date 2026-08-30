@@ -51,8 +51,8 @@
       "inputSchema": 640,
       "modelVisible": 1987,
       "name": "continue_async",
-      "outputSchema": 1331,
-      "wire": 3473
+      "outputSchema": 1366,
+      "wire": 3508
     },
     {
       "annotations": 117,
@@ -493,10 +493,10 @@
     "inputSchema": 42620,
     "instructions": 1983,
     "modelVisible": 73996,
-    "outputSchema": 111670,
-    "payload": 192936,
+    "outputSchema": 111705,
+    "payload": 192971,
     "tools": 54,
-    "wire": 192815,
+    "wire": 192850,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 9798
   }
