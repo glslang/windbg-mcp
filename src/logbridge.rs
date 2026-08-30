@@ -957,9 +957,23 @@ mod tests {
         let (tx, rx) = sync_channel::<(Entry, u32)>(4);
         DROPPED.store(0, Ordering::Relaxed);
 
+        // Eight writers against four slots do not *guarantee* a refusal — when the drain keeps up,
+        // every attempt is taken and the run asserts conservation over the one path it exists to
+        // cover. That is a vacuous pass rather than a wrong one, and it was a flake at roughly one
+        // run in twenty-five. So the drain is held until a record has actually been turned away.
+        //
+        // A rendezvous and not a nap: with nothing draining, a queue of four must refuse the fifth
+        // `enqueue`, so the gate is opened by the very thing it waits for and cannot hang — where
+        // a sleep would only make the refusal *likely*, and would trade the flake for a slower
+        // test that still has one.
+        let (refused_tx, refused_rx) = sync_channel::<()>(1);
+
         // Drains as the writers work, so slots keep freeing and the full/not-full boundary is
         // crossed constantly rather than once.
         let drained = std::thread::spawn(move || {
+            // `Err` only if every writer finished without one refusal, which the gate above makes
+            // impossible; either way the drain proceeds and the assertions below decide.
+            let _ = refused_rx.recv();
             let mut received = 0u64;
             let mut reported = 0u64;
             while let Ok((_, carried)) = rx.recv() {
@@ -972,9 +986,10 @@ mod tests {
         let writers: Vec<_> = (0..THREADS)
             .map(|thread| {
                 let tx = tx.clone();
+                let refused = refused_tx.clone();
                 std::thread::spawn(move || {
                     for n in 0..EACH {
-                        enqueue(
+                        let queued = enqueue(
                             Some(&tx),
                             Entry {
                                 seq: 0,
@@ -985,6 +1000,11 @@ mod tests {
                                 message: format!("thread {thread} record {n}"),
                             },
                         );
+                        if !queued {
+                            // One slot and a non-blocking send, so the first refusal opens the
+                            // gate and every later one costs nothing and blocks nobody.
+                            let _ = refused.try_send(());
+                        }
                     }
                 })
             })
@@ -1007,8 +1027,8 @@ mod tests {
         );
         assert!(
             reported + outstanding > 0,
-            "a queue of 4 against {THREADS} threads must have refused something, or this test is \
-             asserting conservation over a path it never took"
+            "the drain was held until a record was turned away, so refusing nothing means that \
+             gate has stopped working and this is asserting conservation over a path it never took"
         );
     }
 
