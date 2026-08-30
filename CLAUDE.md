@@ -859,9 +859,25 @@ compared ids — they are minted in order, so one above the running job looked l
 ids would work and is the wrong fix: it keeps the inference and props it up with an invariant three
 call sites must maintain, and the next one to allocate an id elsewhere breaks it silently. Barring
 unconditionally needs no invariant — ids are never reused, so barring a job that has already run
-matches nothing later, and one run per session means one queued resume for the single slot. What it
-costs is that the reply can no longer say *which* case it was, and so it does not; that precision
-was invented rather than known.
+matches nothing later. What it costs is that the reply can no longer say *which* case it was, and so
+it does not; that precision was invented rather than known.
+
+**And `barred` is a set, where the obvious answer is one slot.** A session holds one run at a time,
+so only one queued resume ever *needs* barring — which is the right answer to the wrong question,
+because that is about how many bars are wanted at once and not about how many requests can arrive.
+A `break_in` for a run that has since finished still reaches the worker (the supervisor sent it
+while its slot said the run was going) and can be overtaken on the way, landing *after* a later
+`break_in` has barred a genuinely queued run: one slot overwrites that bar with a dead id and the
+queued run starts. It is a `BTreeSet` rather than a `HashSet` because `RUNNING` is a `static` with a
+const initializer and `HashSet::new` is not `const`. Entries leave only in `claim_pump`, which is
+the one place a bar can be used, so a bar for a job that already ran is kept for the worker's life —
+one `u64`, against the alternative of tracking which jobs *have* run, which is the same set the
+other way up.
+
+**Both of those were mine, one commit apart, and they are the same mistake.** Reasoning about the
+sequence a caller intends rather than the states that can actually arrive: ids arrive in allocation
+order, and a break arrives while its run is still queued. Neither survived contact with "what if
+this task is descheduled here".
 
 **And the outcome is a variant, not a `bool`, because its two readers ask different questions.**
 `Output::raised` carries `proto::Interrupted`. `break_in.requested` asks *is this run going to
