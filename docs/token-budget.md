@@ -498,14 +498,30 @@ The table under `--nocapture` carries a **`worst`** column beside `ceiling` for 
 differ only where a rendering is the bigger half.
 
 Which today is one row: `session_status`, the only *typed* tool here whose rendering is larger
-than its typed answer (420 B against 297 B, the 0.7x in the table above). On every other typed row
-`worst` is the typed half, and on a text-only one like `execute` there is only the one channel — so
+than its typed answer — 423 B against 301 B, the 0.7x in the table above. On every other typed row
+`worst` is the typed half, and on a text-only one like `execute` there is only the one channel, so
 everywhere else the new assertion restates the one that was already there and the column reads the
 same as `model`.
 
 What it does **not** say is which ceiling a growing rendering trips first. That depends on the room
-each row has left in each, and the margins are small: growing text alone, `session_status` reaches
-its model ceiling 197 B before `wire` and `crash_triage` 1,026 B before, while `open_dump` reaches
-it 263 B after and `backtrace` 56 B after — and those last two are figures measured against a
-different dump on a different architecture, which is well inside 56 B of noise. The rule is a floor
-under a channel, not a prediction about which assertion speaks first.
+each row has left in each, and the two orders interleave. Growing text alone, measured on the run
+that landed this:
+
+| tool | its model ceiling, relative to `wire` |
+|---|---|
+| `crash_triage` | reached 1,034 B **before** |
+| `session_status` | reached 192 B **before** |
+| `backtrace` | reached 56 B after |
+| `disassemble` | reached 138 B after |
+| `open_dump` | reached 315 B after |
+| `registers` | reached 2,592 B after |
+| `modules` | reached 4,442 B after |
+
+So the rule is a floor under a channel, not a prediction about which assertion speaks first — and
+`backtrace`'s 56 B is close enough to a tie that the order there is not worth relying on either.
+
+Those margins are stable rather than noisy, which is worth knowing before anyone re-derives them.
+`target_tier()` hands every row the **x64** sample whatever the host is, so this table is the same
+dump on both CI runners — and both printed it byte for byte identically, ARM64 included. That is
+not true of the baseline table further up, three of whose rows were re-measured on the ARM64 bench
+against the ARM64 dump; the two tables are read differently for that reason.

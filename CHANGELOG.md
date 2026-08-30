@@ -112,9 +112,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   happens to forward but the only half it can read.
 
   No ceiling moved. `session_status` is the one budgeted typed tool whose rendering is larger than
-  its typed answer (420 B against 297 B), so it is the only row now measured against a number the
-  old assertion never saw; elsewhere the typed half is the larger one and the new check restates
-  the old. Which is what a floor under a channel nothing has yet grown looks like.
+  its typed answer (423 B against 301 B, identical on both CI runners), so it is the only row now
+  measured against a number the old assertion never saw; elsewhere the typed half is the larger one
+  and the new check restates the old. Which is what a floor under a channel nothing has yet grown
+  looks like.
 
 ### Fixed
 
