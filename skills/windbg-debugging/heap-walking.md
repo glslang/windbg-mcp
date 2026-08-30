@@ -29,8 +29,13 @@ validated VS family. An unfamiliar or ambiguous family is intentionally refused.
 - The first query walks the pool. Later queries reuse the same session snapshot. Pass
   `refresh: true` after any execution that could change the target; control tools invalidate the
   cache automatically, but explicit refresh makes the intent clear at the final observation.
-- Read both `layout` and `walk`. `deadline_truncated` and `partial` counts are floors, and an
-  uncovered address is not evidence that it was never pool.
+- For an existence or bounded-cardinality question, pass nonzero `stop_after_matches` to
+  `pool_find_tag`. A newly started walk stops when that many matching allocated chunks have been
+  decoded and reports `walk.coverage: match_limit_reached` plus the threshold. Its `matches` and
+  `total_bytes` are floors. A complete cached snapshot is reused instead and stays exhaustive.
+  `limit` is separate: it caps only the rendered `chunks`, never the walk.
+- Read both `layout` and `walk`. `deadline_truncated`, `partial`, and `match_limit_reached` counts
+  are floors, and an uncovered address is not evidence that it was never pool.
 - Query a tag by its `raw_tag`, not by the `tag` a listing prints. The printed form renders every
   unprintable byte as `.` — and a literal `.` the same way — so a tag containing `.` names no
   particular tag, and `pool_find_tag` will read it as four literal `.` bytes and report no

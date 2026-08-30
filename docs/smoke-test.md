@@ -1153,9 +1153,10 @@ than measuring a patch that never landed.
 turns the MessageManager challenge into a repeatable live regression fixture. It builds a benign
 mode of `mm_exploit.c`, copies it to the VM over WinRM, and waits until the process has retained real
 `Tgsm` messages. It then runs the ignored Rust test through the shipped stdio MCP transport. The
-test attaches over KDNET, checks that `MessageManager.sys` is loaded, finds the retained allocations
-with `pool_find_tag`, verifies the session still serves a register request, and always attempts
-`end_session` before reporting an assertion failure.
+test attaches over KDNET, checks that `MessageManager.sys` is loaded, asks for one retained
+allocation with `pool_find_tag { "stop_after_matches": 1 }`, verifies the result says
+`match_limit_reached` with that stop condition, verifies the session still serves a register
+request, and always attempts `end_session` before reporting an assertion failure.
 
 Prerequisites are a disposable VM with the challenge driver installed and running, PowerShell
 remoting enabled, a working KDNET connection back to the host, the host MSVC Build Tools path used

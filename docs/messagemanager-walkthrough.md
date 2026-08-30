@@ -115,6 +115,11 @@ are for:
 pool_find_tag { "tag": "Tgsm" }
 ```
 
+When only existence matters, add `"stop_after_matches": 1`; that stops a new walk at the first
+allocated match and reports `walk.coverage: "match_limit_reached"`. Keep `limit` for the separate
+question of how many found rows to render. Omit `stop_after_matches` when the exhaustive count and
+byte total matter.
+
 ```text
 tag `Tgsm`: 1 allocation(s), 0x68 bytes total
 ffff8c8f`13a02f90  0x68  SpecialNonPagedNx  Allocated

@@ -6,6 +6,7 @@
 //! returning full text); session-management tools drive the typed `dbgscope` openers.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::num::NonZeroU32;
 use std::time::Duration;
 
 use rmcp::ErrorData;
@@ -1878,6 +1879,11 @@ pub struct PoolFindTagArgs {
     /// after letting the target run, when the cached view describes a target that has moved.
     #[serde(default)]
     pub refresh: Option<bool>,
+    /// Stop a newly started pool walk as soon as this many matching allocated chunks have been
+    /// decoded. Must be nonzero. A complete cached snapshot is still reused, so `matches` and
+    /// `total_bytes` remain exhaustive; `limit` below controls only how many rows are printed.
+    #[serde(default)]
+    pub stop_after_matches: Option<NonZeroU32>,
     /// Maximum rows to print (default 64).
     #[serde(default)]
     pub limit: Option<u32>,
@@ -3117,8 +3123,9 @@ impl WindbgServer {
         engine_result(out)
     }
 
-    /// Find every **allocated** kernel pool chunk carrying a tag, with its size, allocator
-    /// and backend. Needs a broken-in x64 kernel target.
+    /// Find **allocated** kernel pool chunks carrying a tag, with their size, allocator and
+    /// backend. Needs a broken-in x64 kernel target. `stop_after_matches` can make a new walk
+    /// return deliberately early; a complete cached snapshot remains exhaustive.
     /// This walks the pool's own descriptors rather than shelling out to `!poolused`, so the
     /// result is structured.
     /// Only allocated chunks are indexed by tag — a freed chunk's tag is not reliably
@@ -3144,6 +3151,7 @@ impl WindbgServer {
                     args.tag,
                     args.paged,
                     args.refresh,
+                    args.stop_after_matches,
                     args.limit,
                 )),
             )
@@ -5377,6 +5385,16 @@ fn text_of(result: &CallToolResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pool_match_threshold_must_be_nonzero() {
+        let zero = serde_json::json!({"tag": "Tgsm", "stop_after_matches": 0});
+        assert!(serde_json::from_value::<PoolFindTagArgs>(zero).is_err());
+
+        let one = serde_json::json!({"tag": "Tgsm", "stop_after_matches": 1});
+        let parsed: PoolFindTagArgs = serde_json::from_value(one).expect("one is nonzero");
+        assert_eq!(parsed.stop_after_matches.map(NonZeroU32::get), Some(1));
+    }
 
     // ---- the instructions a client is served ---------------------------
 

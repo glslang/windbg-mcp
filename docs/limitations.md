@@ -24,8 +24,12 @@
   (`WINDBG_MCP_CALL_TIMEOUT_SECS`, less what the query waited its turn on the session), so it can
   neither outlive the call that asked for it nor stop early while that call is still waiting; a walk
   cut short still answers, and every result says how much of the pool it reached. `interrupt` ends
-  one sooner. A query that reaches the engine with no time left to walk in — a call timeout at or
-  under the 15s the reply itself reserves, or a long wait behind other work on the session — is
+  one sooner. `pool_find_tag` can also stop deliberately at a nonzero `stop_after_matches` count;
+  that result reports `match_limit_reached`, is not cached as exhaustive, and keeps its counts as
+  floors. A complete cached snapshot still answers exhaustively. This traversal threshold is
+  independent of `limit`, which caps only the rows rendered. A query that reaches the engine with
+  no time left to walk in — a call timeout at or under the 15s the reply itself reserves, or a
+  long wait behind other work on the session — is
   *refused* rather than run, since a truncated walk is discarded rather than cached; without
   `refresh` it is still answered from the cached snapshot if there is one. Two semantics worth knowing: only *allocated* chunks are indexed by tag (a freed
   chunk's tag is not reliably preserved, so `pool_find_tag` never reports freed memory — ask about a
