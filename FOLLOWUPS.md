@@ -51,10 +51,11 @@ open — a tier that makes its own 32-bit fixture instead of waiting to be hande
 WoW64 route a dump header cannot answer for — and, while testing that, from Windows Defender
 quarantining this project's own binary, and item 51 from what building that live route made
 reachable: the first tier to attach to a running process found that ending its session kills it
-(2026-08-27, and **landed** the next day), and item 52 from
+(2026-08-27, and **landed** the next day), and items 52–53 from
 [#83](https://github.com/glslang/windbg-mcp/issues/83)'s asynchronous execution handles, where the
 invariant that stops a description naming a tool its client cannot call turned out to cover only
-half the prose a client is served (2026-08-29).
+half the prose a client is served (2026-08-29), and where a break arriving in the microseconds
+after a run built its stop is recorded in that result's prose and not in its flag (2026-08-30).
 Each item notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -3655,3 +3656,38 @@ documented. The immediate hazard is one sentence, on surfaces that hold `exec` w
 **Where it picks up.** `no_description_names_a_tool_the_client_cannot_call` and `descriptions_for`
 in `src/server.rs`'s tests, `TOOL_NOTES` and `annotate` beside them, and item 41 for the argument
 about which channels a narrowed surface has to narrow.
+
+## 53. [windbg-mcp] A break raised *after* a run's stop is built labels the result cut short
+
+**What it is.** `run_job` calls `release(id)` when an operation ends, and a `true` there — a break
+was raised for this job and the engine had not consumed it — applies `cut_short`, which appends
+"this is what it had reached, not a complete result" to the result's **text**. But a run's
+`StopReport` is built inside the operation, before `release` runs, and `stop_report` sets
+`interrupted` from `run.cut_short` alone — from what `settle` reported. A break lodged after
+`settle` returned is therefore in the note and not in the flag.
+
+**Why the flag is the one that is right.** The target had already stopped when that break was
+raised, at a breakpoint it reached. `docs/sessions.md` defines `interrupted` as the case where the
+position "is where the target happened to be rather than a stop it reached" — so setting it for a
+late break would send a caller past a real breakpoint hit, which is worse than the note. This was
+proposed in review on #257 and declined for that reason.
+
+**What is left.** The note and the flag disagree, in a window of microseconds, for a caller that
+reads the text. On the **asynchronous** path there is no such caller — `wait_for_stop` builds its
+answer from `Output::stop` and never reads `Output::text`, so the note is dropped — which is why
+#257 changed nothing here. On the **synchronous** path (`go`, the stepping tools) a text-reading
+client sees "interrupted, incomplete" beside a `data` that says `interrupted: false`; a
+structured-aware client sees only the second, since `structuredContent` replaces the text block.
+
+**What would close it.** Not labelling a result cut short when the operation has already reported
+its own stop. The async half is one line (`Output::stop` is `Some` exactly for those), the
+synchronous half is not, because its report is inside `data` as JSON and digging it out in
+`run_job` is worse than the wart. The honest shape is for the executor to say whether it has
+already accounted for the interruption, rather than for `run_job` to infer it from the payload —
+which is a change to how every op reports, for a disagreement that needs a microsecond race and a
+text-only client to observe. `crate::batch`'s `ran_told` already answers the same question the
+other way (`|| self.broken()`), correctly for a batch, which is worth reading before choosing.
+
+**Where it picks up.** `run_job`'s `release`/`cut_short` block and `cut_short` itself in
+`src/worker.rs`, `stop_report` beside them, and `Ran::ran_told` for the path that already consults
+the late-break flag.
