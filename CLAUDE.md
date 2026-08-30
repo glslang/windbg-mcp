@@ -793,7 +793,18 @@ go through: `Interrupt` (answered ahead of the worker's queue, so it never waits
 thread), `EndSession` (a teardown refused because the target is running is a session nothing can
 release), and `Resume` itself, which the slot refuses instead, naming the handle already there.
 
-**And `end_session` breaks the pump in rather than waiting for it** (`worker::break_any_pump`,
+**And the refusal is only as good as its ordering, which is what `Session::submit_gate` is for.**
+Reading the slot and putting the job in the queue are two steps, and between them a submitter holds
+nothing — so an ordinary call could pass the check with the slot empty, be descheduled, and enqueue
+*behind* a `Resume` that claimed the slot in the meantime. It then waits out the whole run inside
+`WaitForEvent` instead of being told the target was running, and if the run outlasts its call
+timeout its caller sees a timeout while a command that may **mutate** the target still runs when the
+target stops. The gate is a per-session lock held across both steps by both submitters, so a call
+either queues ahead of the resume or is refused by it. A lock of its own rather than the slot's,
+because the enqueue also takes the registry lock while `Sessions::snapshot` takes the registry lock
+and then the slot's — nesting the slot outside the registry would close that loop.
+
+**And `end_session` breaks the pump in rather than waiting for it** (`worker::stop_resuming`,
 called beside `announce_teardown` from the request reader; `Running::pumping` is claimed around the
 whole of `resume` — the `Execute` included — because a teardown arriving in the window before the
 flag was set would find nothing to break and queue behind the whole run). Every other job on that thread ends on a
@@ -806,6 +817,42 @@ release here has always done. A client disconnect runs the same release, so the 
 this one and needs no separate mechanism — `a_session_can_be_ended_while_its_target_is_running` is
 what covers both.
 
+**Breaking the pump is half of it, and the half that only reaches a run which has already started.**
+A resume still in the engine thread's queue — behind a long `pool_census`, or simply not yet
+dequeued — has no pump to break, so a teardown finds none, queues behind it, and waits out the whole
+run it arrived too early to stop: the same killed worker, reached from the other side of one
+instant. So `stop_resuming` also sets `Running::tearing_down`, and `resume` claims the pump through
+`Running::claim_pump`, which refuses while that is set. The two are read and written under the one
+lock in opposite orders — the reader sets the flag and *then* reads `pumping`, `resume` reads the
+flag and *then* claims — so whichever gets there first, the other sees it. A run is either broken in
+or never started, and there is no third outcome where the teardown waits.
+`a_teardown_either_breaks_a_run_or_stops_it_starting` stages both orderings.
+
+**The same door is closed on EOF**, which is the path with the sharper version of the reason. When
+the supervisor dies the worker's reader falls out of its loop and asks the engine to release the
+target, waiting `ABRUPT_EXIT_RELEASE` — five seconds, against a run that may have an hour left. So
+that path calls `stop_resuming` too, before it queues the release. Without it the wait expires
+against a worker that is working perfectly and the process exits with the target never released:
+exactly the halted live kernel that release exists to prevent, on the one path where nobody is left
+to ask again.
+
+**A break-in names the job it is for, and that is not the same guarantee an `interrupt` has.**
+`EngineOp::Interrupt` carries `job: Option<u64>`. `None` is the `interrupt` tool, whose caller named
+a *session* and gets whatever that session is running — the binding is made in the worker, under the
+lock that claims and releases a job, so it can never land on the one after it. `break_in` is the
+other caller and needs more: it holds a handle to **one run**, and between reading the slot and the
+request being read the run may have stopped and the engine thread started the next thing. Unbound,
+the break would be bound to *that* — a queued command, or the run after this one — and reported to
+its caller as an interruption nobody asked for. Named, the worker refuses rather than rebinds.
+
+**And `requested` is the worker's answer, not `is_ok()`.** Four of the five things an interrupt can
+do are `Ok` and raise nothing: nothing was running, the job named has moved on, a batch is sealed
+for its rollback, or a break is already pending. So the reply carries `Output::raised` — a third
+side-field on that struct, and the only one the *worker* alone can answer rather than the supervisor
+— and `false` now has one meaning: the target had already stopped, so nothing needed sending. A
+break that could not be **delivered** is an error instead, which it previously was not: a lost
+worker came back as `requested: false` and read exactly like the benign race.
+
 **Two smaller things that will look like bugs if you do not know them.** The bound is the caller's
 `max_run_ms` and **not** the call timeout, deliberately: the point of the tool is that the caller
 goes away, so a deadline sized from one tool call's clock would break in on a target the caller was
@@ -816,6 +863,17 @@ instead of answering, and "the call expired" and "the target never stopped" read
 which is right for a call that answers in seconds and wrong for one that can run for an hour — a run
 outlasting the reclamation window would leave its session reclaimable the instant it stopped, and
 the stop could be taken before its caller read it.
+
+**Three more edges, each one line of code, and none of which a test would have found by accident.**
+`Session::busy` reads the **slot** as well as the waiter map, because `reader` removes the waiter
+when the reply lands and the filing task runs after it — so in between, a session with a stale
+submission stamp looks idle, and a concurrent open could close it and leave the stop filed where
+nothing can resolve it. `Execution::ran_for` is stamped at the stop rather than derived from
+`started.elapsed()`, because a stop is kept until another run replaces it: derived, a run read an
+hour later reports an hour, and two reads of one stop disagree. And `wait_for_stop` takes **one**
+deadline before its loop, because the slot is bumped by things that are not stops — the `Resumed`
+milestone is one — and re-arming `wait` per wakeup makes `timeout_ms` a per-wakeup allowance, which
+is `STOP_WAIT_MARGIN` not holding.
 
 **The stop's typed half rides on `Output::stop`, not `Output::data`.** Same shape and reason as
 `Output::summary`: the answer is keyed by a handle the worker has never heard of, so the worker

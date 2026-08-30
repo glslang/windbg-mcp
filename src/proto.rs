@@ -263,18 +263,30 @@ pub enum EngineOp {
     /// would be read after that operation ended, which is a request that can never do anything.
     /// So this one is answered by the reader outright and never queued at all.
     ///
-    /// It carries no job id, because the id that matters is not the caller's to know. A tool call
-    /// names a *session*, and which job that session is running is decided inside the worker
-    /// between the request being written and it being read — so the binding is made where the
-    /// answer is: the reader reads the running job and raises the interrupt under one lock, and the
-    /// engine thread clears that job under the same lock and drains anything still pending before
-    /// it starts the next one. An interrupt therefore reaches the job that was running when it
-    /// arrived, or nothing at all; it can never land on the one after it.
+    /// **`job` is `None` for a caller that names only a session, and `Some` for one that holds a
+    /// run.** The `interrupt` tool is the first: it names a session, and which job that session is
+    /// running is decided inside the worker between the request being written and it being read,
+    /// so the binding is made where the answer is — the reader reads the running job and raises
+    /// the interrupt under one lock, and the engine thread clears that job under the same lock and
+    /// drains anything still pending before it starts the next one. An interrupt therefore reaches
+    /// the job that was running when it arrived, or nothing at all; it can never land on the one
+    /// after it.
+    ///
+    /// `break_in` is the second, and for it that guarantee is not enough. Its caller holds a
+    /// handle to *one run*, the supervisor knows which job that run is, and the run may have
+    /// stopped between the check and this request arriving — so an unbound interrupt would be
+    /// bound here to whatever the worker had started next: a queued `pool_census`, or the run
+    /// after this one. Naming the job makes the reader refuse rather than rebind. The id is the
+    /// supervisor's own, never a client's, so this is not a new thing for a caller to get wrong.
     ///
     /// What it cannot do is bounded by `SetInterrupt` itself: a live-kernel wait whose target has
     /// never connected does not poll, so an `attach_kernel` parked on a dead link is unreachable
     /// this way and only [`Self::EndSession`] ends it.
-    Interrupt,
+    Interrupt {
+        /// The job this break is for, or `None` for "whatever is running".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        job: Option<u64>,
+    },
     /// Release the target. The supervisor tears the worker down afterwards — under
     /// process-per-session a worker outlives its target for no reason.
     ///
@@ -702,7 +714,7 @@ mod tests {
                 command: "g".into(),
                 timeout_ms: 60_000,
             },
-            EngineOp::Interrupt,
+            EngineOp::Interrupt { job: None },
             EngineOp::EndSession,
         ];
         for op in &mut ops {
@@ -1002,6 +1014,27 @@ pub struct Output {
     /// happens on a path that has just pumped a target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<Box<crate::structured::StopReport>>,
+    /// Whether a break is lodged for the job an [`EngineOp::Interrupt`] was about, for that one
+    /// op.
+    ///
+    /// The third field here that exists because only one side can answer it — but the other way
+    /// round from [`Self::summary`] and [`Self::stop`], which the supervisor finishes. This one
+    /// the *worker* alone knows: whether a Ctrl+Break was actually raised depends on what its
+    /// engine thread was doing at the moment the request was read, and that is a fact with a
+    /// lifetime of microseconds on the far side of a pipe.
+    ///
+    /// It is not "the request succeeded", which is what `Ok` already says, and the difference is
+    /// the whole reason it is here. Four of the five answers this op can give are `Ok` and raised
+    /// nothing: there was no job running, the job named is not the one running, the job is a
+    /// [`crate::batch`] sealed for its rollback, or a break was already pending. A caller told
+    /// only that its request went through would report every one of those as a target about to
+    /// stop.
+    ///
+    /// `Some(true)` is therefore "a break is lodged for that job", not "one was raised by this
+    /// call" — an already-pending break is a target that is stopping, which is what the caller
+    /// asked for. `None` is any op that is not an interrupt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raised: Option<bool>,
     /// What ending the session did to a live process the engine held, for the one op that ends
     /// one: `Some(true)` where a process this server **attached** to was detached and left
     /// running, `Some(false)` where the target was one the session takes with it, `None` where
@@ -1026,6 +1059,7 @@ impl Output {
             summary: None,
             stop: None,
             target_left_running: None,
+            raised: None,
         }
     }
 
@@ -1047,6 +1081,7 @@ impl Output {
             summary: None,
             stop: None,
             target_left_running: None,
+            raised: None,
         }
     }
 
@@ -1059,6 +1094,7 @@ impl Output {
             summary: None,
             stop: Some(Box::new(stop)),
             target_left_running: None,
+            raised: None,
         }
     }
 
@@ -1070,6 +1106,7 @@ impl Output {
             summary: Some(summary),
             stop: None,
             target_left_running: None,
+            raised: None,
         }
     }
 
@@ -1081,6 +1118,15 @@ impl Output {
             summary: None,
             stop: None,
             target_left_running,
+            raised: None,
+        }
+    }
+    /// An [`EngineOp::Interrupt`]'s reply: what the worker did, and whether that left a break
+    /// lodged for the job the request was about. See [`Self::raised`].
+    pub fn interrupted(text: impl Into<String>, raised: bool) -> Self {
+        Self {
+            raised: Some(raised),
+            ..Self::text(text)
         }
     }
 }
