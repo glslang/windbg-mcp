@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-08-30
+
 ### Added
 
 - **`modules { "refresh": true }` resynchronises the debugger's module inventory before it lists
@@ -3000,7 +3002,8 @@ Initial release, packaged as a single-plugin Claude Code marketplace.
 - Crash-dump `!analyze` support via automatic WinDbg extension DLL loading.
 - Windows CI (format, clippy, build, test) and walkthrough docs with sample dumps.
 
-[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.13.2...HEAD
+[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/glslang/windbg-mcp/compare/v0.13.2...v0.14.0
 [0.13.2]: https://github.com/glslang/windbg-mcp/compare/v0.13.1...v0.13.2
 [0.13.1]: https://github.com/glslang/windbg-mcp/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/glslang/windbg-mcp/compare/v0.12.1...v0.13.0
