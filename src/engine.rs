@@ -679,6 +679,18 @@ impl Execution {
     }
 }
 
+/// The run that refused a claim, and how long it has been in the state it is in.
+///
+/// `waited` is measured from the milestone when `moving` and from the claim when it is not — see
+/// [`Session::claim_execution`], where the two are told apart — so the refusal can say which of
+/// the two it is quoting rather than calling a queue wait a run.
+#[derive(Debug)]
+struct Held {
+    handle: String,
+    waited: Duration,
+    moving: bool,
+}
+
 /// One run, read out from under its session's lock so a caller can `await` on what it says.
 struct FoundExecution {
     /// The worker job this run is, so a break can be bound to it rather than to whatever the
@@ -939,10 +951,24 @@ impl Session {
     /// The check and the install are one lock acquisition, which is the whole of what stops two
     /// `continue_async` calls arriving together from both minting a handle: check-then-install
     /// through two acquisitions leaves a window in which each sees the slot free.
-    fn claim_execution(&self, execution: Execution) -> Result<(), (String, Duration)> {
+    fn claim_execution(&self, execution: Execution) -> Result<(), Held> {
         let mut slot = self.execution.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(running) = slot.as_ref().filter(|e| e.running()) {
-            return Err((running.handle.clone(), running.started.elapsed()));
+            return Err(Held {
+                handle: running.handle.clone(),
+                // Two clocks and the refusal names which one it is quoting. A run that is moving
+                // has been *resumed*, and how long ago is the milestone's business. One still
+                // queued has not been resumed at all — quoting `ran_for` there would say `0ms`
+                // about a call made ten minutes ago, and quoting the claim would call a queue
+                // wait a run. So: since the target went, or since the caller asked, and the
+                // sentence says which.
+                waited: if running.moving_since.is_some() {
+                    running.ran_for()
+                } else {
+                    running.started.elapsed()
+                },
+                moving: running.moving_since.is_some(),
+            });
         }
         *slot = Some(execution);
         drop(slot);
@@ -2031,15 +2057,28 @@ impl Sessions {
                 bound,
                 stopped: None,
             })
-            .map_err(|(held, running_for)| {
+            .map_err(|held| {
+                let Held {
+                    handle: other,
+                    waited,
+                    moving,
+                } = held;
+                let since = crate::server::fmt_duration(waited);
+                let state = if moving {
+                    format!("resumed {since} ago and not yet stopped")
+                } else {
+                    format!(
+                        "claimed {since} ago and still waiting its turn behind another call on \
+                         this session's engine"
+                    )
+                };
                 EngineError::TargetRunning(format!(
-                    "Session `{}` already has a run in flight: `{held}`, resumed {} ago and not \
-                     yet stopped. A session has one engine thread and a target moves only while \
-                     that thread is pumping it, so a second run could not start until the first \
-                     ended — this refusal is that fact, said at the point it can still be acted \
-                     on. Wait for `{held}` to stop, break the target in, or end the session.",
+                    "Session `{}` already has a run in flight: `{other}`, {state}. A session has \
+                     one engine thread and a target moves only while that thread is pumping it, \
+                     so a second run could not start until the first ended — this refusal is that \
+                     fact, said at the point it can still be acted on. Wait for `{other}` to \
+                     stop, break the target in, or end the session.",
                     session.id,
-                    crate::server::fmt_duration(running_for),
                 ))
             })?;
         // Taken before the job is submitted so no change to the slot can be missed — including one
@@ -4543,7 +4582,7 @@ mod tests {
         let session = dormant("sess-1", SessionState::Open);
         let first = resumed_on(&session, 7);
 
-        let (held, _) = session
+        let held = session
             .claim_execution(Execution {
                 handle: "exec-second".to_string(),
                 command: "g".to_string(),
@@ -4556,8 +4595,13 @@ mod tests {
             })
             .expect_err("a second run started while the first was going");
         assert_eq!(
-            held, first,
+            held.handle, first,
             "the refusal has to name the run already there, or a caller cannot wait for it"
+        );
+        assert!(
+            held.moving,
+            "and say which clock it is quoting: this one is moving, so `waited` is time the \
+             target has been going rather than time the caller has been waiting"
         );
 
         // Once it has stopped the slot is free again — and the new run *replaces* the old one
@@ -5285,6 +5329,52 @@ mod tests {
                 .breaks_in_ms
                 .is_some_and(|left| left <= 60_000),
             "once it is moving the bound counts down"
+        );
+    }
+
+    /// The duplicate-run refusal quotes the clock it names, and a queued run has a different one.
+    ///
+    /// `ran_for` is zero until the target moves, so a refusal built from it would tell a caller
+    /// that a run claimed ten minutes ago was "resumed 0ms ago" — and one built from the claim
+    /// would call a queue wait a run. The refusal says which it is quoting instead.
+    #[test]
+    fn the_duplicate_run_refusal_says_which_clock_it_is_quoting() {
+        let session = dormant("sess-1", SessionState::Open);
+        session
+            .claim_execution(Execution {
+                handle: "exec-queued".to_string(),
+                command: "g".to_string(),
+                job: 7,
+                // Asked for ten minutes ago and still behind another call on the engine.
+                started: Instant::now() - Duration::from_secs(600),
+                moving_since: None,
+                ran_for: None,
+                bound: Duration::from_secs(60),
+                stopped: None,
+            })
+            .expect("a session with no run accepts one");
+
+        let held = session
+            .claim_execution(Execution {
+                handle: "exec-second".to_string(),
+                command: "g".to_string(),
+                job: 8,
+                started: Instant::now(),
+                moving_since: None,
+                ran_for: None,
+                bound: Duration::from_secs(60),
+                stopped: None,
+            })
+            .expect_err("a queued run still holds the slot: it may be moving any moment");
+        assert!(
+            !held.moving,
+            "the run it names has not been resumed, and the refusal must not say it has"
+        );
+        assert!(
+            held.waited >= Duration::from_secs(600),
+            "so the figure is how long the caller has been waiting, not the zero a run that has \
+             not moved has been running: {:?}",
+            held.waited
         );
     }
 
