@@ -3,7 +3,7 @@
 A hands-on tour of the crash-dump tools against two real kernel minidumps:
 [`052126-34312-01.dmp`](samples/052126-34312-01.dmp) (5.8 MB) for §1–§6, and
 [`081226-2187-01.dmp`](samples/081226-2187-01.dmp) in [§7](#7-the-other-shape-of-crash-a-driver-frame-analyze-cant-name),
-where a driver crashes in its own code and `!analyze` cannot name it. It mirrors the skill's
+where a driver crashes in its own code and `!analyze` names no frame inside it. It mirrors the skill's
 [`crash-dump.md`](../skills/windbg-debugging/crash-dump.md) playbook and shows the
 real `windbg` MCP tool calls, their output, and the gotchas — from `crash_triage`'s
 one-call summary through to the culprit driver named by a manual device-stack walk
@@ -157,7 +157,18 @@ FAILURE_BUCKET_ID:  0x9F_3
 ```
 
 `!analyze` already hints at NVIDIA (the timestamp warning) but leaves
-`MODULE_NAME: Unknown_Module` — it didn't auto-attribute the bug to a driver. The
+`MODULE_NAME: Unknown_Module` — it didn't auto-attribute the bug to a driver.
+
+> **That `Unknown_Module` is this host's, not this dump's.** `!analyze` attributes a module from
+> `triage\triage.ini`, which is a separate copy step in
+> [`setup.md`](../skills/windbg-debugging/setup.md) and was not beside the engine when this
+> session was recorded. Bundle it and the same dump answers
+> `MODULE_NAME: pci`, `FAILURE_BUCKET_ID: 0x9F_3_ACPI_IMAGE_pci.sys` (measured 2026-08-30) —
+> which is the **bus driver**, the one §4 below identifies as *not* the culprit. So the manual
+> walk is needed either way; what changes is whether `!analyze` declines to answer or answers with
+> the wrong layer.
+
+The
 faulting stack is the watchdog firing from a timer DPC on an idle CPU (normal for `0x9F`;
 the blame is on whoever holds the IRP, not this stack):
 
@@ -173,9 +184,9 @@ nt!KiIdleLoop
 
 ## 4. Name the culprit by walking the device stack
 
-`!analyze` left the module unknown, so resolve it from the bug-check arguments by hand.
-Arg2 is the **PDO** and Arg4 is the **blocked IRP** — these address-based reads work even
-on this partial minidump:
+`!analyze` left the module unknown — or, on a host with `triage\` bundled, named the bus driver —
+so resolve it from the bug-check arguments by hand. Arg2 is the **PDO** and Arg4 is the **blocked
+IRP** — these address-based reads work even on this partial minidump:
 
 ```jsonc
 // PDO's owning driver — the bus driver, not the culprit
@@ -289,10 +300,14 @@ STACK (11 frames):
 
 Four things to read off this, none of which the `0x9F` can show:
 
-- **`!analyze` says `Unknown_Module`; the frame says `MessageManager+0x1654`.** The driver has
-  no PDB, which is the case `!analyze`'s attribution handles worst and the case `module+RVA`
-  handles fine — the engine knows which image holds the address and where it is loaded, and the
-  offset falls out. Frame 07 is six frames below the top, under a stack of kernel allocator
+- **`!analyze` says `Unknown_Module`; the frame says `MessageManager+0x1654`.** The two answers
+  are computed differently, which is why one is here and the other is not: `module+RVA` comes off
+  the load base, so the engine needs only to know which image holds the address, while
+  `!analyze`'s attribution is table-driven and reads `triage\triage.ini` — absent here, as it is
+  on any host that bundled the engine's DLLs without the `triage\` directory beside them
+  ([`setup.md`](../skills/windbg-debugging/setup.md) copies it as its own step). Bundle it and this
+  line reads `MODULE_NAME: MessageManager`; the frame below is unchanged either way, which is the
+  argument for reading it. Frame 07 is six frames below the top, under a stack of kernel allocator
   internals that a "blame frame 0" rule would have named instead.
 - **`0x1654` is the whole point of an RVA.** Five dumps from the same crash/reboot loop reported
   that frame at five *different* addresses — `0xfffff8020a5e1654`, `0xfffff80561281654`,

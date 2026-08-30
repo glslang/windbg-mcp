@@ -82,8 +82,10 @@
   failure bucket, the blamed module and the per-parameter explanations exist nowhere but `!analyze`'s
   own output, so they are extracted from it and confined to the `analysis` object. **Prefer
   `faulting_frame` to `analysis.module_name`**: the frame's `module+RVA` is computed from the load
-  base and is right for a driver with no PDB, which is exactly where `!analyze`'s attribution goes
-  wrong. **Which frame is the culprit is still a guess, though — only the offset is computed.**
+  base, so it names the driver on any host that can read the dump, while `!analyze`'s attribution
+  additionally needs `triage\triage.ini` beside the engine and reports `Unknown_Module` without it
+  (`skills/windbg-debugging/setup.md` has the copy step). A missing PDB costs the *function* on
+  both — neither answer names one. **Which frame is the culprit is still a guess, though — only the offset is computed.**
   `faulting_frame` is the innermost frame that *could* be a kernel driver: not `nt`/`hal`, not the
   framework layers that sit on a stack on somebody else's behalf (KMDF's `Wdf01000`, Driver
   Verifier), and not a user-mode module — a kernel stack that unwinds past the system call boundary
