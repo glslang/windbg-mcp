@@ -2129,16 +2129,13 @@ impl Sessions {
         // away does it routinely. Reporting the milestone as both would tell a caller to go and
         // do the thing the run is waiting for while the session is already stopped and taking
         // ordinary reads.
-        let started = |moved: bool| {
-            let found = session.execution_by(&handle);
-            crate::structured::ExecutionStarted {
-                session_id: session.id.clone(),
-                execution: handle.clone(),
-                command: command.clone(),
-                running: moved && found.as_ref().is_some_and(|found| found.running),
-                moved,
-                breaks_in_ms: found.and_then(|found| found.breaks_in).map(ms),
-            }
+        let started = |moved: bool, found: &FoundExecution| crate::structured::ExecutionStarted {
+            session_id: session.id.clone(),
+            execution: handle.clone(),
+            command: command.clone(),
+            running: moved && found.running,
+            moved,
+            breaks_in_ms: found.breaks_in.map(ms),
         };
         let settled = tokio::time::timeout(self.call_timeout, async {
             loop {
@@ -2148,21 +2145,39 @@ impl Sessions {
                 // moving" about a target that moved and stopped, which is the one sentence here
                 // that is simply false. `try_recv` leaves the receiver usable when there is
                 // nothing yet, and a value survives the sender being dropped, so a milestone sent
-                // before the reply is never missed.
-                if resumed_rx.try_recv().is_ok() {
-                    return Ok(started(true));
+                // before the reply is never missed. Taken before the slot is read, and acted on
+                // after: the ordering is what matters, not where the value is used.
+                let moved = resumed_rx.try_recv().is_ok();
+                // The slot has held this handle since before the job was submitted, so the only
+                // way it stops resolving is another run replacing it — which a *stopped* run
+                // permits, and this run may have stopped in the moment before this loop got a
+                // turn. Reported rather than worked around, and both alternatives were worse: a
+                // record built from a handle nothing resolves would say the stop is there to be
+                // read when `wait_for_stop` can no longer find it, and carrying on round the loop
+                // would wait for a change to a slot this run no longer owns until the call's whole
+                // budget ran out.
+                let Some(found) = session.execution_by(&handle) else {
+                    return Err(EngineError::Stale(format!(
+                        "The run on session `{}` was started and is `{handle}`, but another run \
+                         has already replaced it — a session holds one at a time. Whatever this \
+                         one reached cannot be read any more. Runs on a session are one at a \
+                         time by construction, so start the next only once the last has been \
+                         collected.",
+                        session.id
+                    )));
+                };
+                if moved {
+                    return Ok(started(true, &found));
                 }
                 // Then the reply, which by now can only belong to a run that never moved the
                 // target: the command completed by itself, or it was refused. A refusal is this
                 // call's failure — reported rather than dressed up as a run that finished early,
                 // which is what a `continue_async` on a session whose target has gone would
                 // otherwise come back as.
-                if let Some(found) = session.execution_by(&handle)
-                    && let Some(stopped) = found.stopped
-                {
+                if let Some(stopped) = &found.stopped {
                     return match stopped.as_ref() {
                         Err(why) => Err(why.clone()),
-                        Ok(_) => Ok(started(false)),
+                        Ok(_) => Ok(started(false, &found)),
                     };
                 }
                 // **One wait, for both signals.** The milestone does not arrive on this channel
@@ -2179,7 +2194,7 @@ impl Sessions {
                 // Cancellation-safe: `watch::Receiver::changed` is documented to be, so losing the
                 // race costs nothing on the next turn.
                 if changed.changed().await.is_err() {
-                    return Ok(started(false));
+                    return Ok(started(false, &found));
                 }
             }
         })
@@ -5282,6 +5297,52 @@ mod tests {
         assert!(
             matches!(why, EngineError::Lost(_)),
             "the failure keeps its kind rather than becoming a quiet `requested: false`: {why:?}"
+        );
+    }
+
+    /// A run whose slot is taken before its own call returns says so, rather than handing back a
+    /// handle nothing resolves.
+    ///
+    /// A run that stops makes the slot replaceable — deliberately, since that is what lets a
+    /// handle age out instead of accumulating — and it can stop before the `continue_async` that
+    /// started it is scheduled again. A concurrent caller watching `session_status` can claim the
+    /// slot in that window. Both of the other answers are worse than an error: a record built
+    /// from the old handle would say the stop is recorded and waiting to be read when
+    /// `wait_for_stop` can no longer find it, and carrying on round the loop would wait on a slot
+    /// this run no longer owns until the whole call budget ran out.
+    #[tokio::test(start_paused = true)]
+    async fn a_run_whose_slot_was_taken_before_it_answered_says_so() {
+        let sessions = Sessions::new(Duration::from_secs(300));
+        let (session, mut jobs) = queued("sess-1", SessionState::Open);
+
+        // The worker answers, and a concurrent caller takes the slot before the starter looks.
+        let racing = Arc::clone(&session);
+        tokio::spawn(async move {
+            let job = jobs.recv().await.expect("the resume reached the queue");
+            let done = racing
+                .waiters
+                .lock()
+                .unwrap()
+                .remove(&job.id)
+                .expect("the waiter is registered")
+                .done;
+            let _ = done.send(Ok(Output::text("Breakpoint 0 hit")));
+            racing.finish_execution(job.id, Ok(Output::text("Breakpoint 0 hit")));
+            // Another `continue_async` gets there first.
+            resumed_on(&racing, job.id + 1);
+        });
+
+        let why = sessions
+            .start_execution(&session, true, "g".to_string(), Duration::from_secs(60))
+            .await
+            .expect_err("the handle this call was about is gone");
+        assert!(
+            matches!(why, EngineError::Stale(_)),
+            "a handle nothing resolves is a stale handle, not a run that is still going: {why:?}"
+        );
+        assert!(
+            why.to_string().contains("replaced"),
+            "and the message has to say what happened to it: {why}"
         );
     }
 

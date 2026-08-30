@@ -924,6 +924,16 @@ time a read arrives, and conservative is correct there. This was declined once a
 deliberately conservative"; that was right about `running()` and wrong about everything else, and
 the tell was three findings landing on one seam.
 
+**And the slot stops resolving the moment another run takes it, including under the call that
+started this one.** A run that has *stopped* is replaceable — that is what makes a handle age out
+rather than accumulate — and it can stop before `continue_async` is scheduled again, so a
+concurrent caller watching `session_status` can claim the slot in that window. `start_execution`
+therefore reads the slot once per turn and reports `Stale` when its own handle has gone. The two
+alternatives are both worse than an error: a record built from the missing handle would tell the
+caller the stop is recorded and waiting when `wait_for_stop` can no longer find it, and carrying on
+round the loop would wait for a change to a slot this run no longer owns until the whole call
+budget ran out.
+
 **And the `Resumed` arm publishes before it wakes.** The phase, then the milestone's channel, then
 `execution_moved()`. `start_execution` waits on the *slot* and reads the channel at the top of its
 loop, so a bump published first can wake it on another runtime thread while the channel is still
