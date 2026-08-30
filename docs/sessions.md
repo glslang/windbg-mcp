@@ -111,15 +111,18 @@ by it:
   anybody is waiting, and stays there until another run replaces it. A client that disconnected
   mid-run can reconnect and read what happened; two callers reading it get the same answer.
 
-**Every run is bounded.** `max_run_ms` is how long the debugger lets the target go before breaking
-it in itself (default 60s, maximum one hour), so a resume that reaches nothing ends rather than
+**Every run is bounded**, and the clock starts when the target *moves* rather than when you asked —
+a run waiting its turn behind another call on the same session reports no elapsed time and its whole
+bound. `max_run_ms` is how long the debugger lets the target go before breaking it in itself (default 60s, maximum one hour), so a resume that reaches nothing ends rather than
 leaving an engine thread waiting for ever with nobody watching. A run that ends that way reports
 `timed_out`, and its position is where the target happened to be rather than a stop it reached.
 `break_in` ends one early; it returns as soon as the request is lodged, and the stop it produces
-arrives on the next `wait_for_stop`. It answers `requested: false` — not an error — when the run had
-already stopped and there was nothing to break, which is the ordinary race between reading a handle
-and acting on it. A break that could not be *delivered* is a failure rather than that, so the two
-are never the same answer.
+arrives on the next `wait_for_stop`. It is bound to the run you name, so it can never land on
+whatever the session started next — and a run that had not begun yet, because something else was
+still on the engine, is **barred from starting** rather than left to run once the queue drains. It
+answers `requested: false` — not an error — only when the run had already finished and there was
+nothing to stop, which is the ordinary race between reading a handle and acting on it. A break that
+could not be *delivered* is a failure rather than that, so the two are never the same answer.
 
 **A stop says where, and whose.** `stopped_at` is the instruction pointer, `thread` the
 operating-system thread id it belongs to, and `processor` which of a kernel target's processors it

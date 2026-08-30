@@ -601,11 +601,27 @@ struct Execution {
     /// The worker job whose reply is this run's stop.
     job: u64,
     started: Instant,
+    /// When the worker reported the target actually moving, or `None` while the run is still
+    /// **queued** behind another operation on the engine thread.
+    ///
+    /// The slot is claimed before the job is even submitted, deliberately — a slot filled only
+    /// once the worker answered would leave a window where the target may be moving and this side
+    /// would let a read through. The cost of that is that `started` is when the *caller asked*,
+    /// which is not when the target went. For a run that goes straight onto an idle engine those
+    /// are the same instant; for one queued behind a `pool_census` they are minutes apart, and
+    /// every figure derived from `started` is then wrong in the same direction: `running_for_ms`
+    /// counts time the target stood still, and `breaks_in_ms` counts down a bound the worker has
+    /// not started — reporting no bound left for a run that has just begun a full-length one.
+    ///
+    /// So the phase is recorded rather than inferred. [`Self::running`] deliberately does **not**
+    /// read it: a queued run is one whose target may be moving by the time a read arrives, and
+    /// that has always been the conservative answer.
+    moving_since: Option<Instant>,
     /// How long the target actually ran, fixed when the stop is filed — `None` while it is still
     /// moving.
     ///
-    /// Recorded rather than derived, because `started.elapsed()` goes on growing after the run is
-    /// over: a stop read an hour later would report an hour-long run, and `session_status` would
+    /// Recorded rather than derived, because the clock it comes from goes on running after the
+    /// run is over: a stop read an hour later would report an hour-long run, and `session_status` would
     /// show a finished run getting steadily longer. The stop is deliberately kept until another
     /// run replaces it, so "how long ago it was filed" and "how long it ran" are different
     /// questions and only the second is this one.
@@ -626,17 +642,29 @@ impl Execution {
         self.stopped.is_none()
     }
 
-    /// How long the target ran: frozen once it stopped, and counting while it has not.
+    /// How long the target ran: frozen once it stopped, counting while it has not, and zero while
+    /// the run is still queued and the target has not moved at all.
     fn ran_for(&self) -> Duration {
-        self.ran_for.unwrap_or_else(|| self.started.elapsed())
+        self.ran_for.unwrap_or_else(|| self.going_for())
+    }
+
+    /// How long the target has been moving, from the milestone rather than from the claim — zero
+    /// for a run still waiting its turn on the engine thread. See [`Self::moving_since`].
+    fn going_for(&self) -> Duration {
+        self.moving_since
+            .map_or(Duration::ZERO, |since| since.elapsed())
     }
 
     /// How much longer the worker will let the target run before breaking it in — `None` once it
     /// has stopped, and `None` again once the bound has passed with no stop reported, since a
     /// figure that has run out is not time anybody has left.
     fn breaks_in(&self) -> Option<Duration> {
+        // Measured from the milestone, because that is when the *worker* starts its own bound: a
+        // run queued behind a long operation would otherwise have its whole budget counted down
+        // before the engine thread reached it, and report no bound left at the moment it began a
+        // full-length run.
         self.running()
-            .then(|| self.bound.saturating_sub(self.started.elapsed()))
+            .then(|| self.bound.saturating_sub(self.going_for()))
             .filter(|left| !left.is_zero())
     }
 
@@ -903,7 +931,7 @@ impl Session {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .filter(|execution| execution.running())
-            .map(|execution| (execution.handle.clone(), execution.started.elapsed()))
+            .map(|execution| (execution.handle.clone(), execution.ran_for()))
     }
 
     /// Installs a run, replacing whatever the slot held. Refuses while one is still going.
@@ -935,7 +963,7 @@ impl Session {
             let Some(execution) = slot.as_mut().filter(|e| e.job == job) else {
                 return;
             };
-            execution.ran_for = Some(execution.started.elapsed());
+            execution.ran_for = Some(execution.going_for());
             execution.stopped = Some(Arc::new(result));
         }
         // The idle clock starts now, not when the run was submitted. `last_used` is stamped on
@@ -962,6 +990,24 @@ impl Session {
             running_for: execution.ran_for(),
             breaks_in: execution.breaks_in(),
         })
+    }
+
+    /// Records that `job`'s target is actually moving — the [`WorkerMessage::Resumed`] milestone.
+    ///
+    /// Keyed by job for [`Self::finish_execution`]'s reason: the slot may by then hold a later
+    /// run, and stamping that one would date it from a milestone that was not its own.
+    fn execution_moving(&self, job: u64) {
+        if let Some(execution) = self
+            .execution
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .filter(|e| e.job == job)
+        {
+            // Only the first, so a worker that reported twice cannot restart the clock on a run
+            // that has been going for an hour.
+            execution.moving_since.get_or_insert_with(Instant::now);
+        }
     }
 
     /// Wakes everything waiting on the slot. Sent rather than compared, so a run replaced by one
@@ -1914,12 +1960,14 @@ impl Sessions {
         // reads as an unexplained truncation without the record that somebody asked for it.
         self.rec.write(crate::record::Event::Interrupt {
             session: session.id.clone(),
-            // The worker's own answer, not `is_ok()`. Four of the five things this op can do are
-            // `Ok` and raise nothing — nothing was running, the job named had moved on, a batch
-            // was sealed for its rollback — and a transcript claiming a break was delivered for
-            // any of them is a record of a cause that never happened, which is the one thing this
-            // event exists to supply.
-            delivered: outcome.as_ref().is_ok_and(|out| out.raised == Some(true)),
+            // The worker's own answer, and specifically the *narrow* half of it: did this
+            // request raise the break. Most of what this op can do is `Ok` and sends nothing —
+            // nothing was running, the job named had already finished, a batch was sealed for its
+            // rollback, or a break was already pending — and this event exists to explain a later
+            // truncated result, which a request that sent nothing does not.
+            delivered: outcome
+                .as_ref()
+                .is_ok_and(|out| out.raised.is_some_and(crate::proto::Interrupted::delivered)),
             // Scrubbed and capped like every other debugger-supplied string that reaches the
             // transcript — this one is the engine's own words about what it stopped, and it is
             // the one path that was not going through the rule the module documents.
@@ -1978,6 +2026,7 @@ impl Sessions {
                 command: command.clone(),
                 job,
                 started: Instant::now(),
+                moving_since: None,
                 ran_for: None,
                 bound,
                 stopped: None,
@@ -2205,10 +2254,11 @@ impl Sessions {
         Ok(crate::structured::BreakInRequested {
             session_id: session.id.clone(),
             execution: handle.to_string(),
-            // The worker's answer, which is the only thing that knows. `Ok` says the request was
-            // read; this says whether it left a break lodged for the job it was about. See
-            // [`crate::proto::Output::raised`].
-            requested: out.raised == Some(true),
+            // The worker's answer, and the *wide* half of it: is this run going to stop. A break
+            // already pending counts, and so does a queued run barred from starting — the caller
+            // asked for the target not to keep going, and in both cases it will not. See
+            // [`crate::proto::Interrupted`].
+            requested: out.raised.is_some_and(crate::proto::Interrupted::stopping),
             detail: out.text,
         })
     }
@@ -3853,13 +3903,15 @@ async fn reader(
                     .unwrap_or_else(|e| e.into_inner())
                     .get_mut(&id)
                     .and_then(|waiting| waiting.resumed.take());
-                // Whether or not anyone was holding the channel: the wake is what
-                // `Sessions::start_execution` is waiting on, and it waits on the *slot* rather
-                // than on the milestone's channel — one wait, so the run failing and the run
-                // starting arrive by the same road. Bumping only inside the arm below would leave
-                // `continue_async` asleep until the run *ended*, which is the one thing the tool
-                // exists not to do.
-                session.execution_moved();
+                // **Everything this milestone says, before anything that wakes a reader of it.**
+                // `start_execution` waits on the *slot* and reads the milestone's channel at the
+                // top of its loop, so a bump published first can wake it on another runtime
+                // thread while the channel is still empty — it would then find nothing, see the
+                // run still going, consume the only notification and wait again, sleeping until
+                // the run *ended*. That is the exact bug this branch shipped once already,
+                // arriving the second time through a two-line ordering instead of a missing wake.
+                // So: the phase on the slot, then the channel, then the wake.
+                session.execution_moving(id);
                 match told {
                     Some(tx) => {
                         let _ = tx.send(());
@@ -3873,6 +3925,13 @@ async fn reader(
                         session.id
                     ),
                 }
+                // Whether or not anyone was holding the channel: the wake is what
+                // `Sessions::start_execution` is waiting on, and it waits on the *slot* rather
+                // than on the milestone's channel — one wait, so the run failing and the run
+                // starting arrive by the same road. Bumping only inside the arm above would leave
+                // `continue_async` asleep until the run *ended*, which is the one thing the tool
+                // exists not to do.
+                session.execution_moved();
             }
             WorkerMessage::Committed { id } | WorkerMessage::Opened { id } => {
                 tracing::warn!(
@@ -4459,6 +4518,7 @@ mod tests {
                 command: "g".to_string(),
                 job,
                 started: Instant::now(),
+                moving_since: Some(Instant::now()),
                 ran_for: None,
                 bound: Duration::from_secs(60),
                 stopped: None,
@@ -4483,6 +4543,7 @@ mod tests {
                 command: "g".to_string(),
                 job: 8,
                 started: Instant::now(),
+                moving_since: Some(Instant::now()),
                 ran_for: None,
                 bound: Duration::from_secs(60),
                 stopped: None,
@@ -4723,9 +4784,11 @@ mod tests {
                     .get_mut(&job.id)
                     .and_then(|waiting| waiting.resumed.take())
                     .expect("a resume registers somewhere to report the milestone");
+                // The real `reader`'s order exactly, which is the point of a double: the phase
+                // and the channel are published *before* the wake that announces them, or a
+                // waiter can be woken on another thread and find neither.
+                session.execution_moving(job.id);
                 let _ = told.send(());
-                // Where the real `reader` bumps it, and for the reason it does: the caller waits
-                // on the slot rather than on the milestone's own channel.
                 session.execution_moved();
             }
             // `None` leaves the run going, which is the ordinary state of one — the reply is the
@@ -4971,6 +5034,7 @@ mod tests {
                 job: 7,
                 // A run that has been going five seconds when it stops.
                 started: Instant::now() - Duration::from_secs(5),
+                moving_since: Some(Instant::now() - Duration::from_secs(5)),
                 ran_for: None,
                 bound: Duration::from_secs(60),
                 stopped: None,
@@ -5074,7 +5138,10 @@ mod tests {
                 .remove(&job.id)
                 .expect("the waiter is registered")
                 .done;
-            let _ = done.send(Ok(Output::interrupted("Interrupted.", true)));
+            let _ = done.send(Ok(Output::interrupted(
+                "Interrupted.",
+                crate::proto::Interrupted::Raised,
+            )));
             job.op
         });
 
@@ -5114,8 +5181,8 @@ mod tests {
                 .expect("the waiter is registered")
                 .done;
             let _ = done.send(Ok(Output::interrupted(
-                "Not interrupted. Job 7 is no longer what this session's engine is running.",
-                false,
+                "Not interrupted. Job 7 has already finished.",
+                crate::proto::Interrupted::AlreadyFinished,
             )));
         });
 
@@ -5150,6 +5217,107 @@ mod tests {
             matches!(why, EngineError::Lost(_)),
             "the failure keeps its kind rather than becoming a quiet `requested: false`: {why:?}"
         );
+    }
+
+    /// A run that is claimed but still queued has not run for any time, and has its whole bound.
+    ///
+    /// The slot is claimed before the job is submitted — deliberately, so no read can slip through
+    /// to a target that may already be moving — which means `started` is when the *caller asked*,
+    /// not when the target went. Behind a long `pool_census` those are minutes apart, and every
+    /// figure taken from `started` is then wrong the same way: time the target stood still counted
+    /// as running, and a bound counted down before the worker had begun it. A run queued longer
+    /// than its own bound would report no bound left at the moment it started a full-length one.
+    #[test]
+    fn a_queued_run_has_not_started_counting() {
+        let session = dormant("sess-1", SessionState::Open);
+        let handle = mint_execution_id();
+        session
+            .claim_execution(Execution {
+                handle: handle.clone(),
+                command: "g".to_string(),
+                job: 7,
+                // Claimed two minutes ago and still waiting its turn: a bound this stale would
+                // have run out twice over.
+                started: Instant::now() - Duration::from_secs(120),
+                moving_since: None,
+                bound: Duration::from_secs(60),
+                ran_for: None,
+                stopped: None,
+            })
+            .expect("a session with no run accepts one");
+
+        let queued = session.execution_info().expect("the slot holds it");
+        assert_eq!(
+            queued.running_for_ms, 0,
+            "the target has not moved, so it has not run for two minutes or for anything else"
+        );
+        assert_eq!(
+            queued.breaks_in_ms,
+            Some(60_000),
+            "the worker starts its bound when it starts pumping, so a run still in the queue has \
+             all of it — reporting none left would say a run that is about to begin is about to \
+             end"
+        );
+        assert!(
+            !queued.stopped,
+            "queued is not stopped: a read arriving now could find the target already moving, \
+             which is why the slot is claimed this early in the first place"
+        );
+
+        // And from the milestone it counts.
+        session.execution_moving(7);
+        assert!(
+            session
+                .execution_info()
+                .expect("the slot holds it")
+                .breaks_in_ms
+                .is_some_and(|left| left <= 60_000),
+            "once it is moving the bound counts down"
+        );
+    }
+
+    /// A second milestone for one job does not restart its clock.
+    #[test]
+    fn a_repeated_milestone_does_not_restart_the_run() {
+        let session = dormant("sess-1", SessionState::Open);
+        let handle = resumed_on(&session, 7);
+        let first = session
+            .execution_by(&handle)
+            .expect("it is there")
+            .running_for;
+        session.execution_moving(7);
+        assert!(
+            session
+                .execution_by(&handle)
+                .expect("it is there")
+                .running_for
+                >= first,
+            "a run that has been going an hour is not one that just started because the worker \
+             said `Resumed` twice"
+        );
+    }
+
+    /// The two questions an interrupt's outcome answers do not partition the same way.
+    ///
+    /// `break_in` asks *is this run going to stop*, for which a break already lodged and a queued
+    /// run barred from starting are both yes. The transcript asks *did this request raise the
+    /// break*, because its `interrupt` event exists to explain a later truncated result and a
+    /// request that sent nothing explains nothing. One `bool` made these the same, and whichever
+    /// reader lost had a plausible wrong answer.
+    #[test]
+    fn an_interrupt_outcome_answers_two_different_questions() {
+        use crate::proto::Interrupted;
+        for (outcome, stopping, delivered) in [
+            (Interrupted::Raised, true, true),
+            (Interrupted::AlreadyPending, true, false),
+            (Interrupted::Barred, true, false),
+            (Interrupted::AlreadyFinished, false, false),
+            (Interrupted::NothingRunning, false, false),
+            (Interrupted::Sealed, false, false),
+        ] {
+            assert_eq!(outcome.stopping(), stopping, "{outcome:?}.stopping()");
+            assert_eq!(outcome.delivered(), delivered, "{outcome:?}.delivered()");
+        }
     }
 
     // ---- releasing what nobody is using -------------------------------------------

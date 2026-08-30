@@ -622,14 +622,16 @@ pub struct StopWait {
 pub struct BreakInRequested {
     pub session_id: String,
     pub execution: String,
-    /// Whether a break is lodged for this run, so the target is going to stop.
+    /// Whether this run is going to stop — or, if it had not started, will not start.
     ///
-    /// `false` is not a failed call and never means the request went astray. It says the engine
-    /// had nothing to break for *this* run: it had already stopped — the ordinary race between a
-    /// caller reading its handle and this arriving — or it had stopped and the worker had moved
-    /// on to something else, which is refused rather than broken in on. Either way the thing the
-    /// caller wanted has happened, and `detail` says which it was. A break that could not be
-    /// delivered at all is an error rather than a `false` here.
+    /// `true` covers three things, because from the caller's side they are one: a Ctrl+Break was
+    /// raised, one was already lodged, or the run was still queued behind other work and has been
+    /// barred from ever setting the target going.
+    ///
+    /// `false` is not a failed call and never means the request went astray. It says there was
+    /// nothing left to stop: the run had already finished — the ordinary race between a caller
+    /// reading its handle and this arriving — and `detail` says so. A break that could not be
+    /// *delivered* is an error rather than a `false` here.
     pub requested: bool,
     /// The debugger's own account of what it did.
     pub detail: String,

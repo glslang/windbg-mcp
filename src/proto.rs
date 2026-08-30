@@ -942,6 +942,56 @@ impl Failed {
     }
 }
 
+/// What an [`EngineOp::Interrupt`] did about the job it was for — see [`Output::raised`].
+///
+/// Every variant is an `Ok`: none of them is a failure, and only the first sent anything to the
+/// engine. What separates them is which of the two questions a reader is asking, and they do not
+/// partition the same way — `Raised` and `AlreadyPending` and `Barred` all mean *this run is going
+/// to stop*, while only `Raised` means *this request is why*.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Interrupted {
+    /// Ctrl+Break was raised on the engine by this request.
+    Raised,
+    /// A break was already lodged for that job and it is stopping; nothing further was sent.
+    ///
+    /// At most one break per job — a [`crate::batch`] told to stop runs its rollback as part of
+    /// the same job, so a second interrupt aimed at it would land on a restore command.
+    AlreadyPending,
+    /// The job had not reached the engine thread yet, and has been barred from starting.
+    ///
+    /// The answer to breaking in a run that is still queued behind another operation. There is no
+    /// pump to interrupt, and letting it start would set a target going that its caller has
+    /// already asked to stop — for up to the bound it named, which may be an hour.
+    Barred,
+    /// The job had already finished, so there was nothing to reach.
+    ///
+    /// Told apart from [`Self::Barred`] by the id alone: job ids are minted in order and the
+    /// worker runs them in order, so one below the running job is one that is over.
+    AlreadyFinished,
+    /// Nothing was running on the engine at all.
+    NothingRunning,
+    /// The job is a [`crate::batch`] running its rollback, which no break may reach.
+    Sealed,
+}
+
+impl Interrupted {
+    /// Whether the job this was about is going to stop — or, for [`Self::Barred`], never start.
+    ///
+    /// What `break_in` reports as `requested`.
+    pub fn stopping(self) -> bool {
+        matches!(self, Self::Raised | Self::AlreadyPending | Self::Barred)
+    }
+
+    /// Whether *this request* raised the break, rather than finding one already there.
+    ///
+    /// What the transcript records as `delivered`: that event explains a later truncated result,
+    /// and a request that sent nothing explains nothing.
+    pub fn delivered(self) -> bool {
+        matches!(self, Self::Raised)
+    }
+}
+
 /// The ordinary case, so a bare `Err(message)?` keeps reading as it did.
 ///
 /// Spelled out for the two string types rather than blanket over `ToString`, which cannot be
@@ -1014,8 +1064,7 @@ pub struct Output {
     /// happens on a path that has just pumped a target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop: Option<Box<crate::structured::StopReport>>,
-    /// Whether a break is lodged for the job an [`EngineOp::Interrupt`] was about, for that one
-    /// op.
+    /// What an [`EngineOp::Interrupt`] did, for that one op.
     ///
     /// The third field here that exists because only one side can answer it — but the other way
     /// round from [`Self::summary`] and [`Self::stop`], which the supervisor finishes. This one
@@ -1024,17 +1073,18 @@ pub struct Output {
     /// lifetime of microseconds on the far side of a pipe.
     ///
     /// It is not "the request succeeded", which is what `Ok` already says, and the difference is
-    /// the whole reason it is here. Four of the five answers this op can give are `Ok` and raised
-    /// nothing: there was no job running, the job named is not the one running, the job is a
-    /// [`crate::batch`] sealed for its rollback, or a break was already pending. A caller told
-    /// only that its request went through would report every one of those as a target about to
-    /// stop.
+    /// the whole reason it is here: most of what this op can do is `Ok` and raises nothing.
     ///
-    /// `Some(true)` is therefore "a break is lodged for that job", not "one was raised by this
-    /// call" — an already-pending break is a target that is stopping, which is what the caller
-    /// asked for. `None` is any op that is not an interrupt.
+    /// **A variant rather than a `bool`, because its two readers want different questions
+    /// answered** and one flag made them the same. `break_in` asks *is this run going to stop* —
+    /// for which a break already pending, or a queued run barred from starting, is a yes. The
+    /// transcript asks *did this request raise a break*, because its `interrupt` event exists to
+    /// explain a later truncated result, and a second request that sent nothing explains nothing.
+    /// Collapsed into one bool, whichever reader lost had a plausible wrong answer.
+    ///
+    /// `None` is any op that is not an interrupt.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub raised: Option<bool>,
+    pub raised: Option<Interrupted>,
     /// What ending the session did to a live process the engine held, for the one op that ends
     /// one: `Some(true)` where a process this server **attached** to was detached and left
     /// running, `Some(false)` where the target was one the session takes with it, `None` where
@@ -1121,9 +1171,9 @@ impl Output {
             raised: None,
         }
     }
-    /// An [`EngineOp::Interrupt`]'s reply: what the worker did, and whether that left a break
-    /// lodged for the job the request was about. See [`Self::raised`].
-    pub fn interrupted(text: impl Into<String>, raised: bool) -> Self {
+    /// An [`EngineOp::Interrupt`]'s reply: what the worker did about the job it was for. See
+    /// [`Self::raised`].
+    pub fn interrupted(text: impl Into<String>, raised: Interrupted) -> Self {
         Self {
             raised: Some(raised),
             ..Self::text(text)
