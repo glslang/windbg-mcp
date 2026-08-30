@@ -96,6 +96,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Documentation: `!analyze`'s module attribution is a fact about the debugging host, not about
+  the dump.** Four documents and a smoke-test fixture said the two checked-in driver crashes
+  disagree about it — that `MessageManager` has no PDB so `!analyze` reports `Unknown_Module`,
+  while `HEVD` ships one so `!analyze` blames it by name. Measured on one engine against both
+  dumps, they behave identically, and what decides it is whether `triage\triage.ini` is beside the
+  engine (`skills/windbg-debugging/setup.md` copies it as a step of its own): with it, each crash
+  is attributed to its driver; without it, both report `Unknown_Module`; with no `winext\` either,
+  `!analyze` does not run at all. A missing PDB costs the *function* — both failure buckets end
+  `!unknown_function` whichever way that falls.
+
+  The same correction reaches the `0x9F` walkthrough, where it changes the reading rather than just
+  the wording: with `triage\` bundled that dump is attributed to `pci` —
+  `0x9F_3_ACPI_IMAGE_pci.sys` — which is the **bus driver** the walkthrough's own device-stack walk
+  identifies as *not* the culprit. So the manual walk is required either way, and what a bundled
+  engine changes is whether `!analyze` declines to answer or answers with the wrong layer.
+
+  `a_driver_crash_names_the_driver_frame_an_all_kernel_walk_would_miss` now asks the host
+  (`triage\triage.ini` beside the server) instead of carrying a per-fixture flag, and asserts on
+  both sides of that rather than skipping either. It had never run: `ci.yml` copies no extension
+  directory, so `analysis.ran` is false on both runners and every `!analyze` assertion in that tier
+  is skipped there.
+
 - **A transcript no longer records an interrupt that reached nothing as one that was delivered.**
   `WINDBG_MCP_TRANSCRIPT`'s `interrupt` event took `delivered` from whether the request succeeded,
   and four of the five things an interrupt can do succeed while raising nothing — there was no

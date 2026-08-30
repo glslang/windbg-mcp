@@ -179,14 +179,6 @@ struct DriverCrashSample {
     /// A symbolised `nt` frame the same walk has to carry, which is what makes the point that one
     /// stack holds both kinds of frame - the mix every real driver crash has.
     kernel_frame: &'static str,
-    /// Whether `!analyze` names [`Self::module`] itself.
-    ///
-    /// The two fixtures disagree, and the disagreement is the coverage. `MessageManager` has **no
-    /// PDB**, so `!analyze` calls the crash `Unknown_Module` and the computed frame is the only
-    /// thing that names the driver - which is why the frame is computed rather than taken from the
-    /// analysis. `HEVD` ships a PDB, so `!analyze` does name it, and the computed frame is checked
-    /// against an independent answer instead.
-    analyze_names_the_module: bool,
     /// Whether `!analyze` reports a freed-pool tag, which only a few bug checks produce.
     carries_a_pool_tag: bool,
     /// Whether the crashing process's name is longer than the 15 bytes
@@ -212,7 +204,6 @@ const DRIVER_CRASHES: &[DriverCrashSample] = &[
         module: "MessageManager",
         rva: "0x1654",
         kernel_frame: "nt!ExFreePoolWithTag",
-        analyze_names_the_module: false,
         carries_a_pool_tag: true,
         process_name_needs_the_audit_name: true,
     },
@@ -227,11 +218,36 @@ const DRIVER_CRASHES: &[DriverCrashSample] = &[
         // `__report_gsfailure`.
         rva: "0x10dc",
         kernel_frame: "nt!KeBugCheckEx",
-        analyze_names_the_module: true,
         carries_a_pool_tag: false,
         process_name_needs_the_audit_name: false,
     },
 ];
+
+/// Whether `!analyze` on this host can attribute a crash to a **module** at all.
+///
+/// It is a fact about the engine beside the server, not about the dump, and that is the whole
+/// reason this function exists rather than a flag on [`DriverCrashSample`]. `triage\triage.ini`
+/// is what `!analyze` reads to turn a faulting address into a module, and `setup.md` copies it as
+/// a separate step from the extension that supplies `!analyze` itself — so a host has three
+/// states, and both checked-in crashes behave the same way in each (measured 2026-08-30 on the
+/// x64 bench, both dumps, one engine, three configurations):
+///
+/// | beside the server | `analysis.ran` | `analysis.module_name` |
+/// | --- | --- | --- |
+/// | `winext\` and `triage\` | `true` | the driver's name |
+/// | `winext\`, no `triage\` | `true` | `Unknown_Module` |
+/// | neither — **which is what CI has** | `false` | absent |
+///
+/// The pair used to be described as disagreeing because `MessageManager` has no PDB and `HEVD`
+/// ships one. They do not disagree: with `triage\` bundled `!analyze` names them both, and with
+/// it absent it names neither — and the bucket id says `!unknown_function` for both either way,
+/// since this host has a PDB for neither. What the missing PDB costs is the *function*, which is
+/// not what this test reads.
+fn analyze_can_attribute_a_module() -> bool {
+    std::path::Path::new(EXE)
+        .parent()
+        .is_some_and(|dir| dir.join("triage").join("triage.ini").exists())
+}
 
 /// A checked-in kernel dump and the facts about *that crash* a test asserts, so one test body can
 /// be pointed at either real crash rather than naming one file.
@@ -7213,8 +7229,8 @@ fn a_bug_check_is_triaged_into_its_fields() {
 ///   and the reason a second fixture was captured: until
 ///   [#154](https://github.com/glslang/windbg-mcp/issues/154) it had only ever run against x64
 ///   frames;
-/// * `!analyze`'s own attribution beside it, which the two fixtures disagree about on purpose
-///   (see [`DriverCrashSample::analyze_names_the_module`]).
+/// * `!analyze`'s own attribution beside it, which the two fixtures agree about and this *host*
+///   decides (see [`analyze_can_attribute_a_module`]).
 #[test]
 fn a_driver_crash_names_the_driver_frame_an_all_kernel_walk_would_miss() {
     if target_tier().is_none() {
@@ -7314,21 +7330,23 @@ fn assert_driver_crash_names_its_driver(sample: &DriverCrashSample) {
 
     let analysis = &triage["analysis"];
     if analysis["ran"] == true {
-        if sample.analyze_names_the_module {
-            // Here the computed frame is checked against an independent answer: this driver ships
-            // a PDB, so `!analyze` blames it too and the two have to agree.
+        if analyze_can_attribute_a_module() {
+            // The computed frame checked against an independent answer: `triage.ini` is beside
+            // the engine, so `!analyze` blames a module of its own and the two have to agree.
             assert_eq!(
                 analysis["module_name"], sample.module,
                 "`!analyze` and the computed frame disagree about which driver crashed: {triage}"
             );
         } else {
-            // And here it is the *only* answer — no PDB, so `!analyze` cannot name the driver,
-            // which is precisely why the frame is computed from the load base instead of taken
-            // from the analysis.
-            assert_ne!(
-                analysis["module_name"], sample.module,
-                "if `!analyze` learns to attribute a PDB-less driver, this test's premise is stale \
-                 and the docs claiming otherwise need revisiting: {triage}"
+            // And here the computed frame is the *only* answer, which is the case that argues for
+            // computing it at all. Asserted rather than skipped: `Unknown_Module` is what a host
+            // with no `triage\` reports, so a run that started naming the driver here would mean
+            // the attribution had moved somewhere this test does not model.
+            assert_eq!(
+                analysis["module_name"], "Unknown_Module",
+                "with no `triage\\triage.ini` beside the engine `!analyze` has nothing to \
+                 attribute a module with, so anything but `Unknown_Module` means the host gained \
+                 one mid-run or the attribution moved: {triage}"
             );
         }
         // Only where the analysis got that far: a truncated run may have been cut off before

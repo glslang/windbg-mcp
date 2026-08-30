@@ -9,8 +9,9 @@
   `0x9F DRIVER_POWER_STATE_FAILURE` traced to `nvlddmkm.sys` — `crash_triage` for the bug check as
   fields, then `!ext.analyze -v` and a manual device-stack walk for the culprit it cannot name, with
   the real outputs and the partial-minidump (`0x80040205`) gotcha. Ends on a second sample, a
-  `0x13A` in a **PDB-less driver**, where `!analyze` says `Unknown_Module` and the frame says
-  `MessageManager+0x1654` — the same offset in five dumps that loaded the driver at five addresses.
+  `0x13A` in a third-party driver, recorded on a host with no `triage\` beside the engine, where
+  `!analyze` says `Unknown_Module` and the frame says `MessageManager+0x1654` — the same offset in
+  five dumps that loaded the driver at five addresses.
 - [`ttd-walkthrough.md`](ttd-walkthrough.md) — a hands-on tour of the TTD tools against the
   [`xusheng6/TTD_lab`](https://github.com/xusheng6/TTD_lab) `helloworld` sample: opening a `.run`,
   surveying events/threads, forward/reverse navigation, memory analysis, and counting `printf` calls

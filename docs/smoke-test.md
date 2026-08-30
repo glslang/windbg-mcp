@@ -454,10 +454,25 @@ dispatch walk in `CLAUDE.md` are how to redo it against another build.
 this suite deliberately does not pair. An engine that resolves symbols reads either dump either way
 round, so pairing them would mean an ARM64 runner stopped reading the x64 crash it reads today:
 trading one architecture's coverage for the other's rather than adding it. What the pair covers
-that neither does alone is `!analyze`. `MessageManager` has no PDB, so `!analyze` calls the crash
-`Unknown_Module` and the computed frame is the only thing that names the driver. `HEVD` ships a
-PDB, so `!analyze` blames it by name and the computed frame is checked against an independent
-answer instead.
+that neither does alone is the attribution arithmetic against a second architecture's stack.
+
+**`!analyze`'s own attribution beside it is a fact about the host, not about either dump**, and
+this file said otherwise until 2026-08-30 — that `MessageManager` has no PDB so `!analyze` calls
+it `Unknown_Module`, and that `HEVD` ships one so `!analyze` blames it by name. Measured on one
+engine against both dumps, they behave identically, and what decides it is whether
+`triage\triage.ini` is beside the engine:
+
+| beside the server | `analysis.ran` | `analysis.module_name` |
+| --- | --- | --- |
+| `winext\` and `triage\` | `true` | the driver's name |
+| `winext\`, no `triage\` | `true` | `Unknown_Module` |
+| neither | `false` | absent |
+
+The last row is **what CI has** — `ci.yml` copies `dbghelp.dll` and `symsrv.dll` and no extension
+directory at all — so every `!analyze` assertion in this tier is skipped there, and a green CI run
+says nothing about any of them. Run the tier on a host with a bundled engine before believing an
+`analysis` claim is covered. The missing PDB does cost something, but not the module: both
+buckets end `!unknown_function` whichever way the table above falls.
 
 Those checks are made against **typed fields** wherever a tool has them (issue #84): the handle is
 read from `structuredContent`, not from a `session_id:` line; `nt` and `hal` are matched as module

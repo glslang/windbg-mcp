@@ -225,6 +225,23 @@ attach teardown, 89 until the 32-bit worker's version resource, 90 until #66's s
 it said 83 while it was 84, and 90 while it was 91, which is the usual state of it, so re-derive it
 rather than trusting this sentence.
 
+**And a gate can be a *directory beside the exe*, which prints no `SKIPPED` line at all.** The
+debugger tier's `!analyze` assertions are inside `if analysis["ran"] == true`, and `ran` is false
+without `winext\ext.dll` — which `ci.yml` does not copy (it takes `dbghelp.dll` and `symsrv.dll`
+and no extension directory), so **every `!analyze` claim in that tier is vacuous on both CI
+runners** and a green matrix says nothing about any of them. Restoring the extensions on this
+bench on 2026-08-30 immediately failed a fixture that had been passing for want of ever running.
+Its premise was wrong in the instructive direction: the two driver crashes were described as
+disagreeing about `!analyze`'s attribution because `MessageManager` has no PDB and `HEVD` ships
+one. Measured on one engine against both dumps, they do not disagree — what decides it is
+`triage\triage.ini` (present: each names its driver; absent: both `Unknown_Module`; no `winext\`:
+`ran: false`), and the missing PDB costs the *function*, which is not what the test read. So
+`analyze_can_attribute_a_module()` asks the **host** and both branches assert, and
+`docs/smoke-test.md` carries the table. Two rules fall out. A fixture whose expected value differs
+per fixture is worth a second look when the thing being measured is the *engine* — one fixture
+would have been enough to notice. And bundling the engine changes what the tier covers, so re-run
+it after a `setup.md` copy rather than assuming a green run transfers.
+
 **The dev exe can be locked too, and the failure is quiet.** A worker left running — a driver
 script that died mid-session, a debugger tier killed partway — holds `target\debug\windbg-mcp.exe`,
 and `cargo build` then fails at the final replace step with `Access is denied (os error 5)` while
