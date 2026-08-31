@@ -93,6 +93,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `worker::resolve`'s `? <expr>`, also caller text, filed as `FOLLOWUPS.md` item 56 rather than
   fixed here because its three callers sit on three different clocks and one of them is item 13.
 
+  **And bounding it added a third state the result had no way to say**, which is
+  `structured::BreakpointSet::timed_out`. A watchdog break comes back as an `Ok` run carrying
+  `cut_short`, so a `bp` that never finished looked from the caller's side exactly like one that
+  ran and matched nothing — the same empty `added`, the same successful result, rendered as "(this
+  call added none)". The two have opposite next moves. The listing is a real engine read taken
+  afterwards, so `added` still settles which happened: empty means the expression is not set and
+  can be retried, non-empty means it landed before the break and must **not** be, since `bp` is not
+  idempotent. Reported in both channels — a structured-aware client drops the text — and it stays a
+  success rather than an error for that same reason: an error is the shape a caller retries. It
+  needed a note of its own rather than `told`'s, whose advice ends "scope it and retry", which here
+  is the one instruction that leaves two breakpoints.
+
 ### Added
 
 - **`arming_the_watchdog_does_not_round_a_quick_command_up`**, in the debugger tier, guarding the
