@@ -2,8 +2,8 @@
 
 Deferred work, in thirteen clusters: items 2–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9 and 11 from surveying this server against
-the MCP `2026-07-28` extensions (tasks, apps), items 13–14 from the bounded-command coverage review
-(#46, 2026-08-02), item 15 from the private worker channel (#65 / #72, 2026-08-04), item 19 from
+the MCP `2026-07-28` extensions (tasks, apps), item 13 from the bounded-command coverage review (#46,
+2026-08-02), item 15 from the private worker channel (#65 / #72, 2026-08-04), item 19 from
 `walk_memory` (#103, 2026-08-13), item 27 from completing the coordinate work (#156–#158,
 2026-08-18), item 32 from running the debugger tier on the ARM64 runner image that replaces
 `windows-11-arm` in September 2026, items 33 and 39 from driving the server with a **local model** —
@@ -22,7 +22,7 @@ in the microseconds after a run built its stop is recorded in that result's pros
 no watchdog in either crate can currently cut short (2026-08-30).
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and the
-2026-08-02 entries that items 13–14 extend.
+2026-08-02 entries that item 13 extends.
 
 **Items that have landed are in [`DONE.md`](./DONE.md), under the numbers they were filed with**,
 which is why the numbering here is sparse — its index is the list of them, and is the one list, so
@@ -205,45 +205,6 @@ that answers nothing until the walk ends.
   so this is reachable only by a caller asking for it. Recorded by the coverage review in
   DECISIONS.md (2026-08-02) rather than fixed there, because it needs a different mechanism than
   the review's subject.
-
-## 14. [dbgscope] Make arming the bounded watchdog ~free
-
-`execute_command_bounded` spawns a watchdog thread that polls a `done` flag on a
-`thread::sleep(200ms)` loop, and joins it once `Execute` returns. Because the flag is set while
-that thread is mid-sleep, the join waits out the remainder — so a bounded command takes
-`ceil(d / 200ms) * 200ms`. Measured (`measure_what_the_bounded_path_costs_a_quick_command`,
-`src/engine.rs`): a 127ms command takes 201ms, a 377ms one takes 401ms, and a 0.2ms `lm` takes
-either ~0.3ms or ~200ms depending on whether it beats the watchdog thread's first poll.
-
-Parking on a condvar (or `thread::park_timeout` + `unpark`) instead of sleeping would let `done`
-wake the watchdog immediately and drop that to ~0.
-
-- **Why it matters here:** the cost is the *only* reason windbg-mcp's cheap point-query tools stay
-  off the bounded path (DECISIONS.md, 2026-08-02). Remove it and the coverage rule simplifies to
-  "bound everything except `index_trace`", with no per-call tax to weigh against a rare wedge.
-- **Why deferred:** it is a dbgscope change with its own review, and the current split is correct
-  as long as the cost stands — this is an improvement to the tradeoff, not a fix to a defect.
-
-**The dbgscope half has landed, and this entry is now about the consequence it named.** The pinned
-revision's `Watchdog` (`src/dbgeng.rs`) parks on a `Condvar` rather than napping: the disarm is
-immediate, and the bound costs nothing until it is actually reached. It arrived through the
-[#226](https://github.com/glslang/windbg-mcp/issues/226) work rather than through this item — the
-sleep was what made a *finite* `WaitForEvent` look attractive, which is the defect that fix was
-about — so nothing here was revisited when it landed. What is left is all on this side:
-
-- **The coverage split still assumes the tax.** `EngineOp::Command` is the unbounded path and is
-  still what `modules`, `backtrace` and the other cheap point queries take (`src/server.rs`,
-  `worker::raw_command` with a zero budget). `DECISIONS.md` (2026-08-02) names this exact
-  condition as its revisit trigger — "revisit if dbgscope's watchdog stops quantizing to 200ms
-  (parking on a condvar instead of polling a sleep would make it ~free), at which point 'bound
-  everything except `index_trace`' becomes the cheaper and simpler rule". The trigger has fired and
-  the entry has not been revisited.
-- **The measurement that justified the split is stale.** `measure_what_the_bounded_path_costs_a_quick_command`
-  moved to `tests/mcp_smoke.rs` (this entry still says `src/engine.rs`) and its doc comment still
-  describes the quantization — "dbgscope's watchdog thread checks its `done` flag, then sleeps
-  200ms". It prints rather than asserts, so it went on passing across the change it exists to
-  catch. Re-run it (`--ignored --nocapture`) before deciding the rule: the argument for collapsing
-  the split is a number, and the number on record is the old engine's.
 
 ## 15. [windbg-mcp] Make handle inheritance a property of the spawn, not of the process
 

@@ -4093,8 +4093,9 @@ impl WindbgServer {
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::Command {
+                EngineOp::BoundedCommand {
                     command: "~".to_string(),
+                    patience_ms: 0,
                 },
             )
             .await;
@@ -4656,7 +4657,10 @@ impl WindbgServer {
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::Command { command: cmd },
+                EngineOp::BoundedCommand {
+                    command: cmd,
+                    patience_ms: 0,
+                },
             )
             .await;
         engine_result(out)
@@ -4686,15 +4690,16 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        // Deliberately *not* on the bounded path, and the one O(trace) command that isn't —
-        // see DECISIONS.md (2026-08-02). Indexing a large trace can legitimately outrun the
-        // per-call timeout, but `-force` deletes an unloadable `.idx` before rebuilding it, so
-        // a watchdog abort mid-rebuild can leave no usable index at all. Here the long run is
-        // productive work rather than a runaway, and the engine frees itself when it finishes.
+        // Deliberately *not* on the bounded path — the only command in this server that isn't,
+        // since the coverage rule collapsed to "bound everything except this one"
+        // (DECISIONS.md, 2026-08-02, revised 2026-08-31). Indexing a large trace can legitimately
+        // outrun the per-call timeout, but `-force` deletes an unloadable `.idx` before rebuilding
+        // it, so a watchdog abort mid-rebuild can leave no usable index at all. Here the long run
+        // is productive work rather than a runaway, and the engine frees itself when it finishes.
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::Command {
+                EngineOp::UnboundedCommand {
                     command: "!ttdext.index -force".to_string(),
                 },
             )
@@ -4791,7 +4796,10 @@ impl WindbgServer {
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::Command { command: cmd },
+                EngineOp::BoundedCommand {
+                    command: cmd,
+                    patience_ms: 0,
+                },
             )
             .await;
         engine_result(out)
@@ -4817,7 +4825,10 @@ impl WindbgServer {
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::Command { command: cmd },
+                EngineOp::BoundedCommand {
+                    command: cmd,
+                    patience_ms: 0,
+                },
             )
             .await;
         engine_result(out)
@@ -4845,7 +4856,10 @@ impl WindbgServer {
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::Command { command: cmd },
+                EngineOp::BoundedCommand {
+                    command: cmd,
+                    patience_ms: 0,
+                },
             )
             .await;
         engine_result(out)
@@ -4881,7 +4895,10 @@ impl WindbgServer {
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::Command { command: cmd },
+                EngineOp::BoundedCommand {
+                    command: cmd,
+                    patience_ms: 0,
+                },
             )
             .await;
         engine_result(out)
@@ -5413,6 +5430,49 @@ mod tests {
         let one = serde_json::json!({"tag": "Tgsm", "stop_after_matches": 1});
         let parsed: PoolFindTagArgs = serde_json::from_value(one).expect("one is nonzero");
         assert_eq!(parsed.stop_after_matches.map(NonZeroU32::get), Some(1));
+    }
+
+    /// The coverage rule, as a test: **one** tool runs a command with no watchdog, and it is
+    /// `index_trace`.
+    ///
+    /// The rule used to be a judgement call with a list either side of it — bound the open-ended
+    /// hatches and the O(trace) scans, leave the point queries alone — because arming dbgscope's
+    /// watchdog rounded a command's runtime up to a multiple of 200ms and a 30ms `k` became a
+    /// 200ms `k` (`DECISIONS.md`, 2026-08-02). The watchdog parks on a condvar now, so the tax is
+    /// gone and the list collapsed to a single exception: `!ttdext.index -force` deletes an
+    /// unloadable `.idx` before rebuilding it, so breaking that in part-way can leave a trace with
+    /// no usable index at all.
+    ///
+    /// Checked by reading the source, the way `record`'s stdout rule is: the property is about
+    /// what is *written*, and the way a collapsed split comes back is a tool added by copy-paste
+    /// picking [`EngineOp::UnboundedCommand`] without anyone deciding to — which no runtime test
+    /// can catch, because the tool works perfectly until the day its command runs away.
+    #[test]
+    fn only_index_trace_runs_a_command_unbounded() {
+        // Only the half that ships; this test is *named* after the thing it searches for.
+        let code = include_str!("server.rs")
+            .split_once("\n#[cfg(test)]")
+            .expect("this module has a test half")
+            .0;
+
+        let mut owners = Vec::new();
+        let mut enclosing = "<no tool>";
+        for line in code.lines() {
+            if let Some(name) = line.trim().strip_prefix("async fn ") {
+                enclosing = name.split('(').next().unwrap_or(name);
+            }
+            if line.contains("EngineOp::UnboundedCommand") {
+                owners.push(enclosing);
+            }
+        }
+        assert_eq!(
+            owners,
+            ["index_trace"],
+            "the unbounded path is `index_trace`'s alone (DECISIONS.md, 2026-08-02, revised \
+             2026-08-31). A tool that must run a raw command takes `EngineOp::BoundedCommand`, \
+             which since dbgscope's watchdog stopped polling a sleep costs nothing until the \
+             bound is actually reached."
+        );
     }
 
     // ---- the instructions a client is served ---------------------------

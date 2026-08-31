@@ -1545,10 +1545,13 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         // makes `Execute` fail and the captured buffer goes with the error, so the caller of a long
         // `index_trace` gets a bare failure and a note promising partial output that is not there.
         //
-        // Zero costs nothing to say. It spawns no watchdog at all — which is the whole reason these
-        // ops are off the bounded path (DECISIONS.md, 2026-08-02: arming one rounds a command up to
-        // a multiple of 200ms) — so this stays unbounded, as `index_trace` in particular must.
-        EngineOp::Command { command } => raw_command(e, &command, 0)
+        // Zero spawns no watchdog at all, which is now what `index_trace` alone asks for: a
+        // `-force` rebuild broken in part-way can leave a trace with no usable index, so the abort
+        // is worse than the wedge. It used to be what every cheap point query asked for too,
+        // because arming a watchdog rounded a command up to a multiple of 200ms; it parks on a
+        // condvar now and costs nothing until the bound is reached, so they all take
+        // [`EngineOp::BoundedCommand`] instead (DECISIONS.md, 2026-08-02, revised 2026-08-31).
+        EngineOp::UnboundedCommand { command } => raw_command(e, &command, 0)
             .map(|run| Output::text(told(run)))
             .map_err(failed),
         EngineOp::BoundedCommand {

@@ -10519,17 +10519,28 @@ fn a_bounded_command_queued_behind_another_job_still_beats_its_caller() {
 }
 
 /// What the bounded path *costs* a command that was never going to run away — the evidence behind
-/// the coverage split in `DECISIONS.md` (2026-08-02), kept as a test so a dbgscope change to the
+/// the coverage rule in `DECISIONS.md` (2026-08-02), kept as a test so a dbgscope change to the
 /// watchdog can be re-measured rather than re-argued.
 ///
-/// The cost is not a constant overhead but a **quantization**: dbgscope's watchdog thread checks
-/// its `done` flag, then sleeps 200ms, so a command takes `ceil(d / 200ms) * 200ms`. The tax on a
-/// point query is best read as: anything that takes 1–200ms now takes 200ms.
+/// **It has been, and the answer moved.** The cost used to be a **quantization** rather than a
+/// constant overhead: the watchdog thread checked its `done` flag and then slept 200ms, so the
+/// join waited out the rest of that nap and a command took `ceil(d / 200ms) * 200ms` — anything
+/// taking 1–200ms took 200ms, which is what kept the cheap point queries off the bounded path.
+/// dbgscope's `Watchdog` parks on a condvar now, so the disarm is immediate. Re-measured here
+/// 2026-08-31 (x64 bench, sample dump, ROUNDS=20, two runs): a bounded `lm` medians 3.0ms and
+/// 3.3ms against the unbounded `modules` beside it at 4.1ms and 4.2ms, and the ~170ms `.for` loop
+/// costs ~171ms and ~185ms rather than being rounded up to 200ms. No run showed the old test's
+/// second mode. That is what collapsed the split to "bound everything except `index_trace`"
+/// (`FOLLOWUPS.md` item 14).
 ///
-/// Prints rather than asserts. The cost belongs to dbgscope's watchdog, not to this crate, and a
-/// threshold pinned here would fail on an unrelated host difference. Measured through the tool
-/// surface, so the numbers now include this server's own per-call overhead — one IPC round trip
-/// on top of what the in-process version measured, which is the number a caller actually sees.
+/// Prints rather than asserts, still: the numbers belong to dbgscope's watchdog and to this host,
+/// and a threshold pinned here would fail on an unrelated host difference. The property the rule
+/// now rests on is asserted next door, in
+/// `arming_the_watchdog_does_not_round_a_quick_command_up`, which is a *shape* rather than a
+/// magnitude and runs in the ordinary tier — this one going on passing across the very change it
+/// exists to catch is why that test exists. Measured through the tool surface, so the numbers
+/// include this server's own per-call overhead — one IPC round trip on top of what the in-process
+/// version measured, which is the number a caller actually sees.
 #[test]
 #[ignore = "a measurement, not an assertion; run manually with --ignored --nocapture"]
 fn measure_what_the_bounded_path_costs_a_quick_command() {
@@ -10580,6 +10591,72 @@ fn measure_what_the_bounded_path_costs_a_quick_command() {
     }
 
     server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
+}
+
+/// The property the coverage rule rests on: arming the watchdog does **not** round a quick command
+/// up to a quantum.
+///
+/// Every command-executing tool but `index_trace` is on the bounded path, and the only reason that
+/// is affordable is that dbgscope's watchdog parks on a condvar rather than napping on a `done`
+/// flag. If it ever goes back to polling a sleep, nothing breaks and nothing fails — every tool in
+/// this server just quietly starts costing a multiple of the nap, which is precisely how the old
+/// split came to exist. The measurement above is where the numbers live, and it is `#[ignore]`d,
+/// so it went on passing across the change it was written to catch; this is the half that runs.
+///
+/// **A shape, not a magnitude.** The regression is a *quantum* — a 3ms command jumping to 200ms —
+/// so the assertion is against the unbounded typed call beside it plus a margin far wider than the
+/// difference in work between them, not against a wall-clock ceiling. A host thirty times slower
+/// than this bench moves both numbers together and still passes; a watchdog that quantizes moves
+/// only one, by more than the whole margin.
+#[test]
+fn arming_the_watchdog_does_not_round_a_quick_command_up() {
+    let Some(dump) = target_tier() else { return };
+    const ROUNDS: usize = 9;
+    /// The nap the watchdog used to take between polls, and so the size of the tax it used to
+    /// levy on anything quicker than one.
+    const QUANTUM: Duration = Duration::from_millis(200);
+    /// Room for the work `modules` does beyond the `lm` it runs — parsing the table, asking the
+    /// engine for each image's identity — plus whatever this host's scheduler adds. Half a
+    /// quantum, so a run that pays one cannot hide inside it.
+    const MARGIN: Duration = Duration::from_millis(100);
+
+    let mut server = Server::started();
+    let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+
+    let median = |mut samples: Vec<Duration>| {
+        samples.sort();
+        samples[samples.len() / 2]
+    };
+    let mut unbounded = Vec::with_capacity(ROUNDS);
+    let mut bounded = Vec::with_capacity(ROUNDS);
+    for _ in 0..ROUNDS {
+        // `modules` is the typed op: no command, so no watchdog can reach it either way.
+        let t = Instant::now();
+        server.tool_text("modules", json!({ "session_id": session }), TARGET_STEP);
+        unbounded.push(t.elapsed());
+
+        // `execute` is the same engine and the same session, running the `lm` that listing is
+        // built from. The one difference is the watchdog.
+        let t = Instant::now();
+        server.tool_text(
+            "execute",
+            json!({ "command": "lm", "session_id": session }),
+            TARGET_STEP,
+        );
+        bounded.push(t.elapsed());
+    }
+    let (unbounded, bounded) = (median(unbounded), median(bounded));
+    println!("bounded `lm` {bounded:?} against unbounded `modules` {unbounded:?} (x{ROUNDS})");
+
+    server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
+
+    assert!(
+        bounded < unbounded + MARGIN,
+        "a bounded `lm` took {bounded:?} against {unbounded:?} for the unbounded `modules` beside \
+         it — more than the {MARGIN:?} margin, which is what dbgscope's watchdog quantizing to \
+         {QUANTUM:?} again would look like. Every tool but `index_trace` is on the bounded path \
+         (DECISIONS.md, 2026-08-02, revised 2026-08-31); that rule assumes arming one is free."
+    );
 }
 
 // ---- tier 4: a live KDNET kernel target ---------------------------------------

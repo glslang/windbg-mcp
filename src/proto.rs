@@ -67,8 +67,30 @@ pub enum EngineOp {
     },
 
     // ---- ordinary work ----
-    /// A raw command, run to completion (`IDebugControl::Execute`).
-    Command {
+    /// A raw command run with **no watchdog at all** — `index_trace`'s, and nothing else's.
+    ///
+    /// Every other command-executing tool takes [`Self::BoundedCommand`]. The split used to be
+    /// wider and was decided on cost: dbgscope's watchdog polled a `done` flag on a 200ms sleep,
+    /// so arming one rounded a command's runtime up to a multiple of that quantum and a 30ms
+    /// point query became a 200ms one (`DECISIONS.md`, 2026-08-02). The watchdog parks on a
+    /// condvar now, the quantum is gone, and the rule is the simpler one that measurement was
+    /// always going to reach: bound everything except this.
+    ///
+    /// This one stays out because here the abort is worse than the wedge. `!ttdext.index -force`
+    /// deletes an unloadable `.idx` before rebuilding it, so a Ctrl+Break part-way through can
+    /// leave a trace with no usable index at all — and the long run is productive work rather
+    /// than a runaway, which finishes and frees the session on its own.
+    ///
+    /// The criterion is **what an abort destroys**, not how long the command runs, which is what
+    /// separates this from the other TTD tools. A `!tt` seek or a `ttd_*` query on an unindexed
+    /// trace can also build an index and run long, but that one is in memory: breaking it in
+    /// abandons work and damages nothing, so those are bounded like everything else.
+    ///
+    /// Named for what it is, rather than left as the general "raw command" door it was, because
+    /// the way this split comes back is a tool added by copy-paste taking the unbounded path
+    /// without anyone deciding to. `only_index_trace_runs_a_command_unbounded` in `server.rs` is
+    /// what actually holds the line; the name is what makes it obvious at the call site.
+    UnboundedCommand {
         command: String,
     },
     /// A raw command bounded by dbgscope's watchdog, which Ctrl+Breaks the engine before the
@@ -149,16 +171,19 @@ pub enum EngineOp {
     },
     /// The current thread's call stack, as values and as the listing rendered from them.
     ///
-    /// One op rather than `k` as a [`Self::Command`] because the answer this tool exists to give
+    /// One op rather than a raw `k` command because the answer this tool exists to give
     /// is each frame's `module` + `rva`, and that is two engine questions per frame — where the
     /// instruction is, and which image holds it — that only the worker can ask. It is the same
     /// walk [`Self::CrashTriage`] does, through the same helper, so the frames of the two tools
     /// are the same records rather than two renderings that agree by inspection.
     ///
-    /// **Unbounded, as the `k` it replaces was.** These are direct engine calls rather than a
-    /// command, so no watchdog can cut them short and resolving a frame's symbol can block on a
-    /// symbol server — which is exactly what `EngineOp::Command { command: "k" }` did before.
-    /// Carrying a `patience_ms` would imply a bound that does not exist.
+    /// **Unbounded, and not by the choice [`Self::UnboundedCommand`] records.** A watchdog
+    /// Ctrl+Breaks a *command*; these are direct engine calls, so nothing can cut one short, and
+    /// resolving a frame's symbol can block on a symbol server exactly as the raw `k` this
+    /// replaced could. Carrying a `patience_ms` would imply a bound that does not exist. The same
+    /// holds for every typed op beside it — [`Self::Modules`], [`Self::Disassemble`],
+    /// [`Self::Registers`] — which is why "bound everything except `index_trace`" is a rule about
+    /// commands and not about tools.
     Backtrace {
         /// How many frames to walk. Bounded by the supervisor before it gets here.
         frames: u32,
@@ -695,7 +720,7 @@ mod tests {
     #[test]
     fn an_op_that_carries_a_deadline_hands_it_to_the_pump() {
         let mut ops = vec![
-            EngineOp::Command {
+            EngineOp::UnboundedCommand {
                 command: "lm".into(),
             },
             EngineOp::BoundedCommand {

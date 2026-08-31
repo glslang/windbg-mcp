@@ -6218,7 +6218,7 @@ mod tests {
             };
             enqueue(
                 1,
-                Call::new(EngineOp::Command {
+                Call::new(EngineOp::UnboundedCommand {
                     command: "before".to_string(),
                 })
                 .named(true),
@@ -6231,7 +6231,7 @@ mod tests {
             );
             enqueue(
                 3,
-                Call::new(EngineOp::Command {
+                Call::new(EngineOp::UnboundedCommand {
                     command: "after".to_string(),
                 })
                 .named(true),
@@ -6250,7 +6250,7 @@ mod tests {
         let before: WorkerRequest =
             serde_json::from_str(&line).expect("the first worker request is JSON");
         assert_eq!(before.id, 1);
-        assert!(matches!(before.op, EngineOp::Command { .. }));
+        assert!(matches!(before.op, EngineOp::UnboundedCommand { .. }));
 
         line.clear();
         requests

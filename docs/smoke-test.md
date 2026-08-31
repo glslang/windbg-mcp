@@ -19,7 +19,7 @@ adding the debugger tier takes it to ~60s, most of it two tests waiting out real
 grace, and a call staying silent long enough to have to report that it is still running.
 
 **The pass count is the same either way**, because each gate is inside its own test: `cargo test
---test mcp_smoke` reports the same number passed with the tier off as with it on — 96 on 2026-08-31,
+--test mcp_smoke` reports the same number passed with the tier off as with it on — 97 on 2026-08-31,
 against ~2s and ~60s respectively, but it moves whenever a test is added, so re-derive it rather
 than reading it here. (A plain `cargo test` runs the unit tests beside it and prints a result line
 per binary, so it is this harness's own line to read.) The runtime is what tells the two runs apart,
@@ -1060,9 +1060,16 @@ case.
   the race.
 - `measure_what_the_bounded_path_costs_a_quick_command` — prints what arming the watchdog costs, as
   a distribution. It asserts nothing; it is the evidence behind which tools take the bounded path
-  ([`DECISIONS.md`](../DECISIONS.md), 2026-08-02), namely that a bounded command is rounded up to a
-  multiple of 200ms. Re-run it after a dbgscope watchdog change — if that cost goes away, so does
-  the reason for the split.
+  ([`DECISIONS.md`](../DECISIONS.md), 2026-08-02). **That cost has since gone away, and so has the
+  split**: the watchdog used to round a command up to a multiple of 200ms, and now parks on a
+  condvar, so every raw command but `index_trace` is bounded. Re-run it after a dbgscope watchdog
+  change; its comment carries the 2026-08-31 numbers to compare against.
+- `arming_the_watchdog_does_not_round_a_quick_command_up` — the assertion the measurement above is
+  not. It runs in the ordinary tier, times a bounded `lm` against the unbounded `modules` beside
+  it, and fails if the first exceeds the second by more than half the old 200ms quantum. A shape
+  rather than a magnitude, deliberately: a slower host moves both numbers and passes, a quantizing
+  watchdog moves one and does not. It exists because the measurement is `#[ignore]`d and therefore
+  went on passing across exactly the change it was written to catch.
 
 These live with the wire tests rather than beside the arithmetic because the wiring they prove now
 spans two processes: the supervisor sends the caller's remaining patience, the worker derives the
