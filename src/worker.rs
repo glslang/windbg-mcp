@@ -1846,11 +1846,29 @@ fn failed<E: ToString>(e: E) -> Failed {
 /// output, and a return value is the wrong place to put prose: the caller before this one had to
 /// string-match for it. Only the deadline earns one — an interrupt *on request* is explained to
 /// the caller by [`cut_short`], and to the one who asked by their own reply.
+///
+/// **It says what happened and stops short of prescribing a retry**, which is not fastidiousness:
+/// every raw command in this server comes through here, and it cannot see which one. It used to
+/// end "scope it and retry", written for the unbounded `s` search that the bounded path was
+/// adopted for — advice that is right for a query and actively harmful for a mutation, since a
+/// `bp` cut short may have installed its breakpoint already and re-running it installs a second.
+/// The reach of that is wider than it looks: `ioctl_trace` builds a `bp` with a logging command
+/// string, a `debug_batch` step is any command at all, and `dx` can execute one. A caller that
+/// knows its own command is a query still gets the scoping hint; nobody gets told to re-issue a
+/// mutation.
+///
+/// The one path that *can* say more is the one that reads the target afterwards —
+/// [`set_breakpoint`] diffs the breakpoint list and so knows whether the mutation landed, which is
+/// why it has [`told_cut_short_bp`] instead of this. That is the shape to copy for any other
+/// mutating command that grows a typed op.
 fn told(run: CommandRun) -> String {
     let note = match run.cut_short {
         Some(Interruption::Deadline { after_ms }) => Some(format!(
             "[windbg-mcp] command interrupted after {after_ms} ms (Ctrl+Break) — it was taking \
-             too long. Scope it (e.g. a bounded memory range) and retry."
+             too long. Whatever it had already done stands: a query can be narrowed (e.g. a \
+             bounded memory range) and run again, but a command that changes the target — `bp`, \
+             `eb`, `r <reg>=` — may have taken effect before the break, so read the target rather \
+             than re-issuing it."
         )),
         _ => None,
     };
@@ -7221,6 +7239,50 @@ mod tests {
     }
 
     // ---- what an interrupted caller is told --------------------------------
+
+    /// The note every bounded raw command gets, which is why it must not prescribe a retry.
+    ///
+    /// One function serves `execute`, `dx`, every `debug_batch` command step and the six typed
+    /// tools that build a command — and it is handed a `CommandRun`, so it cannot see which. It
+    /// used to end "scope it and retry", written for the unbounded `s` search the bounded path was
+    /// adopted for. That is right for a query and harmful for a mutation: `ioctl_trace` builds a
+    /// `bp` with a logging command string, and a `bp` cut short may have installed its breakpoint
+    /// before the break, so re-issuing it installs a second. Raised on
+    /// [#271](https://github.com/glslang/windbg-mcp/pull/271) against `ioctl_trace`, and true of
+    /// `execute { "command": "bp …" }` for as long as the note has existed.
+    #[test]
+    fn the_deadline_note_does_not_tell_a_caller_to_re_issue_a_mutation() {
+        let note = told(CommandRun {
+            output: "partial output\n".to_string(),
+            cut_short: Some(Interruption::Deadline { after_ms: 30_000 }),
+            target_gone: false,
+        });
+        assert!(note.starts_with("partial output"), "{note}");
+        assert!(note.contains("30000 ms"), "{note}");
+        // The fact a caller has to act on: this may have already changed the target.
+        assert!(note.contains("already done stands"), "{note}");
+        assert!(
+            note.contains("read the target rather than re-issuing"),
+            "{note}"
+        );
+        // The scoping hint survives, because it is what a query actually wants.
+        assert!(note.contains("narrowed"), "{note}");
+        // Nothing here may read as "run it again". The old wording ended "and retry".
+        assert!(
+            !note.contains("and retry") && !note.contains("and run it again"),
+            "an unconditional retry instruction is the one thing this note must not carry: {note}"
+        );
+
+        // A run that finished gains nothing at all.
+        assert_eq!(
+            told(CommandRun {
+                output: "partial output\n".to_string(),
+                cut_short: None,
+                target_gone: false,
+            }),
+            "partial output\n"
+        );
+    }
 
     /// A cut-short result keeps what it reached and gains the reason — which is the whole point of
     /// interrupting rather than ending the session.
