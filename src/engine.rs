@@ -4310,6 +4310,11 @@ mod tests {
             let Ok(text) = std::fs::read_to_string(&file) else {
                 continue;
             };
+            // A substring scan before any allocation: 71 of the hundred files this walks never
+            // name the file at all, and normalising one to look is the expensive half.
+            if !text.contains(CITED) {
+                continue;
+            }
             for n in cited_items(&text) {
                 seen += 1;
                 if !open.contains(&n) && !closed.contains(&n) {
@@ -4380,6 +4385,9 @@ mod tests {
         number.parse().ok()
     }
 
+    /// The name a citation is written with, and therefore what is searched for.
+    const CITED: &str = "FOLLOWUPS";
+
     /// Item numbers cited beside `FOLLOWUPS.md` in one file's text.
     fn cited_items(text: &str) -> Vec<u32> {
         let mut flat = String::new();
@@ -4396,7 +4404,12 @@ mod tests {
         }
 
         let mut found = Vec::new();
-        for (at, _) in flat.to_lowercase().match_indices("followups") {
+        // Matched as it is spelled, not case-folded: the citation names a file, and the only
+        // lower-case spellings in this repository are identifiers (this test's own name among
+        // them). It also keeps the offsets honest — a case-folded copy can differ in byte length
+        // from the string being indexed, which is a panic waiting for the first heading with an
+        // uppercase non-ASCII letter in it.
+        for (at, _) in flat.match_indices(CITED) {
             // A window rather than the rest of the line: far enough to clear a markdown link back
             // to the file, short enough that the next sentence's "item" is not this citation's.
             let window: String = flat[at..]
