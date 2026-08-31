@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twenty-eight clusters: items 1–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty-nine clusters: items 1–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 7–11 from surveying this server against the
 MCP `2026-07-28` extensions (tasks, apps), item 12 from the opener split
 (glslang/dbgscope#71, 2026-08-01), items 13–14 from the bounded-command coverage review
@@ -58,7 +58,9 @@ half the prose a client is served (2026-08-29), and where a break arriving in th
 after a run built its stop is recorded in that result's prose and not in its flag (2026-08-30),
 and item 54 from
 [#85](https://github.com/glslang/windbg-mcp/issues/85)'s module-inventory refresh, whose engine
-call no watchdog in either crate can currently cut short (2026-08-30).
+call no watchdog in either crate can currently cut short (2026-08-30), and item 55 from bringing
+dbgscope's session fuzz up to this server's surface, where the second seed it was run under found
+that a handle the raw hatch has retired cannot release its own session (2026-08-31).
 Each item notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -3728,3 +3730,53 @@ deadline.
 **Where it picks up.** `worker::resynchronise` and `EngineOp::Modules` in `src/proto.rs`,
 `DebugEngine::reload_symbols` and `Watchdog` in dbgscope's `src/dbgeng.rs`, and
 `execute_command_bounded` beside it for the shape a bounded direct call takes here.
+
+## 55. [windbg-mcp] A **retired** handle cannot release its own session
+
+**What it is.** A raw `execute` that replaces or releases the target — `qd`, `q`, `.detach`,
+`.kill`, `.opendump` — retires the handle naming that session (`changes_debug_target` →
+`SessionState::Retired`). Retirement refuses every call that *supplies* the handle while leaving
+the worker live and reachable by a call that supplies none
+(`a_retired_handle_is_refused_but_still_the_default_target`), and `end_session` is not exempt: it
+resolves through `Sessions::resolve` like every other tool. Two things then fail to line up.
+
+The `execute` that retires the handle appends "`end_session` releases it" — and `end_session` with
+that handle is refused, which is the server contradicting its own instruction one call later. And
+the refusal's own advice, "omit `session_id` to operate on it anyway", routes to the **current**
+session, which is the newest one `accepts_default` admits. With anything newer open that is a
+different session, so the retired one cannot be released by its owner at all: it comes back when
+everything newer has gone, or on a client disconnect, or on a lease expiry. Until then it holds one
+of the four slots and a live engine process with a live target.
+
+**Measured** on the release build, 2026-08-31, through the shipped MCP transport rather than from
+the source: two launches, the older retired with `execute { "command": "qd" }`. `end_session` by
+handle was refused with the retirement message; `session_status` then reported that session
+`live: true, current: false` holding its own `engine_pid`, and the *newer* one `current: true` — so
+an un-handled `end_session` would have taken the wrong session. Ending the newer one first made the
+retired one current, and an un-handled `end_session` released it.
+
+**Why it was deferred.** It was found by the session fuzz
+(`a_randomised_command_sequence_leaves_the_session_in_one_state_and_the_server_serving`, seed 2) on
+the round-teardown path rather than in the fuzz's own oracle, and a test is the wrong place to
+decide what `end_session` should do about a handle the server has deliberately stopped honouring.
+There is a real argument for today's behaviour — the handle no longer names what it was issued for,
+and honouring it for one tool is a hole in the rule every other tool keeps — so the fix has to pick
+a side rather than patch a sentence.
+
+**What would close it.** Either of two, and they are not the same claim:
+
+- **Exempt `end_session` from retirement.** It does not read the target, it releases the worker,
+  and it is the answer every other refusal on this session gives — the same argument that already
+  exempts it from `worker::refuse_when_the_target_is_gone`. Cheapest, and it makes the note
+  `execute` already appends true.
+- **Or keep the refusal and fix what it promises.** "Omit `session_id`" is a recovery only while
+  nothing newer is open, so the refusal should not offer it unconditionally — and there is then no
+  way at all to release *that* session by name, which is the part worth not shipping.
+
+The first is what `execute`'s own output already tells a caller, so it is the one to take unless
+someone argues for the second.
+
+**Where it picks up.** `end_session` and `changes_debug_target` in `src/server.rs`,
+`SessionState::Retired` with `accepts_handle`/`accepts_default` and `Sessions::resolve` in
+`src/engine.rs`, and `fuzz_reclaim` in `tests/mcp_smoke.rs` — whose fallback branch is what should
+stop being needed.

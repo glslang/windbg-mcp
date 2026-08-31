@@ -15,12 +15,12 @@ $env:WINDBG_MCP_SMOKE_TTD  = "1"; cargo test --test mcp_smoke   # + the TTD tier
 
 It builds and runs against `target/debug`, so it never touches the `target/release` exe a
 connected MCP client holds a lock on (see [`CLAUDE.md`](../CLAUDE.md)). The protocol tier is ~2s;
-adding the debugger tier takes it to ~50s, almost all of it two tests waiting out real timers — a
-lease grace, and a call staying silent long enough to have to report that it is still running.
+adding the debugger tier takes it to ~60s, most of it two tests waiting out real timers — a lease
+grace, and a call staying silent long enough to have to report that it is still running.
 
 **The pass count is the same either way**, because each gate is inside its own test: `cargo test
---test mcp_smoke` reports the same number passed with the tier off as with it on — 87 on 2026-08-26,
-against ~2s and ~55s respectively, but it moves whenever a test is added, so re-derive it rather
+--test mcp_smoke` reports the same number passed with the tier off as with it on — 95 on 2026-08-31,
+against ~2s and ~60s respectively, but it moves whenever a test is added, so re-derive it rather
 than reading it here. (A plain `cargo test` runs the unit tests beside it and prints a result line
 per binary, so it is this harness's own line to read.) The runtime is what tells the two runs apart,
 and `--nocapture` is what prints the `SKIPPED` reason — a run that reports every test green having
@@ -31,7 +31,7 @@ taken a second covered no debugger claim at all.
 | Tier | Gate | Needs | Catches |
 | --- | --- | --- | --- |
 | **Protocol** | always | no debugger, no target, and no network off this machine — it does bind a loopback port for the listener | transport, revision negotiation, tool-surface drift, and the listener's lease up to the point a session is opened |
-| **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump, and a live user-mode target for the seven that want one — `cmd.exe` for the six that launch, `ping` for the one that attaches | `dbgscope` / DbgEng regressions, a lease expiry releasing a real engine worker, driving execution on a live user-mode target synchronously and asynchronously, and what ending a session does to it |
+| **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump, and a live user-mode target for the eight that want one — `cmd.exe` for the seven that launch, `ping` for the one that attaches | `dbgscope` / DbgEng regressions, a lease expiry releasing a real engine worker, driving execution on a live user-mode target synchronously and asynchronously, what ending a session does to it, and — over a seeded randomised sequence — that a session is always in one of its three states and never half-answering |
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a live kernel target you can freeze — KDNET, or serial | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
 | **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
@@ -953,6 +953,62 @@ revision — and the run below is what you do on that PR, not only on a bump you
 3. Re-read the stateless assertions in `discover_opens_a_session_without_initialize` against the new
    revision's `_meta` requirements — that is where per-request metadata rules land.
 4. Update the revision list in `README.md` and this file's list above to match what actually passes.
+
+## The session fuzz
+
+`a_randomised_command_sequence_leaves_the_session_in_one_state_and_the_server_serving`, inside the
+debugger tier rather than beside it — it needs an engine and a live user-mode target, which is that
+gate exactly. It is **dbgscope's `examples/session_fuzz.rs` at this server's surface**: that example
+drives randomised sequences straight at a `DebugEngine` and checks, after every one, that the
+session either still holds a target and answers or says it holds none. It exists because the three
+defects behind [#242](https://github.com/glslang/windbg-mcp/issues/242) were each found by hand, one
+sequence at a time, and none of them is about a *command* — they are about the state the previous
+command left behind, and there are more ways to reach a given state than anyone enumerates.
+
+What the port adds is everything between that engine and a caller:
+
+- **A third state.** `continue_async` leaves a target moving with nobody waiting, and reads are then
+  refused `target_running`. That state machine is the supervisor's
+  ([#83](https://github.com/glslang/windbg-mcp/issues/83)) and the example cannot reach it.
+- **The category a refusal carries**, not merely that it refused — `engine::engine_error`'s `_` arm
+  folded "no target left" into `debugger` once, which tells a caller to change what it asked instead
+  of to release the session.
+- **A bystander session** on the same server, never named by a step and asked after every round:
+  one worker driven into any state at all must leave the supervisor serving and the *other* worker
+  holding its own target. No in-process test can state that.
+- **Reclamation** of whatever the sequence left.
+
+**The oracle is a scale, not an agreement.** The example calls any disagreement between two roads a
+violation; here a run bounded at 1.5s can stop *between* one road and the next, and a target can go
+away while it does. So the rule is that a probe's roads never move **back** down
+`Moving → Holding → Gone`: `stale_session` and then an answer is the half-dead session, while an
+answer and then `stale_session` is a program that finished a millisecond ago.
+
+**The seed is fixed, so CI runs one deterministic walk.** Drawing from the clock would fail on a
+sequence nobody could reproduce. The default (seed 2, 3 rounds of 6 steps, ~1s) is chosen because
+its walk reaches all three states; how long a round lasts depends on whether it draws an unbounded
+`g`, which runs the target to its own ending, so a corpus edit reshuffles both the coverage and the
+runtime. The run prints the states it reached, and **asserts it reached `Gone` at least once** —
+every check is of the form "if the session is in state X it must say so", so a walk that never left
+`Holding` would pass without asking the question. `Moving` is reported and not asserted: it needs a
+run still going one probe later, which is a race on a loaded runner.
+
+The fuzz proper is the soak, and it is the same test:
+
+```pwsh
+$env:WINDBG_MCP_SMOKE_DUMP = "1"
+$env:WINDBG_MCP_SMOKE_FUZZ_SEED = "7"
+$env:WINDBG_MCP_SMOKE_FUZZ_ROUNDS = "50"; $env:WINDBG_MCP_SMOKE_FUZZ_STEPS = "10"
+cargo test --test mcp_smoke -- --nocapture randomised
+```
+
+Run it after touching anything in the wait/settle/guard seam, or in the execution slot. A failing
+seed replays exactly and the panic names it, with the sequence that got there.
+
+**It has already found one thing**, on the second seed it was run under: a handle the raw hatch has
+retired cannot release its own session, and the `execute` that retires it says otherwise in the same
+breath (`FOLLOWUPS.md` item 55). That is left standing rather than fixed — `fuzz_reclaim` takes the
+documented fallback and asserts the session that went is the one it named.
 
 ## The bounded-command tier
 
