@@ -60,7 +60,8 @@ and item 54 from
 [#85](https://github.com/glslang/windbg-mcp/issues/85)'s module-inventory refresh, whose engine
 call no watchdog in either crate can currently cut short (2026-08-30), and item 55 from bringing
 dbgscope's session fuzz up to this server's surface, where the second seed it was run under found
-that a handle the raw hatch has retired cannot release its own session (2026-08-31).
+that a handle the raw hatch has retired cannot release its own session (2026-08-31, and **landed**
+the same day).
 Each item notes its repo, why it was deferred, and where it picks up. See [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 1–6 extend,
 and the 2026-08-02 entries that items 13–14 and item 10 extend.
 
@@ -3731,7 +3732,7 @@ deadline.
 `DebugEngine::reload_symbols` and `Watchdog` in dbgscope's `src/dbgeng.rs`, and
 `execute_command_bounded` beside it for the shape a bounded direct call takes here.
 
-## 55. [windbg-mcp] A **retired** handle cannot release its own session
+## 55. [windbg-mcp] A **retired** handle cannot release its own session — **done** (2026-08-31)
 
 **What it is.** A raw `execute` that replaces or releases the target — `qd`, `q`, `.detach`,
 `.kill`, `.opendump` — retires the handle naming that session (`changes_debug_target` →
@@ -3776,7 +3777,40 @@ a side rather than patch a sentence.
 The first is what `execute`'s own output already tells a caller, so it is the one to take unless
 someone argues for the second.
 
+**What was done.** Both, because the second was not an alternative to the first once the first was
+taken — it is the sentence the fix leaves behind.
+
+`SessionState::accepts_teardown` is a third predicate beside `accepts_handle` and
+`accepts_default`, admitting the same set as the latter and answering a different question:
+retirement says the handle no longer names the *target* it was issued for, and a teardown does not
+touch the target — it releases the **session**, which the handle still names exactly. Its own
+predicate rather than a second caller of `accepts_default`, whose set is the same today, because a
+state that ever wants one without the other should be a change there rather than a surprise.
+
+**Both gates had to widen, and that is measured rather than reasoned.** There is a caller-side
+check (`Sessions::resolve`, now `resolve_for_teardown` beside it) and a queue-front one
+(`Gate::admits`, reached through the new `On::Teardown` and `Call::releasing`). Backing out either
+half alone was tried, and the end-to-end test fails identically both ways: widening only the
+resolve trades the refusal for the same refusal a moment later, from a place with no caller to
+explain it to. `a_teardown_gate_admits_exactly_what_a_teardown_resolve_does` is the unit-level
+join that says they agree on every state.
+
+The refusal text changed too. It now names `end_session` **with the handle in it** as the recovery
+that always works, and mentions omitting `session_id` second and *qualified* — "only while this is
+still your current session" — because unqualified it reads as a way back to this target and is a
+way to act on another.
+
+**Covered by `a_handle_a_raw_command_retired_can_still_end_its_own_session`**, and the second
+launch in it is the test rather than scenery: with one session open the retired one is still
+current, so an un-handled `end_session` reaches it and the defect is invisible. That is why the
+fuzz found this on its round teardown and no single-session test ever did. It asserts both
+directions — a tool that reads the target is *still* refused, so the widening did not delete the
+guarantee — and it was checked by backing the fix out, where it fails.
+
+`fuzz_reclaim` lost its fallback: a round that cannot release by name is now a regression rather
+than a documented detour, over a 50-round soak that draws every retiring command in the corpus.
+
 **Where it picks up.** `end_session` and `changes_debug_target` in `src/server.rs`,
-`SessionState::Retired` with `accepts_handle`/`accepts_default` and `Sessions::resolve` in
-`src/engine.rs`, and `fuzz_reclaim` in `tests/mcp_smoke.rs` — whose fallback branch is what should
-stop being needed.
+`SessionState::accepts_teardown` with `accepts_handle`/`accepts_default`, `On::Teardown`,
+`Call::releasing` and `Sessions::resolve_for_teardown` in `src/engine.rs`, and `fuzz_reclaim` in
+`tests/mcp_smoke.rs`.

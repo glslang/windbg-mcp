@@ -405,6 +405,29 @@ impl SessionState {
         self.accepts_handle() || matches!(self, Self::Retired(_))
     }
 
+    /// May a call that names this session by handle **release** it?
+    ///
+    /// Broader than [`Self::accepts_handle`] by the same one state, and for a reason that is not
+    /// the same reason: retirement says the handle no longer names the *target* it was issued
+    /// for, and a teardown does not touch the target — it releases the **session**, which the
+    /// handle still names exactly.
+    ///
+    /// Refusing it was `FOLLOWUPS.md` item 55, found by the session fuzz. Two things did not line
+    /// up. A raw `execute` that retires a handle appends "`end_session` releases it" and
+    /// `end_session` with that handle was then refused, so the server contradicted its own
+    /// instruction one call later. And the recovery the refusal named — omit `session_id` — routes
+    /// to whichever session is *current*, so with anything newer open the retired one could not be
+    /// released by its owner at all: it held one of the four slots and a live engine process until
+    /// everything newer had gone, or a disconnect, or a lease expiry.
+    ///
+    /// Its own predicate rather than a second caller of [`Self::accepts_default`], whose set is
+    /// the same today. They answer different questions — "where does an unaddressed call go" and
+    /// "may this handle end its session" — and a state that ever wants one without the other
+    /// should be a change here rather than a surprise there.
+    fn accepts_teardown(&self) -> bool {
+        self.accepts_handle() || matches!(self, Self::Retired(_))
+    }
+
     /// Whether the session still owns a worker process.
     pub fn is_live(&self) -> bool {
         !matches!(self, Self::Failed(_) | Self::Closed(_))
@@ -1092,6 +1115,11 @@ enum On {
     /// A caller who supplied none, and so accepts whatever the current session holds — the
     /// behaviour from before handles existed.
     Default,
+    /// A caller who supplied `session_id` and is **releasing** the session rather than working
+    /// on its target. Admitted where [`Self::Handle`] is, plus a retired handle: retirement is
+    /// about the target the handle no longer names, and a teardown does not touch the target.
+    /// See [`SessionState::accepts_teardown`] and `FOLLOWUPS.md` item 55.
+    Teardown,
     /// The supervisor's own teardown. There is no handle to honour and no caller to protect, so
     /// it runs against a session already marked closed. Reclamation needs this: it has to mark
     /// its victim before releasing it, or two opens racing at the session limit both pick the
@@ -1124,6 +1152,7 @@ impl Gate {
         match self.on {
             On::Handle => state.accepts_handle(),
             On::Default => state.accepts_default(),
+            On::Teardown => state.accepts_teardown(),
             On::Supervisor => true,
         }
     }
@@ -1164,6 +1193,13 @@ impl Call {
     /// Records whether the caller supplied `session_id`; see [`On`].
     pub fn named(mut self, named: bool) -> Self {
         self.gate.on = if named { On::Handle } else { On::Default };
+        self
+    }
+
+    /// The same, for a call that **releases** the session rather than working on its target, so a
+    /// retired handle is still good enough to end what it names. See [`On::Teardown`].
+    fn releasing(mut self, named: bool) -> Self {
+        self.gate.on = if named { On::Teardown } else { On::Default };
         self
     }
 
@@ -1500,6 +1536,27 @@ impl Sessions {
     /// `end_session` — and recording at the funnel is what stops them, and the next one like
     /// them, from being missed.
     pub fn resolve(&self, supplied: Option<&str>) -> Result<Arc<Session>, EngineError> {
+        self.resolve_admitting(supplied, SessionState::accepts_handle)
+    }
+
+    /// [`Self::resolve`] for a call that **releases** the session rather than working on its
+    /// target, so a retired handle still resolves.
+    ///
+    /// Both halves have to agree: this is the caller-side check, and [`Call::releasing`] is the
+    /// same widening at the front of the queue. Widening one alone would trade the refusal here
+    /// for the same refusal a moment later, from a place with no caller to explain it to.
+    pub fn resolve_for_teardown(
+        &self,
+        supplied: Option<&str>,
+    ) -> Result<Arc<Session>, EngineError> {
+        self.resolve_admitting(supplied, SessionState::accepts_teardown)
+    }
+
+    fn resolve_admitting(
+        &self,
+        supplied: Option<&str>,
+        admits: fn(&SessionState) -> bool,
+    ) -> Result<Arc<Session>, EngineError> {
         let registry = self.registry();
         let caller = crate::client::current();
         let Some(want) = supplied else {
@@ -1522,7 +1579,7 @@ impl Sessions {
             Some(session) if session.owner != caller => {
                 Err(EngineError::Stale(unknown_handle(want)))
             }
-            Some(session) if session.state().accepts_handle() => {
+            Some(session) if admits(&session.state()) => {
                 crate::record::routed_to(&session.id);
                 Ok(session)
             }
@@ -2352,7 +2409,7 @@ impl Sessions {
     /// under process-per-session it costs nothing else.
     pub async fn end(&self, session: &Arc<Session>, named: bool) -> Result<Output, EngineError> {
         let call = Call::new(EngineOp::EndSession)
-            .named(named)
+            .releasing(named)
             .closing(END_SESSION_CLOSING);
         let outcome = self.release(session, call, END_SESSION_TIMEOUT).await;
         // Read before the rendering, from the outcome rather than from the message it produces:
@@ -3011,11 +3068,19 @@ fn stale_handle(want: &str, state: &SessionState) -> String {
             "session `{want}` never opened:\n  {why}\n\nOpening again is how you get a target — \
              but read the reason first, since some failures leave one behind."
         ),
+        // The recovery named here is the one that always works: `end_session` accepts a retired
+        // handle, because the handle still names the session even though it no longer names a
+        // target (`SessionState::accepts_teardown`). Omitting `session_id` is mentioned second
+        // and **qualified**, which was the other half of `FOLLOWUPS.md` item 55: it routes to
+        // whichever session is current, so with anything newer open it reaches a different one —
+        // advice that reads as a way back to this target and is a way to act on another.
         SessionState::Retired(why) => format!(
             "session handle `{want}` has been retired: {why}. The worker still holds a target, \
              but it is not the one this handle names, so the guarantee the handle buys no longer \
-             applies. Omit `session_id` to operate on it anyway, or open again for a handle that \
-             means something."
+             applies. Open again for a handle that means something, or `end_session \
+             {{ \"session_id\": \"{want}\" }}` to release this worker — that still takes this \
+             handle. Omitting `session_id` reaches the worker only while this is still your \
+             current session, so it is not a way back to it once you have opened another."
         ),
         SessionState::Closed(why) => format!(
             "session `{want}` is closed: {why}. Open a target again with open_dump / open_trace \
@@ -4330,11 +4395,18 @@ mod tests {
     /// only while its session can still make good on it, and the one state that parts company
     /// with that is `Retired` — the worker is alive, so a caller who asked for no guarantee
     /// still reaches it.
+    ///
+    /// **And a teardown is honoured there too** (`FOLLOWUPS.md` item 55). Retirement says the
+    /// handle no longer names the *target*; `end_session` does not touch the target, it releases
+    /// the session, which the handle still names exactly. Refused, a caller with anything newer
+    /// open could not release their own worker at all — omitting `session_id` reaches whichever
+    /// session is current, which is then a different one.
     #[test]
-    fn a_retired_handle_is_refused_but_still_the_default_target() {
+    fn a_retired_handle_is_refused_but_can_still_be_defaulted_to_and_ended() {
         let retired = SessionState::Retired("a raw command replaced the target".to_string());
         assert!(!retired.accepts_handle());
         assert!(retired.accepts_default());
+        assert!(retired.accepts_teardown());
         assert!(retired.is_live());
     }
 
@@ -4347,6 +4419,7 @@ mod tests {
         ] {
             assert!(state.accepts_handle(), "{state:?} should accept its handle");
             assert!(state.accepts_default());
+            assert!(state.accepts_teardown(), "{state:?} should be endable");
         }
     }
 
@@ -4358,7 +4431,39 @@ mod tests {
         ] {
             assert!(!state.accepts_handle(), "{state:?}");
             assert!(!state.accepts_default(), "{state:?}");
+            // A teardown is widened by exactly one state, not into "always". There is nothing
+            // left to release here, and answering a second `end_session` with a release would
+            // report work that did not happen.
+            assert!(!state.accepts_teardown(), "{state:?}");
             assert!(!state.is_live(), "{state:?}");
+        }
+    }
+
+    /// The gate at the front of the queue agrees with the caller-side resolve, on every state.
+    ///
+    /// Both have to widen together: widening one alone trades the refusal in `resolve` for the
+    /// same refusal a moment later from [`Gate`], which has no caller to explain it to. This is
+    /// the join that says they did.
+    #[test]
+    fn a_teardown_gate_admits_exactly_what_a_teardown_resolve_does() {
+        let gate = Gate {
+            on: On::Teardown,
+            retires: None,
+            closes: None,
+        };
+        for state in [
+            SessionState::Opening,
+            SessionState::Attaching,
+            SessionState::Open,
+            SessionState::Retired("`.opendump`".to_string()),
+            SessionState::Failed("boom".to_string()),
+            SessionState::Closed("ended".to_string()),
+        ] {
+            assert_eq!(
+                gate.admits(&state),
+                state.accepts_teardown(),
+                "the queue-front gate and the caller-side check disagree about {state:?}"
+            );
         }
     }
 
@@ -4372,7 +4477,17 @@ mod tests {
 
         let retired = stale_handle("sess-1", &SessionState::Retired("`.opendump`".to_string()));
         assert!(retired.contains("retired"), "{retired}");
-        assert!(retired.contains("Omit `session_id`"), "{retired}");
+        // It names the recovery that always works, and names the handle in it — a retired handle
+        // still ends its own session. It used to offer "Omit `session_id`" unqualified, which
+        // routes to whichever session is current and is therefore a way to act on a *different*
+        // one (`FOLLOWUPS.md` item 55).
+        assert!(retired.contains("end_session"), "{retired}");
+        assert!(retired.contains("sess-1"), "{retired}");
+        assert!(
+            retired.contains("only while this is still your current session"),
+            "the fallback has to carry its condition, or it reads as a way back to this \
+             target: {retired}"
+        );
 
         let closed = stale_handle("sess-1", &SessionState::Closed("ended".to_string()));
         assert!(closed.contains("closed"), "{closed}");

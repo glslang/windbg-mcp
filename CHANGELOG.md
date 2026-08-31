@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **A session handle that a raw `execute` retired can still end its own session.** `qd`, `q`,
+  `.detach`, `.kill` and `.opendump` release or replace the target, which *retires* the handle
+  naming that session: every later call supplying it is refused, while the worker stays live and
+  reachable by a call supplying none. `end_session` was not exempt, and two things did not line
+  up. The `execute` that retires the handle appends "`end_session` releases it", and `end_session`
+  with that handle was refused one call later — the server contradicting its own instruction. And
+  the recovery the refusal named, omitting `session_id`, routes to whichever session is *current*,
+  so with anything newer open it reached a different one. The retired session could then not be
+  released by its owner at all: it held one of the four sessions and a live engine process with a
+  live target until everything newer had gone, or a client disconnect, or a lease expiry.
+
+  A teardown does not touch the target retirement is about — it releases the **session**, which
+  the handle still names exactly — so it is now admitted, through a
+  `SessionState::accepts_teardown` of its own rather than a second caller of `accepts_default`,
+  whose set is the same today but whose question is different. Both places a handle is checked had
+  to widen together, the caller-side `Sessions::resolve` and the `Gate` at the front of the
+  session's queue; backing either half out alone was tried and fails the same way, because
+  widening one only moves the refusal to a place with no caller to explain it to.
+
+  The refusal's own text changed with it: it names `end_session` **with the handle in it** as the
+  recovery that always works, and mentions omitting `session_id` second and qualified — "only
+  while this is still your current session" — since unqualified it reads as a way back to this
+  target and is a way to act on another.
+
+  Found by the session fuzz added below, on the second seed it ran under, and covered by
+  `a_handle_a_raw_command_retired_can_still_end_its_own_session`. The second launch in that test
+  is the test rather than scenery: with one session open the retired one is still current, so an
+  un-handled `end_session` reaches it and the defect is invisible — which is why no
+  single-session test had ever seen it.
+
 ### Added
 
 - **A session fuzz in the debugger tier** — dbgscope's `examples/session_fuzz.rs` brought up to

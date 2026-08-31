@@ -19,7 +19,7 @@ adding the debugger tier takes it to ~60s, most of it two tests waiting out real
 grace, and a call staying silent long enough to have to report that it is still running.
 
 **The pass count is the same either way**, because each gate is inside its own test: `cargo test
---test mcp_smoke` reports the same number passed with the tier off as with it on — 95 on 2026-08-31,
+--test mcp_smoke` reports the same number passed with the tier off as with it on — 96 on 2026-08-31,
 against ~2s and ~60s respectively, but it moves whenever a test is added, so re-derive it rather
 than reading it here. (A plain `cargo test` runs the unit tests beside it and prints a result line
 per binary, so it is this harness's own line to read.) The runtime is what tells the two runs apart,
@@ -31,7 +31,7 @@ taken a second covered no debugger claim at all.
 | Tier | Gate | Needs | Catches |
 | --- | --- | --- | --- |
 | **Protocol** | always | no debugger, no target, and no network off this machine — it does bind a loopback port for the listener | transport, revision negotiation, tool-surface drift, and the listener's lease up to the point a session is opened |
-| **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump, and a live user-mode target for the eight that want one — `cmd.exe` for the seven that launch, `ping` for the one that attaches | `dbgscope` / DbgEng regressions, a lease expiry releasing a real engine worker, driving execution on a live user-mode target synchronously and asynchronously, what ending a session does to it, and — over a seeded randomised sequence — that a session is always in one of its three states and never half-answering |
+| **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump, and a live user-mode target for the nine that want one — `cmd.exe` for the eight that launch, `ping` for the one that attaches | `dbgscope` / DbgEng regressions, a lease expiry releasing a real engine worker, driving execution on a live user-mode target synchronously and asynchronously, what ending a session does to it, and — over a seeded randomised sequence — that a session is always in one of its three states and never half-answering |
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a live kernel target you can freeze — KDNET, or serial | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
 | **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
@@ -1018,10 +1018,15 @@ cargo test --test mcp_smoke -- --nocapture randomised
 Run it after touching anything in the wait/settle/guard seam, or in the execution slot. A failing
 seed replays exactly and the panic names it, with the sequence that got there.
 
-**It has already found one thing**, on the second seed it was run under: a handle the raw hatch has
-retired cannot release its own session, and the `execute` that retires it says otherwise in the same
-breath (`FOLLOWUPS.md` item 55). That is left standing rather than fixed — `fuzz_reclaim` takes the
-documented fallback and asserts the session that went is the one it named.
+**It has already found one thing**, on the second seed it was run under: a handle the raw hatch had
+retired could not release its own session, while the `execute` that retires it says otherwise in the
+same breath. Fixed the same day (`FOLLOWUPS.md` item 55), so `fuzz_reclaim` no longer has a
+fallback — however a round leaves its session, the handle that opened it ends it, and a round that
+cannot is a regression rather than a documented detour.
+`a_handle_a_raw_command_retired_can_still_end_its_own_session` is the targeted test that came out
+of it, and the second launch in it is the test rather than scenery: with one session open the
+retired one is still current, so an un-handled `end_session` reaches it and the defect is
+invisible. That is why the fuzz found this on its round teardown and no single-session test did.
 
 ## The bounded-command tier
 

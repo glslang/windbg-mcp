@@ -212,7 +212,7 @@ It checks *same-file* fragments only, so a cross-file `../README.md#some-heading
 verify by hand.
 
 **The pass count does not say which tiers ran.** Each gate is inside its test, so the `mcp_smoke`
-harness reports the same **95 passed** with the debugger tier off as with it on — that harness's own
+harness reports the same **96 passed** with the debugger tier off as with it on — that harness's own
 result line, since a plain `cargo test` runs the crate's several hundred unit tests beside it and
 prints a result line per binary. What differs between the two runs is the runtime (measured on the
 ARM64 bench 2026-08-23: **1.6s against 61s** for `cargo test --test mcp_smoke`) and the `SKIPPED`
@@ -221,9 +221,10 @@ debugger claim. The count moves whenever a test is added — it was 69 until #19
 until item 37, 79 until the TTD tier, 84 until item 50's version-resource test, 85 until
 item 48's two endings, 87 until item 49's live 32-bit target, 88 until item 51's
 attach teardown, 89 until the 32-bit worker's version resource, 90 until #66's symbol-path default,
-91 until #83's two asynchronous-execution tests, 93 until #85's module-inventory refresh and 94
-until the session fuzz — and it said 83 while it was 84, 90 while it was 91, and 93 while it was
-94, which is the usual state of it, so re-derive it rather than trusting this sentence.
+91 until #83's two asynchronous-execution tests, 93 until #85's module-inventory refresh, 94 until
+the session fuzz and 95 until item 55's retired-handle teardown — and it said 83 while it was 84,
+90 while it was 91, and 93 while it was 94, which is the usual state of it, so re-derive it rather
+than trusting this sentence.
 
 **And a gate can be a *directory beside the exe*, which prints no `SKIPPED` line at all.** The
 debugger tier's `!analyze` assertions are inside `if analysis["ran"] == true`, and `ran` is false
@@ -760,8 +761,12 @@ nothing, which is why the run prints the states it reached and asserts it reache
 edit reshuffles the walk, so read that line rather than the green tick.
 
 It has already paid for itself: the second seed it ran under found that a handle the raw hatch has
-retired cannot release its own session, while the `execute` that retires it says `end_session` will
-(`FOLLOWUPS.md` item 55).
+retired could not release its own session, while the `execute` that retires it says `end_session`
+will. Fixed the same day (`FOLLOWUPS.md` item 55) — and worth reading before touching handle
+routing, because it is the case where the two gates a handle passes have to widen **together**:
+`Sessions::resolve` on the caller's side and `Gate::admits` at the front of the session's queue.
+Backing either half out alone was tried, and the end-to-end test fails identically both ways, since
+widening one only moves the refusal to a place with no caller to explain it to.
 
 **Its blocker moved rather than lifted, and which host it is about is the whole of the distinction.**
 Item 47 defers on "replay does not work on this host at all", and the sentence before it names the
@@ -1033,6 +1038,13 @@ A dump or a trace is closed. A live kernel is resumed and actively detached. A p
 terminated with the session. All of it happens inside dbgscope's `end_session`, from what the
 **opener** recorded — DbgEng cannot be asked, since `GetDebuggeeType` answers
 `DEBUG_USER_WINDOWS_PROCESS` for a launch and an attach alike.
+
+**And it accepts a handle no other tool will (`FOLLOWUPS.md` item 55).** A raw `execute` that
+replaces or releases the target *retires* the handle naming that session, and every other call
+supplying it is refused — but a teardown does not touch the target, it releases the **session**,
+which the handle still names exactly. That is `SessionState::accepts_teardown`, and it is widened
+in *both* the places a handle is checked (`Sessions::resolve_for_teardown` and `On::Teardown` at
+the front of the queue) because widening one alone only moves the refusal.
 
 **And it is per process, not per session**, which is where two rounds of review drove it. DbgEng
 holds several user-mode targets in one session (`|` lists them, saying `attach` or `create` against

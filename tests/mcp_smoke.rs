@@ -5187,6 +5187,105 @@ fn ending_a_session_leaves_a_process_this_server_only_attached_to_running() {
     ran("the attach-teardown tier");
 }
 
+/// **`FOLLOWUPS.md` item 55: a handle a raw command retired can still end its own session.**
+///
+/// A raw `execute` that replaces or releases the target — `qd`, `q`, `.detach`, `.kill`,
+/// `.opendump` — retires the handle naming that session, and retirement refuses every call that
+/// supplies it. `end_session` was not exempt, so two things did not line up: the `execute` that
+/// retired the handle appends "`end_session` releases it", and `end_session` with that handle was
+/// refused one call later; and the recovery the refusal named, omitting `session_id`, routes to
+/// whichever session is **current**. With anything newer open that is a different session, so the
+/// retired one could not be released by its owner at all — it held one of the four slots and a
+/// live engine process until everything newer had gone, or a disconnect, or a lease expiry.
+///
+/// **The second launch is the test, not scenery.** With one session open the retired one is still
+/// current, so an un-handled `end_session` reaches it and the defect is invisible; it takes a
+/// newer session to make the handle the only way back. That is why the fuzz found this on its
+/// round teardown and no single-session test ever did.
+///
+/// Both directions are asserted, because widening the wrong amount passes half of this. A tool
+/// that reads the **target** is still refused — retirement is doing its job, and a fix that let
+/// everything through would have deleted the guarantee rather than the defect — while the
+/// teardown goes through, because the handle still names the *session* whatever became of its
+/// target.
+#[test]
+fn a_handle_a_raw_command_retired_can_still_end_its_own_session() {
+    if !launch_tier() {
+        return;
+    }
+    let mut server = Server::started();
+    let retired = server.open_session(
+        "launch",
+        json!({ "command_line": LIVE_TARGET }),
+        TARGET_STEP,
+    );
+    // Opened *after*, so the session under test is not the current one and `end_session {}` would
+    // reach this instead. Without it this test passes on the unfixed server.
+    let newer = server.open_session(
+        "launch",
+        json!({ "command_line": LIVE_TARGET }),
+        TARGET_STEP,
+    );
+
+    // `qd` — quit and detach — releases the target through the raw hatch, which is what retires
+    // the handle.
+    let released = server.call_tool(
+        "execute",
+        json!({ "session_id": &retired, "command": "qd" }),
+        TARGET_STEP,
+    );
+    assert!(
+        !is_tool_error(&released),
+        "`qd` through the raw hatch reported a failure: {}",
+        text_of(&released["result"])
+    );
+
+    // Retirement still bites for ordinary work, and the refusal names the recovery that works.
+    let refused = server.call_tool("registers", json!({ "session_id": &retired }), TARGET_STEP);
+    let said = text_of(&refused["result"]);
+    assert!(
+        is_tool_error(&refused),
+        "a retired handle answered a call that reads its target: {said}"
+    );
+    assert!(
+        said.contains("end_session"),
+        "the refusal must name the recovery that still takes this handle: {said}"
+    );
+
+    // And the claim. `released` rather than the call merely succeeding: a teardown that killed the
+    // worker also "succeeds", and the difference is what this whole area is about.
+    let ended = server.tool_data(
+        "end_session",
+        json!({ "session_id": &retired }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        ended["released"],
+        json!(true),
+        "a retired handle could not release its own session, so its worker is stranded behind the \
+         newer one: {ended}"
+    );
+    assert_eq!(
+        ended["session_id"],
+        json!(&retired),
+        "the teardown released a different session than the handle named: {ended}"
+    );
+
+    // The newer session is untouched — this released one worker, not whichever was current.
+    let sibling = server.call_tool(
+        "registers",
+        json!({ "session_id": &newer, "filter": "pc" }),
+        TARGET_STEP,
+    );
+    assert!(
+        !is_tool_error(&sibling),
+        "ending the retired session took the newer one with it: {}",
+        text_of(&sibling["result"])
+    );
+    server.call_tool("end_session", json!({ "session_id": &newer }), TARGET_STEP);
+    ran("the retired-handle teardown");
+}
+
 // ---- tier 2: the session fuzz -------------------------------------------------
 
 /// Every wait this fuzz issues, and the bound on every run it starts.
@@ -5484,70 +5583,42 @@ fn a_randomised_command_sequence_leaves_the_session_in_one_state_and_the_server_
 /// Releases the round's session, whatever the sequence left it in, and asserts it was **this**
 /// session that went.
 ///
-/// **The by-handle call is not always enough, and finding that out is the first thing this fuzz
-/// did.** A raw `execute` that releases or replaces the target — `qd`, `q`, `.detach`, `.kill`,
-/// `.opendump` — *retires* the handle: `SessionState::Retired` refuses every call that supplies
-/// it while the worker stays live, so a call that named the session is refused and one that names
-/// none still reaches it (`a_retired_handle_is_refused_but_still_the_default_target`). That is by
-/// design and `end_session` is not exempt from it, so the recovery is the one the refusal names —
-/// omit the handle.
+/// **This used to need a fallback, and the fallback is what the fuzz was really reporting.** A raw
+/// `execute` that releases or replaces the target — `qd`, `q`, `.detach`, `.kill`, `.opendump` —
+/// *retires* the handle, and retirement refuses every call that supplies it. `end_session` was not
+/// exempt, so a round that drew one of those could not release its session by name; this asked
+/// again without the handle, which routes to whichever session is **current** and only worked here
+/// because the round's session happened to be the newest. That was `FOLLOWUPS.md` item 55, and it
+/// is fixed: a retired handle still names the session even though it no longer names a target, so
+/// `SessionState::accepts_teardown` admits it and there is one road again.
 ///
-/// **Which is where a defect lives, measured on the release build 2026-08-31 and left alone here
-/// because a test is the wrong place to fix it** (`FOLLOWUPS.md` item 55). Two things do not line
-/// up. The `execute` that retires the handle appends "`end_session` releases it", and
-/// `end_session` with that handle is then refused — the server contradicting its own instruction.
-/// And "omit `session_id`" routes to the *current* session, which is the newest live one: with a
-/// newer session open, the retired one cannot be released by its owner at all. Measured with two
-/// launches, the older retired by `qd` — `end_session` by handle refused, the retired session
-/// reported `live: true, current: false` holding its own engine pid, and the newer one was what
-/// an un-handled `end_session` would have taken. It comes back only when everything newer has
-/// gone, or on a disconnect or a lease expiry. Until then it holds one of the four slots and a
-/// live target.
-///
-/// So this asserts what the server *does* guarantee — the session goes, by one road or the other,
-/// and the one that went is the one named — rather than the stronger claim the note in `execute`'s
-/// own output makes. If item 55 is taken, the fallback branch is what should stop being needed.
+/// Which makes this the assertion the fuzz wanted in the first place — **however the sequence left
+/// the session, the handle that opened it ends it** — and it is deliberately not written to accept
+/// a refusal any more. A round that cannot release by name is now a regression rather than a
+/// documented detour.
 fn fuzz_reclaim(server: &mut Server, session: &str, round: u64, sequence: &[String], replay: &str) {
-    let context = || format!("{}\n{replay}", sequence.join(" -> "));
+    let context = format!("{}\n{replay}", sequence.join(" -> "));
 
     let ended = fuzz_call(
         server,
         "end_session",
         json!({ "session_id": session }),
-        &context(),
+        &context,
     );
     let report = &ended["result"]["structuredContent"];
-    if report["released"] == json!(true) {
-        return;
-    }
-    assert_eq!(
-        report["error"]["category"],
-        json!("stale_session"),
-        "round {round}: `end_session` neither released the session nor refused it as a handle \
-         that no longer names one, after {}\n{}",
-        context(),
-        text_of(&ended["result"])
-    );
-
-    // The retirement's own documented route. Guarded rather than trusted: it routes by *current*,
-    // so a version of this test where the round's session is not the newest would silently end
-    // the bystander instead and the assertion below is what would say so.
-    let anyway = fuzz_call(server, "end_session", json!({}), &context());
-    let report = &anyway["result"]["structuredContent"];
+    // `released` rather than the call succeeding: a teardown that killed the worker also
+    // "succeeds", and the difference between the two is a live kernel left halted.
     assert_eq!(
         report["released"],
         json!(true),
-        "round {round}: the handle was retired and the route its refusal names did not release \
-         anything either, so the worker is stranded, after {}\n{}",
-        context(),
-        text_of(&anyway["result"])
+        "round {round}: the handle that opened this session could not release it, after {context}\n{}",
+        text_of(&ended["result"])
     );
     assert_eq!(
         report["session_id"],
         json!(session),
-        "round {round}: releasing without a handle took a different session than the one this \
-         round opened, after {}\n{report}",
-        context()
+        "round {round}: the teardown released a different session than the handle named, after \
+         {context}\n{report}"
     );
 }
 
