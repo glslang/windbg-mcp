@@ -4282,8 +4282,9 @@ mod tests {
     /// names still exists, in one of the two, and can be reached from the landing page.
     ///
     /// Lines are joined before scanning because a citation wraps: in a doc comment the file name
-    /// sits on one line and `item 43` on the next. A range (`items 16–18`) checks its endpoints
-    /// only, which is enough for what can actually rot — an entry deleted or renumbered.
+    /// sits on one line and `item 43` on the next. A range is expanded inclusively rather than
+    /// read as two endpoints — `DECISIONS.md` cites `items 7–9`, and item 9 is named nowhere else,
+    /// so the interior of a range is the half that can go missing unnoticed.
     ///
     /// The slug the index is checked against is GitHub's, for the ASCII headings this file has:
     /// lower-case, drop all but letters, digits, spaces, `-` and `_`, then spaces to hyphens.
@@ -4338,6 +4339,10 @@ mod tests {
         let done = std::fs::read_to_string(root.join("DONE.md")).expect("read DONE.md");
         let mut entries = std::collections::BTreeMap::new();
         let mut indexed = std::collections::BTreeMap::new();
+        // A number listed twice is refused rather than overwritten, for the same reason as a
+        // heading filed twice: the map would keep one of them and every check below would agree
+        // with itself about an index that names an entry twice.
+        let mut twice = Vec::new();
         for line in done.lines() {
             if let Some(title) = line.strip_prefix("## ")
                 && let Some(n) = leading_item_number(title)
@@ -4348,10 +4353,15 @@ mod tests {
                 && let Some((number, rest)) = rest.split_once("](#")
                 && let Some((anchor, _)) = rest.split_once(')')
                 && let Ok(n) = number.parse::<u32>()
+                && indexed.insert(n, anchor.to_string()).is_some()
             {
-                indexed.insert(n, anchor.to_string());
+                twice.push(n);
             }
         }
+        assert!(
+            twice.is_empty(),
+            "DONE.md's index lists these item numbers more than once: {twice:?}"
+        );
         assert_eq!(
             entries.keys().collect::<Vec<_>>(),
             indexed.keys().collect::<Vec<_>>(),
@@ -4371,12 +4381,31 @@ mod tests {
     }
 
     /// The item numbers a follow-up file holds, read off its `## N.` headings.
+    ///
+    /// A number filed twice in one file is refused here rather than folded into the set, because
+    /// every check downstream is an identity check: two `## 47.` headings collapse to one entry
+    /// that the overlap and citation tests both pass, while "item 47" has quietly stopped naming
+    /// one thing. A bad merge is how that arrives.
     fn items_in(path: &PathBuf) -> std::collections::BTreeSet<u32> {
         let text = std::fs::read_to_string(path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-        text.lines()
+        let mut found = std::collections::BTreeSet::new();
+        let mut twice = Vec::new();
+        for n in text
+            .lines()
             .filter_map(|line| line.strip_prefix("## ").and_then(leading_item_number))
-            .collect()
+        {
+            if !found.insert(n) {
+                twice.push(n);
+            }
+        }
+        assert!(
+            twice.is_empty(),
+            "{} files these item numbers more than once, so a citation of one names two entries: \
+             {twice:?}",
+            path.display()
+        );
+        found
     }
 
     /// `12` from `12. [windbg-mcp] …`, and nothing from a heading that does not open with one.
@@ -4417,28 +4446,60 @@ mod tests {
                 .take(60)
                 .collect::<String>()
                 .to_lowercase();
-            let Some(after) = window.split_once("item") else {
-                continue;
-            };
-            found.extend(numbers_from(after.1));
+            // Every "item" in the window, not the first: `FOLLOWUPS item 10 records what moved
+            // for items 7–9` is one sentence citing four entries, and `DECISIONS.md` writes
+            // exactly that.
+            for (from, _) in window.match_indices("item") {
+                found.extend(numbers_from(&window[from + "item".len()..]));
+            }
         }
         found
     }
 
-    /// The run of numbers opening a citation's tail: `s 13–14,` is 13 and 14, ` 24's` is 24, and
-    /// ` N` (the literal, in prose about the form) is none.
+    /// The numbers opening a citation's tail: `s 13–14,` is 13 and 14, `s 7–9` is 7, 8 and 9,
+    /// ` 24's` is 24, and ` N` (the literal, in prose about the form) is none.
+    ///
+    /// Two things it refuses, both of which stand in a real sentence a few words from a citation.
+    /// A digit run followed by a comma and another digit is a **thousands group** — `8,654 B`, in
+    /// the eval write-ups — and reading it as two item numbers invents one that cannot exist. And
+    /// an ASCII hyphen is not a separator, so a date (`2026-08-26`) after a number ends the run
+    /// rather than continuing it; the ranges written here are en-dashes.
     fn numbers_from(tail: &str) -> Vec<u32> {
+        /// The widest range ever written in these files is seven (`items 20–26`). Beyond that it
+        /// is a misparse, and expanding one would bury a real failure under hundreds of numbers.
+        const SPAN: u32 = 20;
+
         let mut found = Vec::new();
-        let mut rest = tail;
+        // `item` or `items`, and then the numbers.
+        let mut rest = tail.strip_prefix('s').unwrap_or(tail);
         loop {
-            let rest_at = rest.trim_start_matches([' ', 's', ',', '\u{2013}', '-']);
-            let rest_at = rest_at.strip_prefix("and ").unwrap_or(rest_at).trim_start();
-            let digits: String = rest_at.chars().take_while(char::is_ascii_digit).collect();
-            let Ok(n) = digits.parse() else {
+            rest = rest.trim_start();
+            rest = rest.strip_prefix(',').unwrap_or(rest).trim_start();
+            rest = rest.strip_prefix("and ").unwrap_or(rest).trim_start();
+
+            let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+            let Ok(n) = digits.parse::<u32>() else {
                 return found;
             };
+            rest = &rest[digits.len()..];
+            if rest.starts_with(',') && rest[1..].starts_with(|c: char| c.is_ascii_digit()) {
+                return found;
+            }
             found.push(n);
-            rest = &rest_at[digits.len()..];
+
+            // A range is inclusive, and its interior is the half a citation can lose: `items
+            // 16–18` cites 17, and nothing else in the file mentions it.
+            if let Some(after) = rest.strip_prefix('\u{2013}') {
+                let end: String = after.chars().take_while(char::is_ascii_digit).collect();
+                let Ok(last) = end.parse::<u32>() else {
+                    return found;
+                };
+                if last <= n || last - n > SPAN {
+                    return found;
+                }
+                found.extend(n + 1..=last);
+                rest = &after[end.len()..];
+            }
         }
     }
 
