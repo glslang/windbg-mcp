@@ -98,9 +98,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cut_short`, so a `bp` that never finished looked from the caller's side exactly like one that
   ran and matched nothing — the same empty `added`, the same successful result, rendered as "(this
   call added none)". The two have opposite next moves. The listing is a real engine read taken
-  afterwards, so `added` still settles which happened: empty means the expression is not set and
-  can be retried, non-empty means it landed before the break and must **not** be, since `bp` is not
-  idempotent. Reported in both channels — a structured-aware client drops the text — and it stays a
+  afterwards, so `added` settles which happened — but only alongside `listed`, since an empty
+  `added` is "nothing was added" with a listing and "which of these is new is unknown" without one.
+  With a listing: empty means the expression is not set and can be retried, non-empty means it
+  landed before the break and must **not** be, since `bp` is not idempotent. Without one, neither
+  is known and the answer says so. Reported in both channels — a structured-aware client drops the
+  text — and it stays a
   success rather than an error for that same reason: an error is the shape a caller retries. It
   needed a note of its own rather than `told`'s, whose advice ends "scope it and retry", which here
   is the one instruction that leaves two breakpoints.
