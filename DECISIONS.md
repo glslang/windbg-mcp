@@ -841,7 +841,7 @@ the design this replaced.
 > sit on three different clocks.
 >
 > What is left unbounded is therefore a **list, not a criterion**, and
-> `worker::tests::every_unbounded_execute_in_this_worker_is_one_of_the_known_five` is the list:
+> `worker::tests::every_unbounded_execute_in_this_worker_is_accounted_for` is the list:
 > `execute`'s and `kernel_report`'s opener arms (fixed strings inside an open already bounded by
 > `LOAD_WAIT_MS`), `pump_a_resume`'s `Execute` (bounded by the pump that follows it, since it
 > returns without the target having moved), `resolve` (item 56) and `reachable` (item 13).

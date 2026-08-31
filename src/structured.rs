@@ -1071,8 +1071,14 @@ pub struct BreakpointSet {
     /// Why the listing is missing or incomplete, when it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub listing_error: Option<String>,
-    /// Whether the `bp` itself was **cut short** — the watchdog broke the engine in before the
-    /// command finished, because resolving the expression outran this call's budget.
+    /// Whether the `bp` itself was **cut short**: the engine was broken in before the command
+    /// finished, because resolving the expression outran this call's budget or because somebody
+    /// called `interrupt`.
+    ///
+    /// One field for both, where a stop keeps them apart as `interrupted` and `timed_out`. There
+    /// the next move differs — nobody asked for a deadline break, so running on answers it — and
+    /// here it does not: either way the command did not finish, either way it may have installed
+    /// the breakpoint first, and the listing below is what settles that rather than the cause.
     ///
     /// The one case where [`Self::added`] being empty is not the same fact it usually is. Normally
     /// an empty `added` with `listed` true means `bp` ran and matched nothing; here it means the
@@ -1086,7 +1092,7 @@ pub struct BreakpointSet {
     ///
     /// Defaulted so a record written before this field existed still reads.
     #[serde(default)]
-    pub timed_out: bool,
+    pub cut_short: bool,
 }
 
 /// One breakpoint the session holds.
