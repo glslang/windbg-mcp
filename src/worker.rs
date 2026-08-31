@@ -3657,6 +3657,10 @@ fn set_breakpoint(e: &DebugEngine, expression: &str, budget_ms: u32) -> Result<O
 /// is exactly the move that leaves two breakpoints where the caller wanted one. What replaces it
 /// is in [`render_breakpoints`], which can see the *listing* and so can say whether a retry is
 /// safe rather than guessing. This keeps the fact and the timing.
+///
+/// `target_gone` is not read, where [`told_moving`] reads it first: `bp` does not move the target,
+/// and an op reaching a session whose target has already left is refused before it gets here —
+/// `EngineOp::SetBreakpoint` is not among the exemptions in [`refuse_when_the_target_is_gone`].
 fn told_cut_short_bp(run: CommandRun) -> String {
     let note = match run.cut_short {
         Some(Interruption::Deadline { after_ms }) => Some(format!(
@@ -3700,15 +3704,27 @@ fn render_breakpoints(set: &structured::BreakpointSet) -> String {
     // above is what says which — so the sentence is built here rather than beside the command.
     // Without it `added: []` renders as "(this call added none)", which reads as an expression
     // that matched nothing and is the one thing this was not.
-    let interrupted = match (set.timed_out, set.added.is_empty()) {
-        (false, _) => String::new(),
-        (true, true) => "\nThe `bp` was interrupted before it finished and **nothing was added** \
-                         — the expression is not set. Retry it with an address rather than a \
-                         symbol, or allow this call longer.\n"
+    //
+    // `listed` is read before `added`, and that order is the whole correctness of this. An empty
+    // `added` means two opposite things: with a listing it is "nothing was added", and without one
+    // it is "which of these is new is **unknown**" — the case where the *before* read failed. Only
+    // the first can be retried. Branching on `added` alone would tell a caller whose listing failed
+    // to re-request a breakpoint that may already be set, which is the double-set this tool warns
+    // about everywhere else.
+    let interrupted = match (set.timed_out, set.listed, set.added.is_empty()) {
+        (false, _, _) => String::new(),
+        (true, false, _) => "\nThe `bp` was interrupted before it finished, and the breakpoints \
+                             held before this call could not be read — so whether it was set is \
+                             **unknown**. Do **not** re-request it; `execute { \"command\": \
+                             \"bl\" }` is how to find out what is there.\n"
             .to_string(),
-        (true, false) => "\nThe `bp` was interrupted before it finished, but it had already taken \
-                          effect: the breakpoint marked * below is this call's. Do **not** \
-                          re-request it — a second call sets a second breakpoint.\n"
+        (true, true, true) => "\nThe `bp` was interrupted before it finished and **nothing was \
+                               added** — the expression is not set. Retry it with an address \
+                               rather than a symbol, or allow this call longer.\n"
+            .to_string(),
+        (true, true, false) => "\nThe `bp` was interrupted before it finished, but it had already \
+                                taken effect: the breakpoint marked * below is this call's. Do \
+                                **not** re-request it — a second call sets a second breakpoint.\n"
             .to_string(),
     };
     let mut out = format!(
@@ -7126,6 +7142,34 @@ mod tests {
             "must warn against the retry: {out}"
         );
         assert!(out.lines().any(|l| l.starts_with("* 1")), "{out}");
+    }
+
+    /// An empty `added` means two opposite things, and only the listing tells them apart.
+    ///
+    /// Here the *before* read failed, so the session's breakpoints can be listed but which of them
+    /// is new cannot be worked out — `added` is empty because it is **unknown**. Cut short on top
+    /// of that, the branch keyed on `added` alone would reach "nothing was added, retry it" and
+    /// send a caller to re-request a breakpoint that may already be set. That is the double-set
+    /// every other branch of this function exists to warn about, arriving through the one that was
+    /// added to prevent a different confusion.
+    #[test]
+    fn an_interrupted_bp_whose_before_listing_failed_is_unknown_rather_than_unset() {
+        let out = render_breakpoints(&structured::BreakpointSet {
+            added: Vec::new(),
+            breakpoints: vec![breakpoint(0, Some("0x00007ffb6e6a0e10"))],
+            listed: false,
+            listing_error: Some("the breakpoints held before this call could not be read".into()),
+            timed_out: true,
+        });
+        assert!(out.contains("unknown"), "{out}");
+        assert!(
+            !out.contains("Retry it"),
+            "nothing here knows the expression is unset: {out}"
+        );
+        assert!(
+            out.contains("not** re-request"),
+            "must warn against the retry: {out}"
+        );
     }
 
     /// Both unknowns at once: the command did not finish *and* the list that would settle what it
