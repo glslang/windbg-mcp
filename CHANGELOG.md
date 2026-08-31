@@ -127,11 +127,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   assumption the rule above now rests on. The measurement it was extracted from
   (`measure_what_the_bounded_path_costs_a_quick_command`) is `#[ignore]`d, so it went on passing
   across the very change it exists to catch — the quantization it describes had been gone for six
-  days. This one runs in the ordinary tier and asserts a **shape rather than a magnitude**: a
-  bounded `lm` against the unbounded `modules` beside it, plus half a quantum of margin, so a host
-  thirty times slower moves both numbers together and still passes while a watchdog that quantizes
-  moves only one, by more than the whole margin. The measurement keeps the numbers and its comment
-  now records them.
+  days. This one is in the debugger tier — it opens the sample dump, so a plain `cargo test`
+  stands it down — and is *not* `#[ignore]`d, which is the difference: CI runs it on all three
+  runners. Its oracle is a **ratio between two bounded commands of very different natural cost**,
+  an `execute` of `lm` against an `execute` of a ~170ms `.for` loop, failing if they come within
+  5x. That is what a fixed quantum destroys — rounding both up to a multiple of the nap makes them
+  equal, where without one they stay ~50x apart — and it scales with the host, unlike the first
+  version's bounded-against-unbounded margin, which a slow enough baseline grows into. The
+  measurement keeps the numbers and its comment now records them.
 
 - **A session fuzz in the debugger tier** — dbgscope's `examples/session_fuzz.rs` brought up to
   this server's surface. That example drives randomised command sequences straight at a
