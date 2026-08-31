@@ -195,8 +195,8 @@ where the pinned version is the one that compiles.
 is edited from one and compiled on a VM — so the checks that need no Windows are the cheapest ones
 to forget. `cargo fmt --all --check` is the first step of *Build & test*. The other is
 **`Documentation lint`**, a markdownlint over `README.md`, `CHANGELOG.md`, `docs/**` and
-`skills/**` — note `CLAUDE.md` and `FOLLOWUPS.md` are **not** in its globs, so a clean run says
-nothing about them. `.markdownlint.jsonc` — *not* `.markdownlint-cli2.jsonc`, which does not exist
+`skills/**` — note `CLAUDE.md`, `FOLLOWUPS.md` and `DONE.md` are **not** in its globs, so a clean
+run says nothing about them. `.markdownlint.jsonc` — *not* `.markdownlint-cli2.jsonc`, which does not exist
 here — turns off three of the defaults and leaves every other one on: no line-length rule (MD013),
 no table-pipe spacing (MD060), and duplicate headings flagged only among siblings (MD024), which is
 what lets `CHANGELOG.md` repeat `### Added` under every version. **MD051 — a link fragment with no
@@ -1685,18 +1685,26 @@ and the clause after the colon says what kind of handoff it is: *"the traps, not
 on #159 and #170, *"what is covered, what is not"* on #155.
 
 - **`CLAUDE.md`** — what bites while *editing* a subsystem.
-- **`FOLLOWUPS.md`** — numbered items, each saying what would close it, why it was deferred, and
-  where it picks up. Its header enumerates clusters and needs a line whenever an item is added.
+- **`FOLLOWUPS.md`** — numbered items still **open**, each saying what would close it, why it was
+  deferred, and where it picks up. Its header enumerates clusters and needs a line whenever an item
+  is added.
+- **`DONE.md`** — the same entries once they land, kept in full and **under the number they were
+  filed with**, because `CLAUDE.md`, `CHANGELOG.md`, `ci.yml` and `build.rs` all cite them as
+  "`FOLLOWUPS.md` item N" and those references are prose that breaks silently. Closing an item is
+  therefore a *move*, plus the two header edits it implies: out of `FOLLOWUPS.md`'s cluster list
+  and its "items that have landed" line, into `DONE.md`'s index. An item that is **half** landed or
+  **measured and declined** stays put — the first because the entry narrows to what is left, the
+  second because nothing was built and the reopening condition is the content.
 - **[`docs/smoke-test.md`](./docs/smoke-test.md)** — what each tier claims, per test, with budgets.
 
 Plus `CHANGELOG.md` and whichever `docs/*.md` the behaviour moved in.
 
-**Three places to check, not three files to edit.** A handoff touches the ones its change actually
-moved: #170 updated two of the three and `README.md`, and was right to — the test its
+**Four places to check, not four files to edit.** A handoff touches the ones its change actually
+moved: #170 updated two of them and `README.md`, and was right to — the test its
 `docs/smoke-test.md` entry would have described did not exist yet, landing in #176 later the same
-day. Going looking for a third edit with no subject is how a section gets written about nothing.
+day. Going looking for another edit with no subject is how a section gets written about nothing.
 The failure this list prevents is the opposite one, and it is the common one: *not knowing the
-third file is there*.
+next file is there*.
 
 **This prose is reviewed as hard as code, and deserves to be.** A docs-only PR (#170) drew six
 findings from the Codex bot, every one a real inaccuracy about the lease — and two of them were

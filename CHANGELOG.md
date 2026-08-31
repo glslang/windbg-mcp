@@ -72,6 +72,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the handle, routes to the *newest* session instead. Measured on the release build with two
   launches, the older retired by `qd`.
 
+### Documentation
+
+- **`FOLLOWUPS.md` holds only what is still open; what has landed moved to `DONE.md`.** Thirty-three
+  of its fifty-five entries were finished work, so two thirds of a file read for "what is left" was
+  answering a different question. The entries move **in full and under the numbers they were filed
+  with** — `CLAUDE.md`, `CHANGELOG.md`, `docs/*.md`, `ci.yml` and `build.rs` all cite them as
+  "`FOLLOWUPS.md` item N", and those are prose references that renumbering would break without
+  failing anything — so `FOLLOWUPS.md`'s numbering is now sparse and its header says which numbers
+  went. Neither file is in the markdownlint globs, so neither is checked by CI.
+
+  Two shapes deliberately stayed: an item **measured and declined** (27, 35), where nothing was
+  built and the reopening condition is the content, and one that **half** landed (50), whose entry
+  narrows to the half that is left rather than splitting across two files.
+
+- **Item 14's dbgscope half has landed and the entry did not know it.** dbgscope's `Watchdog` parks
+  on a `Condvar` in the pinned revision, so arming a bound is free — which arrived through the
+  [#226](https://github.com/glslang/windbg-mcp/issues/226) work, where the 200ms sleep was what made
+  a finite `WaitForEvent` look attractive. The consequence it was filed for is still open on this
+  side: `EngineOp::Command` remains the unbounded path for the cheap point queries, `DECISIONS.md`'s
+  own revisit trigger for that split has now fired, and the measurement behind it
+  (`measure_what_the_bounded_path_costs_a_quick_command`) still describes the sleep — it prints
+  rather than asserts, so it went on passing across the change it exists to catch.
+
 ## [0.14.0] - 2026-08-30
 
 ### Added
