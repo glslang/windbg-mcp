@@ -1052,21 +1052,51 @@ impl From<&dbgscope::dbgeng::Module> for ModuleInfo {
 /// The breakpoints a session holds, after a `set_breakpoint`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BreakpointSet {
-    /// The ids this call added. Empty when the command set nothing — which `bp` reports by
-    /// printing an error and is otherwise invisible, since a successful `bp` prints nothing.
+    /// The ids this call added.
     ///
-    /// When `listed` is false this is empty because it is **unknown**, not because nothing was
-    /// added.
+    /// **Non-empty is the only unambiguous value**, and it is unambiguous in the direction that
+    /// matters: those breakpoints exist, this call created them, and asking again would be asking
+    /// for something already there. Everything else about this result is a qualification of the
+    /// *empty* case, so enumerate it rather than reading it as one fact — four different things
+    /// produce it, and repeated review rounds on this row were each a different one of them:
+    ///
+    /// - **`bp` failed**, which it says by printing an error — the only one of the four that is
+    ///   visible in the text, since a successful `bp` prints nothing at all.
+    /// - **The expression already had a breakpoint**, so there was no new id to add. Measured: a
+    ///   resolved breakpoint is keyed by address, so repeating one is a no-op. `bp` prints nothing
+    ///   here either, which is what makes it indistinguishable from the case above without the
+    ///   listing.
+    /// - **The command was cut short** ([`Self::cut_short`]) before it got that far — or after,
+    ///   which is why this is not evidence either way.
+    /// - **It is not known**, because [`Self::listed`] is false and there is no diff to read.
+    ///
+    /// [`Self::breakpoints`] is what separates them: an expression absent from the listing was not
+    /// set, and one present was — whoever set it. Nothing in this struct infers beyond that, and
+    /// nothing reading it should.
     pub added: Vec<u32>,
     /// Every breakpoint the session now holds, added or not.
     pub breakpoints: Vec<BreakpointInfo>,
-    /// Whether the breakpoints above are the session's real list.
+    /// Whether [`Self::added`] is a real before/after diff.
     ///
-    /// False does **not** mean the breakpoint was not set. The `bp` succeeded — that is why this
-    /// is a success and not an error — and the follow-up inspection is what failed. Reporting an
-    /// inspection failure as the mutation failing invites the one recovery that must not happen:
-    /// `bp` is not idempotent, so a caller who retries sets a second breakpoint. `bl` through
-    /// `execute` is the way to find out what is there.
+    /// False says only that the diff is **unavailable**, and nothing about the `bp` itself.
+    /// [`Self::listing_error`] and [`Self::cut_short`] are what say why, and there are three
+    /// shapes: the inspection *before* the command failed, so the session's breakpoints are
+    /// listed and which of them is new is not; the inspection *after* it failed, so there is no
+    /// listing at all; or the command was cut short, so what it managed is a question the missing
+    /// diff cannot answer either.
+    ///
+    /// **It is deliberately not an error**, which is the older half of this and still the point.
+    /// A `bp` that ran and an inspection that then failed is a mutation that happened, so
+    /// reporting the inspection's failure as the mutation's invites the one recovery that must not
+    /// happen — and `bl` through `execute` is what finds out what is there instead.
+    ///
+    /// That the recovery is dangerous is **measured and narrower than it used to be written**. A
+    /// *resolved* expression is deduplicated by the engine: `bp ntdll!NtCreateFile` three times
+    /// leaves one breakpoint, because a resolved breakpoint is keyed by address. A **deferred**
+    /// one is not: `bp nosuchmod!Sym` twice leaves two, there being no address to key on. So a
+    /// retry duplicates exactly when the expression does not resolve — which is also the case
+    /// most likely to be slow enough to be cut short, so the warning earns its place rather than
+    /// being boilerplate.
     pub listed: bool,
     /// Why the listing is missing or incomplete, when it is.
     #[serde(skip_serializing_if = "Option::is_none")]
