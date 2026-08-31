@@ -64,7 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attractive, so fixing that defect retired this trade-off as a side effect and nothing here was
   revisited when it landed.
 
-  `index_trace` stays out, and is now the only thing that is. `!ttdext.index -force` deletes an
+  `index_trace` stays out, and is now the only op that is. `!ttdext.index -force` deletes an
   unloadable `.idx` before rebuilding it, so a break part-way through can leave a trace with no
   usable index at all — the one case where the abort is worse than the wedge, and one whose long
   run is productive work that frees the session when it finishes. What was the general "raw
@@ -73,6 +73,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reading the source — because the way a collapsed split comes back is a tool added by copy-paste
   taking the unbounded path with nobody deciding to, and that tool works perfectly until the day
   its command runs away.
+
+- **`set_breakpoint` runs its `bp` on the caller's clock too.** `EngineOp::SetBreakpoint` carries a
+  `patience_ms` and the command goes through `execute_command_bounded`. The address is the caller's
+  text and `bp` makes the MASM evaluator resolve it, so `bp nt!Foo+0x10` against a deferred module
+  with a `srv*` path is a symbol-server fetch with this session's engine held for all of it — the
+  wedge the bounded path exists to stop, reached through a **typed** op where nothing in the name
+  said there was a command inside. The `bl` reads either side of it stay unbounded, being direct
+  engine calls with no `Execute` to break.
+
+  It survived the first draft of the change above, whose rule was stated over ops and whose test
+  certified ops, so both missed it. `worker::tests::every_unbounded_execute_in_this_worker_is_one_of_the_known_five`
+  is the correction: it reads the source for `Execute` calls rather than for enum variants, and
+  enumerates the five functions that legitimately run one unbounded — the two openers' fixed
+  strings, the resume pump's own `Execute`, and the two that are deferred with items against them.
+  Verified by backing the fix out, which names `set_breakpoint`.
+
+  Enumerating rather than reasoning about it turned up a second instance the review did not:
+  `worker::resolve`'s `? <expr>`, also caller text, filed as `FOLLOWUPS.md` item 56 rather than
+  fixed here because its three callers sit on three different clocks and one of them is item 13.
 
 ### Added
 

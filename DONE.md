@@ -318,13 +318,24 @@ Four things this turned up that the entry could not have said:
   `server::tests::only_index_trace_runs_a_command_unbounded`, which reads the source the way
   `record`'s stdout rule does. Verified by breaking it: routing `threads` back reports
   `["threads", "index_trace"]`.
-- **"Bound everything" is a rule about *commands*, and the entry's phrasing hid that.** A watchdog
-  Ctrl+Breaks an `Execute`; the typed ops — `modules`, `backtrace`, `disassemble`, `registers`,
-  `read_memory` — are direct engine calls with nothing for it to break, which is why none of them
-  carries a `patience_ms` and why a frame whose symbol has to be fetched can still block inside
-  one. The walks and `crash_triage` bound themselves between nodes instead. And
-  `reachable_from_dispatch` is still unbounded in aggregate: it issues many `uf` commands inside
-  one job, which needs a job-level deadline and is still item 13.
+- **"Bound everything" is a rule about *commands*, and stating it over **ops** cost two
+  instances.** A watchdog Ctrl+Breaks an `Execute`, and a *typed* op can run one — nothing in the
+  op's name says so. `set_breakpoint` was doing exactly that, `execute_command("bp <the caller's
+  expression>")`, while every op around it moved; Codex found it on
+  [#271](https://github.com/glslang/windbg-mcp/pull/271) against a first draft whose test
+  certified only the enum variant, which is to say the check agreed with the mistake. Fixed there
+  — `EngineOp::SetBreakpoint` carries a `patience_ms` like any other command — and the check
+  rewritten to read `Execute` calls out of `src/worker.rs` and enumerate the five functions that
+  legitimately run one unbounded. Enumerating rather than reasoning immediately turned up a second:
+  `resolve`'s `? <expr>`, also caller text, now item 56. **The general lesson is the cheap one:** a
+  test written from the same sentence as the change inherits the sentence's blind spot, and the way
+  out is to check the thing the rule is *about* rather than the thing the change touched.
+- **What no phrasing of it reaches.** The typed ops — `modules`, `backtrace`, `disassemble`,
+  `registers`, `read_memory` — are direct engine calls with nothing for a watchdog to break, so a
+  frame whose symbol has to be fetched can still block inside one however the rule is written; the
+  walks and `crash_triage` bound themselves between nodes instead. And `reachable_from_dispatch` is
+  still unbounded in aggregate: many `uf` commands inside one job, which needs a job-level deadline
+  and is still item 13.
 
 ## 16. [windbg-mcp] Exercise a *mutating* `debug_batch` against a live kernel target — **done**
 
