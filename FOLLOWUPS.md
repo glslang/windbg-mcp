@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in fourteen clusters: items 2–6 come from the reachability-confirmation effort (path
+Deferred work, in fifteen clusters: items 2–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9 and 11 from surveying this server against
 the MCP `2026-07-28` extensions (tasks, apps), item 13 from the bounded-command coverage review (#46,
 2026-08-02), item 15 from the private worker channel (#65 / #72, 2026-08-04), item 19 from
@@ -22,7 +22,9 @@ in the microseconds after a run built its stop is recorded in that result's pros
 no watchdog in either crate can currently cut short (2026-08-30), and item 56 from closing item 14 —
 collapsing the coverage rule to "bound every command except `index_trace`" meant enumerating the
 `Execute` calls rather than the ops, which found one left on a shared helper that three callers
-reach on three different clocks (2026-08-31).
+reach on three different clocks (2026-08-31), and item 57 from the review of that same work, where
+bounding a command that **mutates** turned out to want a result that says whether the mutation
+landed — which `set_breakpoint` now has and `ioctl_trace` does not (2026-08-31).
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and the
 2026-08-02 entries that item 13 extends.
@@ -751,3 +753,30 @@ its op is its own; this one is not, for the reason below.
   server can block that too — see `EngineOp::Backtrace`. This item is worth doing because a
   *command* is bounded cheaply and there is no reason to leave one that is not; it is not worth
   doing as a claim that the symbol-server hazard is gone.
+## 57. [windbg-mcp] `ioctl_trace` installs a breakpoint and reports nothing about it
+
+`ioctl_trace` builds a `bp <dispatch> ".printf …; gc"` and runs it as a raw command, so its answer
+is whatever `bp` printed — which on success is **nothing at all**. That is the same gap
+`set_breakpoint` was given a typed result for: no id, no confirmation that anything was armed, and
+no way for a caller to tell "installed" from "silently did nothing" without a separate `bl`.
+
+It matters more since the command was bounded (item 14). A cut-short `bp` may have installed the
+breakpoint before the break, and `ioctl_trace` cannot say which happened — where `set_breakpoint`
+diffs the breakpoint list either side and reports `added` and `timed_out`. The *advice* half is
+fixed: `told` no longer tells any caller to re-issue an interrupted command. The *reporting* half
+is this item.
+
+- **Why deferred:** the fix is to route it through a typed op, which changes the tool's result
+  shape — it would start returning `structuredContent` and an `outputSchema` it does not have
+  today. That is a surface change with a golden to review, and it does not belong in a PR about
+  which commands carry a watchdog. Nothing is unsafe in the meantime; the tool is exactly as
+  informative as it was before item 14.
+- **What would close it:** the cheap version is to pass `<dispatch> ".printf …; gc"` as
+  `EngineOp::SetBreakpoint`'s `expression` — `worker::set_breakpoint` builds `bp {expression}`, so
+  the command comes out identical and the whole typed report comes for free, with no second copy of
+  the diff. The tool's own `reject_command_breakers` already screens `dispatch`, and the quoted
+  command string is this server's, not a caller's.
+- **The better version depends on** [glslang/dbgscope#126](https://github.com/glslang/dbgscope/issues/126),
+  where a typed breakpoint API would let both tools set a `command` string as a **parameter**
+  rather than by hand-escaping `\"` inside a format string — which is the one place in this server
+  where "`bp`'s syntax is the point" is still true.
