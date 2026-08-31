@@ -24,12 +24,19 @@ Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and the
 2026-08-02 entries that items 13–14 extend.
 
-**Items that have landed are in [`DONE.md`](./DONE.md), under the numbers they were filed with** — 1,
-7, 10, 12, 16–18, 20–26, 28–31, 34, 36–38, 40–46, 48, 49, 51 and 55, which is why the numbering here
-is sparse. Nothing is renumbered when it moves: `CLAUDE.md`, `CHANGELOG.md`, `docs/*.md`,
-`.github/workflows/ci.yml` and `build.rs` all cite items as "`FOLLOWUPS.md` item N", and those are
-prose references that would break silently. `DONE.md` opens with an index and with why a finished
-entry is still worth reading.
+**Items that have landed are in [`DONE.md`](./DONE.md), under the numbers they were filed with**,
+which is why the numbering here is sparse — its index is the list of them, and is the one list, so
+there is nothing here to fall out of step with it.
+
+Nothing is renumbered when it moves, and **nothing that cites an item is retargeted either**. Some
+twenty files say "`FOLLOWUPS.md` item N" — doc comments in eleven modules and in `tests/`,
+`CHANGELOG.md`, `DECISIONS.md`, every `docs/*.md`, `build.rs`, `ci.yml` and the eval tooling — so a
+citation whose *file* half followed the entry would make closing an item a sweep of source
+comments, with nothing to catch the ones missed. "Item N" is the stable name; this paragraph is
+what answers *which file*, for whoever followed a citation here.
+`engine::every_followups_citation_names_an_item_that_exists` is what keeps that true: an entry
+deleted, renumbered, or moved without reaching `DONE.md`'s index fails the build rather than a
+reader.
 
 Two kinds of item stay here rather than moving. One that is **measured and declined** (27, 35): each
 records the measurement that settled it and the condition that would reopen it, and item 35 leaves a
