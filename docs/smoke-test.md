@@ -985,10 +985,12 @@ away while it does. So the rule is that a probe's roads never move **back** down
 answer and then `stale_session` is a program that finished a millisecond ago.
 
 **The seed is fixed, so CI runs one deterministic walk.** Drawing from the clock would fail on a
-sequence nobody could reproduce. The default (seed 2, 3 rounds of 6 steps, ~1s) is chosen because
+sequence nobody could reproduce. The default (seed 3, 3 rounds of 6 steps, ~1s) is chosen because
 its walk reaches all three states; how long a round lasts depends on whether it draws an unbounded
-`g`, which runs the target to its own ending, so a corpus edit reshuffles both the coverage and the
-runtime. The run prints the states it reached, and **asserts it reached `Gone` at least once** —
+`g`, which runs the target to its own ending, so anything that reshuffles the walk — a corpus edit,
+or a change to `Rng::new` — reshuffles both the coverage and the runtime, and the number is
+re-derived by scanning rather than kept. The run prints the states it reached, and **asserts it
+reached `Gone` at least once** —
 every check is of the form "if the session is in state X it must say so", so a walk that never left
 `Holding` would pass without asking the question. `Moving` is reported and not asserted: it needs a
 run still going one probe later, which is a race on a loaded runner.

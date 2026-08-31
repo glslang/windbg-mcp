@@ -5380,13 +5380,14 @@ fn a_randomised_command_sequence_leaves_the_session_in_one_state_and_the_server_
     if !launch_tier() {
         return;
     }
-    // **Why this seed.** Its walk reaches all three of [`Held`]'s states, which only one of them
-    // is asserted below — and it does so in about a second, where seed 1's takes twenty. Both
-    // halves are the seed's doing rather than the corpus's: how long a round lasts is decided by
-    // whether it draws an unbounded `g`, which runs the target to its own ending. So a corpus edit
-    // reshuffles the walk and may reshuffle both, and the assertion on `Gone` is what says so
-    // rather than leaving it to whoever notices the runtime.
-    let seed = fuzz_setting("WINDBG_MCP_SMOKE_FUZZ_SEED", 2);
+    // **Why this seed.** Its walk reaches all three of [`Held`]'s states, only one of which is
+    // asserted below — and it does so in about a second, where seed 1's takes twenty. Both halves
+    // are the seed's doing rather than the corpus's: how long a round lasts is decided by whether
+    // it draws an unbounded `g`, which runs the target to its own ending. So anything that
+    // reshuffles the walk — a corpus edit, or a change to `Rng::new` — reshuffles both, and this
+    // number is re-derived by scanning rather than kept. The assertion on `Gone` is what says a
+    // reshuffle cost coverage, instead of leaving it to whoever notices the runtime.
+    let seed = fuzz_setting("WINDBG_MCP_SMOKE_FUZZ_SEED", 3);
     let rounds = fuzz_setting("WINDBG_MCP_SMOKE_FUZZ_ROUNDS", 3);
     let steps = fuzz_setting("WINDBG_MCP_SMOKE_FUZZ_STEPS", 6);
     let replay = format!(
@@ -5758,8 +5759,29 @@ fn fuzz_road(server: &mut Server, tool: &str, args: Value) -> (Option<Held>, Str
 struct Rng(u64);
 
 impl Rng {
+    /// **The forbidden state is zero, not "even".**
+    ///
+    /// This was `seed | 1`, carried over from the example, and that quietly folded every even seed
+    /// onto the odd one above it: `2` and `3` were one run, `6` and `7` were one run, and half of
+    /// the seed space named nothing new. It is a defect *here* in a way it is not there, because
+    /// there the seed defaults to a nanosecond clock reading while here it is a small integer an
+    /// operator types while exploring — and the evidence was already in this branch's own seed
+    /// scan, where `2` and `3` both reported `{Moving: 3, Holding: 7, Gone: 2}` and `4` and `5`
+    /// both `{Holding: 1, Gone: 3}`. Two pairs of "different" runs, read past twice.
+    ///
+    /// Measured over the first 512 seeds, drawing a target and ten corpus steps each: `seed | 1`
+    /// gives **256** distinct walks, and this gives **512**. Running a SplitMix64 finalizer over
+    /// the seed first also gives 512 and was dropped — adjacent seeds already walk differently
+    /// without it, so it would be machinery bought with nothing.
+    ///
+    /// The one collision left is `0` against this constant, which is the state xorshift64* cannot
+    /// be given rather than a pair of ordinary seeds.
     fn new(seed: u64) -> Self {
-        Self(seed | 1)
+        Self(if seed == 0 {
+            0x243F_6A88_85A3_08D3
+        } else {
+            seed
+        })
     }
 
     fn next(&mut self) -> u64 {
