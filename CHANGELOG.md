@@ -98,13 +98,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `bp` that never finished looked from the caller's side exactly like one that ran and matched
   nothing — the same empty `added`, the same successful result, rendered as "(this call added
   none)". The two have opposite next moves. The listing is a real engine read taken afterwards, so
-  `added` settles which happened — but only alongside `listed`, since an empty `added` is "nothing
-  was added" with a listing and "which of these is new is unknown" without one. With a listing:
-  empty means the expression is not set and can be retried, non-empty means it landed before the
-  break and must **not** be, since `bp` is not idempotent. Without one, neither is known and the
-  answer says so. Reported in both channels — a structured-aware client drops the text — and it
-  stays a success rather than an error for that same reason: an error is the shape a caller
-  retries.
+  `added` settles which happened — non-empty is a breakpoint that landed before the break and must
+  **not** be re-requested. Empty settles nothing on its own: without a listing, which of the
+  session's breakpoints is new is unknown, and *with* one it is still not evidence the expression
+  is unset, because a `bp` at an address that already carries a breakpoint adds no id either. So
+  the result says what the diff says and sends the caller to the listing for the rest. Reported in
+  both channels — a structured-aware client drops the text — and it stays a success rather than an
+  error, because an error is the shape a caller retries.
+
+  That last point turned up a fact this module states as a universal and which is only half true.
+  Measured on a live target: `bp ntdll!NtCreateFile` three times leaves **one** breakpoint, and
+  `ntdll!NtClose+0x2` twice leaves one, because a resolved breakpoint is keyed by address — while
+  `bp nosuchmod!Sym` twice leaves **two**, since a deferred one has no address to key on. `bp`
+  duplicates exactly when its expression does not resolve, which is the same condition that makes
+  one slow enough to be cut short in the first place. The warnings stay; what changed is that they
+  are accurate about why, and no longer claim a retry is safe when the diff cannot know it.
 
   **One field for both causes**, unlike a stop's `interrupted`/`timed_out` pair: the `interrupt`
   tool reaches this command as readily as the deadline does and leaves the session in the same

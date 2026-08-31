@@ -3608,8 +3608,17 @@ fn brief(output: &str) -> String {
 /// `cut_short`, so a command that never finished looks from here exactly like one that ran and
 /// matched nothing — same empty `added`, same successful result. It is reported as
 /// [`structured::BreakpointSet::cut_short`] in both channels rather than raised, for the reason
-/// above: an error is the shape a caller retries, and a `bp` that *did* land before the break
-/// would then be set twice.
+/// above: an error is the shape a caller retries.
+///
+/// **`bp` is not idempotent, and the half of that which is true is the half that matters here.**
+/// Measured on a live target 2026-08-31: a *resolved* expression is deduplicated by the engine —
+/// `bp ntdll!NtCreateFile` three times, and `ntdll!NtClose+0x2` twice, each leave **one**
+/// breakpoint, because a resolved breakpoint is keyed by address — while a **deferred** one is
+/// not: `bp nosuchmod!Sym` twice leaves **two**, since there is no address to key on. So a retry
+/// duplicates exactly when the expression does not resolve, which is the same condition that
+/// makes a `bp` slow enough to be cut short in the first place. That is why the warnings here are
+/// worth their words rather than being conservative boilerplate — and why they warn instead of
+/// asserting that a retry is safe, which for a resolved expression it happens to be.
 fn set_breakpoint(e: &DebugEngine, expression: &str, budget_ms: u32) -> Result<Output, Failed> {
     // Best-effort, and taken first: a session whose breakpoint list cannot be read must still be
     // able to set a breakpoint, so this cannot be a `?`.
@@ -3743,11 +3752,16 @@ fn render_breakpoints(set: &structured::BreakpointSet) -> String {
     // that matched nothing and is the one thing this was not.
     //
     // `listed` is read before `added`, and that order is the whole correctness of this. An empty
-    // `added` means two opposite things: with a listing it is "nothing was added", and without one
-    // it is "which of these is new is **unknown**" — the case where the *before* read failed. Only
-    // the first can be retried. Branching on `added` alone would tell a caller whose listing failed
-    // to re-request a breakpoint that may already be set, which is the double-set this tool warns
-    // about everywhere else.
+    // `added` means two opposite things: with a listing it is "this call added nothing", and
+    // without one it is "which of these is new is **unknown**" — the case where the *before* read
+    // failed. Branching on `added` alone would tell a caller whose listing failed to re-request a
+    // breakpoint that may already be set.
+    //
+    // And even *with* a listing, "added nothing" is not "the expression is not set": a `bp` at an
+    // address that already carries one adds no id. Measured on a live target 2026-08-31 —
+    // `bp ntdll!NtCreateFile` three times leaves one breakpoint, and `ntdll!NtClose+0x2` twice
+    // leaves one — because the engine keys a resolved breakpoint by address. So this branch
+    // reports what the diff actually says and lets the listing under it answer the rest.
     let interrupted = match (set.cut_short, set.listed, set.added.is_empty()) {
         (false, _, _) => String::new(),
         (true, false, _) => "\nThe `bp` was interrupted before it finished, and the breakpoints \
@@ -3755,10 +3769,13 @@ fn render_breakpoints(set: &structured::BreakpointSet) -> String {
                              **unknown**. Do **not** re-request it; `execute { \"command\": \
                              \"bl\" }` is how to find out what is there.\n"
             .to_string(),
-        (true, true, true) => "\nThe `bp` was interrupted before it finished and **nothing was \
-                               added** — the expression is not set. Retry it with an address \
-                               rather than a symbol, or allow this call longer.\n"
-            .to_string(),
+        (true, true, true) => {
+            "\nThe `bp` was interrupted before it finished and **this call added \
+                               nothing**. Read the listing below before re-requesting it: an \
+                               expression that already had a breakpoint also adds nothing, and \
+                               only if it is absent there was it really not set.\n"
+                .to_string()
+        }
         (true, true, false) => "\nThe `bp` was interrupted before it finished, but it had already \
                                 taken effect: the breakpoint marked * below is this call's. Do \
                                 **not** re-request it — a second call sets a second breakpoint.\n"
@@ -7159,12 +7176,18 @@ mod tests {
         });
         assert!(out.contains("interrupted"), "{out}");
         assert!(
-            out.contains("nothing was added"),
-            "the caller has to be told the expression is unset: {out}"
+            out.contains("this call added nothing"),
+            "the caller has to be told the command did not get that far: {out}"
+        );
+        // And *not* that the expression is unset, which the diff cannot say: a `bp` at an address
+        // that already carries one adds no id either (measured). The listing settles it.
+        assert!(
+            !out.contains("is not set"),
+            "an empty diff is not evidence the expression is unset: {out}"
         );
         assert!(
-            out.contains("Retry"),
-            "and that retrying is the right move here, unlike every other branch: {out}"
+            out.contains("Read the listing below"),
+            "so the caller is sent to the one thing that does answer it: {out}"
         );
         // The pre-existing breakpoint is still listed, and is not claimed as this call's.
         assert!(out.lines().any(|l| l.starts_with("  0")), "{out}");

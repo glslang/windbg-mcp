@@ -1080,12 +1080,13 @@ pub struct BreakpointSet {
     /// here it does not: either way the command did not finish, either way it may have installed
     /// the breakpoint first, and the listing below is what settles that rather than the cause.
     ///
-    /// The one case where [`Self::added`] being empty is not the same fact it usually is. Normally
-    /// an empty `added` with `listed` true means `bp` ran and matched nothing; here it means the
-    /// command never got to the end, so nothing was added *yet* and the expression is simply
-    /// unset. The listing is still a real read taken afterwards, so `added` still says which of
-    /// the two happened: non-empty is a breakpoint that landed despite the interruption and must
-    /// **not** be re-requested, empty is one that did not and can be.
+    /// It changes what [`Self::added`] being empty can mean. Normally that is `bp` having run and
+    /// matched nothing; here the command may simply not have got that far. `added` non-empty is
+    /// unambiguous either way — a breakpoint that landed before the break, which must **not** be
+    /// re-requested. Empty is not: the listing beside it is what says whether the expression is
+    /// absent or was already there, since a `bp` at an address that already carries one adds no
+    /// id (measured on a live target — a resolved breakpoint is keyed by address, so repeating
+    /// one is a no-op, while a *deferred* one duplicates because there is no address to key on).
     ///
     /// A success rather than an error, for [`Self::listed`]'s reason turned around: `bp` is not
     /// idempotent, and an error is the shape that gets retried.
