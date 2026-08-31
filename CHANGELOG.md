@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A session fuzz in the debugger tier** — dbgscope's `examples/session_fuzz.rs` brought up to
+  this server's surface. That example drives randomised command sequences straight at a
+  `DebugEngine` and checks, after every one of them, that the session either still holds a target
+  and answers or says it holds none; it exists because the three defects behind
+  [#242](https://github.com/glslang/windbg-mcp/issues/242) were each found by hand, one sequence at
+  a time, and none of them is about a *command* — they are about the state the previous command
+  left behind, and there are more ways to reach a given state than anyone enumerates.
+
+  What the port adds is everything between that engine and a caller. A **third state**, since
+  `continue_async` leaves a target moving with nobody waiting and reads are then refused
+  `target_running` — the supervisor's state machine
+  ([#83](https://github.com/glslang/windbg-mcp/issues/83)), which the example cannot reach. The
+  **category** a refusal carries rather than merely that it refused. A **bystander session** on the
+  same server, never named by a step and asked after every round, which is the process-per-session
+  claim no in-process test can make. And reclamation of whatever the sequence left.
+
+  Its oracle is a **scale rather than an agreement**: a bounded run can stop between one road into
+  the session and the next, so what is forbidden is a road moving back down
+  `Moving → Holding → Gone` — `stale_session` and then an answer is the half-dead session, while an
+  answer and then `stale_session` is a program that finished a millisecond ago. The seed is fixed,
+  so CI walks one short deterministic sequence on all three of its `dbgeng.dll`s; the fuzz proper
+  is a soak of the same test, and the run prints the states it reached and asserts it reached the
+  terminal one, because a walk that never left `Holding` would pass without asking the question.
+  `docs/smoke-test.md` has the soak command and what it does and does not assert.
+
+  It found one thing on the second seed it ran under, left standing as `FOLLOWUPS.md` item 55: a
+  handle that a raw `execute` has **retired** cannot release its own session, while the `execute`
+  that retires it appends "`end_session` releases it" — and the recovery its refusal names, omitting
+  the handle, routes to the *newest* session instead. Measured on the release build with two
+  launches, the older retired by `qd`.
+
 ## [0.14.0] - 2026-08-30
 
 ### Added

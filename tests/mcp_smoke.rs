@@ -64,7 +64,7 @@
 //!
 //! See `docs/smoke-test.md` for the runbook.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -5185,6 +5185,593 @@ fn ending_a_session_leaves_a_process_this_server_only_attached_to_running() {
     let _ = target.kill();
     let _ = target.wait();
     ran("the attach-teardown tier");
+}
+
+// ---- tier 2: the session fuzz -------------------------------------------------
+
+/// Every wait this fuzz issues, and the bound on every run it starts.
+///
+/// Short on purpose, and for dbgscope's reason: a resume that reaches no stop is a state worth
+/// generating rather than one to avoid, so the interesting draws are the ones that *reach* this
+/// bound. It also keeps a round to seconds.
+const FUZZ_WAIT_MS: u32 = 1_500;
+
+/// The two targets, and the difference between them is the point.
+///
+/// The short one is over on the first resume, so its exit races whatever is pumping it — issue
+/// [#242](https://github.com/glslang/windbg-mcp/issues/242)'s case. The long one outlives a
+/// bounded wait, so a resume with nothing to stop it is broken in and the session has to survive
+/// that repeatedly.
+///
+/// Ten seconds rather than [`LIVE_TARGET`]'s thirty, because this is what bounds the corpus's
+/// **unbounded** draws: a raw `execute { "command": "g" }` with no breakpoint armed runs until the
+/// target ends, and `raw_command` caps that at `EXEC_WAIT_MS` — a minute. The target's own
+/// lifetime is the shorter clock, and making it the shorter clock is what keeps an unlucky draw
+/// from costing the tier a minute.
+const FUZZ_TARGETS: &[&str] = &["cmd.exe /c exit", "cmd.exe /c ping -n 10 127.0.0.1"];
+
+/// One thing the fuzz can do to a session, named by the **tool** rather than by the command —
+/// which is the whole difference from the example this comes from.
+#[derive(Clone, Copy, Debug)]
+enum FuzzStep {
+    /// The raw hatch: `execute`, which is `Execute` and then `settle` inside the worker. Both
+    /// halves, because the bug they were written for lives in the seam between them.
+    Raw(&'static str),
+    /// A resume with an explicit bound, through `debug_batch`'s `resume` op — the same
+    /// `execute_and_wait` that `go` is built on, with a clock this test picks.
+    Bounded(&'static str),
+    /// The typed steps, which complete on their own next instruction on every architecture.
+    ///
+    /// `go` is deliberately **not** here: its wait is a fixed minute, so every draw of it would
+    /// run to the target's own ending, and what it adds over [`Self::Bounded`] is the argument
+    /// plumbing that
+    /// [`a_target_that_ends_during_a_resume_is_an_ending_and_the_session_says_so`] already pins.
+    Typed(&'static str),
+    /// `run_to_address`, the third wait, at a symbol that may or may not be reached.
+    RunTo(&'static str),
+    /// `continue_async`: the state the example cannot reach at all — a target moving with nobody
+    /// waiting for it, which is the supervisor's state machine rather than the engine's (#83).
+    Async,
+    /// `break_in` on the run in flight, which is the bound named per *job*.
+    BreakIn,
+    /// `wait_for_stop`, short enough to run out on a target that is not going to stop — running
+    /// out is a poll, not a cancellation, and the run has to survive it.
+    WaitStop,
+    /// `interrupt`, which names a *session* rather than a run and can therefore land on whatever
+    /// that session is doing.
+    Interrupt,
+}
+
+/// The corpus.
+///
+/// Deliberately not a grammar over command text — these are the shapes that have produced a state
+/// worth being in. The `Raw` half is dbgscope's, unchanged, because it is the half about the
+/// engine; everything below it is this server's own surface, and is what the example has no way
+/// to reach.
+const FUZZ_CORPUS: &[FuzzStep] = &[
+    FuzzStep::Raw("g"),
+    FuzzStep::Raw("p"),
+    FuzzStep::Raw("t"),
+    // Two resumes in one string: the second meets an engine that is already running, which is
+    // where DbgEng answers 0x8000FFFF and is *right* to.
+    FuzzStep::Raw("g; g"),
+    // Execution reached without a command name saying so — the reason none of the guards reads
+    // the text.
+    FuzzStep::Raw(".if (1) { g }"),
+    FuzzStep::Raw("bp ntdll!NtCreateFile \".echo FUZZ-HIT; g\""),
+    FuzzStep::Raw("bp ntdll!NtCreateFile"),
+    FuzzStep::Raw("bc *"),
+    FuzzStep::Raw("k 3"),
+    FuzzStep::Raw("r"),
+    FuzzStep::Raw("lm"),
+    FuzzStep::Raw(".lastevent"),
+    FuzzStep::Raw("sxe ld:ntdll.dll"),
+    // The four that take the target away, each by a different route: two immediately, one on the
+    // next resume, one by ending the debugger's session.
+    FuzzStep::Raw(".detach"),
+    FuzzStep::Raw(".kill"),
+    FuzzStep::Raw("q"),
+    FuzzStep::Raw("qd"),
+    FuzzStep::Bounded("g"),
+    FuzzStep::Bounded("gu"),
+    FuzzStep::Typed("step_over"),
+    FuzzStep::Typed("step_into"),
+    FuzzStep::RunTo("ntdll!NtCreateFile"),
+    FuzzStep::RunTo("ntdll!NtTerminateProcess"),
+    FuzzStep::Async,
+    FuzzStep::BreakIn,
+    FuzzStep::WaitStop,
+    FuzzStep::Interrupt,
+];
+
+/// What a session's target is doing, read from the outside — the fuzz's oracle.
+///
+/// **Ordered, and the order is load-bearing.** The example this comes from asks every road the
+/// same question and calls any disagreement a violation, which it can do because its two states
+/// are reached only by a step it took itself. Here a third state exists that ends *on its own*: a
+/// run bounded at [`FUZZ_WAIT_MS`] can stop between one road and the next, and a target can go
+/// away while it does. So the rule is that a probe's roads never move **back** down this scale —
+/// `stale_session` and then an answer is the half-dead session #242 is about, while an answer and
+/// then `stale_session` is a program that finished a millisecond ago.
+///
+/// It permits one transition that cannot happen (a stopped target cannot exit unasked, so
+/// `Holding` never becomes `Gone` inside a probe). Keeping the scale total is worth more than
+/// pinning that: the violation this exists to catch is a *decrease*, and no ordering hides one.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Held {
+    /// A run is in flight. Every tool that reads the target is refused, and says which.
+    Moving,
+    /// Stopped, and answering.
+    Holding,
+    /// The handle names nothing this server will run a call against, on every road in. Terminal:
+    /// the round ends here.
+    ///
+    /// **Two paths, one state.** The target *ended* — the program ran to completion, or a command
+    /// released it — or the handle was **retired**, which is what a raw `execute` replacing or
+    /// releasing the target does to the handle naming it. They carry different sentences and the
+    /// same `stale_session`, and a caller holding the handle has the same move either way: release
+    /// it and open again. [`fuzz_road`] has what pinning them apart cost.
+    Gone,
+}
+
+/// A setting the soak run overrides and CI does not.
+fn fuzz_setting(name: &str, default: u64) -> u64 {
+    let Some(raw) = std::env::var_os(name) else {
+        return default;
+    };
+    raw.to_str()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or_else(|| panic!("{name} is set to {raw:?}, which is not a number"))
+}
+
+/// **dbgscope's `examples/session_fuzz.rs`, at this server's surface.**
+///
+/// That example drives randomised sequences straight at a `DebugEngine` and checks, after every
+/// one of them, the single property a session has to keep: it either still holds a target and
+/// answers, or it says it holds none. It was written because the three defects behind
+/// [#242](https://github.com/glslang/windbg-mcp/issues/242) were each found by hand, one sequence
+/// at a time, and none of them is about a *command* — they are about the state the previous
+/// command left the engine in, and the number of ways to reach a given state is larger than
+/// anyone enumerates. An alias, a `.if` branch and `dx …ExecuteCommand("g")` all reach execution
+/// without saying so, which is why the fixes ask the engine rather than reading the text.
+///
+/// **What this adds is everything between that engine and a caller**, which is where this repo's
+/// own near-misses have been:
+///
+/// - **A third state.** `continue_async` leaves a target moving with nobody waiting for it, and
+///   every read is then refused `target_running`. That state machine is the supervisor's (#83),
+///   the example has no way to reach it, and `CLAUDE.md` records three orderings inside it that
+///   shipped wrong once each.
+/// - **The category a refusal carries**, not just that it refused. `engine::engine_error`'s `_`
+///   arm folded "no target left" into `debugger` — the exact failure its own doc comment warns
+///   about — and a caller branching on that is told to change what it asked instead of to release
+///   the session. The engine has one way to say this; the mapping is ours.
+/// - **The supervisor and a sibling.** A wrecked worker must take nothing else down, which is
+///   what process-per-session is for and what no in-process test can state. The bystander session
+///   below is never touched by a step and is asked after every round.
+/// - **`end_session` reclaiming whatever was left** — a target moving, a target gone, an engine
+///   in whatever state a run of `Raw` draws found.
+///
+/// **The seed is fixed and the sequence is therefore one sequence.** A CI test that drew from the
+/// clock would fail on a sequence nobody could reproduce, which is worse than not running. What
+/// runs here is a short deterministic walk over the corpus on three real `dbgeng.dll`s; the fuzz
+/// proper is the soak, and it is the same test:
+///
+/// ```pwsh
+/// $env:WINDBG_MCP_SMOKE_DUMP = "1"
+/// $env:WINDBG_MCP_SMOKE_FUZZ_SEED = "7"
+/// $env:WINDBG_MCP_SMOKE_FUZZ_ROUNDS = "50"; $env:WINDBG_MCP_SMOKE_FUZZ_STEPS = "10"
+/// cargo test --test mcp_smoke -- --nocapture randomised
+/// ```
+///
+/// Run it after touching anything in the wait/settle/guard seam, or in the execution slot. A
+/// failing seed replays exactly, and the panic names it. That soak is the one measured rather
+/// than an illustration: on the x64 bench, 2026-08-31, it walked 173 probes across 50 rounds in
+/// 127s and reached `{Moving: 22, Holding: 104, Gone: 47}` clean.
+///
+/// **The sequence is accumulated rather than printed per step**, which is where this departs from
+/// the example's own advice. There it must print as it goes, because the failure it hunts kills
+/// the process it is running in and the last line on the terminal is the whole report. Here the
+/// process that can die is the *server*, and its death is already a readable panic from
+/// [`Server::await_id`] — so the sequence goes in the message instead, where a captured test run
+/// still shows it.
+#[test]
+fn a_randomised_command_sequence_leaves_the_session_in_one_state_and_the_server_serving() {
+    if !launch_tier() {
+        return;
+    }
+    // **Why this seed.** Its walk reaches all three of [`Held`]'s states, which only one of them
+    // is asserted below — and it does so in about a second, where seed 1's takes twenty. Both
+    // halves are the seed's doing rather than the corpus's: how long a round lasts is decided by
+    // whether it draws an unbounded `g`, which runs the target to its own ending. So a corpus edit
+    // reshuffles the walk and may reshuffle both, and the assertion on `Gone` is what says so
+    // rather than leaving it to whoever notices the runtime.
+    let seed = fuzz_setting("WINDBG_MCP_SMOKE_FUZZ_SEED", 2);
+    let rounds = fuzz_setting("WINDBG_MCP_SMOKE_FUZZ_ROUNDS", 3);
+    let steps = fuzz_setting("WINDBG_MCP_SMOKE_FUZZ_STEPS", 6);
+    let replay = format!(
+        "replay with WINDBG_MCP_SMOKE_FUZZ_SEED={seed} \
+         WINDBG_MCP_SMOKE_FUZZ_ROUNDS={rounds} WINDBG_MCP_SMOKE_FUZZ_STEPS={steps}"
+    );
+
+    let mut server = Server::started();
+    // The bystander, opened before anything is fuzzed and never named by a step. What it is for is
+    // the claim no engine-level test can make: one worker driven into any state at all leaves the
+    // supervisor serving, and leaves the *other* worker holding its own target.
+    let bystander = server.open_session(
+        "launch",
+        json!({ "command_line": LONG_LIVE_TARGET }),
+        TARGET_STEP,
+    );
+
+    let mut rng = Rng::new(seed);
+    let mut reached: BTreeMap<Held, u32> = BTreeMap::new();
+    for round in 1..=rounds {
+        let target = FUZZ_TARGETS[rng.below(FUZZ_TARGETS.len() as u64) as usize];
+        let session = server.open_session("launch", json!({ "command_line": target }), TARGET_STEP);
+        let mut sequence = vec![format!("launch {target}")];
+        let mut execution: Option<String> = None;
+
+        for _ in 0..steps {
+            let step = FUZZ_CORPUS[rng.below(FUZZ_CORPUS.len() as u64) as usize];
+            sequence.push(fuzz_step(&mut server, &session, step, &mut execution));
+            let held = fuzz_probe(&mut server, &session, round, &sequence, &replay);
+            *reached.entry(held).or_default() += 1;
+            if held == Held::Gone {
+                break;
+            }
+        }
+
+        // Whatever the sequence left — a target moving, a target gone, an engine any number of raw
+        // commands into a state nobody named — the session is reclaimable. `released` rather than
+        // the call succeeding: a teardown that killed the worker also "succeeds", and the
+        // difference between the two is a live kernel left halted.
+        fuzz_reclaim(&mut server, &session, round, &sequence, &replay);
+
+        // And the session that was never fuzzed still holds its own target.
+        let sibling = server.call_tool(
+            "registers",
+            json!({ "session_id": &bystander, "filter": "pc" }),
+            TARGET_STEP,
+        );
+        assert!(
+            !is_tool_error(&sibling),
+            "round {round} took the bystander session down with it after {}\n{replay}\n{}",
+            sequence.join(" -> "),
+            text_of(&sibling["result"])
+        );
+    }
+
+    server.call_tool(
+        "end_session",
+        json!({ "session_id": &bystander }),
+        TARGET_STEP,
+    );
+
+    // **Which states this walk actually reached**, and the assertion is the point rather than the
+    // print. Every check above is of the form "if the session is in state X it must say so", so a
+    // run that never left [`Held::Holding`] passes without having asked the question the fuzz
+    // exists for — the guard that refuses a session with no target is reached only by a draw that
+    // takes the target away. That is the same vacuity `ran` and `SKIPPED` are for, one level in:
+    // libtest cannot tell a walk that exercised the guard from one that never met it.
+    //
+    // Deterministic, because the seed is: a corpus edited until this seed no longer takes a target
+    // away fails here rather than quietly covering less. `Moving` is **not** asserted — it needs a
+    // `continue_async` draw whose run is still going one probe later, which is a race this test
+    // must not be the judge of, and the async surface has three tests of its own.
+    assert!(
+        reached.contains_key(&Held::Gone),
+        "no round reached a target that was gone, so nothing checked the refusal every road has \
+         to give — the corpus or the seed has drifted. States reached: {reached:?}\n{replay}"
+    );
+    ran(&format!(
+        "the session fuzz ({rounds} rounds, seed {seed}); states reached: {reached:?}"
+    ));
+}
+
+/// Releases the round's session, whatever the sequence left it in, and asserts it was **this**
+/// session that went.
+///
+/// **The by-handle call is not always enough, and finding that out is the first thing this fuzz
+/// did.** A raw `execute` that releases or replaces the target — `qd`, `q`, `.detach`, `.kill`,
+/// `.opendump` — *retires* the handle: `SessionState::Retired` refuses every call that supplies
+/// it while the worker stays live, so a call that named the session is refused and one that names
+/// none still reaches it (`a_retired_handle_is_refused_but_still_the_default_target`). That is by
+/// design and `end_session` is not exempt from it, so the recovery is the one the refusal names —
+/// omit the handle.
+///
+/// **Which is where a defect lives, measured on the release build 2026-08-31 and left alone here
+/// because a test is the wrong place to fix it** (`FOLLOWUPS.md` item 55). Two things do not line
+/// up. The `execute` that retires the handle appends "`end_session` releases it", and
+/// `end_session` with that handle is then refused — the server contradicting its own instruction.
+/// And "omit `session_id`" routes to the *current* session, which is the newest live one: with a
+/// newer session open, the retired one cannot be released by its owner at all. Measured with two
+/// launches, the older retired by `qd` — `end_session` by handle refused, the retired session
+/// reported `live: true, current: false` holding its own engine pid, and the newer one was what
+/// an un-handled `end_session` would have taken. It comes back only when everything newer has
+/// gone, or on a disconnect or a lease expiry. Until then it holds one of the four slots and a
+/// live target.
+///
+/// So this asserts what the server *does* guarantee — the session goes, by one road or the other,
+/// and the one that went is the one named — rather than the stronger claim the note in `execute`'s
+/// own output makes. If item 55 is taken, the fallback branch is what should stop being needed.
+fn fuzz_reclaim(server: &mut Server, session: &str, round: u64, sequence: &[String], replay: &str) {
+    let context = || format!("{}\n{replay}", sequence.join(" -> "));
+
+    let ended = server.call_tool("end_session", json!({ "session_id": session }), TARGET_STEP);
+    let report = &ended["result"]["structuredContent"];
+    if report["released"] == json!(true) {
+        return;
+    }
+    assert_eq!(
+        report["error"]["category"],
+        json!("stale_session"),
+        "round {round}: `end_session` neither released the session nor refused it as a handle \
+         that no longer names one, after {}\n{}",
+        context(),
+        text_of(&ended["result"])
+    );
+
+    // The retirement's own documented route. Guarded rather than trusted: it routes by *current*,
+    // so a version of this test where the round's session is not the newest would silently end
+    // the bystander instead and the assertion below is what would say so.
+    let anyway = server.call_tool("end_session", json!({}), TARGET_STEP);
+    let report = &anyway["result"]["structuredContent"];
+    assert_eq!(
+        report["released"],
+        json!(true),
+        "round {round}: the handle was retired and the route its refusal names did not release \
+         anything either, so the worker is stranded, after {}\n{}",
+        context(),
+        text_of(&anyway["result"])
+    );
+    assert_eq!(
+        report["session_id"],
+        json!(session),
+        "round {round}: releasing without a handle took a different session than the one this \
+         round opened, after {}\n{report}",
+        context()
+    );
+}
+
+/// Runs one step, and hands back how to describe it in a failure message.
+///
+/// Every result is discarded on purpose: a call failing is not a violation. `bp` on an
+/// unresolvable symbol, a `g` refused because the engine is already running, a `break_in` for a
+/// run that has finished and a `run_to_address` that never arrives are all ordinary. What is
+/// checked is the state left behind, by [`fuzz_probe`].
+fn fuzz_step(
+    server: &mut Server,
+    session: &str,
+    step: FuzzStep,
+    execution: &mut Option<String>,
+) -> String {
+    match step {
+        FuzzStep::Raw(command) => {
+            server.call_tool(
+                "execute",
+                json!({ "session_id": session, "command": command }),
+                TARGET_STEP,
+            );
+            format!("execute `{command}`")
+        }
+        FuzzStep::Bounded(command) => {
+            server.call_tool(
+                "debug_batch",
+                json!({
+                    "session_id": session,
+                    "steps": [{ "op": "resume", "command": command, "timeout_ms": FUZZ_WAIT_MS }],
+                    "timeout_ms": 20000,
+                }),
+                TARGET_STEP,
+            );
+            format!("batch resume `{command}`")
+        }
+        FuzzStep::Typed(tool) => {
+            server.call_tool(tool, json!({ "session_id": session }), TARGET_STEP);
+            tool.to_string()
+        }
+        FuzzStep::RunTo(symbol) => {
+            server.call_tool(
+                "run_to_address",
+                json!({
+                    "session_id": session,
+                    "address": symbol,
+                    "timeout_ms": FUZZ_WAIT_MS,
+                }),
+                TARGET_STEP,
+            );
+            format!("run_to_address {symbol}")
+        }
+        FuzzStep::Async => {
+            let started = server.call_tool(
+                "continue_async",
+                json!({ "session_id": session, "max_run_ms": FUZZ_WAIT_MS }),
+                TARGET_STEP,
+            );
+            // Kept only when one was minted. A refused `continue_async` — the slot is taken, the
+            // target is gone — must not overwrite the handle a later `break_in` is for, and a
+            // handle for a run that has since been *replaced* is exactly what `break_in`'s
+            // `Stale` answer is about, so an old one is worth keeping.
+            if let Some(handle) = started["result"]["structuredContent"]["execution"].as_str() {
+                *execution = Some(handle.to_string());
+            }
+            "continue_async".to_string()
+        }
+        FuzzStep::BreakIn | FuzzStep::WaitStop => {
+            let Some(handle) = execution.clone() else {
+                return format!("{step:?} (no run to name)");
+            };
+            let (tool, args) = if matches!(step, FuzzStep::BreakIn) {
+                (
+                    "break_in",
+                    json!({ "session_id": session, "execution": &handle }),
+                )
+            } else {
+                (
+                    "wait_for_stop",
+                    json!({
+                        "session_id": session,
+                        "execution": &handle,
+                        "timeout_ms": FUZZ_WAIT_MS,
+                    }),
+                )
+            };
+            server.call_tool(tool, args, TARGET_STEP);
+            format!("{tool} {handle}")
+        }
+        FuzzStep::Interrupt => {
+            server.call_tool("interrupt", json!({ "session_id": session }), TARGET_STEP);
+            "interrupt".to_string()
+        }
+    }
+}
+
+/// The invariant, asked of the session after every step.
+fn fuzz_probe(
+    server: &mut Server,
+    session: &str,
+    round: u64,
+    sequence: &[String],
+    replay: &str,
+) -> Held {
+    let violation = |what: &str| -> String {
+        format!(
+            "round {round}: {what}\n  sequence: {}\n  {replay}",
+            sequence.join(" -> ")
+        )
+    };
+
+    // Two roads that fail by different routes — `registers` through the engine's own interfaces,
+    // `execute` through `Execute` — because before #242 each said something different about one
+    // fact. `.echo` rather than `k`, since a target can legitimately be somewhere with no stack
+    // to walk while the session is perfectly healthy.
+    let mut held = Held::Moving;
+    for (tool, args) in [
+        (
+            "registers",
+            json!({ "session_id": session, "filter": "pc" }),
+        ),
+        (
+            "execute",
+            json!({ "session_id": session, "command": ".echo alive" }),
+        ),
+    ] {
+        let (road, why) = fuzz_road(server, tool, args);
+        let Some(road) = road else {
+            panic!("{}", violation(&why));
+        };
+        assert!(
+            road >= held,
+            "{}",
+            violation(&format!(
+                "`{tool}` said {road:?} after an earlier road said {held:?}, which is a session \
+                 answering on one road and refusing on another"
+            ))
+        );
+        held = road;
+    }
+    if held != Held::Gone {
+        return held;
+    }
+
+    // Gone, so every road in has to give the same answer — this is the half-dead session itself,
+    // and one road that still answers is the whole of it. Two more, and the reason they are only
+    // asked here is that a *healthy* session may refuse them for its own reasons.
+    for (tool, args) in [
+        ("backtrace", json!({ "session_id": session })),
+        (
+            "execute",
+            json!({ "session_id": session, "command": "k 3" }),
+        ),
+    ] {
+        let (road, why) = fuzz_road(server, tool, args);
+        assert_eq!(
+            road,
+            Some(Held::Gone),
+            "{}",
+            violation(&format!(
+                "the target is gone and `{tool}` did not say so: {why}"
+            ))
+        );
+    }
+    Held::Gone
+}
+
+/// One road into the session, and what it says the target is doing.
+///
+/// `None` is a violation rather than a state, and the second half of the pair says why — a
+/// category no session state explains. That is not hypothetical tidiness: the refusal for a target
+/// that has gone shipped as `debugger`, which tells a caller to change what it asked rather than
+/// to release the session, and only an assertion on the **category** could see it.
+///
+/// Not [`Server::tool_data`] or [`Server::tool_failure`]: each asserts an outcome, and which
+/// outcome is right here is precisely the question.
+fn fuzz_road(server: &mut Server, tool: &str, args: Value) -> (Option<Held>, String) {
+    let response = server.call_tool(tool, args, TARGET_STEP);
+    assert_no_error(&response, &format!("tools/call {tool}"));
+    let rendered = text_of(&response["result"]);
+    if !is_tool_error(&response) {
+        return (Some(Held::Holding), rendered);
+    }
+    let error = &response["result"]["structuredContent"]["error"];
+    match error["category"].as_str() {
+        Some("target_running") => (Some(Held::Moving), rendered),
+        Some("stale_session") => {
+            // The text half has to carry the refusal too, because a client that drops
+            // `structuredContent` sees only `isError` and this string — an empty one is a call
+            // that failed and said nothing.
+            //
+            // **Its wording is deliberately not pinned here, and the first draft pinned it.** It
+            // asserted #242's sentence, "no target left", which is what a target that *ended*
+            // gets — and the fuzz immediately drew `execute { "command": "qd" }`, which reaches
+            // the same terminal answer down the other road this server has: the raw hatch
+            // released the target, so the **handle is retired** and the refusal says so instead.
+            // Both are right, both are `stale_session`, and from a caller holding the handle they
+            // are one state with one next move. Which sentence belongs to which path is a
+            // targeted test's claim (see the ending tests above); a fuzz that pins prose across
+            // paths it did not enumerate is pinning renderings rather than contracts, and would
+            // fail on the next correct way to lose a target.
+            if rendered.trim().is_empty() {
+                (
+                    None,
+                    format!("`{tool}` refused with an empty message: {response}"),
+                )
+            } else {
+                (Some(Held::Gone), rendered)
+            }
+        }
+        other => (
+            None,
+            format!(
+                "`{tool}` failed with category {other:?}, which no session state explains: \
+                 {rendered}"
+            ),
+        ),
+    }
+}
+
+/// xorshift64*, so a seed replays a run and no dependency is added for it.
+///
+/// Randomness quality is beside the point: what the seed buys is a failing sequence someone else
+/// can reproduce, which a `HashMap`-ordering-style "random" would not.
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Self {
+        Self(seed | 1)
+    }
+
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+
+    fn below(&mut self, bound: u64) -> u64 {
+        self.next() % bound.max(1)
+    }
 }
 
 /// The same gate for a test that reads a **target's memory** rather than the structure of the dump

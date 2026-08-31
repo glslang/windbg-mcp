@@ -212,7 +212,7 @@ It checks *same-file* fragments only, so a cross-file `../README.md#some-heading
 verify by hand.
 
 **The pass count does not say which tiers ran.** Each gate is inside its test, so the `mcp_smoke`
-harness reports the same **94 passed** with the debugger tier off as with it on — that harness's own
+harness reports the same **95 passed** with the debugger tier off as with it on — that harness's own
 result line, since a plain `cargo test` runs the crate's several hundred unit tests beside it and
 prints a result line per binary. What differs between the two runs is the runtime (measured on the
 ARM64 bench 2026-08-23: **1.6s against 61s** for `cargo test --test mcp_smoke`) and the `SKIPPED`
@@ -221,9 +221,9 @@ debugger claim. The count moves whenever a test is added — it was 69 until #19
 until item 37, 79 until the TTD tier, 84 until item 50's version-resource test, 85 until
 item 48's two endings, 87 until item 49's live 32-bit target, 88 until item 51's
 attach teardown, 89 until the 32-bit worker's version resource, 90 until #66's symbol-path default,
-91 until #83's two asynchronous-execution tests and 93 until #85's module-inventory refresh — and
-it said 83 while it was 84, and 90 while it was 91, which is the usual state of it, so re-derive it
-rather than trusting this sentence.
+91 until #83's two asynchronous-execution tests, 93 until #85's module-inventory refresh and 94
+until the session fuzz — and it said 83 while it was 84, 90 while it was 91, and 93 while it was
+94, which is the usual state of it, so re-derive it rather than trusting this sentence.
 
 **And a gate can be a *directory beside the exe*, which prints no `SKIPPED` line at all.** The
 debugger tier's `!analyze` assertions are inside `if analysis["ran"] == true`, and `ran` is false
@@ -744,6 +744,24 @@ Two consequences worth carrying:
 was already on the bounded wait; a dump cannot `go`, and no tier launched a process. The debugger
 tier now does (`launch_tier`, two tests in `tests/mcp_smoke.rs`). The one target type still
 unmeasured on this path is **TTD replay** — `FOLLOWUPS.md` item 47.
+
+**And after touching anything in this seam, run the fuzz** —
+`a_randomised_command_sequence_leaves_the_session_in_one_state_and_the_server_serving`, which is
+dbgscope's `examples/session_fuzz.rs` brought up to this server's surface. Every defect above was
+found by hand, one sequence at a time, and none of them is about a *command*: they are about the
+state the previous one left behind, and the number of ways to reach a given state is larger than
+anyone enumerates. It rides the debugger tier on a fixed seed, so CI walks one short deterministic
+sequence on three real `dbgeng.dll`s; the fuzz proper is a soak of the same test, and
+`docs/smoke-test.md` has the command and what the oracle does and does not assert. Two things to
+know before editing it. **The oracle is a scale rather than an agreement** — a bounded run can stop
+between one road and the next, so what is forbidden is a road moving *back* down
+`Moving → Holding → Gone`, not two roads differing. And a walk that never leaves `Holding` asks
+nothing, which is why the run prints the states it reached and asserts it reached `Gone`; a corpus
+edit reshuffles the walk, so read that line rather than the green tick.
+
+It has already paid for itself: the second seed it ran under found that a handle the raw hatch has
+retired cannot release its own session, while the `execute` that retires it says `end_session` will
+(`FOLLOWUPS.md` item 55).
 
 **Its blocker moved rather than lifted, and which host it is about is the whole of the distinction.**
 Item 47 defers on "replay does not work on this host at all", and the sentence before it names the
