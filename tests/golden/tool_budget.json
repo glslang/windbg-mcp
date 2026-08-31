@@ -384,8 +384,8 @@
       "inputSchema": 467,
       "modelVisible": 852,
       "name": "set_breakpoint",
-      "outputSchema": 2295,
-      "wire": 3293
+      "outputSchema": 2342,
+      "wire": 3340
     },
     {
       "annotations": 123,
@@ -493,10 +493,10 @@
     "inputSchema": 43816,
     "instructions": 1983,
     "modelVisible": 75547,
-    "outputSchema": 112727,
-    "payload": 195543,
+    "outputSchema": 112774,
+    "payload": 195590,
     "tools": 54,
-    "wire": 195422,
+    "wire": 195469,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }

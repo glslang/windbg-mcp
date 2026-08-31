@@ -1071,6 +1071,22 @@ pub struct BreakpointSet {
     /// Why the listing is missing or incomplete, when it is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub listing_error: Option<String>,
+    /// Whether the `bp` itself was **cut short** — the watchdog broke the engine in before the
+    /// command finished, because resolving the expression outran this call's budget.
+    ///
+    /// The one case where [`Self::added`] being empty is not the same fact it usually is. Normally
+    /// an empty `added` with `listed` true means `bp` ran and matched nothing; here it means the
+    /// command never got to the end, so nothing was added *yet* and the expression is simply
+    /// unset. The listing is still a real read taken afterwards, so `added` still says which of
+    /// the two happened: non-empty is a breakpoint that landed despite the interruption and must
+    /// **not** be re-requested, empty is one that did not and can be.
+    ///
+    /// A success rather than an error, for [`Self::listed`]'s reason turned around: `bp` is not
+    /// idempotent, and an error is the shape that gets retried.
+    ///
+    /// Defaulted so a record written before this field existed still reads.
+    #[serde(default)]
+    pub timed_out: bool,
 }
 
 /// One breakpoint the session holds.
