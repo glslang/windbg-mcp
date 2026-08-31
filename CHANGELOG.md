@@ -39,7 +39,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   un-handled `end_session` reaches it and the defect is invisible — which is why no
   single-session test had ever seen it.
 
+### Changed
+
+- **Every raw command this server runs is now bounded, except `index_trace`** (`FOLLOWUPS.md`
+  item 14). `threads`, `goto_position`, `driver_object`, `device_object`, `irp_stack` and
+  `ioctl_trace` moved from `EngineOp::Command` to `EngineOp::BoundedCommand`, so a command that
+  runs away — `!drvobj` against a live kernel whose symbols are being fetched one frame at a time,
+  a `!tt` seek into a trace with no index — now Ctrl+Breaks itself ahead of the caller's timeout
+  and answers with the output it had, instead of holding its session's engine until it finishes.
+
+  The split those six were on the other side of was decided on cost, not on principle: dbgscope's
+  watchdog polled a `done` flag on a 200ms sleep, so the join waited out the rest of the nap and
+  arming one rounded a command up to `ceil(d / 200ms) * 200ms` — a 30ms `k` became a 200ms `k`, and
+  a session issues those by the dozen. That was worth a stated criterion and a list either side of
+  it. It is not worth anything now: the `Watchdog` in the pinned revision parks on a `Condvar`, so
+  the disarm is immediate and the bound costs nothing until it is reached. Re-measured through the
+  tool surface before deciding, twice (x64 bench, sample dump, 20 rounds): a bounded `lm` medians
+  3.0ms and 3.3ms against the unbounded `modules` beside it at 4.1ms and 4.2ms, and a ~170ms `.for`
+  loop costs ~171ms and ~185ms rather than 200ms. The old second mode — where `lm` raced the
+  watchdog's first poll and landed on either ~0.3ms or ~200.7ms run to run — did not appear.
+
+  It arrived through the [#226](https://github.com/glslang/windbg-mcp/issues/226) work rather than
+  through anything aimed at this entry: the sleep was what made a *finite* `WaitForEvent` look
+  attractive, so fixing that defect retired this trade-off as a side effect and nothing here was
+  revisited when it landed.
+
+  `index_trace` stays out, and is now the only thing that is. `!ttdext.index -force` deletes an
+  unloadable `.idx` before rebuilding it, so a break part-way through can leave a trace with no
+  usable index at all — the one case where the abort is worse than the wedge, and one whose long
+  run is productive work that frees the session when it finishes. What was the general "raw
+  command" op is renamed **`EngineOp::UnboundedCommand`** to say so at the call site, and
+  `server::tests::only_index_trace_runs_a_command_unbounded` holds it to its single caller by
+  reading the source — because the way a collapsed split comes back is a tool added by copy-paste
+  taking the unbounded path with nobody deciding to, and that tool works perfectly until the day
+  its command runs away.
+
 ### Added
+
+- **`arming_the_watchdog_does_not_round_a_quick_command_up`**, in the debugger tier, guarding the
+  assumption the rule above now rests on. The measurement it was extracted from
+  (`measure_what_the_bounded_path_costs_a_quick_command`) is `#[ignore]`d, so it went on passing
+  across the very change it exists to catch — the quantization it describes had been gone for six
+  days. This one runs in the ordinary tier and asserts a **shape rather than a magnitude**: a
+  bounded `lm` against the unbounded `modules` beside it, plus half a quantum of margin, so a host
+  thirty times slower moves both numbers together and still passes while a watchdog that quantizes
+  moves only one, by more than the whole margin. The measurement keeps the numbers and its comment
+  now records them.
 
 - **A session fuzz in the debugger tier** — dbgscope's `examples/session_fuzz.rs` brought up to
   this server's surface. That example drives randomised command sequences straight at a
@@ -97,14 +142,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   built and the reopening condition is the content, and one that **half** landed (50), whose entry
   narrows to the half that is left rather than splitting across two files.
 
-- **Item 14's dbgscope half has landed and the entry did not know it.** dbgscope's `Watchdog` parks
-  on a `Condvar` in the pinned revision, so arming a bound is free — which arrived through the
-  [#226](https://github.com/glslang/windbg-mcp/issues/226) work, where the 200ms sleep was what made
-  a finite `WaitForEvent` look attractive. The consequence it was filed for is still open on this
-  side: `EngineOp::Command` remains the unbounded path for the cheap point queries, `DECISIONS.md`'s
-  own revisit trigger for that split has now fired, and the measurement behind it
-  (`measure_what_the_bounded_path_costs_a_quick_command`) still describes the sleep — it prints
-  rather than asserts, so it went on passing across the change it exists to catch.
+- **`DECISIONS.md`'s bounded-command entry (2026-08-02) is superseded by its own revisit trigger**,
+  and says so above the criterion rather than only in its Status line. The criterion stays as the
+  record of what the tax bought while it stood; `FOLLOWUPS.md` item 14 moves to `DONE.md`. Two
+  boundaries the entry now states explicitly, because both have been mistaken for the split before:
+  the typed ops carry no `patience_ms` because there is no *command* for a watchdog to break, and
+  `reachable_from_dispatch` is a job-level deadline and still item 13.
 
 ## [0.14.0] - 2026-08-30
 

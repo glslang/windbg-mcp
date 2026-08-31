@@ -812,9 +812,29 @@ the design this replaced.
 
 > **Since:** process-per-session (above, same day) moved the pieces this entry names. The bounded
 > path is now `EngineOp::BoundedCommand`, the budget arithmetic lives in `src/worker.rs`, and the
-> measurement test moved to `tests/mcp_smoke.rs`'s bounded-command tier. The coverage rule below is
-> unchanged and still the rule; what changed is that a runaway command now pins one session rather
-> than the server.
+> measurement test moved to `tests/mcp_smoke.rs`'s bounded-command tier. What changed there is that
+> a runaway command now pins one session rather than the server.
+>
+> **And since 2026-08-31 the split below is gone**, on the trigger the Status line named: dbgscope's
+> `Watchdog` parks on a `Condvar` instead of napping on a `done` flag, so arming one is free and the
+> quantization the whole criterion traded against no longer exists. Re-measured through the tool
+> surface on the x64 bench (sample dump, 20 rounds, twice): a **bounded** `lm` medians 3.0ms and
+> 3.3ms against the unbounded `modules` beside it at 4.1ms and 4.2ms, and a ~170ms `.for` loop costs
+> ~171ms and ~185ms rather than 200ms. Neither run showed the second mode the old table records.
+> **The rule is now "bound every raw command except `index_trace`"** — `threads`, `goto_position`,
+> `driver_object`, `device_object`, `irp_stack` and `ioctl_trace` moved onto
+> `EngineOp::BoundedCommand`, and what is left of the unbounded op is renamed
+> `EngineOp::UnboundedCommand` and held to its single caller by
+> `server::tests::only_index_trace_runs_a_command_unbounded`. The criterion below is kept as the
+> record of what the tax bought while it stood, not as a rule to apply.
+>
+> Two things the collapse does **not** reach, both because a watchdog Ctrl+Breaks a *command*.
+> The typed ops — `modules`, `backtrace`, `disassemble`, `registers`, `read_memory` — are direct
+> engine calls with no command behind them, so nothing can cut one short and none of them carries
+> a `patience_ms`; the walks (`Pool`, `Heap`, `Walk`) and `crash_triage` already bound themselves
+> between nodes on the caller's clock. And `reachable_from_dispatch` still issues many `uf`
+> commands inside one job, which is a job-level deadline rather than a command-level one — still
+> FOLLOWUPS.md item 13, unchanged by this.
 
 **Context.** `EngineHandle::run_command` (`src/engine.rs`) runs a raw command under dbgscope's
 `execute_command_bounded`, whose watchdog `SetInterrupt`s the engine before the caller's timeout so
@@ -870,9 +890,17 @@ caller-controlled unbounded runtime, so by the criterion it should be bounded �
 bounds a single command string and cannot help a multi-command job. It needs a job-level deadline
 instead; see FOLLOWUPS.md item 13.
 
-**Status:** accepted. Revisit if dbgscope's watchdog stops quantizing to 200ms (parking on a condvar
-instead of polling a sleep would make it ~free), at which point "bound everything except
-`index_trace`" becomes the cheaper and simpler rule — FOLLOWUPS.md item 14.
+**Status:** superseded 2026-08-31, by its own revisit trigger — which read "revisit if dbgscope's
+watchdog stops quantizing to 200ms (parking on a condvar instead of polling a sleep would make it
+~free), at which point 'bound everything except `index_trace`' becomes the cheaper and simpler
+rule". It stopped, through the [#226](https://github.com/glslang/windbg-mcp/issues/226) work rather
+than through anything aimed at this, and the rule is now that one. See the *Since* note above; the
+close is FOLLOWUPS.md item 14, in `DONE.md`.
+
+A trigger written into a Status line is only as good as somebody re-reading it: this one fired on
+2026-08-25 and was noticed on 2026-08-31, because the change that fired it was in the other repo and
+was about a *different* defect. What made it findable at all was that the condition was stated as a
+measurable fact about a named mechanism rather than as "revisit if this gets cheaper".
 
 ---
 

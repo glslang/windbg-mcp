@@ -212,7 +212,7 @@ It checks *same-file* fragments only, so a cross-file `../README.md#some-heading
 verify by hand.
 
 **The pass count does not say which tiers ran.** Each gate is inside its test, so the `mcp_smoke`
-harness reports the same **96 passed** with the debugger tier off as with it on — that harness's own
+harness reports the same **97 passed** with the debugger tier off as with it on — that harness's own
 result line, since a plain `cargo test` runs the crate's several hundred unit tests beside it and
 prints a result line per binary. What differs between the two runs is the runtime (measured on the
 ARM64 bench 2026-08-23: **1.6s against 61s** for `cargo test --test mcp_smoke`) and the `SKIPPED`
@@ -222,7 +222,8 @@ until item 37, 79 until the TTD tier, 84 until item 50's version-resource test, 
 item 48's two endings, 87 until item 49's live 32-bit target, 88 until item 51's
 attach teardown, 89 until the 32-bit worker's version resource, 90 until #66's symbol-path default,
 91 until #83's two asynchronous-execution tests, 93 until #85's module-inventory refresh, 94 until
-the session fuzz and 95 until item 55's retired-handle teardown — and it said 83 while it was 84,
+the session fuzz, 95 until item 55's retired-handle teardown and 96 until item 14's watchdog-cost
+guard — and it said 83 while it was 84,
 90 while it was 91, and 93 while it was 94, which is the usual state of it, so re-derive it rather
 than trusting this sentence.
 

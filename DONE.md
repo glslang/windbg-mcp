@@ -33,7 +33,11 @@ reordering it proposed would have picked the wrong architecture by another route
 `interrupt` tool) is what item 8 rests on: what it built is the job binding, and what it deliberately
 did not build is the queued-job half that only `tasks/cancel` can ask for. **Item 12** (2026-08-02)
 is here because what validating it *disproved* outlives what it confirmed: a kernel attach whose
-target never dials in has no bound at all, which is the constraint item 10 contains. **Item 42**
+target never dials in has no bound at all, which is the constraint item 10 contains. **Item 14**
+(2026-08-31) is the one nobody built: what it asked for landed upstream six days earlier as a side
+effect of an unrelated fix, and closing it here meant re-reading a `DECISIONS.md` Status line whose
+revisit trigger had already fired. It is worth reading for what that cost — the measurement
+justifying the decision was `#[ignore]`d, so it went on passing while its own subject disappeared. **Item 42**
 (2026-08-24) is here because what it built is the capability to repeat a cell and what it
 deliberately did *not* run is the A/B that motivated it — plus one of its own sentences turned out
 to be false on this bench, which the entry now records. **Item 44** (2026-08-25)
@@ -59,6 +63,7 @@ probes for that fact which look correct and are not, one of which passed with th
 - [Item 7](#7-dbgscope--windbg-mcp-on-demand-engine-interrupt--done-2026-08-10) — [dbgscope + windbg-mcp] On-demand engine interrupt — done (2026-08-10)
 - [Item 10](#10-windbg-mcp-process-per-session--done-2026-08-02-issue-61) — [windbg-mcp] Process-per-session — done (2026-08-02, issue #61)
 - [Item 12](#12-dbgscope-validate-the-opener-split-against-a-live-kdnet-target--done-2026-08-02) — [dbgscope] Validate the opener split against a live KDNET target — done (2026-08-02)
+- [Item 14](#14-dbgscope-make-arming-the-bounded-watchdog-free--done-2026-08-25-upstream-2026-08-31-here) — [dbgscope] Make arming the bounded watchdog ~free — done (2026-08-25 upstream, 2026-08-31 here)
 - [Item 16](#16-windbg-mcp-exercise-a-mutating-debug_batch-against-a-live-kernel-target--done) — [windbg-mcp] Exercise a *mutating* `debug_batch` against a live kernel target — done
 - [Item 17](#17-windbg-mcp-let-a-debug_batch-step-call-a-typed-tool-starting-with-the-pool-queries--done) — [windbg-mcp] Let a `debug_batch` step call a typed tool, starting with the pool queries — done
 - [Item 18](#18-windbg-mcp-let-a-running-batch-finish-its-rollback-when-the-client-disconnects--done) — [windbg-mcp] Let a running batch finish its rollback when the client disconnects — done
@@ -264,6 +269,62 @@ next caller does not have to measure it again.
 
 - **Tracked as:** [glslang/dbgscope#73](https://github.com/glslang/dbgscope/issues/73) — closed
   2026-08-14.
+
+## 14. [dbgscope] Make arming the bounded watchdog ~free — **done** (2026-08-25 upstream, 2026-08-31 here)
+
+Filed against dbgscope: `execute_command_bounded` spawned a watchdog thread that polled a `done`
+flag on a `thread::sleep(200ms)` loop and joined it once `Execute` returned, so the join waited out
+the remainder of the nap and a bounded command took `ceil(d / 200ms) * 200ms`. Measured then: a
+127ms command took 201ms, a 377ms one 401ms, and a 0.2ms `lm` took either ~0.3ms or ~200.7ms
+depending on whether it beat the watchdog thread's first poll. Parking on a condvar would drop that
+to ~0, and the point of doing so was never the milliseconds — it was that the tax was the **only**
+reason windbg-mcp's cheap point queries stayed off the bounded path (`DECISIONS.md`, 2026-08-02).
+
+**The dbgscope half landed on its own, through work aimed at something else.** `Watchdog` parks on
+a `Condvar` in the pinned revision, so a disarm is immediate and a bound costs nothing until it is
+actually reached. It arrived through [#226](https://github.com/glslang/windbg-mcp/issues/226) — the
+sleep was what made a *finite* `WaitForEvent` look attractive, and that finite wait was destroying
+sessions — so nobody was looking at this item when the thing it asked for shipped.
+
+**What closed it here was reading a Status line, not writing code.** The 2026-08-02 decision ended
+"revisit if dbgscope's watchdog stops quantizing to 200ms … at which point 'bound everything except
+`index_trace`' becomes the cheaper and simpler rule". That is the whole close: the trigger had
+fired six days earlier and the rule was already the cheaper one. `threads`, `goto_position`,
+`driver_object`, `device_object`, `irp_stack` and `ioctl_trace` moved to
+`EngineOp::BoundedCommand`; `index_trace` keeps the unbounded path, now named
+`EngineOp::UnboundedCommand`, because `!ttdext.index -force` deletes an unloadable `.idx` before
+rebuilding it and a break part-way through can leave a trace with no index at all.
+
+Four things this turned up that the entry could not have said:
+
+- **The measurement had to be re-taken, and it was worth insisting on.** The old table's numbers
+  were the in-process engine's, and the current test compares a *typed* `modules` against a
+  bounded `execute` rather than one command on two paths — so "the tax is gone" was a claim about
+  a program nobody had run. Re-run twice on the x64 bench (sample dump, 20 rounds): bounded `lm`
+  medians 3.0ms and 3.3ms against 4.1ms and 4.2ms for the unbounded `modules` beside it, and the
+  ~170ms `.for` loop costs ~171ms and ~185ms rather than 200ms. The second mode — `lm` racing the
+  first poll and landing on ~0.3ms or ~200.7ms run to run — did not appear in either run.
+- **The measurement went on passing across the change it exists to catch**, because it prints and
+  is `#[ignore]`d. Its comment still described the sleep six days after the sleep was gone. The
+  numbers stay a print — they are dbgscope's and this host's, and a threshold pinned here would
+  fail on an unrelated host difference — but the *shape* is now asserted in the ordinary tier by
+  `arming_the_watchdog_does_not_round_a_quick_command_up`: a bounded `lm` against the unbounded
+  `modules` beside it plus half a quantum of margin, so a slower host moves both numbers and a
+  quantizing watchdog moves one.
+- **Collapsing a split needs the thing that stops it re-forming.** The rule is a sentence in two
+  markdown files, and the way it comes back is a tool added by copy-paste taking the unbounded op
+  with nobody deciding to — which no runtime test can see, because that tool works perfectly until
+  the day its command runs away. Hence the rename and
+  `server::tests::only_index_trace_runs_a_command_unbounded`, which reads the source the way
+  `record`'s stdout rule does. Verified by breaking it: routing `threads` back reports
+  `["threads", "index_trace"]`.
+- **"Bound everything" is a rule about *commands*, and the entry's phrasing hid that.** A watchdog
+  Ctrl+Breaks an `Execute`; the typed ops — `modules`, `backtrace`, `disassemble`, `registers`,
+  `read_memory` — are direct engine calls with nothing for it to break, which is why none of them
+  carries a `patience_ms` and why a frame whose symbol has to be fetched can still block inside
+  one. The walks and `crash_triage` bound themselves between nodes instead. And
+  `reachable_from_dispatch` is still unbounded in aggregate: it issues many `uf` commands inside
+  one job, which needs a job-level deadline and is still item 13.
 
 ## 16. [windbg-mcp] Exercise a *mutating* `debug_batch` against a live kernel target — **done**
 
