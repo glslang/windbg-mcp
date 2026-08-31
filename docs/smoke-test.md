@@ -984,6 +984,17 @@ away while it does. So the rule is that a probe's roads never move **back** down
 `Moving → Holding → Gone`: `stale_session` and then an answer is the half-dead session, while an
 answer and then `stale_session` is a program that finished a millisecond ago.
 
+**A tool error is data; a protocol error is a failure.** A step's tool result is discarded on
+purpose — `bp` on an unresolvable symbol and a `break_in` for a run that has finished are ordinary,
+and what is checked is the state left behind. A top-level JSON-RPC error is not that: it means the
+request never reached a debugger, which is a schema or transport regression and is what this
+harness exists for. So every call the fuzz makes goes through one `fuzz_call`, which refuses one.
+Discarded, it would leave the session readable, every probe passing, the run green, and a whole
+corpus entry silently doing nothing — the same vacuity the `Gone` assertion stops, arriving through
+the wire rather than through the walk. It matters here more than in the tests above because this is
+the widest set of tools the harness drives from one place: nine, with argument shapes nothing else
+exercises.
+
 **The seed is fixed, so CI runs one deterministic walk.** Drawing from the clock would fail on a
 sequence nobody could reproduce. The default (seed 3, 3 rounds of 6 steps, ~1s) is chosen because
 its walk reaches all three states; how long a round lasts depends on whether it draws an unbounded

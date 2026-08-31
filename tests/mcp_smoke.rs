@@ -5415,7 +5415,16 @@ fn a_randomised_command_sequence_leaves_the_session_in_one_state_and_the_server_
 
         for _ in 0..steps {
             let step = FUZZ_CORPUS[rng.below(FUZZ_CORPUS.len() as u64) as usize];
-            sequence.push(fuzz_step(&mut server, &session, step, &mut execution));
+            // The walk so far, rendered before the step runs so a call that fails at the wire can
+            // name what led to it. The step being drawn is in the panic beside this.
+            let context = format!("round {round}, {}\n{replay}", sequence.join(" -> "));
+            sequence.push(fuzz_step(
+                &mut server,
+                &session,
+                step,
+                &mut execution,
+                &context,
+            ));
             let held = fuzz_probe(&mut server, &session, round, &sequence, &replay);
             *reached.entry(held).or_default() += 1;
             if held == Held::Gone {
@@ -5430,10 +5439,11 @@ fn a_randomised_command_sequence_leaves_the_session_in_one_state_and_the_server_
         fuzz_reclaim(&mut server, &session, round, &sequence, &replay);
 
         // And the session that was never fuzzed still holds its own target.
-        let sibling = server.call_tool(
+        let sibling = fuzz_call(
+            &mut server,
             "registers",
             json!({ "session_id": &bystander, "filter": "pc" }),
-            TARGET_STEP,
+            &format!("round {round}, {}\n{replay}", sequence.join(" -> ")),
         );
         assert!(
             !is_tool_error(&sibling),
@@ -5443,10 +5453,11 @@ fn a_randomised_command_sequence_leaves_the_session_in_one_state_and_the_server_
         );
     }
 
-    server.call_tool(
+    fuzz_call(
+        &mut server,
         "end_session",
         json!({ "session_id": &bystander }),
-        TARGET_STEP,
+        "releasing the bystander at the end of the run",
     );
 
     // **Which states this walk actually reached**, and the assertion is the point rather than the
@@ -5499,7 +5510,12 @@ fn a_randomised_command_sequence_leaves_the_session_in_one_state_and_the_server_
 fn fuzz_reclaim(server: &mut Server, session: &str, round: u64, sequence: &[String], replay: &str) {
     let context = || format!("{}\n{replay}", sequence.join(" -> "));
 
-    let ended = server.call_tool("end_session", json!({ "session_id": session }), TARGET_STEP);
+    let ended = fuzz_call(
+        server,
+        "end_session",
+        json!({ "session_id": session }),
+        &context(),
+    );
     let report = &ended["result"]["structuredContent"];
     if report["released"] == json!(true) {
         return;
@@ -5516,7 +5532,7 @@ fn fuzz_reclaim(server: &mut Server, session: &str, round: u64, sequence: &[Stri
     // The retirement's own documented route. Guarded rather than trusted: it routes by *current*,
     // so a version of this test where the round's session is not the newest would silently end
     // the bystander instead and the assertion below is what would say so.
-    let anyway = server.call_tool("end_session", json!({}), TARGET_STEP);
+    let anyway = fuzz_call(server, "end_session", json!({}), &context());
     let report = &anyway["result"]["structuredContent"];
     assert_eq!(
         report["released"],
@@ -5546,49 +5562,54 @@ fn fuzz_step(
     session: &str,
     step: FuzzStep,
     execution: &mut Option<String>,
+    context: &str,
 ) -> String {
     match step {
         FuzzStep::Raw(command) => {
-            server.call_tool(
+            fuzz_call(
+                server,
                 "execute",
                 json!({ "session_id": session, "command": command }),
-                TARGET_STEP,
+                context,
             );
             format!("execute `{command}`")
         }
         FuzzStep::Bounded(command) => {
-            server.call_tool(
+            fuzz_call(
+                server,
                 "debug_batch",
                 json!({
                     "session_id": session,
                     "steps": [{ "op": "resume", "command": command, "timeout_ms": FUZZ_WAIT_MS }],
                     "timeout_ms": 20000,
                 }),
-                TARGET_STEP,
+                context,
             );
             format!("batch resume `{command}`")
         }
         FuzzStep::Typed(tool) => {
-            server.call_tool(tool, json!({ "session_id": session }), TARGET_STEP);
+            fuzz_call(server, tool, json!({ "session_id": session }), context);
             tool.to_string()
         }
         FuzzStep::RunTo(symbol) => {
-            server.call_tool(
+            fuzz_call(
+                server,
                 "run_to_address",
                 json!({
                     "session_id": session,
                     "address": symbol,
                     "timeout_ms": FUZZ_WAIT_MS,
                 }),
-                TARGET_STEP,
+                context,
             );
             format!("run_to_address {symbol}")
         }
         FuzzStep::Async => {
-            let started = server.call_tool(
+            let started = fuzz_call(
+                server,
                 "continue_async",
                 json!({ "session_id": session, "max_run_ms": FUZZ_WAIT_MS }),
-                TARGET_STEP,
+                context,
             );
             // Kept only when one was minted. A refused `continue_async` — the slot is taken, the
             // target is gone — must not overwrite the handle a later `break_in` is for, and a
@@ -5618,14 +5639,48 @@ fn fuzz_step(
                     }),
                 )
             };
-            server.call_tool(tool, args, TARGET_STEP);
+            fuzz_call(server, tool, args, context);
             format!("{tool} {handle}")
         }
         FuzzStep::Interrupt => {
-            server.call_tool("interrupt", json!({ "session_id": session }), TARGET_STEP);
+            fuzz_call(
+                server,
+                "interrupt",
+                json!({ "session_id": session }),
+                context,
+            );
             "interrupt".to_string()
         }
     }
+}
+
+/// Every call this fuzz makes, so that **a failure of the transport is never mistaken for a
+/// failure of the debugger**.
+///
+/// A step's tool result is discarded on purpose — `bp` on an unresolvable symbol and a `break_in`
+/// for a run that has finished are ordinary, and the state left behind is what is checked. A
+/// top-level JSON-RPC error is not that. It means the request never reached a debugger: a schema
+/// that stopped deserializing after a `schemars` bump, a tool rmcp no longer routes, an internal
+/// error surfaced as `-32603`. Discarded along with the tool result, one of those leaves the
+/// session perfectly readable, every probe passing, and the fuzz green while a whole corpus entry
+/// has silently stopped doing anything — which is the same vacuity the `Gone` assertion exists to
+/// stop, arriving through the wire instead of through the walk.
+///
+/// It matters most **here** rather than in the tests above because this is the widest set of tools
+/// the harness drives from one place: nine of them, with argument shapes nothing else exercises.
+/// And transport hygiene is what this harness is *for* — it exists for the two moments a
+/// dependency moves and the spec revs, both of which change the bytes on the wire while the Rust
+/// API stays identical.
+fn fuzz_call(server: &mut Server, tool: &str, args: Value, context: &str) -> Value {
+    let response = server.call_tool(tool, args, TARGET_STEP);
+    assert!(
+        response["error"].is_null(),
+        "`{tool}` came back as a JSON-RPC error rather than as a tool result. That is a transport \
+         or schema failure rather than a debugger one, so it is a regression in what this harness \
+         exists for — and it would otherwise be discarded with the tool result and leave this run \
+         green. Drawn after: {context}\n{response}"
+    );
+    response
 }
 
 /// The invariant, asked of the session after every step.
@@ -5709,8 +5764,7 @@ fn fuzz_probe(
 /// Not [`Server::tool_data`] or [`Server::tool_failure`]: each asserts an outcome, and which
 /// outcome is right here is precisely the question.
 fn fuzz_road(server: &mut Server, tool: &str, args: Value) -> (Option<Held>, String) {
-    let response = server.call_tool(tool, args, TARGET_STEP);
-    assert_no_error(&response, &format!("tools/call {tool}"));
+    let response = fuzz_call(server, tool, args, "a probe of the session's state");
     let rendered = text_of(&response["result"]);
     if !is_tool_error(&response) {
         return (Some(Held::Holding), rendered);
