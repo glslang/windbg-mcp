@@ -3762,7 +3762,11 @@ impl WindbgServer {
         Parameters(args): Parameters<SessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let session_id = args.session_id.as_deref();
-        let session = match self.sessions.resolve(session_id) {
+        // `resolve_for_teardown`, not `resolve`: a **retired** handle still names this session,
+        // and releasing a session is not touching the target retirement is about. Refusing it was
+        // `FOLLOWUPS.md` item 55 — with anything newer open, a caller whose handle a raw
+        // `execute` had retired could not release their own worker at all.
+        let session = match self.sessions.resolve_for_teardown(session_id) {
             Ok(session) => session,
             Err(e) => return engine_result_for(session_id, Err(e)),
         };
