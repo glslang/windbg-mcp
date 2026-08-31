@@ -10537,8 +10537,8 @@ fn a_bounded_command_queued_behind_another_job_still_beats_its_caller() {
 /// and a threshold pinned here would fail on an unrelated host difference. The property the rule
 /// now rests on is asserted next door, in
 /// `arming_the_watchdog_does_not_round_a_quick_command_up`, which is a *shape* rather than a
-/// magnitude and runs in the ordinary tier — this one going on passing across the very change it
-/// exists to catch is why that test exists. Measured through the tool surface, so the numbers
+/// magnitude and is not `#[ignore]`d, so CI runs it — this one going on passing across the very
+/// change it exists to catch is why that test exists. Measured through the tool surface, so the numbers
 /// include this server's own per-call overhead — one IPC round trip on top of what the in-process
 /// version measured, which is the number a caller actually sees.
 #[test]

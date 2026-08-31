@@ -307,10 +307,12 @@ Four things this turned up that the entry could not have said:
 - **The measurement went on passing across the change it exists to catch**, because it prints and
   is `#[ignore]`d. Its comment still described the sleep six days after the sleep was gone. The
   numbers stay a print — they are dbgscope's and this host's, and a threshold pinned here would
-  fail on an unrelated host difference — but the *shape* is now asserted in the ordinary tier by
-  `arming_the_watchdog_does_not_round_a_quick_command_up`: a bounded `lm` against the unbounded
-  `modules` beside it plus half a quantum of margin, so a slower host moves both numbers and a
-  quantizing watchdog moves one.
+  fail on an unrelated host difference — but the *shape* is now asserted in the debugger tier,
+  un-`#[ignore]`d, by `arming_the_watchdog_does_not_round_a_quick_command_up`: the **ratio**
+  between two bounded commands of very different cost, which a fixed quantum collapses to ~1 by
+  rounding both up to the same multiple. A margin against an unbounded baseline was tried first
+  and is the wrong shape — the baseline grows into the margin on exactly the slow host the guard
+  was advertised as surviving.
 - **Collapsing a split needs the thing that stops it re-forming.** The rule is a sentence in two
   markdown files, and the way it comes back is a tool added by copy-paste taking the unbounded op
   with nobody deciding to — which no runtime test can see, because that tool works perfectly until

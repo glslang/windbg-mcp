@@ -1065,11 +1065,20 @@ case.
   condvar, so every raw command but `index_trace` is bounded. Re-run it after a dbgscope watchdog
   change; its comment carries the 2026-08-31 numbers to compare against.
 - `arming_the_watchdog_does_not_round_a_quick_command_up` — the assertion the measurement above is
-  not. It runs in the ordinary tier, times a bounded `lm` against the unbounded `modules` beside
-  it, and fails if the first exceeds the second by more than half the old 200ms quantum. A shape
-  rather than a magnitude, deliberately: a slower host moves both numbers and passes, a quantizing
-  watchdog moves one and does not. It exists because the measurement is `#[ignore]`d and therefore
-  went on passing across exactly the change it was written to catch.
+  not. It exists because that measurement is `#[ignore]`d and so went on passing across exactly
+  the change it was written to catch. **It is in the debugger tier, not in a plain `cargo test`**:
+  it opens the sample dump through `target_tier()`, so without `WINDBG_MCP_SMOKE_DUMP=1` it stands
+  down like everything else here. What it is *not* is `#[ignore]`d, which is the difference from
+  the measurement — CI runs it on all three runners.
+
+  The oracle is a **ratio between two bounded commands of very different natural cost** — an
+  `execute` of `lm` (milliseconds) against an `execute` of a ~20,000-iteration `.for` loop
+  (~170ms) — and it fails if they come within 5x of each other. That is what a fixed quantum does:
+  rounding both up to a multiple of the nap makes a 3ms command and a 170ms one *equal*, where
+  without one they stay ~50x apart. Deliberately not a bounded command against an unbounded
+  baseline plus a margin, which was the first version: the baseline grows into the margin on a
+  slow host, so `200 < 120 + 100` passes on precisely the host the guard claimed to survive. A
+  ratio scales with the host and the absolute numbers do not matter.
 
 These live with the wire tests rather than beside the arithmetic because the wiring they prove now
 spans two processes: the supervisor sends the caller's remaining patience, the worker derives the
