@@ -90,6 +90,11 @@ pub enum EngineOp {
     /// the way this split comes back is a tool added by copy-paste taking the unbounded path
     /// without anyone deciding to. `only_index_trace_runs_a_command_unbounded` in `server.rs` is
     /// what actually holds the line; the name is what makes it obvious at the call site.
+    ///
+    /// That test covers the **ops**, and it is only half the rule — a typed op can run a command
+    /// too, which is how `set_breakpoint` stayed unbounded through the first draft of this change.
+    /// `worker::tests::every_unbounded_execute_in_this_worker_is_one_of_the_known_five` is the
+    /// other half, over the `Execute` calls themselves.
     UnboundedCommand {
         command: String,
     },
@@ -184,6 +189,12 @@ pub enum EngineOp {
     /// holds for every typed op beside it — [`Self::Modules`], [`Self::Disassemble`],
     /// [`Self::Registers`] — which is why "bound everything except `index_trace`" is a rule about
     /// commands and not about tools.
+    ///
+    /// Which cuts the other way too, and is the half that was missed: a typed op that *does* run a
+    /// command carries one. [`Self::SetBreakpoint`] is that case, and
+    /// `worker::tests::every_unbounded_execute_in_this_worker_is_one_of_the_known_five` is what
+    /// stops the next one being an accident. So the absence of a `patience_ms` here is a claim —
+    /// there is no `Execute` in this op — rather than a preference.
     Backtrace {
         /// How many frames to walk. Bounded by the supervisor before it gets here.
         frames: u32,
@@ -210,8 +221,18 @@ pub enum EngineOp {
     /// condition, a command string to run on each hit, `/1` for one-shot. What the typed side
     /// adds is the *answer* — a successful `bp` prints nothing at all, so "did that work, and
     /// what is it now?" was previously only answerable with a second `bl`.
+    ///
+    /// **It carries a `patience_ms` because there is a command inside it**, and the address half
+    /// of that command is the caller's: `bp nt!Foo+0x10` makes the MASM evaluator resolve a
+    /// symbol, which on a deferred module with a `srv*` path is a fetch from a symbol server and
+    /// can take minutes. Typed ops around it carry none — a watchdog Ctrl+Breaks an `Execute` and
+    /// they have none to break — so this one looks like an exception and is the rule: where a
+    /// typed op *does* run a command with caller-supplied text, it is bounded like any other.
+    /// The `bl` reads either side are direct engine calls and are not bounded, which is why the
+    /// budget is spent on the `bp` alone.
     SetBreakpoint {
         expression: String,
+        patience_ms: u32,
     },
     ReadMemory {
         address: String,
@@ -374,6 +395,7 @@ impl EngineOp {
     pub fn patience_slot(&mut self) -> Option<&mut u32> {
         match self {
             Self::BoundedCommand { patience_ms, .. }
+            | Self::SetBreakpoint { patience_ms, .. }
             | Self::Pool { patience_ms, .. }
             | Self::Heap { patience_ms, .. }
             | Self::CrashTriage { patience_ms, .. }
@@ -728,6 +750,10 @@ mod tests {
                 patience_ms: 0,
             },
             EngineOp::Registers { all: false },
+            EngineOp::SetBreakpoint {
+                expression: "nt!KeBugCheckEx".into(),
+                patience_ms: 0,
+            },
             EngineOp::Pool {
                 query: PoolOp::census(None, None),
                 patience_ms: 0,

@@ -828,13 +828,29 @@ the design this replaced.
 > `server::tests::only_index_trace_runs_a_command_unbounded`. The criterion below is kept as the
 > record of what the tax bought while it stood, not as a rule to apply.
 >
-> Two things the collapse does **not** reach, both because a watchdog Ctrl+Breaks a *command*.
-> The typed ops — `modules`, `backtrace`, `disassemble`, `registers`, `read_memory` — are direct
-> engine calls with no command behind them, so nothing can cut one short and none of them carries
-> a `patience_ms`; the walks (`Pool`, `Heap`, `Walk`) and `crash_triage` already bound themselves
-> between nodes on the caller's clock. And `reachable_from_dispatch` still issues many `uf`
-> commands inside one job, which is a job-level deadline rather than a command-level one — still
-> FOLLOWUPS.md item 13, unchanged by this.
+> **The rule is about `Execute` calls, not about ops, and stating it the other way round hid two
+> instances.** A watchdog Ctrl+Breaks a command; a *typed* op can still run one, and nothing about
+> the op's name says so. `set_breakpoint` was doing exactly that — `execute_command("bp <the
+> caller's expression>")` — while every op around it moved onto the bounded path, so
+> `bp nt!Foo+0x10` against a deferred module with a `srv*` path could hold the session's engine for
+> a symbol-server fetch. Raised by Codex on
+> [#271](https://github.com/glslang/windbg-mcp/pull/271) against the first draft of this note, which
+> claimed "every raw command" while certifying only the ops; `EngineOp::SetBreakpoint` now carries a
+> `patience_ms` like any other command. Enumerating the `Execute` calls instead turned up
+> `resolve`'s `? <expr>` as well — also caller text, deferred as item 56 because its three callers
+> sit on three different clocks.
+>
+> What is left unbounded is therefore a **list, not a criterion**, and
+> `worker::tests::every_unbounded_execute_in_this_worker_is_one_of_the_known_five` is the list:
+> `execute`'s and `kernel_report`'s opener arms (fixed strings inside an open already bounded by
+> `LOAD_WAIT_MS`), `pump_a_resume`'s `Execute` (bounded by the pump that follows it, since it
+> returns without the target having moved), `resolve` (item 56) and `reachable` (item 13).
+>
+> Beyond commands entirely: the typed ops — `modules`, `backtrace`, `disassemble`, `registers`,
+> `read_memory` — are direct engine calls with nothing for a watchdog to break, so none of them
+> carries a `patience_ms` and a cold symbol server can block one however this rule is written; the
+> walks (`Pool`, `Heap`, `Walk`) and `crash_triage` bound themselves between nodes on the caller's
+> clock instead.
 
 **Context.** `EngineHandle::run_command` (`src/engine.rs`) runs a raw command under dbgscope's
 `execute_command_bounded`, whose watchdog `SetInterrupt`s the engine before the caller's timeout so

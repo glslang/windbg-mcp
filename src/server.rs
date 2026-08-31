@@ -4294,6 +4294,7 @@ impl WindbgServer {
                 args.session_id.as_deref(),
                 EngineOp::SetBreakpoint {
                     expression: args.expression,
+                    patience_ms: 0,
                 },
             )
             .await;

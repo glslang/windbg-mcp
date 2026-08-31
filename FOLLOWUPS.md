@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in thirteen clusters: items 2–6 come from the reachability-confirmation effort (path
+Deferred work, in fourteen clusters: items 2–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9 and 11 from surveying this server against
 the MCP `2026-07-28` extensions (tasks, apps), item 13 from the bounded-command coverage review (#46,
 2026-08-02), item 15 from the private worker channel (#65 / #72, 2026-08-04), item 19 from
@@ -17,9 +17,12 @@ Defender quarantining this project's own binary while the 32-bit worker was bein
 execution handles, where the invariant that stops a description naming a tool its client cannot call
 turned out to cover only half the prose a client is served (2026-08-29), and where a break arriving
 in the microseconds after a run built its stop is recorded in that result's prose and not in its flag
-(2026-08-30), and item 54 from
+(2026-08-30), item 54 from
 [#85](https://github.com/glslang/windbg-mcp/issues/85)'s module-inventory refresh, whose engine call
-no watchdog in either crate can currently cut short (2026-08-30).
+no watchdog in either crate can currently cut short (2026-08-30), and item 56 from closing item 14 —
+collapsing the coverage rule to "bound every command except `index_trace`" meant enumerating the
+`Execute` calls rather than the ops, which found one left on a shared helper that three callers
+reach on three different clocks (2026-08-31).
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and the
 2026-08-02 entries that item 13 extends.
@@ -715,3 +718,36 @@ deadline.
 **Where it picks up.** `worker::resynchronise` and `EngineOp::Modules` in `src/proto.rs`,
 `DebugEngine::reload_symbols` and `Watchdog` in dbgscope's `src/dbgeng.rs`, and
 `execute_command_bounded` beside it for the shape a bounded direct call takes here.
+## 56. [windbg-mcp] `resolve`'s `? <expr>` is a caller's command on nobody's clock
+
+`worker::resolve` evaluates an address expression by running `? <expr>` through
+`execute_command` — unbounded. The text is the **caller's**: `disassemble { "address":
+"nt!KeBugCheck+0x2e8" }` reaches it verbatim, and `?` makes the MASM evaluator resolve the symbol,
+which on a deferred module with a `srv*` path is a fetch from a symbol server. That is minutes with
+the session's engine held and nothing able to cut it short — the same wedge the bounded path exists
+to stop, arriving through a helper rather than through an op.
+
+Found while closing item 14 (the coverage rule collapsing to "bound every command except
+`index_trace`"), by enumerating the `Execute` calls left in `src/worker.rs` rather than the ops —
+which is also how the `set_breakpoint` instance was found, by Codex, on
+[#271](https://github.com/glslang/windbg-mcp/pull/271). That one was fixed in the same PR because
+its op is its own; this one is not, for the reason below.
+
+- **Why deferred:** `resolve` is a shared helper with three callers on three different clocks, and
+  two of them have no clock to offer. `run_to_address` has a `timeout_ms` it could pass down.
+  `EngineOp::Disassemble` carries no `patience_ms` at all and would have to grow one — the first
+  typed op to carry a deadline for a command *inside* it, which `SetBreakpoint` has now made a
+  shape rather than a novelty. And `reachable` calls it up to `max_functions` times in one job,
+  where a per-call bound is the wrong instrument for the same reason item 13 gives. So the fix is
+  three decisions, not one, and one of them is item 13's.
+- **What would close it:** a `patience_ms` on `EngineOp::Disassemble`, `resolve` taking a budget
+  and running `execute_command_bounded`, and item 13's job-level deadline covering the
+  reachability caller. Done together, `resolve` leaves the allowlist in
+  `worker::tests::every_unbounded_execute_in_this_worker_is_one_of_the_known_five`, which is where
+  the deferral is recorded in code.
+- **Depends on:** item 13 for the `reachable` third of it.
+- **Note the hazard is not fully closable by a watchdog anyway.** `backtrace` resolves a symbol per
+  frame through direct engine calls, with no `Execute` for a watchdog to break, so a cold symbol
+  server can block that too — see `EngineOp::Backtrace`. This item is worth doing because a
+  *command* is bounded cheaply and there is no reason to leave one that is not; it is not worth
+  doing as a claim that the symbol-server hazard is gone.

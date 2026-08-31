@@ -1581,7 +1581,14 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         EngineOp::Disassemble { address, count } => {
             disassemble(e, address.as_deref(), count as usize)
         }
-        EngineOp::SetBreakpoint { expression } => set_breakpoint(e, &expression),
+        EngineOp::SetBreakpoint {
+            expression,
+            patience_ms,
+        } => set_breakpoint(
+            e,
+            &expression,
+            watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), queued),
+        ),
         EngineOp::ReadMemory { address, size } => read_memory(e, &address, size)
             .map(Output::text)
             .map_err(Failed::from),
@@ -3571,15 +3578,22 @@ fn brief(output: &str) -> String {
 /// failure comes back as a success that says the listing is missing —
 /// [`structured::BreakpointSet::listed`] — which is the same distinction `OpenError::PostCommit`
 /// draws for an opener, at a much smaller scale.
-fn set_breakpoint(e: &DebugEngine, expression: &str) -> Result<Output, Failed> {
+fn set_breakpoint(e: &DebugEngine, expression: &str, budget_ms: u32) -> Result<Output, Failed> {
     // Best-effort, and taken first: a session whose breakpoint list cannot be read must still be
     // able to set a breakpoint, so this cannot be a `?`.
     let before: Option<HashSet<u32>> = e
         .breakpoints()
         .ok()
         .map(|held| held.iter().map(|breakpoint| breakpoint.id).collect());
+    // Bounded on the caller's clock, like every other command this server runs. The address is
+    // the caller's text and `bp` makes the evaluator resolve it, so `bp nt!Foo+0x10` against a
+    // deferred module with a `srv*` path is a symbol-server fetch — minutes, with this session's
+    // engine held for all of them. That it sits inside a *typed* op is why it was missed when the
+    // rest moved onto the bounded path (`DECISIONS.md`, 2026-08-02, revised 2026-08-31): nothing
+    // about the op said "there is a command in here".
     let mut text = e
-        .execute_command(&format!("bp {expression}"))
+        .execute_command_bounded(&format!("bp {expression}"), budget_ms)
+        .map(|run| run.output)
         .map_err(failed)?;
     // Past this point the breakpoint exists.
     let set = match (e.breakpoints(), before) {
@@ -5527,6 +5541,81 @@ mod tests {
     use dbgscope::pool::WalkStalls;
 
     use super::*;
+
+    /// The other half of the coverage rule, and the half a check on the *op* cannot see: which
+    /// `Execute` calls in this file run with no watchdog.
+    ///
+    /// `server::tests::only_index_trace_runs_a_command_unbounded` certifies that one **tool**
+    /// constructs [`EngineOp::UnboundedCommand`]. That is true and is narrower than the rule
+    /// reads, because a typed op can run a command too — and one did: `set_breakpoint` reached
+    /// `execute_command("bp <caller's expression>")` while every op around it had moved onto the
+    /// bounded path, so `bp nt!Foo+0x10` against a deferred module with a `srv*` path could hold
+    /// this session's engine for a symbol-server fetch with nothing to cut it short. Raised by
+    /// Codex on [#271](https://github.com/glslang/windbg-mcp/pull/271); the finding was right and
+    /// this test is what stops the next one being found by review rather than by the build.
+    ///
+    /// So the allowlist is enumerated rather than the exception. Every unbounded `execute_command`
+    /// left in this file is one of:
+    ///
+    /// - **`execute`'s opener arms** — `.load ext`, `vertarget`, `!ttdext.index -status`,
+    ///   `dx @$curprocess.TTD.Lifetime`, `r`. Fixed strings with no caller text in them, run once
+    ///   inside an open that is already bounded by `LOAD_WAIT_MS` on its wait half, and each is
+    ///   the *report* an opener answers with rather than work a caller asked for.
+    /// - **`kernel_report`** — `.load kdexts` and `vertarget`, the same, for a kernel attach.
+    /// - **`pump_a_resume`** — the `Execute` that sets the run state. Bounded by the pump that
+    ///   follows it rather than by a watchdog, which is the whole shape of `EngineOp::Resume`:
+    ///   `Execute` returns without the target having moved.
+    /// - **`resolve`** — `? <expr>`, which *is* caller text and is the one entry here that is a
+    ///   deferral rather than a reason. It is a shared helper with three callers on three
+    ///   different clocks (`disassemble`, `run_to_address`, `reachable`), two of which have no
+    ///   patience to thread through it at all. `FOLLOWUPS.md` item 56.
+    /// - **`reachable`** — `lm m` and `uf`, up to `max_functions` of them in one job. A
+    ///   command-level bound is the wrong instrument: no individual `uf` is the problem.
+    ///   `FOLLOWUPS.md` item 13.
+    ///
+    /// Read from the source for `record::tests::this_module_never_writes_to_stdout`'s reason: the
+    /// property is about what is *written*, and no runtime test can prove the absence of a call
+    /// nobody made today.
+    #[test]
+    fn every_unbounded_execute_in_this_worker_is_one_of_the_known_five() {
+        // Only the half that ships; the tests below run no engine, and this one names the thing
+        // it searches for.
+        let code = include_str!("worker.rs")
+            .split_once("\n#[cfg(test)]")
+            .expect("this module has a test half")
+            .0;
+
+        let mut callers = Vec::new();
+        let mut enclosing = "<top level>";
+        for line in code.lines() {
+            // Every function in this file is at column 0; the closures inside them are not, and a
+            // call from one is still that function's.
+            if let Some(name) = line.strip_prefix("fn ").or(line.strip_prefix("pub fn ")) {
+                enclosing = name.split(['(', '<']).next().unwrap_or(name);
+            }
+            // `execute_command_bounded` starts with the same text, so the open paren is what
+            // tells the two apart — which is also why a zero budget is invisible here and is
+            // `only_index_trace_runs_a_command_unbounded`'s half of the question.
+            if line.contains("execute_command(") && !callers.contains(&enclosing) {
+                callers.push(enclosing);
+            }
+        }
+        callers.sort_unstable();
+        assert_eq!(
+            callers,
+            [
+                "execute",
+                "kernel_report",
+                "pump_a_resume",
+                "reachable",
+                "resolve",
+            ],
+            "an `Execute` with no watchdog is in a function this rule has not accounted for. \
+             Every command a tool's op runs is bounded on the caller's clock (DECISIONS.md, \
+             2026-08-02, revised 2026-08-31); the five above are the enumerated exceptions and \
+             the doc comment says why each one is one. Bound it, or add it here with its reason."
+        );
+    }
 
     // ---- pool tags ------------------------------------------------------------------
 
