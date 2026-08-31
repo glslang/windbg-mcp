@@ -10603,22 +10603,27 @@ fn measure_what_the_bounded_path_costs_a_quick_command() {
 /// split came to exist. The measurement above is where the numbers live, and it is `#[ignore]`d,
 /// so it went on passing across the change it was written to catch; this is the half that runs.
 ///
-/// **A shape, not a magnitude.** The regression is a *quantum* — a 3ms command jumping to 200ms —
-/// so the assertion is against the unbounded typed call beside it plus a margin far wider than the
-/// difference in work between them, not against a wall-clock ceiling. A host thirty times slower
-/// than this bench moves both numbers together and still passes; a watchdog that quantizes moves
-/// only one, by more than the whole margin.
+/// **Two bounded commands, not a bounded one against an unbounded baseline.** The obvious test —
+/// a bounded `lm` against the typed `modules` beside it, plus a fixed margin — has a hole that a
+/// slow host walks straight through, and it is the same host this guard advertises itself as
+/// surviving: with `modules` at 120ms, a regressed watchdog rounds `lm` to 200ms and
+/// `200 < 120 + 100` still passes. The baseline eats the margin exactly as the margin becomes
+/// load-bearing. (Raised on [#271](https://github.com/glslang/windbg-mcp/pull/271); comparing the
+/// same command through both paths, the other obvious answer, is not available either — after this
+/// change there is no unbounded path for `lm` to take.)
+///
+/// So the invariant is a **ratio between two commands of very different natural cost**, which is
+/// what a fixed quantum destroys: rounding up to 200ms makes a 3ms `lm` and a ~170ms `.for` loop
+/// into 200.7ms and 200.8ms — *equal*. Without it they stay ~50x apart. A slower host scales both
+/// and the ratio holds, which is the scale-invariance the additive margin only claimed to have.
 #[test]
 fn arming_the_watchdog_does_not_round_a_quick_command_up() {
     let Some(dump) = target_tier() else { return };
-    const ROUNDS: usize = 9;
-    /// The nap the watchdog used to take between polls, and so the size of the tax it used to
-    /// levy on anything quicker than one.
-    const QUANTUM: Duration = Duration::from_millis(200);
-    /// Room for the work `modules` does beyond the `lm` it runs — parsing the table, asking the
-    /// engine for each image's identity — plus whatever this host's scheduler adds. Half a
-    /// quantum, so a run that pays one cannot hide inside it.
-    const MARGIN: Duration = Duration::from_millis(100);
+    const ROUNDS: usize = 7;
+    /// Measured ~50x on this bench and on all three CI runners. Set an order of magnitude below
+    /// that: the failure being caught collapses it to ~1, so anything comfortably above 1
+    /// discriminates, and the room is for a host whose loop and whose `lm` scale differently.
+    const SPREAD: u32 = 5;
 
     let mut server = Server::started();
     let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
@@ -10627,34 +10632,43 @@ fn arming_the_watchdog_does_not_round_a_quick_command_up() {
         samples.sort();
         samples[samples.len() / 2]
     };
-    let mut unbounded = Vec::with_capacity(ROUNDS);
-    let mut bounded = Vec::with_capacity(ROUNDS);
+    let mut quick = Vec::with_capacity(ROUNDS);
+    let mut slow = Vec::with_capacity(ROUNDS);
     for _ in 0..ROUNDS {
-        // `modules` is the typed op: no command, so no watchdog can reach it either way.
-        let t = Instant::now();
-        server.tool_text("modules", json!({ "session_id": session }), TARGET_STEP);
-        unbounded.push(t.elapsed());
-
-        // `execute` is the same engine and the same session, running the `lm` that listing is
-        // built from. The one difference is the watchdog.
+        // Milliseconds: a module listing off an already-open dump.
         let t = Instant::now();
         server.tool_text(
             "execute",
             json!({ "command": "lm", "session_id": session }),
             TARGET_STEP,
         );
-        bounded.push(t.elapsed());
+        quick.push(t.elapsed());
+
+        // Two orders of magnitude more, and CPU-bound in the engine's own evaluator, so it scales
+        // with the host the way the listing does. `0x4e20` because the MASM evaluator's default
+        // base is hex — the same trap the queued-command test documents for `.sleep`.
+        let t = Instant::now();
+        server.tool_text(
+            "execute",
+            json!({
+                "command": ".for (r $t0 = 0; @$t0 < 0x4e20; r $t0 = @$t0 + 1) { }",
+                "session_id": session,
+            }),
+            TARGET_STEP,
+        );
+        slow.push(t.elapsed());
     }
-    let (unbounded, bounded) = (median(unbounded), median(bounded));
-    println!("bounded `lm` {bounded:?} against unbounded `modules` {unbounded:?} (x{ROUNDS})");
+    let (quick, slow) = (median(quick), median(slow));
+    println!("bounded `lm` {quick:?} against a bounded `.for` loop {slow:?} (x{ROUNDS})");
 
     server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
 
     assert!(
-        bounded < unbounded + MARGIN,
-        "a bounded `lm` took {bounded:?} against {unbounded:?} for the unbounded `modules` beside \
-         it — more than the {MARGIN:?} margin, which is what dbgscope's watchdog quantizing to \
-         {QUANTUM:?} again would look like. Every tool but `index_trace` is on the bounded path \
+        slow > quick * SPREAD,
+        "a bounded `lm` took {quick:?} and a bounded `.for` loop {slow:?} — less than {SPREAD}x \
+         apart, where two commands this different in cost should be ~50x. That is what a watchdog \
+         quantizing again looks like: both round up to the same multiple of its nap, and the one \
+         that was quick pays for it. Every tool but `index_trace` is on the bounded path \
          (DECISIONS.md, 2026-08-02, revised 2026-08-31); that rule assumes arming one is free."
     );
 }

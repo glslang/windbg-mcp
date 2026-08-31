@@ -745,7 +745,7 @@ its op is its own; this one is not, for the reason below.
 - **What would close it:** a `patience_ms` on `EngineOp::Disassemble`, `resolve` taking a budget
   and running `execute_command_bounded`, and item 13's job-level deadline covering the
   reachability caller. Done together, `resolve` leaves the allowlist in
-  `worker::tests::every_unbounded_execute_in_this_worker_is_one_of_the_known_five`, which is where
+  `worker::tests::every_unbounded_execute_in_this_worker_is_accounted_for`, which is where
   the deferral is recorded in code.
 - **Depends on:** item 13 for the `reachable` third of it.
 - **Note the hazard is not fully closable by a watchdog anyway.** `backtrace` resolves a symbol per

@@ -93,7 +93,7 @@ pub enum EngineOp {
     ///
     /// That test covers the **ops**, and it is only half the rule — a typed op can run a command
     /// too, which is how `set_breakpoint` stayed unbounded through the first draft of this change.
-    /// `worker::tests::every_unbounded_execute_in_this_worker_is_one_of_the_known_five` is the
+    /// `worker::tests::every_unbounded_execute_in_this_worker_is_accounted_for` is the
     /// other half, over the `Execute` calls themselves.
     UnboundedCommand {
         command: String,
@@ -192,7 +192,7 @@ pub enum EngineOp {
     ///
     /// Which cuts the other way too, and is the half that was missed: a typed op that *does* run a
     /// command carries one. [`Self::SetBreakpoint`] is that case, and
-    /// `worker::tests::every_unbounded_execute_in_this_worker_is_one_of_the_known_five` is what
+    /// `worker::tests::every_unbounded_execute_in_this_worker_is_accounted_for` is what
     /// stops the next one being an accident. So the absence of a `patience_ms` here is a claim —
     /// there is no `Execute` in this op — rather than a preference.
     Backtrace {

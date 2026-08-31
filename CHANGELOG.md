@@ -83,7 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engine calls with no `Execute` to break.
 
   It survived the first draft of the change above, whose rule was stated over ops and whose test
-  certified ops, so both missed it. `worker::tests::every_unbounded_execute_in_this_worker_is_one_of_the_known_five`
+  certified ops, so both missed it. `worker::tests::every_unbounded_execute_in_this_worker_is_accounted_for`
   is the correction: it reads the source for `Execute` calls rather than for enum variants, and
   enumerates the five functions that legitimately run one unbounded — the two openers' fixed
   strings, the resume pump's own `Execute`, and the two that are deferred with items against them.
@@ -94,19 +94,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fixed here because its three callers sit on three different clocks and one of them is item 13.
 
   **And bounding it added a third state the result had no way to say**, which is
-  `structured::BreakpointSet::timed_out`. A watchdog break comes back as an `Ok` run carrying
-  `cut_short`, so a `bp` that never finished looked from the caller's side exactly like one that
-  ran and matched nothing — the same empty `added`, the same successful result, rendered as "(this
-  call added none)". The two have opposite next moves. The listing is a real engine read taken
-  afterwards, so `added` settles which happened — but only alongside `listed`, since an empty
-  `added` is "nothing was added" with a listing and "which of these is new is unknown" without one.
-  With a listing: empty means the expression is not set and can be retried, non-empty means it
-  landed before the break and must **not** be, since `bp` is not idempotent. Without one, neither
-  is known and the answer says so. Reported in both channels — a structured-aware client drops the
-  text — and it stays a
-  success rather than an error for that same reason: an error is the shape a caller retries. It
-  needed a note of its own rather than `told`'s, whose advice ends "scope it and retry", which here
-  is the one instruction that leaves two breakpoints.
+  `structured::BreakpointSet::cut_short`. An interrupted command comes back as an `Ok` run, so a
+  `bp` that never finished looked from the caller's side exactly like one that ran and matched
+  nothing — the same empty `added`, the same successful result, rendered as "(this call added
+  none)". The two have opposite next moves. The listing is a real engine read taken afterwards, so
+  `added` settles which happened — but only alongside `listed`, since an empty `added` is "nothing
+  was added" with a listing and "which of these is new is unknown" without one. With a listing:
+  empty means the expression is not set and can be retried, non-empty means it landed before the
+  break and must **not** be, since `bp` is not idempotent. Without one, neither is known and the
+  answer says so. Reported in both channels — a structured-aware client drops the text — and it
+  stays a success rather than an error for that same reason: an error is the shape a caller
+  retries.
+
+  **One field for both causes**, unlike a stop's `interrupted`/`timed_out` pair: the `interrupt`
+  tool reaches this command as readily as the deadline does and leaves the session in the same
+  state, so reading only the deadline reported an interrupted `bp` as a completed one — and on the
+  branch where the listing had also failed, as a breakpoint positively "set". A stop keeps the two
+  apart because the next move differs there; here it does not, and `added` answers what the cause
+  would only hint at.
 
 ### Added
 

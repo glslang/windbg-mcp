@@ -1174,10 +1174,16 @@ fn stop_resuming() {
 /// interrupting rather than ending the session, and a failure keeps its debugger text because
 /// "this is why it stopped" is not the same claim as "this is what it would have said".
 fn cut_short(result: Result<Output, Failed>) -> Result<Output, Failed> {
+    // Says what happened and stops short of prescribing a re-run, for [`told`]'s reason and on
+    // the other interruption path: this wraps *any* op, so it cannot see whether the one it is
+    // wrapping changed the target. It used to end "Re-run it — scoped more narrowly", which is
+    // right for the search it was written for and installs a second breakpoint when the op was a
+    // `bp`.
     const NOTE: &str = "[windbg-mcp] This operation was interrupted on request (Ctrl+Break) \
                         before it finished, so this is what it had reached, not a complete \
-                        result. Nothing about the target failed. Re-run it — scoped more \
-                        narrowly, if it was interrupted for taking too long.";
+                        result. Nothing about the target failed. Whatever it had already done \
+                        stands: a query can be narrowed and run again, while an operation that \
+                        changes the target may have done so before the break.";
     match result {
         // The note lands on the text and the typed payload is left as it was: the interruption is
         // a fact about this *call*, and rewriting an answer the engine did produce — a stop
@@ -3601,7 +3607,7 @@ fn brief(output: &str) -> String {
 /// said out loud rather than inferred. A watchdog break comes back as an `Ok` run carrying
 /// `cut_short`, so a command that never finished looks from here exactly like one that ran and
 /// matched nothing — same empty `added`, same successful result. It is reported as
-/// [`structured::BreakpointSet::timed_out`] in both channels rather than raised, for the reason
+/// [`structured::BreakpointSet::cut_short`] in both channels rather than raised, for the reason
 /// above: an error is the shape a caller retries, and a `bp` that *did* land before the break
 /// would then be set twice.
 fn set_breakpoint(e: &DebugEngine, expression: &str, budget_ms: u32) -> Result<Output, Failed> {
@@ -3621,13 +3627,19 @@ fn set_breakpoint(e: &DebugEngine, expression: &str, budget_ms: u32) -> Result<O
         .execute_command_bounded(&format!("bp {expression}"), budget_ms)
         .map_err(failed)?;
     // Kept rather than dropped with the rest of the run, because it is the one thing that makes
-    // the line below false. `told` is not the helper for it — its advice ("scope it and retry") is
-    // written for a query, and retrying a `bp` is how a caller ends up with two breakpoints — so
-    // the reason is carried into `render_breakpoints`, which already owns what this tool says
-    // about re-running itself.
-    let timed_out = matches!(run.cut_short, Some(Interruption::Deadline { .. }));
+    // the line below false. `told` is not the helper for it — its advice is written for a query,
+    // and retrying a `bp` is how a caller ends up with two breakpoints — so the reason is carried
+    // into `render_breakpoints`, which already owns what this tool says about re-running itself.
+    //
+    // **Any** interruption, not just the deadline. `Interruption::OnRequest` is the `interrupt`
+    // tool reaching this command, and it leaves the session in exactly the same state: a `bp` that
+    // did not finish and may or may not have installed anything. Reading only `Deadline` here
+    // reported that as a completed command — and on the branch where the listing also failed, as a
+    // breakpoint positively "set". The cause is not what a caller acts on; that the command did
+    // not finish is.
+    let cut_short = run.cut_short.is_some();
     let mut text = told_cut_short_bp(run);
-    // Past this point the breakpoint exists — *unless* `timed_out`, where the command was broken
+    // Past this point the breakpoint exists — *unless* `cut_short`, where the command was broken
     // in before it finished and may have got as far as creating one or not. The listing below is
     // read either way and is what settles it: it is a direct engine call taken after the fact, so
     // `added` reports what really happened rather than what the command intended.
@@ -3641,7 +3653,7 @@ fn set_breakpoint(e: &DebugEngine, expression: &str, budget_ms: u32) -> Result<O
             breakpoints: after.iter().map(structured::BreakpointInfo::from).collect(),
             listed: true,
             listing_error: None,
-            timed_out,
+            cut_short,
         },
         // The list read, but not the one before it — so what is set can be reported and which of
         // them is new cannot. `added` is empty because it is unknown, and `listed` says so.
@@ -3654,14 +3666,14 @@ fn set_breakpoint(e: &DebugEngine, expression: &str, budget_ms: u32) -> Result<O
                  breakpoints below is the new one is unknown"
                     .to_string(),
             ),
-            timed_out,
+            cut_short,
         },
         (Err(why), _) => structured::BreakpointSet {
             added: Vec::new(),
             breakpoints: Vec::new(),
             listed: false,
             listing_error: Some(why.to_string()),
-            timed_out,
+            cut_short,
         },
     };
     text.push_str(&render_breakpoints(&set));
@@ -3679,6 +3691,13 @@ fn set_breakpoint(e: &DebugEngine, expression: &str, budget_ms: u32) -> Result<O
 /// `target_gone` is not read, where [`told_moving`] reads it first: `bp` does not move the target,
 /// and an op reaching a session whose target has already left is refused before it gets here —
 /// `EngineOp::SetBreakpoint` is not among the exemptions in [`refuse_when_the_target_is_gone`].
+///
+/// **Only the deadline gets a note here, and that is not the same as ignoring an interrupt.**
+/// `Interruption::OnRequest` is explained by [`cut_short`], which wraps *every* op's result when a
+/// break was raised for it, so noting it again would say it twice. What the on-request case does
+/// need from this side is the **flag** — [`set_breakpoint`] sets `cut_short` from
+/// `run.cut_short.is_some()`, not from the deadline alone, because the listing's rendering has to
+/// know the command did not finish whatever stopped it.
 fn told_cut_short_bp(run: CommandRun) -> String {
     let note = match run.cut_short {
         Some(Interruption::Deadline { after_ms }) => Some(format!(
@@ -3700,7 +3719,7 @@ fn render_breakpoints(set: &structured::BreakpointSet) -> String {
         // The one thing this branch must not say when the command was cut short is that the
         // breakpoint is set: neither half of that is known here, since the command did not finish
         // *and* the list that would settle it could not be read.
-        if set.timed_out {
+        if set.cut_short {
             return format!(
                 "\nThe breakpoint command was interrupted before it finished, and the session's \
                  breakpoint list could not be read either: {}\n\nSo whether a breakpoint was set \
@@ -3729,7 +3748,7 @@ fn render_breakpoints(set: &structured::BreakpointSet) -> String {
     // the first can be retried. Branching on `added` alone would tell a caller whose listing failed
     // to re-request a breakpoint that may already be set, which is the double-set this tool warns
     // about everywhere else.
-    let interrupted = match (set.timed_out, set.listed, set.added.is_empty()) {
+    let interrupted = match (set.cut_short, set.listed, set.added.is_empty()) {
         (false, _, _) => String::new(),
         (true, false, _) => "\nThe `bp` was interrupted before it finished, and the breakpoints \
                              held before this call could not be read — so whether it was set is \
@@ -3748,7 +3767,7 @@ fn render_breakpoints(set: &structured::BreakpointSet) -> String {
     let mut out = format!(
         "{interrupted}\n{} breakpoint(s) set{}:\n",
         set.breakpoints.len(),
-        match (set.added.len(), set.timed_out) {
+        match (set.added.len(), set.cut_short) {
             (0, true) => " (this call added none — it was interrupted)".to_string(),
             (0, false) if set.listed => " (this call added none)".to_string(),
             (0, _) => String::new(),
@@ -5656,13 +5675,20 @@ mod tests {
     /// Codex on [#271](https://github.com/glslang/windbg-mcp/pull/271); the finding was right and
     /// this test is what stops the next one being found by review rather than by the build.
     ///
-    /// So the allowlist is enumerated rather than the exception. Every unbounded `execute_command`
-    /// left in this file is one of:
+    /// So the allowlist is enumerated rather than the exception, **by count and not by function**.
+    /// `execute` is the whole `EngineOp` dispatcher, so "is `execute` on the list" is a question
+    /// that stays answered however many commands are added to it; the number is what makes each
+    /// one somebody's decision. Every unbounded `execute_command` left in this file is one of:
     ///
-    /// - **`execute`'s opener arms** — `.load ext`, `vertarget`, `!ttdext.index -status`,
-    ///   `dx @$curprocess.TTD.Lifetime`, `r`. Fixed strings with no caller text in them, run once
-    ///   inside an open that is already bounded by `LOAD_WAIT_MS` on its wait half, and each is
-    ///   the *report* an opener answers with rather than work a caller asked for.
+    /// - **`execute`, seven** — six in the opener arms (`.load ext`, `vertarget`,
+    ///   `!ttdext.index -status`, `dx @$curprocess.TTD.Lifetime`, and `r` after an attach and
+    ///   after a launch): fixed strings with no caller text in them, run once inside an open that
+    ///   is already bounded by `LOAD_WAIT_MS` on its wait half, and each the *report* an opener
+    ///   answers with rather than work a caller asked for. The seventh is **not** an opener and
+    ///   the count is how you find it: `SymbolPath`'s `.sympath`, which echoes back the path just
+    ///   applied. Same argument — a fixed string, reading state this call has already changed —
+    ///   but it is an ordinary arm, so a reader who took "`execute`'s opener arms" at face value
+    ///   would be six for seven.
     /// - **`kernel_report`** — `.load kdexts` and `vertarget`, the same, for a kernel attach.
     /// - **`pump_a_resume`** — the `Execute` that sets the run state. Bounded by the pump that
     ///   follows it rather than by a watchdog, which is the whole shape of `EngineOp::Resume`:
@@ -5679,7 +5705,7 @@ mod tests {
     /// property is about what is *written*, and no runtime test can prove the absence of a call
     /// nobody made today.
     #[test]
-    fn every_unbounded_execute_in_this_worker_is_one_of_the_known_five() {
+    fn every_unbounded_execute_in_this_worker_is_accounted_for() {
         // Only the half that ships; the tests below run no engine, and this one names the thing
         // it searches for.
         let code = include_str!("worker.rs")
@@ -5687,7 +5713,11 @@ mod tests {
             .expect("this module has a test half")
             .0;
 
-        let mut callers = Vec::new();
+        // **Call sites, not functions.** Deduplicating by enclosing function would let a new
+        // `execute_command` inside an arm of `execute` — which is the whole `EngineOp` dispatcher,
+        // already allowlisted, and already holding seven — leave this list unchanged and the test
+        // green. The count is what makes each one a decision somebody took.
+        let mut sites: Vec<&str> = Vec::new();
         let mut enclosing = "<top level>";
         for line in code.lines() {
             // Every function in this file is at column 0; the closures inside them are not, and a
@@ -5698,24 +5728,28 @@ mod tests {
             // `execute_command_bounded` starts with the same text, so the open paren is what
             // tells the two apart — which is also why a zero budget is invisible here and is
             // `only_index_trace_runs_a_command_unbounded`'s half of the question.
-            if line.contains("execute_command(") && !callers.contains(&enclosing) {
-                callers.push(enclosing);
+            if line.contains("execute_command(") {
+                sites.push(enclosing);
             }
         }
-        callers.sort_unstable();
+        let mut counted: Vec<(&str, usize)> = Vec::new();
+        for site in sites {
+            match counted.iter_mut().find(|(name, _)| *name == site) {
+                Some((_, n)) => *n += 1,
+                None => counted.push((site, 1)),
+            }
+        }
+        counted.sort_unstable();
         assert_eq!(
-            callers,
+            counted,
             [
-                "execute",
-                "kernel_report",
-                "pump_a_resume",
-                "reachable",
-                "resolve",
+                ("execute", 7),
+                ("kernel_report", 2),
+                ("pump_a_resume", 1),
+                ("reachable", 2),
+                ("resolve", 1),
             ],
-            "an `Execute` with no watchdog is in a function this rule has not accounted for. \
-             Every command a tool's op runs is bounded on the caller's clock (DECISIONS.md, \
-             2026-08-02, revised 2026-08-31); the five above are the enumerated exceptions and \
-             the doc comment says why each one is one. Bound it, or add it here with its reason."
+            "an `Execute` with no watchdog is in a place this rule has not accounted for. Every              command a tool's op runs is bounded on the caller's clock (DECISIONS.md, 2026-08-02,              revised 2026-08-31); the sites above are the enumerated exceptions and the doc              comment says why each is one. Bound it, or add it here with its reason — including              when the count of an already-listed function goes up, which is a new unbounded              command inside a function that has some for other reasons."
         );
     }
 
@@ -7070,7 +7104,7 @@ mod tests {
             ],
             listed: true,
             listing_error: None,
-            timed_out: false,
+            cut_short: false,
         });
         assert!(out.contains("2 breakpoint(s) set"), "{out}");
         assert!(out.contains("1 added by this call"), "{out}");
@@ -7096,7 +7130,7 @@ mod tests {
             breakpoints: Vec::new(),
             listed: false,
             listing_error: Some("the engine refused: 0x80004005".to_string()),
-            timed_out: false,
+            cut_short: false,
         });
         assert!(out.contains("the breakpoint is set"), "{out}");
         assert!(out.contains("0x80004005"), "{out}");
@@ -7121,7 +7155,7 @@ mod tests {
             breakpoints: vec![breakpoint(0, Some("0x00007ffb6e6a0e10"))],
             listed: true,
             listing_error: None,
-            timed_out: true,
+            cut_short: true,
         });
         assert!(out.contains("interrupted"), "{out}");
         assert!(
@@ -7148,7 +7182,7 @@ mod tests {
             breakpoints: vec![breakpoint(1, None)],
             listed: true,
             listing_error: None,
-            timed_out: true,
+            cut_short: true,
         });
         assert!(out.contains("interrupted"), "{out}");
         assert!(
@@ -7177,7 +7211,7 @@ mod tests {
             breakpoints: vec![breakpoint(0, Some("0x00007ffb6e6a0e10"))],
             listed: false,
             listing_error: Some("the breakpoints held before this call could not be read".into()),
-            timed_out: true,
+            cut_short: true,
         });
         assert!(out.contains("unknown"), "{out}");
         assert!(
@@ -7200,7 +7234,7 @@ mod tests {
             breakpoints: Vec::new(),
             listed: false,
             listing_error: Some("the engine refused: 0x80004005".to_string()),
-            timed_out: true,
+            cut_short: true,
         });
         assert!(
             !out.contains("the breakpoint is set"),
