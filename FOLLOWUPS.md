@@ -3756,7 +3756,7 @@ an un-handled `end_session` would have taken the wrong session. Ending the newer
 retired one current, and an un-handled `end_session` released it.
 
 **Why it was deferred.** It was found by the session fuzz
-(`a_randomised_command_sequence_leaves_the_session_in_one_state_and_the_server_serving`, seed 2) on
+(`a_randomised_command_sequence_leaves_the_session_in_one_state_and_the_server_serving`) on
 the round-teardown path rather than in the fuzz's own oracle, and a test is the wrong place to
 decide what `end_session` should do about a handle the server has deliberately stopped honouring.
 There is a real argument for today's behaviour — the handle no longer names what it was issued for,
