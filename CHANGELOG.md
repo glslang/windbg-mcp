@@ -79,8 +79,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answering a different question. The entries move **in full and under the numbers they were filed
   with** — `CLAUDE.md`, `CHANGELOG.md`, `docs/*.md`, `ci.yml` and `build.rs` all cite them as
   "`FOLLOWUPS.md` item N", and those are prose references that renumbering would break without
-  failing anything — so `FOLLOWUPS.md`'s numbering is now sparse and its header says which numbers
-  went. Neither file is in the markdownlint globs, so neither is checked by CI.
+  failing anything — so `FOLLOWUPS.md`'s numbering is now sparse and its header is what answers
+  *which file*, above every entry. Neither file is in the markdownlint globs, so neither is checked
+  by CI.
+
+  **Citations are deliberately not retargeted**, and `every_followups_citation_names_an_item_that_exists`
+  is what makes that safe: it reads every text file in the repository and fails if a cited number is
+  in neither file, if a number is in both, or if `DONE.md`'s index has fallen out of step with its
+  entries. Some twenty files carry that string — doc comments in eleven modules and in `tests/`,
+  `DECISIONS.md`, every `docs/*.md`, `build.rs`, `ci.yml` and the eval tooling — so a citation whose
+  file half followed the entry would make every close a sweep of source comments, unchecked, and one
+  that had to be repeated on the next close. The number is the name; which file holds it is the
+  landing page's answer. Proved by breaking it three ways: an entry renumbered, an index line
+  dropped, and an anchor corrupted.
 
   Two shapes deliberately stayed: an item **measured and declined** (27, 35), where nothing was
   built and the reopening condition is the content, and one that **half** landed (50), whose entry

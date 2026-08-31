@@ -1689,12 +1689,24 @@ on #159 and #170, *"what is covered, what is not"* on #155.
   deferred, and where it picks up. Its header enumerates clusters and needs a line whenever an item
   is added.
 - **`DONE.md`** — the same entries once they land, kept in full and **under the number they were
-  filed with**, because `CLAUDE.md`, `CHANGELOG.md`, `ci.yml` and `build.rs` all cite them as
-  "`FOLLOWUPS.md` item N" and those references are prose that breaks silently. Closing an item is
-  therefore a *move*, plus the two header edits it implies: out of `FOLLOWUPS.md`'s cluster list
-  and its "items that have landed" line, into `DONE.md`'s index. An item that is **half** landed or
-  **measured and declined** stays put — the first because the entry narrows to what is left, the
-  second because nothing was built and the reopening condition is the content.
+  filed with**. Closing an item is therefore a *move*: out of `FOLLOWUPS.md`, out of its cluster
+  list, and into `DONE.md` **with an index line**, which is the only list of what has closed. An
+  item that is **half** landed or **measured and declined** stays put — the first because the entry
+  narrows to what is left, the second because nothing was built and the reopening condition is the
+  content.
+
+  **A citation is not retargeted, and that is a decision rather than an oversight.** Some twenty
+  files say "`FOLLOWUPS.md` item N" — doc comments in eleven modules and in `tests/`,
+  `CHANGELOG.md`, `DECISIONS.md`, every `docs/*.md`, `build.rs`, `ci.yml` and the eval tooling — so
+  a citation whose file half followed the entry would make every close a sweep of source comments,
+  unchecked, in a form that would have to be swept again next time. The number is the name;
+  `FOLLOWUPS.md`'s header answers *which file*, above every entry, for whoever followed one there.
+  What keeps that from rotting is a test rather than the rule:
+  `engine::every_followups_citation_names_an_item_that_exists` reads every text file in the
+  repository and fails if a cited number is in neither file, if one number is in both, or if
+  `DONE.md`'s index has fallen out of step with its own entries. It was raised as a review finding
+  on the split ([#270](https://github.com/glslang/windbg-mcp/pull/270)) with the sweep as its
+  proposed fix; the fact was right and the remedy was the expensive half of it.
 - **[`docs/smoke-test.md`](./docs/smoke-test.md)** — what each tier claims, per test, with budgets.
 
 Plus `CHANGELOG.md` and whichever `docs/*.md` the behaviour moved in.

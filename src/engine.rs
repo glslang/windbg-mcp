@@ -4268,6 +4268,209 @@ mod tests {
         );
     }
 
+    /// Every "`FOLLOWUPS.md` item N" citation in this repository names an item that exists, and
+    /// `DONE.md`'s index covers every entry in it.
+    ///
+    /// **A citation is deliberately not retargeted when an item closes**, which is what this test
+    /// exists to make safe. The string is spread over some twenty files — doc comments in eleven
+    /// modules and in `tests/`, `CHANGELOG.md`, `DECISIONS.md`, every `docs/*.md`, `build.rs`,
+    /// `ci.yml` and the eval tooling — so making the *file* half of a citation follow the entry
+    /// would turn closing an item into a sweep of source comments, with nothing to catch the ones
+    /// missed. "Item N" is the stable name; which of the two files holds it is what
+    /// `FOLLOWUPS.md`'s header answers, above every entry, for whoever followed a citation there.
+    /// So the invariant is not that a citation points at the right file — it is that the number it
+    /// names still exists, in one of the two, and can be reached from the landing page.
+    ///
+    /// Lines are joined before scanning because a citation wraps: in a doc comment the file name
+    /// sits on one line and `item 43` on the next. A range (`items 16–18`) checks its endpoints
+    /// only, which is enough for what can actually rot — an entry deleted or renumbered.
+    ///
+    /// The slug the index is checked against is GitHub's, for the ASCII headings this file has:
+    /// lower-case, drop all but letters, digits, spaces, `-` and `_`, then spaces to hyphens.
+    #[test]
+    fn every_followups_citation_names_an_item_that_exists() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let open = items_in(&root.join("FOLLOWUPS.md"));
+        let closed = items_in(&root.join("DONE.md"));
+        assert!(
+            !open.is_empty() && !closed.is_empty(),
+            "neither file parsed as items"
+        );
+
+        let both: Vec<_> = open.intersection(&closed).collect();
+        assert!(
+            both.is_empty(),
+            "these item numbers are in both FOLLOWUPS.md and DONE.md, so a citation resolves to \
+             two different entries: {both:?}"
+        );
+
+        let mut dangling = Vec::new();
+        let mut seen = 0;
+        for file in repo_text(&root) {
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            for n in cited_items(&text) {
+                seen += 1;
+                if !open.contains(&n) && !closed.contains(&n) {
+                    dangling.push(format!("{}: item {n}", file.display()));
+                }
+            }
+        }
+        assert!(
+            dangling.is_empty(),
+            "these cite a follow-up that is in neither FOLLOWUPS.md nor DONE.md — an entry was \
+             deleted or renumbered, and the citation cannot be followed: {dangling:?}"
+        );
+        assert!(
+            seen >= 60,
+            "found only {seen} citations, where this repository has of the order of a hundred — \
+             the scanner no longer matches, so this test is checking nothing"
+        );
+
+        // The landing page: a reader who followed a citation to FOLLOWUPS.md is sent here, so the
+        // index has to name everything the file holds, at an anchor that resolves.
+        let done = std::fs::read_to_string(root.join("DONE.md")).expect("read DONE.md");
+        let mut entries = std::collections::BTreeMap::new();
+        let mut indexed = std::collections::BTreeMap::new();
+        for line in done.lines() {
+            if let Some(title) = line.strip_prefix("## ")
+                && let Some(n) = leading_item_number(title)
+            {
+                entries.insert(n, anchor_of(title));
+            }
+            if let Some(rest) = line.strip_prefix("- [Item ")
+                && let Some((number, rest)) = rest.split_once("](#")
+                && let Some((anchor, _)) = rest.split_once(')')
+                && let Ok(n) = number.parse::<u32>()
+            {
+                indexed.insert(n, anchor.to_string());
+            }
+        }
+        assert_eq!(
+            entries.keys().collect::<Vec<_>>(),
+            indexed.keys().collect::<Vec<_>>(),
+            "DONE.md's index and its entries disagree — an entry moved in without an index line, \
+             or the other way round"
+        );
+        let broken: Vec<_> = indexed
+            .iter()
+            .filter(|(n, anchor)| entries.get(n) != Some(*anchor))
+            .map(|(n, anchor)| format!("item {n} -> #{anchor}"))
+            .collect();
+        assert!(
+            broken.is_empty(),
+            "these index links do not match the heading they name, so they resolve to nothing: \
+             {broken:?}"
+        );
+    }
+
+    /// The item numbers a follow-up file holds, read off its `## N.` headings.
+    fn items_in(path: &PathBuf) -> std::collections::BTreeSet<u32> {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        text.lines()
+            .filter_map(|line| line.strip_prefix("## ").and_then(leading_item_number))
+            .collect()
+    }
+
+    /// `12` from `12. [windbg-mcp] …`, and nothing from a heading that does not open with one.
+    fn leading_item_number(title: &str) -> Option<u32> {
+        let (number, _) = title.split_once('.')?;
+        number.parse().ok()
+    }
+
+    /// Item numbers cited beside `FOLLOWUPS.md` in one file's text.
+    fn cited_items(text: &str) -> Vec<u32> {
+        let mut flat = String::new();
+        for line in text.lines() {
+            let mut line = line.trim_start();
+            for sigil in ["///", "//!", "//", "#", "*", "-"] {
+                if let Some(rest) = line.strip_prefix(sigil) {
+                    line = rest.trim_start();
+                    break;
+                }
+            }
+            flat.push_str(line);
+            flat.push(' ');
+        }
+
+        let mut found = Vec::new();
+        for (at, _) in flat.to_lowercase().match_indices("followups") {
+            // A window rather than the rest of the line: far enough to clear a markdown link back
+            // to the file, short enough that the next sentence's "item" is not this citation's.
+            let window: String = flat[at..]
+                .chars()
+                .take(60)
+                .collect::<String>()
+                .to_lowercase();
+            let Some(after) = window.split_once("item") else {
+                continue;
+            };
+            found.extend(numbers_from(after.1));
+        }
+        found
+    }
+
+    /// The run of numbers opening a citation's tail: `s 13–14,` is 13 and 14, ` 24's` is 24, and
+    /// ` N` (the literal, in prose about the form) is none.
+    fn numbers_from(tail: &str) -> Vec<u32> {
+        let mut found = Vec::new();
+        let mut rest = tail;
+        loop {
+            let rest_at = rest.trim_start_matches([' ', 's', ',', '\u{2013}', '-']);
+            let rest_at = rest_at.strip_prefix("and ").unwrap_or(rest_at).trim_start();
+            let digits: String = rest_at.chars().take_while(char::is_ascii_digit).collect();
+            let Ok(n) = digits.parse() else {
+                return found;
+            };
+            found.push(n);
+            rest = &rest_at[digits.len()..];
+        }
+    }
+
+    /// GitHub's heading slug, for ASCII headings.
+    fn anchor_of(title: &str) -> String {
+        title
+            .chars()
+            .flat_map(char::to_lowercase)
+            .filter(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_'))
+            .map(|c| if c == ' ' { '-' } else { c })
+            .collect()
+    }
+
+    /// Every text file in the repository a citation could be written in — so one added to a new
+    /// module, a new document or a new script is checked rather than silently skipped.
+    fn repo_text(dir: &PathBuf) -> Vec<PathBuf> {
+        const READ: [&str; 8] = ["md", "rs", "py", "json", "toml", "yml", "yaml", "ps1"];
+        let mut found = Vec::new();
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                // `target` is enormous and holds copies of this crate's own source; a dotted
+                // directory is tooling, except the workflows, which cite items too.
+                if name == "target"
+                    || name == "node_modules"
+                    || (name.starts_with('.') && name != ".github")
+                {
+                    continue;
+                }
+                found.extend(repo_text(&path));
+            } else if path
+                .extension()
+                .is_some_and(|e| READ.iter().any(|r| e == *r))
+            {
+                found.push(path);
+            }
+        }
+        found
+    }
+
     /// Every `.rs` file under a directory, recursively — so a spawn added in a new submodule is
     /// checked rather than silently skipped.
     fn rust_sources(dir: &PathBuf) -> Vec<PathBuf> {
