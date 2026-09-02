@@ -70,8 +70,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `set_breakpoint` takes **`one_shot`**, which removes the breakpoint the first time it is hit.
   This was reachable before by putting `/1` in `expression`, and only because the expression was
   interpolated into `bp {expression}`: `/1` is not a location, so it could not survive the move to a
-  typed setter and has a parameter of its own. It costs 365 B of model-visible surface, the only
-  part of this change the model pays for.
+  typed setter and has a parameter of its own.
+- `set_breakpoint` also takes **`pass_count`**, `bp`'s trailing `Passes` argument, reachable
+  through `expression` before for the same reason. Its remaining options have no typed equivalent
+  and are not added: `/p`, `/c` and `/C` have no setter on the engine's breakpoint interface at
+  all, and `/t` takes an ETHREAD pointer where the engine's thread filter takes its own thread id —
+  a different thing rather than a spelling of it. A raw `bp` still reaches those. Together the two
+  parameters cost 839 B of model-visible surface, which is all the model pays for this change.
 
 - **Every raw command this server runs is now bounded, except `index_trace`** (`FOLLOWUPS.md`
   item 14). `threads`, `goto_position`, `driver_object`, `device_object`, `irp_stack` and

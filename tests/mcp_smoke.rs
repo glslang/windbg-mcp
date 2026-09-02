@@ -4712,6 +4712,21 @@ fn a_second_breakpoint_at_one_address_replaces_the_first_and_says_so() {
         once["breakpoint"]["one_shot"], true,
         "`one_shot` has to reach the engine, not just the request:\n{once}"
     );
+    // Same argument for the pass count, which `bp` took as a trailing argument and which was
+    // therefore reachable through `expression` for the same accidental reason.
+    let passes = server.tool_data(
+        "set_breakpoint",
+        json!({
+            "session_id": &session,
+            "expression": "ntdll!NtOpenFile",
+            "pass_count": 5,
+        }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        passes["breakpoint"]["pass_count"], 5,
+        "`pass_count` has to reach the engine:\n{passes}"
+    );
 
     let second = server.tool_data(
         "set_breakpoint",

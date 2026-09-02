@@ -251,6 +251,11 @@ pub enum EngineOp {
         /// location, so it cannot go there any more and has a parameter of its own.
         #[serde(default)]
         one_shot: bool,
+        /// Stop only on the nth arrival — `bp`'s trailing `Passes` argument, reachable through the
+        /// expression before for the same reason `/1` was. `None` and `Some(1)` are the same to
+        /// the engine.
+        #[serde(default)]
+        pass_count: Option<u32>,
         patience_ms: u32,
     },
     ReadMemory {
@@ -773,6 +778,7 @@ mod tests {
                 expression: "nt!KeBugCheckEx".into(),
                 command: None,
                 one_shot: false,
+                pass_count: None,
                 patience_ms: 0,
             },
             EngineOp::Pool {
