@@ -4949,7 +4949,12 @@ impl WindbgServer {
                 },
             )
             .await;
-        engine_result(out)
+        // `engine_result_for`, not `engine_result`: this tool routes by `session_id` like any
+        // other, so a failure that does not name the session it was aimed at is one a caller
+        // holding several cannot place. It answered with plain text before, where there was no
+        // field for it to go missing from; the typed result has one, and `set_breakpoint` — the
+        // same op, the same shape — has always filled it in.
+        engine_result_for(args.session_id.as_deref(), out)
     }
 
     /// Static, best-effort control-flow reachability: is the code block at `address`
