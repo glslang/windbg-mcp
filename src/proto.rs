@@ -232,7 +232,7 @@ pub enum EngineOp {
     ///
     /// **It keeps its `patience_ms`, and the reason is unchanged even though the command is gone.**
     /// A symbolic location is resolved *eagerly* by the engine — measured at 2445 ms for a cold
-    /// `KERNELBASE!CreateFileW` over `srv*`, against 6 ms warm — so the block moved from an
+    /// `KERNELBASE!CreateFileW` over `srv*`, against 151 ms warm — so the block moved from an
     /// `Execute` a watchdog could Ctrl+Break to a direct engine call, and the question was whether
     /// anything could still reach it. `SetInterrupt` can, which is what
     /// `DebugEngine::set_breakpoint_bounded` is built on, so the bound survived the move. Typed ops
