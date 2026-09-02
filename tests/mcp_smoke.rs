@@ -9066,6 +9066,71 @@ fn engine_pid_of(status: &Value, session_id: &str) -> u32 {
         .unwrap_or_else(|| panic!("`{session_id}` reports no engine pid: {session}")) as u32
 }
 
+/// The processes attached to this harness's console, or nothing when it has none.
+fn console_process_list() -> Vec<u32> {
+    use windows_sys::Win32::System::Console::GetConsoleProcessList;
+    let mut buf = vec![0u32; 64];
+    loop {
+        // SAFETY: a valid, writable buffer, described to the call at its true length.
+        let n = unsafe { GetConsoleProcessList(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+        if n == 0 {
+            return Vec::new(); // No console: `ERROR_INVALID_HANDLE`.
+        }
+        if n <= buf.len() {
+            buf.truncate(n);
+            return buf;
+        }
+        buf = vec![0u32; n];
+    }
+}
+
+/// A real session's engine worker opens **no console window of its own**
+/// ([#273](https://github.com/glslang/windbg-mcp/issues/273)).
+///
+/// A console-subsystem child of a console-*less* parent is given a brand-new, visible console,
+/// and a GUI MCP client starts this server without one — so on the hosts this is used from, every
+/// session open put a window on the desktop and took the foreground with it. The fix is a
+/// creation flag applied to a child that has no console to inherit, and `engine.rs` covers the
+/// flag itself and a stand-in spawned with it.
+///
+/// What only the shipped binary can say is that the worker `spawn_worker` actually creates — the
+/// supervisor re-executing its own image, several layers below any unit test — is in **this**
+/// console rather than one of its own. Which is also the assertion that refuses the obvious
+/// simplification: passing the flag unconditionally opens no window either, and silently takes
+/// the worker's stderr off the terminal with it.
+#[test]
+fn a_session_worker_opens_no_console_window_of_its_own() {
+    let Some(dump) = target_tier() else { return };
+    let ours = console_process_list();
+    if ours.is_empty() {
+        skip("this harness has no console, so a worker's console is windowless by construction");
+        return;
+    }
+
+    let mut server = Server::started();
+    let server_pid = server.child.id();
+    // The precondition, asserted rather than assumed: if the *server* did not inherit this
+    // console, nothing below is about the worker. It is the harness that spawned it, with no
+    // creation flags, so this failing means the shape of the test has moved.
+    assert!(
+        console_process_list().contains(&server_pid),
+        "the server ({server_pid}) is not in this harness's console, so this test cannot say \
+         anything about its worker"
+    );
+
+    let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+    let status = server.tool_data("session_status", json!({}), TARGET_STEP);
+    let worker = engine_pid_of(&status, &session);
+    let sharing = console_process_list();
+    assert!(
+        sharing.contains(&worker),
+        "the engine worker ({worker}) is not attached to this console ({sharing:?}), so it was \
+         given one of its own — which off a console-less parent is a visible window on the \
+         desktop, and which takes its stderr off the terminal either way"
+    );
+    ran("a session's engine worker shares this console rather than opening one");
+}
+
 /// Sessions are independent processes, so opening a second target must not disturb the first.
 ///
 /// Under the single-engine design this was impossible by construction — one process, one DbgEng

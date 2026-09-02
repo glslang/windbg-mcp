@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A session no longer opens a console window on the desktop.** Windows gives a console-subsystem
+  child of a console-*less* parent a brand-new, *visible* console — and a GUI MCP client starts a
+  stdio server without one — so every engine worker this server spawned put a window on the desktop,
+  titled with the exe's path and taking the foreground as it appeared. At the rate a model opens and
+  ends sessions (`MAX_SESSIONS` is 4, so a fifth open reclaims one) that is a machine nobody can
+  work at, which is [#273](https://github.com/glslang/windbg-mcp/issues/273). The worker and the
+  `TTD.exe` recorder are now spawned with `CREATE_NO_WINDOW`.
+
+  **Only when this process has no console of its own**, which is not a refinement but the whole of
+  it. The flag does not suppress a console — it suppresses the *window*, by giving the child a
+  console of its own — and a worker's stderr is *inherited*. A console handle passed to a process
+  attached to a different console is re-bound to that one: measured here, such a child's write
+  reports success, bytes written and no error, and the text lands in its own invisible console
+  rather than in the terminal. Applied unconditionally the flag would therefore delete every worker
+  log line from a terminal-run server, silently, and make the log ring's "they are still on the
+  server's stderr" untrue. So it goes on exactly where it changes something: with no console there
+  is nothing to inherit and nothing for stderr to lose (a pipe or a file is inherited unchanged),
+  and with one the worker shares it and opens no window anyway. `attached_to_a_console` asks
+  `GetConsoleProcessList` rather than `GetConsoleWindow`, which answers "no console" for a ConPTY —
+  Windows Terminal, and this repo's own harness — and would apply the flag to a worker holding a
+  live console handle.
+
+  Two assertions, and the unconditional version fails both: `engine.rs` checks that a child spawned
+  with a worker's flags **joins this process's console**, and the debugger tier checks the same of a
+  real session's engine pid, read from `session_status`. A *debuggee* launched by `launch` gets its
+  window from DbgEng rather than from here; that is
+  [dbgscope#129](https://github.com/glslang/dbgscope/issues/129), fixed there.
+
 - **A session handle that a raw `execute` retired can still end its own session.** `qd`, `q`,
   `.detach`, `.kill` and `.opendump` release or replace the target, which *retires* the handle
   naming that session: every later call supplying it is refused, while the worker stays live and
