@@ -36,6 +36,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot};
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+use windows_sys::Win32::System::Console::GetConsoleProcessList;
 
 use crate::kdconn;
 use crate::proto::{EngineOp, Output, SymbolPathSetting, WorkerMessage, WorkerRequest};
@@ -166,6 +167,60 @@ fn release_handoff(
 /// With the flag, Ctrl+C is disabled for the worker's group. The supervisor still dies, its handles
 /// still close, and the worker meets the EOF path that knows how to let go.
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+
+/// `CREATE_NO_WINDOW`, passed only to a child this process has no console to hand down.
+///
+/// A console-subsystem child spawned with neither this flag nor `CREATE_NEW_CONSOLE` inherits its
+/// parent's console — and where the parent has **none**, Windows gives the child a brand-new,
+/// *visible* one instead, titled with the exe's path and taking the foreground as it appears. A
+/// GUI MCP client has no console to pass on, so on the hosts this server is actually used from,
+/// every worker spawn opened a window; at the rate a model opens and ends sessions that is a
+/// desktop nobody can work at ([#273](https://github.com/glslang/windbg-mcp/issues/273)).
+///
+/// **It is conditional because the flag does not suppress a console — it suppresses the window,
+/// by giving the child a console of its own**, and a worker's stderr is *inherited*
+/// ([`spawn_worker`]). A console handle handed to a process attached to a different console is
+/// re-bound to that one: measured on this bench, such a child's `WriteFile` reports success —
+/// bytes written, no error — and the text lands in its own invisible console instead of in the
+/// terminal, while a child that inherits the console writes where the operator is looking.
+/// Applied unconditionally this would therefore delete every worker log line from a terminal-run
+/// server, silently, and make [`crate::logbridge`]'s "they are still on the server's stderr"
+/// untrue.
+///
+/// So it goes on exactly where it changes something. With no console there is nothing to inherit
+/// and nothing for stderr to lose — it is a pipe or a file, which is inherited unchanged
+/// (measured) — and with one, the worker shares it and opens no window anyway.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// [`CREATE_NO_WINDOW`] when this process has no console, and no flag at all when it has one.
+///
+/// Shared with [`crate::ttd::record_launch`], the other process this server creates: a recorder
+/// window is the same window, and the recorded target inherits whatever console the recorder was
+/// given.
+pub(crate) fn without_a_console_window() -> u32 {
+    if attached_to_a_console() {
+        0
+    } else {
+        CREATE_NO_WINDOW
+    }
+}
+
+/// Whether this process is attached to a console at all.
+///
+/// **Not `GetConsoleWindow() != NULL`**, which is the usual spelling of this question and is
+/// wrong here: a console with no window is an ordinary thing — a ConPTY (Windows Terminal, and
+/// this repo's own test harness) has none, and neither has a console created by
+/// [`CREATE_NO_WINDOW`] one level up — so that call answers "no console" for a process holding a
+/// live console handle, which is the one case where passing the flag on costs something.
+/// `GetConsoleProcessList` counts the processes sharing this process's console and fails with
+/// `ERROR_INVALID_HANDLE` when there is no console; both halves measured on this bench.
+fn attached_to_a_console() -> bool {
+    // The count, not the identifiers: a buffer too small for all of them is not a failure — the
+    // call answers how many there are and stores none — so one element is enough to ask with.
+    let mut one = [0u32; 1];
+    // SAFETY: a valid, writable one-element buffer, described to the call as one element.
+    unsafe { GetConsoleProcessList(one.as_mut_ptr(), 1) != 0 }
+}
 
 /// Counter behind [`mint_session_id`]. Only needs to be unique within this process.
 static SESSION_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -3624,7 +3679,12 @@ fn spawn_worker(
         // Which is why the worker also gets its own process group: see
         // [`CREATE_NEW_PROCESS_GROUP`]. EOF cannot be the teardown if a console Ctrl+C ends the
         // worker before its channel ever closes.
-        .creation_flags(CREATE_NEW_PROCESS_GROUP)
+        //
+        // And [`without_a_console_window`], which is nothing at all when this process has a
+        // console to hand down — the two flags are independent, and the Ctrl+C guarantee rests on
+        // the group rather than on a side effect of the other, which is documented as ignored for
+        // a child that is not a console application.
+        .creation_flags(CREATE_NEW_PROCESS_GROUP | without_a_console_window())
         .spawn()?;
     // Explicitly, and before the lock is released rather than at the end of the function: the
     // child has its copies, and these are the ones that would otherwise stay inheritable — and
@@ -4173,13 +4233,18 @@ mod tests {
         let (mut child, channel) =
             spawn_worker(Path::new("cmd.exe"), None).expect("spawn a stand-in worker");
         let mut stdout = child.stdout.take().expect("a worker's stdout is piped");
-        let mut printed = String::new();
-        tokio::time::timeout(Duration::from_secs(10), stdout.read_to_string(&mut printed))
+        // **Bytes, not a `String`.** `cmd.exe` writes its banner in the code page of whatever
+        // console it ended up attached to, which is the *host's* business and not this test's: on
+        // a system whose OEM code page is GBK the banner is not UTF-8, and reading it as one fails
+        // the test for a property it does not hold an opinion about. What is under test is whether
+        // those bytes reached the protocol channel.
+        let mut printed = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), stdout.read_to_end(&mut printed))
             .await
             .expect("the stand-in's stdout closed within 10s")
             .expect("read the stand-in's stdout");
         assert!(
-            !printed.trim().is_empty(),
+            printed.iter().any(|b| !b.is_ascii_whitespace()),
             "the stand-in printed nothing to stdout, so this test would pass whatever the \
              channel did with it"
         );
@@ -4198,6 +4263,91 @@ mod tests {
              supervisor's own copy of the child's end left open looks like"
         );
         let _ = child.wait().await;
+    }
+
+    /// The processes attached to this process's console, or nothing when it has none.
+    fn console_process_list() -> Vec<u32> {
+        let mut buf = vec![0u32; 64];
+        loop {
+            // SAFETY: a valid, writable buffer, described to the call at its true length.
+            let n = unsafe { GetConsoleProcessList(buf.as_mut_ptr(), buf.len() as u32) } as usize;
+            if n == 0 {
+                return Vec::new(); // No console: `ERROR_INVALID_HANDLE`.
+            }
+            if n <= buf.len() {
+                buf.truncate(n);
+                return buf;
+            }
+            // Too small — the call stored nothing and answered how many there are.
+            buf = vec![0u32; n];
+        }
+    }
+
+    /// A child spawned the way a worker is opens **no console window of its own**, and the half of
+    /// that with teeth is the console branch.
+    ///
+    /// Passing `CREATE_NO_WINDOW` unconditionally also leaves no window anywhere, so a test that
+    /// only looked for a window would wave through the simplification this conditional exists to
+    /// refuse — and that simplification silently sends a worker's stderr to a console nobody is
+    /// looking at ([`CREATE_NO_WINDOW`]). So where this process has a console, the assertion is
+    /// that the child **joined it**, which is what keeps its log lines in the terminal.
+    ///
+    /// Spawned here rather than through [`spawn_worker`] for one reason only: a stand-in handed a
+    /// worker's command line exits in milliseconds, and this has to read a list the child is still
+    /// in. The shipped call site is asserted end to end by `mcp_smoke`, against a real session's
+    /// engine pid.
+    #[tokio::test]
+    async fn a_worker_shares_this_processs_console_or_gets_a_windowless_one() {
+        let flags = without_a_console_window();
+        if console_process_list().is_empty() {
+            assert_eq!(
+                flags, CREATE_NO_WINDOW,
+                "with no console to inherit, a worker would be given a brand-new visible one"
+            );
+            eprintln!(
+                "SKIPPED: this process has no console, so there is no sharing to observe — the \
+                 flag is asserted instead"
+            );
+            return;
+        }
+
+        assert_eq!(
+            flags, 0,
+            "a console this process can hand down is one the worker must inherit, so that its              stderr keeps reaching the terminal"
+        );
+
+        let mut child = {
+            let _one_spawn_at_a_time = spawn_guard();
+            Command::new("cmd")
+                .args(["/c", "ping", "-n", "30", "127.0.0.1"])
+                .stdout(Stdio::null())
+                .kill_on_drop(true)
+                .creation_flags(CREATE_NEW_PROCESS_GROUP | flags)
+                .spawn()
+                .expect("spawn a stand-in child")
+        };
+        let pid = child.id().expect("a freshly spawned child has a pid");
+
+        // Polled: a child joins its console during its own startup, not when `CreateProcess`
+        // returns, so the list can legitimately not name it yet.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let joined = loop {
+            if console_process_list().contains(&pid) {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let _ = child.kill().await;
+        assert!(
+            joined,
+            "pid {pid} never appeared in this process's console ({:?}), so it opened a console of \
+             its own — which off a console-bearing parent is a visible window, and takes the \
+             worker's stderr with it",
+            console_process_list()
+        );
     }
 
     /// The rule [`SPAWN_LOCK`] rests on, checked against the source rather than asserted in a doc

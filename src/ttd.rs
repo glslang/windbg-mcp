@@ -4,6 +4,7 @@
 //! standalone recorder). Replay of the resulting `.run` trace is done through the
 //! normal engine path ([`crate::engine`] → `open_trace`).
 
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime};
@@ -231,7 +232,13 @@ pub fn record_launch(
         .arg("-launch")
         .args(&argv)
         .stdout(Stdio::from(log))
-        .stderr(Stdio::from(log_err));
+        .stderr(Stdio::from(log_err))
+        // The same rule as a worker's, and here it covers two processes: the recorder, and the
+        // target *it* launches with the console it was given. Nothing is lost by it either way —
+        // both halves of this recorder's output are the log file above, which is inherited as a
+        // handle whatever console the process ends up in. See
+        // [`crate::engine::without_a_console_window`].
+        .creation_flags(crate::engine::without_a_console_window());
     // Configured kernel connections do not reach the recorder. TTD.exe launches `target` with
     // this environment inherited, and the recorded target is an arbitrary binary — frequently the
     // least trustworthy program on the machine, which is usually *why* it is being recorded. Same

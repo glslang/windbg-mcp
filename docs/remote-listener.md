@@ -489,6 +489,17 @@ because the SCM registers a service once and a bad credential then fails it at e
 `windbg-mcp.exe --uninstall-service` removes it, stopping it first and waiting for it — a delete
 issued against a running service only marks it, and this one has debug targets to let go of.
 
+**A service also puts the whole server tree in session 0, where nothing it starts can reach your
+desktop.** That is worth knowing because a debugger starts processes it does not control the windows
+of: a launched debuggee's own GUI, an extension DLL, `TTD.exe`'s recorded target. Session 0 has no
+interactive window station, so a window any of them opens is invisible and cannot take the
+foreground — which was the complaint in
+[#273](https://github.com/glslang/windbg-mcp/issues/273), where every session opened a console
+window on the desktop. The windows this server and its engine were themselves responsible for are
+fixed in the code and need none of this. What a service adds is the rest of the class, and the cost
+is the same isolation seen from the other side: a `launch`ed debuggee runs in session 0 too, so it
+cannot show a window to you or read one from your desktop.
+
 **Upgrading means replacing the exe *and restarting* — and running the client commands from the
 binary the service actually runs.** The credential file gained a shape in 0.11.0 that an earlier
 service refuses (an entry that is an object, carrying a client's `--tools` beside its token), so a

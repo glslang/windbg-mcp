@@ -506,6 +506,14 @@ processes, so they need real ones:
 - *No worker outlives the connection.* Reads the engine pid out of `session_status`, disconnects,
   and checks the process is gone — otherwise every disconnect leaks a debugger process, and for a
   launch or an attach, a debuggee with it.
+- *No worker opens a console window of its own.* Reads the same engine pid and checks it is in
+  **this harness's** console process list. A console child of a console-*less* parent is given a
+  brand-new visible console, which is what a GUI MCP client's server spawns for every session
+  ([#273](https://github.com/glslang/windbg-mcp/issues/273)) — so the fix is a creation flag
+  applied only where there is no console to inherit, and this is the assertion that refuses the
+  simpler unconditional version: that one opens no window either, and silently moves a worker's
+  stderr to a console nobody reads. It stands down on a harness with no console, where the flag is
+  applied and there is no sharing to observe; `engine.rs` covers that branch.
 - *A batch commits or fails, and its rollback runs either way.* `src/batch.rs` proves the executor
   over a scripted debuggee; this proves the wiring — argument schema, the op crossing the pipe, the
   engine seam, the report coming back — by running one batch to `COMMITTED` (with a capture bound

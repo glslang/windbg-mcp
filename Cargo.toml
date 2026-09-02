@@ -10,7 +10,7 @@ repository = "https://github.com/glslang/windbg-mcp"
 license = "MIT"
 
 [dependencies]
-dbgscope = { git = "https://github.com/glslang/dbgscope", rev = "879cbb1f5a5b15a0cdeaca41930c1420ea32b24a" }
+dbgscope = { git = "https://github.com/glslang/dbgscope", rev = "c97d70f27bfbddab016fa9448d4096b84592ff8c" }
 # 3.1.1 is a floor, not a preference: every 3.x before it generates a `tools/list` that omits
 # SEP-2549's required `ttlMs`/`cacheScope`, which a spec-strict `2026-07-28` client rejects
 # outright — the server connects and appears to expose no tools at all (upstream issue #1114).
@@ -49,6 +49,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
+    # `GetConsoleProcessList`, which is how `engine::attached_to_a_console` answers whether a
+    # child this server spawns has a console to inherit — and therefore whether it would open a
+    # window of its own. The obvious `GetConsoleWindow` is in the same feature and is the wrong
+    # call: a ConPTY console has no window (issue #273).
+    "Win32_System_Console",
     "Win32_System_Threading",
     # `IsWow64Process2`, which is how `src/target.rs` reads the architecture of a *live* process
     # before a worker is spawned for it. The call itself is in `Win32_System_Threading` above; this
@@ -75,7 +80,12 @@ winresource = { version = "0.1", default-features = false }
 # resource back off the exe it just built. A dev-dependency rather than a feature on the entry
 # above: the edition-2024 resolver does not unify these into a normal build, so the shipped
 # binary's `windows-sys` surface is unchanged by a test wanting to check the metadata.
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Storage_FileSystem",
+    # `GetConsoleProcessList`, so the debugger tier can assert that a real session's engine
+    # worker is attached to *this* console rather than one of its own (issue #273).
+    "Win32_System_Console",
+] }
 # `test-util` only, and only for the tests: `src/progress.rs` asserts on a heartbeat measured in
 # tens of seconds, and the alternative — real sleeps shrunk to milliseconds — is a test that fails
 # on a loaded runner for reasons that have nothing to do with the code. A paused clock makes the
