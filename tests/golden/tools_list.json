@@ -1343,6 +1343,7 @@
       },
       "params": [
         "expression: string",
+        "one_shot: boolean|null",
         "session_id: string|null"
       ],
       "required": [

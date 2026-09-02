@@ -67,6 +67,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depth rather than as the only defence.
 - A breakpoint's **watched region** is reported where it has one — `watch: {access, size}` for a
   data breakpoint, which the read side could previously say only that a breakpoint *was*.
+- `set_breakpoint` takes **`one_shot`**, which removes the breakpoint the first time it is hit.
+  This was reachable before by putting `/1` in `expression`, and only because the expression was
+  interpolated into `bp {expression}`: `/1` is not a location, so it could not survive the move to a
+  typed setter and has a parameter of its own. It costs 365 B of model-visible surface, the only
+  part of this change the model pays for.
 
 - **Every raw command this server runs is now bounded, except `index_trace`** (`FOLLOWUPS.md`
   item 14). `threads`, `goto_position`, `driver_object`, `device_object`, `irp_stack` and

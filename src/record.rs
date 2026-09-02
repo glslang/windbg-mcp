@@ -789,7 +789,14 @@ fn derived(call: &InFlight, data: &Value, limit: usize) -> Vec<Event> {
                 stopped_at: run.stopped_at,
             }]
         }
-        "set_breakpoint" => {
+        // **Both tools, because both install a breakpoint and both now report the same shape.**
+        // `ioctl_trace` used to answer with whatever its `bp` printed — nothing, on success — so
+        // there was no value here to record; it goes through the same typed op now, and a
+        // transcript that recorded only `set_breakpoint` would omit a logging breakpoint armed on
+        // a live kernel, and the ids it replaced, while the response describes both. Keyed on the
+        // tool name rather than on the payload's shape for the reason every arm here is: the name
+        // is what a reader greps.
+        "set_breakpoint" | "ioctl_trace" => {
             let Some(set) = typed::<BreakpointSet>(data) else {
                 return Vec::new();
             };

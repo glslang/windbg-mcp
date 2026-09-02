@@ -1593,11 +1593,13 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         EngineOp::SetBreakpoint {
             expression,
             command,
+            one_shot,
             patience_ms,
         } => set_breakpoint(
             e,
             &expression,
             command.as_deref(),
+            one_shot,
             watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), queued),
         ),
         EngineOp::ReadMemory { address, size } => read_memory(e, &address, size)
@@ -3622,12 +3624,16 @@ fn set_breakpoint(
     e: &DebugEngine,
     expression: &str,
     command: Option<&str>,
+    one_shot: bool,
     budget_ms: u32,
 ) -> Result<Output, Failed> {
     let mut spec =
         BreakpointSpec::code(BreakpointAt::Expression(expression.to_string())).replacing_existing();
     if let Some(command) = command {
         spec = spec.with_command(command);
+    }
+    if one_shot {
+        spec = spec.one_shot();
     }
     // Bounded, and the bound is still real after the move off the text path: a symbolic location
     // is resolved eagerly, so `nt!Foo+0x10` on a module whose PDB is not local is a symbol-server

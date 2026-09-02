@@ -244,6 +244,13 @@ pub enum EngineOp {
         /// `ioctl_trace` is what needs it.
         #[serde(default)]
         command: Option<String>,
+        /// Remove itself the first time it is hit — `bp /1`, as a flag.
+        ///
+        /// It was reachable before this op was typed, by putting `/1` in the expression, which
+        /// worked only because the expression was interpolated into a command line. `/1` is not a
+        /// location, so it cannot go there any more and has a parameter of its own.
+        #[serde(default)]
+        one_shot: bool,
         patience_ms: u32,
     },
     ReadMemory {
@@ -765,6 +772,7 @@ mod tests {
             EngineOp::SetBreakpoint {
                 expression: "nt!KeBugCheckEx".into(),
                 command: None,
+                one_shot: false,
                 patience_ms: 0,
             },
             EngineOp::Pool {
