@@ -4286,6 +4286,12 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<BreakpointArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        // **Defence in depth since dbgscope#126, where it used to be the only defence.** The
+        // expression reaches the engine as a parameter now rather than being interpolated into
+        // `bp <expression>`, so a `;` in it separates nothing and a `"` opens nothing — there is no
+        // command line for it to break out of. It is kept because an operand carrying either is
+        // still far more likely to be a mistake than an intent, and refusing it early says so
+        // better than a debugger error would.
         if let Err(e) = reject_command_breakers("expression", &args.expression, Quotes::Rejected) {
             return typed_error(ErrorCategory::InvalidArgument, e, args.session_id);
         }
@@ -4294,6 +4300,7 @@ impl WindbgServer {
                 args.session_id.as_deref(),
                 EngineOp::SetBreakpoint {
                     expression: args.expression,
+                    command: None,
                     patience_ms: 0,
                 },
             )
@@ -4871,13 +4878,21 @@ impl WindbgServer {
     /// needs no hand-assembled offsets. Reads the current IO_STACK_LOCATION via
     /// `poi(@rdx+0xb8)` (x64); confirm the offset with `dt nt!_IRP` / `dt nt!_IO_STACK_LOCATION`
     /// on the target. Requires a real KDNET/VM target — a local kernel cannot set code bp's.
-    #[rmcp::tool(annotations(
-        title = "Trace dispatched IOCTLs",
-        read_only_hint = false,
-        destructive_hint = false,
-        idempotent_hint = false,
-        open_world_hint = true
-    ))]
+    // The output schema is not decoration here: routing this through `EngineOp::SetBreakpoint`
+    // makes it answer with `structuredContent`, and a structured-aware client **replaces** the
+    // text block with it (`docs/token-budget.md`). A tool that sends one without declaring a
+    // schema hands those clients an undeclared shape and takes their text away; declaring it is
+    // what makes the two halves the same answer. `FOLLOWUPS.md` item 57.
+    #[rmcp::tool(
+        annotations(
+            title = "Trace dispatched IOCTLs",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::BreakpointSet>>()
+    )]
     async fn ioctl_trace(
         &self,
         Parameters(args): Parameters<IoctlTraceArgs>,
@@ -4888,16 +4903,22 @@ impl WindbgServer {
         // IRP in @rdx at dispatch entry (x64). CurrentStackLocation = poi(Irp+0xb8).
         // Within IO_STACK_LOCATION: OutputBufferLength +0x08, InputBufferLength +0x10,
         // IoControlCode +0x18 (Parameters union begins at +0x08).
-        let cmd = format!(
-            "bp {} \".printf \\\"IOCTL %08x in=%x out=%x\\\\n\\\", \
-             dwo(poi(@rdx+0xb8)+0x18), dwo(poi(@rdx+0xb8)+0x10), dwo(poi(@rdx+0xb8)+0x08); gc\"",
-            args.dispatch
-        );
+        //
+        // **Written plainly since dbgscope#126.** This was a `bp <dispatch> "…"` built as one
+        // string, so the command had to survive being a quoted argument inside a `;`-separated
+        // command line: every `"` was `\\\"` and the newline `\\\\n`, hand-escaped in a format
+        // string, and `dispatch` had to be screened for the same two characters because an operand
+        // carrying one would have closed the quote and appended a command of the caller's
+        // choosing. As a parameter it needs none of that — the engine takes it through
+        // `SetCommand`, where nothing is parsed — so what is written here is what runs.
+        let command = ".printf \"IOCTL %08x in=%x out=%x\\n\", dwo(poi(@rdx+0xb8)+0x18), \
+                       dwo(poi(@rdx+0xb8)+0x10), dwo(poi(@rdx+0xb8)+0x08); gc";
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::BoundedCommand {
-                    command: cmd,
+                EngineOp::SetBreakpoint {
+                    expression: args.dispatch,
+                    command: Some(command.to_string()),
                     patience_ms: 0,
                 },
             )

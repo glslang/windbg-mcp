@@ -222,8 +222,8 @@
       "inputSchema": 532,
       "modelVisible": 1006,
       "name": "ioctl_trace",
-      "outputSchema": 0,
-      "wire": 1145
+      "outputSchema": 2538,
+      "wire": 3699
     },
     {
       "annotations": 76,
@@ -384,8 +384,8 @@
       "inputSchema": 467,
       "modelVisible": 852,
       "name": "set_breakpoint",
-      "outputSchema": 2342,
-      "wire": 3340
+      "outputSchema": 2538,
+      "wire": 3536
     },
     {
       "annotations": 123,
@@ -493,10 +493,10 @@
     "inputSchema": 43816,
     "instructions": 1983,
     "modelVisible": 75547,
-    "outputSchema": 112774,
-    "payload": 195590,
+    "outputSchema": 115508,
+    "payload": 198340,
     "tools": 54,
-    "wire": 195469,
+    "wire": 198219,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }
