@@ -1344,6 +1344,7 @@
       "params": [
         "expression: string",
         "one_shot: boolean|null",
+        "pass_count: integer|null/uint32",
         "session_id: string|null"
       ],
       "required": [

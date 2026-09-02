@@ -1784,6 +1784,14 @@ pub struct BreakpointArgs {
     /// location, so it goes here instead.
     #[serde(default)]
     pub one_shot: Option<bool>,
+    /// Stop only on the nth arrival: 1 (the default) stops every time, 5 stops on the fifth.
+    ///
+    /// `bp`'s trailing `Passes` argument. Its remaining options have no typed equivalent — `/p`,
+    /// `/c` and `/C` have no setter on the engine's breakpoint interface, and `/t` takes an
+    /// ETHREAD where the engine's filter takes a thread id — so a raw `bp` is still the way to
+    /// reach those.
+    #[serde(default)]
+    pub pass_count: Option<u32>,
     /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
     /// session and be refused if its target was replaced or closed.
     #[serde(default)]
@@ -4309,6 +4317,7 @@ impl WindbgServer {
                     expression: args.expression,
                     command: None,
                     one_shot: args.one_shot.unwrap_or(false),
+                    pass_count: args.pass_count,
                     patience_ms: 0,
                 },
             )
@@ -4932,8 +4941,10 @@ impl WindbgServer {
                 EngineOp::SetBreakpoint {
                     expression: args.dispatch,
                     command: Some(command.to_string()),
-                    // A trace wants every hit; a one-shot would log one IOCTL and disarm.
+                    // A trace wants every hit; a one-shot would log one IOCTL and disarm, and a
+                    // pass count would skip the first n.
                     one_shot: false,
+                    pass_count: None,
                     patience_ms: 0,
                 },
             )
