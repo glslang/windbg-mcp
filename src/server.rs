@@ -1777,6 +1777,13 @@ pub struct DxArgs {
 pub struct BreakpointArgs {
     /// Breakpoint location: symbol, address, or expression (e.g. "nt!NtCreateFile").
     pub expression: String,
+    /// Remove the breakpoint the first time it is hit, so it stops the target once.
+    ///
+    /// This is `bp /1` as a parameter. It used to be reachable by putting `/1` in `expression`,
+    /// which worked only because the location was interpolated into a command line; it is not a
+    /// location, so it goes here instead.
+    #[serde(default)]
+    pub one_shot: Option<bool>,
     /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
     /// session and be refused if its target was replaced or closed.
     #[serde(default)]
@@ -4301,6 +4308,7 @@ impl WindbgServer {
                 EngineOp::SetBreakpoint {
                     expression: args.expression,
                     command: None,
+                    one_shot: args.one_shot.unwrap_or(false),
                     patience_ms: 0,
                 },
             )
@@ -4897,8 +4905,13 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<IoctlTraceArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        // `typed_error`, not `tool_error`, because this tool declares an `outputSchema` now: a
+        // refusal is still an answer, and a schema-validating client is entitled to
+        // `structuredContent` on every one. The engine-side refusals already carried it — they
+        // come back through `engine_result` — so this early return was the one path that did not,
+        // which is exactly the shape a test driving the tool with no session cannot reach.
         if let Err(e) = reject_command_breakers("dispatch", &args.dispatch, Quotes::Rejected) {
-            return tool_error(e);
+            return typed_error(ErrorCategory::InvalidArgument, e, args.session_id);
         }
         // IRP in @rdx at dispatch entry (x64). CurrentStackLocation = poi(Irp+0xb8).
         // Within IO_STACK_LOCATION: OutputBufferLength +0x08, InputBufferLength +0x10,
@@ -4919,6 +4932,8 @@ impl WindbgServer {
                 EngineOp::SetBreakpoint {
                     expression: args.dispatch,
                     command: Some(command.to_string()),
+                    // A trace wants every hit; a one-shot would log one IOCTL and disarm.
+                    one_shot: false,
                     patience_ms: 0,
                 },
             )

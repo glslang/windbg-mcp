@@ -4694,6 +4694,25 @@ fn a_second_breakpoint_at_one_address_replaces_the_first_and_says_so() {
         "the breakpoint just set should be in the session's listing:\n{first}"
     );
 
+    // `one_shot` is a parameter now, and it has to actually reach the engine. It was reachable
+    // before by putting `/1` in the expression — which worked only because the expression was
+    // interpolated into `bp {expression}` — so a typed setter that dropped it would be a silent
+    // regression for anyone using that form. Asserted against the engine's read-back, not against
+    // the argument going in.
+    let once = server.tool_data(
+        "set_breakpoint",
+        json!({
+            "session_id": &session,
+            "expression": "ntdll!NtClose",
+            "one_shot": true,
+        }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        once["breakpoint"]["one_shot"], true,
+        "`one_shot` has to reach the engine, not just the request:\n{once}"
+    );
+
     let second = server.tool_data(
         "set_breakpoint",
         json!({ "session_id": &session, "expression": expression }),
