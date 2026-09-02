@@ -33,7 +33,7 @@
 //! can ask for the same thing, and the binding ([`Running`]) that decides *which job* the request
 //! reaches. See `AGENTS.md` and the `DECISIONS.md` entry for the invariant and its boundary.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, PipeReader, PipeWriter, Write};
 use std::num::NonZeroUsize;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
@@ -43,7 +43,10 @@ use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use dbgscope::dbgeng::{CommandRun, DebugEngine, InterruptHandle, Interruption, RunToOutcome};
+use dbgscope::dbgeng::{
+    BreakpointAt, BreakpointSpec, CommandRun, DebugEngine, InterruptHandle, Interruption,
+    RunToOutcome,
+};
 use dbgscope::heap::{self as heap_query, HeapAllocation, HeapBackend, HeapState, HeapWalk};
 use dbgscope::pool::query::{self, PoolPageFilter, PoolWalk};
 use dbgscope::pool::{
@@ -1589,10 +1592,12 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         }
         EngineOp::SetBreakpoint {
             expression,
+            command,
             patience_ms,
         } => set_breakpoint(
             e,
             &expression,
+            command.as_deref(),
             watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), queued),
         ),
         EngineOp::ReadMemory { address, size } => read_memory(e, &address, size)
@@ -1858,15 +1863,16 @@ fn failed<E: ToString>(e: E) -> Failed {
 /// end "scope it and retry", written for the unbounded `s` search that the bounded path was
 /// adopted for — advice that is right for a query and actively harmful for a mutation, since a
 /// `bp` cut short may have installed its breakpoint already and re-running it installs a second.
-/// The reach of that is wider than it looks: `ioctl_trace` builds a `bp` with a logging command
-/// string, a `debug_batch` step is any command at all, and `dx` can execute one. A caller that
-/// knows its own command is a query still gets the scoping hint; nobody gets told to re-issue a
-/// mutation.
+/// The reach of that is wider than it looks: a `debug_batch` step is any command at all, and `dx`
+/// can execute one. A caller that knows its own command is a query still gets the scoping hint;
+/// nobody gets told to re-issue a mutation.
 ///
-/// The one path that *can* say more is the one that reads the target afterwards —
-/// [`set_breakpoint`] diffs the breakpoint list and so knows whether the mutation landed, which is
-/// why it has [`told_cut_short_bp`] instead of this. That is the shape to copy for any other
-/// mutating command that grows a typed op.
+/// The one path that *can* say more is the one that knows what its mutation did — [`set_breakpoint`]
+/// is handed the breakpoint by the engine, so it can say whether the location resolved and tailor
+/// the advice to that, which is why it has [`told_cut_short_bp`] instead of this. That is the shape
+/// to copy for any other mutating command that grows a typed op. (`ioctl_trace` used to be listed
+/// here as a `bp` with a logging command string; it goes through that typed op now, so it gets the
+/// better note rather than this one.)
 fn told(run: CommandRun) -> String {
     let note = match run.cut_short {
         Some(Interruption::Deadline { after_ms }) => Some(format!(
@@ -3584,219 +3590,169 @@ fn brief(output: &str) -> String {
     line.chars().take(160).collect()
 }
 
-/// Sets a breakpoint and reports what the session holds afterwards.
+/// Sets a breakpoint and reports it, plus what the session holds afterwards.
 ///
-/// The ids are diffed across the `bp` rather than assumed, because `bp` is not the only thing
-/// that can produce one: a command string on an existing breakpoint can add another, and DbgEng
-/// reuses ids freed by a `bc`. Diffing says what *this call* did; guessing "the highest id" would
-/// be right until the first time it was not.
+/// **The id comes from the engine now, not from a diff.** This used to run `bp <expression>` and
+/// subtract the breakpoint list either side of it, because a successful `bp` prints nothing at all
+/// and there was no other way to learn what it had done. `set_breakpoint_bounded` hands back the
+/// breakpoint it created, so the id, the address and whether it deferred are read off the object
+/// itself. The diff went, and with it the whole degraded mode where the "before" read failed and
+/// `added` was empty because it was *unknown* rather than empty — a distinction that needed two
+/// fields and four paragraphs to explain and now cannot arise.
 ///
-/// A successful `bp` prints nothing at all, so the text alone cannot distinguish "set" from
-/// "silently did nothing" — which is the gap this fills, in **both** channels: the listing is
-/// rendered into the text too, or a client that reads only text is left with the empty string
-/// this was meant to fix.
+/// **`Replace`, deliberately, because that is what `bp` did.** The engine deduplicates nothing:
+/// two typed sets at one address leave two breakpoints, both armed, and both *activate* on the one
+/// stop — so each runs its command, and removing one by id leaves the address armed by the other.
+/// `bp` resolves and then removes what is already there, printing `breakpoint N redefined`. Since
+/// this tool's callers have always had that behaviour, keeping it is the change-free choice, and
+/// [`structured::BreakpointSet::replaced`] is the line of debugger text turned into a value.
 ///
-/// **Only the `bp` itself can fail this call.** The listing either side of it is an inspection,
-/// and an inspection that fails after a mutation must not be reported as the mutation failing:
-/// the breakpoint is set, and a caller who retries on that error sets a second one. So a listing
-/// failure comes back as a success that says the listing is missing —
-/// [`structured::BreakpointSet::listed`] — which is the same distinction `OpenError::PostCommit`
-/// draws for an opener, at a much smaller scale.
+/// **The listing is still read, and is now unable to lie about the mutation.** It is an inspection
+/// taken after the fact, best-effort: if it fails, `breakpoints` is empty and nothing else in the
+/// result moves, because the breakpoint this call set is reported from the engine's own object
+/// rather than by finding it in that list. The rule it used to need — an inspection that fails
+/// after a mutation must not be reported as the mutation failing — is now a property of the shape
+/// instead of a comment on a field.
 ///
-/// **And the `bp` can end without failing**, which is the third state and the one that has to be
-/// said out loud rather than inferred. A watchdog break comes back as an `Ok` run carrying
-/// `cut_short`, so a command that never finished looks from here exactly like one that ran and
-/// matched nothing — same empty `added`, same successful result. It is reported as
-/// [`structured::BreakpointSet::cut_short`] in both channels rather than raised, for the reason
-/// above: an error is the shape a caller retries.
-///
-/// **`bp` is not idempotent, and the half of that which is true is the half that matters here.**
-/// Measured on a live target 2026-08-31: a *resolved* expression is deduplicated by the engine —
-/// `bp ntdll!NtCreateFile` three times, and `ntdll!NtClose+0x2` twice, each leave **one**
-/// breakpoint, because a resolved breakpoint is keyed by address — while a **deferred** one is
-/// not: `bp nosuchmod!Sym` twice leaves **two**, since there is no address to key on. So a retry
-/// duplicates exactly when the expression does not resolve, which is the same condition that
-/// makes a `bp` slow enough to be cut short in the first place. That is why the warnings here are
-/// worth their words rather than being conservative boilerplate — and why they warn instead of
-/// asserting that a retry is safe, which for a resolved expression it happens to be.
-fn set_breakpoint(e: &DebugEngine, expression: &str, budget_ms: u32) -> Result<Output, Failed> {
-    // Best-effort, and taken first: a session whose breakpoint list cannot be read must still be
-    // able to set a breakpoint, so this cannot be a `?`.
-    let before: Option<HashSet<u32>> = e
+/// **What survives unchanged is `cut_short`**, and the reason it is not an error. A break leaves
+/// the breakpoint set and its location possibly unresolved, and an error is the shape a caller
+/// retries — which here means a second breakpoint, since a deferred expression has no address to
+/// deduplicate on. `render_breakpoints` is where that is explained to a human.
+fn set_breakpoint(
+    e: &DebugEngine,
+    expression: &str,
+    command: Option<&str>,
+    budget_ms: u32,
+) -> Result<Output, Failed> {
+    let mut spec =
+        BreakpointSpec::code(BreakpointAt::Expression(expression.to_string())).replacing_existing();
+    if let Some(command) = command {
+        spec = spec.with_command(command);
+    }
+    // Bounded, and the bound is still real after the move off the text path: a symbolic location
+    // is resolved eagerly, so `nt!Foo+0x10` on a module whose PDB is not local is a symbol-server
+    // fetch with this session's engine held for all of it — 2445 ms measured for a cold
+    // `KERNELBASE!CreateFileW`. `SetInterrupt` reaches that resolve, which is what makes this a
+    // bound rather than a promise.
+    let done = e.set_breakpoint_bounded(&spec, budget_ms).map_err(failed)?;
+    // Best-effort and deliberately not a `?`: the breakpoint is set, and a session whose list
+    // cannot be read must not have that reported as the set having failed.
+    let breakpoints = e
         .breakpoints()
-        .ok()
-        .map(|held| held.iter().map(|breakpoint| breakpoint.id).collect());
-    // Bounded on the caller's clock, like every other command this server runs. The address is
-    // the caller's text and `bp` makes the evaluator resolve it, so `bp nt!Foo+0x10` against a
-    // deferred module with a `srv*` path is a symbol-server fetch — minutes, with this session's
-    // engine held for all of them. That it sits inside a *typed* op is why it was missed when the
-    // rest moved onto the bounded path (`DECISIONS.md`, 2026-08-02, revised 2026-08-31): nothing
-    // about the op said "there is a command in here".
-    let run = e
-        .execute_command_bounded(&format!("bp {expression}"), budget_ms)
-        .map_err(failed)?;
-    // Kept rather than dropped with the rest of the run, because it is the one thing that makes
-    // the line below false. `told` is not the helper for it — its advice is written for a query,
-    // and retrying a `bp` is how a caller ends up with two breakpoints — so the reason is carried
-    // into `render_breakpoints`, which already owns what this tool says about re-running itself.
-    //
-    // **Any** interruption, not just the deadline. `Interruption::OnRequest` is the `interrupt`
-    // tool reaching this command, and it leaves the session in exactly the same state: a `bp` that
-    // did not finish and may or may not have installed anything. Reading only `Deadline` here
-    // reported that as a completed command — and on the branch where the listing also failed, as a
-    // breakpoint positively "set". The cause is not what a caller acts on; that the command did
-    // not finish is.
-    let cut_short = run.cut_short.is_some();
-    let mut text = told_cut_short_bp(run);
-    // Past this point the breakpoint exists — *unless* `cut_short`, where the command was broken
-    // in before it finished and may have got as far as creating one or not. The listing below is
-    // read either way and is what settles it: it is a direct engine call taken after the fact, so
-    // `added` reports what really happened rather than what the command intended.
-    let set = match (e.breakpoints(), before) {
-        (Ok(after), Some(before)) => structured::BreakpointSet {
-            added: after
-                .iter()
-                .map(|breakpoint| breakpoint.id)
-                .filter(|id| !before.contains(id))
-                .collect(),
-            breakpoints: after.iter().map(structured::BreakpointInfo::from).collect(),
-            listed: true,
-            listing_error: None,
-            cut_short,
-        },
-        // The list read, but not the one before it — so what is set can be reported and which of
-        // them is new cannot. `added` is empty because it is unknown, and `listed` says so.
-        (Ok(after), None) => structured::BreakpointSet {
-            added: Vec::new(),
-            breakpoints: after.iter().map(structured::BreakpointInfo::from).collect(),
-            listed: false,
-            listing_error: Some(
-                "the breakpoints held before this call could not be read, so which of the \
-                 breakpoints below is the new one is unknown"
-                    .to_string(),
-            ),
-            cut_short,
-        },
-        (Err(why), _) => structured::BreakpointSet {
-            added: Vec::new(),
-            breakpoints: Vec::new(),
-            listed: false,
-            listing_error: Some(why.to_string()),
-            cut_short,
-        },
+        .map(|held| held.iter().map(structured::BreakpointInfo::from).collect())
+        .unwrap_or_default();
+    let set = structured::BreakpointSet {
+        breakpoint: structured::BreakpointInfo::from(&done.breakpoint),
+        replaced: done.replaced,
+        breakpoints,
+        cut_short: done.cut_short.is_some(),
     };
+    let mut text = told_cut_short_bp(done.cut_short);
     text.push_str(&render_breakpoints(&set));
     Ok(Output::typed(text, set))
 }
 
-/// [`told`] for a `bp`, where the same deadline means the same thing and its advice does not.
+/// [`told`] for a breakpoint, where the same deadline means the same thing and its advice does not.
 ///
 /// `told` tells the caller to scope the query and retry, which is right for a search and wrong
-/// twice over here: there is nothing to scope in a symbol, and `bp` is not idempotent, so a retry
-/// is exactly the move that leaves two breakpoints where the caller wanted one. What replaces it
-/// is in [`render_breakpoints`], which can see the *listing* and so can say whether a retry is
-/// safe rather than guessing. This keeps the fact and the timing.
-///
-/// `target_gone` is not read, where [`told_moving`] reads it first: `bp` does not move the target,
-/// and an op reaching a session whose target has already left is refused before it gets here —
-/// `EngineOp::SetBreakpoint` is not among the exemptions in [`refuse_when_the_target_is_gone`].
+/// twice over here: there is nothing to scope in a symbol, and setting a breakpoint is not
+/// idempotent, so a retry is exactly the move that leaves two where the caller wanted one. What
+/// replaces it is in [`render_breakpoints`], which can see whether the location resolved and so can
+/// say whether a retry is safe rather than guessing. This keeps the fact and the timing.
 ///
 /// **Only the deadline gets a note here, and that is not the same as ignoring an interrupt.**
 /// `Interruption::OnRequest` is explained by [`cut_short`], which wraps *every* op's result when a
 /// break was raised for it, so noting it again would say it twice. What the on-request case does
 /// need from this side is the **flag** — [`set_breakpoint`] sets `cut_short` from
-/// `run.cut_short.is_some()`, not from the deadline alone, because the listing's rendering has to
-/// know the command did not finish whatever stopped it.
-fn told_cut_short_bp(run: CommandRun) -> String {
-    let note = match run.cut_short {
-        Some(Interruption::Deadline { after_ms }) => Some(format!(
-            "[windbg-mcp] the `bp` command did not finish within {after_ms} ms, so the debugger \
-             broke it in (Ctrl+Break). Resolving the expression is what takes this long — a \
-             symbol whose module has to be fetched from a symbol server."
-        )),
-        _ => None,
-    };
-    appended(run.output, note)
+/// `Option::is_some`, not from the deadline alone, because the rendering has to know the resolve
+/// did not finish whatever stopped it.
+///
+/// It takes the interruption rather than a `CommandRun` because there is no command any more:
+/// there is no debugger text to append a note to, so the note is the whole of what this returns.
+fn told_cut_short_bp(cut_short: Option<Interruption>) -> String {
+    match cut_short {
+        Some(Interruption::Deadline { after_ms }) => format!(
+            "[windbg-mcp] resolving the breakpoint's location did not finish within {after_ms} ms, \
+             so the debugger broke in (Ctrl+Break). A symbol whose module has to be fetched from a \
+             symbol server is what takes this long; the module is left on export symbols and needs \
+             reloading rather than another attempt at this call.\n"
+        ),
+        _ => String::new(),
+    }
 }
 
 /// Renders what a `set_breakpoint` left the session holding, for the text channel.
 ///
-/// Appended to the command's own output rather than replacing it: `bp` prints nothing when it
-/// succeeds and an error when it does not, and both are worth keeping.
+/// The whole of the text channel now, rather than an appendix to the debugger's own output: there
+/// is no command, so there is nothing the engine printed to keep.
 fn render_breakpoints(set: &structured::BreakpointSet) -> String {
-    if !set.listed && set.breakpoints.is_empty() {
-        // The one thing this branch must not say when the command was cut short is that the
-        // breakpoint is set: neither half of that is known here, since the command did not finish
-        // *and* the list that would settle it could not be read.
-        if set.cut_short {
-            return format!(
-                "\nThe breakpoint command was interrupted before it finished, and the session's \
-                 breakpoint list could not be read either: {}\n\nSo whether a breakpoint was set \
-                 is **unknown**. Do not re-run this call to find out — `bp` is not idempotent and \
-                 a second call sets a second breakpoint. Use `execute {{ \"command\": \"bl\" }}` \
-                 first.\n",
-                set.listing_error.as_deref().unwrap_or("no reason given")
-            );
-        }
-        return format!(
-            "\nThe breakpoint command ran and the breakpoint is set, but the session's breakpoint \
-             list could not be read: {}\n\nDo **not** re-run this call to find out what it did — \
-             `bp` is not idempotent and a second call sets a second breakpoint. Use `execute \
-             {{ \"command\": \"bl\" }}` instead.\n",
-            set.listing_error.as_deref().unwrap_or("no reason given")
-        );
-    }
-    // What a cut-short run means depends entirely on whether anything was added, and the listing
-    // above is what says which — so the sentence is built here rather than beside the command.
-    // Without it `added: []` renders as "(this call added none)", which reads as an expression
-    // that matched nothing and is the one thing this was not.
-    //
-    // `listed` is read before `added`, and that order is the whole correctness of this. An empty
-    // `added` means two opposite things: with a listing it is "this call added nothing", and
-    // without one it is "which of these is new is **unknown**" — the case where the *before* read
-    // failed. Branching on `added` alone would tell a caller whose listing failed to re-request a
-    // breakpoint that may already be set.
-    //
-    // And even *with* a listing, "added nothing" is not "the expression is not set": a `bp` at an
-    // address that already carries one adds no id. Measured on a live target 2026-08-31 —
-    // `bp ntdll!NtCreateFile` three times leaves one breakpoint, and `ntdll!NtClose+0x2` twice
-    // leaves one — because the engine keys a resolved breakpoint by address. So this branch
-    // reports what the diff actually says and lets the listing under it answer the rest.
-    let interrupted = match (set.cut_short, set.listed, set.added.is_empty()) {
-        (false, _, _) => String::new(),
-        (true, false, _) => "\nThe `bp` was interrupted before it finished, and the breakpoints \
-                             held before this call could not be read — so whether it was set is \
-                             **unknown**. Do **not** re-request it; `execute { \"command\": \
-                             \"bl\" }` is how to find out what is there.\n"
-            .to_string(),
-        (true, true, true) => {
-            "\nThe `bp` was interrupted before it finished and **this call added \
-                               nothing**. Read the listing below before re-requesting it: an \
-                               expression that already had a breakpoint also adds nothing, and \
-                               only if it is absent there was it really not set.\n"
-                .to_string()
-        }
-        (true, true, false) => "\nThe `bp` was interrupted before it finished, but it had already \
-                                taken effect: the breakpoint marked * below is this call's. Do \
-                                **not** re-request it — a second call sets a second breakpoint.\n"
-            .to_string(),
-    };
+    // **One sentence about this call, and it is never conditional on the listing.** The four-way
+    // match this replaces existed because an empty `added` meant four different things and only the
+    // listing could separate them; the engine now names the breakpoint it created, so what this
+    // call did is known before the listing is read and cannot be contradicted by it failing.
+    let bp = &set.breakpoint;
     let mut out = format!(
-        "{interrupted}\n{} breakpoint(s) set{}:\n",
-        set.breakpoints.len(),
-        match (set.added.len(), set.cut_short) {
-            (0, true) => " (this call added none — it was interrupted)".to_string(),
-            (0, false) if set.listed => " (this call added none)".to_string(),
-            (0, _) => String::new(),
-            (n, _) => format!(" ({n} added by this call, marked *)"),
-        }
+        "\nBreakpoint {} set at {}{}.\n",
+        bp.id,
+        bp.address
+            .as_deref()
+            .or(bp.expression.as_deref())
+            .unwrap_or("an unresolved location"),
+        if bp.deferred {
+            " — deferred, so it has no address until its module loads"
+        } else {
+            ""
+        },
     );
+    if !set.replaced.is_empty() {
+        // The replacement is worth saying out loud rather than leaving in a field: a caller who
+        // had a *logging* breakpoint at this address has just lost it, and would otherwise notice
+        // only when the log stopped.
+        out.push_str(&format!(
+            "It replaced {} already at that address ({}), which is what `bp` does.\n",
+            match set.replaced.len() {
+                1 => "the breakpoint".to_string(),
+                n => format!("the {n} breakpoints"),
+            },
+            set.replaced
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    if set.cut_short {
+        // Says what is uncertain and what is not, because the two used to be one question. The
+        // breakpoint is set — that is not in doubt any more — and only its *location* is.
+        out.push_str(if bp.deferred {
+            "\nResolving its location was interrupted, and it is **deferred**: it has no address \
+             yet. Do **not** re-request it — the breakpoint above is set, and a second call would \
+             set a second one, which for a deferred location the engine cannot deduplicate.\n"
+        } else {
+            "\nResolving its location was interrupted, but it did resolve — the address above is \
+             where it will fire. Do **not** re-request it.\n"
+        });
+    }
+    if set.breakpoints.is_empty() {
+        // Distinguished from "the session holds none", which is impossible here: this call just
+        // set one. So an empty listing is a failed inspection, and says so rather than rendering
+        // as an empty table.
+        out.push_str(
+            "\nThe session's full breakpoint list could not be read, which says nothing about the \
+             breakpoint above.\n",
+        );
+        return out;
+    }
+    out.push_str(&format!(
+        "\nThe session now holds {} breakpoint(s) (this call's marked *):\n",
+        set.breakpoints.len(),
+    ));
     for breakpoint in &set.breakpoints {
         // Trimmed at the end, because the columns are padded for alignment and the last one on a
         // row is usually empty — trailing spaces on every line of a tool result are noise.
         let row = format!(
             "{} {:<3} {:<18} {:<9}{}{}",
-            if set.added.contains(&breakpoint.id) {
+            if breakpoint.id == set.breakpoint.id {
                 "*"
             } else {
                 " "
@@ -3823,9 +3779,6 @@ fn render_breakpoints(set: &structured::BreakpointSet) -> String {
         );
         out.push_str(row.trim_end());
         out.push('\n');
-    }
-    if let Some(why) = &set.listing_error {
-        out.push_str(&format!("\nNote: {why}.\n"));
     }
     out
 }
@@ -5692,6 +5645,12 @@ mod tests {
     /// Codex on [#271](https://github.com/glslang/windbg-mcp/pull/271); the finding was right and
     /// this test is what stops the next one being found by review rather than by the build.
     ///
+    /// **That op runs no command at all now** (dbgscope#126), which does not retire this test and
+    /// is the reason worth keeping: reading why `set_breakpoint` ran a command led to finding that
+    /// its stated reason — `bp`'s syntax — was unreachable through the tool, and the op became a
+    /// typed setter. A count that only ever went up would have missed that; what this asserts is
+    /// the *set*, so a site leaving it is as visible as one arriving.
+    ///
     /// So the allowlist is enumerated rather than the exception, **by count and not by function**.
     /// `execute` is the whole `EngineOp` dispatcher, so "is `execute` on the list" is a question
     /// that stays answered however many commands are added to it; the number is what makes each
@@ -7099,6 +7058,7 @@ mod tests {
             address: address.map(str::to_string),
             expression: address.is_none().then(|| "nosuchmod!Sym".to_string()),
             command: None,
+            watch: None,
             thread: None,
             enabled: true,
             deferred: address.is_none(),
@@ -7108,191 +7068,127 @@ mod tests {
         }
     }
 
-    /// A successful `bp` prints **nothing**, so a text-only client saw an empty result and could
-    /// not tell it from silence. The listing goes into the text as well as into the typed answer,
-    /// or the fix only reaches half the clients it was written for.
+    fn breakpoint_set(
+        set: structured::BreakpointInfo,
+        breakpoints: Vec<structured::BreakpointInfo>,
+    ) -> structured::BreakpointSet {
+        structured::BreakpointSet {
+            breakpoint: set,
+            replaced: Vec::new(),
+            breakpoints,
+            cut_short: false,
+        }
+    }
+
+    /// Setting a breakpoint printed **nothing**, so a text-only client saw an empty result and
+    /// could not tell it from silence. The answer goes into the text as well as into the typed
+    /// half, or the fix only reaches half the clients it was written for.
     #[test]
     fn a_breakpoint_that_was_set_says_so_in_the_text_too() {
-        let out = render_breakpoints(&structured::BreakpointSet {
-            added: vec![1],
-            breakpoints: vec![
+        let out = render_breakpoints(&breakpoint_set(
+            breakpoint(1, None),
+            vec![
                 breakpoint(0, Some("0x00007ffb6e6a0e10")),
                 breakpoint(1, None),
             ],
-            listed: true,
-            listing_error: None,
-            cut_short: false,
-        });
-        assert!(out.contains("2 breakpoint(s) set"), "{out}");
-        assert!(out.contains("1 added by this call"), "{out}");
-        // The new one is marked, and the deferred one says it has no address rather than
-        // printing a zero — which would name the null page as where it will fire.
-        assert!(out.lines().any(|l| l.starts_with("* 1")), "{out}");
-        assert!(out.lines().any(|l| l.starts_with("  0")), "{out}");
+        ));
+        assert!(out.contains("Breakpoint 1 set"), "{out}");
+        assert!(out.contains("deferred"), "{out}");
+        assert!(out.contains("0x00007ffb6e6a0e10"), "{out}");
+        // The one this call set is marked in the listing, so a caller reading the table can find
+        // it without comparing ids by eye.
         assert!(
-            out.contains("(unresolved)") && out.contains("nosuchmod!Sym"),
-            "{out}"
+            out.lines().any(|line| line.starts_with("* 1")),
+            "this call's breakpoint should be marked in the listing: {out}"
         );
     }
 
-    /// A listing that failed *after* the `bp` must not read as a breakpoint that was not set.
+    /// A listing that failed must not read as a breakpoint that was not set.
     ///
-    /// This is the whole reason that case is a success rather than an error: `bp` is not
-    /// idempotent, so a caller who reads "failed" and retries ends up with two breakpoints. The
-    /// text has to say both things — it is set, and do not re-run this to find out what it did.
+    /// **This used to need saying and now cannot be got wrong**, which is the point of asserting
+    /// it here rather than dropping the test with the fields it was written against. The listing
+    /// was once the *only* source of what a call had done — the id came from diffing `bl` either
+    /// side — so a failed read meant an unknown outcome and two fields (`listed`,
+    /// `listing_error`) existed to say so. The engine now hands back the breakpoint it created,
+    /// so the mutation and the inspection are different fields and a failure in one cannot reach
+    /// the other.
     #[test]
-    fn a_listing_that_failed_after_the_bp_still_says_the_breakpoint_is_set() {
-        let out = render_breakpoints(&structured::BreakpointSet {
-            added: Vec::new(),
-            breakpoints: Vec::new(),
-            listed: false,
-            listing_error: Some("the engine refused: 0x80004005".to_string()),
-            cut_short: false,
-        });
-        assert!(out.contains("the breakpoint is set"), "{out}");
-        assert!(out.contains("0x80004005"), "{out}");
+    fn a_listing_that_failed_still_says_the_breakpoint_is_set() {
+        let out = render_breakpoints(&breakpoint_set(
+            breakpoint(3, Some("0x00007ffb6e6a0e10")),
+            Vec::new(),
+        ));
+        assert!(out.contains("Breakpoint 3 set"), "{out}");
+        assert!(out.contains("0x00007ffb6e6a0e10"), "{out}");
         assert!(
-            out.contains("second breakpoint"),
-            "must warn against the retry: {out}"
+            out.contains("could not be read"),
+            "the missing listing should be explained rather than rendered as an empty table: {out}"
+        );
+        // And it must not invite the recovery that sets a second breakpoint.
+        assert!(
+            !out.to_ascii_lowercase().contains("re-run"),
+            "nothing here is unknown, so nothing should suggest running it again: {out}"
         );
     }
 
-    /// A `bp` cut short by the watchdog is an `Ok` run, so nothing about the result *shape* says
-    /// it did not finish — and the default rendering of an empty `added` is "(this call added
-    /// none)", which is the sentence for an expression that matched nothing. The two states have
-    /// opposite next moves and must not share a sentence.
+    /// A replacement is told to the caller, not left in a field.
     ///
-    /// Reachable exactly where the bound was added for: `watchdog_budget_ms` floors at
-    /// `WATCHDOG_HEADROOM`, so this needs a `bp` still resolving fifteen seconds in, which is a
-    /// symbol whose module is being fetched from a symbol server.
+    /// Setting a breakpoint where one already is *removes* it — that is what `bp` does, and what
+    /// this tool has always done — and the caller most affected is the one whose old breakpoint
+    /// carried a command: an `ioctl_trace` log that stops with nothing to say why. It was a
+    /// `breakpoint N redefined` line in debugger text before and is a value now, so the rendering
+    /// is what puts it back in front of a human.
     #[test]
-    fn an_interrupted_bp_that_added_nothing_does_not_read_as_one_that_matched_nothing() {
-        let out = render_breakpoints(&structured::BreakpointSet {
-            added: Vec::new(),
-            breakpoints: vec![breakpoint(0, Some("0x00007ffb6e6a0e10"))],
-            listed: true,
-            listing_error: None,
-            cut_short: true,
-        });
+    fn a_breakpoint_that_replaced_others_says_which() {
+        let mut set = breakpoint_set(
+            breakpoint(4, Some("0x00007ffb6e6a0e10")),
+            vec![breakpoint(4, Some("0x00007ffb6e6a0e10"))],
+        );
+        set.replaced = vec![1, 2];
+        let out = render_breakpoints(&set);
+        assert!(out.contains("replaced"), "{out}");
+        assert!(out.contains('1') && out.contains('2'), "{out}");
+    }
+
+    /// Cut short and **resolved**: the location got an address, so the only thing to say is not to
+    /// ask again.
+    ///
+    /// A break leaves an `Ok` result carrying a breakpoint, so nothing about the shape says the
+    /// resolve did not finish. What changed with the typed setter is that this is no longer
+    /// ambiguous — the breakpoint is known set either way, and only its *location* was ever in
+    /// question.
+    #[test]
+    fn an_interrupted_set_that_resolved_says_where_it_landed_and_not_to_retry() {
+        let mut set = breakpoint_set(
+            breakpoint(2, Some("0x00007ffb6e6a0e10")),
+            vec![breakpoint(2, Some("0x00007ffb6e6a0e10"))],
+        );
+        set.cut_short = true;
+        let out = render_breakpoints(&set);
         assert!(out.contains("interrupted"), "{out}");
+        assert!(out.contains("it did resolve"), "{out}");
         assert!(
-            out.contains("this call added nothing"),
-            "the caller has to be told the command did not get that far: {out}"
+            out.contains("**not** re-request"),
+            "a retry sets a second breakpoint: {out}"
         );
-        // And *not* that the expression is unset, which the diff cannot say: a `bp` at an address
-        // that already carries one adds no id either (measured). The listing settles it.
-        assert!(
-            !out.contains("is not set"),
-            "an empty diff is not evidence the expression is unset: {out}"
-        );
-        assert!(
-            out.contains("Read the listing below"),
-            "so the caller is sent to the one thing that does answer it: {out}"
-        );
-        // The pre-existing breakpoint is still listed, and is not claimed as this call's.
-        assert!(out.lines().any(|l| l.starts_with("  0")), "{out}");
     }
 
-    /// The other half, and the one where the advice inverts: the break landed *after* the
-    /// breakpoint was created, so the mutation happened and a retry sets a second one.
+    /// Cut short and **deferred**: the same interruption, and the advice has more force.
     ///
-    /// This is why `told` is not the helper for a cut-short `bp` — its note ends "scope it and
-    /// retry", which here is the one instruction that damages the session.
+    /// The engine deduplicates a resolved location by address, so a retry there is merely wasteful;
+    /// a deferred one has no address to key on, so a retry genuinely leaves two breakpoints. The
+    /// two states must not share a sentence, and the deferred one is the one that has to warn.
     #[test]
-    fn an_interrupted_bp_that_still_landed_says_not_to_retry() {
-        let out = render_breakpoints(&structured::BreakpointSet {
-            added: vec![1],
-            breakpoints: vec![breakpoint(1, None)],
-            listed: true,
-            listing_error: None,
-            cut_short: true,
-        });
+    fn an_interrupted_set_that_deferred_warns_that_a_retry_would_duplicate() {
+        let mut set = breakpoint_set(breakpoint(2, None), vec![breakpoint(2, None)]);
+        set.cut_short = true;
+        let out = render_breakpoints(&set);
         assert!(out.contains("interrupted"), "{out}");
+        assert!(out.contains("deferred"), "{out}");
         assert!(
-            out.contains("already taken effect"),
-            "an interruption after the mutation is not a failure: {out}"
+            out.contains("cannot deduplicate"),
+            "the deferred case is the one where a retry really does duplicate: {out}"
         );
-        assert!(
-            out.contains("re-request"),
-            "must warn against the retry: {out}"
-        );
-        assert!(out.lines().any(|l| l.starts_with("* 1")), "{out}");
-    }
-
-    /// An empty `added` means two opposite things, and only the listing tells them apart.
-    ///
-    /// Here the *before* read failed, so the session's breakpoints can be listed but which of them
-    /// is new cannot be worked out — `added` is empty because it is **unknown**. Cut short on top
-    /// of that, the branch keyed on `added` alone would reach "nothing was added, retry it" and
-    /// send a caller to re-request a breakpoint that may already be set. That is the double-set
-    /// every other branch of this function exists to warn about, arriving through the one that was
-    /// added to prevent a different confusion.
-    #[test]
-    fn an_interrupted_bp_whose_before_listing_failed_is_unknown_rather_than_unset() {
-        let out = render_breakpoints(&structured::BreakpointSet {
-            added: Vec::new(),
-            breakpoints: vec![breakpoint(0, Some("0x00007ffb6e6a0e10"))],
-            listed: false,
-            listing_error: Some("the breakpoints held before this call could not be read".into()),
-            cut_short: true,
-        });
-        assert!(out.contains("unknown"), "{out}");
-        assert!(
-            !out.contains("Retry it"),
-            "nothing here knows the expression is unset: {out}"
-        );
-        assert!(
-            out.contains("not** re-request"),
-            "must warn against the retry: {out}"
-        );
-    }
-
-    /// Both unknowns at once: the command did not finish *and* the list that would settle what it
-    /// did could not be read. The pre-existing branch for an unreadable listing asserts "the
-    /// breakpoint is set", which here would be a claim nothing supports.
-    #[test]
-    fn an_interrupted_bp_with_no_listing_does_not_claim_the_breakpoint_is_set() {
-        let out = render_breakpoints(&structured::BreakpointSet {
-            added: Vec::new(),
-            breakpoints: Vec::new(),
-            listed: false,
-            listing_error: Some("the engine refused: 0x80004005".to_string()),
-            cut_short: true,
-        });
-        assert!(
-            !out.contains("the breakpoint is set"),
-            "nothing here knows that: {out}"
-        );
-        assert!(out.contains("unknown"), "{out}");
-        assert!(
-            out.contains("second breakpoint"),
-            "must warn against the retry: {out}"
-        );
-    }
-
-    /// The note that carries the *fact* into the text, which the listing's sentence then
-    /// interprets. Its wording is deliberately not `told`'s.
-    #[test]
-    fn a_cut_short_bp_keeps_the_engines_output_and_says_it_was_broken_in() {
-        let told = told_cut_short_bp(CommandRun {
-            output: "some engine output".to_string(),
-            cut_short: Some(Interruption::Deadline { after_ms: 15_000 }),
-            target_gone: false,
-        });
-        assert!(told.contains("some engine output"), "{told}");
-        assert!(told.contains("15000 ms"), "{told}");
-        assert!(
-            !told.to_ascii_lowercase().contains("retry"),
-            "the retry advice belongs where the listing can say whether it is safe: {told}"
-        );
-
-        // A run that finished is untouched — no note, and no blank line appended to it either.
-        let clean = told_cut_short_bp(CommandRun {
-            output: "some engine output".to_string(),
-            cut_short: None,
-            target_gone: false,
-        });
-        assert_eq!(clean, "some engine output");
     }
 
     // ---- what an interrupted caller is told --------------------------------

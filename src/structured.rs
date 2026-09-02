@@ -1049,77 +1049,56 @@ impl From<&dbgscope::dbgeng::Module> for ModuleInfo {
     }
 }
 
-/// The breakpoints a session holds, after a `set_breakpoint`.
+/// What a `set_breakpoint` did, and what the session holds afterwards.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct BreakpointSet {
-    /// The ids this call added.
+    /// The breakpoint this call set, as the **engine** reports it.
     ///
-    /// **Non-empty is the only unambiguous value**, and it is unambiguous in the direction that
-    /// matters: those breakpoints exist, this call created them, and asking again would be asking
-    /// for something already there. Everything else about this result is a qualification of the
-    /// *empty* case, so enumerate it rather than reading it as one fact — four different things
-    /// produce it, and repeated review rounds on this row were each a different one of them:
+    /// The whole of what this call did, and known rather than inferred: the engine hands back the
+    /// object it created, so its id, its address and whether it is deferred are read off it
+    /// directly. Nothing here is a guess, and there is no case in which it is unavailable —
+    /// a call that did not set a breakpoint is an error, not a result with this missing.
     ///
-    /// - **`bp` failed**, which it says by printing an error — the only one of the four that is
-    ///   visible in the text, since a successful `bp` prints nothing at all.
-    /// - **The expression already had a breakpoint**, so there was no new id to add. Measured: a
-    ///   resolved breakpoint is keyed by address, so repeating one is a no-op. `bp` prints nothing
-    ///   here either, which is what makes it indistinguishable from the case above without the
-    ///   listing.
-    /// - **The command was cut short** ([`Self::cut_short`]) before it got that far — or after,
-    ///   which is why this is not evidence either way.
-    /// - **It is not known**, because [`Self::listed`] is false and there is no diff to read.
+    /// **This replaced a before-and-after diff of `bl`**, which is worth knowing because the diff's
+    /// empty case had four meanings and this has none: the command failed, or the expression
+    /// already had a breakpoint, or the command was cut short, or the "before" listing failed and
+    /// the answer was simply unknown. A caller had to be told how to tell those apart. Now the id
+    /// is the answer.
+    pub breakpoint: BreakpointInfo,
+    /// Ids of breakpoints removed to make room, at the same resolved address.
     ///
-    /// [`Self::breakpoints`] is what separates them: an expression absent from the listing was not
-    /// set, and one present was — whoever set it. Nothing in this struct infers beyond that, and
-    /// nothing reading it should.
-    pub added: Vec<u32>,
-    /// Every breakpoint the session now holds, added or not.
+    /// Normally empty. Non-empty means this location already had breakpoints and they have been
+    /// replaced — which is what `bp` does, and what this tool has always done, but it was
+    /// previously a `breakpoint N redefined` line in the debugger's text rather than a value.
+    ///
+    /// **Empty does not mean nothing was there**: a location that has not resolved has no address
+    /// to compare, so a deferred breakpoint replaces nothing and duplicates instead. Read
+    /// [`BreakpointInfo::deferred`] on [`Self::breakpoint`] before concluding the address was
+    /// clear.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub replaced: Vec<u32>,
+    /// Every breakpoint the session now holds, this call's included.
+    ///
+    /// An inspection taken after the fact, and **best-effort**: if it cannot be read this is empty,
+    /// which says nothing about the breakpoint above — that one is reported by the engine as it is
+    /// created. An inspection that fails after a mutation must not be reported as the mutation
+    /// failing, and here it cannot be, because the two facts no longer share a field.
+    #[serde(default)]
     pub breakpoints: Vec<BreakpointInfo>,
-    /// Whether [`Self::added`] is a real before/after diff.
-    ///
-    /// False says only that the diff is **unavailable**, and nothing about the `bp` itself.
-    /// [`Self::listing_error`] and [`Self::cut_short`] are what say why, and there are three
-    /// shapes: the inspection *before* the command failed, so the session's breakpoints are
-    /// listed and which of them is new is not; the inspection *after* it failed, so there is no
-    /// listing at all; or the command was cut short, so what it managed is a question the missing
-    /// diff cannot answer either.
-    ///
-    /// **It is deliberately not an error**, which is the older half of this and still the point.
-    /// A `bp` that ran and an inspection that then failed is a mutation that happened, so
-    /// reporting the inspection's failure as the mutation's invites the one recovery that must not
-    /// happen — and `bl` through `execute` is what finds out what is there instead.
-    ///
-    /// That the recovery is dangerous is **measured and narrower than it used to be written**. A
-    /// *resolved* expression is deduplicated by the engine: `bp ntdll!NtCreateFile` three times
-    /// leaves one breakpoint, because a resolved breakpoint is keyed by address. A **deferred**
-    /// one is not: `bp nosuchmod!Sym` twice leaves two, there being no address to key on. So a
-    /// retry duplicates exactly when the expression does not resolve — which is also the case
-    /// most likely to be slow enough to be cut short, so the warning earns its place rather than
-    /// being boilerplate.
-    pub listed: bool,
-    /// Why the listing is missing or incomplete, when it is.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub listing_error: Option<String>,
-    /// Whether the `bp` itself was **cut short**: the engine was broken in before the command
-    /// finished, because resolving the expression outran this call's budget or because somebody
-    /// called `interrupt`.
+    /// Whether resolving the location was **cut short**: the engine was broken in before it
+    /// finished, because the symbol outran this call's budget or because somebody called
+    /// `interrupt`.
     ///
     /// One field for both, where a stop keeps them apart as `interrupted` and `timed_out`. There
     /// the next move differs — nobody asked for a deadline break, so running on answers it — and
-    /// here it does not: either way the command did not finish, either way it may have installed
-    /// the breakpoint first, and the listing below is what settles that rather than the cause.
+    /// here it does not: either way the location may not have finished resolving.
     ///
-    /// It changes what [`Self::added`] being empty can mean. Normally that is `bp` having run and
-    /// matched nothing; here the command may simply not have got that far. `added` non-empty is
-    /// unambiguous either way — a breakpoint that landed before the break, which must **not** be
-    /// re-requested. Empty is not: the listing beside it is what says whether the expression is
-    /// absent or was already there, since a `bp` at an address that already carries one adds no
-    /// id (measured on a live target — a resolved breakpoint is keyed by address, so repeating
-    /// one is a no-op, while a *deferred* one duplicates because there is no address to key on).
-    ///
-    /// A success rather than an error, for [`Self::listed`]'s reason turned around: `bp` is not
-    /// idempotent, and an error is the shape that gets retried.
+    /// **The breakpoint exists either way**, which is why this is a field on a success rather than
+    /// an error: an error is the shape a caller retries, and a retry here sets a second breakpoint.
+    /// What it qualifies is only the *location* — read
+    /// [`BreakpointInfo::deferred`] and [`BreakpointInfo::address`] on [`Self::breakpoint`] to see
+    /// where it actually ended up. A break also abandons the symbol load it interrupted, so a
+    /// module left on export symbols needs reloading rather than another attempt at this.
     ///
     /// Defaulted so a record written before this field existed still reads.
     #[serde(default)]
@@ -1144,6 +1123,13 @@ pub struct BreakpointInfo {
     /// The command string the debugger runs each time it fires (what `ioctl_trace` installs).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// For a data breakpoint, what it watches: the access, and how many bytes.
+    ///
+    /// Absent for a code breakpoint, which watches no region. Reported because the engine reports
+    /// it — without it a data breakpoint says only that it *is* one, which cannot be checked
+    /// against what was asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watch: Option<DataWatch>,
     /// The thread it is restricted to, or absent for any thread.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread: Option<u32>,
@@ -1172,6 +1158,33 @@ pub enum BreakpointKind {
     Other { kind_code: u32 },
 }
 
+/// What a data breakpoint watches, as the engine holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DataWatch {
+    /// `read`, `write`, `read_write`, `execute`, `io` — or the engine's own bits for a combination
+    /// this build does not name, which is reported rather than folded into a plausible neighbour.
+    pub access: String,
+    /// How many bytes are watched, starting at the breakpoint's address.
+    pub size: u32,
+}
+
+impl From<dbgscope::dbgeng::DataWatch> for DataWatch {
+    fn from(watch: dbgscope::dbgeng::DataWatch) -> Self {
+        use dbgscope::dbgeng::DataAccess as Engine;
+        Self {
+            access: match watch.access {
+                Engine::Read => "read".to_string(),
+                Engine::Write => "write".to_string(),
+                Engine::ReadWrite => "read_write".to_string(),
+                Engine::Execute => "execute".to_string(),
+                Engine::Io => "io".to_string(),
+                Engine::Other(bits) => format!("{bits:#x}"),
+            },
+            size: watch.size,
+        }
+    }
+}
+
 impl From<&dbgscope::dbgeng::BreakpointInfo> for BreakpointInfo {
     fn from(bp: &dbgscope::dbgeng::BreakpointInfo) -> Self {
         use dbgscope::dbgeng::BreakpointKind as Engine;
@@ -1185,6 +1198,7 @@ impl From<&dbgscope::dbgeng::BreakpointInfo> for BreakpointInfo {
             address: bp.address.map(addr),
             expression: bp.expression.clone(),
             command: bp.command.clone(),
+            watch: bp.data.map(DataWatch::from),
             thread: bp.thread,
             enabled: bp.enabled,
             deferred: bp.deferred,
@@ -2826,6 +2840,7 @@ mod tests {
                 address: Some(addr(0x1000)),
                 expression: None,
                 command: None,
+                watch: None,
                 thread: None,
                 enabled: true,
                 deferred: false,

@@ -793,19 +793,35 @@ fn derived(call: &InFlight, data: &Value, limit: usize) -> Vec<Event> {
             let Some(set) = typed::<BreakpointSet>(data) else {
                 return Vec::new();
             };
-            // Only what this call added. The rest of the list is state, not a change, and a
+            // Only what this call changed. The rest of the list is state, not a change, and a
             // transcript that recorded the whole list as a mutation would report the same
             // breakpoint again every time another one was set.
-            set.added
-                .iter()
-                .map(|id| Event::Mutation {
-                    request,
-                    session: session.clone(),
-                    kind: "breakpoint".to_string(),
-                    detail: Capped::of(&breakpoint_detail(&set, *id), limit),
-                    step: None,
-                })
-                .collect()
+            //
+            // **A replacement is a mutation too**, and the one a reader is most likely to be
+            // hunting for: a breakpoint that stopped firing because a later call took its address.
+            // It is recorded beside the set rather than folded into its sentence, so the ids the
+            // transcript says went away are greppable.
+            let mut events = vec![Event::Mutation {
+                request,
+                session: session.clone(),
+                kind: "breakpoint".to_string(),
+                detail: Capped::of(&breakpoint_detail(&set), limit),
+                step: None,
+            }];
+            events.extend(set.replaced.iter().map(|id| Event::Mutation {
+                request,
+                session: session.clone(),
+                kind: "breakpoint".to_string(),
+                detail: Capped::of(
+                    &format!(
+                        "breakpoint {id} removed — replaced by breakpoint {} at the same address",
+                        set.breakpoint.id
+                    ),
+                    limit,
+                ),
+                step: None,
+            }));
+            events
         }
         "debug_batch" => batch_events(request, session, data, limit),
         _ => Vec::new(),
@@ -900,18 +916,23 @@ fn name_of<T: Serialize>(value: &T) -> String {
 }
 
 /// How one added breakpoint reads in a transcript: where it will fire, and what it is.
-fn breakpoint_detail(set: &BreakpointSet, id: u32) -> String {
-    let Some(bp) = set.breakpoints.iter().find(|b| b.id == id) else {
-        // The listing failed, so the id is all this call knows. It still happened.
-        return format!("breakpoint {id} set (the session's list could not be read back)");
-    };
+fn breakpoint_detail(set: &BreakpointSet) -> String {
+    // Read off the breakpoint the engine reported, not found by id in the listing. That search
+    // used to have a miss to handle — "the session's list could not be read back" — and it is
+    // gone: the mutation and the inspection are different fields now, so a failed listing cannot
+    // reach this at all.
+    let bp = &set.breakpoint;
     let at = bp
         .address
         .as_deref()
         .or(bp.expression.as_deref())
         .unwrap_or("an unresolved location");
     let deferred = if bp.deferred { ", deferred" } else { "" };
-    format!("breakpoint {id} at {at}{deferred}")
+    let command = match &bp.command {
+        Some(command) => format!(", running {command:?} on each hit"),
+        None => String::new(),
+    };
+    format!("breakpoint {} at {at}{deferred}{command}", bp.id)
 }
 
 // ---- redaction ------------------------------------------------------------

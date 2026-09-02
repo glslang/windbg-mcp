@@ -728,7 +728,26 @@
         "readOnly": false
       },
       "name": "ioctl_trace",
-      "output": null,
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/BreakpointSet",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
       "params": [
         "dispatch: string",
         "session_id: string|null"

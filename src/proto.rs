@@ -215,23 +215,35 @@ pub enum EngineOp {
         /// How many instructions to render. Bounded by the supervisor before it gets here.
         count: u32,
     },
-    /// Set a breakpoint (`bp <expression>`) and report what the session now holds.
+    /// Set a breakpoint and report it, plus what the session now holds.
     ///
-    /// A command rather than a typed `AddBreakpoint` because `bp`'s syntax is the point: a
-    /// condition, a command string to run on each hit, `/1` for one-shot. What the typed side
-    /// adds is the *answer* — a successful `bp` prints nothing at all, so "did that work, and
-    /// what is it now?" was previously only answerable with a second `bl`.
+    /// **Typed, since dbgscope#126.** This ran `bp <expression>` as text until then, on the
+    /// reasoning that `bp`'s syntax was the point — a condition, a command string, `/1` for
+    /// one-shot. That did not survive contact with the caller: two of those three need a quoted
+    /// string, and quotes are exactly what `reject_command_breakers` refuses in the operand, so
+    /// the only part of the syntax reachable through the tool was `/1`, which is one flag bit.
+    /// What the text path did cost was real — the operand had to be screened because a `"` opens a
+    /// command string WinDbg runs on every hit, and the id had to be recovered by diffing `bl`
+    /// either side, since a successful `bp` prints nothing at all.
     ///
-    /// **It carries a `patience_ms` because there is a command inside it**, and the address half
-    /// of that command is the caller's: `bp nt!Foo+0x10` makes the MASM evaluator resolve a
-    /// symbol, which on a deferred module with a `srv*` path is a fetch from a symbol server and
-    /// can take minutes. Typed ops around it carry none — a watchdog Ctrl+Breaks an `Execute` and
-    /// they have none to break — so this one looks like an exception and is the rule: where a
-    /// typed op *does* run a command with caller-supplied text, it is bounded like any other.
-    /// The `bl` reads either side are direct engine calls and are not bounded, which is why the
-    /// budget is spent on the `bp` alone.
+    /// So both halves are parameters now. [`Self::command`] is the one that could not be sent
+    /// before at any price: it reaches the engine through `SetCommand`, where a `;` separates
+    /// nothing and a `"` opens nothing, so there is nothing to escape and nothing to screen.
+    ///
+    /// **It keeps its `patience_ms`, and the reason is unchanged even though the command is gone.**
+    /// A symbolic location is resolved *eagerly* by the engine — measured at 2445 ms for a cold
+    /// `KERNELBASE!CreateFileW` over `srv*`, against 6 ms warm — so the block moved from an
+    /// `Execute` a watchdog could Ctrl+Break to a direct engine call, and the question was whether
+    /// anything could still reach it. `SetInterrupt` can, which is what
+    /// `DebugEngine::set_breakpoint_bounded` is built on, so the bound survived the move. Typed ops
+    /// around this one carry no patience because nothing there can be interrupted at all; this one
+    /// is not an exception to that rule but an instance of it.
     SetBreakpoint {
         expression: String,
+        /// A debugger command to run on every hit, as `bp`'s quoted trailing argument was.
+        /// `ioctl_trace` is what needs it.
+        #[serde(default)]
+        command: Option<String>,
         patience_ms: u32,
     },
     ReadMemory {
@@ -752,6 +764,7 @@ mod tests {
             EngineOp::Registers { all: false },
             EngineOp::SetBreakpoint {
                 expression: "nt!KeBugCheckEx".into(),
+                command: None,
                 patience_ms: 0,
             },
             EngineOp::Pool {

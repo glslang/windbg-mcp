@@ -41,6 +41,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`set_breakpoint` no longer runs `bp` as text**, and its result is a different shape as a result.
+  It now goes through dbgscope's typed breakpoint API
+  ([dbgscope#126](https://github.com/glslang/dbgscope/issues/126)), which hands back the breakpoint
+  it created — so `breakpoint` carries the id, the address, whether it is `deferred` and the command
+  it runs, all read off the engine rather than inferred. What that replaces is an `added` list
+  recovered by **diffing `bl` either side of the `bp`**, since a successful `bp` prints nothing at
+  all, plus the two fields (`listed`, `listing_error`) whose whole job was to say the diff might be
+  unavailable and an empty `added` therefore *unknown* rather than empty. None of that can arise
+  now. `replaced` is new: setting a breakpoint where one already is removes it — what `bp` has
+  always done, previously visible only as a `breakpoint N redefined` line in debugger text — and the
+  ids it took are now a value a caller can act on.
+- **`ioctl_trace` returns a structured result**, having previously answered with whatever its `bp`
+  printed, which on success was nothing at all (`FOLLOWUPS.md` item 57). It installs its logging
+  breakpoint through the same typed op and reports the same `BreakpointSet`, with an `outputSchema`
+  to match — a structured-aware client replaces the text block with `structuredContent`, so sending
+  one without declaring a schema would have handed those clients an undeclared shape and taken their
+  text away.
+- Both tools' **command strings stopped being escaped by hand**. `ioctl_trace` built
+  `bp <dispatch> ".printf \"IOCTL %08x …\", …; gc"` as one string, so every quote was `\\\"` and the
+  newline `\\\\n` inside a Rust format string, and the `dispatch` operand had to be screened for `;`
+  and `"` because either would have closed the quote and appended a command of the caller's
+  choosing. A command reaches the engine as a parameter now, where a `;` separates nothing and a `"`
+  opens nothing. `reject_command_breakers` stays on `set_breakpoint`'s expression as defence in
+  depth rather than as the only defence.
+- A breakpoint's **watched region** is reported where it has one — `watch: {access, size}` for a
+  data breakpoint, which the read side could previously say only that a breakpoint *was*.
+
 - **Every raw command this server runs is now bounded, except `index_trace`** (`FOLLOWUPS.md`
   item 14). `threads`, `goto_position`, `driver_object`, `device_object`, `irp_stack` and
   `ioctl_trace` moved from `EngineOp::Command` to `EngineOp::BoundedCommand`, so a command that

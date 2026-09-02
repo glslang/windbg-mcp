@@ -93,6 +93,7 @@ probes for that fact which look correct and are not, one of which passed with th
 - [Item 49](#49-windbg-mcp-the-x86-engine-host-is-gone--a-worker-of-the-targets-architecture-replaced-it--done-2026-08-26-to-27) — [windbg-mcp] The x86 engine host is gone — a worker of the target's architecture replaced it — done (2026-08-26 to 27)
 - [Item 51](#51-windbg-mcp--dbgscope-end_session-on-a-user-mode-attach-kills-the-process-it-attached-to--done-2026-08-28) — [windbg-mcp + dbgscope] `end_session` on a user-mode attach kills the process it attached to — done (2026-08-28)
 - [Item 55](#55-windbg-mcp-a-retired-handle-cannot-release-its-own-session--done-2026-08-31) — [windbg-mcp] A retired handle cannot release its own session — done (2026-08-31)
+- [Item 57](#57-windbg-mcp-ioctl_trace-installs-a-breakpoint-and-reports-nothing-about-it--done-2026-09-02) — [windbg-mcp] `ioctl_trace` installs a breakpoint and reports nothing about it — done (2026-09-02)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -3178,3 +3179,40 @@ than a documented detour, over a 50-round soak that draws every retiring command
 `SessionState::accepts_teardown` with `accepts_handle`/`accepts_default`, `On::Teardown`,
 `Call::releasing` and `Sessions::resolve_for_teardown` in `src/engine.rs`, and `fuzz_reclaim` in
 `tests/mcp_smoke.rs`.
+
+## 57. [windbg-mcp] `ioctl_trace` installs a breakpoint and reports nothing about it — **done** (2026-09-02)
+
+**What it was filed for.** `ioctl_trace` built a `bp <dispatch> ".printf …; gc"` and ran it as a raw
+command, so its answer was whatever `bp` printed — which on success is **nothing at all**. No id, no
+confirmation anything was armed, and no way to tell "installed" from "silently did nothing" without
+a separate `bl`. Bounding the command (item 14) sharpened it: a cut-short `bp` may have installed the
+breakpoint before the break, and this tool could not say which happened.
+
+**What landed.** The tool routes through `EngineOp::SetBreakpoint` with the logging command as a
+typed `command` parameter, so it inherits the whole typed report —
+`structured::BreakpointSet`, with the breakpoint the engine created, what it replaced, and whether
+the location resolve was cut short. It declares an `outputSchema` to match, which is not a detail: a
+structured-aware client **replaces** the text block with `structuredContent`, so a tool that sends
+one without declaring a schema hands those clients an undeclared shape and takes their text away.
+
+**The entry's own cheap version was the wrong one, and knowing why is the point of keeping this.**
+It proposed passing `<dispatch> ".printf …; gc"` as `EngineOp::SetBreakpoint`'s **expression**,
+reasoning that `worker::set_breakpoint` built `bp {expression}` so the command would come out
+identical "and the whole typed report comes for free". That was true of the code as it stood and is
+now false in a way that would not have failed loudly: the op no longer builds a command line, so an
+expression carrying a quoted command string would be handed to `SetOffsetExpression` as a *location*
+and refused, or worse, silently resolved to something else. The cheap version was a shortcut through
+an implementation detail rather than through the interface, and the detail moved.
+
+**What the better version cost, and what it removed.** It depended on
+[dbgscope#126](https://github.com/glslang/dbgscope/issues/126) — a typed breakpoint API — which
+landed as [dbgscope#127](https://github.com/glslang/dbgscope/pull/127). What it deleted is the
+hand-escaping this entry named as "the one place in this server where `bp`'s syntax is the point":
+the command was `\\\"` per quote and `\\n` for the newline, written inside a Rust format string,
+and `dispatch` had to be screened for `;` and `"` because either would have closed the quote and
+appended a command of the caller's choosing. As a parameter there is nothing to escape and nothing
+to screen — `reject_command_breakers` stays on the tool as defence in depth rather than as the only
+defence.
+
+**Where it picks up.** `ioctl_trace` in `src/server.rs`, `EngineOp::SetBreakpoint` in
+`src/proto.rs`, and `worker::set_breakpoint`.

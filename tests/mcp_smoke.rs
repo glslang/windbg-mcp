@@ -2238,6 +2238,16 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
             json!({ "expression": "nt!KeBugCheckEx" }),
             "error",
         ),
+        // Reachable here despite needing a live driver target to do anything useful, because what
+        // this test asks is whether a tool that declares an `outputSchema` answers with
+        // `structuredContent` — and a refusal is an answer. It installs a breakpoint through the
+        // same typed op as `set_breakpoint` and reports the same shape (`FOLLOWUPS.md` item 57),
+        // so the schema is real on the error path too.
+        (
+            "ioctl_trace",
+            json!({ "dispatch": "nt!IopXxxControlFile" }),
+            "error",
+        ),
         (
             "run_to_address",
             json!({ "address": "nt!KeBugCheckEx" }),
@@ -4614,6 +4624,101 @@ fn a_raw_execution_control_command_moves_the_target_instead_of_wedging_the_sessi
         json!(false),
         "a launched process goes with its session, and the result does not say so: {}",
         ended["result"]["structuredContent"]
+    );
+}
+
+/// dbgscope#126: a breakpoint's id comes from the engine, and a second one at the same address
+/// **replaces** the first — reported as a value rather than as debugger text.
+///
+/// Two claims that only a real engine can settle, and that the change would look correct without.
+///
+/// **The id is the engine's.** This used to be recovered by diffing `bl` either side of a `bp`,
+/// because a successful `bp` prints nothing at all; the whole degraded mode around a failed
+/// "before" read went with the diff. A result that names a breakpoint the session does not hold
+/// would pass every unit test in this repo, since none of them has an engine.
+///
+/// **The replacement is real and is measured, not assumed.** The engine deduplicates nothing —
+/// two typed sets at one address leave two breakpoints, both armed, both activating on the one
+/// stop, so each runs its command and removing one by id leaves the address armed by the other.
+/// `bp` collapses them, and this tool has always had `bp`'s behaviour, so keeping it is what makes
+/// this change invisible to a caller. `replaced` is that collapse turned into a value: it was a
+/// `breakpoint N redefined` line in text before, which nothing could act on.
+///
+/// A resolved location, deliberately — `ntdll!NtCreateFile` is present in every process and its
+/// symbols are loaded at the initial break. A deferred one would replace nothing, there being no
+/// address to key on, which is the asymmetry the test below its assertion notes.
+#[test]
+fn a_second_breakpoint_at_one_address_replaces_the_first_and_says_so() {
+    if !launch_tier() {
+        return;
+    }
+    let mut server = Server::started();
+    let session = server.open_session(
+        "launch",
+        json!({ "command_line": LIVE_TARGET }),
+        TARGET_STEP,
+    );
+    let expression = "ntdll!NtCreateFile";
+
+    let first = server.tool_data(
+        "set_breakpoint",
+        json!({ "session_id": &session, "expression": expression }),
+        TARGET_STEP,
+    );
+    let first_bp = &first["breakpoint"];
+    assert!(
+        first_bp["id"].is_number(),
+        "the engine names the breakpoint it created; got:\n{first}"
+    );
+    assert_eq!(
+        first_bp["deferred"], false,
+        "`{expression}` should resolve at the initial break, or this test is measuring the \
+         deferred path instead:\n{first}"
+    );
+    assert!(
+        first_bp["address"].is_string(),
+        "a resolved breakpoint reports where it will fire:\n{first}"
+    );
+    assert!(
+        first["replaced"]
+            .as_array()
+            .is_none_or(|ids| ids.is_empty()),
+        "nothing was at this address yet:\n{first}"
+    );
+    // The listing is a separate field from the mutation now, and has to contain it.
+    let listed = first["breakpoints"]
+        .as_array()
+        .expect("the session's breakpoint listing");
+    assert!(
+        listed.iter().any(|bp| bp["id"] == first_bp["id"]),
+        "the breakpoint just set should be in the session's listing:\n{first}"
+    );
+
+    let second = server.tool_data(
+        "set_breakpoint",
+        json!({ "session_id": &session, "expression": expression }),
+        TARGET_STEP,
+    );
+    let replaced = second["replaced"]
+        .as_array()
+        .expect("a second breakpoint at one address replaces the first")
+        .clone();
+    assert_eq!(
+        replaced,
+        vec![first_bp["id"].clone()],
+        "the second call should report taking exactly the first breakpoint's id:\n{second}"
+    );
+    // And the session holds one breakpoint at that address afterwards, not two — which is the
+    // property `replaced` is a claim about, checked against the engine rather than against the
+    // field that made the claim.
+    let held = second["breakpoints"]
+        .as_array()
+        .expect("the session's breakpoint listing");
+    let address = second["breakpoint"]["address"].clone();
+    let at_address = held.iter().filter(|bp| bp["address"] == address).count();
+    assert_eq!(
+        at_address, 1,
+        "one breakpoint should be left at {address}, not {at_address}:\n{second}"
     );
 }
 
