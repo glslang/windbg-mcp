@@ -3577,14 +3577,21 @@ struct Channel {
 ///
 /// std holds a lock of its own across the same window for the stdio handles it prepares, which is
 /// the same reasoning applied to the same hazard; this one covers the handles std knows nothing
-/// about. **A new `Command::spawn` anywhere in this crate has to take it** — see [`spawn_guard`].
+/// about. **A new process created anywhere in this crate has to take it** — `spawn`, and equally
+/// `output` and `status`, which spawn and wait in one call. See [`spawn_guard`].
 static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
-/// Claims [`SPAWN_LOCK`] for the caller's own `spawn()`. Hold it across the call and no longer.
+/// Claims [`SPAWN_LOCK`] for the caller's own process creation. Hold it across that and no longer.
 ///
 /// Every process creation in this server goes through here, including ones that have nothing to do
 /// with debug sessions: the flag is a property of the *process*, not of the spawn that set it, so a
 /// child started for any reason during the window inherits whatever is marked.
+///
+/// "And no longer" is a rule about the **creation**, which `Command::output` and `Command::status`
+/// fuse with the wait — so a caller using either holds this across the child's whole run, and that
+/// is only acceptable for a child that exits in milliseconds (`service::icacls` is the one). For
+/// anything longer, `spawn` under the guard and wait after it: every other process creation in
+/// this server queues behind this lock.
 pub(crate) fn spawn_guard() -> std::sync::MutexGuard<'static, ()> {
     SPAWN_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -4364,8 +4371,32 @@ mod tests {
     /// `.spawn()` with empty parentheses is a reliable marker for a *process* spawn here: a
     /// thread spawn always takes a closure, and `tokio::spawn` a future. The count is asserted
     /// too, so a refactor that stops matching fails loudly instead of quietly checking nothing.
+    ///
+    /// **`.spawn()` alone is not the whole of process creation, and the gap was live**: `Command`
+    /// also has `output()` and `status()`, which spawn and wait in one call, and `service::icacls`
+    /// used the first of those — so this test read "no unguarded spawns" over a source file that
+    /// creates a process the marker could not see. Its own name was half of why that stayed
+    /// invisible, and is why this is `every_process_created…` rather than `every_process_spawn…`:
+    /// what the rule is about is a *process being created*, and `spawn` is only the spelling that
+    /// says so.
+    ///
+    /// The two fused calls are matched **only in a function that also constructs a `Command`**,
+    /// which `.spawn()` needs and they do. `.status()` is the reason: `response.status()` is an
+    /// HTTP status in `listen::gate`, twice, and an unanchored marker would demand the spawn lock
+    /// there. What the anchor costs is a fused call on a `Command` some *other* function built —
+    /// nothing does that here, and a marker that is wrong about `listen.rs` on every run is worse
+    /// than one that could miss a shape this crate has never had. `.spawn()` stays unanchored,
+    /// since it is specific enough on its own and anchoring it would open exactly that hole in the
+    /// half that is load-bearing today.
+    ///
+    /// Each half is counted separately and each is asserted, because a marker that matches nothing
+    /// passes: the fused half rests on `icacls` being the one site, and if that call moves to
+    /// `spawn` the assertion says so rather than quietly checking nothing.
+    ///
+    /// A raw `CreateProcessW` through `windows-sys` would be outside all of this. Nothing in this
+    /// crate creates a process that way, and the rule for one that did is the same rule.
     #[test]
-    fn every_process_spawn_in_this_crate_takes_the_spawn_lock() {
+    fn every_process_created_in_this_crate_takes_the_spawn_lock() {
         // Assembled at run time rather than written as literals, because this function is *in* the
         // source it reads. Written out, the two lines below would each match themselves: the
         // matcher would count as a spawn site, and — the guard's name being on the line above it —
@@ -4375,14 +4406,21 @@ mod tests {
         // itself, which is what leaves the floor counting only real spawns.
         let a_spawn = [".spawn", "()"].concat();
         let the_guard = ["spawn_", "guard()"].concat();
+        // Split for the same reason, and one more: written out, `Command::new(` would make this
+        // function count as one that builds a command, and the two fused markers below are matched
+        // only inside such a function.
+        let a_command = ["Command", "::new("].concat();
+        let fused = [[".output", "()"].concat(), [".status", "()"].concat()];
 
-        let mut sites = 0;
+        let mut spawns = 0;
+        let mut fused_sites = 0;
         let mut unguarded = Vec::new();
         for file in rust_sources(&PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/src"))) {
             let text = std::fs::read_to_string(&file).expect("read a source file");
             // Reset at each function, so "guarded" means guarded *here* rather than anywhere
             // earlier in the file. Comments are skipped: prose about a `fn` is not one.
             let mut guarded = false;
+            let mut builds_a_command = false;
             for (n, line) in text.lines().enumerate() {
                 let code = line.trim_start();
                 if code.starts_with("//") {
@@ -4390,15 +4428,20 @@ mod tests {
                 }
                 if code.starts_with("fn ") || code.contains(" fn ") {
                     guarded = false;
+                    builds_a_command = false;
                 }
                 if code.contains(&the_guard) {
                     guarded = true;
                 }
-                if code.contains(&a_spawn) {
-                    sites += 1;
-                    if !guarded {
-                        unguarded.push(format!("{}:{}", file.display(), n + 1));
-                    }
+                if code.contains(&a_command) {
+                    builds_a_command = true;
+                }
+                let spawns_here = code.contains(&a_spawn);
+                let fused_here = builds_a_command && fused.iter().any(|f| code.contains(f));
+                spawns += usize::from(spawns_here);
+                fused_sites += usize::from(fused_here);
+                if (spawns_here || fused_here) && !guarded {
+                    unguarded.push(format!("{}:{}", file.display(), n + 1));
                 }
             }
         }
@@ -4406,15 +4449,21 @@ mod tests {
             unguarded.is_empty(),
             // `engine::spawn_guard` without its parentheses, for the reason above: written in
             // full it would be one more line the checker sees as a guard.
-            "these spawn a process without holding `engine::spawn_guard` in the same function, \
+            "these create a process without holding `engine::spawn_guard` in the same function, \
              so a child started there can inherit a worker's protocol channel and keep it from \
              ever reporting EOF: {unguarded:?}"
         );
         assert!(
-            sites >= 3,
+            spawns >= 3,
             "expected to find the known process spawns (the worker, the TTD recorder, the test \
-             stand-in) and found {sites} — the marker no longer matches, so this test is checking \
+             stand-in) and found {spawns} — the marker no longer matches, so this test is checking \
              nothing"
+        );
+        assert!(
+            fused_sites >= 1,
+            "expected to find the spawn-and-wait in `service::icacls` and found none, so the half \
+             of this marker that covers `output`/`status` is checking nothing — if that call is \
+             now a `spawn`, this floor is what needs re-deriving"
         );
     }
 

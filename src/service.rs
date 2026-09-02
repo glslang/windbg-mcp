@@ -380,12 +380,28 @@ const SYSTEM_SID: &str = "*S-1-5-18";
 const ADMINISTRATORS_SID: &str = "*S-1-5-32-544";
 
 /// Runs one `icacls` invocation, or says which one failed and why.
+///
+/// Under [`crate::engine::spawn_guard`], like every other process this crate creates. Nothing here
+/// wants an inherited handle — but a handle is inheritable **process-wide** from the moment it is
+/// marked, so a child started inside a worker's spawn window inherits that worker's protocol
+/// channel and keeps the pipe from ever reporting EOF. That this particular caller cannot collide
+/// (these are operator commands, in a process that serves no session and spawns no worker) is a
+/// property of today's call sites rather than of the rule, and it is the kind of exception the next
+/// person has to re-derive; taking the lock costs an uncontended acquire.
+///
+/// **The guard spans the wait as well as the spawn here**, which `output()` fuses and only a
+/// rewrite to `spawn` + `wait_with_output` would separate. That is right for `icacls`, which exits
+/// in milliseconds, and would be wrong for a long-running child: this lock is what every worker
+/// spawn queues behind. A new shell-out that is not near-instant wants the split form.
 fn icacls(path: &std::path::Path, args: &[&str]) -> Result<()> {
-    let out = std::process::Command::new("icacls")
-        .arg(path)
-        .args(args)
-        .output()
-        .with_context(|| format!("cannot run `icacls {}`", args.join(" ")))?;
+    let out = {
+        let _one_spawn_at_a_time = crate::engine::spawn_guard();
+        std::process::Command::new("icacls")
+            .arg(path)
+            .args(args)
+            .output()
+    }
+    .with_context(|| format!("cannot run `icacls {}`", args.join(" ")))?;
     if !out.status.success() {
         bail!(
             "`icacls {} {}` failed: {}",

@@ -246,10 +246,12 @@ and no other spawn site needs to know the rule exists.
   — and tokio exposes the inner command through `Command::as_std_mut()`, so on stabilization this
   is a handful of lines in `spawn_worker` with tokio's `Child` intact. **That stabilization is the
   trigger**; there is no reason to hand-roll it first.
-- **Meanwhile:** `every_process_spawn_in_this_crate_takes_the_spawn_lock` (`src/engine.rs`) reads
-  the crate's own source and fails if a `.spawn()` appears without `spawn_guard` held in the same
-  function. The convention is pinned rather than merely documented, which is what makes this an
-  improvement to *how* the property is held rather than a fix to a live hole.
+- **Meanwhile:** `every_process_created_in_this_crate_takes_the_spawn_lock` (`src/engine.rs`) reads
+  the crate's own source and fails if a process is created without `spawn_guard` held in the same
+  function — `.spawn()` anywhere, and `.output()`/`.status()`, which fuse the spawn with the wait,
+  in a function that also builds a `Command`. The convention is pinned rather than merely
+  documented, which is what makes this an improvement to *how* the property is held rather than a
+  fix to a live hole.
 
 ## 19. [windbg-mcp] Let a `debug_batch` step walk a structure
 
