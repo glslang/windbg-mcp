@@ -166,7 +166,14 @@ fn release_handoff(
 ///
 /// With the flag, Ctrl+C is disabled for the worker's group. The supervisor still dies, its handles
 /// still close, and the worker meets the EOF path that knows how to let go.
-const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+///
+/// Imported rather than hand-declared, here and for [`CREATE_NO_WINDOW`] below: `windows-sys`
+/// types these as `PROCESS_CREATION_FLAGS`, which is a plain `u32` alias rather than the `windows`
+/// crate's newtype, so they are the exact type [`std::os::windows::process::CommandExt::creation_flags`]
+/// takes — and they are in `Win32_System_Threading`, which this crate already enables for
+/// `IsWow64Process2` ([`crate::target`]). A local copy would buy only somewhere to put this
+/// comment, which a `use` carries just as well.
+use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 
 /// `CREATE_NO_WINDOW`, passed only to a child this process has no console to hand down.
 ///
@@ -190,7 +197,7 @@ const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 /// So it goes on exactly where it changes something. With no console there is nothing to inherit
 /// and nothing for stderr to lose — it is a pipe or a file, which is inherited unchanged
 /// (measured) — and with one, the worker shares it and opens no window anyway.
-const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
 
 /// [`CREATE_NO_WINDOW`] when this process has no console, and no flag at all when it has one.
 ///
