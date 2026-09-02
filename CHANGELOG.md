@@ -37,6 +37,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window from DbgEng rather than from here; that is
   [dbgscope#129](https://github.com/glslang/dbgscope/issues/129), fixed there.
 
+- **The rule that no process is created without the spawn lock was checked by a marker that could
+  not see half of them.** `Command` spawns and waits in one call through `output()` and `status()`
+  as well as through `spawn()`, and `service::icacls` used the first of those — so
+  `every_process_spawn_in_this_crate_takes_the_spawn_lock` reported no unguarded spawns over a
+  source tree that created a process it could not see. Its own name was half of why that stayed
+  invisible — the rule is about a *process being created*, and `spawn` is only the spelling that
+  says so — so it is now `every_process_created_in_this_crate_takes_the_spawn_lock`.
+
+  Harmless where it stood — `icacls` runs from the install and client-editing commands, in a
+  process that serves no session and spawns no worker — but that is a property of today's call
+  sites rather than of the rule, and the lock exists because a handle is inheritable **process-wide**
+  from the moment it is marked: a child started inside a worker's spawn window inherits that
+  worker's protocol channel and keeps the pipe from ever reporting EOF, so the session never
+  settles. `icacls` now takes the guard, and the marker counts the two fused calls.
+
+  They are matched **only inside a function that also constructs a `Command`**, because
+  `response.status()` is an HTTP status in `listen::gate` and an unanchored marker demands the
+  spawn lock there — verified by removing the anchor, which lights up both lines. `spawn()` stays
+  unanchored: it is specific enough alone, and anchoring it would open that same hole in the half
+  that is load-bearing today. Each half is counted and asserted separately, since a marker that
+  matches nothing passes.
+
 - **A session handle that a raw `execute` retired can still end its own session.** `qd`, `q`,
   `.detach`, `.kill` and `.opendump` release or replace the target, which *retires* the handle
   naming that session: every later call supplying it is refused, while the worker stays live and
