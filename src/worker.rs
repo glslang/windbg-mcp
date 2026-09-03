@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 
 use dbgscope::dbgeng::{
     BreakpointAt, BreakpointSpec, CommandRun, DebugEngine, InterruptHandle, Interruption,
-    RunToOutcome,
+    RunToOutcome, WaitOutcome,
 };
 use dbgscope::heap::{self as heap_query, HeapAllocation, HeapBackend, HeapState, HeapWalk};
 use dbgscope::pool::query::{self, PoolPageFilter, PoolWalk};
@@ -136,6 +136,49 @@ fn stop_inheriting(handle: RawHandle) -> std::io::Result<()> {
 /// `PendingTarget::wait` ignores this for that one case. That unbounded wait is the reason
 /// sessions live in their own process.
 const LOAD_WAIT_MS: u32 = 60_000;
+
+/// Whether the wait that *is* the load finished it, as an opener's `transition` reads it.
+///
+/// `open_dump` and `open_trace` defer the real work to the next `WaitForEvent`, so this wait is
+/// not a wait *for* the load — it is the load. Only [`WaitOutcome::Stopped`] is one that finished:
+/// the engine processed the target and stopped on it.
+///
+/// **[`WaitOutcome::Expired`] is the one this was silently passing**, and it could not have done
+/// otherwise: until [dbgscope#136] a finite wait answered `Result<(), _>`, and `S_FALSE` — the
+/// bound passing with the load still going — was flattened by the generated wrapper into the same
+/// `Ok` a stop gets. So a dump too large, or a symbol path too cold, to finish inside
+/// [`LOAD_WAIT_MS`] was reported as an open that worked, and whatever the caller did next failed
+/// for a reason nothing connected to the open. The two comments at the call sites have said "a
+/// load wait that times out still leaves DbgEng holding the dump" since they were written; that is
+/// what `commit()` above the wait is for, and this is the other half of it finally arriving — the
+/// caller is told the session holds the target, so `end_session` is the recovery and opening again
+/// would claim a second one.
+///
+/// [`WaitOutcome::OnRequest`] is a host interrupting the load through `interrupt`. Not an error
+/// about the target, but not a finished load either, and the same advice applies.
+/// [`WaitOutcome::Deadline`] cannot arise — a finite bound arms no watchdog — so it shares that
+/// arm rather than being given a message this cannot produce.
+///
+/// **The reachability of `Expired` here is argued, not measured.** dbgscope measured a finite
+/// expiry on a *running* target (`S_FALSE` at 312 ms for a 300 ms bound); nothing has held a dump
+/// load past sixty seconds on purpose. So this is unit-tested as a mapping, and what is not
+/// claimed is how often the mapping fires.
+///
+/// [dbgscope#136]: https://github.com/glslang/dbgscope/issues/136
+fn load_completed(outcome: WaitOutcome, target: &str) -> Result<(), String> {
+    match outcome {
+        WaitOutcome::Stopped { .. } => Ok(()),
+        WaitOutcome::Expired => Err(format!(
+            "the {target} had not finished loading after {LOAD_WAIT_MS} ms. The session holds it, \
+             so end_session releases it; opening it again would claim a second target. A large \
+             dump or a cold symbol path is the usual cause."
+        )),
+        WaitOutcome::OnRequest | WaitOutcome::Deadline => Err(format!(
+            "loading the {target} was interrupted before it finished. The session holds it, so \
+             end_session releases it; opening it again would claim a second target."
+        )),
+    }
+}
 
 /// Most bytes a single `read_memory` will fetch.
 ///
@@ -1416,7 +1459,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
                 // load wait that times out still leaves DbgEng holding the dump.
                 e.open_dump(&path).map_err(es)?;
                 commit();
-                e.wait_for_event(LOAD_WAIT_MS).map_err(es)
+                load_completed(e.wait_for_event(LOAD_WAIT_MS).map_err(es)?, "dump")
             },
             || {
                 // Load the WinDbg extension DLL so `!`-extension commands resolve — most
@@ -1442,7 +1485,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
                 // still leaves DbgEng holding the trace.
                 e.open_trace(&path).map_err(trace_open_failure)?;
                 commit();
-                e.wait_for_event(LOAD_WAIT_MS).map_err(es)
+                load_completed(e.wait_for_event(LOAD_WAIT_MS).map_err(es)?, "trace")
             },
             || {
                 // Check the index state *before* any data-model query: `!ttdext.index -status`
@@ -8934,5 +8977,47 @@ mod tests {
             !explained.contains("Nothing about the trace or the path needs changing"),
             "never the unconditional claim, which a mistyped path would falsify: {explained}"
         );
+    }
+
+    /// **A load wait that did not load is a failure**, which is what the wait answering a value
+    /// rather than `Result<(), _>` bought (dbgscope#136).
+    ///
+    /// The gap this closes was structural rather than an oversight: `S_FALSE` and `S_OK` were one
+    /// `Ok(())`, so an opener could not tell a dump that finished loading from one still loading
+    /// at the bound, and reported both as an open that worked. The commit above the wait was
+    /// already placed for this — the target exists, so the recovery is `end_session` and not
+    /// another open — and the two comments saying so predate any code that could reach it.
+    ///
+    /// Asserted as a mapping, because that is the whole of what this host can check: holding a
+    /// real dump load past sixty seconds is not something a test can arrange. So the `Expired` arm
+    /// is unmeasured against a real engine, and says so where it is defined.
+    #[test]
+    fn a_load_that_did_not_finish_is_not_an_open_that_worked() {
+        assert!(
+            load_completed(WaitOutcome::Stopped { process: None }, "dump").is_ok(),
+            "a load that stopped on its target is the one outcome that finished it"
+        );
+
+        let expired = load_completed(WaitOutcome::Expired, "dump")
+            .expect_err("a bound that passed with the load still going is not a finished load");
+        assert!(
+            expired.contains("end_session"),
+            "the advice names the recovery for a target the session already holds: {expired}"
+        );
+        assert!(
+            expired.contains(&LOAD_WAIT_MS.to_string()),
+            "and says what bound it was measured against, or the number is folklore: {expired}"
+        );
+
+        // Both breaks, because the reason is that the load did not finish and not which origin
+        // stopped it -- and the `Deadline` arm is unreachable on a finite bound, so this is the
+        // only place it is exercised at all.
+        for broke_in in [WaitOutcome::OnRequest, WaitOutcome::Deadline] {
+            let interrupted = load_completed(broke_in, "trace").unwrap_err();
+            assert!(
+                interrupted.contains("trace") && interrupted.contains("end_session"),
+                "{broke_in:?} names the target it left half-open and the recovery: {interrupted}"
+            );
+        }
     }
 }
