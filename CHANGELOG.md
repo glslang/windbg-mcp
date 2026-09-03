@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **A dump or trace that had not finished loading is no longer reported as an open that worked.**
+  `open_dump` and `open_trace` defer the real work to the next `WaitForEvent`, so
+  `wait_for_event(LOAD_WAIT_MS)` *is* the load — and dbgscope's finite wait used to answer
+  `Result<(), _>`, flattening `S_FALSE` (the 60-second bound passing with the load still going) into
+  the same `Ok` a completed load gets. A dump too large, or a symbol path too cold, to finish inside
+  that bound therefore came back as a successful open, and whatever the caller did next failed for a
+  reason nothing connected to it. Nothing here could have caught it: the fact was discarded inside
+  the wait.
+
+  dbgscope now returns a `WaitOutcome` ([dbgscope#136](https://github.com/glslang/dbgscope/issues/136)
+  stage 1) and `worker::load_completed` reads it — only `Stopped` is a load that finished. The
+  failure is reported **post-commit**, which is what the `commit()` already sitting above the wait
+  was for: the caller is told the session holds the target, so `end_session` is the recovery and
+  opening again would claim a second one. A host interrupting the load reports the same way. The
+  `Expired` arm is **unmeasured against a real engine** — holding a dump load past sixty seconds is
+  not something a test can arrange — so `a_load_that_did_not_finish_is_not_an_open_that_worked`
+  asserts the mapping, and nothing claims how often it fires.
+
 - **A session no longer opens a console window on the desktop.** Windows gives a console-subsystem
   child of a console-*less* parent a brand-new, *visible* console — and a GUI MCP client starts a
   stdio server without one — so every engine worker this server spawned put a window on the desktop,

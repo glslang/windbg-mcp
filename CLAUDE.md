@@ -729,6 +729,24 @@ was written and used the bounded INFINITE wait for every target type; only this 
 does, and a forced break at the bound is reported (`Interruption::Deadline` → `StopReport.timed_out`)
 rather than passing for a stop.
 
+**The last two finite waits are the openers', and they had the same defect for the same reason.**
+`open_dump` and `open_trace` defer the load to the next `WaitForEvent`, so
+`wait_for_event(LOAD_WAIT_MS)` *is* the load — and until
+[dbgscope#136](https://github.com/glslang/dbgscope/issues/136) that call answered `Result<(), _>`,
+flattening `S_FALSE` and `S_OK` into one `Ok`. A dump too large or a symbol path too cold to finish
+inside 60s was therefore reported as an open that worked, and whatever the caller did next failed
+with nothing connecting it to the open. It could not have been caught here: the fact was thrown away
+inside the wait. dbgscope now returns a `WaitOutcome`, `worker::load_completed` reads it, and only
+`Stopped` is a load that finished. Three things about it. The failure is deliberately **post-commit**
+— `commit()` already sat above the wait, and the two comments there have said "a load wait that times
+out still leaves DbgEng holding the dump" since they were written, so the caller is told the session
+holds the target and that `end_session` is the recovery rather than another open. `Deadline` is
+unreachable there (a finite bound arms no watchdog) and shares the `OnRequest` arm rather than
+getting a message nothing can produce. And **the `Expired` arm is unmeasured against a real engine**:
+holding a dump load past sixty seconds is not something a test can arrange, so
+`a_load_that_did_not_finish_is_not_an_open_that_worked` asserts the mapping and nothing claims how
+often it fires.
+
 Two consequences worth carrying:
 
 - **The reason the finite wait looked attractive was a sleep.** Both dbgscope watchdogs polled a

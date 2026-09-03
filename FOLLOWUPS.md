@@ -478,7 +478,7 @@ Two smaller things the same run left open:
 ## 47. [windbg-mcp + dbgscope] The bounded wait is unmeasured on a TTD replay target
 
 **What changed under it.** Fixing [#226](https://github.com/glslang/windbg-mcp/issues/226) made
-`execute_and_wait` use `wait_for_event_bounded` — `WaitForEvent(INFINITE)` with a watchdog that
+`execute_and_wait` use the watchdog-bounded wait — `WaitForEvent(INFINITE)` with a watchdog that
 `SetInterrupt`s at the bound — for **every** target type, where before only a live kernel took it
 and everything else took a finite `WaitForEvent`. That was not a tidy-up: the finite wait returns
 `S_FALSE` on expiry with the target still running and the engine holding no current process/thread,
@@ -535,8 +535,10 @@ timeout path is *unreachable* on this target type rather than untested — which
 an answer rather than as a test, and is worth writing down either way. Deciding that costs one
 measurement and is what the next person should do before writing anything.
 
-**Where it picks up.** `dbgscope`'s `DebugEngine::execute_and_wait` and `wait_for_event_bounded`
-(`src/dbgeng.rs`); `worker::resumed`; and the pair
+**Where it picks up.** `dbgscope`'s `DebugEngine::execute_and_wait` and `DebugEngine::pump`
+(`src/dbgeng.rs` — `wait_for_event_bounded` was folded into that one pump by
+[dbgscope#136](https://github.com/glslang/dbgscope/issues/136), and what this item wants to see on a
+replay target is now a `WaitOutcome::Deadline`); `worker::resumed`; and the pair
 `a_raw_execution_control_command_moves_the_target_instead_of_wedging_the_session` /
 `a_resume_that_reaches_no_stop_says_so_and_leaves_the_session_usable` in `tests/mcp_smoke.rs`,
 which are the shape a TTD one would copy.
