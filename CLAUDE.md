@@ -756,9 +756,18 @@ Two consequences worth carrying:
   `Watchdog` now wakes on a condvar, so a disarm is immediate and the bound costs nothing until it
   is reached. That trade-off is retired rather than worked around; the criterion in `DECISIONS.md`
   still stands, but its price has changed.
-- **The origin of a break is the watchdog's own flag, not `interrupt_raised`** — which the watchdog
-  sets too, since that is what `InterruptHandle::interrupt` does. Reading the shared flag alone
-  reports the crate's own deadline as "a host asked".
+- **The origin of a break is the watchdog's own flag**, which used to need saying because the
+  watchdog reached the engine through `InterruptHandle::interrupt` like any host and so raised the
+  same engine-wide flag — reading that flag alone reported the crate's own deadline as "a host
+  asked". Since [dbgscope#136](https://github.com/glslang/dbgscope/issues/136) stage 2 the watchdog
+  goes through a private `break_in_only` and files nothing, so the two origins are independent
+  signals and there is no shared flag to misread. A host's request is instead filed against the
+  **operation** it will stop, under the same lock that delivers `SetInterrupt` — which is what
+  closed dbgscope#135: an operation clearing the flag as it opened could erase a request whose
+  break was still on the way, and the synthetic stop was then reported as the target's own.
+  `InterruptHandle::interrupt` answers a `BreakRequest` saying which operation it reached, or
+  `NothingRunning`; `worker::interrupt_running` logs that and deliberately does not turn it into a
+  different answer for the caller — see the comment there.
 
 **Why nothing caught any of it.** Every tier that drives execution was the live-kernel one, which
 was already on the bounded wait; a dump cannot `go`, and no tier launched a process. The debugger
