@@ -1355,12 +1355,19 @@ fn interrupt_running(bound: Option<u64>) -> Result<(Interrupted, String), String
                 .to_string(),
         );
     };
-    handle.interrupt().map_err(es)?;
+    let filed = handle.interrupt().map_err(es)?;
     // Recorded only once the raise succeeded: a failed one has left nothing pending, and claiming
     // otherwise would have the engine thread drain an interrupt that was never lodged and label a
     // complete result as cut short.
     running.interrupt_raised();
-    tracing::info!("worker: interrupt raised for job {job}");
+    // Logged, and deliberately not turned into a different answer for the caller.
+    // `BreakRequest::NothingRunning` says the *engine* had no bounded operation to file the request
+    // against — a typed getter, or a plain `execute_command`, neither of which is one — and not
+    // that this session is idle: the job the caller named is running either way, and the break was
+    // delivered either way, since `SetInterrupt` is engine-wide. What it does tell you, in a log
+    // read after the fact, is whether the break had anything to be reported by, which is the
+    // difference between an operation that will come back `cut_short` and one that will not.
+    tracing::info!("worker: interrupt raised for job {job}, filed as {filed:?}");
     Ok((
         Interrupted::Raised,
         "Interrupted. Ctrl+Break was raised on this session's engine, so the operation it was \

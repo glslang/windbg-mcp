@@ -109,6 +109,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A break this server asks for is now scoped to the engine operation it will stop.** dbgscope's
+  interrupt was an engine-wide flag that each bounded operation cleared as it opened, so a request
+  lodged between that clear and the wait it was meant for was erased while its `SetInterrupt` was
+  still on the way — and the synthetic Ctrl+Break that then arrived was reported as the target's
+  own stop. This server reaches that path: `interrupt`/`break_in` raise the break from the request
+  reader, off the engine thread, while a live open runs on it.
+
+  Closed upstream by [dbgscope#135](https://github.com/glslang/dbgscope/issues/135) /
+  [#136](https://github.com/glslang/dbgscope/issues/136) stage 2: the request is filed against the
+  operation running at that instant, under the same lock that delivers `SetInterrupt`, and there is
+  no clear anywhere. Nothing about this server's tool surface changes —
+  `worker::interrupt_running` now logs which operation the break was filed against, and
+  deliberately does **not** turn that into a different answer for the caller: `NothingRunning`
+  means the *engine* had no bounded operation to file against (a typed getter, a plain
+  `execute_command`), not that the session is idle, and the break is delivered either way.
+
 - **`set_breakpoint` no longer runs `bp` as text**, and its result is a different shape as a result.
   It now goes through dbgscope's typed breakpoint API
   ([dbgscope#126](https://github.com/glslang/dbgscope/issues/126)), which hands back the breakpoint
