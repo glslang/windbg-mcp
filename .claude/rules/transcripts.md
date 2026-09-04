@@ -1,7 +1,7 @@
 ---
 paths:
-  - "src/record.rs"
-  - "src/cast.rs"
+  - "src/**/*.rs"
+  - "build.rs"
 ---
 
 ## Recording a session while debugging this server

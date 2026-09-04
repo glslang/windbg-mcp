@@ -1,11 +1,7 @@
 ---
 paths:
-  - "src/client.rs"
-  - "src/listen.rs"
-  - "src/service.rs"
-  - "src/kdconn.rs"
-  - "src/server.rs"
-  - "src/engine.rs"
+  - "src/**/*.rs"
+  - "build.rs"
 ---
 
 ## Several clients on one listener (`src/client.rs`)

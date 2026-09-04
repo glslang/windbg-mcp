@@ -1,9 +1,7 @@
 ---
 paths:
-  - "src/toolset.rs"
-  - "src/server.rs"
-  - "src/schema.rs"
-  - "src/worker.rs"
+  - "src/**/*.rs"
+  - "build.rs"
 ---
 
 ## Adding a tool (`src/toolset.rs`)

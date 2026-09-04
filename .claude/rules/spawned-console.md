@@ -1,6 +1,7 @@
 ---
 paths:
-  - "src/engine.rs"
+  - "src/**/*.rs"
+  - "build.rs"
 ---
 
 ## The console a spawned child is given (`engine::without_a_console_window`)

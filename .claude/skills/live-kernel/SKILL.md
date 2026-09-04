@@ -5,7 +5,7 @@ description: Reach and drive a live kernel target from this bench - KDNET and se
 
 # Live kernel and driver IOCTL work
 
-### Two ways a target is reached, and neither is "the" procedure
+## Two ways a target is reached, and neither is "the" procedure
 
 **KDNET.** Check the target is reachable *before* starting the tier, not by starting it — an attach
 that finds nothing parks its worker in `WaitForEvent(INFINITE)` for the whole run and reports a
