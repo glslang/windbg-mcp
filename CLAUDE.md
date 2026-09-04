@@ -63,7 +63,11 @@ so most rules bind most of them. Against the 72,396 bytes of all eight, `engine.
 **89%**, `worker.rs` and `server.rs` 69%, `proto.rs` 62%. Eleven hand-maintained lists were buying
 11–38% on the files anyone actually edits, at a review round for each one that was wrong. One scope
 buys that back by leaving nothing to get wrong. Where the laziness still pays is the other axis, and
-it is untouched: a docs, `tools/`, `Cargo` or PowerShell session loads this file and nothing else.
+it is untouched: a session that touches no Rust never loads the **72,211 bytes** of code rules at
+all. It loads this file plus the one narrow rule its subject matches — 1,567 B of
+`markdown-and-docs` for a docs session, 1,717 B of `powershell-scripts` for `tools/` or a `.ps1`,
+8,031 B of `cargo-and-dependencies` for a manifest. (A `build.rs` edit is the exception and loads
+both halves, being a build input as well as the file the version resource lives in.)
 
 So the *Covers* column is the index. The eight are split by **subject**, not by which files trip
 them — read it to pick the one you want.
