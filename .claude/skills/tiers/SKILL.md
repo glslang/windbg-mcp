@@ -60,7 +60,7 @@ separate binary.
 `cargo test` includes `tests/mcp_smoke.rs`, which spawns the **dev** binary (via
 `CARGO_BIN_EXE_windbg-mcp`) and drives it over stdio — so it is also clear of the release lock.
 After a dependency bump (`rmcp`, `schemars`, `tokio`, `cargo update -p dbgscope`) or an MCP spec
-revision, run it and follow [`docs/smoke-test.md`](./docs/smoke-test.md).
+revision, run it and follow [`docs/smoke-test.md`](../../../docs/smoke-test.md).
 
 Two of its tests budget **what this server costs the model driving it** — the tool surface, paid
 once per conversation, and each result, paid every call. They are guarded differently, and the
@@ -77,7 +77,7 @@ difference matters when you change one:
   the tier and read the table. Changing a ceiling is an edit to that slice, not a re-record.
 
 `--nocapture` is what makes either print anything: libtest shows a passing test's output nowhere.
-[`docs/token-budget.md`](./docs/token-budget.md) has the baseline and what it exposed — including
+[`docs/token-budget.md`](../../../docs/token-budget.md) has the baseline and what it exposed — including
 the two client behaviours it settled by measurement: `outputSchema` never reaches the model, and
 `structuredContent` *replaces* the text block rather than accompanying it. To include the tier that
 opens the sample dump through DbgEng, set the gate first (PowerShell, not `VAR=1 cmd`):
