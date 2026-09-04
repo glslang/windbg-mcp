@@ -545,7 +545,7 @@ which are the shape a TTD one would copy.
 
 ---
 
-## 50. [windbg-mcp] The released binary is unsigned — the metadata half has landed
+## 50. [windbg-mcp] The released binary is unsigned — only the certificate is left
 
 **What happened.** On 2026-08-26 Windows Defender quarantined a freshly built
 `target\debug\windbg-mcp.exe` as `Trojan:Win32/Bearfoos.B!ml`, blocking every smoke test that
@@ -623,16 +623,29 @@ question `serverInfo.version` does. Four things that entry did not see:
     criteria require the project to be **findable at the top of a web search for its name**, and
     this one is both small and named generically enough that it is not. That is not a bar effort
     closes, so it is crossed off rather than deferred.
-  - **Certum's open-source code-signing certificates** are therefore the route being taken, not a
-    fallback — aimed at EU individual developers, around a hundred euros for several years. **Take
-    the cloud signing rather than the token**: a physical token cannot be reached from a
-    GitHub-hosted runner, which would mean signing by hand or a self-hosted runner, and since June
-    2023 the CA/Browser Forum has required code-signing keys to be on FIPS 140-2 Level 2 hardware
-    or an equivalent cloud HSM, so a plain `.pfx` is unlikely to be on offer at all. That changes
-    exactly one line of the workflow — `signtool sign`'s `/f`/`/p` become the vendor's provider
-    flags — and nothing around it.
+  - **Certum's open-source certificates on SimplySign** were the next candidate and are **out**, on
+    2026-09-04, for a reason worth keeping: SimplySign is "cloud" in the sense that the key sits in
+    Certum's HSM rather than on a USB token, but reaching it needs **SimplySign Desktop creating a
+    virtual card reader plus a mobile OTP**. That is an interactive session, not a credential a
+    runner can hold, so it is no more automatable from GitHub than a token is. "Cloud signing" is
+    not the property to shop for — *a credential that fits in a secret* is.
+  - **SSL.com's IV (Individual Validated) tier with eSigner** is the route that clears every gate,
+    and is **deferred on price rather than eligibility** — $129/year, not worth it until this
+    project has confirmed users (decided 2026-09-04). It is the first candidate that is genuinely
+    CI-native: the **TOTP secret itself** goes in a repository secret and CodeSignTool computes the
+    one-time code, so there is no phone in the loop — `ES_USERNAME`, `ES_PASSWORD`, `CREDENTIAL_ID`,
+    `ES_TOTP_SECRET`. IV needs no business registration (government ID only), and the only geography
+    on their page is US shipping *for the hardware token*, which cloud enrolment sidesteps.
+    **Two things to confirm before paying**, both being the exact shape that has caught this three
+    times: that they issue IV to an individual in this maintainer's country, and that **IV** rather
+    than EV alone works with CodeSignTool — their comparison says IV/OV/EV are all eSigner
+    compatible, CodeSignTool's own blurb says "EV". Prefer downloading and SHA-verifying
+    CodeSignTool over the `SSLcom/esigner-codesign` action, which is the pattern `release.yml`
+    already uses for the MCP registry publisher and avoids giving a third-party action a job holding
+    `contents: write` and `id-token: write`.
+  - **DigiCert KeyLocker** is out: OV and EV only, both of which need a legal entity.
 
-  So the one option left standing is OV-class, and reputation accumulates rather than arriving —
+  So the one option left standing is below EV, and reputation accumulates rather than arriving —
   which is an argument for doing the per-release submission above *regardless* of what gets signed,
   not for treating signing as the thing that makes it unnecessary. Prices and programme terms move;
   treat these as the shape of the choice, not as quotes. Note also what the release *does* carry and why it does not help here:
