@@ -372,6 +372,38 @@ stayed green — a passing test is not evidence that a deleted check was doing n
 nothing covered it. Before deleting, name every property the code provides; after deleting, assert
 the ones you meant to keep.
 
+**A test can stage exactly the right scenario, run, and pass because a *neighbouring* rule covers
+it.** Not a vacuous assertion — the paragraph above about capability gates is the case that never
+runs; this one runs, asserts the right thing, and is green for the wrong reason, so reading it tells
+you nothing. The only way to find out is to **break the rule the test claims to pin and confirm that
+test fails**. If it stays green it is riding on something else; find what, and pick a construction
+that other rule cannot reach.
+
+The evidence is [dbgscope#139](https://github.com/glslang/dbgscope/pull/139) (2026-09-04), eight
+review rounds and eleven findings on one 700-line module. **Four of them were invisible to a suite
+that already covered the mechanism**, each needing one specific construction to become visible:
+
+| what was missed | what made it visible |
+|---|---|
+| a departed claim reopening the open that held it | **two attaches** — with a launch, an unrelated rule protects it either way |
+| a claim handed along a chain rather than broadcast | **three** launches — with two, both readings agree |
+| an arrived claim believed without re-reading the session | a **second process** keeping the session alive |
+| a finished attach blocking a launch on a reused pid | a departed attach **whose guard is still held** |
+
+Two of the four were regressions introduced by that PR and two were pre-existing, which is the point:
+the split is invisible from the test results, because *every* one of them was green before and after.
+The reviewer found them and the suite could not, and that is a property of the constructions rather
+than of the reviewer — so the answer is not "review harder" but **mutation-verify each new rule
+against the mutation it is for**, one at a time, and treat "the whole suite still passes" as the
+thing to be suspicious of. Two of that PR's own commits shipped a fix whose test passed with the fix
+backed out, until exactly that was done.
+
+A corollary worth having in front of you when a reviewer says a scenario is unreachable: **measure it
+rather than arguing.** Round nine of that PR claimed two live attaches on one pid could starve each
+other. One probe settled it — the kernel gives a process one debug port and refuses the second with
+`0xD0000048 STATUS_PORT_ALREADY_SET` — and the measurement went into the code beside the rule, where
+the next round will find it.
+
 `cargo test` includes `tests/mcp_smoke.rs`, which spawns the **dev** binary (via
 `CARGO_BIN_EXE_windbg-mcp`) and drives it over stdio — so it is also clear of the release lock.
 After a dependency bump (`rmcp`, `schemars`, `tokio`, `cargo update -p dbgscope`) or an MCP spec
