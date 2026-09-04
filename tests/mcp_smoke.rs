@@ -839,8 +839,9 @@ fn stamped_version() -> String {
 ///
 /// **Why it is a test and not a hard failure in `build.rs`.** The resource needs `rc.exe`, and the
 /// `cargo check --target x86_64-pc-windows-msvc` this repo runs from a Mac has none — a workflow
-/// `CLAUDE.md` documents and that must not start failing over metadata. So the build script warns
-/// and carries on, and the check moves here, where it only ever runs on the host that can build one.
+/// `.claude/rules/cargo-and-dependencies.md` documents and that must not start failing over
+/// metadata. So the build script warns and carries on, and the check moves here, where it only
+/// ever runs on the host that can build one.
 ///
 /// The split in what is pinned is deliberate: the fields a *checker* compares are pinned to their
 /// values, and the ones a human reads are asserted non-empty, so rewording the prose is not a test
@@ -5578,8 +5579,8 @@ fn fuzz_setting(name: &str, default: u64) -> u64 {
 ///
 /// - **A third state.** `continue_async` leaves a target moving with nobody waiting for it, and
 ///   every read is then refused `target_running`. That state machine is the supervisor's (#83),
-///   the example has no way to reach it, and `CLAUDE.md` records three orderings inside it that
-///   shipped wrong once each.
+///   the example has no way to reach it, and `.claude/rules/async-runs.md` records three orderings
+///   inside it that shipped wrong once each.
 /// - **The category a refusal carries**, not just that it refused. `engine::engine_error`'s `_`
 ///   arm folded "no target left" into `debugger` — the exact failure its own doc comment warns
 ///   about — and a caller branching on that is told to change what it asked instead of to release

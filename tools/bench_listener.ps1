@@ -12,7 +12,8 @@
 #       < bench-tokens.json
 #
 # Windows PowerShell 5.1 is the only PowerShell a debuggee is guaranteed to have, so this file
-# stays ASCII - see CLAUDE.md on what a BOM-less non-ASCII character does to a 5.1 parse.
+# stays ASCII - see .claude/rules/powershell-scripts.md on what a BOM-less non-ASCII character
+# does to a 5.1 parse.
 $ErrorActionPreference = 'Stop'
 
 $exe = $env:WINDBG_MCP_EXE

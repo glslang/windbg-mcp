@@ -9,9 +9,9 @@ paths:
 
 `dbgscope` is a **git dependency pinned to an exact `rev`**, not a path dependency — a `windbg-mcp`
 build pulls it from GitHub, so **local edits to a dbgscope checkout are invisible to a `windbg-mcp`
-build until they are pushed** and the pin is moved. Add new DbgEng primitives as typed `dbgscope`
-methods (returning `Result<_, DbgEngError>`, not `panic!`/`.expect`), not via the `execute` text
-hatch.
+build until they are pushed** and the pin is moved. (The rule that a new DbgEng primitive is a
+typed method rather than an `execute` text hatch is in `CLAUDE.md`, not here: it binds a Rust-only
+change, which never loads this file.)
 
 **`cargo update -p dbgscope` does not move the pin.** `Cargo.toml` names a 40-character `rev`, so
 the update command only re-resolves *that* revision; the pin is moved by editing the `rev` and then
