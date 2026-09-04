@@ -308,7 +308,7 @@ a user-mode dump that died on an unhandled C++ exception, return the thrown HRES
 message*. The routine is mechanical — find the `0xE06D7363` record, take the object after the EH
 magic, decode — and it was performed by hand three times in one evening. That belongs in
 [`dbgscope`](https://github.com/glslang/dbgscope) as a typed method rather than in a walkthrough as
-a recipe, per the rule in `CLAUDE.md` that new primitives are typed methods, not text hatches.
+a recipe, per the rule in `.claude/rules/cargo-and-dependencies.md` that new primitives are typed methods, not text hatches.
 
 Two smaller notes for the same list. `!error` earned its place — three times it turned a bare dword
 into the sentence that redirected the whole investigation. And **nothing about a user-mode dump of
