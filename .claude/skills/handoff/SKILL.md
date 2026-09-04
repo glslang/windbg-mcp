@@ -21,8 +21,9 @@ on #159 and #170, *"what is covered, what is not"* on #155.
 
   **`paths:` is one shared scope for the eight code rules, and that is a decision rather than
   laziness.** Each was first scoped to the files named in its own title, which is the natural thing
-  to do and was wrong twelve times across five review rounds on
-  [#285](https://github.com/glslang/windbg-mcp/pull/285) — `worker-architecture` binds `worker.rs`
+  to do and was wrong fourteen times: eight filed as review findings across six rounds on
+  [#285](https://github.com/glslang/windbg-mcp/pull/285), six more found by enumerating rather
+  than waiting for the next round. `worker-architecture` binds `worker.rs`
   and `proto.rs`, `listener-clients` binds `server.rs` and `engine.rs`, `tool-surface` binds
   `worker.rs`, `execution-waits` binds `server.rs`, `batch.rs` and `structured.rs`, `transcripts`
   binds `main.rs`, `server.rs` and `engine.rs`, and so on. Two heuristics were tried and both
@@ -36,12 +37,13 @@ on #159 and #170, *"what is covered, what is not"* on #155.
   `engine.rs` already loaded 89%, `worker.rs` and `server.rs` 69%, `proto.rs` 62% — because every
   tool call crosses those four. Eleven hand-maintained lists bought 11–38% on the files anyone
   edits and cost a review round per mistake, so they were replaced by `src/**/*.rs` plus
-  `build.rs`, identical in all eight. **A new code rule copies that scope; it does not invent
+  `tests/**/*.rs` and `build.rs` — `build.rs`'s own `INPUTS` less the manifests — identical in
+  all eight. **A new code rule copies that scope; it does not invent
   one.** The laziness that still pays is on the other axis and is untouched: a docs, `tools/`,
   `Cargo` or PowerShell session loads `CLAUDE.md` and nothing else.
 
   The three rules that are *not* about this server's code keep narrow scopes, and should: they are
-  genuinely disjoint (`Cargo.*`, `**/*.md`, `**/*.ps1`), they overlap nothing, and five rounds
+  genuinely disjoint (`Cargo.*`, `**/*.md`, `**/*.ps1`), they overlap nothing, and six rounds
   filed no finding against any of them.
 - **`.claude/skills/*/SKILL.md`** — the procedures: `tiers`, `review-round`, `live-kernel`,
   `eval-bench`, and this file. A skill's body costs nothing until it is invoked, so length is
