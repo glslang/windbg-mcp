@@ -3,6 +3,9 @@ paths:
   - "src/worker.rs"
   - "src/engine.rs"
   - "src/proto.rs"
+  - "src/server.rs"
+  - "src/batch.rs"
+  - "src/structured.rs"
 ---
 
 ## Driving execution: the two waits, and the state a raw command can leave

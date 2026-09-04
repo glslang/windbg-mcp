@@ -4,6 +4,7 @@ paths:
   - "src/worker.rs"
   - "src/proto.rs"
   - "src/server.rs"
+  - "src/structured.rs"
 ---
 
 ## A run the caller is not waiting for (`continue_async`, #83)
