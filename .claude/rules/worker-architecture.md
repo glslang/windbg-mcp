@@ -1,6 +1,7 @@
 ---
 paths:
   - "src/**/*.rs"
+  - "tests/**/*.rs"
   - "build.rs"
 ---
 
