@@ -59,21 +59,23 @@ about the code share **one** scope: `src/**/*.rs`, `tests/**/*.rs` and `build.rs
 a **read**, not a grep, so if you are about to reason about a subsystem from search results alone,
 open the rule first.
 
-**They share a scope because per-rule scoping was measured and did not pay.** Six review rounds on
-[#285](https://github.com/glslang/windbg-mcp/pull/285) filed ten findings, **eight** of them one
-file whose editor a rule binds and whose `paths:` did not name it — and six more were found by
-enumerating rather than waiting for the next round. There was no end to them because this crate's
-files are entangled: every tool call crosses `server.rs`, `engine.rs`, `proto.rs` and `worker.rs`,
-so most rules bind most of them. Against the 72,396 bytes of all eight, `engine.rs` already loaded
+**They share a scope because per-rule scoping was measured and did not pay.** Review on
+[#285](https://github.com/glslang/windbg-mcp/pull/285) filed **nine** findings that were one file
+whose editor a rule binds and whose `paths:` did not name it, spread across rounds one to nine, and
+six more were found by enumerating rather than waiting for the next round. There was no end to them
+because this crate's files are entangled: every tool call crosses `server.rs`, `engine.rs`,
+`proto.rs` and `worker.rs`, so most rules bind most of them. Measured at the restructure, against
+the 72,396 bytes of all eight then, `engine.rs` already loaded
 **89%**, `worker.rs` and `server.rs` 69%, `proto.rs` 62%. Eleven hand-maintained lists were buying
 11–38% on the files anyone actually edits, at a review round for each one that was wrong. One scope
 buys that back by leaving nothing to get wrong. Where the laziness still pays is the other axis, and
-it is untouched: a session that touches no Rust never loads the **72,211 bytes** of code rules at
-all. It loads this file plus whichever narrow rules its files match, which is at most 11,315 B if
-all three somehow fired. How many fire is deliberately not stated more precisely than that — the
-globs intersect (`examples/README.md` matches two, `build.rs` matches four), and two attempts to
-give the exact composition here were both wrong, one of them in the commit that fixed the other.
-The bound is the claim; the arithmetic below it is a Venn diagram, and `/handoff` has it.
+it is untouched: a session that touches no Rust never loads the code rules at all, and picks up at
+most the three narrow ones. Measured after round nine: **72,211 B** against **11,345 B** —
+a measurement rather than an invariant, since any edit to a rule moves it, and the second of those
+figures was already stale by 30 bytes when first written here. How many narrow rules fire is
+deliberately not stated: the globs intersect (`examples/README.md` matches two, `build.rs` four),
+and two attempts to give the exact composition were both wrong, one in the commit that fixed the
+other. `/handoff` carries the method and what went wrong with it.
 
 So the *Covers* column is the index. The eight are split by **subject**, not by which files trip
 them — read it to pick the one you want.

@@ -21,10 +21,11 @@ on #159 and #170, *"what is covered, what is not"* on #155.
 
   **`paths:` is one shared scope for the eight code rules, and that is a decision rather than
   laziness.** Each was first scoped to the files named in its own title, which is the natural thing
-  to do and was wrong fourteen times: eight filed as review findings across six rounds on
-  [#285](https://github.com/glslang/windbg-mcp/pull/285), six more found by enumerating rather
-  than waiting for the next round. `worker-architecture` binds `worker.rs`
-  and `proto.rs`, `listener-clients` binds `server.rs` and `engine.rs`, `tool-surface` binds
+  to do and was wrong fifteen times: nine filed as review findings across rounds one to nine of
+  [#285](https://github.com/glslang/windbg-mcp/pull/285), six more found by enumerating rather than
+  waiting for the next round — and the ninth landed *after* the shared scope, against
+  `cargo-and-dependencies`, whose first paragraph bound a Rust-only change from a manifest-scoped
+  file. `worker-architecture` binds `worker.rs` and `proto.rs`, `listener-clients` binds `server.rs` and `engine.rs`, `tool-surface` binds
   `worker.rs`, `execution-waits` binds `server.rs`, `batch.rs` and `structured.rs`, `transcripts`
   binds `main.rs`, `server.rs` and `engine.rs`, and so on. Two heuristics were tried and both
   failed: "start from the four hub files" cannot reach `batch.rs`, which is bound by what it
@@ -33,15 +34,14 @@ on #159 and #170, *"what is covered, what is not"* on #155.
   `engine.rs` through *registry*, `transcripts` names `server.rs` through the `registers` **tool**,
   and `Arch` and `Expired` are each defined in two modules meaning different things).
 
-  What settled it was measuring instead of arguing. Against the 72,396 bytes of all eight rules,
-  `engine.rs` already loaded 89%, `worker.rs` and `server.rs` 69%, `proto.rs` 62% — because every
-  tool call crosses those four. Eleven hand-maintained lists bought 11–38% on the files anyone
+  What settled it was measuring instead of arguing. At the restructure, against the 72,396 bytes of
+  all eight rules then, `engine.rs` already loaded 89%, `worker.rs` and `server.rs` 69%, and
+  `proto.rs` 62% — because every tool call crosses those four. Eleven hand-maintained lists bought 11–38% on the files anyone
   edits and cost a review round per mistake, so they were replaced by `src/**/*.rs` plus
   `tests/**/*.rs` and `build.rs` — `build.rs`'s own `INPUTS` less the manifests — identical in
-  all eight. **A new code rule copies that scope; it does not invent
-  one.** The laziness that still pays is on the other axis and is untouched: a session touching no
-  Rust never loads the 72,211 bytes of code rules at all — it loads `CLAUDE.md` plus whichever
-  narrow rules its files match, at most 11,315 B with all three firing.
+  all eight. **A new code rule copies that scope; it does not invent one.** The laziness that still pays is on the other axis and is untouched: a session touching no
+  Rust never loads the code rules at all — it loads `CLAUDE.md` plus whichever narrow rules its
+  files match. Measured after round nine: 72,211 B against 11,345 B.
 
   **State that as a bound, never as a composition.** Two goes at the exact wording were both review
   findings: "and nothing else" (the narrow rule loads too), then "the one narrow rule its subject
@@ -49,6 +49,15 @@ on #159 and #170, *"what is covered, what is not"* on #155.
   `examples/README.md` matches two rules and `build.rs` four. The globs intersect by design, so any
   sentence counting how many fire has to be re-derived against them, and the saving does not need
   the count: what it rests on is the code rules not firing.
+
+  **A byte figure in prose is a measurement, not an invariant — so date it.** The bound was written
+  as 11,315 B and was already 30 bytes stale, because the commit that added a pointer sentence to
+  `cargo-and-dependencies.md` moved it in the same series; a reviewer recomputed and was right.
+  Worse, this file carried 72,396 and 72,211 for the same quantity in two paragraphs, both phrased
+  as current fact, because they were snapshots taken four commits apart. Every such figure here now
+  says when it was taken, which is the only form that stays true — the percentages above are from
+  the restructure and must not be "corrected" against today's sizes, or they stop matching the
+  total they were computed from.
 
   The three rules that are *not* about this server's code keep narrow scopes, and should: their
   **subjects** are disjoint from the code's, so scoping them is one obvious judgement each rather
@@ -62,7 +71,7 @@ on #159 and #170, *"what is covered, what is not"* on #155.
   lives in, and a README beside the scripts it documents is both markdown and script context.
   Overlap costs a few kilobytes on a file that genuinely has two subjects. The failure to care
   about is a rule that does **not** load where it is needed, which is the opposite direction and
-  the one all fourteen mistakes were in. Do not narrow a scope to make a Venn diagram tidy.
+  the one all fifteen mistakes were in. Do not narrow a scope to make a Venn diagram tidy.
 
   One thing to know while reading them: `powershell-scripts` names `tools/**`, so it also loads on
   the eval scripts, which are Python. That is deliberate — its stderr-draining rule is about
