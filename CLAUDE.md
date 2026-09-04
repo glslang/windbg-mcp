@@ -398,11 +398,13 @@ against the mutation it is for**, one at a time, and treat "the whole suite stil
 thing to be suspicious of. Two of that PR's own commits shipped a fix whose test passed with the fix
 backed out, until exactly that was done.
 
-A corollary worth having in front of you when a reviewer says a scenario is unreachable: **measure it
-rather than arguing.** Round nine of that PR claimed two live attaches on one pid could starve each
-other. One probe settled it — the kernel gives a process one debug port and refuses the second with
-`0xD0000048 STATUS_PORT_ALREADY_SET` — and the measurement went into the code beside the rule, where
-the next round will find it.
+A corollary for the other direction, which is the one you are in more often: **when you are about to
+tell a reviewer their scenario is unreachable, measure it first.** Round nine of that PR said two
+live attaches on one pid could starve each other, and the reply forming in my head was that they
+cannot. That reply happened to be right — the kernel gives a process one debug port and refuses the
+second with `0xD0000048 STATUS_PORT_ALREADY_SET` — but it was worth nothing until a probe said so,
+and the probe is what could be put in the code beside the rule for the next round to find. A
+dismissal you have not measured is indistinguishable, to you, from one you have.
 
 `cargo test` includes `tests/mcp_smoke.rs`, which spawns the **dev** binary (via
 `CARGO_BIN_EXE_windbg-mcp`) and drives it over stdio — so it is also clear of the release lock.
