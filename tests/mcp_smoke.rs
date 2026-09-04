@@ -839,7 +839,7 @@ fn stamped_version() -> String {
 ///
 /// **Why it is a test and not a hard failure in `build.rs`.** The resource needs `rc.exe`, and the
 /// `cargo check --target x86_64-pc-windows-msvc` this repo runs from a Mac has none — a workflow
-/// `.claude/rules/cargo-and-dependencies.md` documents and that must not start failing over
+/// `.claude/rules/cross-target-check.md` documents and that must not start failing over
 /// metadata. So the build script warns and carries on, and the check moves here, where it only
 /// ever runs on the host that can build one.
 ///

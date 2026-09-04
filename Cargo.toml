@@ -59,7 +59,7 @@ windows-sys = { version = "0.61", features = [
     # before a worker is spawned for it. The call itself is in `Win32_System_Threading` above; this
     # feature is here for its `IMAGE_FILE_MACHINE` out-parameters, which are gated by module path
     # rather than by subject — the same trap `IMAGE_NT_HEADERS64` hit, recorded in
-    # `.claude/rules/cargo-and-dependencies.md`.
+    # `.claude/rules/cross-target-check.md`.
     "Win32_System_SystemInformation",
 ] }
 # The Windows service role (`src/service.rs`). A wrapper rather than hand-rolled SCM FFI because
