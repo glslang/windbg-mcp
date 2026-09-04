@@ -39,8 +39,11 @@ on #159 and #170, *"what is covered, what is not"* on #155.
   edits and cost a review round per mistake, so they were replaced by `src/**/*.rs` plus
   `tests/**/*.rs` and `build.rs` — `build.rs`'s own `INPUTS` less the manifests — identical in
   all eight. **A new code rule copies that scope; it does not invent
-  one.** The laziness that still pays is on the other axis and is untouched: a docs, `tools/`,
-  `Cargo` or PowerShell session loads `CLAUDE.md` and nothing else.
+  one.** The laziness that still pays is on the other axis and is untouched: a session touching no
+  Rust never loads the 72,211 bytes of code rules at all — it loads `CLAUDE.md` plus the one narrow
+  rule its subject matches, between 1,567 and 8,031 bytes. Both these files said "and nothing
+  else", which is false — the narrow rule loads too — and was a review finding; if you restate the
+  saving, state it as the code rules not firing rather than as nothing firing.
 
   The three rules that are *not* about this server's code keep narrow scopes, and should: their
   **subjects** are disjoint from the code's, so scoping them is one obvious judgement each rather
@@ -96,6 +99,17 @@ moved: #170 updated two of them and `README.md`, and was right to — the test i
 day. Going looking for another edit with no subject is how a section gets written about nothing.
 The failure this list prevents is the opposite one, and it is the common one: *not knowing the
 next file is there*.
+
+**The closing sentence of an explanation is where the false claim goes.** Rounds six, seven and
+eight of #285 were three consecutive findings of exactly this, none of them about the thing being
+explained and all of them about the tidy line at the end of it: "a docs session loads `CLAUDE.md`
+and nothing else" (it loads the matching narrow rule too), the three narrow rules "overlap nothing"
+(`build.rs` is in two scopes, `examples/README.md` in two), and a commit message claiming a change
+"closes the class" (the next round reopened it). Each was written *after* the accurate paragraph
+above it, as a summary — and summarising is where the qualifier gets dropped, because a crisp line
+reads better than a true one. The tell is a sentence with **nothing**, **every**, **always**,
+**closes** or **never** in it that you wrote to finish a paragraph rather than to state a fact.
+Re-read those against the thing itself, not against the paragraph they conclude.
 
 **This prose is reviewed as hard as code, and deserves to be.** A docs-only PR (#170) drew six
 findings from the Codex bot, every one a real inaccuracy about the lease — and two of them were
