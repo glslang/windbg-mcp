@@ -47,29 +47,39 @@ protocol.
 ## Where the rest of it lives
 
 **Rules load themselves; skills you invoke.** A rule under `.claude/rules/` carries a `paths:` glob
-and is pulled into context when Claude reads a file matching it — so editing `src/client.rs` brings
-the listener rule with it and nothing else. That trigger is a **read**, not a grep: if you are about
-to reason about a subsystem from search results alone, open the rule named here first.
+and is pulled into context when Claude reads a file matching it. The three about something other
+than this server's code are scoped to that thing — a `Cargo.toml`, a `.md`, a `.ps1`. The eight
+about the code share **one** scope: `src/**/*.rs` and `build.rs`. That trigger is a **read**, not a
+grep, so if you are about to reason about a subsystem from search results alone, open the rule
+first.
 
-**And this table is the backstop for a `paths:` that is wrong**, which four review rounds on
-[#285](https://github.com/glslang/windbg-mcp/pull/285) say is the normal state rather than the
-exception — nine scopes were missing across five rules, every one of them a file whose editor the
-rule binds. So the *Covers* column is what to scan when you are about to change `src/`: a rule that
-describes what you are touching is worth opening whether or not it loaded itself.
+**They share a scope because per-rule scoping was measured and did not pay.** Five review rounds on
+[#285](https://github.com/glslang/windbg-mcp/pull/285) filed twelve findings, every one a file whose
+editor a rule binds and whose `paths:` did not name it — and there was no end to them because this
+crate's files are entangled: every tool call crosses `server.rs`, `engine.rs`, `proto.rs` and
+`worker.rs`, so most rules bind most of them. Against the 72,396 bytes of all eight, `engine.rs`
+already loaded **89%**, `worker.rs` and `server.rs` 69%, `proto.rs` 62%. Eleven hand-maintained
+lists were buying 11–38% on the files anyone actually edits, at a review round for each one that was
+wrong. One scope buys that back by leaving nothing to get wrong. Where the laziness still pays is
+the other axis, and it is untouched: a docs, `tools/`, `Cargo` or PowerShell session loads this file
+and nothing else.
+
+So the *Covers* column is the index. The eight are split by **subject**, not by which files trip
+them — read it to pick the one you want.
 
 | Rule (`.claude/rules/`) | Loads when you touch | Covers |
 |---|---|---|
 | `cargo-and-dependencies.md` | `Cargo.toml`, `Cargo.lock`, `build.rs` | moving the `dbgscope` `rev` pin, the Mac `cargo check`/`fetch`/`metadata` workflow, `build.rs`'s PE version resource, why `[patch]` is never committed |
 | `markdown-and-docs.md` | `**/*.md` | CI's two non-Rust gates: `cargo fmt --all --check` and the markdownlint globs |
 | `powershell-scripts.md` | `**/*.ps1`, `tools/**`, `examples/**` | the three ways a shipped `.ps1` fails only under PowerShell 5.1; draining stderr when driving the server from a script |
-| `execution-waits.md` | `src/worker.rs`, `src/engine.rs`, `src/proto.rs`, `src/server.rs`, `src/batch.rs`, `src/structured.rs` | the two waits, what a raw `execute` of execution-control text leaves behind, `settle`, the load-wait outcome, the session fuzz |
-| `async-runs.md` | `src/engine.rs`, `src/worker.rs`, `src/proto.rs`, `src/server.rs`, `src/structured.rs` | `continue_async`: the slot, the filing task, the refusal, `submit_gate`, breaking the pump, bars, `break_in` against `interrupt` |
-| `session-teardown.md` | `src/engine.rs`, `src/worker.rs`, `src/proto.rs` | what `end_session` does to a dump, a live kernel, an attached process and a launched one — and the handle it still accepts |
-| `spawned-console.md` | `src/engine.rs` | `CREATE_NO_WINDOW` and why it is conditional; what a launched debuggee gets instead |
-| `worker-architecture.md` | `src/target.rs`, `src/engine.rs`, `src/worker.rs`, `src/proto.rs` | the 32-bit worker image: deciding before the engine exists, `x86\`, the build-identity check, falling back |
-| `tool-surface.md` | `src/toolset.rs`, `src/server.rs`, `src/schema.rs`, `src/worker.rs` | adding a tool: the second file, output schemas carrying no prose, per-client surfaces, `TOOL_NOTES`/`SUMMARY_NOTES` |
-| `listener-clients.md` | `src/client.rs`, `src/listen.rs`, `src/service.rs`, `src/kdconn.rs`, `src/server.rs`, `src/engine.rs` | several clients on one listener: credentials, per-client surfaces, ambient identity, the lease, driving `2026-07-28` by hand |
-| `transcripts.md` | `src/record.rs`, `src/cast.rs` | `WINDBG_MCP_TRANSCRIPT`, what it records that stderr cannot, and `--render-cast` |
+| `execution-waits.md` | any `src/*.rs` or `build.rs` | the two waits, what a raw `execute` of execution-control text leaves behind, `settle`, the load-wait outcome, the session fuzz |
+| `async-runs.md` | any `src/*.rs` or `build.rs` | `continue_async`: the slot, the filing task, the refusal, `submit_gate`, breaking the pump, bars, `break_in` against `interrupt` |
+| `session-teardown.md` | any `src/*.rs` or `build.rs` | what `end_session` does to a dump, a live kernel, an attached process and a launched one — and the handle it still accepts |
+| `spawned-console.md` | any `src/*.rs` or `build.rs` | `CREATE_NO_WINDOW` and why it is conditional; what a launched debuggee gets instead |
+| `worker-architecture.md` | any `src/*.rs` or `build.rs` | the 32-bit worker image: deciding before the engine exists, `x86\`, the build-identity check, falling back |
+| `tool-surface.md` | any `src/*.rs` or `build.rs` | adding a tool: the second file, output schemas carrying no prose, per-client surfaces, `TOOL_NOTES`/`SUMMARY_NOTES` |
+| `listener-clients.md` | any `src/*.rs` or `build.rs` | several clients on one listener: credentials, per-client surfaces, ambient identity, the lease, driving `2026-07-28` by hand |
+| `transcripts.md` | any `src/*.rs` or `build.rs` | `WINDBG_MCP_TRANSCRIPT`, what it records that stderr cannot, and `--render-cast` |
 
 | Skill (`.claude/skills/`) | Invoke when |
 |---|---|

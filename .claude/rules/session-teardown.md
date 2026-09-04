@@ -1,8 +1,7 @@
 ---
 paths:
-  - "src/engine.rs"
-  - "src/worker.rs"
-  - "src/proto.rs"
+  - "src/**/*.rs"
+  - "build.rs"
 ---
 
 ## What ending a session does to its target (`FOLLOWUPS.md` item 51)

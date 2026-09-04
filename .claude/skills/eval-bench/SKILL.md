@@ -5,7 +5,7 @@ description: Run and read the local-model benchmark (`tools/local_model_eval.py`
 
 # Benchmarking a model against this server
 
-## Benchmarking a model against this server (`tools/local_model_eval.py`)
+## The grid, and what bites while running it
 
 `docs/local-model-eval.md` is the result; this is what bites while running it again. The grid is
 three scripts — the ollama driver, the Claude Code driver, and the matrix runner that spawns either
