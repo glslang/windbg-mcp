@@ -40,10 +40,15 @@ on #159 and #170, *"what is covered, what is not"* on #155.
   `tests/**/*.rs` and `build.rs` — `build.rs`'s own `INPUTS` less the manifests — identical in
   all eight. **A new code rule copies that scope; it does not invent
   one.** The laziness that still pays is on the other axis and is untouched: a session touching no
-  Rust never loads the 72,211 bytes of code rules at all — it loads `CLAUDE.md` plus the one narrow
-  rule its subject matches, between 1,567 and 8,031 bytes. Both these files said "and nothing
-  else", which is false — the narrow rule loads too — and was a review finding; if you restate the
-  saving, state it as the code rules not firing rather than as nothing firing.
+  Rust never loads the 72,211 bytes of code rules at all — it loads `CLAUDE.md` plus whichever
+  narrow rules its files match, at most 11,315 B with all three firing.
+
+  **State that as a bound, never as a composition.** Two goes at the exact wording were both review
+  findings: "and nothing else" (the narrow rule loads too), then "the one narrow rule its subject
+  matches" — which was written one commit *after* the paragraph below documenting that
+  `examples/README.md` matches two rules and `build.rs` four. The globs intersect by design, so any
+  sentence counting how many fire has to be re-derived against them, and the saving does not need
+  the count: what it rests on is the code rules not firing.
 
   The three rules that are *not* about this server's code keep narrow scopes, and should: their
   **subjects** are disjoint from the code's, so scoping them is one obvious judgement each rather
@@ -108,8 +113,16 @@ and nothing else" (it loads the matching narrow rule too), the three narrow rule
 "closes the class" (the next round reopened it). Each was written *after* the accurate paragraph
 above it, as a summary — and summarising is where the qualifier gets dropped, because a crisp line
 reads better than a true one. The tell is a sentence with **nothing**, **every**, **always**,
-**closes** or **never** in it that you wrote to finish a paragraph rather than to state a fact.
-Re-read those against the thing itself, not against the paragraph they conclude.
+**one**, **closes** or **never** in it that you wrote to finish a paragraph rather than to state a
+fact. Re-read those against the thing itself, not against the paragraph they conclude.
+
+**And round ten was the same mistake inside the commit that named it.** The fix for "and nothing
+else" replaced it with "the one narrow rule its subject matches", which is false for the same
+`examples/README.md` the paragraph above had documented one commit earlier — so the correction, the
+rule it contradicted, and the paragraph warning about exactly this shipped together. Naming a habit
+does not interrupt it. What worked was changing the *shape* of the claim: state a bound, which
+survives a glob change, rather than a composition, which has to be re-derived against every scope
+and was wrong both times it was written.
 
 **This prose is reviewed as hard as code, and deserves to be.** A docs-only PR (#170) drew six
 findings from the Codex bot, every one a real inaccuracy about the lease — and two of them were

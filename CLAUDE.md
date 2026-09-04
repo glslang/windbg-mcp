@@ -69,10 +69,11 @@ so most rules bind most of them. Against the 72,396 bytes of all eight, `engine.
 11–38% on the files anyone actually edits, at a review round for each one that was wrong. One scope
 buys that back by leaving nothing to get wrong. Where the laziness still pays is the other axis, and
 it is untouched: a session that touches no Rust never loads the **72,211 bytes** of code rules at
-all. It loads this file plus the one narrow rule its subject matches — 1,567 B of
-`markdown-and-docs` for a docs session, 1,717 B of `powershell-scripts` for `tools/` or a `.ps1`,
-8,031 B of `cargo-and-dependencies` for a manifest. (A `build.rs` edit is the exception and loads
-both halves, being a build input as well as the file the version resource lives in.)
+all. It loads this file plus whichever narrow rules its files match, which is at most 11,315 B if
+all three somehow fired. How many fire is deliberately not stated more precisely than that — the
+globs intersect (`examples/README.md` matches two, `build.rs` matches four), and two attempts to
+give the exact composition here were both wrong, one of them in the commit that fixed the other.
+The bound is the claim; the arithmetic below it is a Venn diagram, and `/handoff` has it.
 
 So the *Covers* column is the index. The eight are split by **subject**, not by which files trip
 them — read it to pick the one you want.
