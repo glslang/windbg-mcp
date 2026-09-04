@@ -19,6 +19,11 @@ kernel, crash-dump, and Time Travel Debugging (TTD) work. The low-level DbgEng b
 the sibling crate [`dbgscope`](https://github.com/glslang/dbgscope) (a **path/git dependency we grow
 ourselves** — do not add third-party DbgEng crates).
 
+**A new DbgEng primitive is a typed `dbgscope` method**, returning `Result<_, DbgEngError>` rather
+than `panic!`/`.expect`, never the `execute` text hatch. It is here rather than in
+`.claude/rules/cargo-and-dependencies.md` with the rest of the dbgscope material because it binds a
+Rust-only change, which loads that rule never — it is scoped to the manifests and `build.rs`.
+
 **The binary has two roles.** Started normally it is the **supervisor**: MCP on stdio, no DbgEng.
 Re-executed with `--engine-worker` it owns exactly one debug session, because dbgeng.dll holds one
 debuggee session per process. Key source: `src/engine.rs` (the supervisor — session registry,

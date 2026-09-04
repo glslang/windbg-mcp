@@ -278,9 +278,13 @@ def run_cell(plan, tokens, backend, model, context, surface, draw, subset, plann
 
     os.makedirs(logs_dir, exist_ok=True)
     # **Claude Code reads the project it is started in, and walks *up* to find it.** `CLAUDE.md`,
-    # settings, the checkout itself - and this repository's `CLAUDE.md` now quotes two of the six
-    # answers, in the section explaining how the grader was fixed. So a cell started anywhere
-    # under the checkout is handed part of the answer key before it calls a tool.
+    # settings, the checkout itself - and the guidance that quotes two of the six answers, in the
+    # passage explaining how the grader was fixed, is still in this checkout: it moved out of
+    # `CLAUDE.md` into `.claude/skills/eval-bench/SKILL.md`. That narrowed the leak rather than
+    # closing it - a skill's body reaches the model only when it is invoked, where `CLAUDE.md` was
+    # injected unconditionally - but the file is still readable from anywhere under the checkout,
+    # and a cell that greps for its task would find it. The neutral working directory is still the
+    # fence.
     #
     # `logs_dir` looked neutral and is not: the checked-in plan keeps logs in `eval-out/`, inside
     # the tree. An empty directory of this process's own is the only one that is neutral wherever
