@@ -7,8 +7,9 @@ paths:
 is edited from one and compiled on a VM — so the checks that need no Windows are the cheapest ones
 to forget. `cargo fmt --all --check` is the first step of *Build & test*. The other is
 **`Documentation lint`**, a markdownlint over `README.md`, `CHANGELOG.md`, `docs/**` and
-`skills/**` — note `CLAUDE.md`, `FOLLOWUPS.md` and `DONE.md` are **not** in its globs, so a clean
-run says nothing about them. `.markdownlint.jsonc` — *not* `.markdownlint-cli2.jsonc`, which does not exist
+`skills/**` — note `CLAUDE.md`, `FOLLOWUPS.md`, `DONE.md` and everything under `.claude/` are
+**not** in its globs, so a clean run says nothing about them. `skills/**` is the *shipped* plugin
+skill; `.claude/skills/` is this repo's own guidance and is unlinted like the rules beside it. `.markdownlint.jsonc` — *not* `.markdownlint-cli2.jsonc`, which does not exist
 here — turns off three of the defaults and leaves every other one on: no line-length rule (MD013),
 no table-pipe spacing (MD060), and duplicate headings flagged only among siblings (MD024), which is
 what lets `CHANGELOG.md` repeat `### Added` under every version. **MD051 — a link fragment with no

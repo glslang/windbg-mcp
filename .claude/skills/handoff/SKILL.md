@@ -18,6 +18,19 @@ on #159 and #170, *"what is covered, what is not"* on #155.
 - **`.claude/rules/*.md`** — what bites while *editing* a subsystem, scoped by a `paths:` glob so
   it loads only when Claude reads a file it covers. A new subsystem note goes in the rule whose
   `paths` already match the file it is about, or in a new rule named after the seam.
+
+  **`paths:` names the files whose *editor* needs the rule, which is not the files the rule
+  mentions**, and getting that backwards costs in both directions. `worker-architecture.md` was
+  scoped to `src/target.rs` and `src/engine.rs` because those are what its title is about, and it
+  shipped that way — while the invariants it holds are binding on `worker.rs` (the engine goes into
+  a `OnceLock`, so it cannot be swapped mid-session) and on `proto.rs` (nothing types a target
+  address as `usize`), whose editors would have lost them silently. That was a review finding on
+  [#285](https://github.com/glslang/windbg-mcp/pull/285). The other direction has no finding
+  because nothing catches it: `transcripts.md` names `src/structured.rs` only to say the transcript
+  obeys the same rule, and adding it to that glob would load a rule on every `structured.rs` edit
+  that tells its editor nothing. So it is a judgement per file, and a test asserting "every module
+  a rule names is in its `paths`" would encode the wrong one — it was drafted here and dropped for
+  exactly that.
 - **`.claude/skills/*/SKILL.md`** — the procedures: `tiers`, `review-round`, `live-kernel`,
   `eval-bench`, and this file. A skill's body costs nothing until it is invoked, so length is
   cheap here and expensive in `CLAUDE.md`. Its `description` is the whole of how it gets found —

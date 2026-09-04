@@ -60,7 +60,7 @@ to reason about a subsystem from search results alone, open the rule named here 
 | `async-runs.md` | `src/engine.rs`, `src/worker.rs`, `src/proto.rs` | `continue_async`: the slot, the filing task, the refusal, `submit_gate`, breaking the pump, bars, `break_in` against `interrupt` |
 | `session-teardown.md` | `src/engine.rs`, `src/worker.rs` | what `end_session` does to a dump, a live kernel, an attached process and a launched one — and the handle it still accepts |
 | `spawned-console.md` | `src/engine.rs` | `CREATE_NO_WINDOW` and why it is conditional; what a launched debuggee gets instead |
-| `worker-architecture.md` | `src/target.rs`, `src/engine.rs` | the 32-bit worker image: deciding before the engine exists, `x86\`, the build-identity check, falling back |
+| `worker-architecture.md` | `src/target.rs`, `src/engine.rs`, `src/worker.rs`, `src/proto.rs` | the 32-bit worker image: deciding before the engine exists, `x86\`, the build-identity check, falling back |
 | `tool-surface.md` | `src/toolset.rs`, `src/server.rs`, `src/schema.rs` | adding a tool: the second file, output schemas carrying no prose, per-client surfaces, `TOOL_NOTES`/`SUMMARY_NOTES` |
 | `listener-clients.md` | `src/client.rs`, `src/listen.rs`, `src/service.rs`, `src/kdconn.rs` | several clients on one listener: credentials, per-client surfaces, ambient identity, the lease, driving `2026-07-28` by hand |
 | `transcripts.md` | `src/record.rs`, `src/cast.rs` | `WINDBG_MCP_TRANSCRIPT`, what it records that stderr cannot, and `--render-cast` |
