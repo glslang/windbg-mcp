@@ -70,7 +70,7 @@ on #159 and #170, *"what is covered, what is not"* on #155.
   `DONE.md`'s index has fallen out of step with its own entries. It was raised as a review finding
   on the split ([#270](https://github.com/glslang/windbg-mcp/pull/270)) with the sweep as its
   proposed fix; the fact was right and the remedy was the expensive half of it.
-- **[`docs/smoke-test.md`](./docs/smoke-test.md)** — what each tier claims, per test, with budgets.
+- **[`docs/smoke-test.md`](../../../docs/smoke-test.md)** — what each tier claims, per test, with budgets.
 
 Plus `CHANGELOG.md` and whichever `docs/*.md` the behaviour moved in.
 

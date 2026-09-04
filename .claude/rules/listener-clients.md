@@ -148,8 +148,8 @@ on a 4xx and leaves the body on the exception, so those refusals read as empty w
 name what is missing. Before believing any protocol-level claim about `--listen`, read the validator
 that produced it: the rmcp source is on the Mac and needs no Windows build, at
 `<rmcp>/src/transport/streamable_http_server/tower.rs`, where `<rmcp>` is the directory
-`cargo metadata` reports for the pinned version rather than one assembled by hand — see *Local
-verification* for why that distinction has teeth.
+`cargo metadata` reports for the pinned version rather than one assembled by hand — see
+`.claude/rules/cargo-and-dependencies.md` for why that distinction has teeth.
 
 **A listener test that needs a real engine worker belongs in the debugger tier**, however cheap it
 looks — the protocol tier's contract is "no debugger target". An attach cannot *park* without

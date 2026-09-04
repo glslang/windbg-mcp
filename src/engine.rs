@@ -4587,6 +4587,72 @@ mod tests {
         );
     }
 
+    /// Every relative markdown link in this repository resolves to a file that exists.
+    ///
+    /// **This is the check the `CLAUDE.md` split needed and did not have.** Moving prose into
+    /// `.claude/skills/<name>/SKILL.md` puts it three directories down, so a `./docs/smoke-test.md`
+    /// that was right at the root silently became `.claude/skills/tiers/docs/smoke-test.md` — three
+    /// such links, found by review rather than by anything here
+    /// ([#285](https://github.com/glslang/windbg-mcp/pull/285)). Markdownlint does not cover it:
+    /// MD051 checks *same-file* fragments, and `.claude/**` is outside CI's globs anyway.
+    ///
+    /// Unlike the question of which files a rule's `paths:` should name — which was tried as a
+    /// lint twice and abandoned, because tool names and English words are the same strings as this
+    /// crate's items — this one is mechanical and has no judgement in it: the target either exists
+    /// on disk or it does not.
+    ///
+    /// A target containing whitespace is not a link. That exclusion is load-bearing rather than
+    /// tidy: `skills/windbg-debugging/setup.md` casts a value with `([xml](Get-Content "…" -Raw))`,
+    /// which a laxer extractor reads as a link to a file called `Get-Content "…`.
+    #[test]
+    fn every_relative_markdown_link_resolves() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let mut broken = Vec::new();
+        let mut seen = 0;
+        for file in cited_text(&root) {
+            if file.extension().is_none_or(|e| e != "md") {
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let here = file.parent().unwrap_or(&root);
+            for (_, target) in text.match_indices("](").map(|(i, _)| (i, &text[i + 2..])) {
+                let Some(end) = target.find(')') else {
+                    continue;
+                };
+                let target = &target[..end];
+                if target.is_empty()
+                    || target.chars().any(char::is_whitespace)
+                    || target.starts_with('#')
+                    || target.starts_with("http")
+                    || target.starts_with("mailto:")
+                {
+                    continue;
+                }
+                // A fragment addresses a heading inside the file, which is markdownlint's job.
+                let path = target.split('#').next().unwrap_or(target);
+                if path.is_empty() {
+                    continue;
+                }
+                seen += 1;
+                if !here.join(path).exists() {
+                    broken.push(format!("{}: {target}", file.display()));
+                }
+            }
+        }
+        assert!(
+            broken.is_empty(),
+            "these markdown links name a file that is not there — a document moved and its links \
+             did not follow it: {broken:?}"
+        );
+        assert!(
+            seen >= 200,
+            "expected a few hundred relative links across this repository's markdown and found \
+             {seen}, so the extractor no longer matches and this test is checking nothing"
+        );
+    }
+
     /// The item numbers a follow-up file holds, read off its `## N.` headings.
     ///
     /// A number filed twice in one file is refused here rather than folded into the set, because
