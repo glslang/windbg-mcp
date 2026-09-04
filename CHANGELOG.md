@@ -109,6 +109,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The debug engine no longer claims to cross threads.** dbgscope
+  [#136](https://github.com/glslang/dbgscope/issues/136) stage 4, the last of that refactor, deletes
+  `unsafe impl Send` and `unsafe impl Sync for DebugEngine`. Both asserted the opposite of what that
+  crate says about itself — `SetInterrupt` is the one DbgEng call documented as safe from any thread
+  *because the rest of the engine is single-thread-affine* — and neither carried a safety comment,
+  because neither could have been given a true one. `InterruptHandle` is now its only `Send + Sync`
+  type: one `SetInterrupt`, from anywhere, and nothing else.
+
+  **A breaking change upstream that this server does not feel**, which is worth separating from "no
+  behaviour changed": a worker builds its engine in `worker::build_engine`, on the engine thread
+  that then uses it for the whole of that worker's life, so it never needed either bound. That was
+  measured before the change rather than after — removing each and building leaves this crate
+  compiling unchanged.
+
 - **The engine's arrival bookkeeping is a delivery register rather than an engine-wide record.**
   dbgscope [#136](https://github.com/glslang/dbgscope/issues/136) stage 3: an open registers what it
   is waiting for, a stop is routed to the first open that wants it and has nothing yet, and the
