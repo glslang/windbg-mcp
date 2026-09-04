@@ -379,9 +379,12 @@ you nothing. The only way to find out is to **break the rule the test claims to 
 test fails**. If it stays green it is riding on something else; find what, and pick a construction
 that other rule cannot reach.
 
-The evidence is [dbgscope#139](https://github.com/glslang/dbgscope/pull/139) (2026-09-04), eight
-review rounds and eleven findings on one 700-line module. **Four of them were invisible to a suite
-that already covered the mechanism**, each needing one specific construction to become visible:
+The evidence is [dbgscope#139](https://github.com/glslang/dbgscope/pull/139) (2026-09-04), **nine
+review rounds and fourteen findings** on one 700-line module — counted from
+`gh api repos/<owner>/<repo>/pulls/<n>/reviews` and `.../comments`, because the first draft of this
+paragraph said eight and eleven from memory and was caught by a reviewer noticing it disagreed with
+its own "round nine" two paragraphs down. Four of the fourteen were invisible to a suite that
+already covered the mechanism, each needing one specific construction to become visible:
 
 | what was missed | what made it visible |
 |---|---|
