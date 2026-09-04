@@ -42,9 +42,23 @@ on #159 and #170, *"what is covered, what is not"* on #155.
   one.** The laziness that still pays is on the other axis and is untouched: a docs, `tools/`,
   `Cargo` or PowerShell session loads `CLAUDE.md` and nothing else.
 
-  The three rules that are *not* about this server's code keep narrow scopes, and should: they are
-  genuinely disjoint (`Cargo.*`, `**/*.md`, `**/*.ps1`), they overlap nothing, and six rounds
-  filed no finding against any of them.
+  The three rules that are *not* about this server's code keep narrow scopes, and should: their
+  **subjects** are disjoint from the code's, so scoping them is one obvious judgement each rather
+  than a per-file list, and no round has filed a scope finding against any of the three.
+
+  **Their globs do overlap, and that is fine** — the sentence here used to say they "overlap
+  nothing", which is simply false and was a review finding in its own right.
+  `cargo-and-dependencies` names `build.rs`, which is also in the code scope; `powershell-scripts`
+  names `examples/**`, which catches `examples/README.md` alongside `markdown-and-docs`'s
+  `**/*.md`. Both are wanted: `build.rs` is a build input *and* the file the PE version resource
+  lives in, and a README beside the scripts it documents is both markdown and script context.
+  Overlap costs a few kilobytes on a file that genuinely has two subjects. The failure to care
+  about is a rule that does **not** load where it is needed, which is the opposite direction and
+  the one all fourteen mistakes were in. Do not narrow a scope to make a Venn diagram tidy.
+
+  One thing to know while reading them: `powershell-scripts` names `tools/**`, so it also loads on
+  the eval scripts, which are Python. That is deliberate — its stderr-draining rule is about
+  driving this server from *any* script — but the rule's name undersells it.
 - **`.claude/skills/*/SKILL.md`** — the procedures: `tiers`, `review-round`, `live-kernel`,
   `eval-bench`, and this file. A skill's body costs nothing until it is invoked, so length is
   cheap here and expensive in `CLAUDE.md`. Its `description` is the whole of how it gets found —
