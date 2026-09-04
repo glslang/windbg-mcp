@@ -109,6 +109,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **An abandoned launch no longer leaves its process to the next one.** dbgscope
+  [#141](https://github.com/glslang/dbgscope/issues/141): dropping a launch guard before anything
+  pumps does not un-queue its `CreateProcessWide`, so that process still arrived and was claimed by
+  whichever launch asked next — whose `wait()` then returned for a target it never asked for. The
+  entry now stays until its own create is accounted for, and a launch whose wait timed out is
+  discarded rather than kept.
+
+  **Unreachable from here, and that is a property rather than luck**: each opener in `worker.rs`
+  creates one `PendingTarget` and waits on it inside the same closure, so this server never abandons
+  a launch guard and never has two launches pending at once. The bump is the pin alone. What is
+  still open upstream is *identification* — which of two simultaneous launches gets which process —
+  declined there for the same reason it cannot arise here.
+
 - **The debug engine no longer claims to cross threads.** dbgscope
   [#136](https://github.com/glslang/dbgscope/issues/136) stage 4, the last of that refactor, deletes
   `unsafe impl Send` and `unsafe impl Sync for DebugEngine`. Both asserted the opposite of what that
