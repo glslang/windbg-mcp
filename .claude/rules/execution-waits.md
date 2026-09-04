@@ -2,6 +2,7 @@
 paths:
   - "src/worker.rs"
   - "src/engine.rs"
+  - "src/proto.rs"
 ---
 
 ## Driving execution: the two waits, and the state a raw command can leave

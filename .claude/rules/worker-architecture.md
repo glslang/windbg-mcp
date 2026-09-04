@@ -69,10 +69,15 @@ fatal; what actually catches a supervisor and a worker disagreeing is the build 
 **Which is also the trap while editing this on a bench.** That check refuses an
 `x86\windbg-mcp.exe` built from *any* other state of the tree, and on a dirty tree the identity
 carries a digest over the uncommitted diff of `build.rs`'s `INPUTS` — `src`, `tests`, `build.rs`
-and the two manifests — so `cargo fmt` moves it as surely as a code change does. A stale 32-bit worker is
+and the two manifests — so `cargo fmt` moves it as surely as a code change does. **And so does
+`git commit`**, in the direction nobody expects: committing takes the diff to empty, so the
+identity goes from `<commit>-dirty.<digest>` to a clean `<commit>` and the worker built minutes
+earlier under the digest is refused. Measured on
+[#285](https://github.com/glslang/windbg-mcp/pull/285) — the tier passed, the commit landed, and
+the same tier failed on the next run with nothing in `src` changed. A stale 32-bit worker is
 therefore turned away, the session falls back to this build, and the smoke tier fails saying *this
 host could not give the target a 32-bit worker* — which reads as a missing file rather than a stale
-one. After every edit, before running that tier:
+one. After every edit **and after every commit**, before running that tier:
 
 ```pwsh
 cargo build --target i686-pc-windows-msvc
