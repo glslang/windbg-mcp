@@ -47,7 +47,7 @@ right than naming it, and the attach that follows is where DbgEng asks for debug
 **`IsWow64Process2` lives behind a feature gated by module path, not by subject.** The call is in
 `Win32_System_Threading`, its `IMAGE_FILE_MACHINE` out-parameters are in
 `Win32_System_SystemInformation`, and without the second feature the import does not resolve —
-the same trap `.claude/rules/cargo-and-dependencies.md` records for `IMAGE_NT_HEADERS64`.
+the same trap `.claude/rules/cross-target-check.md` records for `IMAGE_NT_HEADERS64`.
 
 **The dump half answers for `MDMP` only, and that is the whole format.** Every user-mode capture on
 Windows goes through `MiniDumpWriteDump` — procdump, WER, Task Manager, DebugDiag, VS,

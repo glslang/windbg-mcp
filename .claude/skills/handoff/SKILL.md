@@ -19,7 +19,7 @@ on #159 and #170, *"what is covered, what is not"* on #155.
   it loads only when Claude reads a file it covers. A new subsystem note goes in the rule whose
   **subject** it belongs to; the scope is not part of that choice, for the reason below.
 
-  **`paths:` is one shared scope for the eight code rules, and that is a decision rather than
+  **`paths:` is one shared scope for the nine code rules, and that is a decision rather than
   laziness.** Each was first scoped to the files named in its own title, which is the natural thing
   to do and was wrong fifteen times: nine filed as review findings across rounds one to nine of
   [#285](https://github.com/glslang/windbg-mcp/pull/285), six more found by enumerating rather than
@@ -35,24 +35,28 @@ on #159 and #170, *"what is covered, what is not"* on #155.
   and `Arch` and `Expired` are each defined in two modules meaning different things).
 
   What settled it was measuring instead of arguing. At the restructure, against the 72,396 bytes of
-  all eight rules then, `engine.rs` already loaded 89%, `worker.rs` and `server.rs` 69%, and
+  all eight rules as they then were, `engine.rs` already loaded 89%, `worker.rs` and `server.rs` 69%, and
   `proto.rs` 62% — because every tool call crosses those four. Eleven hand-maintained lists bought 11–38% on the files anyone
   edits and cost a review round per mistake, so they were replaced by `src/**/*.rs` plus
   `tests/**/*.rs` and `build.rs` — `build.rs`'s own `INPUTS` less the manifests — identical in
-  all eight. **A new code rule copies that scope; it does not invent one.** The laziness that still pays is on the other axis and is untouched: a session touching no
+  all of them. **A new code rule copies that scope; it does not invent one.** The laziness that still pays is on the other axis and is untouched: a session touching no
   Rust never loads the code rules at all — it loads `CLAUDE.md` plus whichever narrow rules its
-  files match. Measured after round nine: 72,211 B against 11,345 B.
+  files match. Measured after round twelve: 77,169 B against 6,496 B.
 
   **State that as a bound, never as a composition.** Two goes at the exact wording were both review
   findings: "and nothing else" (the narrow rule loads too), then "the one narrow rule its subject
   matches" — which was written one commit *after* the paragraph below documenting that
-  `examples/README.md` matches two rules and `build.rs` four. The globs intersect by design, so any
+  `examples/README.md` matches two rules and `build.rs` nine. The globs intersect by design, so any
   sentence counting how many fire has to be re-derived against them, and the saving does not need
   the count: what it rests on is the code rules not firing.
 
-  **A byte figure in prose is a measurement, not an invariant — so date it.** The bound was written
-  as 11,315 B and was already 30 bytes stale, because the commit that added a pointer sentence to
-  `cargo-and-dependencies.md` moved it in the same series; a reviewer recomputed and was right.
+  **A byte figure in prose is a measurement, not an invariant — so date it, and paste it rather
+  than derive it.** The bound was written as 11,315 B and was already 30 bytes stale, because the
+  commit that added a pointer sentence to `cargo-and-dependencies.md` moved it in the same series;
+  a reviewer recomputed and was right. Then, updating it after round twelve's split, the figures
+  went in as 77,134 and 6,422 — arrived at by subtracting the moved section by hand, one line
+  after a command had printed 77,169 and 6,496. Both halves of this rule matter and the second is
+  the one that keeps being broken: run the measurement, then copy what it said.
   Worse, this file carried 72,396 and 72,211 for the same quantity in two paragraphs, both phrased
   as current fact, because they were snapshots taken four commits apart. Every such figure here now
   says when it was taken, which is the only form that stays true — the percentages above are from
@@ -118,7 +122,7 @@ next file is there*.
 eight of #285 were three consecutive findings of exactly this, none of them about the thing being
 explained and all of them about the tidy line at the end of it: "a docs session loads `CLAUDE.md`
 and nothing else" (it loads the matching narrow rule too), the three narrow rules "overlap nothing"
-(`build.rs` is in two scopes, `examples/README.md` in two), and a commit message claiming a change
+(`build.rs` is in nine scopes, `examples/README.md` in two), and a commit message claiming a change
 "closes the class" (the next round reopened it). Each was written *after* the accurate paragraph
 above it, as a summary — and summarising is where the qualifier gets dropped, because a crisp line
 reads better than a true one. The tell is a sentence with **nothing**, **every**, **always**,

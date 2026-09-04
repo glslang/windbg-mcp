@@ -53,7 +53,7 @@ protocol.
 
 **Rules load themselves; skills you invoke.** A rule under `.claude/rules/` carries a `paths:` glob
 and is pulled into context when Claude reads a file matching it. The three about something other
-than this server's code are scoped to that thing — a `Cargo.toml`, a `.md`, a `.ps1`. The eight
+than this server's code are scoped to that thing — a `Cargo.toml`, a `.md`, a `.ps1`. The nine
 about the code share **one** scope: `src/**/*.rs`, `tests/**/*.rs` and `build.rs` — which is
 `build.rs`'s own `INPUTS` less the two manifests, those having a rule of their own. That trigger is
 a **read**, not a grep, so if you are about to reason about a subsystem from search results alone,
@@ -70,19 +70,20 @@ the 72,396 bytes of all eight then, `engine.rs` already loaded
 11–38% on the files anyone actually edits, at a review round for each one that was wrong. One scope
 buys that back by leaving nothing to get wrong. Where the laziness still pays is the other axis, and
 it is untouched: a session that touches no Rust never loads the code rules at all, and picks up at
-most the three narrow ones. Measured after round nine: **72,211 B** against **11,345 B** —
+most the three narrow ones. Measured after round twelve: **77,169 B** against **6,496 B** —
 a measurement rather than an invariant, since any edit to a rule moves it, and the second of those
 figures was already stale by 30 bytes when first written here. How many narrow rules fire is
-deliberately not stated: the globs intersect (`examples/README.md` matches two, `build.rs` four),
+deliberately not stated: the globs intersect (`examples/README.md` matches two rules, `build.rs` nine),
 and two attempts to give the exact composition were both wrong, one in the commit that fixed the
 other. `/handoff` carries the method and what went wrong with it.
 
-So the *Covers* column is the index. The eight are split by **subject**, not by which files trip
+So the *Covers* column is the index. The nine are split by **subject**, not by which files trip
 them — read it to pick the one you want.
 
 | Rule (`.claude/rules/`) | Loads when you touch | Covers |
 |---|---|---|
-| `cargo-and-dependencies.md` | `Cargo.toml`, `Cargo.lock`, `build.rs` | moving the `dbgscope` `rev` pin, the Mac `cargo check`/`fetch`/`metadata` workflow, `build.rs`'s PE version resource, why `[patch]` is never committed |
+| `cargo-and-dependencies.md` | `Cargo.toml`, `Cargo.lock`, `build.rs` | moving the `dbgscope` `rev` pin, why a `[patch]` is never committed, and why a green dbgscope PR says nothing about Miri |
+| `cross-target-check.md` | any `src/` or `tests/` Rust, or `build.rs` | type-checking the whole crate from a Mac, `build.rs`'s PE version resource and its expected warning, reading a dependency's pinned source with `cargo fetch`/`metadata` |
 | `markdown-and-docs.md` | `**/*.md` | CI's two non-Rust gates: `cargo fmt --all --check` and the markdownlint globs |
 | `powershell-scripts.md` | `**/*.ps1`, `tools/**`, `examples/**` | the three ways a shipped `.ps1` fails only under PowerShell 5.1; draining stderr when driving the server from a script |
 | `execution-waits.md` | any `src/` or `tests/` Rust, or `build.rs` | the two waits, what a raw `execute` of execution-control text leaves behind, `settle`, the load-wait outcome, the session fuzz |
