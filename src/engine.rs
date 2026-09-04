@@ -4479,8 +4479,9 @@ mod tests {
     ///
     /// **A citation is deliberately not retargeted when an item closes**, which is what this test
     /// exists to make safe. The string is spread over some twenty files — doc comments in eleven
-    /// modules and in `tests/`, `CHANGELOG.md`, `DECISIONS.md`, every `docs/*.md`, `build.rs`,
-    /// `ci.yml` and the eval tooling — so making the *file* half of a citation follow the entry
+    /// modules and in `tests/`, `CHANGELOG.md`, `DECISIONS.md`, every `docs/*.md`, the rules and
+    /// skills under `.claude/`, `build.rs`, `ci.yml` and the eval tooling — so making the *file*
+    /// half of a citation follow the entry
     /// would turn closing an item into a sweep of source comments, with nothing to catch the ones
     /// missed. "Item N" is the stable name; which of the two files holds it is what
     /// `FOLLOWUPS.md`'s header answers, above every entry, for whoever followed a citation there.
@@ -4733,10 +4734,13 @@ mod tests {
             let name = name.to_string_lossy();
             if path.is_dir() {
                 // `target` is enormous and holds copies of this crate's own source; a dotted
-                // directory is tooling, except the workflows, which cite items too.
+                // directory is tooling, except the workflows and `.claude`, which cite items too.
+                // `.claude` holds most of what `CLAUDE.md` used to — the path-scoped rules and
+                // the working skills — so excluding it would take some thirty citations out of
+                // this walk while every one of them still read as covered.
                 if name == "target"
                     || name == "node_modules"
-                    || (name.starts_with('.') && name != ".github")
+                    || (name.starts_with('.') && name != ".github" && name != ".claude")
                 {
                     continue;
                 }

@@ -506,8 +506,8 @@ has run. What is unknown is the *timeout* path: a `reverse_go` that reaches no s
 either breaks in cleanly or does not, and if it does not, the failure shape is the one this issue
 was about. `run_to_address` has used the same wait for every target type since it was written and
 documents it as working everywhere, but that is a doc comment rather than a measurement, and
-"generalised from one backend" is a mistake this repo has made before (`CLAUDE.md`, *Handing the
-work over*).
+"generalised from one backend" is a mistake this repo has made before
+(`.claude/skills/handoff/SKILL.md`).
 
 **The blocker moved to a different host rather than lifting, and the tier it wanted now exists**
 (2026-08-26). The deferral above is about the **ARM64 bench**, and nothing since has re-checked it.

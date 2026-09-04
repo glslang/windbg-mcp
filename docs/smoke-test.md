@@ -448,7 +448,7 @@ $hex = '41' * 1024   # the buffer is far shorter; the cookie is what matters
 `0x222007` was read out of the driver's own dispatch rather than taken from HEVD's headers, and
 that check earned its keep: this build's IOCTL codes are not the ones the widely-quoted list gives,
 and the code that list calls the null dereference is `FREE_UAF_OBJECT` here. `decode_ioctl` and the
-dispatch walk in `CLAUDE.md` are how to redo it against another build.
+dispatch walk in `.claude/skills/live-kernel/SKILL.md` are how to redo it against another build.
 
 **The two driver crashes are asserted on every host, not paired by architecture** — the one place
 this suite deliberately does not pair. An engine that resolves symbols reads either dump either way
@@ -1102,7 +1102,7 @@ the two agree across the pipe, which is the part neither module can prove alone.
 
 The only tier that touches another machine, and the last thing to run. It needs a live kernel target
 you are willing to freeze for the duration, booted with debugging enabled — see the KDNET gotchas in
-[`CLAUDE.md`](../CLAUDE.md) before diagnosing a failure.
+[`.claude/skills/live-kernel/SKILL.md`](../.claude/skills/live-kernel/SKILL.md) before diagnosing a failure.
 
 ```pwsh
 $env:WINDBG_MCP_SMOKE_KERNEL = "net:port=50000,key=<w.x.y.z>"
@@ -1512,7 +1512,7 @@ does not reach.
 - **Live kernel (KDNET)** — the [live-kernel tier](#the-live-kernel-tier) covers the session
   lifecycle (attach, coexist, detach). For execution control on a real target, additionally run
   `examples/drive_kernel_test.ps1 -Connection "net:port=<n>,key=<w.x.y.z>"`: attach,
-  `bp nt!NtCreateFile`, `go` to it, resume, detach. See the KDNET gotchas in `CLAUDE.md` before
+  `bp nt!NtCreateFile`, `go` to it, resume, detach. See the KDNET gotchas in `.claude/skills/live-kernel/SKILL.md` before
   diagnosing a hang.
 - **TTD** — recording and the two queries are the [TTD tier](#the-ttd-tier) now, which is where to
   start; it needs a WinDbg engine payload next to the binary to replay what it records (System32's

@@ -31,8 +31,12 @@ package-lock.json
 *.obj
 *.exe
 
-# Local Claude Code config
-.claude/
+# Local Claude Code config. `rules/` and `skills/` are the working guidance that used to live in
+# `CLAUDE.md` and are shared like it; everything else here is this machine's — `settings.local.json`
+# carries absolute server paths, and the lock file is a running session's.
+.claude/*
+!.claude/rules/
+!.claude/skills/
 
 # Output of the local-model eval (`tools/local_model_eval.py`), which the checked-in plan
 # writes here: run logs and one JSON record per task. Measurements, not sources.
