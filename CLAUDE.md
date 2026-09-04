@@ -56,13 +56,13 @@ to reason about a subsystem from search results alone, open the rule named here 
 | `cargo-and-dependencies.md` | `Cargo.toml`, `Cargo.lock`, `build.rs` | moving the `dbgscope` `rev` pin, the Mac `cargo check`/`fetch`/`metadata` workflow, `build.rs`'s PE version resource, why `[patch]` is never committed |
 | `markdown-and-docs.md` | `**/*.md` | CI's two non-Rust gates: `cargo fmt --all --check` and the markdownlint globs |
 | `powershell-scripts.md` | `**/*.ps1`, `tools/**`, `examples/**` | the three ways a shipped `.ps1` fails only under PowerShell 5.1; draining stderr when driving the server from a script |
-| `execution-waits.md` | `src/worker.rs`, `src/engine.rs` | the two waits, what a raw `execute` of execution-control text leaves behind, `settle`, the load-wait outcome, the session fuzz |
-| `async-runs.md` | `src/engine.rs`, `src/worker.rs`, `src/proto.rs` | `continue_async`: the slot, the filing task, the refusal, `submit_gate`, breaking the pump, bars, `break_in` against `interrupt` |
-| `session-teardown.md` | `src/engine.rs`, `src/worker.rs` | what `end_session` does to a dump, a live kernel, an attached process and a launched one — and the handle it still accepts |
+| `execution-waits.md` | `src/worker.rs`, `src/engine.rs`, `src/proto.rs` | the two waits, what a raw `execute` of execution-control text leaves behind, `settle`, the load-wait outcome, the session fuzz |
+| `async-runs.md` | `src/engine.rs`, `src/worker.rs`, `src/proto.rs`, `src/server.rs` | `continue_async`: the slot, the filing task, the refusal, `submit_gate`, breaking the pump, bars, `break_in` against `interrupt` |
+| `session-teardown.md` | `src/engine.rs`, `src/worker.rs`, `src/proto.rs` | what `end_session` does to a dump, a live kernel, an attached process and a launched one — and the handle it still accepts |
 | `spawned-console.md` | `src/engine.rs` | `CREATE_NO_WINDOW` and why it is conditional; what a launched debuggee gets instead |
 | `worker-architecture.md` | `src/target.rs`, `src/engine.rs`, `src/worker.rs`, `src/proto.rs` | the 32-bit worker image: deciding before the engine exists, `x86\`, the build-identity check, falling back |
-| `tool-surface.md` | `src/toolset.rs`, `src/server.rs`, `src/schema.rs` | adding a tool: the second file, output schemas carrying no prose, per-client surfaces, `TOOL_NOTES`/`SUMMARY_NOTES` |
-| `listener-clients.md` | `src/client.rs`, `src/listen.rs`, `src/service.rs`, `src/kdconn.rs` | several clients on one listener: credentials, per-client surfaces, ambient identity, the lease, driving `2026-07-28` by hand |
+| `tool-surface.md` | `src/toolset.rs`, `src/server.rs`, `src/schema.rs`, `src/worker.rs` | adding a tool: the second file, output schemas carrying no prose, per-client surfaces, `TOOL_NOTES`/`SUMMARY_NOTES` |
+| `listener-clients.md` | `src/client.rs`, `src/listen.rs`, `src/service.rs`, `src/kdconn.rs`, `src/server.rs`, `src/engine.rs` | several clients on one listener: credentials, per-client surfaces, ambient identity, the lease, driving `2026-07-28` by hand |
 | `transcripts.md` | `src/record.rs`, `src/cast.rs` | `WINDBG_MCP_TRANSCRIPT`, what it records that stderr cannot, and `--render-cast` |
 
 | Skill (`.claude/skills/`) | Invoke when |

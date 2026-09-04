@@ -19,18 +19,30 @@ on #159 and #170, *"what is covered, what is not"* on #155.
   it loads only when Claude reads a file it covers. A new subsystem note goes in the rule whose
   `paths` already match the file it is about, or in a new rule named after the seam.
 
-  **`paths:` names the files whose *editor* needs the rule, which is not the files the rule
-  mentions**, and getting that backwards costs in both directions. `worker-architecture.md` was
-  scoped to `src/target.rs` and `src/engine.rs` because those are what its title is about, and it
-  shipped that way — while the invariants it holds are binding on `worker.rs` (the engine goes into
-  a `OnceLock`, so it cannot be swapped mid-session) and on `proto.rs` (nothing types a target
-  address as `usize`), whose editors would have lost them silently. That was a review finding on
-  [#285](https://github.com/glslang/windbg-mcp/pull/285). The other direction has no finding
-  because nothing catches it: `transcripts.md` names `src/structured.rs` only to say the transcript
-  obeys the same rule, and adding it to that glob would load a rule on every `structured.rs` edit
-  that tells its editor nothing. So it is a judgement per file, and a test asserting "every module
-  a rule names is in its `paths`" would encode the wrong one — it was drafted here and dropped for
-  exactly that.
+  **`paths:` names the files whose *editor* needs the rule, not the files the rule mentions — and
+  the ones it will be missing are `engine.rs`, `worker.rs`, `proto.rs` and `server.rs`.** Every
+  rule here was first scoped to the files in its own title, which is the natural thing to do and
+  was wrong five times: `worker-architecture` bound `worker.rs` and `proto.rs`, `listener-clients`
+  bound `server.rs` (`WindbgServer::call_tool` is where a client's identity is re-entered) and
+  `engine.rs`, `tool-surface` bound `worker.rs` (`summary_text` builds the prose the rule is
+  about), `execution-waits` bound `proto.rs` (`EngineOp`, `StopReport`) and `async-runs` bound
+  `server.rs` (the two `idempotentHint`s). Three of those were review findings on
+  [#285](https://github.com/glslang/windbg-mcp/pull/285), landing one a round; the other two came
+  from finally enumerating instead of grepping. It is always those four because they are the four
+  `CLAUDE.md` names as the key source — nearly every behaviour here crosses supervisor, worker and
+  MCP, so a rule about any of it binds files its title does not name. **Start from the four and ask
+  which ones this rule constrains.**
+
+  **A test cannot do this, and the evidence is worth keeping.** The obvious check — every symbol a
+  rule names must resolve to a file in its `paths` — was drafted twice and dropped, because an
+  enumeration of every code-span identifier against every definition in `src/` returns mostly
+  collisions: `cargo-and-dependencies` "names" `engine.rs` through the word *registry* and
+  `worker.rs` through *execute*, `markdown-and-docs` names it through `fmt`, and `transcripts`
+  names `server.rs` through the `registers` **tool**. Tool names and English words are the same
+  strings as this crate's items. And the one true negative is real too: `transcripts.md` names
+  `src/structured.rs` only to say the transcript obeys the same rule, so declaring it would load a
+  rule on every `structured.rs` edit that tells its editor nothing. The judgement stays manual;
+  what makes it tractable is the paragraph above, not a lint.
 - **`.claude/skills/*/SKILL.md`** — the procedures: `tiers`, `review-round`, `live-kernel`,
   `eval-bench`, and this file. A skill's body costs nothing until it is invoked, so length is
   cheap here and expensive in `CLAUDE.md`. Its `description` is the whole of how it gets found —
