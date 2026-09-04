@@ -2,6 +2,8 @@
 paths:
   - "src/target.rs"
   - "src/engine.rs"
+  - "src/worker.rs"
+  - "src/proto.rs"
 ---
 
 ## A worker of the target's architecture (`src/target.rs`, `engine::worker_images`)

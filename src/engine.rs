@@ -4514,7 +4514,7 @@ mod tests {
 
         let mut dangling = Vec::new();
         let mut seen = 0;
-        for file in repo_text(&root) {
+        for file in cited_text(&root) {
             let Ok(text) = std::fs::read_to_string(&file) else {
                 continue;
             };
@@ -4720,6 +4720,22 @@ mod tests {
             .collect()
     }
 
+    /// Every file the citation walk reads: the repository's text, plus the two **tracked**
+    /// subtrees of `.claude` — the path-scoped rules and the working skills, which hold most of
+    /// what `CLAUDE.md` used to and some thirty of its citations with it.
+    ///
+    /// They are named here rather than excepted inside [`repo_text`] because `.gitignore` is
+    /// `.claude/*` with exactly these two negated: everything else under that directory is
+    /// machine-local, and a walk that took the whole of it would fail this shared test on
+    /// whichever developer's untracked file happened to name a number.
+    fn cited_text(root: &PathBuf) -> Vec<PathBuf> {
+        let mut found = repo_text(root);
+        for tracked in [".claude/rules", ".claude/skills"] {
+            found.extend(repo_text(&root.join(tracked)));
+        }
+        found
+    }
+
     /// Every text file in the repository a citation could be written in — so one added to a new
     /// module, a new document or a new script is checked rather than silently skipped.
     fn repo_text(dir: &PathBuf) -> Vec<PathBuf> {
@@ -4734,13 +4750,15 @@ mod tests {
             let name = name.to_string_lossy();
             if path.is_dir() {
                 // `target` is enormous and holds copies of this crate's own source; a dotted
-                // directory is tooling, except the workflows and `.claude`, which cite items too.
-                // `.claude` holds most of what `CLAUDE.md` used to — the path-scoped rules and
-                // the working skills — so excluding it would take some thirty citations out of
-                // this walk while every one of them still read as covered.
+                // directory is tooling, except the workflows, which cite items too. `.claude` is
+                // deliberately **not** excepted here even though most of what `CLAUDE.md` used to
+                // hold now lives in it: the two tracked subtrees are seeded by the caller instead,
+                // because `.gitignore` keeps everything else under `.claude` machine-local and a
+                // walk that entered the whole directory would fail this shared test on whichever
+                // developer's `settings.local.json` happened to name a number.
                 if name == "target"
                     || name == "node_modules"
-                    || (name.starts_with('.') && name != ".github" && name != ".claude")
+                    || (name.starts_with('.') && name != ".github")
                 {
                     continue;
                 }
