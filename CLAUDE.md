@@ -51,13 +51,19 @@ and is pulled into context when Claude reads a file matching it — so editing `
 the listener rule with it and nothing else. That trigger is a **read**, not a grep: if you are about
 to reason about a subsystem from search results alone, open the rule named here first.
 
+**And this table is the backstop for a `paths:` that is wrong**, which four review rounds on
+[#285](https://github.com/glslang/windbg-mcp/pull/285) say is the normal state rather than the
+exception — nine scopes were missing across five rules, every one of them a file whose editor the
+rule binds. So the *Covers* column is what to scan when you are about to change `src/`: a rule that
+describes what you are touching is worth opening whether or not it loaded itself.
+
 | Rule (`.claude/rules/`) | Loads when you touch | Covers |
 |---|---|---|
 | `cargo-and-dependencies.md` | `Cargo.toml`, `Cargo.lock`, `build.rs` | moving the `dbgscope` `rev` pin, the Mac `cargo check`/`fetch`/`metadata` workflow, `build.rs`'s PE version resource, why `[patch]` is never committed |
 | `markdown-and-docs.md` | `**/*.md` | CI's two non-Rust gates: `cargo fmt --all --check` and the markdownlint globs |
 | `powershell-scripts.md` | `**/*.ps1`, `tools/**`, `examples/**` | the three ways a shipped `.ps1` fails only under PowerShell 5.1; draining stderr when driving the server from a script |
-| `execution-waits.md` | `src/worker.rs`, `src/engine.rs`, `src/proto.rs` | the two waits, what a raw `execute` of execution-control text leaves behind, `settle`, the load-wait outcome, the session fuzz |
-| `async-runs.md` | `src/engine.rs`, `src/worker.rs`, `src/proto.rs`, `src/server.rs` | `continue_async`: the slot, the filing task, the refusal, `submit_gate`, breaking the pump, bars, `break_in` against `interrupt` |
+| `execution-waits.md` | `src/worker.rs`, `src/engine.rs`, `src/proto.rs`, `src/server.rs`, `src/batch.rs`, `src/structured.rs` | the two waits, what a raw `execute` of execution-control text leaves behind, `settle`, the load-wait outcome, the session fuzz |
+| `async-runs.md` | `src/engine.rs`, `src/worker.rs`, `src/proto.rs`, `src/server.rs`, `src/structured.rs` | `continue_async`: the slot, the filing task, the refusal, `submit_gate`, breaking the pump, bars, `break_in` against `interrupt` |
 | `session-teardown.md` | `src/engine.rs`, `src/worker.rs`, `src/proto.rs` | what `end_session` does to a dump, a live kernel, an attached process and a launched one — and the handle it still accepts |
 | `spawned-console.md` | `src/engine.rs` | `CREATE_NO_WINDOW` and why it is conditional; what a launched debuggee gets instead |
 | `worker-architecture.md` | `src/target.rs`, `src/engine.rs`, `src/worker.rs`, `src/proto.rs` | the 32-bit worker image: deciding before the engine exists, `x86\`, the build-identity check, falling back |

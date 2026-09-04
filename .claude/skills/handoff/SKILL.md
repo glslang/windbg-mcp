@@ -33,16 +33,33 @@ on #159 and #170, *"what is covered, what is not"* on #155.
   MCP, so a rule about any of it binds files its title does not name. **Start from the four and ask
   which ones this rule constrains.**
 
-  **A test cannot do this, and the evidence is worth keeping.** The obvious check — every symbol a
+  **That heuristic is a starting point and not a closure**, which is worth saying because the
+  commit that introduced it claimed otherwise and drew a fourth round the same evening.
+  `execution-waits` also binds `server.rs` (where six `CommandAndWait` and four `BoundedCommand`
+  sites decide which wait a tool gets, and where `EXEC_WAIT_MS` is defined), `batch.rs` (the
+  `{"op": "command"}` step goes through `raw_command`) and `structured.rs` (`StopReport` is the
+  shape a deadline break is reported in) — and `batch.rs` is not a hub file, so the heuristic
+  would never have reached it.
+
+  **A test cannot do this, and two separate reasons matter.** The obvious check — every symbol a
   rule names must resolve to a file in its `paths` — was drafted twice and dropped, because an
   enumeration of every code-span identifier against every definition in `src/` returns mostly
   collisions: `cargo-and-dependencies` "names" `engine.rs` through the word *registry* and
-  `worker.rs` through *execute*, `markdown-and-docs` names it through `fmt`, and `transcripts`
-  names `server.rs` through the `registers` **tool**. Tool names and English words are the same
-  strings as this crate's items. And the one true negative is real too: `transcripts.md` names
-  `src/structured.rs` only to say the transcript obeys the same rule, so declaring it would load a
-  rule on every `structured.rs` edit that tells its editor nothing. The judgement stays manual;
-  what makes it tractable is the paragraph above, not a lint.
+  `worker.rs` through *execute*, `markdown-and-docs` names it through `fmt`, `transcripts` names
+  `server.rs` through the `registers` **tool**, and `Arch` and `Expired` are each defined in two
+  modules that mean different things by them. Tool names and English words are the same strings as
+  this crate's items. The second reason is worse: an index of *definitions* cannot find `batch.rs`
+  at all, because that file defines none of the names and is bound by what it **routes**. And the
+  one true negative is real as well — `transcripts.md` names `src/structured.rs` only to say the
+  transcript obeys the same rule, so declaring it would load a rule that tells a `structured.rs`
+  editor nothing.
+
+  **When you do run the enumeration, adjudicate every entry, not every row.** Round three happened
+  because the `execution-waits → server.rs` row read `EXEC_WAIT_MS debug_batch dx end_session`, the
+  three tool names made it look like noise, and the whole row went in the bin with the one real
+  entry inside it. The noise is per entry. The backstop for all of this is the routing table in
+  `CLAUDE.md`, which is loaded every session and lists what each rule covers whether or not its
+  `paths` would have fired.
 - **`.claude/skills/*/SKILL.md`** — the procedures: `tiers`, `review-round`, `live-kernel`,
   `eval-bench`, and this file. A skill's body costs nothing until it is invoked, so length is
   cheap here and expensive in `CLAUDE.md`. Its `description` is the whole of how it gets found —
