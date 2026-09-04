@@ -109,6 +109,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **The engine's arrival bookkeeping is a delivery register rather than an engine-wide record.**
+  dbgscope [#136](https://github.com/glslang/dbgscope/issues/136) stage 3: an open registers what it
+  is waiting for, a stop is routed to the first open that wants it and has nothing yet, and the
+  entry dies with the guard that made it. That deletes the three lifecycle rules the record it
+  replaces needed — pruned at both openers for pid reuse, cleared where a session is replaced and
+  cleared again where one is ended — because nothing outlives its reader any more. It also makes two
+  opens pending at once exact where they were ambiguous, which the type it replaces had documented
+  as an accepted cost.
+
+  **No behaviour of this server moves**, which is worth stating rather than leaving to be inferred
+  from a green suite: a worker holds one target for its whole life and `EngineOp` has no second
+  opener, so every case the register newly tells apart is one this server cannot reach. What the
+  bump buys is the correctness of the layer underneath, and the shapes it makes safe to add. No
+  public API changed either, so this is the pin alone.
+
 - **A break this server asks for is now scoped to the engine operation it will stop.** dbgscope's
   interrupt was an engine-wide flag that each bounded operation cleared as it opened, so a request
   lodged between that clear and the wait it was meant for was erased while its `SetInterrupt` was
