@@ -126,3 +126,30 @@ before it having been cleared says nothing, since an `!ml` verdict is scored on 
 it. And it is the step that gets *shorter* once the binary is signed: a signature is a stable
 identity for the reputation to attach to, where an unsigned build starts from nothing each time.
 Worth doing pre-emptively on a release rather than waiting for the first report.
+
+### Switching signing on
+
+The workflow already has the steps; they are skipped while no certificate is configured, and the
+build log says so (`No code-signing certificate is configured`). Two repository secrets turn them
+on, and nothing else needs editing:
+
+| name | what it holds |
+|---|---|
+| `CODE_SIGNING_PFX` | the `.pfx`, base64-encoded (`[Convert]::ToBase64String([IO.File]::ReadAllBytes('cert.pfx'))`) |
+| `CODE_SIGNING_PFX_PASSWORD` | its password |
+
+Optionally `CODE_SIGNING_TIMESTAMP_URL` as a repository **variable**, if the issuer wants its own
+RFC 3161 timestamp server rather than the default.
+
+Check it with a **`workflow_dispatch` dry run** before tagging: signing is deliberately not limited
+to tag pushes, so a dry run exercises the whole path and uploads the artifact without publishing
+anything.
+
+**A certificate bought today probably is not a `.pfx`.** Since June 2023 the CA/Browser Forum has
+required code-signing private keys to live on FIPS 140-2 Level 2 hardware or an equivalent cloud
+HSM, so an OV certificate normally arrives on a **token** or as a **cloud signing** service. A
+physical token cannot be reached from a GitHub-hosted runner at all — that would mean signing by
+hand or running a self-hosted runner — so if the choice is open, take the cloud option. Switching to
+one changes a single line in `release.yml`: the `signtool sign` invocation swaps `/f`/`/p` for the
+provider flags the vendor documents. Everything around it — where the steps sit relative to
+packaging, which files are signed, and the verification — is unaffected.

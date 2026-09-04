@@ -79,6 +79,111 @@ jobs:
       - name: Test
         run: cargo test --locked
 
+      # ---- Authenticode signing (FOLLOWUPS.md item 50) --------------------------
+      #
+      # **Placed here on purpose, and this is the half that is easy to get wrong.**
+      # Both artifacts embed both exes, `SHA256SUMS.txt` covers those archives,
+      # `server.json` carries the .mcpb's hash and the provenance attestation is
+      # taken over both — so signing anywhere after `Package` would publish
+      # checksums and an attestation for bytes nobody downloads. Signing is of the
+      # two **executables**; a .zip and a .mcpb are archives, which Authenticode
+      # does not cover at all, and what stands behind those is the checksum file
+      # and the attestation.
+      #
+      # It is **inert until the secrets exist**, which is the state this repo is in
+      # today: no certificate has been obtained yet, and a fork never has secrets.
+      # Nothing downstream changes when it is unconfigured, so this cannot break a
+      # release by sitting here — it can only fail loudly once it is switched on.
+      #
+      # **The credential shape below is the one part that may not survive contact
+      # with the certificate**, and it is worth knowing before buying one rather
+      # than after. A `.pfx` in a secret is the simplest and most reviewable shape,
+      # and it is also the one the CA/Browser Forum has required issuers to stop
+      # handing out: since June 2023 a code-signing private key must be generated
+      # and held on FIPS 140-2 Level 2 hardware or an equivalent cloud HSM, so a
+      # new OV certificate normally arrives on a **token** or as a **cloud signing**
+      # service rather than as a file. That matters here in one specific way — a
+      # physical token cannot be reached from a GitHub-hosted runner at all, so a
+      # token-only certificate means signing by hand or standing up a self-hosted
+      # runner, and the cloud option is the one that keeps this workflow working.
+      #
+      # If it turns out to be cloud signing, exactly one thing below changes: the
+      # `signtool sign` invocation swaps `/f <pfx> /p <password>` for the provider
+      # flags that vendor documents (typically `/csp`/`/kc`, or `/dlib` with their
+      # KSP). The gating, the placement before `Package`, the two targets and the
+      # verification step are all unaffected — which is why they are written and
+      # reviewed now and that one line is not.
+      - name: Is signing configured?
+        id: signing
+        shell: bash
+        env:
+          PFX: ${{ secrets.CODE_SIGNING_PFX }}
+        run: |
+          # Through an env var and an output rather than `if: secrets.X != ''`,
+          # because the `secrets` context is not available in a step-level `if`:
+          # that condition evaluates false for ever and says nothing, which is the
+          # failure mode a gate must not have.
+          if [ -n "$PFX" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No code-signing certificate is configured; this build's binaries are unsigned."
+          fi
+
+      - name: Sign the binaries
+        # Runs on dry runs too, deliberately: a `workflow_dispatch` is where the
+        # signing path gets exercised without cutting a release. If the eventual
+        # certificate meters signatures, add `github.event_name == 'push'` here.
+        if: steps.signing.outputs.configured == 'true'
+        shell: pwsh
+        env:
+          PFX: ${{ secrets.CODE_SIGNING_PFX }}
+          PFX_PASSWORD: ${{ secrets.CODE_SIGNING_PFX_PASSWORD }}
+          # RFC 3161. Without a timestamp the signature dies with the certificate,
+          # so this is not optional; `verify /tw` below is what enforces it.
+          TIMESTAMP_URL: ${{ vars.CODE_SIGNING_TIMESTAMP_URL || 'http://timestamp.digicert.com' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          # signtool ships with the Windows SDK and is not on PATH. Take the
+          # newest x64 one rather than a fixed version, which moves with the image.
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+                      Sort-Object { [version]$_.Directory.Parent.Name } | Select-Object -Last 1
+          if (-not $signtool) { throw "signtool.exe not found in the Windows SDK on this runner" }
+
+          # The certificate exists only in this runner's temp directory and only
+          # for this step.
+          $pfx = Join-Path $env:RUNNER_TEMP "code-signing.pfx"
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX))
+          try {
+            foreach ($exe in @("target/release/windbg-mcp.exe",
+                               "target/i686-pc-windows-msvc/release/windbg-mcp.exe")) {
+              & $signtool.FullName sign /v /fd SHA256 /f $pfx /p $env:PFX_PASSWORD /tr $env:TIMESTAMP_URL /td SHA256 $exe
+              if ($LASTEXITCODE -ne 0) { throw "signtool sign failed for $exe" }
+            }
+          } finally {
+            Remove-Item $pfx -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Verify the signatures
+        # A separate step, and not decoration. `signtool sign` reporting success
+        # is not Windows accepting the result: a chain the machine cannot build,
+        # or a timestamp that silently did not attach, both leave an exe that
+        # signed "fine" and warns on a user's machine. `/pa` asks under the
+        # Authenticode policy, which is the one the shell and SmartScreen use, and
+        # `/tw` makes an untimestamped signature a failure rather than a warning.
+        if: steps.signing.outputs.configured == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" -ErrorAction SilentlyContinue |
+                      Sort-Object { [version]$_.Directory.Parent.Name } | Select-Object -Last 1
+          foreach ($exe in @("target/release/windbg-mcp.exe",
+                             "target/i686-pc-windows-msvc/release/windbg-mcp.exe")) {
+            & $signtool.FullName verify /pa /tw /v $exe
+            if ($LASTEXITCODE -ne 0) { throw "signature verification failed for $exe" }
+          }
+
       - name: Package
         shell: pwsh
         run: |

@@ -593,8 +593,16 @@ question `serverInfo.version` does. Four things that entry did not see:
   says nothing about the next, since an `!ml` verdict is scored on the file in front of it — and it
   is a human action with an account behind it, so it belongs in `docs/releasing.md` (where it now
   is) rather than in a workflow.
-- **Authenticode signing** in `release.yml`, which is the standing fix and the part that needs a
-  decision. Two things about it are easy to get backwards. It **does not guarantee** an `!ml`
+- **Authenticode signing** in `release.yml`. **The plumbing has landed and only the certificate is
+  missing**, which is the whole of what is left here: the sign and verify steps sit between `Test`
+  and `Package` — before the archives that embed the exes, the checksum file, `server.json`'s hash
+  and the provenance attestation, all of which would otherwise describe unsigned bytes — gated on
+  `CODE_SIGNING_PFX` being set, so they skip with a build-log notice until it is. Two secrets switch
+  them on; [`docs/releasing.md`](./docs/releasing.md) has the names and the dry-run check. The
+  verification step is not decoration: `signtool verify /pa /tw` was confirmed to **fail on the
+  current unsigned exe**, so a signing step that silently no-ops cannot pass a release through.
+
+  Two things about signing are easy to get backwards. It **does not guarantee** an `!ml`
   detection goes away — Microsoft's own issue files signing under a later tier than the metadata —
   and it is not a prerequisite for the submission above; what it buys is a *stable identity for
   reputation to attach to*, so the submission stops starting from nothing each release, plus the fix
@@ -610,15 +618,23 @@ question `serverInfo.version` does. Four things that entry did not see:
     than accumulating it, and it is also the one a solo maintainer cannot buy: EV issuance requires
     a registered legal entity, so it is a company-formation decision before it is a few hundred a
     year.
-  - **SignPath's Foundation programme** signs open-source projects for free and has no such
-    geographic or entity bar, which makes it the first ask.
-  - **Certum's open-source code-signing certificates** are the paid fallback — aimed at EU
-    individual developers, around a hundred euros for several years, on a token or their cloud
-    signing.
+  - **SignPath's Foundation programme** signs open-source projects for free and has no geographic
+    or entity bar — it was the first ask here, and on 2026-09-04 the maintainer ruled it out: its
+    criteria require the project to be **findable at the top of a web search for its name**, and
+    this one is both small and named generically enough that it is not. That is not a bar effort
+    closes, so it is crossed off rather than deferred.
+  - **Certum's open-source code-signing certificates** are therefore the route being taken, not a
+    fallback — aimed at EU individual developers, around a hundred euros for several years. **Take
+    the cloud signing rather than the token**: a physical token cannot be reached from a
+    GitHub-hosted runner, which would mean signing by hand or a self-hosted runner, and since June
+    2023 the CA/Browser Forum has required code-signing keys to be on FIPS 140-2 Level 2 hardware
+    or an equivalent cloud HSM, so a plain `.pfx` is unlikely to be on offer at all. That changes
+    exactly one line of the workflow — `signtool sign`'s `/f`/`/p` become the vendor's provider
+    flags — and nothing around it.
 
-  So the reachable options are both OV-class, and reputation accumulates rather than arriving — which
-  is an argument for doing the per-release submission above *regardless* of what gets signed, not
-  for treating signing as the thing that makes it unnecessary. Prices and programme terms move;
+  So the one option left standing is OV-class, and reputation accumulates rather than arriving —
+  which is an argument for doing the per-release submission above *regardless* of what gets signed,
+  not for treating signing as the thing that makes it unnecessary. Prices and programme terms move;
   treat these as the shape of the choice, not as quotes. Note also what the release *does* carry and why it does not help here:
   `release.yml` produces a Sigstore build-provenance attestation, which is a supply-chain claim a
   user verifies deliberately with `gh attestation verify`. Nothing on the machine reads it, and it
