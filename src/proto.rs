@@ -496,6 +496,38 @@ impl EngineOp {
             _ => None,
         }
     }
+
+    /// What kind of thing this op makes the session's target, for the questions that stay live
+    /// long after the open.
+    ///
+    /// **Every opener is named**, and the wildcard arm means "opens nothing" rather than "some
+    /// other kind of target". A variant added without a line here is `None` — which
+    /// [`crate::worker::may_ask_the_os`], the one caller, treats as *do not ask the host about it*,
+    /// so the cost of forgetting is a correction not made rather than a wrong answer given.
+    pub fn target_origin(&self) -> Option<TargetOrigin> {
+        match self {
+            Self::Launch { .. } | Self::AttachProcess { .. } => Some(TargetOrigin::LocalProcess),
+            Self::OpenDump { .. } | Self::OpenTrace { .. } => Some(TargetOrigin::Recorded),
+            Self::AttachKernel { .. } | Self::AttachKernelLocal => Some(TargetOrigin::Kernel),
+            _ => None,
+        }
+    }
+}
+
+/// What a session's target *is*, as distinct from what file or process id names it.
+///
+/// The distinction that matters to every user of this: **whose machine the target's process ids
+/// belong to.** A live local process's are this host's and can be asked about; a dump's and a
+/// trace's were this host's at some point in the past and have since been reissued to whatever is
+/// running now; a kernel's are the debugged machine's and were never this host's at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetOrigin {
+    /// A user-mode process running on this machine, now — `launch` or `attach_process`.
+    LocalProcess,
+    /// A file: a crash dump, or a TTD trace. Both replay a process that has already exited.
+    Recorded,
+    /// A kernel, live or dumped. Its process ids are the target machine's.
+    Kernel,
 }
 
 /// `reachable_from_dispatch`'s arguments, after the supervisor has applied its defaults.

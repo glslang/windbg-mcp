@@ -496,6 +496,29 @@ pub(crate) fn parse_u64(s: &str) -> Result<u64, String> {
     parsed.map_err(|_| format!("invalid number: {s}"))
 }
 
+/// An error-reporting value as a caller actually writes one.
+///
+/// [`parse_u64`] first, so `0x80070005` and `2147942405` are unchanged, and a **signed** decimal
+/// after it. `HRESULT` is declared `LONG`, so everything that stores one in a native integer
+/// prints it negative — `.NET`'s `Exception.HResult`, PowerShell's `$_.Exception.HResult`, a
+/// `ctypes` `WinError` — and `-2147024891` is the form `0x80070005` is quoted in far more often
+/// than the arithmetic value is. This tool's own argument says "decimal or 0x-hex" and then
+/// refused the commonest decimal there is (Codex, round nine of
+/// [#286](https://github.com/glslang/windbg-mcp/pull/286)).
+///
+/// **Sign-extended to 64 bits rather than reinterpreted to 32**, so it lands in the narrowing the
+/// caller already does: `-2147024891` becomes `0xffffffff80070005`, which is exactly the shape a
+/// WIL fail-fast carries and is truncated by the arm that exists for it. One rule, not two.
+///
+/// Only `i32` is accepted, so a number outside a 32-bit value's range is still refused rather than
+/// wrapped into a different one.
+pub(crate) fn parse_status_value(s: &str) -> Result<u64, String> {
+    parse_u64(s).or_else(|why| match s.trim().parse::<i32>() {
+        Ok(signed) => Ok(signed as i64 as u64),
+        Err(_) => Err(why),
+    })
+}
+
 pub(crate) fn hexdump(base: u64, bytes: &[u8]) -> String {
     let mut out = String::new();
     for (i, chunk) in bytes.chunks(16).enumerate() {
@@ -2112,9 +2135,10 @@ pub struct ExceptionTriageArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct DecodeErrorReportingArgs {
-    /// A 32-bit status value (decimal or 0x-hex): an HRESULT, an NTSTATUS, or a Win32 error —
-    /// e.g. "0x80670015". A 64-bit sign-extended value is accepted and truncated, since that is
-    /// how one arrives in an exception parameter.
+    /// A 32-bit status value: an HRESULT, an NTSTATUS, or a Win32 error — e.g. "0x80670015".
+    /// 0x-hex, or decimal signed or unsigned ("-2147024891" is 0x80070005, as an HRESULT held in a
+    /// `LONG` prints). A 64-bit sign-extended value is accepted and truncated, since that is how
+    /// one arrives in an exception parameter.
     pub code: String,
 }
 
@@ -3651,7 +3675,7 @@ impl WindbgServer {
         // declares an `outputSchema`, and a schema-aware client that is handed a text-only failure
         // for a tool that promised structured content has been given something it may reject. The
         // refusal is the one result a caller most needs to be able to read.
-        let value = match parse_u64(&args.code) {
+        let value = match parse_status_value(&args.code) {
             Ok(value) => value,
             Err(why) => return typed_error(ErrorCategory::InvalidArgument, why, None),
         };
@@ -7299,6 +7323,43 @@ mod tests {
         assert_eq!(structured["status"], "ok");
         assert_eq!(structured["verdict"], "hit");
         assert_eq!(structured["target"], "0xfffff8031ab10000");
+    }
+
+    /// **`-2147024891` is how `0x80070005` is written down**, because `HRESULT` is a `LONG` and
+    /// every runtime that holds one in a native integer prints it that way. The argument said
+    /// "decimal or 0x-hex" and took only the unsigned half, so the commonest decimal form of the
+    /// commonest value this tool is asked about was an invalid-argument error.
+    #[test]
+    fn a_signed_decimal_status_is_the_value_its_bits_are() {
+        // The reviewer's case, and the two neighbours that say this is bit reinterpretation and
+        // not arithmetic: an all-ones word, and a small negative.
+        assert_eq!(parse_status_value("-2147024891"), Ok(0xffff_ffff_8007_0005));
+        assert_eq!(parse_status_value("-1"), Ok(0xffff_ffff_ffff_ffff));
+        assert_eq!(parse_status_value("-5"), Ok(0xffff_ffff_ffff_fffb));
+
+        // Sign-extended so it lands in the truncation the caller already does, which is what makes
+        // this one rule rather than two. Same answer as the hexadecimal form of the same value.
+        for (signed, hex) in [("-2147024891", "0x80070005"), ("-2147467259", "0x80004005")] {
+            assert_eq!(
+                u32::try_from(parse_status_value(signed).unwrap() & 0xffff_ffff),
+                u32::try_from(parse_status_value(hex).unwrap()),
+                "{signed} and {hex} are the same 32 bits"
+            );
+        }
+
+        // Unchanged for everything that already worked.
+        assert_eq!(parse_status_value("0x80070005"), Ok(0x8007_0005));
+        assert_eq!(parse_status_value("2147942405"), Ok(2_147_942_405));
+        assert_eq!(
+            parse_status_value("0xffffffff8000ffff"),
+            Ok(0xffff_ffff_8000_ffff)
+        );
+
+        // And a decimal outside a 32-bit value's range is still refused rather than wrapped into a
+        // different number — the same refusal the unsigned side makes.
+        assert!(parse_status_value("-4294967296").is_err());
+        assert!(parse_status_value("-9999999999999999999999").is_err());
+        assert!(parse_status_value("not a number").is_err());
     }
 
     #[test]

@@ -4942,6 +4942,23 @@ fn a_sign_extended_error_code_is_accepted_and_a_wider_one_is_refused() {
         out["result"]["structuredContent"]["error"]["category"], "invalid_argument",
         "{out}"
     );
+
+    // **And the signed decimal an HRESULT is printed as**, which is a `LONG` held in a native
+    // integer and is how .NET, PowerShell and `ctypes` all render one. Asserted through the tool
+    // rather than only against the parser, because the parser being right is not the same fact as
+    // this tool calling it.
+    let out = server.call_tool(
+        "decode_error_reporting",
+        json!({ "code": "-2147024891" }),
+        STEP,
+    );
+    let data = &out["result"]["structuredContent"];
+    assert_eq!(
+        data["status"], "ok",
+        "the signed decimal form of 0x80070005 was refused: {out}"
+    );
+    assert_eq!(data["value"], "0x80070005", "{data}");
+    assert_eq!(data["symbolic"], "E_ACCESSDENIED", "{data}");
 }
 
 /// A live user-mode target that runs long enough to be driven and exits on its own.

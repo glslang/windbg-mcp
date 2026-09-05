@@ -59,7 +59,7 @@ use crate::batch::{self, BatchOp, Debuggee, Ran};
 use crate::fault;
 use crate::proto::{
     EngineOp, Failed, HeapBackendFilter, HeapOp, HeapStateFilter, Interrupted, MAX_MODULE_ROWS,
-    Output, PoolOp, ReachabilityOp, SymbolPathSetting, WorkerMessage, WorkerRequest,
+    Output, PoolOp, ReachabilityOp, SymbolPathSetting, TargetOrigin, WorkerMessage, WorkerRequest,
 };
 use crate::server::{
     EXEC_WAIT_MS, fmt_addr, format_recipe, format_report, hexdump, matches_module_pattern,
@@ -909,11 +909,18 @@ fn start_log_writer() {
 /// Set once, by [`engine_thread`], before `Ready`. `None` is the ordinary case and says nothing.
 static LIMITATION: OnceLock<Option<String>> = OnceLock::new();
 
-/// What this worker was started for, which is `None` for a `launch` — the supervisor has no dump to
-/// parse and no process to ask about until one exists.
+/// What kind of target this worker holds, set by the op that opened it.
 ///
-/// Read by [`target_bitness`], which must not hand a *dump's* recorded process id to the OS.
-static OPENING: OnceLock<Option<Opening>> = OnceLock::new();
+/// **The op and not the spawn argument**, which is the same distinction as
+/// [`crate::proto::EngineOp::opening`] against [`crate::proto::EngineOp::target_origin`]. The
+/// supervisor's `Opening` is a *preselection hint*: it exists to choose a worker image, so it
+/// carries the two openers whose architecture can be read before an engine exists and is `None` for
+/// every other — a launch, a trace, a kernel attach, alike. Reading a session's kind off it
+/// therefore says "launch" for a TTD trace, and the OS gets asked about a process id recorded on
+/// somebody's machine months ago.
+///
+/// Read by [`may_ask_the_os`].
+static TARGET_ORIGIN: OnceLock<TargetOrigin> = OnceLock::new();
 
 /// What this session cannot do, if anything.
 fn session_limitation() -> Option<String> {
@@ -1001,9 +1008,6 @@ const NO_X86_WORKER: &str = "This is a 32-bit target and this build of the serve
 
 /// Owns the [`DebugEngine`] for the life of the process and runs one op at a time.
 fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
-    // Kept because `target_bitness` needs to know whether the recorded process id belongs
-    // to a process on *this* machine. Set before the engine exists, so nothing races it.
-    let _ = OPENING.set(target.clone());
     // Reported and exited rather than accepted: the supervisor is waiting for exactly one of these
     // two messages before it registers a session, so a dead engine reads as server machinery
     // rather than as a debugger error the model would pointlessly retry.
@@ -1450,6 +1454,13 @@ fn apply_symbol_path(e: &DebugEngine, setting: &SymbolPathSetting) -> Result<(),
 fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<Output, Failed> {
     if let Some(refusal) = refuse_when_the_target_is_gone(e, &op) {
         return Err(refusal);
+    }
+    // Before the open rather than after it, so a failed one still records what was attempted: this
+    // decides whether a later call may ask the host OS about a process id, and the answer for a
+    // half-opened trace is the same as for a whole one. `OnceLock`, because a worker holds one
+    // target for its life — a second opener is refused as "this session already holds a target".
+    if let Some(origin) = op.target_origin() {
+        let _ = TARGET_ORIGIN.set(origin);
     }
     match op {
         // ---- openers ----
@@ -3205,10 +3216,11 @@ fn crash_triage(
 /// ask about until one exists, so the supervisor cannot preselect the 32-bit worker for one:
 /// `Opening` is `None` there by construction.
 ///
-/// So for a **live** target the OS is asked as well, which is the same `IsWow64Process2` behind
-/// [`crate::target::process_arch`] that the routing itself uses. Only for a live one — on a dump the
-/// recorded process id names a process that is long gone, and an unrelated one may have inherited
-/// the number.
+/// So for a process **running on this machine** the OS is asked as well, which is the same
+/// `IsWow64Process2` behind [`crate::target::process_arch`] that the routing itself uses. Only for
+/// one of those: a dump's and a trace's recorded process ids name a process that is long gone, and
+/// an unrelated live one may have inherited the number. [`may_ask_the_os`] is that precondition,
+/// and is written as an allowlist for a reason it gives there.
 ///
 /// **What this still does not track is `.effmach`.** The engine's *effective* machine follows the
 /// target through the WoW64 transition — measured on that same launch: `x64 (AMD64)` at the initial
@@ -3227,7 +3239,7 @@ fn target_bitness(e: &DebugEngine) -> fault::Bitness {
         }
     };
 
-    let os_says = if !may_ask_the_os(OPENING.get().and_then(Option::as_ref), engine_says) {
+    let os_says = if !may_ask_the_os(TARGET_ORIGIN.get().copied(), engine_says) {
         None
     } else {
         match e
@@ -3289,16 +3301,29 @@ fn native_bitness() -> fault::Bitness {
 /// Whether the OS may be asked about this target's process — the second of [`target_bitness`]'s
 /// two questions, and the one with a precondition.
 ///
-/// **A recorded process id is only this machine's to query when the target is on this machine.** A
-/// dump's names a process that exited before the file was written, and some unrelated live process
-/// may have inherited the number since; a `launch` and a supervisor-routed `attach` are both here,
-/// now, and fair to ask about. The third case — a guest's process id, arriving over a KDNET cable
-/// — never reaches this: `exception_triage` refuses a kernel target before any of it runs.
+/// **A recorded process id is only this machine's to query when the target is on this machine.**
+/// `IsWow64Process2` takes a number and answers about whatever holds it *now*, so asking it about
+/// a process id from somewhere else is not a query that fails — it is one that succeeds about the
+/// wrong process. On a busy host a reused id is a real answer, and a 32-bit one would override a
+/// 64-bit target's own header.
+///
+/// **So this is an allowlist, and it was a denylist for one round.** The first version asked
+/// "is this not a dump?", which is true of a TTD trace — a trace replays a process that exited on
+/// somebody else's machine, and `EngineOp::opening` reports `None` for one exactly as it does for
+/// a `launch` (Codex, round nine of
+/// [#286](https://github.com/glslang/windbg-mcp/pull/286)). A rule shaped as "everything except the
+/// kinds I listed" is wrong again for every kind added after it, so the shape is the fix rather
+/// than a second exclusion: only [`TargetOrigin::LocalProcess`] is asked about, and a target this
+/// build has no origin recorded for is not.
+///
+/// The kernel arm is unreachable today — `exception_triage` refuses a kernel target before any of
+/// this runs — and is written anyway, because "some other rule further up happens to stop it" is
+/// the property that quietly stops holding.
 ///
 /// An engine that already answered x86 is not asked either. Nothing is left to correct, and the
 /// answer costs a process open.
-fn may_ask_the_os(opening: Option<&Opening>, engine_says: Option<Arch>) -> bool {
-    !matches!(opening, Some(Opening::Dump(_)))
+fn may_ask_the_os(origin: Option<TargetOrigin>, engine_says: Option<Arch>) -> bool {
+    matches!(origin, Some(TargetOrigin::LocalProcess))
         && !matches!(engine_says, Some(Arch::X86 | Arch::Arm))
 }
 
@@ -6064,25 +6089,124 @@ mod tests {
     /// inherited it, which on a busy machine is a real process with a real answer and no relation
     /// to the dump. The result would not be a failed query to fall back from — it would be a
     /// confident wrong width, on the one target kind whose own header already says the right one.
+    ///
+    /// **A TTD trace is the same fact and was not the same rule**, which is why this asserts a
+    /// kind rather than "not a dump": a trace replays a process that exited on somebody else's
+    /// machine, and the first version of the gate let it through.
     #[test]
     fn test_only_a_process_on_this_machine_is_asked_about() {
-        let dump = Opening::Dump(std::path::PathBuf::from("crash.dmp"));
-        let attached = Opening::Process(4242);
+        // Asked about: the two openers that leave a process running here. The launch is the case
+        // the correction exists for, since the supervisor cannot preselect the 32-bit worker for a
+        // process that does not exist yet.
+        assert!(may_ask_the_os(
+            Some(TargetOrigin::LocalProcess),
+            Some(Arch::X64)
+        ));
+        assert!(may_ask_the_os(Some(TargetOrigin::LocalProcess), None));
 
+        // Not asked about: everything whose process ids were issued somewhere else.
         assert!(
-            !may_ask_the_os(Some(&dump), Some(Arch::X64)),
-            "a dump's recorded process id was handed to this machine's OS"
+            !may_ask_the_os(Some(TargetOrigin::Recorded), Some(Arch::X64)),
+            "a recorded process id was handed to this machine's OS"
         );
-        // A launch — no opening at all, and the case the correction exists for, since the
-        // supervisor cannot preselect the 32-bit worker for a process that does not exist yet.
-        assert!(may_ask_the_os(None, Some(Arch::X64)));
-        assert!(may_ask_the_os(Some(&attached), Some(Arch::X64)));
-        assert!(may_ask_the_os(None, None));
+        assert!(!may_ask_the_os(Some(TargetOrigin::Kernel), Some(Arch::X64)));
+        assert!(
+            !may_ask_the_os(None, Some(Arch::X64)),
+            "a target this build records no origin for was asked about anyway"
+        );
 
         // Nothing to correct: the engine already named a 32-bit machine, and asking costs a
         // process open for an answer that cannot change the outcome.
-        assert!(!may_ask_the_os(None, Some(Arch::X86)));
-        assert!(!may_ask_the_os(None, Some(Arch::Arm)));
+        assert!(!may_ask_the_os(
+            Some(TargetOrigin::LocalProcess),
+            Some(Arch::X86)
+        ));
+        assert!(!may_ask_the_os(
+            Some(TargetOrigin::LocalProcess),
+            Some(Arch::Arm)
+        ));
+    }
+
+    /// **Every opener says what it opens, and a trace says `Recorded`.**
+    ///
+    /// The gate above is only as good as the classification feeding it, and the classification is
+    /// a `match` with a wildcard arm — so the way it goes wrong is an opener quietly falling into
+    /// the wildcard. That is exactly what `EngineOp::opening` does with `OpenTrace`, for its own
+    /// good reasons, and reading a session's kind off *that* is what put a trace in the same
+    /// bucket as a launch.
+    #[test]
+    fn test_every_opener_says_what_kind_of_target_it_opens() {
+        use crate::proto::SymbolPathSetting;
+
+        for (op, want) in [
+            (
+                EngineOp::Launch {
+                    command_line: "cmd.exe".into(),
+                },
+                Some(TargetOrigin::LocalProcess),
+            ),
+            (
+                EngineOp::AttachProcess { pid: 4242 },
+                Some(TargetOrigin::LocalProcess),
+            ),
+            (
+                EngineOp::OpenDump {
+                    path: "crash.dmp".into(),
+                },
+                Some(TargetOrigin::Recorded),
+            ),
+            (
+                EngineOp::OpenTrace {
+                    path: "trace.run".into(),
+                },
+                Some(TargetOrigin::Recorded),
+            ),
+            (EngineOp::AttachKernelLocal, Some(TargetOrigin::Kernel)),
+            (
+                EngineOp::AttachKernel {
+                    connection: crate::kdconn::Connection::new("net:port=50000,key=1.2.3.4"),
+                },
+                Some(TargetOrigin::Kernel),
+            ),
+            // And something that opens nothing, so the wildcard arm means what it says.
+            (
+                EngineOp::SymbolPath {
+                    setting: SymbolPathSetting {
+                        path: String::new(),
+                        append: false,
+                    },
+                    reload: String::new(),
+                },
+                None,
+            ),
+            (EngineOp::EndSession, None),
+        ] {
+            assert_eq!(
+                op.target_origin(),
+                want,
+                "{op:?} is classified as {:?}",
+                op.target_origin()
+            );
+        }
+
+        // The rule the list above exists to protect: an opener is one of the ops
+        // `refuse_when_the_target_is_gone` exempts, and every one of those must have an origin.
+        // A new opener added without a line in `target_origin` fails here rather than silently
+        // becoming a target nobody may ask the OS about — or, worse, one they may.
+        for op in [
+            EngineOp::OpenDump { path: "d".into() },
+            EngineOp::OpenTrace { path: "t".into() },
+            EngineOp::AttachKernelLocal,
+            EngineOp::AttachProcess { pid: 1 },
+            EngineOp::Launch {
+                command_line: "c".into(),
+            },
+        ] {
+            assert!(
+                op.target_origin().is_some(),
+                "{op:?} opens a target and does not say what kind"
+            );
+        }
     }
 
     /// The other half of the coverage rule, and the half a check on the *op* cannot see: which
