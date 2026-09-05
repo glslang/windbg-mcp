@@ -157,6 +157,12 @@
   would default to — zero is `FAST_FAIL_LEGACY_GS_VIOLATION`, so defaulting named a specific
   security check that the record never mentioned. Every real `__fastfail` supplies a subcode; one
   that does not is truncated or synthetic, and the summary says so.
+- **And it draws no conclusion from the subcode it has not got.** Preserving the field was half of
+  that: the summary went on giving such a record the dismissal above — "not a stack buffer
+  overrun" — which is the *other* thing only a subcode can support, since the two `/GS` subcodes
+  are exactly that. So there are three answers rather than two, and a record with no parameters
+  gets the one that says nothing has been established. A negative finding read off an absent field
+  is the same mistake as a positive one, and reads more convincingly.
 - **A scanned throw record is never this fault's cause, only a candidate for it.** A C++
   `EXCEPTION_RECORD` outlives the frames that held it: a `try`/`catch` unwinds past one without
   erasing it, so a later direct `abort()` running deeper than the old throw site finds a valid

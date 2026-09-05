@@ -523,6 +523,14 @@ const GS_COOKIE_SUBCODES: &[u64] = &[
     2, // FAST_FAIL_STACK_COOKIE_CHECK_FAILURE
 ];
 
+/// Whether a fail-fast subcode is one of the `/GS` cookie failures.
+///
+/// A predicate rather than the list, because the two sentences that turn on it should not also be
+/// counting its entries — this file has already shipped one count that argued against counts.
+fn is_a_gs_cookie_failure(subcode: u64) -> bool {
+    GS_COOKIE_SUBCODES.contains(&subcode)
+}
+
 /// `FAST_FAIL_FATAL_APP_EXIT`, the subcode the CRT's `abort` raises.
 ///
 /// Named because two decisions turn on it and they must not drift apart: the sentence
@@ -1222,17 +1230,39 @@ fn summary_of(kind: &FaultKind, evidence: ThrowEvidence) -> Option<String> {
             } else {
                 ""
             };
-            // **The lead sentence is conditional, because for two subcodes it would be false.**
-            let lead = if subcode.is_some_and(|s| GS_COOKIE_SUBCODES.contains(&s)) {
-                "a __fastfail, and one of the two whose code name is the literal truth: a /GS \
-                 stack cookie check failed, which means the guard value between a local buffer \
-                 and the return address was overwritten. Stack corruption is the finding here, \
-                 not a misreading of the code's name"
-            } else {
-                "a __fastfail — a deliberate process exit, not a stack buffer overrun, whatever \
-                 the code's name and the system's message text for it say"
+            // **Three answers, because the dismissal is false for some subcodes and unsupported
+            // for a record that carries none.** `0xc0000409` is `STATUS_STACK_BUFFER_OVERRUN` and
+            // almost never one — but a `/GS` cookie failure *is* stack corruption, and a record
+            // with no parameters cannot say it was not one. An earlier version had two arms and
+            // gave the parameterless case the dismissal, which is a negative finding read off a
+            // field that is not there (Codex, round ten of
+            // [#286](https://github.com/glslang/windbg-mcp/pull/286)). It is the same mistake as
+            // the `unwrap_or_default` that made an absent subcode zero, one layer up: there the
+            // record was given a subcode it does not carry, here a conclusion only a subcode
+            // supports.
+            //
+            // **The third arm names no check**, deliberately. Saying which subcodes would have
+            // meant corruption puts `FAST_FAIL_LEGACY_GS_VIOLATION` in a sentence about a record
+            // that carries no subcode, which is the confusion this whole seam keeps producing.
+            let lead = match subcode {
+                Some(subcode) if is_a_gs_cookie_failure(*subcode) => format!(
+                    "a __fastfail, and one of those whose code name is the literal truth: a /GS \
+                     stack cookie check failed, which means the guard value between a local \
+                     buffer and the return address was overwritten. Stack corruption is the \
+                     finding here, not a misreading of the code's name. {named} is what says why."
+                ),
+                Some(_) => format!(
+                    "a __fastfail — a deliberate process exit, not a stack buffer overrun, \
+                     whatever the code's name and the system's message text for it say. {named} \
+                     is what says why."
+                ),
+                None => format!(
+                    "a __fastfail, and {named}, so nothing here says which kind. Most subcodes \
+                     are not stack corruption despite the code's name, but the /GS cookie checks \
+                     are, and with no parameters this record rules nothing out."
+                ),
             };
-            Some(format!("{lead}. {named} is what says why.{abort}"))
+            Some(format!("{lead}{abort}"))
         }
         FaultKind::CppThrow(_) => Some(
             "a C++ throw that reached RaiseException. The thrown object is what carries the \
@@ -2140,6 +2170,19 @@ mod tests {
         );
         let text = summary_of(&abort, ThrowEvidence::None).expect("a fail-fast gets a summary");
         assert!(text.contains("not a stack buffer overrun"), "{text}");
+
+        // **The three arms are three, and the difference between the second and the third is the
+        // whole point.** A known non-/GS subcode is told it is not corruption; a record with no
+        // subcode is told nothing, because there is nothing to tell it from. Asserted together so
+        // a change that collapses them back into two fails here rather than in a summary nobody
+        // reads until it has misled someone.
+        let bare = classify(STATUS_STACK_BUFFER_OVERRUN, &[], Bitness::Bits64);
+        let bare = summary_of(&bare, ThrowEvidence::None).expect("a fail-fast gets a summary");
+        assert_ne!(
+            text.contains("not a stack buffer overrun"),
+            bare.contains("not a stack buffer overrun"),
+            "a known subcode and an absent one got the same verdict:\n  {text}\n  {bare}"
+        );
     }
 
     /// **The dword after the sentinel is checked, because "it decodes" was only ever prose.**
@@ -2436,6 +2479,20 @@ mod tests {
         assert!(
             text.contains("no subcode"),
             "a summary that has no subcode to report has to say so: {text}"
+        );
+
+        // **And it draws no conclusion from the field it does not have.** Preserving `subcode: None`
+        // was half the fix; the summary went on giving such a record the dismissal the other
+        // subcodes earn — "not a stack buffer overrun" — which is a negative finding read off an
+        // absent field. Subcode 0 *is* `FAST_FAIL_LEGACY_GS_VIOLATION` and subcode 2 is a stack
+        // cookie check, so a record carrying no parameters cannot exclude either.
+        assert!(
+            !text.contains("not a stack buffer overrun"),
+            "a record with no subcode was told what it was not: {text}"
+        );
+        assert!(
+            text.contains("rules nothing out"),
+            "a summary with nothing to go on has to say that, not stay silent: {text}"
         );
 
         // Subcode zero really *is* that check when the record says zero, which is the other half.
