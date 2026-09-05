@@ -560,6 +560,7 @@ mod tests {
     const USER_MODE_SAMPLES: &[(&str, Arch)] = &[
         ("cppthrow-fastfail.dmp", Arch::X64),
         ("cppthrow-fastfail-x86.dmp", Arch::X86),
+        ("stale-throw-abort.dmp", Arch::X64),
     ];
 
     /// The synthesised headers above are this parser's own idea of the format, so they cannot

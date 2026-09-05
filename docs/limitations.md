@@ -134,6 +134,26 @@
   walk this host could not do, not a stack with an unusual frame in it. Put the binaries where the
   debugger can find them (`.exepath`, or beside the dump) before reading a stack from a dump that
   came from another machine.
+- **A scanned throw record is labelled, because finding one does not make it this fault's.** A
+  C++ `EXCEPTION_RECORD` outlives the frames that held it: a `try`/`catch` unwinds past one without
+  erasing it, so a later direct `abort()` running deeper than the old throw site finds a valid
+  record above its stack pointer. Measured, on `docs/samples/stale-throw-abort.dmp` — the scan
+  really does promote a candidate there, so "the scan will not find anything" is not the guard.
+  What separates the two is whether an exception is **being dispatched**, which the stack shows:
+  `KiUserExceptionDispatcher` and the unhandled-exception filter are on it for a genuine unhandled
+  throw and on nothing else. `thrown.provenance` reports which case this is — `reported` when the
+  debugger stopped on the throw, `dispatching` when the stack corroborates, `scanned` when it does
+  not and the object may belong to an exception the program handled. Corroboration needs symbols
+  for `ntdll`/`KERNELBASE`, not for the faulting image, so a dump from another machine can still
+  reach `dispatching`; a host with no symbols at all reports `scanned` and says less rather than
+  guessing more.
+- **An exception code is decoded as an `NTSTATUS`, and a bare code is decoded as both.** The two
+  namespaces overlap and the system message table answers for the wrong one where they do:
+  `0x80000003` is `STATUS_BREAKPOINT`, and `FormatMessage` reads it as `E_INVALIDARG` — "One or
+  more arguments are invalid". So `exception_triage` decodes the record's code as a status, while
+  `decode_error_reporting`, which is given a number of unknown provenance, reports every reading
+  and leads with the `HRESULT` one. Both tools carry `system_message` and `ntstatus_message`
+  side by side regardless; the difference is only which leads.
 - **The buried-throw scan runs on one fault shape, and reports nothing on the others.** It is
   `abort`'s fail-fast — `0xc0000409` with subcode 7 and none of WIL's parameters — because that is
   the fault whose cause is somewhere other than its own record. It deliberately does *not* run on

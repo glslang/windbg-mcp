@@ -3336,6 +3336,24 @@ fn exception_triage(e: &DebugEngine, frames: usize, scan_stack: bool) -> Result<
         .as_ref()
         .map(|throw| fault::thrown_error(&read, throw));
 
+    // **What the find is worth, which is not the same as whether there was one.** A record that
+    // parses may be a *handled* exception's, left on the stack by an earlier try/catch and never
+    // erased -- see `fault::ThrowEvidence`. The stack is what tells them apart: an unhandled throw
+    // reaches abort through the exception dispatch, so those frames are still on it.
+    let evidence = match (&throw, &kind) {
+        (Some(_), _)
+            if fault::stack_is_dispatching(
+                attributed.iter().filter_map(|f| f.frame.symbol.as_deref()),
+            ) =>
+        {
+            fault::ThrowEvidence::Dispatching
+        }
+        // A throw that *is* the reported fault needs no corroboration: the debugger stopped on it.
+        (Some(_), fault::FaultKind::CppThrow(_)) => fault::ThrowEvidence::Dispatching,
+        (Some(_), _) => fault::ThrowEvidence::Scanned,
+        (None, _) => fault::ThrowEvidence::None,
+    };
+
     let process_name = e
         .current_process_name()
         .ok()
@@ -3346,6 +3364,7 @@ fn exception_triage(e: &DebugEngine, frames: usize, scan_stack: bool) -> Result<
         event.first_chance,
         &kind,
         thrown.as_ref(),
+        evidence,
         attributed.iter().map(triage::frame_info).collect(),
         truncated,
         walked_stored_context,
