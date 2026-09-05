@@ -3327,6 +3327,36 @@ fn may_ask_the_os(origin: Option<TargetOrigin>, engine_says: Option<Arch>) -> bo
         && !matches!(engine_says, Some(Arch::X86 | Arch::Arm))
 }
 
+/// Which of the two events carries this fault, asking for the fallback **only if the first does
+/// not answer**.
+///
+/// The stored event is the better answer where there is one — it is the fault the target was
+/// captured on, and it stays that way however far the caller has navigated — and `last_event` is
+/// what a live target has instead. They are alternatives, so asking for both is asking one question
+/// too many, and the extra question used to be the fatal one: `stored_event` was read best-effort
+/// while `last_event` was a hard `?`, so a dump carrying a perfectly good crash event was refused
+/// outright whenever the *unused* fallback failed to read (Codex, round thirteen of
+/// [#286](https://github.com/glslang/windbg-mcp/pull/286)). The asymmetry was backwards.
+///
+/// `Err` is reserved for the fallback failing, and the caller distinguishes it from `Ok(None)`,
+/// because "there is no exception here" and "nobody could ask" are different things to tell a
+/// caller — the same distinction the fault summaries keep.
+///
+/// Taking the fallback as a closure is what lets a test assert it is not called at all: this is a
+/// rule about a question that must *not* be asked, and nothing about the returned value records
+/// whether it was.
+fn choose_exception_event<E>(
+    stored: Option<&dbgscope::dbgeng::DebugEvent>,
+    last: impl FnOnce() -> Result<Option<dbgscope::dbgeng::DebugEvent>, E>,
+) -> Result<Option<dbgscope::dbgeng::DebugEvent>, E> {
+    if let Some(stored) = stored
+        && stored.exception.is_some()
+    {
+        return Ok(Some(stored.clone()));
+    }
+    Ok(last()?.filter(|last| last.exception.is_some()))
+}
+
 /// A user-mode fault as fields — the exception record, what kind it is, the thrown object, and the
 /// crashing stack ([`crate::fault`]).
 ///
@@ -3358,14 +3388,9 @@ fn exception_triage(e: &DebugEngine, frames: usize, scan_stack: bool) -> Result<
         tracing::debug!("worker: exception triage could not read the stored event: {why}");
         None
     });
-    let last = e.last_event().map_err(es)?;
-
-    // The stored event first: it is the fault this target was captured on, and it stays that way
-    // however far the caller has navigated. `last_event` is the live target's answer.
-    let (event, _) = match (&stored, &last) {
-        (Some(stored), _) if stored.exception.is_some() => (stored, true),
-        (_, Some(last)) if last.exception.is_some() => (last, false),
-        _ => {
+    let event = match choose_exception_event(stored.as_ref(), || e.last_event()) {
+        Ok(Some(event)) => event,
+        Ok(None) => {
             return Err(Failed::categorised(
                 structured::ErrorCategory::Debugger,
                 "this target is not stopped on an exception: the engine reports no exception \
@@ -3375,7 +3400,21 @@ fn exception_triage(e: &DebugEngine, frames: usize, scan_stack: bool) -> Result<
                     .to_string(),
             ));
         }
+        // **A failed read is not a finding about the target.** Saying "this target is not stopped
+        // on an exception" when the question could not be put is the same invention as a negative
+        // subcode verdict read off a record that carries none.
+        Err(why) => {
+            return Err(Failed::categorised(
+                structured::ErrorCategory::Debugger,
+                format!(
+                    "could not establish whether this target is stopped on an exception: it has \
+                     no stored crash event, and reading the last event failed ({why}). That is a \
+                     failure of this call rather than a fact about the target."
+                ),
+            ));
+        }
     };
+    let event = &event;
     let record = event
         .exception
         .as_ref()
@@ -6031,6 +6070,75 @@ mod tests {
     use dbgscope::pool::WalkStalls;
 
     use super::*;
+
+    /// **The fallback is not asked when the first source answered, and a test can only see that
+    /// with a probe.**
+    ///
+    /// `stored_event` was read best-effort and `last_event` was a hard `?`, so a dump carrying a
+    /// perfectly good crash event was refused outright whenever the *unused* fallback failed —
+    /// and nothing about the returned value records whether the second question was put, so the
+    /// closure counts the calls.
+    #[test]
+    fn test_the_fallback_event_is_not_asked_for_when_the_stored_one_answered() {
+        use std::cell::Cell;
+
+        let with_exception = |address: u64| dbgscope::dbgeng::DebugEvent {
+            kind: 2,
+            process: 0,
+            thread: 0,
+            exception: Some(dbgscope::dbgeng::ExceptionRecord {
+                code: 0xc000_0409,
+                flags: 0,
+                address,
+                parameters: vec![7],
+                nested: None,
+            }),
+            first_chance: false,
+            context: None,
+        };
+        let without = dbgscope::dbgeng::DebugEvent {
+            exception: None,
+            ..with_exception(0)
+        };
+
+        // A stored event carrying an exception: the fallback is never reached, so a fallback that
+        // would fail — or panic — cannot affect the answer.
+        let asked = Cell::new(0);
+        let chosen = choose_exception_event(Some(&with_exception(0x1000)), || {
+            asked.set(asked.get() + 1);
+            Err::<_, String>("the engine refused".to_string())
+        });
+        assert_eq!(
+            asked.get(),
+            0,
+            "the fallback was asked for even though the stored event answered"
+        );
+        assert_eq!(
+            chosen.expect("a failing fallback cannot fail a triage that did not need it"),
+            Some(with_exception(0x1000))
+        );
+
+        // A stored event with no exception in it does not answer, so the fallback is asked — and
+        // its failure is an `Err`, which the caller reports as a failed question rather than as a
+        // target with no exception.
+        let asked = Cell::new(0);
+        let chosen = choose_exception_event(Some(&without), || {
+            asked.set(asked.get() + 1);
+            Err::<Option<dbgscope::dbgeng::DebugEvent>, String>("the engine refused".to_string())
+        });
+        assert_eq!(asked.get(), 1);
+        assert_eq!(chosen, Err("the engine refused".to_string()));
+
+        // No stored event at all — a live target — and the fallback answers.
+        let chosen = choose_exception_event(None, || Ok::<_, String>(Some(with_exception(0x2000))));
+        assert_eq!(chosen, Ok(Some(with_exception(0x2000))));
+
+        // Neither carries an exception: `Ok(None)`, which is a fact about the target rather than a
+        // failure, and the caller says so in those words.
+        let chosen =
+            choose_exception_event(Some(&without), || Ok::<_, String>(Some(without.clone())));
+        assert_eq!(chosen, Ok(None));
+    }
 
     /// **A WoW64 process is the one target both sources describe and only one of them is right
     /// about.**

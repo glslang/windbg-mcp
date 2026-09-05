@@ -2556,8 +2556,12 @@ pub struct StatusInfo {
     /// and therefore a different question from [`Self::hresult_failed`]: `0x80670015` is a failed
     /// `HRESULT` and reads as a *warning* here.
     pub ntstatus_severity: String,
-    /// The facility, where the two layouts agree.
-    pub facility: u32,
+    /// The facility as an **NTSTATUS** reads it: bits 16..=27.
+    pub ntstatus_facility: u32,
+    /// The facility as an **HRESULT** reads it: bits 16..=26. Bit 27 is `X`, reserved, so the two
+    /// differ exactly when it is set — and a set `X` also says the value is not a well-formed
+    /// HRESULT, which is worth seeing rather than folding into a facility number.
+    pub hresult_facility: u32,
     /// The low sixteen bits.
     pub code: u32,
     /// Whether the customer bit is set, marking a value that is in nobody's message table.

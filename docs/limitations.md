@@ -234,7 +234,9 @@
   still carries both; what it must not do is describe that failure as a target that had nothing to
   walk from.
 - **`decode_error_reporting` reads the host's message tables, not the target's.** The structural
-  fields — severity, facility, code, the customer bit — are arithmetic and cannot differ. The
+  fields — severity, facility, code, the customer bit — are arithmetic and cannot differ between
+  hosts. They can differ between *readings*, and the facility is where: an HRESULT's is eleven bits
+  and an NTSTATUS's is twelve, so a value with bit 27 set has two, and both are reported. The
   message text comes from this machine (`FormatMessageW`, plus `ntdll`'s table for an `NTSTATUS`),
   so a dump from a build that words an error differently is described in this host's words;
   `message_provenance` says so on every answer that carries one — and says only that, since this

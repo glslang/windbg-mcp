@@ -123,6 +123,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value, because that is the shape a WIL fail-fast's HRESULT arrives in — `0xffffffff8000ffff`
   decodes to `E_UNEXPECTED`.
 
+  **The facility is two fields for the same reason.** An HRESULT's is bits 16..=26 and an
+  NTSTATUS's is 16..=27, so bit 27 — an HRESULT's reserved `X` — is inside one and outside the
+  other: `0x88070005` is NTSTATUS facility `0x807` and HRESULT facility `0x7`, `FACILITY_WIN32`
+  with a reserved bit set that says it is not a well-formed HRESULT at all. A single `facility`
+  documented as "where the two layouts agree" was the one place this tool quietly picked a reading,
+  and it picked the twelve-bit one for both. `ntstatus_facility` and `hresult_facility` now sit
+  beside `ntstatus_severity` and `hresult_failed`, which had the naming right already.
+
 ### Changed
 
 - Both new tools join the **`crash`** group, which is why `crash_triage`'s refusal on a user-mode
