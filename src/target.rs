@@ -82,13 +82,18 @@ impl Arch {
         }
     }
 
-    /// The same answer from an `IMAGE_FILE_MACHINE`, which is how a *live* process reports it.
+    /// The same answer from an `IMAGE_FILE_MACHINE`, which is how a *live* process reports it —
+    /// and, measured, how the debug engine's `GetActualProcessorType` reports it too.
     ///
     /// A separate mapping rather than a shared one, because these are two different enumerations
     /// that happen to describe the same set: a minidump's `ProcessorArchitecture` numbers x64 as
     /// 9, and a PE machine type numbers it 0x8664. Folding them into one table is how a value
     /// from the wrong namespace comes to be read as a plausible architecture.
-    fn of_machine(value: IMAGE_FILE_MACHINE) -> Option<Self> {
+    ///
+    /// So which table the engine's answer belongs to was **checked rather than assumed**: opening
+    /// the two checked-in user-mode fixtures reports `0x14c` and `0x8664`, which are PE machine
+    /// values — `0` and `9` are what the other namespace would have given.
+    pub(crate) fn of_machine(value: IMAGE_FILE_MACHINE) -> Option<Self> {
         match value {
             IMAGE_FILE_MACHINE_I386 => Some(Self::X86),
             IMAGE_FILE_MACHINE_AMD64 => Some(Self::X64),
@@ -552,45 +557,54 @@ mod tests {
     /// `cppthrow-fastfail.dmp` is `exception_triage`'s fixture — a C++ throw nothing caught, so the
     /// CRT fail-fasted. It is a `MiniDumpWriteDump` capture of an x64 process, which is exactly the
     /// shape this parser routes on, so it is asserted rather than skipped.
-    const USER_MODE_SAMPLE: &str = "cppthrow-fastfail.dmp";
+    const USER_MODE_SAMPLES: &[(&str, Arch)] = &[
+        ("cppthrow-fastfail.dmp", Arch::X64),
+        ("cppthrow-fastfail-x86.dmp", Arch::X86),
+    ];
 
     /// The synthesised headers above are this parser's own idea of the format, so they cannot
     /// show it reads a file somebody else wrote. **These are real dumps**, checked in and opened
     /// by the smoke tier.
     ///
     /// Every kernel crash dump must come back `Other`, so a kernel target is never routed at a
-    /// 32-bit worker that could not open it. The one user-mode sample must come back
-    /// `UserMinidump(X64)` — it is the only file here that exercises this parser against a real
-    /// minidump somebody else's code wrote, since the 32-bit case below is built at test time.
+    /// 32-bit worker that could not open it. Each user-mode sample must come back with **its own**
+    /// architecture — these are the only files here that exercise this parser against real
+    /// minidumps somebody else's code wrote, since the synthesised cases above are this module's
+    /// own idea of the format.
     ///
-    /// **Both halves are named, rather than the loop accepting either answer.** The rule this
+    /// **The x86 one is the case the whole module exists for**, and it is real rather than
+    /// synthesised: a 32-bit user minidump is what has to reach the 32-bit worker, because the x64
+    /// engine cannot open it.
+    ///
+    /// **Every half is named, rather than the loop accepting whatever it finds.** The rule this
     /// started as was "every sample is a kernel dump", and the tempting way to admit a user-mode
     /// one is to relax the assertion; that would leave a kernel dump misread as a user minidump
     /// passing silently, which is the routing bug the whole module exists to prevent.
     #[test]
     fn the_checked_in_samples_route_to_the_worker_their_target_needs() {
         let samples = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/samples");
-        let (mut kernel, mut user) = (0, 0);
+        let (mut kernel, mut seen) = (0, Vec::new());
         for entry in std::fs::read_dir(&samples).expect("the sample directory is checked in") {
             let path = entry.expect("a readable directory entry").path();
             if path.extension().is_none_or(|e| e != "dmp") {
                 continue;
             }
             let read = read(&path).expect("a checked-in sample reads");
-            let user_mode = path
-                .file_name()
-                .is_some_and(|name| name == USER_MODE_SAMPLE);
-            if user_mode {
-                user += 1;
-                assert_eq!(
-                    read,
-                    DumpTarget::UserMinidump(Arch::X64),
-                    "{}",
-                    path.display()
-                );
-            } else {
-                kernel += 1;
-                assert_eq!(read, DumpTarget::Other, "{}", path.display());
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            match USER_MODE_SAMPLES.iter().find(|(sample, _)| *sample == name) {
+                Some((_, arch)) => {
+                    seen.push(name.to_string());
+                    assert_eq!(
+                        read,
+                        DumpTarget::UserMinidump(*arch),
+                        "{} did not route at the worker its own architecture needs",
+                        path.display()
+                    );
+                }
+                None => {
+                    kernel += 1;
+                    assert_eq!(read, DumpTarget::Other, "{}", path.display());
+                }
             }
         }
         // Or the loop above asserted nothing at all, which is the way a table-driven test rots.
@@ -598,7 +612,16 @@ mod tests {
             kernel >= 4,
             "expected the checked-in kernel samples, saw {kernel}"
         );
-        assert_eq!(user, 1, "expected exactly one user-mode sample, saw {user}");
+        seen.sort();
+        let mut want: Vec<String> = USER_MODE_SAMPLES
+            .iter()
+            .map(|(sample, _)| (*sample).to_string())
+            .collect();
+        want.sort();
+        assert_eq!(
+            seen, want,
+            "a named user-mode sample is missing from docs/samples"
+        );
     }
 
     /// The parser against a **real 32-bit user minidump** — the file this whole routing exists

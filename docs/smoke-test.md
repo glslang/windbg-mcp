@@ -1393,13 +1393,21 @@ assertion that fires), the unconditional early-exit failure, `.arg(target)` for 
 line, and the probe against this process's directory — which fails with `` `a01.run` is not a
 recording of `a program.exe` ``, the wrong-program recording exactly as it was first measured.
 
-## The user-mode fault fixture
+## The user-mode fault fixtures
 
-`docs/samples/cppthrow-fastfail.dmp` is the only **user-mode** dump checked in, and the only sample
-purpose-built rather than captured. It is what
-`a_user_mode_fault_is_triaged_from_its_exception_record` opens, and it exists because the faults
-that motivated `exception_triage` could not be checked in at all: they were 122-345 MB and carried
-a live desktop session (`explorer-crash-walkthrough.md` §10).
+`docs/samples/cppthrow-fastfail.dmp` and `docs/samples/cppthrow-fastfail-x86.dmp` are the only
+**user-mode** dumps checked in, and the only samples purpose-built rather than captured. They are
+what `a_user_mode_fault_is_triaged_from_its_exception_record` and
+`a_32_bit_user_mode_fault_is_triaged_at_its_own_pointer_width` open, and they exist because the
+faults that motivated `exception_triage` could not be checked in at all: they were 122-345 MB and
+carried a live desktop session (`explorer-crash-walkthrough.md` §10).
+
+**The 32-bit one is not a smaller copy of the first — it is a different ABI.** A 32-bit C++ throw
+raises three parameters where a 64-bit one raises four, its `EXCEPTION_RECORD` is 80 bytes rather
+than 152, and `TypeDescriptor::name` sits at `+8` rather than `+16`. Each of those makes a reader
+using the wrong table come back **empty** rather than fail, so nothing but a real 32-bit dump
+catches it: before this fixture the tool reported no thrown object at all on that whole target
+class.
 
 `docs/samples/cppthrow.cpp` is the whole program — a C++ object thrown and nothing catching it, so
 the CRT calls `terminate` -> `abort` -> `__fastfail`, which is that walkthrough's first fault
@@ -1440,11 +1448,27 @@ visible in anything a debugger prints, and all of which is in the file. Check be
 search the dump for `\Users\` as both ASCII and UTF-16LE, and expect the only paths in it to be
 `C:\Windows\System32\*` and `C:\wmfixture\cppthrow.exe`.
 
-**Delete `C:\wmfixture` afterwards, or know that you are the one host the test behaves differently
-on.** The dump carries no image, and on x64 the unwind data lives in the image's `.pdata` — so a
+The 32-bit one is the same source through `vcvars32.bat`, with its own WER key:
+
+```pwsh
+cmd /c '"C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars32.bat" && cd /d C:\wmfixture && cl /nologo /EHsc /Zi /MT /Od cppthrow32.cpp /Fe:cppthrow32.exe'
+```
+
+**Delete `C:\wmfixture` afterwards, or know that you are the one host the tests behave differently
+on.** The dumps carry no image, and on x64 the unwind data lives in the image's `.pdata` — so a
 host that still has `cppthrow.exe` unwinds the whole stack and reads the thrown type, and every
 other host gets frame 0, the HRESULT from the sentinel alone, and a `SKIPPED` line saying so. Both
 branches are asserted; the way to see the second is to rename the binary and re-run.
+
+**On the 32-bit fixture only the *type* route is gated that way.** Its unwind is frame-pointer
+based rather than `.pdata`-driven, so the stack walks whole with the image moved aside — measured.
+What still needs the binary is `ThrowInfo` and the descriptors it points at, so a host without it
+gets the HRESULT from the sentinel alone, exactly as on x64.
+
+**Symbols are a worse signal than they look on a bench that has already opened these dumps.**
+Moving `cppthrow32.exe` *and* its `.pdb` aside still resolved every frame here, because the engine
+had cached the PDB — so "rename it and re-run" measures the image, not the symbols. The tier tests
+gate on what they observe rather than on a claim about what CI has.
 
 ## The 32-bit managed target tier
 

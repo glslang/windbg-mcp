@@ -25,8 +25,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   succeeds while the binary is at its recorded path and returns `????????` once it is moved aside),
   while the thrown object is on the stack and always is. And the throw's own record is **searched
   for**: when a C++ exception goes unhandled the event the debugger sees is `abort`'s fail-fast, so
-  the crashing thread's stack is scanned for the `0xe06d7363` record, bounded by the frames the same
-  call already walked.
+  the crashing thread's stack is scanned for the `0xe06d7363` record, anchored on the innermost
+  frame — whose stack pointer comes from the recorded context rather than from unwinding — and
+  bounded by a fixed span.
+
+  That scan runs on **that fault shape alone**: `abort`'s fail-fast, carrying none of WIL's
+  parameters. Not on every fault whose own record holds no throw, which is every access violation
+  and every breakpoint — a C++ `EXCEPTION_RECORD` outlives the frames that held it, so a fault
+  deeper than an old `try`/`catch` would find that handled exception's object and report it as the
+  root cause. And the summary for subcode 7 no longer says an `abort` *means* an uncaught C++
+  exception: it is one of its causes, alongside a direct `abort()`, a failed `assert` and every
+  other `terminate()`, and the sentence names the throw only when the scan actually found one.
+
+  The whole C++ EH decode is laid out at the **target's** pointer width rather than this build's.
+  A 32-bit throw raises three parameters where a 64-bit one raises four, its `EXCEPTION_RECORD` is
+  80 bytes rather than 152, and `TypeDescriptor::name` is at `+8` rather than `+16` — each of which
+  makes a mismatched reader come back empty rather than fail, so a 32-bit fault previously reported
+  no thrown object at all. The width comes from `GetActualProcessorType` per target, and
+  `docs/samples/cppthrow-fastfail-x86.dmp` is the second checked-in fixture that holds it.
 
   The stack comes from the **stored crash context** ([dbgscope#144]), so it is the crash whatever
   thread the session has selected, and the selection is left where it was — which is why this is
@@ -52,8 +68,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session stopped pointing at `backtrace` and `execute`. Those are `inspect`, so a `--tools crash`
   caller — the surface most likely to hit that refusal — was guaranteed to get no pointer with it.
   It names `exception_triage` now, which that caller has.
-- The tool surface is **56 tools and 79,825 B** of model context, from 54 and 75,547 (measured
-  2026-09-05). `--tools crash` is 13 tools and 18,026 B.
+- The tool surface is **56 tools and 80,177 B** of model context, from 54 and 75,547 (measured
+  2026-09-05). `--tools crash` is 13 tools and 18,378 B.
 
 [dbgscope#144]: https://github.com/glslang/dbgscope/pull/144
 

@@ -3181,6 +3181,45 @@ fn crash_triage(
     Ok(Output::typed(triage::render(&report), report))
 }
 
+/// The debuggee's pointer width, which the C++ EH decode is laid out by.
+///
+/// **Asked of the engine, not taken from this build.** A 32-bit target normally arrives in the
+/// 32-bit worker, so `cfg!(target_pointer_width)` would usually agree — but only usually: when the
+/// 32-bit worker image is missing this server falls back to the 64-bit one
+/// (`.claude/rules/worker-architecture.md`), and a WoW64 process attached in either can present as
+/// x86. `GetActualProcessorType` answers for the target itself. Measured on both checked-in
+/// user-mode fixtures: `0x14c` for the 32-bit one, `0x8664` for the 64-bit.
+///
+/// Where the engine declines or names a machine this build has no entry for, the worker's own
+/// width is the fallback, because that is the width the routing chose this worker for.
+fn target_bitness(e: &DebugEngine) -> fault::Bitness {
+    let native = if cfg!(target_pointer_width = "32") {
+        fault::Bitness::Bits32
+    } else {
+        fault::Bitness::Bits64
+    };
+    match e.processor_type() {
+        Ok(machine) => match Arch::of_machine(machine as u16) {
+            Some(Arch::X86 | Arch::Arm) => fault::Bitness::Bits32,
+            Some(Arch::X64 | Arch::Arm64) => fault::Bitness::Bits64,
+            other => {
+                tracing::debug!(
+                    "worker: target reports machine {machine:#x} ({other:?}), decoding the fault \
+                     at this worker's own width"
+                );
+                native
+            }
+        },
+        Err(why) => {
+            tracing::debug!(
+                "worker: could not ask the target its machine ({why}), using this \
+                 worker's own width"
+            );
+            native
+        }
+    }
+}
+
 /// A user-mode fault as fields — the exception record, what kind it is, the thrown object, and the
 /// crashing stack ([`crate::fault`]).
 ///
@@ -3253,7 +3292,8 @@ fn exception_triage(e: &DebugEngine, frames: usize, scan_stack: bool) -> Result<
         .is_some_and(|stored| stored.context.is_some())
         && !attributed.is_empty();
 
-    let kind = fault::classify(record.code, &record.parameters);
+    let bitness = target_bitness(e);
+    let kind = fault::classify(record.code, &record.parameters, bitness);
     let read = |address: u64, len: usize| e.read_memory(address, len).ok();
 
     // The throw, by whichever route this fault leaves open.
@@ -3261,7 +3301,11 @@ fn exception_triage(e: &DebugEngine, frames: usize, scan_stack: bool) -> Result<
         fault::FaultKind::CppThrow(throw) => Some(throw.clone()),
         _ => None,
     };
-    if throw.is_none() && scan_stack {
+    // Gated on the *fault shape*, not merely on the record carrying no throw — see
+    // [`fault::may_bury_a_throw`], which is where the reasoning lives. `scan_stack` stays the
+    // caller's off-switch rather than becoming an on-one: there is no fault where a hunt through
+    // raw stack is more trustworthy than this.
+    if throw.is_none() && scan_stack && fault::may_bury_a_throw(&kind) {
         // **Anchored on the innermost frame and a fixed span, not on the outermost frame.**
         //
         // The obvious range is `min(stack_offset)..max(stack_offset)` — the region the walk itself
@@ -3283,9 +3327,9 @@ fn exception_triage(e: &DebugEngine, frames: usize, scan_stack: bool) -> Result<
             && innermost != 0
         {
             let end = innermost.saturating_add(STACK_SCAN_SPAN);
-            throw = fault::find_cpp_records(&read, innermost, end)
+            throw = fault::find_cpp_records(&read, innermost, end, bitness)
                 .first()
-                .and_then(|at| fault::record_at(&read, *at));
+                .and_then(|at| fault::record_at(&read, *at, bitness));
         }
     }
     let thrown = throw

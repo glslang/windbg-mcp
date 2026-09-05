@@ -288,7 +288,7 @@ None of these is a bug. They are recorded because they were invisible, and
    which 7,980 B is the `StepAction`/`Check` vocabulary its schema pulls out of `src/batch.rs`.
    Then `walk_memory` 4,080, `crash_triage` 2,936, `reachable_from_dispatch` 2,628, `server_log`
    2,599: **21,989 B, 33%**, against a median tool of 900 B. (Those per-tool figures are of
-   2026-08-22; the surface has since grown to 56 tools and 79,825 B, so the *share* is now 27.5%
+   2026-08-22; the surface has since grown to 56 tools and 80,177 B, so the *share* is now 27.4%
    while none of the tools named has changed. A share is the half that goes stale.)
 
    This is where the weight is, and it is a different kind of problem from findings 1–4. Those were
@@ -326,25 +326,25 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 10 | 16,457 | 20.6% |
-   | `session` | 10 | 12,817 | 16.1% |
-   | `inspect` | 9 | 11,626 | 14.6% |
-   | `batch` | 1 | 10,021 | 12.6% |
+   | `allocator` | 10 | 16,457 | 20.5% |
+   | `session` | 10 | 12,817 | 16.0% |
+   | `inspect` | 9 | 11,626 | 14.5% |
+   | `batch` | 1 | 10,021 | 12.5% |
    | `exec` | 8 | 9,206 | 11.5% |
-   | `ttd` | 9 | 6,829 | 8.6% |
+   | `ttd` | 9 | 6,829 | 8.5% |
    | `ioctl` | 6 | 6,494 | 8.1% |
-   | `crash` | 3 | 6,375 | 8.0% |
+   | `crash` | 3 | 6,727 | 8.4% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 56 | 79,825 |
-   | `session,inspect,exec,crash` | 30 | 39,103 |
-   | `session,inspect,crash` | 22 | 29,744 |
-   | `crash` | 13 | 18,026 |
+   | *(absent)* | 56 | 80,177 |
+   | `session,inspect,exec,crash` | 30 | 39,455 |
+   | `session,inspect,crash` | 22 | 30,096 |
+   | `crash` | 13 | 18,378 |
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`
-   is 18,026 rather than the 19,192 its two rows sum to, because the cross-references leave with
+   is 18,378 rather than the 19,544 its two rows sum to, because the cross-references leave with
    the tools they name — 1,166 B of them, pointing at `modules`, `debug_batch`, `backtrace`,
    `continue_async` and `break_in`.
 
@@ -373,8 +373,8 @@ Two more ride it, both needing no debugger. `every_tool_belongs_to_exactly_one_g
 put in a group would vanish from every narrowed surface without a word — the default surface would
 still carry it, so nothing else would notice. And
 `a_narrowed_tool_surface_serves_only_what_it_was_asked_for` starts a server with `--tools crash` and
-checks the three things that makes true: eleven tools, a refusal by name for a tool that exists and
-is not served, and a figure under half the whole surface (it prints 18,026 B).
+checks the three things that makes true: thirteen tools, a refusal by name for a tool that exists
+and is not served, and a figure under half the whole surface (it prints 18,378 B).
 
 Beside them, `output_schemas_carry_constraints_not_prose` is the
 assertion that finding 1 stays fixed. It reads `tools/list` off the wire, so it catches the way that

@@ -180,6 +180,12 @@ const USER_FAULT_DUMP: &str = concat!(
     "/docs/samples/cppthrow-fastfail.dmp"
 );
 
+/// The same fault built 32-bit — a different C++ EH ABI, not the same dump in a smaller file.
+const USER_FAULT_DUMP_X86: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/docs/samples/cppthrow-fastfail-x86.dmp"
+);
+
 /// A checked-in **driver** crash and the facts about it that
 /// [`a_driver_crash_names_the_driver_frame_an_all_kernel_walk_would_miss`] asserts, so one test
 /// body covers both architectures' stacks rather than naming one file.
@@ -4693,6 +4699,115 @@ fn a_user_mode_fault_is_triaged_from_its_exception_record() {
             );
         }
     }
+
+    server.call_tool("end_session", json!({ "session_id": session }), STEP);
+}
+
+/// **The same fault on a 32-bit target, which is a different ABI rather than a smaller dump.**
+///
+/// Measured by building one program twice and having it print its own record: a 32-bit C++ throw
+/// raises **three** parameters where a 64-bit one raises four, because the fourth is an image base
+/// its descriptors' RVAs are relative to and a 32-bit graph holds absolute pointers instead. Its
+/// `EXCEPTION_RECORD` is 80 bytes rather than 152, with the parameter count eight bytes earlier and
+/// the parameters at half the stride, and `TypeDescriptor::name` is at `+8` rather than `+16`.
+///
+/// Every one of those is a way the 64-bit reader **silently finds nothing** rather than failing.
+/// Before this fixture existed the tool returned no `thrown` at all here, on a target class the
+/// server routes at a dedicated 32-bit worker on purpose — so this is the test that says the decode
+/// is the target's and not this build's.
+///
+/// It asserts the recovered HRESULT unconditionally, because that is the claim: on this dump the
+/// record is found by scanning a 32-bit stack for a 32-bit record, and the number in it decodes.
+#[test]
+fn a_32_bit_user_mode_fault_is_triaged_at_its_own_pointer_width() {
+    if !launch_tier() {
+        return;
+    }
+    if !std::path::Path::new(USER_FAULT_DUMP_X86).exists() {
+        skip(&format!(
+            "32-bit user-mode fault dump not found at {USER_FAULT_DUMP_X86}"
+        ));
+        return;
+    }
+    let mut server = Server::started();
+    let session = server.open_session(
+        "open_dump",
+        json!({ "path": USER_FAULT_DUMP_X86 }),
+        TARGET_STEP,
+    );
+
+    let out = server.call_tool(
+        "exception_triage",
+        json!({ "session_id": session }),
+        TARGET_STEP,
+    );
+    let data = &out["result"]["structuredContent"];
+    assert_eq!(data["status"], "ok", "{out}");
+
+    // The same fault as the x64 fixture, read off a record laid out differently.
+    assert_eq!(data["exception"]["code"], "0xc0000409", "{data}");
+    assert_eq!(data["kind"], "fail_fast", "{data}");
+    assert_eq!(
+        data["exception"]["parameters"].as_array().map(Vec::len),
+        Some(1),
+        "a one-parameter fail-fast is the CRT's, on either width: {data}"
+    );
+
+    // **The claim.** The event is `abort`'s fail-fast; the throw's own record is a local of an
+    // earlier frame and is found by scanning the stack for a *32-bit* `EXCEPTION_RECORD`. Read
+    // with the 64-bit table this comes back empty -- not wrong, absent -- so an unconditional
+    // assertion here is exactly the right shape.
+    let thrown = &data["thrown"];
+    assert!(
+        !thrown.is_null(),
+        "no throw was recovered from a 32-bit stack, which is what the 64-bit-only reader did: \
+         {data}"
+    );
+    assert_eq!(thrown["hresult"]["value"], "0x80670015", "{data}");
+    assert!(
+        thrown["hresult"]["system_message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("StateRepository"),
+        "the recovered HRESULT did not resolve to a message: {thrown}"
+    );
+
+    // And the summary may now name the uncaught exception, because a record was actually found --
+    // which is the difference between reporting a cause and assuming one.
+    assert!(
+        data["summary"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("nobody caught"),
+        "a throw was recovered, so the summary is entitled to say so: {data}"
+    );
+
+    // The type route is gated the same way as on x64: the descriptors are in the image, which this
+    // dump does not carry. A host that has the binary reads `.?AUhresult_error@@` at `+8` -- the
+    // 32-bit offset, which is the one that would silently return `ult_error@@` if it were wrong.
+    match thrown["type_name"].as_str() {
+        None => {
+            assert_eq!(thrown["hresult_confidence"], "convention", "{thrown}");
+            skip("this host has not got the 32-bit fixture's image, so the type route is untested");
+        }
+        Some(name) => {
+            assert!(
+                name.contains("hresult_error"),
+                "the descriptor name was read at the wrong offset: {thrown}"
+            );
+            assert_eq!(
+                thrown["mangled_name"], ".?AUhresult_error@@",
+                "a name read eight bytes late is still a name, and still wrong: {thrown}"
+            );
+            assert_eq!(thrown["hresult_confidence"], "corroborated", "{thrown}");
+        }
+    }
+
+    // The stack is the crash's, and frame 0 is in the faulting image whatever symbols this host
+    // has, because `module`+`rva` is computed from the load base rather than resolved.
+    assert_eq!(data["frames_from_stored_context"], true, "{data}");
+    let frames = data["frames"].as_array().expect("no frames");
+    assert_eq!(frames[0]["module"], "cppthrow32", "{data}");
 
     server.call_tool("end_session", json!({ "session_id": session }), STEP);
 }
