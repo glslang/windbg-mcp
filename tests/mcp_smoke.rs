@@ -4890,6 +4890,60 @@ fn a_stale_throw_record_is_not_reported_as_this_faults_cause() {
     server.call_tool("end_session", json!({ "session_id": session }), STEP);
 }
 
+/// **A sign extension has its sign bit set, and a refusal carries structured content.**
+///
+/// `0xffffffff8000ffff` is how a WIL fail-fast's HRESULT arrives, so it is accepted and truncated.
+/// `0xffffffff00000005` has the same all-ones upper half and is **not** `5` widened — sign
+/// extension copies bit 31, which is clear there — so truncating it would answer a question nobody
+/// asked. And because this tool declares an `outputSchema`, its refusals are typed: a schema-aware
+/// client handed a text-only failure for a tool that promised structured content may reject it, and
+/// a refusal is the result a caller most needs to be able to read.
+///
+/// No debugger and no session: this is a pure decode, which is the point of the tool.
+#[test]
+fn a_sign_extended_error_code_is_accepted_and_a_wider_one_is_refused() {
+    let mut server = Server::started();
+
+    let out = server.call_tool(
+        "decode_error_reporting",
+        json!({ "code": "0xffffffff8000ffff" }),
+        STEP,
+    );
+    let data = &out["result"]["structuredContent"];
+    assert_eq!(data["status"], "ok", "{out}");
+    assert_eq!(data["value"], "0x8000ffff", "{data}");
+    assert_eq!(data["symbolic"], "E_UNEXPECTED", "{data}");
+
+    // The same upper half with bit 31 clear is a different number, not a widening of 5.
+    let out = server.call_tool(
+        "decode_error_reporting",
+        json!({ "code": "0xffffffff00000005" }),
+        STEP,
+    );
+    assert_eq!(
+        out["result"]["isError"], true,
+        "a value that is not a sign extension was decoded anyway: {out}"
+    );
+    let refusal = &out["result"]["structuredContent"];
+    assert_eq!(
+        refusal["status"], "error",
+        "a tool with an outputSchema refused without structured content: {out}"
+    );
+    assert_eq!(refusal["error"]["category"], "invalid_argument", "{out}");
+
+    // A malformed code takes the same route, since it is the other validation path.
+    let out = server.call_tool(
+        "decode_error_reporting",
+        json!({ "code": "not a number" }),
+        STEP,
+    );
+    assert_eq!(out["result"]["isError"], true, "{out}");
+    assert_eq!(
+        out["result"]["structuredContent"]["error"]["category"], "invalid_argument",
+        "{out}"
+    );
+}
+
 /// A live user-mode target that runs long enough to be driven and exits on its own.
 const LIVE_TARGET: &str = "cmd.exe /c ping -n 30 127.0.0.1";
 

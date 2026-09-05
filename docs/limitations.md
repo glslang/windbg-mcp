@@ -134,6 +134,17 @@
   walk this host could not do, not a stack with an unusual frame in it. Put the binaries where the
   debugger can find them (`.exepath`, or beside the dump) before reading a stack from a dump that
   came from another machine.
+- **The `0xAABBCCDD` sentinel is not read when the thrown type was read and is not an
+  `hresult_error`.** Those four bytes have no header behind them, so they occur inside objects that
+  have nothing to do with `winrt`; what makes a hit believable is the *type* saying to expect one.
+  A type that was read and disagrees is contrary evidence rather than absent evidence, so no
+  `hresult` is reported and `type_note` says why — reporting the dword after a coincidental match
+  would invent a failure code out of some unrelated member's value. The sentinel still answers when
+  the type could not be read at all, which is the ordinary minidump case.
+- **A `0xc0000409` with no parameters reports no subcode**, rather than the zero an absent field
+  would default to — zero is `FAST_FAIL_LEGACY_GS_VIOLATION`, so defaulting named a specific
+  security check that the record never mentioned. Every real `__fastfail` supplies a subcode; one
+  that does not is truncated or synthetic, and the summary says so.
 - **A scanned throw record is never this fault's cause, only a candidate for it.** A C++
   `EXCEPTION_RECORD` outlives the frames that held it: a `try`/`catch` unwinds past one without
   erasing it, so a later direct `abort()` running deeper than the old throw site finds a valid

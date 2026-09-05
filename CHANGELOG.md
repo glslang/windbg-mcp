@@ -44,6 +44,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for anything the scan produced and `reported` only when the debugger stopped on the throw itself,
   and the summary never names an uncaught exception on the strength of a scan.
 
+  Two smaller refusals to invent a field. A `0xc0000409` carrying **no parameters** reports no
+  subcode rather than defaulting to zero, which is `FAST_FAIL_LEGACY_GS_VIOLATION` and would name a
+  security check the record never mentioned. And the `0xAABBCCDD` sentinel is **not** read when the
+  thrown type was read and is not an `hresult_error`: those four bytes occur inside unrelated
+  objects, and what makes a hit believable is the type expecting one, so a type that disagrees is
+  contrary evidence rather than absent evidence.
+
+  `decode_error_reporting` also stopped accepting `0xffffffff00000005` as a sign extension — an
+  all-ones upper half is only one when the low half's sign bit is set — and its two validation
+  refusals are typed, since it declares an `outputSchema`.
+
   Each **candidate** is checked against what it points at, which is the part that is about the
   record rather than about the stack: a thrown object is copied onto the stack, so one whose
   `object` lies outside the scanned range belongs to no throw on this thread. That rejects the
