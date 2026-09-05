@@ -826,3 +826,35 @@ the process is running in its own code.
 **Where it picks up.** `worker::target_bitness` and `worker::decide_bitness` in `src/worker.rs`,
 the module docs in `src/target.rs` — which already name this call as the authoritative one, and say
 why the *routing* cannot use it — and dbgscope's `src/dbgeng.rs` beside `processor_type`.
+
+## 59. [dbgscope + windbg-mcp] Nothing can ask which thread the engine has selected
+
+`exception_triage` reads the fault from the stored event where there is one and from `last_event`
+otherwise. `DebugEvent` carries `thread` — the **engine** thread index the event belongs to — so on
+a live target the tool could check whether the thread it is about to walk is the one that raised the
+exception, and it cannot: `IDebugSystemObjects::GetCurrentThreadId` is used inside dbgscope's
+`current_processor` and is not public, and the only public thread call,
+`current_thread_system_id`, answers in a different namespace from `DebugEvent::thread`. There is no
+public listing pairing the two either.
+
+So a live session where the caller has selected another thread since the fault — `~Ns`, or an
+`execute` of one — gets this fault's record beside that thread's frames, and the buried-throw scan
+searches that thread's stack. Found by Codex on
+[#286](https://github.com/glslang/windbg-mcp/pull/286).
+
+- **Why deferred:** the fix is a typed getter in dbgscope and a `rev` pin moved, which is the
+  two-repo flow, for a case that needs the caller to have changed threads between the fault and the
+  call.
+- **What would close it:** `DebugEngine::current_thread_id` (the engine index, beside
+  `current_thread_system_id`), and `worker::exception_triage` comparing it to `DebugEvent::thread`
+  — reporting the mismatch as a field rather than silently combining the two, in the shape
+  `stored_crash_context` already established. Walking the *right* thread would mean selecting it,
+  which this tool does not do: leaving the selection alone is what makes it read-only where
+  `crash_triage` needed a scope guard.
+- **What it costs meanwhile:** the result says which stack it walked rather than claiming it is the
+  crash's — the tool description, the `STACK` line and the scanned-record caution all say the
+  stack is the selected thread's when no stored context was found. That is honest and it is not the
+  same as knowing, which is what this item buys.
+
+**Where it picks up.** `worker::exception_triage` in `src/worker.rs`, `fault::render`'s `STACK`
+line, and dbgscope's `src/dbgeng.rs` beside `current_thread_system_id`.
