@@ -46,7 +46,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   Two smaller refusals to invent a field. A `0xc0000409` carrying **no parameters** reports no
   subcode rather than defaulting to zero, which is `FAST_FAIL_LEGACY_GS_VIOLATION` and would name a
-  security check the record never mentioned. And the `0xAABBCCDD` sentinel is **not** read when the
+  security check the record never mentioned — and its summary draws no conclusion either, where it
+  had gone on saying "not a stack buffer overrun". That dismissal is what a *known* non-`/GS`
+  subcode earns; asserting it from an absent field is the same invention in the other direction,
+  and the `/GS` subcodes it would have to exclude are the ones that really are stack corruption.
+  And the `0xAABBCCDD` sentinel is **not** read when the
   thrown type was read and is not an `hresult_error`: those four bytes occur inside unrelated
   objects, and what makes a hit believable is the type expecting one, so a type that disagrees is
   contrary evidence rather than absent evidence. That is asked of the **whole** catchable-type
