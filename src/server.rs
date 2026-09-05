@@ -3591,21 +3591,23 @@ impl WindbgServer {
     /// Read a user-mode fault as fields: the exception record with its code decoded, what kind of
     /// fault it is, the thrown C++ object where there was one, and the crashing stack.
     /// The counterpart to a bug check for a process rather than a machine.
-    /// Answers the question a stack alone cannot: `0xc0000409` is a deliberate process exit
-    /// rather than the stack buffer overrun its name and the system's message text claim, and
-    /// what says why is the subcode — 7 is the CRT's abort, which an uncaught C++ exception
+    /// Answers the question a stack alone cannot: `0xc0000409` is usually a deliberate process
+    /// exit rather than the stack buffer overrun its name and the system's message text claim,
+    /// and what says which is the subcode — 7 is the CRT's abort, which an uncaught C++ exception
     /// reaches through `terminate` but so does a direct `abort()`, a failed assert and the
-    /// invalid-parameter handler.
+    /// invalid-parameter handler, while 0 and 2 are `/GS` cookie failures and really are stack
+    /// corruption.
     /// For that subcode it recovers the thrown object and the HRESULT it carries: the record the
-    /// debugger sees is the fail-fast, so the throw's own record is found by searching the
-    /// crashing thread's stack, and the thrown type is decoded from the compiler's own descriptors
-    /// where the module's image is reachable. A found record carries `provenance`: `reported` when
-    /// the debugger stopped on the throw, and `scanned` when it was found on the stack — where it
-    /// is a candidate rather than a cause, because such a record outlives the frames that held it
-    /// and may be from an exception this program handled earlier.
-    /// The stack is walked from the register context the dump was written with, so it is the
-    /// crash whatever thread the session has selected — and the selection is left where it was,
-    /// which is what keeps this a read of the target.
+    /// debugger sees is the fail-fast, so the throw's own record is found by searching the stack
+    /// this call walked, and the thrown type is decoded from the compiler's own descriptors where
+    /// the module's image is reachable. A found record carries `provenance`: `reported` when the
+    /// debugger stopped on the throw, and `scanned` when it was found on the stack — where it is a
+    /// candidate rather than a cause, because such a record outlives the frames that held it and
+    /// may be from an exception this program handled earlier.
+    /// Where the target recorded a crash context — a dump written for a fault — the stack is
+    /// walked from it, so it is the crash whatever thread is selected, and `stored_crash_context`
+    /// says so. A live target records none: there the stack and the scan are the selected
+    /// thread's. The selection is left where it was either way, which keeps this a read.
     /// A thrown HRESULT is located by a sentinel no header states, and the result says so rather
     /// than presenting it beside the facts read from the record.
     #[rmcp::tool(
@@ -3652,7 +3654,7 @@ impl WindbgServer {
     /// tables give it. What a debugger's `!error` answers, as fields.
     /// Reports every reading rather than choosing one, because a bare value does not say which
     /// space it came from: `0xc0000005` is an NTSTATUS while `0x80070005` is an HRESULT wrapping
-    /// a Win32 error, and severity is one bit in the first space and two in the second.
+    /// a Win32 error, and severity is two bits as an NTSTATUS against one as an HRESULT.
     /// The message text comes from this host's message tables, so it describes the value rather
     /// than the machine a dump came from; the structural fields are arithmetic and cannot differ.
     /// Pure — needs no debug session, so it takes no `session_id`.

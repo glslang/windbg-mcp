@@ -713,20 +713,41 @@ pub fn thrown_error(read: &Read<'_>, throw: &CppThrow) -> ThrownError {
     };
 
     match describe_type(read, throw) {
-        Some((mangled, size)) => {
+        Ok((mangled, size)) => {
             out.type_name = demangle(&mangled);
             out.mangled_name = Some(mangled);
             out.size = size;
         }
-        None => {
-            out.type_note = Some(
-                "the thrown type could not be read: `ThrowInfo` and the descriptors it points at \
-                 live in the throwing module's image, which a minidump does not capture — the \
-                 debugger reads them from the binary on disk, so this is what a dump from another \
-                 machine, or one whose binaries have moved, looks like. The HRESULT below, where \
-                 there is one, came from the thrown object on the stack instead."
-                    .to_string(),
-            );
+        // **One sentence per reason, and none of them says what kind of target this is.** This
+        // module decodes values and never sees a session, so a note claiming "this is what a dump
+        // from another machine looks like" was telling a caller holding a live process something
+        // about a file it had not opened — the same mistake as the provenance sentence that named
+        // a dump to `decode_error_reporting`. Where an image really is the likely cause it is
+        // offered as a condition the reader can check, not as a diagnosis.
+        Err(why) => {
+            out.type_note = Some(match why {
+                TypeUnread::NoTypeInformation => {
+                    "this throw carries no type information: `ThrowInfo`'s catchable-type array \
+                     RVA is zero, which is the compiler saying there is none rather than a read \
+                     that failed. The HRESULT below, where there is one, came from the thrown \
+                     object instead."
+                        .to_string()
+                }
+                TypeUnread::ImplausibleCount(count) => format!(
+                    "the thrown type was not decoded: the catchable-type count read as {count}, \
+                     which no real hierarchy reaches, so the graph was not followed. That is a \
+                     corrupt or misaddressed read rather than a missing image — the numbers here \
+                     are not the ones this structure holds."
+                ),
+                TypeUnread::Unreadable(what) => format!(
+                    "the thrown type could not be read: {what} would not read. The walk needs the \
+                     throwing module's image, which holds `ThrowInfo` and the descriptors it \
+                     points at — a minidump does not capture that, so the debugger reads it from \
+                     the binary on disk, and a target whose binaries are not where it looks reads \
+                     exactly like this. The HRESULT below, where there is one, came from the \
+                     thrown object instead."
+                ),
+            });
         }
     }
 
@@ -781,8 +802,26 @@ pub fn thrown_error(read: &Read<'_>, throw: &CppThrow) -> ThrownError {
     out
 }
 
-/// The mangled type name and object size, from the EH graph. `None` if any link is unreadable.
-fn describe_type(read: &Read<'_>, throw: &CppThrow) -> Option<(String, Option<u32>)> {
+/// Why the EH graph produced no type.
+///
+/// **Carried rather than collapsed into `None`.** These are three quite different facts about the
+/// target and the note written for the caller used to name one of them — the missing image —
+/// whichever had actually happened, because the walk threw the distinction away and the sentence
+/// guessed it back. A throw that carries no type information is the compiler saying so; a count
+/// past the sanity bound is a corrupt read; only the third is the missing-image case, and it is
+/// the only one whose explanation should mention an image at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TypeUnread {
+    /// `ThrowInfo::pCatchableTypeArray` is zero — there is no type information to read.
+    NoTypeInformation,
+    /// A catchable-type count of zero, or past [`eh::MAX_CATCHABLE_TYPES`].
+    ImplausibleCount(u32),
+    /// A link would not read, named so the note can say which.
+    Unreadable(&'static str),
+}
+
+/// The mangled type name and object size, from the EH graph.
+fn describe_type(read: &Read<'_>, throw: &CppThrow) -> Result<(String, Option<u32>), TypeUnread> {
     let (rvas, _) = catchable_types(read, throw)?;
     // **The first entry, and only the first.** The array is the thrown type followed by everything
     // it can be caught as — its bases, and `void*` — most-derived first. The rest are how a
@@ -797,11 +836,13 @@ fn describe_type(read: &Read<'_>, throw: &CppThrow) -> Option<(String, Option<u3
 /// **`None` means the walk did not finish, which is not the same as no.** A base whose descriptor
 /// is unreadable is a base whose name was never compared, and the caller's whole reason to ask is
 /// to decide whether the graph contradicts the sentinel. Only a complete pass over the array can
-/// say it does.
+/// say it does — so every [`TypeUnread`] is `None` here, including the ones that are a positive
+/// finding for the *type* note: "this throw carries no type information" says nothing at all about
+/// what the object is.
 fn caught_as_an_hresult_error(read: &Read<'_>, throw: &CppThrow) -> Option<bool> {
-    let (rvas, count) = catchable_types(read, throw)?;
+    let (rvas, count) = catchable_types(read, throw).ok()?;
     for index in 0..count {
-        let (name, _) = catchable_type_at(read, throw, rvas, index)?;
+        let (name, _) = catchable_type_at(read, throw, rvas, index).ok()?;
         if name.contains("hresult_error") {
             return Some(true);
         }
@@ -810,22 +851,33 @@ fn caught_as_an_hresult_error(read: &Read<'_>, throw: &CppThrow) -> Option<bool>
 }
 
 /// The `CatchableTypeArray` a throw points at: where its RVAs start, and how many there are.
-fn catchable_types(read: &Read<'_>, throw: &CppThrow) -> Option<(u64, u32)> {
-    let info = read(throw.throw_info, eh::THROW_INFO_SIZE)?;
+fn catchable_types(read: &Read<'_>, throw: &CppThrow) -> Result<(u64, u32), TypeUnread> {
+    let info =
+        read(throw.throw_info, eh::THROW_INFO_SIZE).ok_or(TypeUnread::Unreadable("`ThrowInfo`"))?;
     let array_rva = u32::from_le_bytes(
-        info.get(eh::THROW_INFO_CATCHABLE_ARRAY..eh::THROW_INFO_CATCHABLE_ARRAY + 4)?
-            .try_into()
-            .ok()?,
+        info.get(eh::THROW_INFO_CATCHABLE_ARRAY..eh::THROW_INFO_CATCHABLE_ARRAY + 4)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .ok_or(TypeUnread::Unreadable("`ThrowInfo`"))?,
     );
+    // Zero is the compiler saying there is no type information, not a read that failed.
     if array_rva == 0 {
-        return None;
+        return Err(TypeUnread::NoTypeInformation);
     }
-    let array = throw.image_base.checked_add(array_rva as u64)?;
-    let count = u32_at(read, array.checked_add(eh::ARRAY_COUNT as u64)?)?;
+    let array = throw
+        .image_base
+        .checked_add(array_rva as u64)
+        .ok_or(TypeUnread::Unreadable("the catchable-type array's address"))?;
+    let count = array
+        .checked_add(eh::ARRAY_COUNT as u64)
+        .and_then(|at| u32_at(read, at))
+        .ok_or(TypeUnread::Unreadable("the catchable-type count"))?;
     if count == 0 || count > eh::MAX_CATCHABLE_TYPES {
-        return None;
+        return Err(TypeUnread::ImplausibleCount(count));
     }
-    Some((array.checked_add(eh::ARRAY_FIRST_RVA as u64)?, count))
+    array
+        .checked_add(eh::ARRAY_FIRST_RVA as u64)
+        .map(|rvas| (rvas, count))
+        .ok_or(TypeUnread::Unreadable("the catchable-type array"))
 }
 
 /// One entry of the `CatchableTypeArray`: its mangled type name, and the object size it records.
@@ -834,28 +886,36 @@ fn catchable_type_at(
     throw: &CppThrow,
     rvas: u64,
     index: u32,
-) -> Option<(String, Option<u32>)> {
-    let rva = u32_at(read, rvas.checked_add(index as u64 * 4)?)?;
-    let catchable = throw.image_base.checked_add(rva as u64)?;
-    let entry = read(catchable, eh::CATCHABLE_TYPE_SIZE)?;
+) -> Result<(String, Option<u32>), TypeUnread> {
+    let entry_at = |what: &'static str| TypeUnread::Unreadable(what);
+    let rva = rvas
+        .checked_add(index as u64 * 4)
+        .and_then(|at| u32_at(read, at))
+        .ok_or(entry_at("a catchable type's RVA"))?;
+    let catchable = throw
+        .image_base
+        .checked_add(rva as u64)
+        .ok_or(entry_at("a catchable type's address"))?;
+    let entry = read(catchable, eh::CATCHABLE_TYPE_SIZE).ok_or(entry_at("a `CatchableType`"))?;
     let descriptor_rva = u32::from_le_bytes(
         entry
-            .get(eh::CATCHABLE_TYPE_DESCRIPTOR..eh::CATCHABLE_TYPE_DESCRIPTOR + 4)?
-            .try_into()
-            .ok()?,
+            .get(eh::CATCHABLE_TYPE_DESCRIPTOR..eh::CATCHABLE_TYPE_DESCRIPTOR + 4)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .ok_or(entry_at("a `CatchableType`"))?,
     );
     let size = u32::from_le_bytes(
         entry
-            .get(eh::CATCHABLE_SIZE..eh::CATCHABLE_SIZE + 4)?
-            .try_into()
-            .ok()?,
+            .get(eh::CATCHABLE_SIZE..eh::CATCHABLE_SIZE + 4)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes).ok())
+            .ok_or(entry_at("a `CatchableType`"))?,
     );
-    let descriptor = throw.image_base.checked_add(descriptor_rva as u64)?;
-    let name = read_c_string(
-        read,
-        descriptor.checked_add(throw.bitness.type_descriptor_name() as u64)?,
-    )?;
-    Some((name, (size != 0).then_some(size)))
+    let name = throw
+        .image_base
+        .checked_add(descriptor_rva as u64)
+        .and_then(|at| at.checked_add(throw.bitness.type_descriptor_name() as u64))
+        .and_then(|at| read_c_string(read, at))
+        .ok_or(entry_at("the `TypeDescriptor`'s name"))?;
+    Ok((name, (size != 0).then_some(size)))
 }
 
 /// Reads up to `want` bytes, shrinking until the target will answer.
@@ -1552,11 +1612,25 @@ pub fn render(triage: &crate::structured::ExceptionTriage) -> String {
                     .map(|best| format!(" — {best}"))
                     .unwrap_or_default()
             ));
-            text.push_str(
-                "  found by the winrt::hresult_error sentinel, which no header states — the \
-                 value after it is checked to be a failed HRESULT, so it is believable because of \
-                 what it is rather than where it sat.\n",
-            );
+            // **Which route found it is a field, not an assumption.** This said "found by the
+            // sentinel" for every hit, including the ones where the EH graph named the thrown type
+            // an `hresult_error` first and the sentinel only confirmed the offset it predicted —
+            // understating the strongest fact this module produces, and describing a two-route
+            // agreement as a pattern no header states. `hresult_confidence` is in the same struct
+            // and already says which; the sentence now reads it, the way the notes above read
+            // their reason.
+            text.push_str(match thrown.hresult_confidence.as_deref() {
+                Some("corroborated") => {
+                    "  the thrown type named winrt::hresult_error and the sentinel then matched \
+                     inside the object: two routes agreeing, so the offset was expected rather \
+                     than assumed.\n"
+                }
+                _ => {
+                    "  found by the winrt::hresult_error sentinel, which no header states — the \
+                     value after it is checked to be a failed HRESULT, so it is believable \
+                     because of what it is rather than where it sat.\n"
+                }
+            });
         }
         if thrown.provenance.as_deref() == Some("scanned") {
             text.push_str(
@@ -1564,6 +1638,18 @@ pub fn render(triage: &crate::structured::ExceptionTriage) -> String {
                  Such a record outlives the frames that held it, so this may be from an exception \
                  the program caught earlier rather than the cause of this fault.\n",
             );
+            // **And say *which* stack was scanned when it is not promised to be the crash's.**
+            // The scan is anchored on frame 0 of the walk above, so without a stored context it
+            // searches whatever thread is selected — the faulting one on any session nobody has
+            // touched, and some other thread's on a session where `~Ns` has run since the fault.
+            // The caution above warns about the record's age and said nothing about its thread.
+            if !triage.frames_from_stored_context {
+                text.push_str(
+                    "  It was scanned on the stack above, which is the selected thread's rather \
+                     than one the target recorded for this fault — so on a session where the \
+                     thread has been changed since, it is a different thread's record.\n",
+                );
+            }
         }
         if let Some(note) = &thrown.type_note {
             text.push_str(&format!("  {note}\n"));
@@ -3127,7 +3213,10 @@ mod tests {
             image_base: base,
             bitness: Bitness::Bits64,
         };
-        assert_eq!(describe_type(&read_nothing, &throw), None);
+        assert_eq!(
+            describe_type(&read_nothing, &throw),
+            Err(TypeUnread::Unreadable("`ThrowInfo`"))
+        );
 
         // A count past the sanity bound is a corrupt read, not a deep hierarchy.
         let mut memory = FakeMemory::new();
@@ -3139,7 +3228,7 @@ mod tests {
         let read = |address, len| memory.read(address, len);
         assert_eq!(
             describe_type(&read, &throw),
-            None,
+            Err(TypeUnread::ImplausibleCount(eh::MAX_CATCHABLE_TYPES + 1)),
             "an implausible catchable-type count was walked anyway"
         );
 
@@ -3148,7 +3237,232 @@ mod tests {
         eh_graph(&mut memory, base, ".?AVx@@", 8, Bitness::Bits64);
         memory.put(base + 0x1000, vec![0u8; eh::THROW_INFO_SIZE]);
         let read = |address, len| memory.read(address, len);
-        assert_eq!(describe_type(&read, &throw), None);
+        assert_eq!(
+            describe_type(&read, &throw),
+            Err(TypeUnread::NoTypeInformation)
+        );
+
+        // A graph whose descriptor is gone: the array walked, the name did not.
+        let mut memory = FakeMemory::new();
+        eh_graph(&mut memory, base, ".?AVx@@", 8, Bitness::Bits64);
+        memory.put(base + 0x4000, Vec::new());
+        let read = |address, len| memory.read(address, len);
+        assert_eq!(
+            describe_type(&read, &throw),
+            Err(TypeUnread::Unreadable("the `TypeDescriptor`'s name"))
+        );
+    }
+
+    /// **A scanned record found on the selected thread's stack says so.**
+    ///
+    /// The scan is anchored on frame 0 of the walk this call did, so without a stored crash
+    /// context it searches whatever thread is selected — the faulting one on a session nobody has
+    /// touched, and another thread's where `~Ns` has run since the fault. The existing caution
+    /// warns that such a record outlives its frames, which is about its *age*; nothing said
+    /// anything about its thread, and the tool description asserted outright that the scan
+    /// searched "the crashing thread's stack" (Codex, round twelve of
+    /// [#286](https://github.com/glslang/windbg-mcp/pull/286)).
+    ///
+    /// Knowing rather than qualifying needs `IDebugSystemObjects::GetCurrentThreadId`, which the
+    /// pinned dbgscope does not expose — `FOLLOWUPS.md` item 59.
+    #[test]
+    fn test_a_scan_on_an_unpromised_stack_says_whose_stack_it_was() {
+        let record = dbgscope::dbgeng::ExceptionRecord {
+            code: STATUS_STACK_BUFFER_OVERRUN,
+            flags: 0,
+            address: 0x7ff6_a1d9_1000,
+            parameters: vec![FAST_FAIL_FATAL_APP_EXIT],
+            nested: None,
+        };
+        let kind = classify(record.code, &record.parameters, Bitness::Bits64);
+        let thrown = ThrownError {
+            object: 0x0000_008d_e693_fd60,
+            type_name: None,
+            mangled_name: None,
+            size: None,
+            hresult: None,
+            type_note: None,
+        };
+        let built = |evidence, stored_crash_context| {
+            render(&report(
+                &record,
+                false,
+                &kind,
+                Some(&thrown),
+                evidence,
+                Vec::new(),
+                false,
+                stored_crash_context,
+                None,
+            ))
+        };
+
+        // Scanned, with no stored context: the stack walked was the selected thread's, and the
+        // caution has to say so rather than leave the record looking like this thread's fault.
+        let text = built(ThrowEvidence::Scanned, false);
+        assert!(text.contains("CAUTION"), "{text}");
+        assert!(
+            text.contains("selected thread's rather than one the target recorded"),
+            "a scan of an unpromised stack did not say whose stack it was: {text}"
+        );
+
+        // Reported by the debugger: not a scan at all, so neither sentence belongs.
+        let text = built(ThrowEvidence::Reported, false);
+        assert!(
+            !text.contains("CAUTION") && !text.contains("selected thread's rather than"),
+            "a record the debugger reported was cautioned as a scan: {text}"
+        );
+    }
+
+    /// **The line under a thrown HRESULT says which route found it, because a field says which.**
+    ///
+    /// It read "found by the winrt::hresult_error sentinel ... believable because of what it is
+    /// rather than where it sat" for *every* hit — including the ones where the EH graph named the
+    /// type first and the sentinel merely confirmed the offset that name predicted. That is the
+    /// strongest fact this module produces, described as the weakest, and `hresult_confidence` was
+    /// sitting in the same struct saying so. The derived-catchable-type fix earlier in this branch
+    /// made corroborated hits commoner, not rarer.
+    #[test]
+    fn test_the_thrown_hresult_line_says_which_route_actually_found_it() {
+        let base = 0x7ff6_a1d9_0000;
+        let object_at = 0x0000_008d_e693_fd60;
+        let throw = CppThrow {
+            object: object_at,
+            throw_info: base + 0x1000,
+            image_base: base,
+            bitness: Bitness::Bits64,
+        };
+        let record = dbgscope::dbgeng::ExceptionRecord {
+            code: STATUS_CPP_EH_EXCEPTION,
+            flags: 0,
+            address: base + 0x2000,
+            parameters: vec![CPP_EH_MAGIC, object_at, base + 0x1000, base],
+            nested: None,
+        };
+        let rendered = |memory: &FakeMemory| {
+            let read = |address, len| memory.read(address, len);
+            let thrown = thrown_error(&read, &throw);
+            let kind = classify(record.code, &record.parameters, Bitness::Bits64);
+            render(&report(
+                &record,
+                true,
+                &kind,
+                Some(&thrown),
+                ThrowEvidence::Reported,
+                Vec::new(),
+                false,
+                false,
+                None,
+            ))
+        };
+
+        // Corroborated: the graph named the type, and the sentinel then matched.
+        let mut both = FakeMemory::new();
+        eh_graph(
+            &mut both,
+            base,
+            ".?AVhresult_error@winrt@@",
+            0x10,
+            Bitness::Bits64,
+        );
+        both.put(object_at, hresult_object(0x8007_0005));
+        let text = rendered(&both);
+        assert!(
+            text.contains("two routes agreeing"),
+            "a corroborated hit was described as a bare sentinel match: {text}"
+        );
+        assert!(
+            !text.contains("believable because of what it is rather than where it sat"),
+            "the weakest wording was used for the strongest fact: {text}"
+        );
+
+        // Convention: no graph to read, so the sentinel is the only route and says so.
+        let mut alone = FakeMemory::new();
+        alone.put(object_at, hresult_object(0x8007_0005));
+        let text = rendered(&alone);
+        assert!(
+            text.contains("found by the winrt::hresult_error sentinel"),
+            "a lone sentinel hit stopped saying it was one: {text}"
+        );
+        assert!(!text.contains("two routes agreeing"), "{text}");
+    }
+
+    /// **This module cannot see a target, so nothing it writes may name one.**
+    ///
+    /// Rounds ten and eleven of [#286](https://github.com/glslang/windbg-mcp/pull/286) were three
+    /// findings on one seam: a sentence asserting something the value it was built from does not
+    /// establish. Two of them named a *dump* — `message_provenance` to a pure caller that had
+    /// opened no file, and the stack line to a target that did have a crash context. `fault.rs` is
+    /// a decode of bytes and never holds a session, so the class is closed by the rule rather than
+    /// one sentence at a time: **the reason is carried, the note is written from it, and no note
+    /// claims what kind of target this is.**
+    ///
+    /// The one mention of a minidump that survives is a *conditional* — "a target whose binaries
+    /// are not where it looks reads exactly like this" — which is a check the reader can make, not
+    /// a diagnosis of a target this code cannot see.
+    #[test]
+    fn test_no_type_note_says_what_kind_of_target_this_is() {
+        let base = 0x7ff6_a1d9_0000;
+        let throw = CppThrow {
+            object: 0x1000,
+            throw_info: base + 0x1000,
+            image_base: base,
+            bitness: Bitness::Bits64,
+        };
+        let note_for = |memory: &FakeMemory| {
+            let read = |address, len| memory.read(address, len);
+            thrown_error(&read, &throw).type_note
+        };
+
+        // Every reason produces a note, and each names its own reason rather than the commonest.
+        let mut nothing = FakeMemory::new();
+        nothing.put(0x1000, vec![0u8; 32]);
+        let unreadable = note_for(&nothing).expect("an unreadable graph is explained");
+        assert!(
+            unreadable.contains("`ThrowInfo` would not read"),
+            "the note did not say which link failed: {unreadable}"
+        );
+
+        let mut none = FakeMemory::new();
+        eh_graph(&mut none, base, ".?AVx@@", 8, Bitness::Bits64);
+        none.put(base + 0x1000, vec![0u8; eh::THROW_INFO_SIZE]);
+        let no_info = note_for(&none).expect("an absent graph is explained");
+        assert!(
+            no_info.contains("carries no type information"),
+            "a throw with no type information was told its image was missing: {no_info}"
+        );
+        assert!(
+            !no_info.contains("minidump"),
+            "a positive finding about the throw was explained as a missing image: {no_info}"
+        );
+
+        let mut corrupt = FakeMemory::new();
+        eh_graph(&mut corrupt, base, ".?AVx@@", 8, Bitness::Bits64);
+        let mut array = vec![0u8; 8];
+        array[..4].copy_from_slice(&(eh::MAX_CATCHABLE_TYPES + 1).to_le_bytes());
+        array[4..8].copy_from_slice(&0x3000u32.to_le_bytes());
+        corrupt.put(base + 0x2000, array);
+        let implausible = note_for(&corrupt).expect("a corrupt count is explained");
+        assert!(
+            implausible.contains("corrupt or misaddressed"),
+            "a corrupt read was explained as a missing image: {implausible}"
+        );
+        assert!(!implausible.contains("minidump"), "{implausible}");
+
+        // And none of the three tells the caller what it is holding.
+        for note in [unreadable, no_info, implausible] {
+            for claim in [
+                "this is what a dump",
+                "a dump from another machine",
+                "this dump",
+                "this target is",
+            ] {
+                assert!(
+                    !note.contains(claim),
+                    "a module that never sees a session said {claim:?}: {note}"
+                );
+            }
+        }
     }
 
     /// The sentinel scan stays inside the object when the object's size is known.
