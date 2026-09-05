@@ -625,6 +625,157 @@ mod tests {
         );
     }
 
+    /// The directories a checked-in dump is allowed to have been captured from.
+    ///
+    /// **Literal, and deliberately not derived from the files.** A rule built by reading the dumps
+    /// would accept whatever the next capture leaks, which is the failure mode this exists to
+    /// stop: the leak that prompted it looked exactly like a correct capture from every angle
+    /// except the bytes.
+    const FIXTURE_ROOTS: &[&str] = &[r"C:\Windows", r"C:\WINDOWS", r"C:\wmfixture"];
+
+    /// **A minidump is a capture of the machine that wrote it, and a debugger does not print most
+    /// of it.**
+    ///
+    /// `RTL_USER_PROCESS_PARAMETERS` alone carries the image path, the command line, the window
+    /// title, the DLL search path, the environment block *and* the current directory. Clearing
+    /// `ProcessStartInfo.EnvironmentVariables` — which the runbook in `docs/smoke-test.md` has
+    /// always said to do — scrubs one of those and nothing else, so a capture launched from the
+    /// repository checkout recorded `C:\workspace\windbg-mcp\` as its current directory with a
+    /// spotless environment beside it. Two of the three user-mode fixtures shipped that way, twice
+    /// each in UTF-16LE, and every test, every review and every `!peb` of the *environment block*
+    /// passed over it; Codex found it by reading the file
+    /// ([#286](https://github.com/glslang/windbg-mcp/pull/286)).
+    ///
+    /// So the check is on the **bytes**, not on the fields anyone thought to name. Both encodings,
+    /// and UTF-16LE at both byte alignments, because a string in a binary does not have to be
+    /// aligned to be readable by whoever looks.
+    ///
+    /// This is the durable half of that fix. The runbook's added `WorkingDirectory` line is a
+    /// procedure someone has to follow; this is what fails when they do not.
+    ///
+    /// **It covers the user-mode fixtures and not the kernel samples**, and that boundary is the
+    /// difference between a capture this project *makes* and one it *found*. A fixture here is
+    /// built from a checked-in `.cpp` and run under a WER key, at a path this file names, so
+    /// "it was captured from the fixture bench" is a rule that can be met. A kernel crash dump is
+    /// a machine bug-checking: it records whatever was on that machine, its paths are the
+    /// evidence, and there is no re-run that produces the same bug check with a tidier layout.
+    /// Scanning them would therefore only ever produce an allowlist of what is already in them,
+    /// which asserts nothing. What is in them is a separate question from this test's.
+    #[test]
+    fn no_user_mode_fixture_names_a_directory_off_the_fixture_bench() {
+        let samples = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/samples");
+        let mut leaks = Vec::new();
+        for (name, _) in USER_MODE_SAMPLES {
+            let path = samples.join(name);
+            let bytes = std::fs::read(&path)
+                .unwrap_or_else(|why| panic!("{name} is a checked-in fixture: {why}"));
+            for found in drive_paths(&bytes) {
+                if !FIXTURE_ROOTS
+                    .iter()
+                    .any(|root| found.starts_with(root) || root.starts_with(&found))
+                {
+                    leaks.push(format!("{name}: {found:?}"));
+                }
+            }
+        }
+        leaks.sort();
+        leaks.dedup();
+        assert!(
+            leaks.is_empty(),
+            "these fixtures carry a path from the machine that captured them, which is somebody's \
+             directory layout in version control — recapture them per the runbook in \
+             `docs/smoke-test.md` rather than widening `FIXTURE_ROOTS`: {leaks:#?}"
+        );
+    }
+
+    /// The scanner above, against a capture that leaks — because a scan that finds nothing is
+    /// indistinguishable from a scan that looks nowhere, and this one had to work in three
+    /// encodings on a file nobody wrote for it.
+    #[test]
+    fn the_fixture_scan_finds_a_path_in_every_encoding_a_dump_holds_one_in() {
+        let leaked = r"C:\workspace\windbg-mcp\";
+        for (label, bytes) in [
+            ("ascii", leaked.as_bytes().to_vec()),
+            (
+                "utf-16le, aligned",
+                leaked.encode_utf16().flat_map(u16::to_le_bytes).collect(),
+            ),
+            (
+                "utf-16le, odd offset",
+                std::iter::once(0)
+                    .chain(leaked.encode_utf16().flat_map(u16::to_le_bytes))
+                    .collect(),
+            ),
+        ] {
+            // Padded, because a real one is in the middle of a file rather than at its start.
+            let mut haystack = vec![0xffu8; 64];
+            haystack.extend_from_slice(&bytes);
+            haystack.extend_from_slice(&[0u8; 64]);
+            assert!(
+                drive_paths(&haystack).iter().any(|p| p.starts_with(leaked)),
+                "the scanner missed a leaked path encoded {label}"
+            );
+        }
+        // And the fixture bench's own paths are not findings, or the rule above is unusable.
+        let clean: Vec<u8> = r"C:\wmfixture\cppthrow.exe"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        assert!(
+            drive_paths(&clean)
+                .iter()
+                .all(|p| FIXTURE_ROOTS.iter().any(|root| p.starts_with(root))),
+            "the fixture bench's own path was read as something else"
+        );
+    }
+
+    /// Every `X:\...` in `bytes`, read as ASCII and as UTF-16LE at both byte alignments.
+    ///
+    /// Deliberately dumb: a run of printable characters, cut at the first byte that is not one.
+    /// It over-reports — a path is found inside a longer string, and the same path is found in
+    /// three encodings — and over-reporting is free here, because the caller's allowlist is what
+    /// decides and a duplicate costs a line of a failure message.
+    fn drive_paths(bytes: &[u8]) -> Vec<String> {
+        let mut out = Vec::new();
+        for (width, skew) in [(1usize, 0usize), (2, 0), (2, 1)] {
+            let mut run = String::new();
+            let mut units = bytes[skew..].chunks_exact(width);
+            loop {
+                let printable = match units.next() {
+                    Some(unit) => {
+                        let ascii = unit[0].is_ascii_graphic() || unit[0] == b' ';
+                        (ascii && (width == 1 || unit[1] == 0)).then_some(unit[0] as char)
+                    }
+                    None => None,
+                };
+                match printable {
+                    Some(c) => run.push(c),
+                    None => {
+                        out.extend(drive_paths_in(&run));
+                        run.clear();
+                        if units.len() == 0 {
+                            break;
+                        }
+                    }
+                }
+            }
+            out.extend(drive_paths_in(&run));
+        }
+        out
+    }
+
+    /// The `X:\...` substrings of one printable run, each taken to its end.
+    fn drive_paths_in(run: &str) -> Vec<String> {
+        let bytes = run.as_bytes();
+        let mut out = Vec::new();
+        for at in 0..bytes.len().saturating_sub(2) {
+            if bytes[at].is_ascii_alphabetic() && bytes[at + 1] == b':' && bytes[at + 2] == b'\\' {
+                out.push(run[at..].to_string());
+            }
+        }
+        out
+    }
+
     /// The parser against a **real 32-bit user minidump** — the file this whole routing exists
     /// for, and the one shape no checked-in sample has.
     ///
