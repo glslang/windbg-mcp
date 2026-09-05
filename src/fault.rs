@@ -109,8 +109,19 @@ pub struct StatusDecode {
     pub hresult_failed: bool,
     /// The severity of the value **read as an `NTSTATUS`**, which is a two-bit field.
     pub ntstatus_severity: Severity,
-    /// The facility field — bits 16..27, where the two layouts do agree.
-    pub facility: u32,
+    /// The facility as an **NTSTATUS** reads it: bits 16..=27, twelve of them.
+    pub ntstatus_facility: u32,
+    /// The facility as an **HRESULT** reads it: bits 16..=26, eleven — bit 27 is `X`, reserved,
+    /// and belongs to no facility here.
+    ///
+    /// **Two fields because the layouts disagree**, which one field asserting they agree could not
+    /// say. They differ only when bit 27 is set, and then by a whole order of magnitude:
+    /// `0x88070005` is NTSTATUS facility `0x807` and HRESULT facility `0x7` — `FACILITY_WIN32`,
+    /// with a reserved bit set that says this is not a well-formed HRESULT at all. This module's
+    /// whole contract is reporting both readings of an ambiguous dword rather than choosing, so
+    /// a shared field was the one place it quietly chose (Codex, round thirteen of
+    /// [#286](https://github.com/glslang/windbg-mcp/pull/286)).
+    pub hresult_facility: u32,
     /// The low 16 bits.
     pub code: u16,
     /// Whether the customer bit (bit 29) is set, which marks a value that is **not** Microsoft's
@@ -268,7 +279,8 @@ pub fn decode_status_as(value: u32, reading: Reading) -> StatusDecode {
         value,
         hresult_failed: value & 0x8000_0000 != 0,
         ntstatus_severity: Severity::of(value),
-        facility: (value >> 16) & 0x0fff,
+        ntstatus_facility: (value >> 16) & 0x0fff,
+        hresult_facility: (value >> 16) & 0x07ff,
         code: value as u16,
         customer_defined,
         // **No `HRESULT` name for a value the caller has told us is a status.** The table is
@@ -1247,7 +1259,8 @@ pub fn status_info(decode: &StatusDecode) -> crate::structured::StatusInfo {
         ntstatus_message: decode.ntstatus_message.clone(),
         hresult_failed: decode.hresult_failed,
         ntstatus_severity: decode.ntstatus_severity.as_str().to_string(),
-        facility: decode.facility,
+        ntstatus_facility: decode.ntstatus_facility,
+        hresult_facility: decode.hresult_facility,
         code: u32::from(decode.code),
         customer_defined: decode.customer_defined,
         message_provenance: has_message.then(|| MESSAGE_PROVENANCE.to_string()),
@@ -3251,6 +3264,55 @@ mod tests {
             describe_type(&read, &throw),
             Err(TypeUnread::Unreadable("the `TypeDescriptor`'s name"))
         );
+    }
+
+    /// **The two layouts disagree about the facility, and one field said they agree.**
+    ///
+    /// An HRESULT's facility is bits 16..=26 and an NTSTATUS's is 16..=27, so bit 27 — `X`, an
+    /// HRESULT's reserved bit — lands inside one and outside the other. A shared twelve-bit mask
+    /// is the NTSTATUS reading, published as though it were both: `0x88070005` came out as HRESULT
+    /// facility `0x807`, which is not a facility at all, when the HRESULT reading is `FACILITY_WIN32`
+    /// with a reserved bit set. This module exists to report both readings of an ambiguous dword
+    /// rather than choosing one, and that field was where it quietly chose.
+    #[test]
+    fn test_the_facility_is_decoded_for_each_layout_rather_than_shared() {
+        // The reviewer's value: bit 27 set, so the readings part company.
+        let split = decode_status(0x8807_0005);
+        assert_eq!(
+            split.ntstatus_facility, 0x807,
+            "an NTSTATUS facility is twelve bits and includes bit 27"
+        );
+        assert_eq!(
+            split.hresult_facility, 0x007,
+            "an HRESULT facility is eleven bits: bit 27 is reserved, not facility"
+        );
+
+        // Everything with bit 27 clear reads the same either way, which is why one field survived
+        // this long — every value the tool had been tested against was one of these.
+        for value in [0x8007_0005u32, 0xc000_0005, 0x8067_0015, 0x8000_ffff, 0] {
+            let both = decode_status(value);
+            assert_eq!(
+                both.ntstatus_facility, both.hresult_facility,
+                "bit 27 is clear in {value:#010x}, so the layouts agree about its facility"
+            );
+        }
+
+        // And the split is exactly bit 27: mask arithmetic, asserted rather than described.
+        for value in [0x0800_0000u32, 0xffff_ffff, 0x0fff_0000] {
+            let decoded = decode_status(value);
+            assert_eq!(decoded.ntstatus_facility, (value >> 16) & 0x0fff);
+            assert_eq!(decoded.hresult_facility, (value >> 16) & 0x07ff);
+            assert_eq!(
+                decoded.ntstatus_facility & 0x07ff,
+                decoded.hresult_facility,
+                "the two readings differ only in bit 27: {value:#010x}"
+            );
+        }
+
+        // The wire carries both, since a caller cannot recompute what it was not given.
+        let info = status_info(&decode_status(0x8807_0005));
+        assert_eq!(info.ntstatus_facility, 0x807);
+        assert_eq!(info.hresult_facility, 0x007);
     }
 
     /// **A scanned record found on the selected thread's stack says so.**
