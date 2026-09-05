@@ -56,6 +56,7 @@ use dbgscope::pool::{
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
 use crate::batch::{self, BatchOp, Debuggee, Ran};
+use crate::fault;
 use crate::proto::{
     EngineOp, Failed, HeapBackendFilter, HeapOp, HeapStateFilter, Interrupted, MAX_MODULE_ROWS,
     Output, PoolOp, ReachabilityOp, SymbolPathSetting, WorkerMessage, WorkerRequest,
@@ -1710,6 +1711,9 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             Duration::from_millis(u64::from(patience_ms)),
             queued,
         ),
+        EngineOp::ExceptionTriage { frames, scan_stack } => {
+            exception_triage(e, frames as usize, scan_stack)
+        }
         // The caller's own deadline, on the same arithmetic as a bounded command's: a walk that
         // outlives its caller holds this session against nobody. Taking dbgscope's default instead
         // was wrong in both directions — see [`EngineOp::Pool`].
@@ -3177,6 +3181,133 @@ fn crash_triage(
     Ok(Output::typed(triage::render(&report), report))
 }
 
+/// A user-mode fault as fields — the exception record, what kind it is, the thrown object, and the
+/// crashing stack ([`crate::fault`]).
+///
+/// **Two events are read, and which one answers is not the obvious one.** `stored_event` is the
+/// event the dump was *written for* and does not move; `last_event` is whatever stopped the engine
+/// most recently, which on a session somebody has been stepping in is not the fault. So the stored
+/// one is preferred wherever there is one, and the last event is the answer for a live target,
+/// which stores none.
+///
+/// **And the record the debugger sees is often not the interesting one.** When a C++ exception
+/// goes unhandled, the process dies in `abort` and the event is that fail-fast — the throw's own
+/// record is a local of a frame between the throw site and `RaiseException`. There is no engine
+/// call that returns it, so the crashing thread's stack is scanned for it, bounded by the frames
+/// this same call walked rather than by a guess at where the stack is.
+fn exception_triage(e: &DebugEngine, frames: usize, scan_stack: bool) -> Result<Output, Failed> {
+    // Asked before the reads, because on a kernel target every one of them would answer something
+    // unhelpful rather than fail, and "no exception" is the wrong thing to tell a caller looking
+    // at a bug check.
+    if matches!(e.is_kernel_target(), Ok(true)) {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::Debugger,
+            structured::KERNEL_MODE_NO_EXCEPTION.to_string(),
+        ));
+    }
+
+    let stored = e.stored_event().unwrap_or_else(|why| {
+        // Best effort: a target with no stored event is the ordinary case for anything live, and
+        // the last event still answers. Failing here would refuse a live session its own fault.
+        tracing::debug!("worker: exception triage could not read the stored event: {why}");
+        None
+    });
+    let last = e.last_event().map_err(es)?;
+
+    // The stored event first: it is the fault this target was captured on, and it stays that way
+    // however far the caller has navigated. `last_event` is the live target's answer.
+    let (event, _) = match (&stored, &last) {
+        (Some(stored), _) if stored.exception.is_some() => (stored, true),
+        (_, Some(last)) if last.exception.is_some() => (last, false),
+        _ => {
+            return Err(Failed::categorised(
+                structured::ErrorCategory::Debugger,
+                "this target is not stopped on an exception: the engine reports no exception \
+                 event. A live process broken into rather than faulted reads this way, and so \
+                 does a dump written by hand rather than for a fault — neither has an exception \
+                 to report, which is a fact about the target rather than a failure of this call."
+                    .to_string(),
+            ));
+        }
+    };
+    let record = event
+        .exception
+        .as_ref()
+        .expect("the arm above selected an event with an exception");
+
+    // The stack, from the stored context where there is one. That is `.ecxr` without `.ecxr`: the
+    // caller's selected thread is left where it was, which is what lets this stay a read.
+    let (attributed, truncated) =
+        match stored.as_ref().and_then(|stored| stored.context.as_ref()) {
+            Some(context) => walk_attributed_from(e, Some(context), frames, "exception triage"),
+            None => walk_attributed_from(e, None, frames, "exception triage"),
+        }
+        .unwrap_or_else(|why| {
+            // Best effort, as `crash_triage`'s walk is: the record and the thrown object are the
+            // answer, and a triage that could not walk the stack still carries both.
+            tracing::debug!("worker: exception triage could not walk the stack: {why}");
+            (Vec::new(), false)
+        });
+    let walked_stored_context = stored
+        .as_ref()
+        .is_some_and(|stored| stored.context.is_some())
+        && !attributed.is_empty();
+
+    let kind = fault::classify(record.code, &record.parameters);
+    let read = |address: u64, len: usize| e.read_memory(address, len).ok();
+
+    // The throw, by whichever route this fault leaves open.
+    let mut throw = match &kind {
+        fault::FaultKind::CppThrow(throw) => Some(throw.clone()),
+        _ => None,
+    };
+    if throw.is_none() && scan_stack {
+        // **Bounded by the frames already walked, not by a guess.** Every frame carries the stack
+        // pointer it was walked with, so the range between the innermost and the outermost is
+        // exactly the region a throw's record can be in — and it is a region this call has already
+        // established is readable, rather than a span picked from a register.
+        if let (Some(low), Some(high)) = (
+            attributed.iter().map(|f| f.frame.stack_offset).min(),
+            attributed.iter().map(|f| f.frame.stack_offset).max(),
+        ) && high > low
+        {
+            // One frame's worth past the outermost, so a record sitting in the last frame walked
+            // is inside the range rather than exactly at its edge.
+            let end = high.saturating_add(STACK_SCAN_TAIL);
+            throw = fault::find_cpp_records(&read, low, end)
+                .first()
+                .and_then(|at| fault::record_at(&read, *at));
+        }
+    }
+    let thrown = throw
+        .as_ref()
+        .map(|throw| fault::thrown_error(&read, throw));
+
+    let process_name = e
+        .current_process_name()
+        .ok()
+        .filter(|name| !name.trim().is_empty());
+
+    let report = fault::report(
+        record,
+        event.first_chance,
+        &kind,
+        thrown.as_ref(),
+        attributed.iter().map(triage::frame_info).collect(),
+        truncated,
+        walked_stored_context,
+        process_name,
+    );
+    Ok(Output::typed(fault::render(&report), report))
+}
+
+/// How far past the outermost frame's stack pointer the throw scan runs.
+///
+/// One frame's worth, so a record in the last frame walked is inside the range rather than exactly
+/// at its edge. Small deliberately: the scan is the only *search* here, and a wide one on a stack
+/// that is mostly unreadable is reads that buy nothing.
+const STACK_SCAN_TAIL: u64 = 0x1000;
+
 /// The current thread's stack, each frame attributed to the module holding it, and whether the
 /// stack went on past `frames`.
 ///
@@ -3200,7 +3331,26 @@ fn walk_attributed(
     frames: usize,
     what: &str,
 ) -> Result<(Vec<AttributedFrame>, bool), String> {
-    let mut walked = e.stack_frames(frames.saturating_add(1)).map_err(es)?;
+    walk_attributed_from(e, None, frames, what)
+}
+
+/// [`walk_attributed`], optionally from a recorded register context rather than the current one.
+///
+/// **The same walk either way, which is the point of it being one function.** A frame's `module` +
+/// `rva` is the coordinate this server's whole disassembler story rests on, and a second copy of
+/// the attribution loop would agree with the first until one of them was fixed. `None` is the
+/// current thread — what `k` walks — and `Some` is the crash whatever thread is selected.
+fn walk_attributed_from(
+    e: &DebugEngine,
+    context: Option<&dbgscope::dbgeng::ThreadContext>,
+    frames: usize,
+    what: &str,
+) -> Result<(Vec<AttributedFrame>, bool), String> {
+    let want = frames.saturating_add(1);
+    let mut walked = match context {
+        Some(context) => e.stack_frames_from(context, want).map_err(es)?,
+        None => e.stack_frames(want).map_err(es)?,
+    };
     let truncated = walked.len() > frames;
     walked.truncate(frames);
     let attributed = walked

@@ -1917,7 +1917,7 @@ mod tests {
         ][..];
         assert_eq!(
             surface(configured, "bench").as_deref(),
-            Some("11 of 54 tools (session, crash)"),
+            Some("13 of 56 tools (session, crash)"),
             "`bench` is served the surface its own variable names"
         );
         assert_eq!(
@@ -1935,7 +1935,7 @@ mod tests {
                 "local"
             )
             .as_deref(),
-            Some("19 of 54 tools (session, inspect)")
+            Some("19 of 56 tools (session, inspect)")
         );
     }
 
@@ -2022,7 +2022,7 @@ mod tests {
             creds
                 .surface_for("ci")
                 .map(crate::toolset::Toolset::summary),
-            Some("11 of 54 tools (session, crash)".to_string()),
+            Some("13 of 56 tools (session, crash)".to_string()),
             "the file's surface stands, not the variable's"
         );
     }
@@ -2042,7 +2042,7 @@ mod tests {
         assert_eq!(creds.surface_for("ci"), None);
         assert_eq!(
             creds.surfaces(),
-            vec![("bench", "10 of 54 tools (session)".to_string())],
+            vec![("bench", "10 of 56 tools (session)".to_string())],
             "only the client that named one is listed"
         );
     }

@@ -1801,7 +1801,16 @@ const MODEL_VISIBLE_CEILING: usize = 83_000;
 /// multiplier is unchanged — the next shared type is still inlined everywhere it can be reached —
 /// but what is multiplied is a handful of keywords rather than a paragraph, which is `FOLLOWUPS.md`
 /// item 24's first finding done rather than priced.
-const WIRE_CEILING: usize = 205_000;
+///
+/// **Raised 205,000 -> 215,000 when `exception_triage` and `decode_error_reporting` landed**, and
+/// the check that says it is a headroom change rather than a leak is the arithmetic: the payload
+/// went 199,058 -> 207,981, and the two new tools are 5,981 and 2,942 B of wire, which sums to
+/// exactly the difference. Nothing else moved -- so `StatusInfo`, which appears three times inside
+/// `ExceptionTriage` as well as being `decode_error_reporting`'s whole output, did **not** multiply
+/// the way `PdbInfo` did. That is the question this ceiling exists to force, and the number to
+/// re-derive rather than trust: it is a measurement of 2026-09-05, and any edit to a shared output
+/// type moves it.
+const WIRE_CEILING: usize = 215_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,021
 /// bytes, because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary from
@@ -2156,7 +2165,7 @@ fn a_narrowed_tool_surface_serves_only_what_it_was_asked_for() {
     assert!(!names.contains(&"ttd_calls"), "{names:?}");
     assert!(!names.contains(&"pool_find_tag"), "{names:?}");
     assert!(!names.contains(&"debug_batch"), "{names:?}");
-    assert_eq!(names.len(), 11, "{names:?}");
+    assert_eq!(names.len(), 13, "{names:?}");
 
     // The point of the exercise, measured the same way `tool_surface_stays_within_its_token_budget`
     // measures the whole surface: this is what the caller stops paying for at the start of every
@@ -2209,7 +2218,10 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
     // `attach_kernel_local` is deliberately absent: it is the one schema-bearing tool whose
     // failure path cannot be reached without trying the thing itself, and on a machine booted
     // with debugging enabled it would *succeed* and leave this test holding the local kernel.
-    const UNREACHED: &[&str] = &["attach_kernel_local"];
+    // `attach_kernel_local` needs a host booted with kernel debugging on; `exception_triage`
+    // needs a target stopped on a fault, which no session-less call can produce -- the dump tier
+    // is where it is exercised, against a real one.
+    const UNREACHED: &[&str] = &["attach_kernel_local", "exception_triage"];
     let cases: &[(&str, Value, &str)] = &[
         // Openers, each failing before anything is created: a path that does not exist, a pid
         // that cannot be attached, an image that cannot be launched, a selector with neither
@@ -2228,6 +2240,15 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
         // server having logged its own startup.
         ("session_status", json!({}), "ok"),
         ("server_log", json!({}), "ok"),
+        // Pure: it decodes a number and never looks for a session, so it answers `ok` here where
+        // everything else that is not this server's own bookkeeping cannot. The value is the one
+        // the explorer walkthrough turned on, so a host whose message tables stopped answering
+        // this fails the test rather than shipping a decoder that returns a bare number.
+        (
+            "decode_error_reporting",
+            json!({ "code": "0x80670015" }),
+            "ok",
+        ),
         // Everything else needs a session, and there is none.
         ("end_session", json!({}), "error"),
         ("registers", json!({}), "error"),
@@ -3081,13 +3102,13 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     assert!(names.contains(&"crash_triage".to_string()), "{names:?}");
     assert!(names.contains(&"open_dump".to_string()), "{names:?}");
     assert!(!names.contains(&"debug_batch".to_string()), "{names:?}");
-    assert_eq!(names.len(), 11, "{names:?}");
+    assert_eq!(names.len(), 13, "{names:?}");
 
     // And the startup line says which surface it ended up with, which is not always the spec that
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 11 of 54 tools (session, crash)"),
+        log.contains("serving 13 of 56 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -3119,7 +3140,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 19 of 54 tools (session, inspect) — except bench serves 11 of 54 tools \
+            "serving 19 of 56 tools (session, inspect) — except bench serves 13 of 56 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),
@@ -3144,7 +3165,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let by_local = listed(&mut server, &local_token, &local_mcp);
     let by_bench = listed(&mut server, &bench_token, &bench_mcp);
     assert_eq!(by_local.len(), 19, "{by_local:?}");
-    assert_eq!(by_bench.len(), 11, "{by_bench:?}");
+    assert_eq!(by_bench.len(), 13, "{by_bench:?}");
     assert!(by_local.contains(&"registers".to_string()), "{by_local:?}");
     assert!(
         !by_local.contains(&"crash_triage".to_string()),

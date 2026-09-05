@@ -3,7 +3,7 @@
     "(none)",
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 54,
+  "toolCount": 56,
   "tools": [
     {
       "hints": {
@@ -297,6 +297,42 @@
         "openWorld": false,
         "readOnly": true
       },
+      "name": "decode_error_reporting",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/StatusInfo",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "code: string"
+      ],
+      "required": [
+        "code"
+      ],
+      "title": "Decode an error-reporting value"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": false,
+        "readOnly": true
+      },
       "name": "decode_ioctl",
       "output": null,
       "params": [
@@ -430,6 +466,42 @@
       ],
       "required": [],
       "title": "End debug session"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": true,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "exception_triage",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/ExceptionTriage",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "frames: integer|null/uint32",
+        "scan_stack: boolean|null",
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Triage a user-mode fault"
     },
     {
       "hints": {
