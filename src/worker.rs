@@ -3327,6 +3327,27 @@ fn may_ask_the_os(origin: Option<TargetOrigin>, engine_says: Option<Arch>) -> bo
         && !matches!(engine_says, Some(Arch::X86 | Arch::Arm))
 }
 
+/// What may honestly be said about where a throw record came from.
+///
+/// **`NoneFound` only where a search actually ran.** [`fault::ThrowEvidence`] used to have one
+/// variant for "searched and found nothing" and "did not search", so a caller who passed
+/// `scan_stack: false` was told the result of the search they had declined. The mapping is a
+/// function rather than a `match` inside the triage because that is the only way a test reaches it:
+/// collapsing the two arms back together leaves every summary test passing — they build the
+/// evidence themselves — and shows up only as a dead-variant warning that CI does not deny.
+fn evidence_for(
+    found: bool,
+    is_direct_throw: bool,
+    no_search: Option<fault::NoSearch>,
+) -> fault::ThrowEvidence {
+    match (found, is_direct_throw, no_search) {
+        (true, true, _) => fault::ThrowEvidence::Reported,
+        (true, false, _) => fault::ThrowEvidence::Scanned,
+        (false, _, Some(why)) => fault::ThrowEvidence::NotSearched(why),
+        (false, _, None) => fault::ThrowEvidence::NoneFound,
+    }
+}
+
 /// Which of the two events carries this fault, asking for the fallback **only if the first does
 /// not answer**.
 ///
@@ -3455,7 +3476,16 @@ fn exception_triage(e: &DebugEngine, frames: usize, scan_stack: bool) -> Result<
     // [`fault::may_bury_a_throw`], which is where the reasoning lives. `scan_stack` stays the
     // caller's off-switch rather than becoming an on-one: there is no fault where a hunt through
     // raw stack is more trustworthy than this.
-    if throw.is_none() && scan_stack && fault::may_bury_a_throw(&kind, &record.parameters) {
+    let mut no_search = if throw.is_some() {
+        Some(fault::NoSearch::AlreadyHadOne)
+    } else if !scan_stack {
+        Some(fault::NoSearch::CallerDeclined)
+    } else if !fault::may_bury_a_throw(&kind, &record.parameters) {
+        Some(fault::NoSearch::WrongFaultShape)
+    } else {
+        None
+    };
+    if no_search.is_none() {
         // **Anchored on the innermost frame and a fixed span, not on the outermost frame.**
         //
         // The obvious range is `min(stack_offset)..max(stack_offset)` — the region the walk itself
@@ -3474,8 +3504,11 @@ fn exception_triage(e: &DebugEngine, frames: usize, scan_stack: bool) -> Result<
         // is above it by construction — it is a local of a frame *between* the throw site and
         // `RaiseException`, both outward of where the target is stopped — so this scans up from
         // there by a bounded span.
-        if let Some(innermost) = fault::scan_anchor(attributed.iter().map(|f| f.frame.stack_offset))
-        {
+        let anchor = fault::scan_anchor(attributed.iter().map(|f| f.frame.stack_offset));
+        if anchor.is_none() {
+            no_search = Some(fault::NoSearch::NoAnchor);
+        }
+        if let Some(innermost) = anchor {
             let end = innermost.saturating_add(STACK_SCAN_SPAN);
             // **Every candidate is checked against what it points at, not just the first.**
             // `find_cpp_records` promotes on self-consistency, and four bytes of `0xe06d7363` with
@@ -3495,11 +3528,11 @@ fn exception_triage(e: &DebugEngine, frames: usize, scan_stack: bool) -> Result<
 
     // Where the record came from, which is the only thing that can be said about it honestly --
     // see `fault::ThrowEvidence`. A scan earns no claim about cause however much it corroborates.
-    let evidence = match (&throw, &kind) {
-        (Some(_), fault::FaultKind::CppThrow(_)) => fault::ThrowEvidence::Reported,
-        (Some(_), _) => fault::ThrowEvidence::Scanned,
-        (None, _) => fault::ThrowEvidence::None,
-    };
+    let evidence = evidence_for(
+        throw.is_some(),
+        matches!(kind, fault::FaultKind::CppThrow(_)),
+        no_search,
+    );
 
     let process_name = e
         .current_process_name()
@@ -6070,6 +6103,44 @@ mod tests {
     use dbgscope::pool::WalkStalls;
 
     use super::*;
+
+    /// **"Searched and found nothing" is not "did not search", and only this reaches the mapping.**
+    ///
+    /// The summary tests build a [`fault::ThrowEvidence`] themselves, so they stay green when the
+    /// triage stops producing one of its variants — the collapse shows up as a dead-variant
+    /// warning, and CI runs clippy without denying warnings. This asserts the mapping the triage
+    /// actually performs.
+    #[test]
+    fn test_a_declined_search_is_not_recorded_as_a_search_that_found_nothing() {
+        use fault::{NoSearch, ThrowEvidence};
+
+        // Nothing found, and a reason nothing was looked for: each reason survives to the summary.
+        for why in [
+            NoSearch::CallerDeclined,
+            NoSearch::NoAnchor,
+            NoSearch::WrongFaultShape,
+            NoSearch::AlreadyHadOne,
+        ] {
+            assert_eq!(
+                evidence_for(false, false, Some(why)),
+                ThrowEvidence::NotSearched(why),
+                "a search that never ran was recorded as one that found nothing"
+            );
+        }
+
+        // Nothing found *because* the search came back empty: the one state that may say so.
+        assert_eq!(evidence_for(false, false, None), ThrowEvidence::NoneFound);
+
+        // A record the debugger stopped on outranks both; one dug out of the stack is `scanned`
+        // however it was reached.
+        assert_eq!(evidence_for(true, true, None), ThrowEvidence::Reported);
+        assert_eq!(evidence_for(true, false, None), ThrowEvidence::Scanned);
+        assert_eq!(
+            evidence_for(true, true, Some(NoSearch::AlreadyHadOne)),
+            ThrowEvidence::Reported,
+            "the record was in the fault, which is why no search ran — that is `reported`"
+        );
+    }
 
     /// **The fallback is not asked when the first source answered, and a test can only see that
     /// with a probe.**

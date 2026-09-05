@@ -37,6 +37,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exception: it is one of its causes, alongside a direct `abort()`, a failed `assert` and every
   other `terminate()`, and the sentence names the throw only when the scan actually found one.
 
+  **A scan that did not run reports no result.** The hunt is skipped for three reasons a caller
+  can meet — `scan_stack: false`, a fault shape that never buries a throw, a walk with no frame to
+  anchor on — and the summary told all of them that no throw record was found on this stack, which
+  is the outcome of a search none of them made. The evidence type said so itself ("No record was
+  found, or none was looked for") and the sentence beneath it picked one. "Nothing was looked for"
+  is its own state now, carrying which reason applied.
+
   A recovered record carries **`provenance`**, because finding one does not make it this fault's:
   a C++ `EXCEPTION_RECORD` outlives the frames that held it, so a direct `abort()` deeper than an
   earlier `try`/`catch` finds a valid record above its stack pointer — measured, on
