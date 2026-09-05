@@ -386,7 +386,62 @@ pub struct WilFailure {
     pub line: u64,
 }
 
-/// A C++ throw's four parameters, named.
+/// The target's pointer width, which is the axis the MSVC C++ EH ABI actually varies on.
+///
+/// **Named for the width rather than for x86.** `_WIN64` is what makes the EH descriptors hold
+/// RVAs instead of pointers and widens `EXCEPTION_RECORD`, so ARM64 lays them out exactly like x64
+/// and 32-bit ARM exactly like x86. A rule keyed on "is it x86" would be right twice and wrong
+/// twice.
+///
+/// Every difference below is **measured** rather than read off a header, by building one throw
+/// twice and having it print its own record and walk its own graph:
+///
+/// | | 32-bit | 64-bit |
+/// |---|---|---|
+/// | parameters a throw raises | 3 | 4 (the last is the image base) |
+/// | `ThrowInfo`'s links | absolute pointers | RVAs from that base |
+/// | `TypeDescriptor::name` | `+8` | `+16` |
+/// | `EXCEPTION_RECORD` size | 80 | 152 |
+///
+/// The pointer-versus-RVA row needs no branch: a 32-bit target reports **no** image base, so
+/// taking it as zero makes `base + field` the identity and the same arithmetic serves both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Bitness {
+    /// x86 and 32-bit ARM.
+    Bits32,
+    /// x64 and ARM64.
+    Bits64,
+}
+
+impl Bitness {
+    /// How many parameters a C++ throw raises. The fourth is the image base, which a 32-bit target
+    /// has no use for because its descriptors hold absolute pointers.
+    const fn cpp_throw_parameters(self) -> usize {
+        match self {
+            Self::Bits32 => 3,
+            Self::Bits64 => 4,
+        }
+    }
+
+    /// `TypeDescriptor::name`, which follows a vtable pointer and a spare pointer — so it moves
+    /// with the pointer width, and is the one EH offset that does.
+    const fn type_descriptor_name(self) -> usize {
+        match self {
+            Self::Bits32 => eh::TYPE_DESCRIPTOR_NAME_32,
+            Self::Bits64 => eh::TYPE_DESCRIPTOR_NAME_64,
+        }
+    }
+
+    /// The `EXCEPTION_RECORD` layout as the *target's* compiler lays it out on its own stack.
+    const fn record(self) -> record::Layout {
+        match self {
+            Self::Bits32 => record::BITS32,
+            Self::Bits64 => record::BITS64,
+        }
+    }
+}
+
+/// A C++ throw's parameters, named.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CppThrow {
     /// Where the thrown object is. On the stack of the throwing frame, so it is in any dump that
@@ -395,9 +450,18 @@ pub struct CppThrow {
     pub object: u64,
     /// The `ThrowInfo`, which describes the thrown *type*. In the throwing module's `.rdata`.
     pub throw_info: u64,
-    /// The image base every RVA inside `ThrowInfo` is relative to.
+    /// The image base every RVA inside `ThrowInfo` is relative to — and **zero on a 32-bit
+    /// target**, which raises no such parameter because those links are absolute pointers already.
     pub image_base: u64,
+    /// The width those links were laid out at.
+    pub bitness: Bitness,
 }
+
+/// `FAST_FAIL_FATAL_APP_EXIT`, the subcode the CRT's `abort` raises.
+///
+/// Named because two decisions turn on it and they must not drift apart: the sentence
+/// [`summary_of`] writes, and whether `exception_triage` goes looking for a buried throw at all.
+pub const FAST_FAIL_FATAL_APP_EXIT: u64 = 7;
 
 /// The `__fastfail` subcodes worth naming.
 ///
@@ -412,7 +476,7 @@ const FAIL_FAST_SUBCODES: &[(u64, &str)] = &[
     (4, "FAST_FAIL_INCORRECT_STACK"),
     (5, "FAST_FAIL_INVALID_ARG"),
     (6, "FAST_FAIL_GS_COOKIE_INIT"),
-    (7, "FAST_FAIL_FATAL_APP_EXIT"),
+    (FAST_FAIL_FATAL_APP_EXIT, "FAST_FAIL_FATAL_APP_EXIT"),
     (8, "FAST_FAIL_RANGE_CHECK_FAILURE"),
     (9, "FAST_FAIL_UNSAFE_REGISTRY_ACCESS"),
     (10, "FAST_FAIL_GUARD_ICALL_CHECK_FAILURE"),
@@ -441,17 +505,20 @@ pub fn fail_fast_subcode(subcode: u64) -> Option<&'static str> {
 /// rule, from having got two different fail-fasts in one evening whose `HRESULT` was retrieved two
 /// entirely different ways. A one-parameter `0xc0000409` hides its cause in a thrown object; a
 /// three-parameter one has it right there in parameter 1.
-pub fn classify(code: u32, parameters: &[u64]) -> FaultKind {
+pub fn classify(code: u32, parameters: &[u64], bitness: Bitness) -> FaultKind {
     match code {
         STATUS_STACK_BUFFER_OVERRUN => {
             let subcode = parameters.first().copied().unwrap_or_default();
             FaultKind::FailFast {
                 subcode,
                 subcode_name: fail_fast_subcode(subcode),
-                // Three parameters, not "at least two": WIL writes both, and a record with two
-                // would be some third thing whose second parameter this has no reason to read as
-                // an HRESULT.
-                wil: (parameters.len() >= 3).then(|| WilFailure {
+                // **Exactly three, not "at least three".** WIL writes the subcode, the HRESULT and
+                // the line and stops, so three *is* the discriminator; a record with two would be
+                // some third thing whose second parameter this has no reason to read as an
+                // HRESULT, and so would a record with four. Reading a fourth-parameter record as
+                // WIL's would put two arbitrary numbers on the wire under the names `hresult` and
+                // `line`, which is worse than saying nothing.
+                wil: (parameters.len() == 3).then(|| WilFailure {
                     // Truncating rather than casting through `i64`: the parameter is a
                     // sign-extended 32-bit HRESULT, so the low half *is* the value.
                     hresult: parameters[1] as u32,
@@ -460,12 +527,18 @@ pub fn classify(code: u32, parameters: &[u64]) -> FaultKind {
             }
         }
         // Every field below is at a fixed index, so the count is checked before any of them is
-        // read. A throw with fewer parameters is not a throw this understands.
-        STATUS_CPP_EH_EXCEPTION if parameters.len() >= 4 && parameters[0] == CPP_EH_MAGIC => {
+        // read. A throw with fewer parameters is not a throw this understands — and how many is
+        // "fewer" is the target's, not this build's: a 32-bit throw raises three, having no image
+        // base to report.
+        STATUS_CPP_EH_EXCEPTION
+            if parameters.len() >= bitness.cpp_throw_parameters()
+                && parameters[0] == CPP_EH_MAGIC =>
+        {
             FaultKind::CppThrow(CppThrow {
                 object: parameters[1],
                 throw_info: parameters[2],
-                image_base: parameters[3],
+                image_base: parameters.get(3).copied().unwrap_or_default(),
+                bitness,
             })
         }
         STATUS_ACCESS_VIOLATION if parameters.len() >= 2 => FaultKind::AccessViolation {
@@ -505,8 +578,14 @@ mod eh {
     pub const CATCHABLE_SIZE: usize = 20;
     /// `CatchableType` is 28 bytes: two `int`s, a three-`int` `PMD`, then two more `int`s.
     pub const CATCHABLE_TYPE_SIZE: usize = 28;
-    /// `TypeDescriptor::name`, past the vtable pointer and the spare, both pointer-sized.
-    pub const TYPE_DESCRIPTOR_NAME: usize = 16;
+    /// `TypeDescriptor::name`, the mangled name, after the vtable pointer and a spare — **the
+    /// only offset here that moves with the pointer width**, since those two are pointers and
+    /// every other field in the graph is a fixed-width `int` either way. Reading a 32-bit
+    /// descriptor at the 64-bit offset does not fail, it returns the name eight bytes in:
+    /// `.?AUhresult_error@@` reads as `ult_error@@`, which is why this is a table and not a guess.
+    pub const TYPE_DESCRIPTOR_NAME_64: usize = 16;
+    /// `TypeDescriptor::name` on a 32-bit target.
+    pub const TYPE_DESCRIPTOR_NAME_32: usize = 8;
     /// A sanity bound on the catchable-type list. A legitimate hierarchy is a handful deep; a
     /// count past this is a corrupt read, and walking it would be a read loop driven by dump data.
     pub const MAX_CATCHABLE_TYPES: u32 = 64;
@@ -632,7 +711,7 @@ fn describe_type(read: &Read<'_>, throw: &CppThrow) -> Option<(String, Option<u3
     let descriptor = throw.image_base.checked_add(descriptor_rva as u64)?;
     let name = read_c_string(
         read,
-        descriptor.checked_add(eh::TYPE_DESCRIPTOR_NAME as u64)?,
+        descriptor.checked_add(throw.bitness.type_descriptor_name() as u64)?,
     )?;
     Some((name, (size != 0).then_some(size)))
 }
@@ -783,7 +862,12 @@ const SCAN_CHUNK: usize = 4096;
 ///
 /// Every hit is a **candidate**: `0xe06d7363` is four bytes, and four bytes occur. What promotes
 /// one to a record is that the fields behind it are self-consistent, which [`record_at`] checks.
-pub fn find_cpp_records(read: &Read<'_>, stack_low: u64, stack_high: u64) -> Vec<u64> {
+pub fn find_cpp_records(
+    read: &Read<'_>,
+    stack_low: u64,
+    stack_high: u64,
+    bitness: Bitness,
+) -> Vec<u64> {
     let mut found = Vec::new();
     let needle = STATUS_CPP_EH_EXCEPTION.to_le_bytes();
     let mut at = stack_low;
@@ -810,7 +894,7 @@ pub fn find_cpp_records(read: &Read<'_>, stack_low: u64, stack_high: u64) -> Vec
         for offset in (0..chunk.len().saturating_sub(3)).step_by(4) {
             if chunk[offset..offset + 4] == needle {
                 let candidate = at + offset as u64;
-                if record_at(read, candidate).is_some() {
+                if record_at(read, candidate, bitness).is_some() {
                     found.push(candidate);
                     if found.len() >= MAX_RECORDS {
                         break;
@@ -823,17 +907,52 @@ pub fn find_cpp_records(read: &Read<'_>, stack_low: u64, stack_high: u64) -> Vec
     found
 }
 
-/// Offsets into a 64-bit `EXCEPTION_RECORD` as the compiler lays it out on the stack.
+/// Offsets into an `EXCEPTION_RECORD` as the compiler lays it out on the target's own stack.
 ///
 /// **Not `EXCEPTION_RECORD64`**, which is the engine's flattened form: this is the native
 /// structure, with a real pointer for the nested record and the address. Getting this wrong by one
 /// slot is the mistake the walkthrough records making, which is why the parameters are reached from
 /// the *count* rather than by assuming four.
+///
+/// **And "native" means the target's, not this build's.** Three pointer-sized members precede the
+/// count, so the whole tail moves: reading a 32-bit target's stack with the 64-bit table finds the
+/// count eight bytes late and every parameter at twice its stride, which does not fail — it
+/// silently matches nothing, so the scan comes back empty on a target it should have answered.
+/// Both rows are measured, by having a throw print `sizeof` and the two offsets under each build.
 mod record {
-    pub const NUMBER_PARAMETERS: usize = 24;
-    pub const FIRST_PARAMETER: usize = 32;
+    /// One target's layout.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Layout {
+        /// `NumberParameters`, after `ExceptionCode`, `ExceptionFlags`, `ExceptionRecord` and
+        /// `ExceptionAddress` — two `DWORD`s and two pointers.
+        pub number_parameters: usize,
+        /// `ExceptionInformation[0]`, which the `ULONG_PTR` array's alignment can pad up to.
+        pub first_parameter: usize,
+        /// Each parameter is a `ULONG_PTR`.
+        pub parameter_width: usize,
+        /// `sizeof(EXCEPTION_RECORD)`.
+        pub size: usize,
+    }
+
+    /// The array is `EXCEPTION_MAXIMUM_PARAMETERS` long whatever the width.
     pub const MAX_PARAMETERS: u32 = 15;
-    pub const SIZE: usize = FIRST_PARAMETER + MAX_PARAMETERS as usize * 8;
+
+    /// Measured: `sizeof` 152, count at 24, parameters at 32.
+    pub const BITS64: Layout = Layout {
+        number_parameters: 24,
+        first_parameter: 32,
+        parameter_width: 8,
+        size: 32 + MAX_PARAMETERS as usize * 8,
+    };
+
+    /// Measured: `sizeof` 80, count at 16, parameters at 20 — no padding before the array, because
+    /// a `ULONG_PTR` needs none at 4 bytes.
+    pub const BITS32: Layout = Layout {
+        number_parameters: 16,
+        first_parameter: 20,
+        parameter_width: 4,
+        size: 20 + MAX_PARAMETERS as usize * 4,
+    };
 }
 
 /// Reads a C++ throw's `EXCEPTION_RECORD` at `address`, if what is there is one.
@@ -841,24 +960,31 @@ mod record {
 /// The self-consistency check is what makes a stack scan usable: a record must declare a plausible
 /// parameter count and carry the EH magic in its first parameter. Four bytes of `0xe06d7363` that
 /// are something else fail both.
-pub fn record_at(read: &Read<'_>, address: u64) -> Option<CppThrow> {
-    let bytes = read(address, record::SIZE)?;
+pub fn record_at(read: &Read<'_>, address: u64, bitness: Bitness) -> Option<CppThrow> {
+    let layout = bitness.record();
+    let bytes = read(address, layout.size)?;
     let code = u32::from_le_bytes(bytes.get(..4)?.try_into().ok()?);
     if code != STATUS_CPP_EH_EXCEPTION {
         return None;
     }
     let count = u32::from_le_bytes(
         bytes
-            .get(record::NUMBER_PARAMETERS..record::NUMBER_PARAMETERS + 4)?
+            .get(layout.number_parameters..layout.number_parameters + 4)?
             .try_into()
             .ok()?,
     );
-    if !(4..=record::MAX_PARAMETERS).contains(&count) {
+    // The floor is the target's own: three on a 32-bit throw, which carries no image base.
+    let least = bitness.cpp_throw_parameters() as u32;
+    if !(least..=record::MAX_PARAMETERS).contains(&count) {
         return None;
     }
     let parameter = |index: usize| -> Option<u64> {
-        let at = record::FIRST_PARAMETER + index * 8;
-        Some(u64::from_le_bytes(bytes.get(at..at + 8)?.try_into().ok()?))
+        let at = layout.first_parameter + index * layout.parameter_width;
+        let slot = bytes.get(at..at + layout.parameter_width)?;
+        Some(match layout.parameter_width {
+            4 => u64::from(u32::from_le_bytes(slot.try_into().ok()?)),
+            _ => u64::from_le_bytes(slot.try_into().ok()?),
+        })
     };
     if parameter(0)? != CPP_EH_MAGIC {
         return None;
@@ -866,7 +992,10 @@ pub fn record_at(read: &Read<'_>, address: u64) -> Option<CppThrow> {
     Some(CppThrow {
         object: parameter(1)?,
         throw_info: parameter(2)?,
-        image_base: parameter(3)?,
+        // Absent by construction where the count says three, and the zero is then exactly right:
+        // the graph's links are absolute on such a target.
+        image_base: if count > 3 { parameter(3)? } else { 0 },
+        bitness,
     })
 }
 
@@ -902,7 +1031,14 @@ pub fn status_info(decode: &StatusDecode) -> crate::structured::StatusInfo {
 }
 
 /// The one sentence a fault gets, where the code alone would mislead.
-fn summary_of(kind: &FaultKind) -> Option<String> {
+///
+/// **`found_throw` is what separates a cause from a possibility.** An earlier draft said subcode 7
+/// "means a C++ exception nobody caught", and that is one of its causes rather than its meaning:
+/// `abort` is also reached by calling it, by `assert`, by the CRT's invalid-parameter handler, and
+/// by `terminate` for reasons that never involved a throw — a `noexcept` function that throws, a
+/// joinable `std::thread` destroyed. The record cannot tell those apart, so the summary stops at
+/// what the record says and names the throw only when one was actually read off the stack.
+fn summary_of(kind: &FaultKind, found_throw: bool) -> Option<String> {
     match kind {
         FaultKind::FailFast {
             subcode,
@@ -913,10 +1049,23 @@ fn summary_of(kind: &FaultKind) -> Option<String> {
                 || format!("subcode {subcode:#x}"),
                 |name| format!("{name} (subcode {subcode:#x})"),
             );
+            let abort = if *subcode == FAST_FAIL_FATAL_APP_EXIT {
+                if found_throw {
+                    " Subcode 7 is the CRT's abort(), and a C++ throw's own record was found \
+                     buried on this stack — so this one is an exception nobody caught, and THROWN \
+                     below is it."
+                } else {
+                    " Subcode 7 is the CRT's abort(): an uncaught C++ exception ends here, but so \
+                     does a direct abort(), a failed assert and every other terminate() — and no \
+                     throw record was found on this stack, so the record does not say which."
+                }
+            } else {
+                ""
+            };
             Some(format!(
                 "a __fastfail — a deliberate process exit, not a stack buffer overrun, whatever \
                  the code's name and the system's message text for it say. {named} is what says \
-                 why; subcode 7 is the CRT's abort(), which means a C++ exception nobody caught."
+                 why.{abort}"
             ))
         }
         FaultKind::CppThrow(_) => Some(
@@ -934,6 +1083,31 @@ fn summary_of(kind: &FaultKind) -> Option<String> {
         ),
         FaultKind::Other => None,
     }
+}
+
+/// Whether this fault is the shape that can have a C++ throw buried under it.
+///
+/// **The gate on the stack scan, and it is about the fault rather than about the absence of a
+/// throw in the record.** Scanning whenever the record carries no throw means scanning on every
+/// access violation and every breakpoint — and a C++ `EXCEPTION_RECORD` left behind by an
+/// exception the program *caught* stays perfectly legible on the stack long after its frames have
+/// gone. An unrelated fault deeper than an old throw site would find one and report it as the
+/// thrown object: a specific, plausible, wrong root cause, which is worse than the silence it
+/// replaces.
+///
+/// So the answer is yes for exactly the shape the scan was written for — `abort`'s fail-fast,
+/// carrying none of WIL's fields. A WIL fail-fast puts its `HRESULT` in parameter 1, so there is
+/// nothing buried to go looking for, and a fail-fast with any other subcode was not reached
+/// through `terminate` at all.
+pub fn may_bury_a_throw(kind: &FaultKind) -> bool {
+    matches!(
+        kind,
+        FaultKind::FailFast {
+            subcode: FAST_FAIL_FATAL_APP_EXIT,
+            wil: None,
+            ..
+        }
+    )
 }
 
 /// The kind, as the one stable word a caller branches on.
@@ -1004,7 +1178,7 @@ pub fn report(
     crate::structured::ExceptionTriage {
         exception: exception_info(record, first_chance),
         kind: kind_word(kind).to_string(),
-        summary: summary_of(kind),
+        summary: summary_of(kind, thrown.is_some()),
         thrown: thrown.map(thrown_info),
         failure: match kind {
             FaultKind::FailFast { wil: Some(wil), .. } => Some(crate::structured::WilFailureInfo {
@@ -1157,7 +1331,12 @@ mod tests {
     use super::*;
 
     /// Builds a `ThrowInfo`/`CatchableTypeArray`/`CatchableType`/`TypeDescriptor` graph.
-    fn eh_graph(memory: &mut FakeMemory, base: u64, mangled: &str, size: u32) {
+    ///
+    /// `bitness` moves one thing — where the descriptor's name starts — because that is the only
+    /// offset in the graph that is not a fixed-width `int` on both. On a 32-bit target `base` is
+    /// zero and the "RVAs" written here are then the absolute addresses, which is exactly how the
+    /// real thing works.
+    fn eh_graph(memory: &mut FakeMemory, base: u64, mangled: &str, size: u32, bitness: Bitness) {
         // ThrowInfo at base+0x1000, pointing at the array by RVA.
         let mut info = vec![0u8; eh::THROW_INFO_SIZE];
         info[eh::THROW_INFO_CATCHABLE_ARRAY..eh::THROW_INFO_CATCHABLE_ARRAY + 4]
@@ -1179,10 +1358,32 @@ mod tests {
         memory.put(base + 0x3000, catchable);
 
         // The descriptor: vtable, spare, then the name.
-        let mut descriptor = vec![0u8; eh::TYPE_DESCRIPTOR_NAME];
+        let mut descriptor = vec![0u8; bitness.type_descriptor_name()];
         descriptor.extend_from_slice(mangled.as_bytes());
         descriptor.push(0);
         memory.put(base + 0x4000, descriptor);
+    }
+
+    /// An `EXCEPTION_RECORD` for a C++ throw, laid out at the target's width.
+    ///
+    /// One builder for both, so a test cannot accidentally assert 64-bit offsets against a 32-bit
+    /// claim: the offsets come from the same table the code under test uses, and what each test
+    /// supplies is the parameter list a target of that width would really raise.
+    fn cpp_record(bitness: Bitness, parameters: &[u64]) -> Vec<u8> {
+        let layout = bitness.record();
+        let mut bytes = vec![0u8; layout.size];
+        bytes[..4].copy_from_slice(&STATUS_CPP_EH_EXCEPTION.to_le_bytes());
+        let count = parameters.len() as u32;
+        bytes[layout.number_parameters..layout.number_parameters + 4]
+            .copy_from_slice(&count.to_le_bytes());
+        for (index, value) in parameters.iter().enumerate() {
+            let at = layout.first_parameter + index * layout.parameter_width;
+            match layout.parameter_width {
+                4 => bytes[at..at + 4].copy_from_slice(&(*value as u32).to_le_bytes()),
+                _ => bytes[at..at + 8].copy_from_slice(&value.to_le_bytes()),
+            }
+        }
+        bytes
     }
 
     /// A `winrt::hresult_error`-shaped object: sentinel then code, behind a vtable slot.
@@ -1206,7 +1407,13 @@ mod tests {
         let base = 0x7ff6_a1d9_0000;
         let object_at = 0x0000_008d_e693_fd60;
         let mut memory = FakeMemory::new();
-        eh_graph(&mut memory, base, ".?AVhresult_error@winrt@@", 0x10);
+        eh_graph(
+            &mut memory,
+            base,
+            ".?AVhresult_error@winrt@@",
+            0x10,
+            Bitness::Bits64,
+        );
         memory.put(object_at, hresult_object(0x8067_0015));
         let read = |address, len| memory.read(address, len);
 
@@ -1214,6 +1421,7 @@ mod tests {
             object: object_at,
             throw_info: base + 0x1000,
             image_base: base,
+            bitness: Bitness::Bits64,
         };
         let thrown = thrown_error(&read, &throw);
         assert_eq!(thrown.type_name.as_deref(), Some("winrt::hresult_error"));
@@ -1256,6 +1464,7 @@ mod tests {
                 object: object_at,
                 throw_info: 0x7ff6_a1e2_aa00,
                 image_base: 0x7ff6_a1d9_0000,
+                bitness: Bitness::Bits64,
             },
         );
         assert_eq!(thrown.type_name, None);
@@ -1319,7 +1528,7 @@ mod tests {
         }
         // The record declares four parameters and the reader reads fifteen slots' worth, so the
         // tail past the four real ones is whatever the stack held. Zeroed here.
-        record_bytes.resize(record::SIZE, 0);
+        record_bytes.resize(Bitness::Bits64.record().size, 0);
         memory.put(throw_record, record_bytes);
 
         // `dd 0x8de693fd60 L4` — the thrown object: 00000000 00000000 aabbccdd 80670015
@@ -1364,14 +1573,15 @@ mod tests {
         }
         memory.put(base + 0x9_aa30, catchable);
         // `da base+0x9be28+0x10` — TypeDescriptor's name: ".?AUhresult_error@@"
-        let mut descriptor = vec![0u8; eh::TYPE_DESCRIPTOR_NAME];
+        let mut descriptor = vec![0u8; Bitness::Bits64.type_descriptor_name()];
         descriptor.extend_from_slice(b".?AUhresult_error@@\0");
         memory.put(base + 0x9_be28, descriptor);
 
         let read = |address, len| memory.read(address, len);
 
         // The record parses, and its parameters are the four the walkthrough names.
-        let throw = record_at(&read, throw_record).expect("the real record did not parse");
+        let throw =
+            record_at(&read, throw_record, Bitness::Bits64).expect("the real record did not parse");
         assert_eq!(throw.object, 0x0000_008d_e693_fd60);
         assert_eq!(throw.throw_info, base + 0x9_aa00);
         assert_eq!(
@@ -1408,7 +1618,7 @@ mod tests {
     /// `abort`, whose cause is in a thrown object, and three is WIL's, whose cause is right there.
     #[test]
     fn test_the_parameter_count_decides_which_fail_fast_this_is() {
-        let crt = classify(STATUS_STACK_BUFFER_OVERRUN, &[7]);
+        let crt = classify(STATUS_STACK_BUFFER_OVERRUN, &[7], Bitness::Bits64);
         assert_eq!(
             crt,
             FaultKind::FailFast {
@@ -1419,10 +1629,30 @@ mod tests {
             "a one-parameter fail-fast was read as carrying WIL's extras"
         );
 
+        // **Four parameters is not WIL's shape either**, and the direction matters: reading a
+        // record that merely has *at least* three as WIL's puts two arbitrary stack values on the
+        // wire named `hresult` and `line`, which a reader has no way to distrust. Three is the
+        // discriminator, so it is asserted from both sides.
+        let four = classify(
+            STATUS_STACK_BUFFER_OVERRUN,
+            &[7, 0xffff_ffff_8000_ffff, 0x28f, 0x1234],
+            Bitness::Bits64,
+        );
+        assert_eq!(
+            four,
+            FaultKind::FailFast {
+                subcode: 7,
+                subcode_name: Some("FAST_FAIL_FATAL_APP_EXIT"),
+                wil: None,
+            },
+            "a four-parameter fail-fast was read as WIL's, inventing an HRESULT and a line"
+        );
+
         // The walkthrough's second fault, verbatim.
         let wil = classify(
             STATUS_STACK_BUFFER_OVERRUN,
             &[7, 0xffff_ffff_8000_ffff, 0x28f],
+            Bitness::Bits64,
         );
         let FaultKind::FailFast { wil: Some(wil), .. } = wil else {
             panic!("a three-parameter fail-fast was not read as WIL's");
@@ -1439,22 +1669,272 @@ mod tests {
         );
     }
 
+    /// **The layout numbers, as literals, because every other test here would agree with a wrong
+    /// table.**
+    ///
+    /// `eh_graph` and `cpp_record` build their fixtures through the same `Bitness` methods that
+    /// [`record_at`] and [`describe_type`] read them back through, so changing a constant moves the
+    /// fixture with the parser and every one of those tests stays green. They check that the code
+    /// reads the layout it was told to; only this one checks *which* layout it was told.
+    ///
+    /// The numbers are measured, by building one program twice and having it print `sizeof`, the
+    /// two offsets, and the name it finds at each candidate — `docs/samples/cppthrow.cpp`'s shape
+    /// under `cl /EHa` for x86 and x64. Reading the 32-bit descriptor at the 64-bit offset does not
+    /// fail; it returns `ult_error@@` where `.?AUhresult_error@@` was, which is a silent wrong
+    /// answer and exactly why it is nailed down here.
+    #[test]
+    fn test_the_layout_table_is_the_measured_one() {
+        // sizeof(EXCEPTION_RECORD): 152 and 80.
+        assert_eq!(Bitness::Bits64.record().size, 152);
+        assert_eq!(Bitness::Bits32.record().size, 80);
+        // offsetof(NumberParameters): four `DWORD`/pointer members precede it.
+        assert_eq!(Bitness::Bits64.record().number_parameters, 24);
+        assert_eq!(Bitness::Bits32.record().number_parameters, 16);
+        // offsetof(ExceptionInformation).
+        assert_eq!(Bitness::Bits64.record().first_parameter, 32);
+        assert_eq!(Bitness::Bits32.record().first_parameter, 20);
+        assert_eq!(Bitness::Bits64.record().parameter_width, 8);
+        assert_eq!(Bitness::Bits32.record().parameter_width, 4);
+        // TypeDescriptor::name, past a vtable pointer and a spare.
+        assert_eq!(Bitness::Bits64.type_descriptor_name(), 16);
+        assert_eq!(Bitness::Bits32.type_descriptor_name(), 8);
+        // What a throw raises, which is the whole of the x86 difference in `classify`.
+        assert_eq!(Bitness::Bits64.cpp_throw_parameters(), 4);
+        assert_eq!(Bitness::Bits32.cpp_throw_parameters(), 3);
+    }
+
+    /// **A 32-bit record on a 32-bit stack, read end to end.**
+    ///
+    /// The pair to the 64-bit scan test above, and not a copy of it: the record is half the size,
+    /// its count sits eight bytes earlier, its parameters are four bytes apart and there are three
+    /// of them, and the graph it points at holds absolute addresses rather than RVAs. Every one of
+    /// those is a way the 64-bit reader silently finds nothing rather than failing, which is what
+    /// it did on the real 32-bit dump before this.
+    #[test]
+    fn test_a_32_bit_throw_is_found_and_walked_on_a_32_bit_stack() {
+        let stack = 0x00af_e000_u64;
+        let base = 0; // A 32-bit graph's links are absolute, so there is no base to add.
+        let object_at = stack + 0x800;
+        let mut memory = FakeMemory::new();
+        // The graph, hung off address 0 the way `image_base` of zero makes the arithmetic work.
+        eh_graph(
+            &mut memory,
+            base,
+            ".?AUhresult_error@@",
+            0x10,
+            Bitness::Bits32,
+        );
+
+        let mut page = vec![0u8; 0x1000];
+        let record_offset = 0x400;
+        let rec = cpp_record(Bitness::Bits32, &[CPP_EH_MAGIC, object_at, base + 0x1000]);
+        assert_eq!(rec.len(), 80, "the fixture is not a 32-bit record");
+        page[record_offset..record_offset + rec.len()].copy_from_slice(&rec);
+        page[0x800..0x810].copy_from_slice(&hresult_object(0x8067_0015));
+        memory.put(stack, page);
+        let read = |address, len| memory.read(address, len);
+
+        let hits = find_cpp_records(&read, stack, stack + 0x1000, Bitness::Bits32);
+        assert_eq!(
+            hits,
+            vec![stack + record_offset as u64],
+            "the 32-bit record was not found on a 32-bit stack"
+        );
+        let throw = record_at(&read, hits[0], Bitness::Bits32).expect("the record did not parse");
+        assert_eq!(throw.image_base, 0, "a 32-bit throw declares no image base");
+        let thrown = thrown_error(&read, &throw);
+        assert_eq!(thrown.type_name.as_deref(), Some("hresult_error"));
+        assert_eq!(
+            thrown.hresult,
+            Some((0x8067_0015, Confidence::Corroborated)),
+            "the 32-bit graph named the type, so the sentinel hit is corroborated"
+        );
+
+        // **And the 64-bit reader finds nothing here**, which is the half that says the two
+        // layouts are really different rather than the wide one being a superset.
+        assert!(
+            find_cpp_records(&read, stack, stack + 0x1000, Bitness::Bits64).is_empty(),
+            "the 64-bit reader accepted a 32-bit record, so this test proves nothing"
+        );
+    }
+
+    /// **The buried-throw scan runs on one fault shape, and the list of what it declines is the
+    /// test.**
+    ///
+    /// The scan reads raw stack looking for a C++ `EXCEPTION_RECORD`, and such a record outlives
+    /// the frames that held it — an exception the program caught leaves one behind that is still
+    /// perfectly legible. Running the scan on any fault that merely lacks a throw in its own record
+    /// means an access violation deeper than an old throw site reports that stale object as its
+    /// cause: specific, plausible and wrong.
+    #[test]
+    fn test_only_an_abort_fail_fast_goes_looking_for_a_buried_throw() {
+        let fail_fast =
+            |parameters: &[u64]| classify(STATUS_STACK_BUFFER_OVERRUN, parameters, Bitness::Bits64);
+
+        // The shape it exists for: `abort`, whose cause is not in its own record.
+        assert!(may_bury_a_throw(&fail_fast(&[FAST_FAIL_FATAL_APP_EXIT])));
+
+        // WIL's fail-fast carries the HRESULT in parameter 1, so there is nothing buried.
+        assert!(
+            !may_bury_a_throw(&fail_fast(&[
+                FAST_FAIL_FATAL_APP_EXIT,
+                0xffff_ffff_8000_ffff,
+                0x28f
+            ])),
+            "a WIL fail-fast has its cause in the record and must not be hunted for another"
+        );
+
+        // Another subcode is another mechanism entirely — a stack cookie, a corrupt list entry —
+        // and none of them arrives through `terminate`.
+        assert!(!may_bury_a_throw(&fail_fast(&[2])));
+
+        // And the faults that motivated the gate: these all lack a throw in the record, which is
+        // the property the first version keyed on.
+        assert!(!may_bury_a_throw(&classify(
+            STATUS_ACCESS_VIOLATION,
+            &[1, 0xdead_beef],
+            Bitness::Bits64
+        )));
+        assert!(!may_bury_a_throw(&classify(
+            STATUS_BREAKPOINT,
+            &[],
+            Bitness::Bits64
+        )));
+        assert!(!may_bury_a_throw(&classify(
+            0xc000_001d,
+            &[],
+            Bitness::Bits64
+        )));
+
+        // A real throw needs no scan; the record is the throw.
+        assert!(!may_bury_a_throw(&classify(
+            STATUS_CPP_EH_EXCEPTION,
+            &[CPP_EH_MAGIC, 1, 2, 3],
+            Bitness::Bits64
+        )));
+    }
+
+    /// **The summary reports what the record says and stops there.**
+    ///
+    /// An earlier version said subcode 7 "means a C++ exception nobody caught". That is one of its
+    /// causes, not its meaning: `abort` is also reached by calling it, by a failed `assert`, by the
+    /// CRT's invalid-parameter handler, and by `terminate` for reasons with no throw in them at all
+    /// — a `noexcept` function that throws, a joinable `std::thread` destroyed. Nothing in the
+    /// record distinguishes those, so the claim was free.
+    #[test]
+    fn test_the_abort_summary_claims_a_throw_only_when_one_was_found() {
+        let abort = classify(
+            STATUS_STACK_BUFFER_OVERRUN,
+            &[FAST_FAIL_FATAL_APP_EXIT],
+            Bitness::Bits64,
+        );
+
+        let alone = summary_of(&abort, false).expect("a fail-fast always gets a summary");
+        assert!(
+            alone.contains("FAST_FAIL_FATAL_APP_EXIT"),
+            "the subcode is what says why, and has to be named: {alone}"
+        );
+        assert!(
+            !alone.contains("nobody caught"),
+            "the summary asserted an uncaught exception with no throw record to show for it: \
+             {alone}"
+        );
+        assert!(
+            alone.contains("so does a direct abort()"),
+            "a summary that cannot tell the causes apart has to say so: {alone}"
+        );
+
+        let found = summary_of(&abort, true).expect("a fail-fast always gets a summary");
+        assert!(
+            found.contains("nobody caught"),
+            "with the throw's own record read off the stack, this one really is uncaught: {found}"
+        );
+
+        // And another subcode gets neither sentence, rather than the abort story with a different
+        // number in it.
+        let cookie = classify(STATUS_STACK_BUFFER_OVERRUN, &[2], Bitness::Bits64);
+        let text = summary_of(&cookie, false).expect("a fail-fast always gets a summary");
+        assert!(!text.contains("abort()"), "{text}");
+        assert!(
+            text.contains("FAST_FAIL_STACK_COOKIE_CHECK_FAILURE"),
+            "{text}"
+        );
+    }
+
     /// A throw is recognised by its magic, not by its code alone.
     #[test]
     fn test_a_throw_without_the_eh_magic_is_not_decoded() {
         assert!(matches!(
-            classify(STATUS_CPP_EH_EXCEPTION, &[CPP_EH_MAGIC, 1, 2, 3]),
+            classify(
+                STATUS_CPP_EH_EXCEPTION,
+                &[CPP_EH_MAGIC, 1, 2, 3],
+                Bitness::Bits64
+            ),
             FaultKind::CppThrow(_)
         ));
         assert_eq!(
-            classify(STATUS_CPP_EH_EXCEPTION, &[0xdead_beef, 1, 2, 3]),
+            classify(
+                STATUS_CPP_EH_EXCEPTION,
+                &[0xdead_beef, 1, 2, 3],
+                Bitness::Bits64
+            ),
             FaultKind::Other,
             "a record with the right code and the wrong magic was decoded as a throw"
         );
         assert_eq!(
-            classify(STATUS_CPP_EH_EXCEPTION, &[CPP_EH_MAGIC, 1, 2]),
+            classify(
+                STATUS_CPP_EH_EXCEPTION,
+                &[CPP_EH_MAGIC, 1, 2],
+                Bitness::Bits64
+            ),
             FaultKind::Other,
-            "a three-parameter throw was decoded from fields it does not have"
+            "a three-parameter throw was decoded from fields a 64-bit one does not have"
+        );
+    }
+
+    /// **A 32-bit throw raises three parameters, and three is all of them.**
+    ///
+    /// Measured rather than reasoned about: the same `throw` built both ways, each printing its own
+    /// record. The 64-bit one carries an image base its descriptors' RVAs are relative to; the
+    /// 32-bit one has no such parameter because its descriptors hold absolute pointers.
+    ///
+    /// So the count is a fact about the *target*, and a build-wide `>= 4` classified every 32-bit
+    /// C++ throw as `Other` — an entire supported target class, since a 32-bit user minidump is
+    /// routed at the 32-bit worker on purpose.
+    #[test]
+    fn test_a_32_bit_throw_carries_no_image_base() {
+        let throw = classify(
+            STATUS_CPP_EH_EXCEPTION,
+            &[CPP_EH_MAGIC, 0x00af_fe3c, 0x004d_82f0],
+            Bitness::Bits32,
+        );
+        assert_eq!(
+            throw,
+            FaultKind::CppThrow(CppThrow {
+                object: 0x00af_fe3c,
+                throw_info: 0x004d_82f0,
+                image_base: 0,
+                bitness: Bitness::Bits32,
+            }),
+            "a 32-bit throw was not decoded from the three parameters it really raises"
+        );
+
+        // And the zero is not a shrug: it is what makes `base + field` the identity, so the same
+        // arithmetic reads absolute links on 32-bit and RVAs on 64-bit.
+        let FaultKind::CppThrow(throw) = throw else {
+            unreachable!("asserted above")
+        };
+        assert_eq!(throw.image_base, 0);
+
+        // The 64-bit rule is unchanged and still refuses three, which is the half of this pair
+        // that stops the fix from becoming "accept anything".
+        assert_eq!(
+            classify(
+                STATUS_CPP_EH_EXCEPTION,
+                &[CPP_EH_MAGIC, 0x00af_fe3c, 0x004d_82f0],
+                Bitness::Bits64
+            ),
+            FaultKind::Other,
         );
     }
 
@@ -1465,30 +1945,29 @@ mod tests {
         let base = 0x7ff6_a1d9_0000;
         let object_at = stack + 0x800;
         let mut memory = FakeMemory::new();
-        eh_graph(&mut memory, base, ".?AVhresult_error@winrt@@", 0x10);
+        eh_graph(
+            &mut memory,
+            base,
+            ".?AVhresult_error@winrt@@",
+            0x10,
+            Bitness::Bits64,
+        );
 
         let mut page = vec![0u8; 0x1000];
         // A bare copy of the code with nothing behind it — the false positive a scan must drop.
         page[0x100..0x104].copy_from_slice(&STATUS_CPP_EH_EXCEPTION.to_le_bytes());
         // And a real record.
         let record_at_offset = 0x400;
-        let mut rec = vec![0u8; record::SIZE];
-        rec[..4].copy_from_slice(&STATUS_CPP_EH_EXCEPTION.to_le_bytes());
-        rec[record::NUMBER_PARAMETERS..record::NUMBER_PARAMETERS + 4]
-            .copy_from_slice(&4u32.to_le_bytes());
-        for (index, value) in [CPP_EH_MAGIC, object_at, base + 0x1000, base]
-            .into_iter()
-            .enumerate()
-        {
-            let at = record::FIRST_PARAMETER + index * 8;
-            rec[at..at + 8].copy_from_slice(&value.to_le_bytes());
-        }
+        let rec = cpp_record(
+            Bitness::Bits64,
+            &[CPP_EH_MAGIC, object_at, base + 0x1000, base],
+        );
         page[record_at_offset..record_at_offset + rec.len()].copy_from_slice(&rec);
         page[0x800..0x810].copy_from_slice(&hresult_object(0x8067_0015));
         memory.put(stack, page);
         let read = |address, len| memory.read(address, len);
 
-        let hits = find_cpp_records(&read, stack, stack + 0x1000);
+        let hits = find_cpp_records(&read, stack, stack + 0x1000, Bitness::Bits64);
         assert_eq!(
             hits,
             vec![stack + record_at_offset as u64],
@@ -1496,7 +1975,8 @@ mod tests {
         );
 
         // And the record it found leads all the way to the answer.
-        let throw = record_at(&read, hits[0]).expect("the reported record did not parse");
+        let throw =
+            record_at(&read, hits[0], Bitness::Bits64).expect("the reported record did not parse");
         let thrown = thrown_error(&read, &throw);
         assert_eq!(thrown.type_name.as_deref(), Some("winrt::hresult_error"));
         assert_eq!(
@@ -1521,23 +2001,22 @@ mod tests {
         let base = 0x7ff6_a1d9_0000;
         let object_at = stack + 0x100;
         let mut memory = FakeMemory::new();
-        eh_graph(&mut memory, base, ".?AVhresult_error@winrt@@", 0x10);
+        eh_graph(
+            &mut memory,
+            base,
+            ".?AVhresult_error@winrt@@",
+            0x10,
+            Bitness::Bits64,
+        );
 
         // Half a chunk of readable stack, and the record inside it. A 4 KB read of this refuses.
         let mut page = vec![0u8; SCAN_CHUNK / 2];
         page[0x100..0x110].copy_from_slice(&hresult_object(0x8067_0015));
         let record_offset = 0x200;
-        let mut rec = vec![0u8; record::SIZE];
-        rec[..4].copy_from_slice(&STATUS_CPP_EH_EXCEPTION.to_le_bytes());
-        rec[record::NUMBER_PARAMETERS..record::NUMBER_PARAMETERS + 4]
-            .copy_from_slice(&4u32.to_le_bytes());
-        for (index, value) in [CPP_EH_MAGIC, object_at, base + 0x1000, base]
-            .into_iter()
-            .enumerate()
-        {
-            let at = record::FIRST_PARAMETER + index * 8;
-            rec[at..at + 8].copy_from_slice(&value.to_le_bytes());
-        }
+        let rec = cpp_record(
+            Bitness::Bits64,
+            &[CPP_EH_MAGIC, object_at, base + 0x1000, base],
+        );
         page[record_offset..record_offset + rec.len()].copy_from_slice(&rec);
         memory.put(stack, page);
         let read = |address, len| memory.read(address, len);
@@ -1548,7 +2027,7 @@ mod tests {
             "the fixture is not exercising the case: a full-chunk read has to refuse here"
         );
         assert_eq!(
-            find_cpp_records(&read, stack, stack + SCAN_CHUNK as u64),
+            find_cpp_records(&read, stack, stack + SCAN_CHUNK as u64, Bitness::Bits64),
             vec![stack + record_offset as u64],
             "the scan skipped the chunk its read refused, and stepped over the record in it"
         );
@@ -1647,12 +2126,13 @@ mod tests {
             object: 0,
             throw_info: base + 0x1000,
             image_base: base,
+            bitness: Bitness::Bits64,
         };
         assert_eq!(describe_type(&read_nothing, &throw), None);
 
         // A count past the sanity bound is a corrupt read, not a deep hierarchy.
         let mut memory = FakeMemory::new();
-        eh_graph(&mut memory, base, ".?AVx@@", 8);
+        eh_graph(&mut memory, base, ".?AVx@@", 8, Bitness::Bits64);
         let mut array = vec![0u8; 8];
         array[..4].copy_from_slice(&(eh::MAX_CATCHABLE_TYPES + 1).to_le_bytes());
         array[4..8].copy_from_slice(&0x3000u32.to_le_bytes());
@@ -1666,7 +2146,7 @@ mod tests {
 
         // A zero array RVA is "no type information", not offset zero of the image.
         let mut memory = FakeMemory::new();
-        eh_graph(&mut memory, base, ".?AVx@@", 8);
+        eh_graph(&mut memory, base, ".?AVx@@", 8, Bitness::Bits64);
         memory.put(base + 0x1000, vec![0u8; eh::THROW_INFO_SIZE]);
         let read = |address, len| memory.read(address, len);
         assert_eq!(describe_type(&read, &throw), None);

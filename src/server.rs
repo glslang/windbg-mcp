@@ -2097,6 +2097,11 @@ pub struct ExceptionTriageArgs {
     /// It is what finds the answer on the ordinary unhandled-exception crash, where the record the
     /// debugger sees is the CRT's fail-fast and the throw's own record is a local of an earlier
     /// frame. Set false to skip the only search this tool does.
+    ///
+    /// The search runs on that fault shape alone — `abort`'s fail-fast, carrying none of WIL's
+    /// fields — and not on any fault whose own record holds no throw. A C++ record outlives the
+    /// frames that held it, so scanning after an access violation can turn up one an earlier
+    /// `try`/`catch` dealt with years of instructions ago and report it as the cause.
     #[serde(default)]
     pub scan_stack: Option<bool>,
     /// Which session to act on. Omit for the current one; pass an opener's handle to route to that

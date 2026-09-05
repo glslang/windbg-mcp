@@ -124,7 +124,8 @@
   comes back, because the thrown object is on the *stack* and therefore captured. Neither route is
   a superset of the other; both are tried.
 - **A minidump without the faulting module's image unwinds badly on x64, and that is a fact about
-  dumps rather than about this server.** The unwind data lives in the image's `.pdata`, which a
+  dumps rather than about this server.** (x86 is not affected the same way — its unwind is
+  frame-pointer based, and the 32-bit fixture walks its whole stack with the image moved aside.) The unwind data lives in the image's `.pdata`, which a
   minidump does not capture, so the engine reads it off the binary on disk. Measured on the
   checked-in fixture with its executable moved aside: frame 0 is right either way — it comes from
   the recorded context rather than from unwinding — and beyond it the frames alternate between
@@ -133,6 +134,23 @@
   walk this host could not do, not a stack with an unusual frame in it. Put the binaries where the
   debugger can find them (`.exepath`, or beside the dump) before reading a stack from a dump that
   came from another machine.
+- **The buried-throw scan runs on one fault shape, and reports nothing on the others.** It is
+  `abort`'s fail-fast — `0xc0000409` with subcode 7 and none of WIL's parameters — because that is
+  the fault whose cause is somewhere other than its own record. It deliberately does *not* run on
+  every fault that carries no throw: a C++ `EXCEPTION_RECORD` outlives the frames that held it, so
+  an access violation deeper on the stack than an old `try`/`catch` would find that handled
+  exception's object and report it as the cause. A specific wrong answer is worse than none, so on
+  an access violation, a breakpoint or a WIL fail-fast there is no `thrown` and the record's own
+  fields are the whole answer.
+- **The C++ EH decode is laid out at the *target's* pointer width, which is not this build's.**
+  A 32-bit throw raises **three** parameters where a 64-bit one raises four — the fourth is an image
+  base, and a 32-bit graph's links are absolute pointers needing none — its `EXCEPTION_RECORD` is 80
+  bytes rather than 152 with the parameter count and the parameters both earlier, and
+  `TypeDescriptor::name` sits at `+8` rather than `+16`. All measured, by building one program twice
+  and having it print its own record and walk its own graph. Every one of those differences makes a
+  mismatched reader come back *empty* rather than fail, so the width is read from the engine
+  (`GetActualProcessorType`) per target rather than assumed; `docs/samples/cppthrow-fastfail-x86.dmp`
+  is the fixture that keeps it honest.
 - **`exception_triage`'s stack comes from the stored crash context where the target has one.** That
   is what `.ecxr` adopts, walked without `.ecxr`'s effect on the session, so the caller's selected
   thread and frame are left alone — which is what lets the tool be read-only where `crash_triage`
