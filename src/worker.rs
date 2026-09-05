@@ -3305,7 +3305,7 @@ fn exception_triage(e: &DebugEngine, frames: usize, scan_stack: bool) -> Result<
     // [`fault::may_bury_a_throw`], which is where the reasoning lives. `scan_stack` stays the
     // caller's off-switch rather than becoming an on-one: there is no fault where a hunt through
     // raw stack is more trustworthy than this.
-    if throw.is_none() && scan_stack && fault::may_bury_a_throw(&kind) {
+    if throw.is_none() && scan_stack && fault::may_bury_a_throw(&kind, &record.parameters) {
         // **Anchored on the innermost frame and a fixed span, not on the outermost frame.**
         //
         // The obvious range is `min(stack_offset)..max(stack_offset)` — the region the walk itself

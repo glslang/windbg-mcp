@@ -134,6 +134,18 @@
   walk this host could not do, not a stack with an unusual frame in it. Put the binaries where the
   debugger can find them (`.exepath`, or beside the dump) before reading a stack from a dump that
   came from another machine.
+- **`0xc0000409`'s dismissal is conditional, because for two subcodes the code's name is the
+  literal truth.** `FAST_FAIL_LEGACY_GS_VIOLATION` (0) and `FAST_FAIL_STACK_COOKIE_CHECK_FAILURE`
+  (2) are the compiler reporting that a `/GS` guard between a local buffer and the return address
+  was overwritten — so stack corruption *is* the finding there, and the summary says so instead of
+  leading with "not a stack buffer overrun".
+- **The value after the `0xAABBCCDD` sentinel must be a failed `HRESULT`.** The sentinel is four
+  bytes with no header behind it, so it occurs by chance; the claim about a hit has always been
+  that the number after it decodes, and now that is tested rather than asserted. A
+  `winrt::hresult_error` exists to carry a failure, so bit 31 is set in every one — a success code
+  or a small member value there means the object is not one and the match was a coincidence. The
+  check is structural rather than "resolves to a message", so a failed `HRESULT` from a component
+  whose table this host lacks is still reported.
 - **The `0xAABBCCDD` sentinel is not read when the thrown type was read and is not an
   `hresult_error`.** Those four bytes have no header behind them, so they occur inside objects that
   have nothing to do with `winrt`; what makes a hit believable is the *type* saying to expect one.
@@ -170,7 +182,7 @@
   and leads with the `HRESULT` one. Both tools carry `system_message` and `ntstatus_message`
   side by side regardless; the difference is only which leads.
 - **The buried-throw scan runs on one fault shape, and reports nothing on the others.** It is
-  `abort`'s fail-fast — `0xc0000409` with subcode 7 and none of WIL's parameters — because that is
+  `abort`'s fail-fast — `0xc0000409` with subcode 7 and **exactly one** parameter — because that is
   the fault whose cause is somewhere other than its own record. It deliberately does *not* run on
   every fault that carries no throw: a C++ `EXCEPTION_RECORD` outlives the frames that held it, so
   an access violation deeper on the stack than an old `try`/`catch` would find that handled
