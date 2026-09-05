@@ -119,3 +119,19 @@ same output schema — so a caller can branch on a stable category instead of on
 nothing changed — unlike `timeout`, where it may still be running), `stale_session`, `worker_lost`,
 `capacity`. Both branches carry a `status` discriminator (`"ok"` / `"error"`), which is what lets one
 schema describe a result whichever way it went.
+
+## Binary Ninja bridge contracts
+
+`current_location` and `read_memory` use the existing `status: "ok"` / `status: "error"`
+outcome and typed error categories. Their text remains available to ordinary MCP hosts.
+
+A successful `current_location` contains `location_state`, nullable `address`, `thread`,
+`processor`, and `coordinate`. A missing execution context differs from a valid instruction
+pointer outside all loaded images, and both differ from a failed module-attribution call.
+Coordinates follow [the shared PE coordinate contract](coordinates.md#guarded-bridge-coordinates).
+
+A successful `read_memory` contains `address`, `requested_size`, `read_size`, and `data`.
+`data` is lowercase hexadecimal in memory byte order, two characters per byte actually read.
+`read_size < requested_size` explicitly identifies a partial read. The existing allocation
+bound still applies; address ranges must not overflow. Batch reads share the same helper
+and continue to embed its text in the batch report.

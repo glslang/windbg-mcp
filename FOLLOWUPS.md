@@ -858,3 +858,11 @@ searches that thread's stack. Found by Codex on
 
 **Where it picks up.** `worker::exception_triage` in `src/worker.rs`, `fault::render`'s `STACK`
 line, and dbgscope's `src/dbgeng.rs` beside `current_thread_system_id`.
+
+## 60. [windbg-mcp] Structured dispatch reachability paths for the Binary Ninja bridge
+
+Preserve `reachable_from_dispatch` text while exposing typed paths and branch recipes.
+Attribute coordinate-bearing addresses to modules on the worker's engine thread and carry
+PE matching metadata plus RVA. This is separate from the bridge's guarded breakpoint,
+run-to, memory, and current-location contracts. Runtime coverage, if imported later, must
+mean observed execution only; an unobserved location is not proof of unreachability.

@@ -64,6 +64,15 @@
       "wire": 5654
     },
     {
+      "annotations": 69,
+      "description": 89,
+      "inputSchema": 314,
+      "modelVisible": 460,
+      "name": "current_location",
+      "outputSchema": 2283,
+      "wire": 2843
+    },
+    {
       "annotations": 134,
       "description": 1714,
       "inputSchema": 8255,
@@ -336,11 +345,11 @@
     {
       "annotations": 64,
       "description": 59,
-      "inputSchema": 522,
-      "modelVisible": 633,
+      "inputSchema": 1588,
+      "modelVisible": 1699,
       "name": "read_memory",
-      "outputSchema": 0,
-      "wire": 712
+      "outputSchema": 1309,
+      "wire": 3103
     },
     {
       "annotations": 120,
@@ -372,11 +381,11 @@
     {
       "annotations": 114,
       "description": 529,
-      "inputSchema": 791,
-      "modelVisible": 1375,
+      "inputSchema": 1844,
+      "modelVisible": 2428,
       "name": "run_to_address",
       "outputSchema": 1505,
-      "wire": 3025
+      "wire": 4078
     },
     {
       "annotations": 75,
@@ -399,11 +408,11 @@
     {
       "annotations": 115,
       "description": 330,
-      "inputSchema": 1306,
-      "modelVisible": 1691,
+      "inputSchema": 2356,
+      "modelVisible": 2741,
       "name": "set_breakpoint",
       "outputSchema": 2538,
-      "wire": 4375
+      "wire": 5425
     },
     {
       "annotations": 123,
@@ -506,15 +515,15 @@
     }
   ],
   "totals": {
-    "annotations": 5970,
-    "description": 31477,
-    "inputSchema": 46465,
+    "annotations": 6039,
+    "description": 31566,
+    "inputSchema": 49948,
     "instructions": 1983,
-    "modelVisible": 80877,
-    "outputSchema": 121123,
-    "payload": 209557,
-    "tools": 56,
-    "wire": 209434,
+    "modelVisible": 84506,
+    "outputSchema": 124715,
+    "payload": 216895,
+    "tools": 57,
+    "wire": 216771,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }

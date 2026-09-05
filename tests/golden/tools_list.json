@@ -3,7 +3,7 @@
     "(none)",
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 56,
+  "toolCount": 57,
   "tools": [
     {
       "hints": {
@@ -250,6 +250,40 @@
       ],
       "required": [],
       "title": "Triage a bug check"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "current_location",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/CurrentLocation",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Current location"
     },
     {
       "hints": {
@@ -1174,14 +1208,33 @@
         "readOnly": true
       },
       "name": "read_memory",
-      "output": null,
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/MemoryRead",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
       "params": [
-        "address: string",
+        "address: string|null",
+        "coordinate: any",
         "session_id: string|null",
         "size: integer/uint32"
       ],
       "required": [
-        "address",
         "size"
       ],
       "title": "Read memory"
@@ -1305,13 +1358,12 @@
         "root": "object"
       },
       "params": [
-        "address: string",
+        "address: string|null",
+        "coordinate: any",
         "session_id: string|null",
         "timeout_ms: integer|null/uint32"
       ],
-      "required": [
-        "address"
-      ],
+      "required": [],
       "title": "Run to address"
     },
     {
@@ -1414,14 +1466,13 @@
         "root": "object"
       },
       "params": [
-        "expression: string",
+        "coordinate: any",
+        "expression: string|null",
         "one_shot: boolean|null",
         "pass_count: integer|null/uint32",
         "session_id: string|null"
       ],
-      "required": [
-        "expression"
-      ],
+      "required": [],
       "title": "Set breakpoint"
     },
     {

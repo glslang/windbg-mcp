@@ -109,3 +109,7 @@ and `ttd_memory` query `@$cursession.TTD.{Calls,Memory}` (every call to a functi
 an address range), and `ttd_events` queries `@$curprocess.TTD.Events` (the module/thread/exception
 timeline). For anything else, `dx` evaluates arbitrary data-model/LINQ expressions, e.g.
 `@$cursession.TTD.Calls("ntdll!NtCreateFile").Where(c => c.ReturnValue != 0)`.
+
+`current_location` belongs to `inspect`. The optional identity-guarded `coordinate` input
+on `read_memory`, `set_breakpoint`, and `run_to_address` requires an explicit session and
+excludes the tool's traditional location argument. See [coordinates](coordinates.md).

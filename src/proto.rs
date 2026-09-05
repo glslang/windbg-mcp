@@ -139,6 +139,8 @@ pub enum EngineOp {
         command: String,
         timeout_ms: u32,
     },
+    /// The selected instruction pointer, context, and containing image coordinate.
+    CurrentLocation,
     /// The target's registers, as text (`r`) *and* as values.
     ///
     /// `all` is the caller's choice between the integer registers — which is what `r` prints, and
@@ -239,6 +241,8 @@ pub enum EngineOp {
     /// around this one carry no patience because nothing there can be interrupted at all; this one
     /// is not an exception to that rule but an instance of it.
     SetBreakpoint {
+        #[serde(default)]
+        coordinate: Option<Box<crate::structured::ImageCoordinate>>,
         expression: String,
         /// A debugger command to run on every hit, as `bp`'s quoted trailing argument was.
         /// `ioctl_trace` is what needs it.
@@ -259,6 +263,8 @@ pub enum EngineOp {
         patience_ms: u32,
     },
     ReadMemory {
+        #[serde(default)]
+        coordinate: Option<Box<crate::structured::ImageCoordinate>>,
         address: String,
         size: u32,
     },
@@ -281,6 +287,8 @@ pub enum EngineOp {
         reload: String,
     },
     RunToAddress {
+        #[serde(default)]
+        coordinate: Option<Box<crate::structured::ImageCoordinate>>,
         address: String,
         timeout_ms: u32,
     },
@@ -826,6 +834,7 @@ mod tests {
             },
             EngineOp::Registers { all: false },
             EngineOp::SetBreakpoint {
+                coordinate: None,
                 expression: "nt!KeBugCheckEx".into(),
                 command: None,
                 one_shot: false,

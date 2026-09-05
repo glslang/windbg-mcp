@@ -141,3 +141,38 @@ between knowing about both.
 
 The example above is that claim being tested rather than argued: two machines, one coordinate, and
 an 11 MB image selected out of a symbol server by two integers.
+
+## Guarded bridge coordinates
+
+The Binary Ninja bridge and host-orchestrated workflows share this location form:
+
+```json
+{
+  "module": "driver",
+  "image_name": "driver.sys",
+  "identity": { "timestamp": 1234567890, "size": 65536 },
+  "rva": "0x1234"
+}
+```
+
+`size` is PE `SizeOfImage`. Timestamp and size are matching metadata, not cryptographic
+identity. Preserve available original-file SHA-256 and architecture separately for
+reproducibility. An unavailable hash is not a match. Paths describe provenance and are
+not used to resolve an image across machines. When both sides have a PDB identity, its
+GUID and age must match and neither identity may be marked unmatched.
+
+`current_location` reads the instruction pointer, available system thread ID and kernel
+processor, and containing coordinate in one worker job. `location_state` distinguishes
+`mapped`, `unmapped`, `attribution_failed`, and `context_unavailable`. A running target
+is a typed `target_running` error; polling never interrupts it.
+
+`set_breakpoint`, `run_to_address`, and `read_memory` accept `coordinate` instead of their
+existing `expression`/`address`. Supply exactly one form and an explicit `session_id` for
+coordinates. The worker resolves the unique loaded module and validates its identity and
+entire requested range immediately before acting, in the same serialized engine job.
+Missing, ambiguous, unloaded, replaced, and out-of-range images are refused. No cached
+address from pairing is used for an action.
+
+See [the bridge plan](binja-windbg-mcp-plan.md) and
+[validation record](binja-windbg-mcp-validation.md). The independently usable Binary Ninja
+plugin is maintained in the separate `binja-windbg-mcp` repository.

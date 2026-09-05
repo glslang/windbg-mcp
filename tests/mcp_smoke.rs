@@ -1814,7 +1814,8 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// So 68,893 + 4,892 came to 73,785 and the measurement is 73,996 — the arithmetic was right and
 /// the model of it was not, which is the failure mode a derived figure has and a recorded one
 /// does not. It is why `tests/golden/tool_budget.json` is the source and this line is a ceiling.
-const MODEL_VISIBLE_CEILING: usize = 83_000;
+/// The bridge adds guarded coordinate inputs and current_location; see docs/token-budget.md.
+const MODEL_VISIBLE_CEILING: usize = 88_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
 /// the array's own punctuation and every result-level field are inside it. 192,971 bytes today,
@@ -1845,7 +1846,9 @@ const MODEL_VISIBLE_CEILING: usize = 83_000;
 /// the way `PdbInfo` did. That is the question this ceiling exists to force, and the number to
 /// re-derive rather than trust: it is a measurement of 2026-09-05, and any edit to a shared output
 /// type moves it.
-const WIRE_CEILING: usize = 215_000;
+/// Bridge coordinate inputs and two structured outputs add 7,338 B after rebase.
+/// See docs/token-budget.md; output schemas still carry constraints only.
+const WIRE_CEILING: usize = 225_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,021
 /// bytes, because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary from
@@ -2287,6 +2290,12 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
         // Everything else needs a session, and there is none.
         ("end_session", json!({}), "error"),
         ("registers", json!({}), "error"),
+        ("current_location", json!({}), "error"),
+        (
+            "read_memory",
+            json!({"address": "0x0", "size": 32}),
+            "error",
+        ),
         ("modules", json!({}), "error"),
         ("backtrace", json!({}), "error"),
         ("disassemble", json!({}), "error"),
@@ -3143,7 +3152,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 13 of 56 tools (session, crash)"),
+        log.contains("serving 13 of 57 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -3175,7 +3184,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 19 of 56 tools (session, inspect) — except bench serves 13 of 56 tools \
+            "serving 20 of 57 tools (session, inspect) — except bench serves 13 of 57 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),
@@ -3199,7 +3208,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
 
     let by_local = listed(&mut server, &local_token, &local_mcp);
     let by_bench = listed(&mut server, &bench_token, &bench_mcp);
-    assert_eq!(by_local.len(), 19, "{by_local:?}");
+    assert_eq!(by_local.len(), 20, "{by_local:?}");
     assert_eq!(by_bench.len(), 13, "{by_bench:?}");
     assert!(by_local.contains(&"registers".to_string()), "{by_local:?}");
     assert!(
@@ -7430,6 +7439,7 @@ fn tool_results_stay_within_their_budget() {
         // 9,804 -> 3,480 B model, and the ceiling 13,500 -> 5,000 with them, since a ceiling left
         // at the old figure is what would let them come back unnoticed.
         ("registers", json!({}), 5_000, 6_000),
+        ("current_location", json!({}), 900, 1_200),
         ("backtrace", json!({}), 3_000, 4_000),
         ("disassemble", json!({}), 4_000, 6_000),
         // One page of rows rather than the whole table since the row cap landed — the ceiling
@@ -14422,4 +14432,47 @@ fn a_32_bit_managed_process_is_attached_by_an_engine_that_can_load_its_sos() {
     let _ = child.kill();
     let _ = child.wait();
     ran("the 32-bit managed attach tier");
+}
+
+#[test]
+fn bridge_location_and_memory_share_the_module_coordinate() {
+    let Some(dump) = target_tier() else {
+        return;
+    };
+    let mut server = Server::started();
+    let session = server.open_session("open_dump", json!({"path": dump}), TARGET_STEP);
+    let location = server.tool_data(
+        "current_location",
+        json!({"session_id": session}),
+        TARGET_STEP,
+    );
+    assert_eq!(location["status"], "ok");
+    assert_eq!(location["location_state"], "mapped");
+    let coordinate = &location["coordinate"];
+    let memory = server.tool_data(
+        "read_memory",
+        json!({"session_id": session, "coordinate": coordinate, "size": 32}),
+        TARGET_STEP,
+    );
+    assert_eq!(memory["address"], location["address"]);
+    assert!(
+        serde_json::to_vec(&memory).unwrap().len() < 400,
+        "32-byte structured memory result exceeded its budget"
+    );
+    assert_eq!(memory["requested_size"], 32);
+    assert!(memory["read_size"].as_u64().unwrap() <= 32);
+    assert_eq!(
+        memory["data"].as_str().unwrap().len(),
+        memory["read_size"].as_u64().unwrap() as usize * 2
+    );
+    let mut replaced = coordinate.clone();
+    replaced["identity"]["timestamp"] =
+        json!(coordinate["identity"]["timestamp"].as_u64().unwrap() ^ 1);
+    let failure = server.tool_failure(
+        "set_breakpoint",
+        json!({"session_id": session, "coordinate": replaced}),
+        TARGET_STEP,
+    );
+    assert_eq!(failure["error"]["category"], "debugger");
+    server.tool_data("end_session", json!({"session_id": session}), TARGET_STEP);
 }

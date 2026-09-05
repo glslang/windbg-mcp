@@ -57,6 +57,70 @@ pub fn addr(value: u64) -> String {
     format!("{value:#018x}")
 }
 
+/// Shared PE matching metadata. This is not a cryptographic identity.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImageIdentity {
+    pub timestamp: u32,
+    pub size: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdb: Option<CoordinatePdb>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CoordinatePdb {
+    pub guid: String,
+    pub age: u32,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unmatched: bool,
+}
+
+impl From<PdbInfo> for CoordinatePdb {
+    fn from(pdb: PdbInfo) -> Self {
+        Self {
+            guid: pdb.guid,
+            age: pdb.age,
+            unmatched: pdb.unmatched,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImageCoordinate {
+    pub module: String,
+    pub image_name: String,
+    pub identity: ImageIdentity,
+    pub rva: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LocationState {
+    Mapped,
+    Unmapped,
+    AttributionFailed,
+    ContextUnavailable,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CurrentLocation {
+    pub location_state: LocationState,
+    pub address: Option<String>,
+    pub thread: Option<u32>,
+    pub processor: Option<u32>,
+    pub coordinate: Option<ImageCoordinate>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MemoryRead {
+    pub address: String,
+    pub requested_size: u32,
+    pub read_size: u32,
+    pub data: String,
+}
+
 /// A tool's typed answer: the payload, or why there is none.
 ///
 /// Internally tagged on `status`, so both branches are objects of the same schema and a client

@@ -530,3 +530,30 @@ Those margins are stable rather than noisy, which is worth knowing before anyone
 dump on both CI runners — and both printed it byte for byte identically, ARM64 included. That is
 not true of the baseline table further up, three of whose rows were re-measured on the ARM64 bench
 against the ARM64 dump; the two tables are read differently for that reason.
+
+## Binary Ninja bridge surface (2026-09-05)
+
+After rebasing onto `2f9cce0`, the Windows ARM64 protocol run measures the 57-tool
+surface at **84,506 B model-visible** and **216,895 B serialized payload**. Upstream's
+56 tools cost 80,877 B and 209,557 B respectively. Only these four definitions change:
+
+| Tool | Added model-visible bytes | Added per-tool wire bytes |
+|---|---:|---:|
+| `current_location` (new) | 460 | 2,843 |
+| `read_memory` | 1,066 | 2,391 |
+| `run_to_address` | 1,053 | 1,053 |
+| `set_breakpoint` | 1,050 | 1,050 |
+
+The model-visible increase is 3,629 B. Per-tool wire growth is 7,337 B; the new array
+separator brings payload growth to 7,338 B. The model-visible ceiling moves from
+83,000 to 88,000 B and the payload ceiling from 215,000 to 225,000 B, covering the
+coordinate input alternatives and two structured outputs with modest headroom.
+Output schemas still use `constraints_of`; coordinate PDB input contains only GUID,
+age, and the unmatched flag, so it does not repeat the descriptive module-list PDB
+schema in model context.
+
+Both surface goldens record the actual definitions. Result costs are separate:
+`current_location` has a 900 B model-channel / 1,200 B wire ceiling in the debugger-tier
+budget table, and the bridge smoke asserts a 32-byte structured memory read stays below
+400 B. The one-MiB memory allocation cap is unchanged; structured memory adds two hex
+characters per actual byte read.

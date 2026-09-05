@@ -1717,10 +1717,27 @@ pub struct ExecuteArgs {
     pub session_id: Option<String>,
 }
 
+fn guarded_location(
+    location: Option<String>,
+    coordinate: &Option<structured::ImageCoordinate>,
+    session: Option<&str>,
+) -> Result<String, String> {
+    match (location, coordinate) {
+        (Some(value), None) if !value.trim().is_empty() => Ok(value),
+        (None, Some(_)) if session.is_some_and(|s| !s.trim().is_empty()) => Ok(String::new()),
+        (None, Some(_)) => Err("coordinate requires an explicit session_id".into()),
+        _ => Err("provide exactly one location: address/expression or coordinate".into()),
+    }
+}
+
 #[derive(Deserialize, JsonSchema)]
 pub struct ReadMemoryArgs {
     /// Virtual address (decimal or 0x-hex).
-    pub address: String,
+    #[serde(default)]
+    pub address: Option<String>,
+    /// Identity-guarded image location. Requires an explicit session and no other location.
+    #[serde(default)]
+    pub coordinate: Option<structured::ImageCoordinate>,
     /// Number of bytes to read.
     pub size: u32,
     /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
@@ -1799,7 +1816,11 @@ pub struct DxArgs {
 #[derive(Deserialize, JsonSchema)]
 pub struct BreakpointArgs {
     /// Breakpoint location: symbol, address, or expression (e.g. "nt!NtCreateFile").
-    pub expression: String,
+    #[serde(default)]
+    pub expression: Option<String>,
+    /// Identity-guarded image location. Requires an explicit session and no other location.
+    #[serde(default)]
+    pub coordinate: Option<structured::ImageCoordinate>,
     /// Remove the breakpoint the first time it is hit, so it stops the target once.
     ///
     /// This is `bp /1` as a parameter. It used to be reachable by putting `/1` in `expression`,
@@ -2259,7 +2280,11 @@ pub struct ReachabilityArgs {
 pub struct RunToAddressArgs {
     /// Address, symbol, or expression to run until (any WinDbg form — a bare value is
     /// hex, "0x"-hex and symbols also work). Typically a block from `reachable_from_dispatch`.
-    pub address: String,
+    #[serde(default)]
+    pub address: Option<String>,
+    /// Identity-guarded image location. Requires an explicit session and no other location.
+    #[serde(default)]
+    pub coordinate: Option<structured::ImageCoordinate>,
     /// How long to wait for the target to reach `address` before reporting a timeout
     /// (milliseconds). Defaults to the standard execution wait.
     #[serde(default)]
@@ -4144,26 +4169,50 @@ impl WindbgServer {
         engine_result_for(args.session_id.as_deref(), out)
     }
 
+    /// Read the selected instruction pointer, execution context, and containing PE coordinate.
+    #[rmcp::tool(annotations(title = "Current location", read_only_hint = true,
+        open_world_hint = true),
+        output_schema = constraints_of::<Outcome<structured::CurrentLocation>>())]
+    async fn current_location(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        engine_result_for(
+            args.session_id.as_deref(),
+            self.run(args.session_id.as_deref(), EngineOp::CurrentLocation)
+                .await,
+        )
+    }
+
     /// Read process/kernel virtual memory and return a hex dump.
     #[rmcp::tool(annotations(
         title = "Read memory",
         read_only_hint = true,
         open_world_hint = true
-    ))]
+    ), output_schema = constraints_of::<Outcome<structured::MemoryRead>>())]
     async fn read_memory(
         &self,
         Parameters(args): Parameters<ReadMemoryArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        let location =
+            match guarded_location(args.address, &args.coordinate, args.session_id.as_deref()) {
+                Ok(location) => location,
+                Err(message) => {
+                    return typed_error(ErrorCategory::InvalidArgument, message, args.session_id);
+                }
+            };
+
         let out = self
             .run(
                 args.session_id.as_deref(),
                 EngineOp::ReadMemory {
-                    address: args.address,
+                    address: location,
+                    coordinate: args.coordinate.map(Box::new),
                     size: args.size,
                 },
             )
             .await;
-        engine_result(out)
+        engine_result_for(args.session_id.as_deref(), out)
     }
 
     /// Walk a structure and read named fields out of every node — **without one unreadable
@@ -4513,20 +4562,32 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<BreakpointArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        let location = match guarded_location(
+            args.expression,
+            &args.coordinate,
+            args.session_id.as_deref(),
+        ) {
+            Ok(location) => location,
+            Err(message) => {
+                return typed_error(ErrorCategory::InvalidArgument, message, args.session_id);
+            }
+        };
+
         // **Defence in depth since dbgscope#126, where it used to be the only defence.** The
         // expression reaches the engine as a parameter now rather than being interpolated into
         // `bp <expression>`, so a `;` in it separates nothing and a `"` opens nothing — there is no
         // command line for it to break out of. It is kept because an operand carrying either is
         // still far more likely to be a mistake than an intent, and refusing it early says so
         // better than a debugger error would.
-        if let Err(e) = reject_command_breakers("expression", &args.expression, Quotes::Rejected) {
+        if let Err(e) = reject_command_breakers("expression", &location, Quotes::Rejected) {
             return typed_error(ErrorCategory::InvalidArgument, e, args.session_id);
         }
         let out = self
             .run(
                 args.session_id.as_deref(),
                 EngineOp::SetBreakpoint {
-                    expression: args.expression,
+                    expression: location,
+                    coordinate: args.coordinate.map(Box::new),
                     command: None,
                     one_shot: args.one_shot.unwrap_or(false),
                     pass_count: args.pass_count,
@@ -4723,14 +4784,23 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<RunToAddressArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        if let Err(e) = reject_command_breakers("address", &args.address, Quotes::Rejected) {
+        let location =
+            match guarded_location(args.address, &args.coordinate, args.session_id.as_deref()) {
+                Ok(location) => location,
+                Err(message) => {
+                    return typed_error(ErrorCategory::InvalidArgument, message, args.session_id);
+                }
+            };
+
+        if let Err(e) = reject_command_breakers("address", &location, Quotes::Rejected) {
             return typed_error(ErrorCategory::InvalidArgument, e, args.session_id);
         }
         let out = self
             .run(
                 args.session_id.as_deref(),
                 EngineOp::RunToAddress {
-                    address: args.address,
+                    address: location,
+                    coordinate: args.coordinate.map(Box::new),
                     timeout_ms: args.timeout_ms.unwrap_or(EXEC_WAIT_MS),
                 },
             )
@@ -5152,6 +5222,7 @@ impl WindbgServer {
                 args.session_id.as_deref(),
                 EngineOp::SetBreakpoint {
                     expression: args.dispatch,
+                    coordinate: None,
                     command: Some(command.to_string()),
                     // A trace wants every hit; a one-shot would log one IOCTL and disarm, and a
                     // pass count would skip the first n.
@@ -8021,5 +8092,29 @@ fffff803`3e254755 cc              int     3
         assert_eq!(p.field, Some(IoField::IoControlCode));
         assert_eq!(p.value, Some(0x222003));
         assert_eq!(p.relation, Some("!=")); // jne taken ⇒ inequality leaves toward B
+    }
+}
+
+#[cfg(test)]
+mod bridge_argument_tests {
+    use super::*;
+
+    #[test]
+    fn coordinate_requires_one_location_and_an_explicit_session() {
+        let coordinate = Some(
+            serde_json::from_value::<structured::ImageCoordinate>(serde_json::json!({
+                "module": "driver", "image_name": "driver.sys",
+                "identity": {"timestamp": 123, "size": 4096}, "rva": "0x123"
+            }))
+            .unwrap(),
+        );
+        assert!(guarded_location(None, &coordinate, Some("session")).is_ok());
+        assert!(guarded_location(None, &coordinate, None).is_err());
+        assert!(guarded_location(Some("0x1".into()), &coordinate, Some("session")).is_err());
+        assert!(guarded_location(None, &None, Some("session")).is_err());
+        assert_eq!(
+            guarded_location(Some("nt!Symbol".into()), &None, None).unwrap(),
+            "nt!Symbol"
+        );
     }
 }

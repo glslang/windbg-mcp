@@ -1643,3 +1643,13 @@ does not reach.
   with nothing in any of them, which a count cannot tell from a query that matched.
 - **Driver IOCTL sweep** — `examples/sweep_ioctls.ps1` plus the target-side
   `examples/send_ioctls_target.ps1`; needs a benign test driver on a KDNET target.
+
+## Binary Ninja bridge
+
+The debugger tier includes `bridge_location_and_memory_share_the_module_coordinate`:
+its instruction pointer is mapped to a PE identity and RVA, memory is read through that
+coordinate, and a mismatched timestamp is refused before installing a breakpoint.
+`current_location` is also measured by the result-budget test. Protocol-tier coverage checks
+both new structured-result paths and the updated inspect-group membership and goldens.
+See [bridge validation](binja-windbg-mcp-validation.md) for automated results and the
+separate Binary Ninja UI/real-driver acceptance gates.

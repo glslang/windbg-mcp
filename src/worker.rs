@@ -1651,6 +1651,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             command,
             timeout_ms,
         } => resume(e, id, &command, timeout_ms),
+        EngineOp::CurrentLocation => current_location(e),
         EngineOp::Registers { all } => registers(e, all),
         EngineOp::Modules {
             filter,
@@ -1662,22 +1663,31 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             disassemble(e, address.as_deref(), count as usize)
         }
         EngineOp::SetBreakpoint {
+            coordinate,
             expression,
             command,
             one_shot,
             pass_count,
             patience_ms,
-        } => set_breakpoint(
-            e,
-            &expression,
-            command.as_deref(),
-            one_shot,
-            pass_count,
-            watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), queued),
-        ),
-        EngineOp::ReadMemory { address, size } => read_memory(e, &address, size)
-            .map(Output::text)
-            .map_err(Failed::from),
+        } => {
+            let expression = resolve_coordinate(e, coordinate.as_deref(), expression, 1)?;
+            set_breakpoint(
+                e,
+                &expression,
+                command.as_deref(),
+                one_shot,
+                pass_count,
+                watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), queued),
+            )
+        }
+        EngineOp::ReadMemory {
+            address,
+            size,
+            coordinate,
+        } => {
+            let address = resolve_coordinate(e, coordinate.as_deref(), address, u64::from(size))?;
+            read_memory(e, &address, size).map_err(Failed::from)
+        }
         // The caller's own deadline, on the same arithmetic as a pool walk's and for the same
         // reason — with one difference that makes it matter more here. A pool walk is bounded by
         // dbgscope *as well*; this one has no command behind it, so between-node checking is the
@@ -1717,8 +1727,12 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         }
         EngineOp::RunToAddress {
             address,
+            coordinate,
             timeout_ms,
-        } => run_to_address(e, &address, timeout_ms),
+        } => {
+            let address = resolve_coordinate(e, coordinate.as_deref(), address, 1)?;
+            run_to_address(e, &address, timeout_ms)
+        }
         EngineOp::Reachability(args) => reachable(e, args).map(Output::text).map_err(Failed::from),
         EngineOp::CrashTriage {
             frames,
@@ -4089,8 +4103,12 @@ fn set_breakpoint(
     pass_count: Option<u32>,
     budget_ms: u32,
 ) -> Result<Output, Failed> {
-    let mut spec =
-        BreakpointSpec::code(BreakpointAt::Expression(expression.to_string())).replacing_existing();
+    let location = expression
+        .strip_prefix("0x")
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        .map(BreakpointAt::Address)
+        .unwrap_or_else(|| BreakpointAt::Expression(expression.to_string()));
+    let mut spec = BreakpointSpec::code(location).replacing_existing();
     if let Some(command) = command {
         spec = spec.with_command(command);
     }
@@ -4254,11 +4272,160 @@ fn render_breakpoints(set: &structured::BreakpointSet) -> String {
     out
 }
 
+/// Resolve and act in the same engine job; no cached pairing address is trusted.
+fn resolve_coordinate(
+    e: &DebugEngine,
+    coordinate: Option<&structured::ImageCoordinate>,
+    fallback: String,
+    size: u64,
+) -> Result<String, Failed> {
+    let Some(coordinate) = coordinate else {
+        return Ok(fallback);
+    };
+    let modules = e.modules().map_err(es)?;
+    let modules: Vec<_> = modules
+        .iter()
+        .map(|module| {
+            let info = structured::ModuleInfo::from(module);
+            if coordinate.identity.pdb.is_some()
+                && info.name.eq_ignore_ascii_case(&coordinate.module)
+            {
+                with_pdb_identity(e, module, info)
+            } else {
+                info
+            }
+        })
+        .collect();
+    guarded_address(coordinate, &modules, size)
+        .map(structured::addr)
+        .map_err(Failed::from)
+}
+
+fn guarded_address(
+    coordinate: &structured::ImageCoordinate,
+    modules: &[structured::ModuleInfo],
+    size: u64,
+) -> Result<u64, String> {
+    let matched: Vec<_> = modules
+        .iter()
+        .filter(|m| {
+            !m.unloaded
+                && m.name.eq_ignore_ascii_case(&coordinate.module)
+                && m.image_name
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or("")
+                    .eq_ignore_ascii_case(&coordinate.image_name)
+        })
+        .collect();
+    if matched.len() != 1 {
+        return Err("coordinate module missing or ambiguous".into());
+    }
+    let module = matched[0];
+    if module.timestamp != coordinate.identity.timestamp || module.size != coordinate.identity.size
+    {
+        return Err("coordinate PE identity mismatch".into());
+    }
+    if let (Some(expected), Some(actual)) = (&coordinate.identity.pdb, &module.pdb)
+        && (expected.unmatched
+            || actual.unmatched
+            || expected.age != actual.age
+            || !expected.guid.eq_ignore_ascii_case(&actual.guid))
+    {
+        return Err("coordinate PDB identity mismatch".into());
+    }
+    let rva = coordinate
+        .rva
+        .strip_prefix("0x")
+        .filter(|v| !v.is_empty())
+        .and_then(|v| u64::from_str_radix(v, 16).ok())
+        .ok_or("coordinate rva must be 0x hexadecimal")?;
+    if rva >= module.size || rva.checked_add(size).is_none_or(|end| end > module.size) {
+        return Err("coordinate range is outside the image".into());
+    }
+    parse_u64(&module.start)?
+        .checked_add(rva)
+        .ok_or("coordinate address overflows".into())
+}
+
+fn current_location(e: &DebugEngine) -> Result<Output, Failed> {
+    if e.is_running().map_err(es)? {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::TargetRunning,
+            "target is running",
+        ));
+    }
+    let address = e.instruction_pointer().ok();
+    let thread = e.current_thread_system_id().ok();
+    let processor = e.current_processor().ok().flatten();
+    let module = match address {
+        Some(address) => e
+            .module_at(address)
+            .map(|module| {
+                module.map(|m| with_pdb_identity(e, &m, structured::ModuleInfo::from(&m)))
+            })
+            .map_err(es),
+        None => Ok(None),
+    };
+    let (location_state, coordinate) = location_coordinate(address, module)?;
+    let location = structured::CurrentLocation {
+        location_state,
+        address: address.map(structured::addr),
+        thread,
+        processor,
+        coordinate,
+    };
+    Ok(Output::typed(
+        format!(
+            "Current location: {:?} {}",
+            location.location_state,
+            location.address.as_deref().unwrap_or("unavailable")
+        ),
+        location,
+    ))
+}
+
+fn location_coordinate(
+    address: Option<u64>,
+    module: Result<Option<structured::ModuleInfo>, String>,
+) -> Result<
+    (
+        structured::LocationState,
+        Option<structured::ImageCoordinate>,
+    ),
+    Failed,
+> {
+    use structured::LocationState;
+    Ok(match address {
+        None => (LocationState::ContextUnavailable, None),
+        Some(address) => match module {
+            Err(_) => (LocationState::AttributionFailed, None),
+            Ok(None) => (LocationState::Unmapped, None),
+            Ok(Some(m)) => {
+                let base = parse_u64(&m.start)?;
+                (
+                    LocationState::Mapped,
+                    Some(structured::ImageCoordinate {
+                        module: m.name,
+                        image_name: m.image_name.rsplit(['\\', '/']).next().unwrap_or("").into(),
+                        identity: structured::ImageIdentity {
+                            timestamp: m.timestamp,
+                            size: m.size,
+                            pdb: m.pdb.map(structured::CoordinatePdb::from),
+                        },
+                        rva: format!("{:#x}", address - base),
+                    }),
+                )
+            }
+        },
+    })
+}
+
 /// Reads target memory and renders it as a hex dump.
 ///
 /// Free function rather than an inline arm because a batch step reads memory the same way, and a
 /// second copy of the bound below would be a second chance to get it wrong.
-fn read_memory(e: &DebugEngine, address: &str, size: u32) -> Result<String, String> {
+fn read_memory(e: &DebugEngine, address: &str, size: u32) -> Result<Output, String> {
     let addr = parse_u64(address)?;
     // Bounded before the allocation, not after. `size` arrives from the caller as a bare `u32`,
     // and a large one costs that many bytes here plus a hexdump several times larger — enough to
@@ -4271,8 +4438,18 @@ fn read_memory(e: &DebugEngine, address: &str, size: u32) -> Result<String, Stri
              own paging."
         ));
     }
+    addr.checked_add(u64::from(size))
+        .ok_or("memory range overflows")?;
     let bytes = e.read_memory(addr, size as usize).map_err(es)?;
-    Ok(hexdump(addr, &bytes))
+    Ok(Output::typed(
+        hexdump(addr, &bytes),
+        structured::MemoryRead {
+            address: structured::addr(addr),
+            requested_size: size,
+            read_size: bytes.len() as u32,
+            data: bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
+        },
+    ))
 }
 
 /// Resolves the address a walk starts from, **inside the walk's own deadline**.
@@ -4559,7 +4736,7 @@ impl Debuggee for BatchEngine<'_> {
     }
 
     fn read_memory(&mut self, address: &str, size: u32) -> Result<Ran, String> {
-        let output = read_memory(self.e, address, size)?;
+        let output = read_memory(self.e, address, size)?.text;
         Ok(Ran {
             output,
             interrupted: self.broken(),
@@ -5980,8 +6157,11 @@ fn resolve(e: &DebugEngine, expr: &str) -> Option<u64> {
 }
 
 fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, Failed> {
-    let target =
-        resolve(e, address).ok_or_else(|| format!("could not resolve address `{address}`"))?;
+    let target = address
+        .strip_prefix("0x")
+        .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        .or_else(|| resolve(e, address))
+        .ok_or_else(|| format!("could not resolve address `{address}`"))?;
     let res = e.run_to_address(target, wait).map_err(failed)?;
     query::invalidate_allocator_snapshots();
     let mut msg = match res.outcome {
@@ -9723,5 +9903,83 @@ mod tests {
                 "{broke_in:?} names the target it left half-open and the recovery: {interrupted}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+
+    fn module() -> structured::ModuleInfo {
+        serde_json::from_value(serde_json::json!({
+            "name": "driver", "image_name": "driver.sys", "start": "0x0000000000100000",
+            "end": "0x0000000000101000", "size": 4096, "timestamp": 123,
+            "checksum": 0, "symbols": "deferred", "user_mode": false
+        }))
+        .unwrap()
+    }
+
+    fn coordinate() -> structured::ImageCoordinate {
+        structured::ImageCoordinate {
+            module: "driver".into(),
+            image_name: "driver.sys".into(),
+            identity: structured::ImageIdentity {
+                timestamp: 123,
+                size: 4096,
+                pdb: None,
+            },
+            rva: "0x123".into(),
+        }
+    }
+
+    #[test]
+    fn current_location_distinguishes_absence_from_failed_attribution() {
+        use structured::LocationState;
+        assert!(matches!(
+            location_coordinate(None, Ok(None)).unwrap().0,
+            LocationState::ContextUnavailable
+        ));
+        assert!(matches!(
+            location_coordinate(Some(1), Ok(None)).unwrap().0,
+            LocationState::Unmapped
+        ));
+        assert!(matches!(
+            location_coordinate(Some(1), Err("lookup failed".into()))
+                .unwrap()
+                .0,
+            LocationState::AttributionFailed
+        ));
+        let (state, coordinate) = location_coordinate(Some(0x100123), Ok(Some(module()))).unwrap();
+        assert!(matches!(state, LocationState::Mapped));
+        assert_eq!(coordinate.unwrap().rva, "0x123");
+    }
+
+    #[test]
+    fn coordinate_is_resolved_against_the_current_image() {
+        let module = module();
+        assert_eq!(
+            guarded_address(&coordinate(), std::slice::from_ref(&module), 32).unwrap(),
+            0x100123
+        );
+        let mut replacement = module.clone();
+        replacement.timestamp += 1;
+        assert!(guarded_address(&coordinate(), &[replacement], 1).is_err());
+        assert!(guarded_address(&coordinate(), &[module.clone(), module], 1).is_err());
+        assert!(guarded_address(&coordinate(), &[], 1).is_err());
+    }
+
+    #[test]
+    fn coordinate_range_must_fit_entirely_in_the_loaded_image() {
+        let mut coordinate = coordinate();
+        coordinate.rva = "0xfff".into();
+        assert!(guarded_address(&coordinate, &[module()], 1).is_ok());
+        assert!(guarded_address(&coordinate, &[module()], 2).is_err());
+        coordinate.rva = "0x1000".into();
+        assert!(guarded_address(&coordinate, &[module()], 0).is_err());
+        coordinate.rva = "0x1;g".into();
+        assert!(guarded_address(&coordinate, &[module()], 1).is_err());
+        let mut unloaded = module();
+        unloaded.unloaded = true;
+        assert!(guarded_address(&self::coordinate(), &[unloaded], 1).is_err());
     }
 }

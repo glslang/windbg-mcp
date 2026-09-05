@@ -114,21 +114,26 @@ table), load the `.sys` in Binary Ninja:
    (`+0x20`). These confirm the `poi(@rdx+0xb8)+…` chain `ioctl_trace` uses — no runtime
    guesswork.
 4. Emit a **JSON IOCTL map** for the dynamic step to join against. Suggested schema (one object
-   per code):
+   per case site, preserving repeated codes):
 
    ```json
    {
      "code": "0x0022e004",
-     "device_type": "0x0022",
-     "function": "0x801",
-     "method": "METHOD_BUFFERED",
-     "required_access": "FILE_ANY_ACCESS",
+     "device_type": 34,
+     "function": 2049,
+     "method": "buffered",
+     "required_access": "read_write",
+     "dispatch_rva": "0x1200",
      "case_rva": "0x14c0",
-     "in_size": 8,
-     "out_size": 4,
-     "predicted_reachable": true
+     "in_size": null,
+     "out_size": null,
+     "evidence": []
    }
    ```
+
+   `0x0022e004` requires read and write access. Size fields are exact proven sizes or
+   `null`; retain minimum and conditional checks separately in `evidence`. Probe evidence
+   records observed sites and analysis coverage, not safe handling or a vulnerability.
 
    RVAs (`case_rva`) rebase to the live load base (`lm m <driver>`).
 

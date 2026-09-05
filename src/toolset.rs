@@ -112,6 +112,7 @@ const GROUPS: &[Group] = &[
         name: "inspect",
         tools: &[
             "registers",
+            "current_location",
             "backtrace",
             "disassemble",
             "read_memory",
@@ -510,7 +511,7 @@ mod tests {
         assert!(set.includes("end_session"));
         assert!(!set.includes("ttd_calls"));
         assert!(!set.includes("debug_batch"));
-        assert_eq!(set.summary(), "13 of 56 tools (session, crash)");
+        assert_eq!(set.summary(), "13 of 57 tools (session, crash)");
     }
 
     #[test]
@@ -521,7 +522,7 @@ mod tests {
         assert!(!set.includes("disassemble"));
         assert_eq!(
             set.summary(),
-            "12 of 56 tools (session, backtrace, registers)"
+            "12 of 57 tools (session, backtrace, registers)"
         );
     }
 
@@ -633,7 +634,7 @@ mod tests {
         // Both name the tool and what is served, because those do not depend on who chose it.
         for said in [&run, &own] {
             assert!(said.contains("`debug_batch`"), "{said}");
-            assert!(said.contains("13 of 56 tools (session, crash)"), "{said}");
+            assert!(said.contains("13 of 57 tools (session, crash)"), "{said}");
         }
     }
 
