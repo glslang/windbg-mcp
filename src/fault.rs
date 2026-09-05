@@ -124,6 +124,23 @@ pub struct StatusDecode {
     pub system_message: Option<String>,
     /// What `ntdll`'s message table says, reading the value as an `NTSTATUS`.
     pub ntstatus_message: Option<String>,
+    /// Which namespace the caller knows this value came from, where it knows.
+    pub reading: Reading,
+}
+
+/// What the caller knows about which namespace a value belongs to.
+///
+/// **The two overlap, so this is not a formatting preference — it is the difference between the
+/// right sentence and a plausible wrong one.** An exception record's code is an `NTSTATUS` by
+/// construction; a value typed into `decode_error_reporting` could be anything, and there the tool
+/// reports every reading rather than choosing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Reading {
+    /// A bare value: report all readings, lead with the `HRESULT` one.
+    #[default]
+    Unknown,
+    /// Known to be an `NTSTATUS` — an exception code, a bug check, a status returned by a syscall.
+    NtStatus,
 }
 
 impl StatusDecode {
@@ -131,7 +148,20 @@ impl StatusDecode {
     ///
     /// Prefers the symbolic name where there is one, because `E_UNEXPECTED` tells a reader more
     /// than "Catastrophic failure" does; then the system message; then `ntdll`'s.
+    ///
+    /// **Unless the caller knows the value is an `NTSTATUS`, in which case `ntdll`'s table leads
+    /// and the `HRESULT` name is suppressed entirely.** The two namespaces overlap, and where they
+    /// do the system table answers with the wrong one: `0x80000003` is `STATUS_BREAKPOINT`, and
+    /// `FormatMessage` reads it as `E_INVALIDARG` and returns "One or more arguments are invalid".
+    /// A debugger that prints that for every breakpoint is worse than one that prints nothing.
+    /// Both readings stay on the wire either way — this only decides which one leads.
     pub fn best_effort(&self) -> Option<String> {
+        if self.reading == Reading::NtStatus {
+            return self
+                .ntstatus_message
+                .clone()
+                .or_else(|| self.system_message.clone());
+        }
         match (
             self.symbolic,
             self.system_message.as_deref(),
@@ -188,19 +218,29 @@ impl Severity {
 /// has no package identity."), neither of which is a code anybody would think to hardcode. What
 /// they do *not* carry is the name a C++ programmer recognises, and for this handful the name is
 /// the more useful half: `E_UNEXPECTED` locates the throw where "Catastrophic failure" does not.
+///
+/// **And a name here outranks both message tables**, because [`StatusDecode::best_effort`] prefers
+/// it — so a wrong entry is not a cosmetic slip, it is the headline.
+///
+/// This table used to carry `0x80000001`–`0x80000009` as `E_NOTIMPL` … `E_ACCESSDENIED`.
+/// `winerror.h` really does define those names at those values — **inside the `#else` of
+/// `#if defined(_WIN32) && !defined(_MAC)`** (10.0.26100.0, `shared/winerror.h` lines 30418/30500),
+/// so they are the non-Win32 branch and dead on every platform this server runs on. The live branch
+/// puts `E_INVALIDARG` at `0x80070057` and `E_NOTIMPL` at `0x80004001`.
+///
+/// What made it a bug rather than a curiosity is that all nine collide with a defined `NTSTATUS`,
+/// and two of them are the likeliest codes in the whole range for a *debugger*: `0x80000003` is
+/// `STATUS_BREAKPOINT` and `0x80000004` is `STATUS_SINGLE_STEP`. Every breakpoint this tool decoded
+/// announced itself as `E_INVALIDARG`. Separately, `0x8000000e` was labelled
+/// `E_STRING_NOT_NULL_TERMINATED`, which is `0x80000017`; `0x8000000e` is `E_ILLEGAL_METHOD_CALL`.
+///
+/// Checked against this machine's SDK rather than from memory — which is how the error got in —
+/// and `test_no_well_known_name_shadows_a_code_this_module_classifies` keeps the collision out.
 const WELL_KNOWN: &[(u32, &str)] = &[
-    (0x8000_0001, "E_NOTIMPL"),
-    (0x8000_0002, "E_OUTOFMEMORY"),
-    (0x8000_0003, "E_INVALIDARG"),
-    (0x8000_0004, "E_NOINTERFACE"),
-    (0x8000_0005, "E_POINTER"),
-    (0x8000_0006, "E_HANDLE"),
-    (0x8000_0007, "E_ABORT"),
-    (0x8000_0008, "E_FAIL"),
-    (0x8000_0009, "E_ACCESSDENIED"),
     (0x8000_000b, "E_BOUNDS"),
     (0x8000_000c, "E_CHANGED_STATE"),
-    (0x8000_000e, "E_STRING_NOT_NULL_TERMINATED"),
+    (0x8000_000e, "E_ILLEGAL_METHOD_CALL"),
+    (0x8000_0017, "E_STRING_NOT_NULL_TERMINATED"),
     (0x8000_4001, "E_NOTIMPL"),
     (0x8000_4002, "E_NOINTERFACE"),
     (0x8000_4003, "E_POINTER"),
@@ -210,6 +250,7 @@ const WELL_KNOWN: &[(u32, &str)] = &[
     (0x8007_0005, "E_ACCESSDENIED"),
     (0x8007_000e, "E_OUTOFMEMORY"),
     (0x8007_0057, "E_INVALIDARG"),
+    (0x8007_0006, "E_HANDLE"),
     (0x0000_0000, "S_OK"),
     (0x0000_0001, "S_FALSE"),
 ];
@@ -221,7 +262,7 @@ const WELL_KNOWN: &[(u32, &str)] = &[
 /// result: a dump from a build that names an error differently will be described in this host's
 /// words. In practice these strings are stable across builds, and the alternative — `!error` in the
 /// engine — reads the same tables from the same machine.
-pub fn decode_status(value: u32) -> StatusDecode {
+pub fn decode_status_as(value: u32, reading: Reading) -> StatusDecode {
     let customer_defined = value & 0x2000_0000 != 0;
     StatusDecode {
         value,
@@ -230,10 +271,17 @@ pub fn decode_status(value: u32) -> StatusDecode {
         facility: (value >> 16) & 0x0fff,
         code: value as u16,
         customer_defined,
-        symbolic: WELL_KNOWN
-            .iter()
-            .find(|(known, _)| *known == value)
-            .map(|(_, name)| *name),
+        // **No `HRESULT` name for a value the caller has told us is a status.** The table is
+        // right about `0x8000ffff` as an `HRESULT` and would be wrong about it as an `NTSTATUS`,
+        // and there is no way to be right about both from the number alone.
+        symbolic: (reading == Reading::Unknown)
+            .then(|| {
+                WELL_KNOWN
+                    .iter()
+                    .find(|(known, _)| *known == value)
+                    .map(|(_, name)| *name)
+            })
+            .flatten(),
         // A customer-defined value is in nobody's table, and asking would return either nothing or
         // — worse — an unrelated Microsoft string that happens to share the number.
         system_message: (!customer_defined)
@@ -242,7 +290,13 @@ pub fn decode_status(value: u32) -> StatusDecode {
         ntstatus_message: (!customer_defined)
             .then(|| message::from_ntdll(value))
             .flatten(),
+        reading,
     }
+}
+
+/// A value of unknown provenance, which is what `decode_error_reporting` is given.
+pub fn decode_status(value: u32) -> StatusDecode {
+    decode_status_as(value, Reading::Unknown)
 }
 
 /// The host's message tables. The only impure code in this module, and it touches no debuggee.
@@ -1032,13 +1086,17 @@ pub fn status_info(decode: &StatusDecode) -> crate::structured::StatusInfo {
 
 /// The one sentence a fault gets, where the code alone would mislead.
 ///
-/// **`found_throw` is what separates a cause from a possibility.** An earlier draft said subcode 7
-/// "means a C++ exception nobody caught", and that is one of its causes rather than its meaning:
-/// `abort` is also reached by calling it, by `assert`, by the CRT's invalid-parameter handler, and
-/// by `terminate` for reasons that never involved a throw — a `noexcept` function that throws, a
-/// joinable `std::thread` destroyed. The record cannot tell those apart, so the summary stops at
-/// what the record says and names the throw only when one was actually read off the stack.
-fn summary_of(kind: &FaultKind, found_throw: bool) -> Option<String> {
+/// **[`ThrowEvidence`] is what separates a cause from a possibility.** An earlier draft said
+/// subcode 7 "means a C++ exception nobody caught", and that is one of its causes rather than its
+/// meaning: `abort` is also reached by calling it, by `assert`, by the CRT's invalid-parameter
+/// handler, and by `terminate` for reasons that never involved a throw — a `noexcept` function that
+/// throws, a joinable `std::thread` destroyed.
+///
+/// The draft after that named the throw whenever the scan found a record, which is better and still
+/// wrong: a found record may be a *handled* exception's, left on the stack by an earlier
+/// `try`/`catch`. Only [`ThrowEvidence::Dispatching`] — a record **and** a stack that shows the
+/// exception machinery running — supports the strong sentence.
+fn summary_of(kind: &FaultKind, evidence: ThrowEvidence) -> Option<String> {
     match kind {
         FaultKind::FailFast {
             subcode,
@@ -1050,14 +1108,25 @@ fn summary_of(kind: &FaultKind, found_throw: bool) -> Option<String> {
                 |name| format!("{name} (subcode {subcode:#x})"),
             );
             let abort = if *subcode == FAST_FAIL_FATAL_APP_EXIT {
-                if found_throw {
-                    " Subcode 7 is the CRT's abort(), and a C++ throw's own record was found \
-                     buried on this stack — so this one is an exception nobody caught, and THROWN \
-                     below is it."
-                } else {
-                    " Subcode 7 is the CRT's abort(): an uncaught C++ exception ends here, but so \
-                     does a direct abort(), a failed assert and every other terminate() — and no \
-                     throw record was found on this stack, so the record does not say which."
+                match evidence {
+                    ThrowEvidence::Dispatching => {
+                        " Subcode 7 is the CRT's abort(), the stack shows an exception being \
+                         dispatched, and the throw's own record was found on it — so this one is a \
+                         C++ exception nobody caught, and THROWN below is it."
+                    }
+                    ThrowEvidence::Scanned => {
+                        " Subcode 7 is the CRT's abort(): an uncaught C++ exception ends here, but \
+                         so does a direct abort(), a failed assert and every other terminate(). A \
+                         C++ throw record was found on this stack, but nothing on the stack shows \
+                         an exception in flight — and a record outlives the frames that held it, \
+                         so THROWN below may be from an exception this program handled earlier."
+                    }
+                    ThrowEvidence::None => {
+                        " Subcode 7 is the CRT's abort(): an uncaught C++ exception ends here, but \
+                         so does a direct abort(), a failed assert and every other terminate() — \
+                         and no throw record was found on this stack, so the record does not say \
+                         which."
+                    }
                 }
             } else {
                 ""
@@ -1083,6 +1152,58 @@ fn summary_of(kind: &FaultKind, found_throw: bool) -> Option<String> {
         ),
         FaultKind::Other => None,
     }
+}
+
+/// How much the buried-throw scan's find is worth.
+///
+/// **A record that parses is not a cause.** `find_cpp_records` promotes a candidate on
+/// self-consistency alone, and a C++ `EXCEPTION_RECORD` outlives the frames that held it: after a
+/// `try`/`catch`, the handler unwinds past the record but nothing erases it, so a later
+/// `abort()` — called directly, or through a failed `assert`, or through the invalid-parameter
+/// handler — that runs deeper than the old throw site finds a perfectly valid record above its
+/// stack pointer. It parses, its object is readable, its `HRESULT` decodes. It is simply from a
+/// different exception, one the program handled.
+///
+/// Geometry cannot separate the two: in both cases the record sits above the current stack pointer
+/// inside a live caller's frame. What does separate them is whether an exception is **being
+/// dispatched right now**, and the stack says so — an unhandled C++ throw reaches `abort` *through*
+/// `KiUserExceptionDispatcher` and the unhandled-exception filter, which are therefore still on the
+/// stack, while a direct `abort()` has none of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThrowEvidence {
+    /// No record was found, or none was looked for.
+    None,
+    /// A record was found and parsed, and nothing on the stack says an exception is in flight —
+    /// so it may predate this fault.
+    Scanned,
+    /// A record was found *and* the stack shows an exception being dispatched.
+    Dispatching,
+}
+
+/// Frames that mean an exception is in flight, rather than merely having happened once.
+///
+/// All from the dispatch path an unhandled throw takes to `terminate`, and none of them on the
+/// stack of a direct `abort()`. `ntdll` and `KERNELBASE` are the modules involved, so this works on
+/// a host that has no symbols for the *faulting* image — which is the ordinary case for a dump from
+/// another machine, and is why the corroboration is not keyed on the throwing module's own frames.
+const DISPATCH_FRAMES: &[&str] = &[
+    "KiUserExceptionDispatcher",
+    "UnhandledExceptionFilter",
+    "CxxThrowException",
+    "RaiseException",
+];
+
+/// Whether a walked stack shows an exception being dispatched.
+///
+/// Symbol-based, and therefore **weaker on a host with no symbols at all** — where it answers
+/// `false` and the caller says less rather than guessing more. That is the right direction: the
+/// thrown object and its `HRESULT` are reported either way, and only the claim about *cause* is
+/// withheld.
+pub fn stack_is_dispatching(symbols: impl IntoIterator<Item = impl AsRef<str>>) -> bool {
+    symbols.into_iter().any(|symbol| {
+        let symbol = symbol.as_ref();
+        DISPATCH_FRAMES.iter().any(|frame| symbol.contains(frame))
+    })
 }
 
 /// Whether this fault is the shape that can have a C++ throw buried under it.
@@ -1121,8 +1242,22 @@ fn kind_word(kind: &FaultKind) -> &'static str {
     }
 }
 
+/// The word [`crate::structured::ThrownErrorInfo::provenance`] carries.
+fn provenance_word(evidence: ThrowEvidence, reported: bool) -> Option<&'static str> {
+    match (evidence, reported) {
+        (ThrowEvidence::None, _) => None,
+        (_, true) => Some("reported"),
+        (ThrowEvidence::Dispatching, false) => Some("dispatching"),
+        (ThrowEvidence::Scanned, false) => Some("scanned"),
+    }
+}
+
 /// [`ThrownError`] as the wire type.
-pub fn thrown_info(thrown: &ThrownError) -> crate::structured::ThrownErrorInfo {
+pub fn thrown_info(
+    thrown: &ThrownError,
+    evidence: ThrowEvidence,
+    reported: bool,
+) -> crate::structured::ThrownErrorInfo {
     crate::structured::ThrownErrorInfo {
         object: format!("{:#018x}", thrown.object),
         type_name: thrown.type_name.clone(),
@@ -1139,6 +1274,7 @@ pub fn thrown_info(thrown: &ThrownError) -> crate::structured::ThrownErrorInfo {
             .to_string()
         }),
         type_note: thrown.type_note.clone(),
+        provenance: provenance_word(evidence, reported).map(str::to_string),
     }
 }
 
@@ -1149,7 +1285,8 @@ pub fn exception_info(
 ) -> crate::structured::ExceptionInfo {
     crate::structured::ExceptionInfo {
         code: format!("{:#010x}", record.code),
-        decoded: status_info(&decode_status(record.code)),
+        // An exception code *is* an `NTSTATUS`, so it is decoded as one rather than guessed at.
+        decoded: status_info(&decode_status_as(record.code, Reading::NtStatus)),
         address: format!("{:#018x}", record.address),
         flags: format!("{:#x}", record.flags),
         noncontinuable: record.noncontinuable(),
@@ -1170,6 +1307,7 @@ pub fn report(
     first_chance: bool,
     kind: &FaultKind,
     thrown: Option<&ThrownError>,
+    evidence: ThrowEvidence,
     frames: Vec<crate::structured::FrameInfo>,
     frames_truncated: bool,
     frames_from_stored_context: bool,
@@ -1178,8 +1316,9 @@ pub fn report(
     crate::structured::ExceptionTriage {
         exception: exception_info(record, first_chance),
         kind: kind_word(kind).to_string(),
-        summary: summary_of(kind, thrown.is_some()),
-        thrown: thrown.map(thrown_info),
+        summary: summary_of(kind, evidence),
+        thrown: thrown
+            .map(|thrown| thrown_info(thrown, evidence, matches!(kind, FaultKind::CppThrow(_)))),
         failure: match kind {
             FaultKind::FailFast { wil: Some(wil), .. } => Some(crate::structured::WilFailureInfo {
                 hresult: status_info(&decode_status(wil.hresult)),
@@ -1258,6 +1397,14 @@ pub fn render(triage: &crate::structured::ExceptionTriage) -> String {
             text.push_str(
                 "  found by the winrt::hresult_error sentinel, which no header states — it is \
                  believable because it decodes, not because of where it sat.\n",
+            );
+        }
+        if thrown.provenance.as_deref() == Some("scanned") {
+            text.push_str(
+                "  CAUTION: found by scanning the stack, and nothing on the stack shows an \
+                 exception in flight — such a record outlives the frames that held it, so this \
+                 may be from an exception the program caught earlier rather than the cause of \
+                 this fault.\n",
             );
         }
         if let Some(note) = &thrown.type_note {
@@ -1829,7 +1976,8 @@ mod tests {
             Bitness::Bits64,
         );
 
-        let alone = summary_of(&abort, false).expect("a fail-fast always gets a summary");
+        let alone =
+            summary_of(&abort, ThrowEvidence::None).expect("a fail-fast always gets a summary");
         assert!(
             alone.contains("FAST_FAIL_FATAL_APP_EXIT"),
             "the subcode is what says why, and has to be named: {alone}"
@@ -1844,20 +1992,183 @@ mod tests {
             "a summary that cannot tell the causes apart has to say so: {alone}"
         );
 
-        let found = summary_of(&abort, true).expect("a fail-fast always gets a summary");
+        // **A record that merely parses does not promote the claim.** The middle case, and the one
+        // a bare `found: bool` got wrong: an `abort()` called directly after the program caught an
+        // exception earlier finds that exception's record, still valid, above its stack pointer.
+        let stale =
+            summary_of(&abort, ThrowEvidence::Scanned).expect("a fail-fast always gets a summary");
+        assert!(
+            !stale.contains("nobody caught"),
+            "a scanned record with nothing corroborating it was reported as the cause: {stale}"
+        );
+        assert!(
+            stale.contains("handled earlier"),
+            "a scanned record has to carry the reason it might not be this fault's: {stale}"
+        );
+
+        let found = summary_of(&abort, ThrowEvidence::Dispatching)
+            .expect("a fail-fast always gets a summary");
         assert!(
             found.contains("nobody caught"),
-            "with the throw's own record read off the stack, this one really is uncaught: {found}"
+            "with a record *and* a dispatching stack, this one really is uncaught: {found}"
         );
 
         // And another subcode gets neither sentence, rather than the abort story with a different
         // number in it.
         let cookie = classify(STATUS_STACK_BUFFER_OVERRUN, &[2], Bitness::Bits64);
-        let text = summary_of(&cookie, false).expect("a fail-fast always gets a summary");
+        let text =
+            summary_of(&cookie, ThrowEvidence::None).expect("a fail-fast always gets a summary");
         assert!(!text.contains("abort()"), "{text}");
         assert!(
             text.contains("FAST_FAIL_STACK_COOKIE_CHECK_FAILURE"),
             "{text}"
+        );
+    }
+
+    /// **A dispatching stack is what promotes a scanned record, and symbols are how it is seen.**
+    ///
+    /// The frames named are the exception machinery's, in `ntdll` and `KERNELBASE` — deliberately
+    /// not the throwing module's, because a dump from another machine has no symbols for *that*
+    /// image and would otherwise never corroborate.
+    #[test]
+    fn test_the_dispatch_frames_are_what_say_an_exception_is_in_flight() {
+        assert!(stack_is_dispatching([
+            "cppthrow!abort",
+            "ntdll!KiUserExceptionDispatcher",
+            "cppthrow!main",
+        ]));
+        assert!(stack_is_dispatching([
+            "KERNELBASE!UnhandledExceptionFilter"
+        ]));
+        assert!(stack_is_dispatching(["cppthrow32!_CxxThrowException"]));
+
+        // A direct abort(): the CRT's own frames, and nothing dispatching.
+        assert!(
+            !stack_is_dispatching([
+                "cppthrow!abort",
+                "cppthrow!main",
+                "kernel32!BaseThreadInitThunk"
+            ]),
+            "a direct abort() was read as an exception in flight"
+        );
+        // And a host with no symbols at all cannot corroborate, which is the honest answer rather
+        // than a reason to assume either way.
+        assert!(!stack_is_dispatching(Vec::<String>::new()));
+    }
+
+    /// **No name in this table may shadow a code this module itself classifies as a fault.**
+    ///
+    /// The table used to carry the non-Win32 `E_*` values, where `0x80000003` is `E_INVALIDARG` —
+    /// and `0x80000003` is `STATUS_BREAKPOINT`, a constant defined twenty lines away in this same
+    /// file. Since `best_effort` prefers the symbolic name, every breakpoint decoded as
+    /// `E_INVALIDARG`. This is the assertion that the two namespaces stay apart, written against
+    /// the codes this module actually meets rather than against all of `ntstatus.h`.
+    #[test]
+    fn test_no_well_known_name_shadows_a_code_this_module_classifies() {
+        for code in [
+            STATUS_BREAKPOINT,
+            STATUS_ACCESS_VIOLATION,
+            STATUS_STACK_BUFFER_OVERRUN,
+            STATUS_CPP_EH_EXCEPTION,
+            0x8000_0004, // STATUS_SINGLE_STEP
+            0x8000_0001, // STATUS_GUARD_PAGE_VIOLATION
+            0x8000_0002, // STATUS_DATATYPE_MISALIGNMENT
+        ] {
+            assert!(
+                !WELL_KNOWN.iter().any(|(known, _)| *known == code),
+                "{code:#010x} is an NTSTATUS this module decodes, and the HRESULT table claims it"
+            );
+        }
+
+        // **The breakpoint a debugger meets constantly must decode as one**, and removing the
+        // bogus name was only half of it: `FormatMessage` reads `0x80000003` as `E_INVALIDARG` and
+        // answers "One or more arguments are invalid", so the *message* was wrong even once the
+        // name was gone. An exception code is an `NTSTATUS`, and saying so is what fixes it.
+        let as_code = decode_status_as(STATUS_BREAKPOINT, Reading::NtStatus);
+        assert_eq!(as_code.symbolic, None, "a status was given an HRESULT name");
+        assert!(
+            as_code
+                .best_effort()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains("breakpoint"),
+            "a breakpoint did not describe itself as one: {as_code:?}"
+        );
+
+        // Asked about the bare number, the tool still reports **both** readings rather than
+        // choosing for the caller - that is `decode_error_reporting`'s whole design, and the
+        // ambiguity is real: this value is a legitimate `E_INVALIDARG` in the non-Win32 headers.
+        let bare = decode_status(STATUS_BREAKPOINT);
+        assert!(bare.system_message.is_some(), "{bare:?}");
+        assert!(
+            bare.ntstatus_message
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .contains("breakpoint"),
+            "the status reading has to survive even when it does not lead: {bare:?}"
+        );
+    }
+
+    /// The names that remain are the SDK's, checked rather than recalled.
+    ///
+    /// Spot-checked against `shared/winerror.h` 10.0.26100.0 — the `#if defined(_WIN32)` branch,
+    /// which is the live one here. The whole table was compared against that header when the
+    /// non-Win32 values were removed; these are the entries whose being wrong would be worst.
+    #[test]
+    fn test_every_well_known_name_is_the_sdks_win32_value() {
+        for (code, name) in [
+            (0x8000_4001u32, "E_NOTIMPL"),
+            (0x8000_4002, "E_NOINTERFACE"),
+            (0x8000_4003, "E_POINTER"),
+            (0x8000_4004, "E_ABORT"),
+            (0x8000_4005, "E_FAIL"),
+            (0x8007_0005, "E_ACCESSDENIED"),
+            (0x8007_0006, "E_HANDLE"),
+            (0x8007_000e, "E_OUTOFMEMORY"),
+            (0x8007_0057, "E_INVALIDARG"),
+            (0x8000_ffff, "E_UNEXPECTED"),
+            (0x8000_000e, "E_ILLEGAL_METHOD_CALL"),
+            (0x8000_0017, "E_STRING_NOT_NULL_TERMINATED"),
+        ] {
+            assert_eq!(
+                decode_status(code).symbolic,
+                Some(name),
+                "{code:#010x} is not the name this build gives it"
+            );
+        }
+    }
+
+    /// **The record a caller actually receives says "breakpoint", and that is a separate claim
+    /// from `decode_status_as` being able to.**
+    ///
+    /// Written because mutation testing found the gap: reverting `exception_info` to decode the
+    /// code as a bare value left every test green, since they all called the decoder directly.
+    /// The rule that matters is the one at the *call site* — an exception code is an `NTSTATUS` —
+    /// so it is asserted through [`exception_info`], on the value that made this a bug.
+    #[test]
+    fn test_a_breakpoints_exception_record_reads_as_a_breakpoint() {
+        let record = dbgscope::dbgeng::ExceptionRecord {
+            code: STATUS_BREAKPOINT,
+            flags: 0,
+            address: 0x7ff8_1234_5678,
+            parameters: vec![0],
+            nested: None,
+        };
+        let info = exception_info(&record, true);
+        let best = info.decoded.best_effort.unwrap_or_default();
+        assert!(
+            best.to_ascii_lowercase().contains("breakpoint"),
+            "the exception a debugger meets most did not describe itself: {best}"
+        );
+        assert!(
+            !best.contains("arguments are invalid"),
+            "the system table's HRESULT reading led for a value that is an NTSTATUS: {best}"
+        );
+        assert!(
+            info.decoded.symbolic.is_none(),
+            "an exception code was given an HRESULT name: {:?}",
+            info.decoded.symbolic
         );
     }
 

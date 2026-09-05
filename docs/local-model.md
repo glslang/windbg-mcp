@@ -288,9 +288,9 @@ spec. Re-read them rather than trusting this table, which has been stale before.
 
 | | bytes | ≈tokens |
 |---|---|---|
-| The tool surface, paid once per conversation | 80,177 (56 tools) | ~20k |
+| The tool surface, paid once per conversation | 80,549 (56 tools) | ~20k |
 | — the same surface as `--tools session,inspect,crash` | 26,305 (20 tools) | ~6.5k |
-| — as `--tools crash` | 18,378 (13 tools) | ~4.5k |
+| — as `--tools crash` | 18,750 (13 tools) | ~4.5k |
 | Its worst single tool (`debug_batch`) | 10,021 | ~2.5k |
 | The largest answer this server gives (`modules`) | 53,875 | ~13k |
 | `read_memory` at its design limit | ~4 MiB of hex | ~1M |
@@ -463,7 +463,7 @@ client-side.**
 
 - **The tool-surface profile is `--tools`** (2026-08-22). Start the listener with
   `--tools session,inspect,crash` and the surface is 20 tools and 25,465 B instead of 51 and
-  68,893 — `--tools crash` is 13 and 18,378 B, which is the difference between "roughly twice an 8k
+  68,893 — `--tools crash` is 13 and 18,750 B, which is the difference between "roughly twice an 8k
   window" and "half of one". The tools that remain are the tools they were, less the sentences
   pointing at ones that went (item 41).
   The whole table is in [`token-budget.md`](./token-budget.md) under finding 8, and the README has

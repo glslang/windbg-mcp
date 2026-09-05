@@ -37,6 +37,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exception: it is one of its causes, alongside a direct `abort()`, a failed `assert` and every
   other `terminate()`, and the sentence names the throw only when the scan actually found one.
 
+  A recovered record carries **`provenance`**, because finding one does not make it this fault's:
+  a C++ `EXCEPTION_RECORD` outlives the frames that held it, so a direct `abort()` deeper than an
+  earlier `try`/`catch` finds a valid record above its stack pointer — measured, on
+  `docs/samples/stale-throw-abort.dmp`, which is checked in as the negative case. `dispatching`
+  means the stack also shows the exception machinery running (`KiUserExceptionDispatcher` and the
+  unhandled-exception filter, whose symbols come from `ntdll`/`KERNELBASE` rather than the faulting
+  image), `scanned` means it does not, and only the first lets the summary name an uncaught
+  exception.
+
+  **An exception record's code is decoded as an `NTSTATUS`.** The namespaces overlap and the system
+  message table answers for the wrong one where they do: `0x80000003` is `STATUS_BREAKPOINT`, and
+  `FormatMessage` reads it as `E_INVALIDARG` — so every breakpoint used to report "One or more
+  arguments are invalid". `decode_error_reporting`, given a number of unknown provenance, still
+  reports every reading. Relatedly the symbolic-name table had carried `winerror.h`'s **non-Win32**
+  `E_*` block (`0x80000001`–`0x80000009`, behind the `#else` of `#if defined(_WIN32)`), whose nine
+  values each shadow a defined `NTSTATUS`; they are gone, `0x8000000e` is `E_ILLEGAL_METHOD_CALL`
+  rather than `E_STRING_NOT_NULL_TERMINATED`, and a test keeps the two namespaces apart.
+
   The whole C++ EH decode is laid out at the **target's** pointer width rather than this build's.
   A 32-bit throw raises three parameters where a 64-bit one raises four, its `EXCEPTION_RECORD` is
   80 bytes rather than 152, and `TypeDescriptor::name` is at `+8` rather than `+16` — each of which
@@ -68,8 +86,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session stopped pointing at `backtrace` and `execute`. Those are `inspect`, so a `--tools crash`
   caller — the surface most likely to hit that refusal — was guaranteed to get no pointer with it.
   It names `exception_triage` now, which that caller has.
-- The tool surface is **56 tools and 80,177 B** of model context, from 54 and 75,547 (measured
-  2026-09-05). `--tools crash` is 13 tools and 18,378 B.
+- The tool surface is **56 tools and 80,549 B** of model context, from 54 and 75,547 (measured
+  2026-09-05). `--tools crash` is 13 tools and 18,750 B.
 
 [dbgscope#144]: https://github.com/glslang/dbgscope/pull/144
 

@@ -2583,6 +2583,17 @@ pub struct ThrownErrorInfo {
     /// How [`Self::hresult`] was found: `convention`, always, and named rather than assumed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hresult_confidence: Option<String>,
+    /// How this record was obtained, and - when it was scanned for rather than reported - whether
+    /// anything corroborates that it belongs to *this* fault.
+    ///
+    /// `reported` when the debugger stopped on the throw itself. Otherwise the record was found by
+    /// scanning the stack, and a C++ `EXCEPTION_RECORD` outlives the frames that held it: a
+    /// `try`/`catch` unwinds past one without erasing it. So `dispatching` means the stack also
+    /// shows the exception machinery running, which a direct `abort()` has no reason to, and
+    /// `scanned` means it does not - **the object below may be one this program handled**, and the
+    /// fault may have nothing to do with it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<String>,
     /// Why the type could not be named, when it could not.
     ///
     /// Nearly always the same reason, and it is a fact about **dumps** rather than about this

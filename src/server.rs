@@ -3569,11 +3569,16 @@ impl WindbgServer {
     /// The counterpart to a bug check for a process rather than a machine.
     /// Answers the question a stack alone cannot: `0xc0000409` is a deliberate process exit
     /// rather than the stack buffer overrun its name and the system's message text claim, and
-    /// what says why is the subcode — 7 is the CRT's abort, i.e. a C++ exception nobody caught.
-    /// For an unhandled throw it recovers the thrown object and the HRESULT it carries: the
-    /// record the debugger sees is the fail-fast, so the throw's own record is found by searching
-    /// the crashing thread's stack, and the thrown type is decoded from the compiler's own
-    /// descriptors where the module's image is reachable.
+    /// what says why is the subcode — 7 is the CRT's abort, which an uncaught C++ exception
+    /// reaches through `terminate` but so does a direct `abort()`, a failed assert and the
+    /// invalid-parameter handler.
+    /// For that subcode it recovers the thrown object and the HRESULT it carries: the record the
+    /// debugger sees is the fail-fast, so the throw's own record is found by searching the
+    /// crashing thread's stack, and the thrown type is decoded from the compiler's own descriptors
+    /// where the module's image is reachable. A found record carries `provenance`, because such a
+    /// record outlives the frames that held it — `dispatching` when the stack also shows the
+    /// exception machinery running, `scanned` when it does not and the object may be from an
+    /// exception this program handled earlier.
     /// The stack is walked from the register context the dump was written with, so it is the
     /// crash whatever thread the session has selected — and the selection is left where it was,
     /// which is what keeps this a read of the target.

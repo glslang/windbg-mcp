@@ -1448,11 +1448,33 @@ visible in anything a debugger prints, and all of which is in the file. Check be
 search the dump for `\Users\` as both ASCII and UTF-16LE, and expect the only paths in it to be
 `C:\Windows\System32\*` and `C:\wmfixture\cppthrow.exe`.
 
-The 32-bit one is the same source through `vcvars32.bat`, with its own WER key:
+The 32-bit one is the **same source** through `vcvars32.bat`, copied under its own name so the
+two builds do not share object files, and with a WER key of its own — the key is matched on the
+executable's name, so `cppthrow.exe`'s does not cover it:
 
 ```pwsh
+Copy-Item docs\samples\cppthrow.cpp $dir\cppthrow32.cpp
 cmd /c '"C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars32.bat" && cd /d C:\wmfixture && cl /nologo /EHsc /Zi /MT /Od cppthrow32.cpp /Fe:cppthrow32.exe'
+
+$k32 = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\cppthrow32.exe'
+New-Item -Path $k32 -Force | Out-Null
+New-ItemProperty -Path $k32 -Name DumpFolder -Value "$dir\dumps" -PropertyType ExpandString -Force
+New-ItemProperty -Path $k32 -Name DumpType   -Value 1 -PropertyType DWord -Force
+New-ItemProperty -Path $k32 -Name DumpCount  -Value 2 -PropertyType DWord -Force
 ```
+
+Then run it with the same scrubbed environment as above, pointing `$psi.FileName` at
+`$dir\cppthrow32.exe`.
+
+### The negative fixture
+
+`docs/samples/stale-throw-abort.dmp` is the case that says the guard above is not decoration.
+`docs/samples/staleabort.cpp` catches an exception and then calls `abort()` from deeper than the
+throw site, so the handled exception's record is still on the stack above the aborting frame — and
+the buried-throw scan **does** find one there. The fault is `0xc0000409` subcode 7 with one
+parameter, byte for byte the shape of a genuine unhandled throw, so only the absence of the
+exception machinery on the stack tells them apart. Build and capture it exactly as above, with the
+scrubbed environment, under its own WER key.
 
 **Delete `C:\wmfixture` afterwards, or know that you are the one host the tests behave differently
 on.** The dumps carry no image, and on x64 the unwind data lives in the image's `.pdata` — so a

@@ -186,6 +186,12 @@ const USER_FAULT_DUMP_X86: &str = concat!(
     "/docs/samples/cppthrow-fastfail-x86.dmp"
 );
 
+/// The **negative** fixture: an exception the program caught, then a direct `abort()` deeper.
+const STALE_THROW_DUMP: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/docs/samples/stale-throw-abort.dmp"
+);
+
 /// A checked-in **driver** crash and the facts about it that
 /// [`a_driver_crash_names_the_driver_frame_an_all_kernel_walk_would_miss`] asserts, so one test
 /// body covers both architectures' stacks rather than naming one file.
@@ -4808,6 +4814,78 @@ fn a_32_bit_user_mode_fault_is_triaged_at_its_own_pointer_width() {
     assert_eq!(data["frames_from_stored_context"], true, "{data}");
     let frames = data["frames"].as_array().expect("no frames");
     assert_eq!(frames[0]["module"], "cppthrow32", "{data}");
+
+    server.call_tool("end_session", json!({ "session_id": session }), STEP);
+}
+
+/// **A stale throw record must not become this fault's cause**, which is a claim no synthetic
+/// test could make credible on its own.
+///
+/// `docs/samples/staleabort.cpp` catches an exception and then calls `abort()` from deeper than the
+/// throw site, so the handled exception's `EXCEPTION_RECORD` is still on the stack above the
+/// aborting frame's stack pointer. The fault is `0xc0000409` subcode 7 with one parameter — byte
+/// for byte the shape of a genuine unhandled throw — so nothing in the record tells them apart, and
+/// the buried-throw scan finds a record here.
+///
+/// **It really does**, measured on this dump: the scan promotes a candidate, so the guard cannot be
+/// "the scan will not find anything". What separates the two is that no exception is being
+/// dispatched — none of the exception machinery is on this stack — and that is what the summary and
+/// `provenance` are required to say.
+#[test]
+fn a_stale_throw_record_is_not_reported_as_this_faults_cause() {
+    if !launch_tier() {
+        return;
+    }
+    if !std::path::Path::new(STALE_THROW_DUMP).exists() {
+        skip(&format!("stale-throw dump not found at {STALE_THROW_DUMP}"));
+        return;
+    }
+    let mut server = Server::started();
+    let session = server.open_session(
+        "open_dump",
+        json!({ "path": STALE_THROW_DUMP }),
+        TARGET_STEP,
+    );
+
+    let out = server.call_tool(
+        "exception_triage",
+        json!({ "session_id": session }),
+        TARGET_STEP,
+    );
+    let data = &out["result"]["structuredContent"];
+    assert_eq!(data["status"], "ok", "{out}");
+
+    // The same fault shape as the genuine one, which is the whole difficulty.
+    assert_eq!(data["exception"]["code"], "0xc0000409", "{data}");
+    assert_eq!(data["kind"], "fail_fast", "{data}");
+    assert_eq!(
+        data["exception"]["parameters"].as_array().map(Vec::len),
+        Some(1),
+        "{data}"
+    );
+
+    // **The claim, and it holds whether or not the scan found anything here.** If a record was
+    // found it must be labelled as merely scanned; either way the summary must not name an
+    // uncaught exception, because nothing on this stack supports one.
+    let summary = data["summary"].as_str().unwrap_or_default();
+    assert!(
+        !summary.contains("nobody caught"),
+        "a direct abort() was reported as an uncaught C++ exception: {summary}"
+    );
+
+    match data["thrown"].as_object() {
+        Some(thrown) => {
+            assert_eq!(
+                thrown["provenance"], "scanned",
+                "a record found with nothing dispatching must say so: {thrown:?}"
+            );
+            assert!(
+                summary.contains("handled earlier"),
+                "the summary has to carry the caveat the provenance implies: {summary}"
+            );
+        }
+        None => skip("no throw record was found on this host's read of the stale-abort dump"),
+    }
 
     server.call_tool("end_session", json!({ "session_id": session }), STEP);
 }
