@@ -511,6 +511,18 @@ pub struct CppThrow {
     pub bitness: Bitness,
 }
 
+/// The two subcodes for which `0xc0000409`'s name is the literal truth.
+///
+/// **The dismissal this module's summary leads with is wrong for exactly these.** `0xc0000409` is
+/// `STATUS_STACK_BUFFER_OVERRUN` and almost never one — except when the subcode says a `/GS` cookie
+/// check failed, which is the compiler reporting that the guard value between a local buffer and
+/// the return address was overwritten. There, stack corruption is not a misreading of the code's
+/// name; it is the finding, and telling a reader otherwise sends them away from the defect.
+const GS_COOKIE_SUBCODES: &[u64] = &[
+    0, // FAST_FAIL_LEGACY_GS_VIOLATION
+    2, // FAST_FAIL_STACK_COOKIE_CHECK_FAILURE
+];
+
 /// `FAST_FAIL_FATAL_APP_EXIT`, the subcode the CRT's `abort` raises.
 ///
 /// Named because two decisions turn on it and they must not drift apart: the sentence
@@ -881,7 +893,21 @@ fn hresult_in(read: &Read<'_>, object: u64, size: Option<u32>) -> Option<u32> {
         };
         let word = u32::from_le_bytes(window.get(..4)?.try_into().ok()?);
         if word == HRESULT_ERROR_SENTINEL {
-            return Some(u32::from_le_bytes(window.get(4..8)?.try_into().ok()?));
+            let candidate = u32::from_le_bytes(window.get(4..8)?.try_into().ok()?);
+            // **Checked, because the sentinel alone was never the reason to believe it.** Four
+            // bytes with no header behind them occur, and the claim made about a hit has always
+            // been that the number *after* it decodes — so that has to be tested rather than
+            // asserted in prose. A `winrt::hresult_error` exists to carry a failure, so bit 31 is
+            // set in every one of them; a success code or an arbitrary member value there means
+            // this object is not one and the four bytes were a coincidence.
+            //
+            // Bit 31 only, not "resolves to a message": a failed HRESULT from a component whose
+            // table this host does not have is still a real HRESULT, and `StatusInfo` already
+            // reports whether it resolved. Rejecting those would trade a rare false positive for a
+            // common false negative.
+            if decode_status(candidate).hresult_failed {
+                return Some(candidate);
+            }
         }
     }
     None
@@ -1151,11 +1177,17 @@ fn summary_of(kind: &FaultKind, evidence: ThrowEvidence) -> Option<String> {
             } else {
                 ""
             };
-            Some(format!(
+            // **The lead sentence is conditional, because for two subcodes it would be false.**
+            let lead = if subcode.is_some_and(|s| GS_COOKIE_SUBCODES.contains(&s)) {
+                "a __fastfail, and one of the two whose code name is the literal truth: a /GS \
+                 stack cookie check failed, which means the guard value between a local buffer \
+                 and the return address was overwritten. Stack corruption is the finding here, \
+                 not a misreading of the code's name"
+            } else {
                 "a __fastfail — a deliberate process exit, not a stack buffer overrun, whatever \
-                 the code's name and the system's message text for it say. {named} is what says \
-                 why.{abort}"
-            ))
+                 the code's name and the system's message text for it say"
+            };
+            Some(format!("{lead}. {named} is what says why.{abort}"))
         }
         FaultKind::CppThrow(_) => Some(
             "a C++ throw that reached RaiseException. The thrown object is what carries the \
@@ -1255,15 +1287,21 @@ pub fn object_is_on_the_scanned_stack(throw: &CppThrow, low: u64, high: u64) -> 
 /// carrying none of WIL's fields. A WIL fail-fast puts its `HRESULT` in parameter 1, so there is
 /// nothing buried to go looking for, and a fail-fast with any other subcode was not reached
 /// through `terminate` at all.
-pub fn may_bury_a_throw(kind: &FaultKind) -> bool {
-    matches!(
-        kind,
-        FaultKind::FailFast {
-            subcode: Some(FAST_FAIL_FATAL_APP_EXIT),
-            wil: None,
-            ..
-        }
-    )
+pub fn may_bury_a_throw(kind: &FaultKind, parameters: &[u64]) -> bool {
+    // **The count is checked here rather than inferred from `wil`,** which is the mistake this
+    // replaces: `wil` is `None` for *anything* that is not exactly three parameters, so a
+    // subcode-7 record with two or four also passed. The shape the scan exists for is the CRT's,
+    // and that is one parameter — the walkthrough's own rule, and the same count the classifier
+    // uses to tell the CRT's fail-fast from WIL's.
+    parameters.len() == 1
+        && matches!(
+            kind,
+            FaultKind::FailFast {
+                subcode: Some(FAST_FAIL_FATAL_APP_EXIT),
+                wil: None,
+                ..
+            }
+        )
 }
 
 /// The kind, as the one stable word a caller branches on.
@@ -1427,8 +1465,9 @@ pub fn render(triage: &crate::structured::ExceptionTriage) -> String {
                     .unwrap_or_default()
             ));
             text.push_str(
-                "  found by the winrt::hresult_error sentinel, which no header states — it is \
-                 believable because it decodes, not because of where it sat.\n",
+                "  found by the winrt::hresult_error sentinel, which no header states — the \
+                 value after it is checked to be a failed HRESULT, so it is believable because of \
+                 what it is rather than where it sat.\n",
             );
         }
         if thrown.provenance.as_deref() == Some("scanned") {
@@ -1946,50 +1985,128 @@ mod tests {
     /// cause: specific, plausible and wrong.
     #[test]
     fn test_only_an_abort_fail_fast_goes_looking_for_a_buried_throw() {
-        let fail_fast =
-            |parameters: &[u64]| classify(STATUS_STACK_BUFFER_OVERRUN, parameters, Bitness::Bits64);
+        let gate = |parameters: &[u64]| {
+            let kind = classify(STATUS_STACK_BUFFER_OVERRUN, parameters, Bitness::Bits64);
+            may_bury_a_throw(&kind, parameters)
+        };
 
-        // The shape it exists for: `abort`, whose cause is not in its own record.
-        assert!(may_bury_a_throw(&fail_fast(&[FAST_FAIL_FATAL_APP_EXIT])));
+        // The shape it exists for: the CRT's `abort`, one parameter, cause not in its own record.
+        assert!(gate(&[FAST_FAIL_FATAL_APP_EXIT]));
 
-        // WIL's fail-fast carries the HRESULT in parameter 1, so there is nothing buried.
+        // **Every other count is refused, and the count is checked rather than inferred.** Reading
+        // it off `wil` — which is `None` for anything that is not exactly three — let two- and
+        // four-parameter subcode-7 records through, since neither is WIL's either.
         assert!(
-            !may_bury_a_throw(&fail_fast(&[
-                FAST_FAIL_FATAL_APP_EXIT,
-                0xffff_ffff_8000_ffff,
-                0x28f
-            ])),
+            !gate(&[FAST_FAIL_FATAL_APP_EXIT, 0x1234]),
+            "a two-parameter fail-fast is not the CRT's one-parameter abort"
+        );
+        assert!(
+            !gate(&[FAST_FAIL_FATAL_APP_EXIT, 0xffff_ffff_8000_ffff, 0x28f]),
             "a WIL fail-fast has its cause in the record and must not be hunted for another"
+        );
+        assert!(
+            !gate(&[FAST_FAIL_FATAL_APP_EXIT, 1, 2, 3]),
+            "a four-parameter fail-fast is some third thing, not the CRT's"
         );
 
         // Another subcode is another mechanism entirely — a stack cookie, a corrupt list entry —
         // and none of them arrives through `terminate`.
-        assert!(!may_bury_a_throw(&fail_fast(&[2])));
+        assert!(!gate(&[2]));
 
         // And the faults that motivated the gate: these all lack a throw in the record, which is
         // the property the first version keyed on.
-        assert!(!may_bury_a_throw(&classify(
-            STATUS_ACCESS_VIOLATION,
-            &[1, 0xdead_beef],
-            Bitness::Bits64
-        )));
-        assert!(!may_bury_a_throw(&classify(
-            STATUS_BREAKPOINT,
-            &[],
-            Bitness::Bits64
-        )));
-        assert!(!may_bury_a_throw(&classify(
-            0xc000_001d,
-            &[],
-            Bitness::Bits64
-        )));
+        let av = classify(STATUS_ACCESS_VIOLATION, &[1, 0xdead_beef], Bitness::Bits64);
+        assert!(!may_bury_a_throw(&av, &[1, 0xdead_beef]));
+        let bp = classify(STATUS_BREAKPOINT, &[], Bitness::Bits64);
+        assert!(!may_bury_a_throw(&bp, &[]));
 
         // A real throw needs no scan; the record is the throw.
-        assert!(!may_bury_a_throw(&classify(
+        let throw = classify(
             STATUS_CPP_EH_EXCEPTION,
             &[CPP_EH_MAGIC, 1, 2, 3],
-            Bitness::Bits64
-        )));
+            Bitness::Bits64,
+        );
+        assert!(!may_bury_a_throw(&throw, &[CPP_EH_MAGIC, 1, 2, 3]));
+    }
+
+    /// **For two subcodes the code's name is the literal truth, and the summary must not dismiss
+    /// it.**
+    ///
+    /// `0xc0000409` is `STATUS_STACK_BUFFER_OVERRUN` and almost never one — except when the subcode
+    /// says a `/GS` cookie check failed, which is the compiler reporting that the guard between a
+    /// local buffer and the return address was overwritten. Leading with "not a stack buffer
+    /// overrun" there sends a reader away from the actual defect.
+    #[test]
+    fn test_a_gs_cookie_failure_is_not_told_it_is_not_stack_corruption() {
+        for subcode in [0u64, 2] {
+            let kind = classify(STATUS_STACK_BUFFER_OVERRUN, &[subcode], Bitness::Bits64);
+            let text = summary_of(&kind, ThrowEvidence::None).expect("a fail-fast gets a summary");
+            assert!(
+                !text.contains("not a stack buffer overrun"),
+                "subcode {subcode} is a /GS cookie failure and was told it was not corruption: \
+                 {text}"
+            );
+            assert!(
+                text.contains("Stack corruption is the finding"),
+                "a /GS cookie failure has to say what it is: {text}"
+            );
+        }
+
+        // And every other subcode keeps the dismissal, which is the reason the tool exists.
+        let abort = classify(
+            STATUS_STACK_BUFFER_OVERRUN,
+            &[FAST_FAIL_FATAL_APP_EXIT],
+            Bitness::Bits64,
+        );
+        let text = summary_of(&abort, ThrowEvidence::None).expect("a fail-fast gets a summary");
+        assert!(text.contains("not a stack buffer overrun"), "{text}");
+    }
+
+    /// **The dword after the sentinel is checked, because "it decodes" was only ever prose.**
+    ///
+    /// The sentinel is four bytes with no header behind it, so it occurs by chance. The claim made
+    /// about a hit has always been that the number after it decodes — which was asserted in a
+    /// sentence and tested nowhere. A `winrt::hresult_error` exists to carry a failure, so bit 31
+    /// is set in every one of them.
+    #[test]
+    fn test_a_sentinel_hit_that_is_not_a_failed_hresult_is_declined() {
+        let object_at = 0x1000;
+        let sentinel_object = |code: u32| {
+            let mut bytes = vec![0u8; 8];
+            bytes.extend_from_slice(&HRESULT_ERROR_SENTINEL.to_le_bytes());
+            bytes.extend_from_slice(&code.to_le_bytes());
+            bytes
+        };
+
+        // A real one.
+        let mut memory = FakeMemory::new();
+        memory.put(object_at, sentinel_object(0x8067_0015));
+        let read = |address, len| memory.read(address, len);
+        assert_eq!(hresult_in(&read, object_at, Some(16)), Some(0x8067_0015));
+
+        // `S_OK` after the sentinel: an object that is not one of these, and four coincidental
+        // bytes. Reporting `0` as the exception's failure code would be worse than nothing.
+        let mut memory = FakeMemory::new();
+        memory.put(object_at, sentinel_object(0));
+        let read = |address, len| memory.read(address, len);
+        assert_eq!(
+            hresult_in(&read, object_at, Some(16)),
+            None,
+            "a success code was reported as a thrown error's HRESULT"
+        );
+
+        // An arbitrary small member value, likewise.
+        let mut memory = FakeMemory::new();
+        memory.put(object_at, sentinel_object(42));
+        let read = |address, len| memory.read(address, len);
+        assert_eq!(hresult_in(&read, object_at, Some(16)), None);
+
+        // A failed HRESULT this host has no message for is still a real one, and is kept — the
+        // check is structural, so an unknown component's code is not thrown away.
+        let mut memory = FakeMemory::new();
+        memory.put(object_at, sentinel_object(0x8bad_f00d));
+        let read = |address, len| memory.read(address, len);
+        assert_eq!(hresult_in(&read, object_at, Some(16)), Some(0x8bad_f00d));
     }
 
     /// **The summary reports what the record says and stops there.**
