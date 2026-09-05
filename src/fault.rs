@@ -1334,11 +1334,33 @@ fn summary_of(kind: &FaultKind, evidence: ThrowEvidence) -> Option<String> {
                          record outlives the frames that held it, so confirm the throw site is on \
                          the stack above before calling it the cause."
                     }
-                    ThrowEvidence::None => {
+                    ThrowEvidence::NoneFound => {
                         " Subcode 7 is the CRT's abort(): an uncaught C++ exception ends here, but \
                          so does a direct abort(), a failed assert and every other terminate() — \
                          and no throw record was found on this stack, so the record does not say \
                          which."
+                    }
+                    // **Not the same sentence, because no search was made.** Reporting an empty
+                    // result for a hunt that never ran is a negative finding out of nothing, and
+                    // the reason is carried so this says which of the four happened.
+                    ThrowEvidence::NotSearched(NoSearch::CallerDeclined) => {
+                        " Subcode 7 is the CRT's abort(): an uncaught C++ exception ends here, but \
+                         so does a direct abort(), a failed assert and every other terminate(). \
+                         The stack was not searched for a throw record — `scan_stack` was off — so \
+                         nothing here rules one in or out."
+                    }
+                    ThrowEvidence::NotSearched(NoSearch::NoAnchor) => {
+                        " Subcode 7 is the CRT's abort(): an uncaught C++ exception ends here, but \
+                         so does a direct abort(), a failed assert and every other terminate(). \
+                         The stack could not be searched for a throw record — the walk gave no \
+                         frame to anchor on — so nothing here rules one in or out."
+                    }
+                    ThrowEvidence::NotSearched(
+                        NoSearch::WrongFaultShape | NoSearch::AlreadyHadOne,
+                    ) => {
+                        " Subcode 7 is the CRT's abort(): an uncaught C++ exception ends here, but \
+                         so does a direct abort(), a failed assert and every other terminate(). \
+                         The record does not say which."
                     }
                 }
             } else {
@@ -1417,12 +1439,43 @@ fn summary_of(kind: &FaultKind, evidence: ThrowEvidence) -> Option<String> {
 /// is the event rather than something found lying on the stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThrowEvidence {
-    /// No record was found, or none was looked for.
-    None,
+    /// The stack **was** searched and nothing on it parsed as a throw record.
+    NoneFound,
+    /// No search happened; [`NoSearch`] says why not.
+    ///
+    /// **Split from [`Self::NoneFound`] because they are opposite facts and the summary asserted
+    /// one of them.** This enum's own doc used to read "No record was found, or none was looked
+    /// for" — the conflation was written down — and the sentence below it then told every caller
+    /// that no record was found on this stack, including the ones where nothing had been looked at.
+    /// A caller who passed `scan_stack: false` was informed of the result of the search they
+    /// declined (Codex, round fifteen of
+    /// [#286](https://github.com/glslang/windbg-mcp/pull/286)).
+    ///
+    /// It is the third of these on this branch — an absent subcode given the verdict a known one
+    /// earns, a crash context that would not walk reported as a target that had none — so the rule
+    /// is worth stating rather than rediscovering: **an answer that can mean "we did not look"
+    /// needs a state that says so.**
+    NotSearched(NoSearch),
     /// Found by scanning the stack. It may predate this fault.
     Scanned,
     /// The debugger stopped on this throw; it is the reported event.
     Reported,
+}
+
+/// Why the buried-throw scan did not run.
+///
+/// Carried rather than collapsed, for the reason [`TypeUnread`] is: these are four different things
+/// to tell a caller, and one sentence covering all of them would be guessing which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoSearch {
+    /// The record already carried a throw, so there was nothing to hunt for.
+    AlreadyHadOne,
+    /// The caller passed `scan_stack: false`.
+    CallerDeclined,
+    /// This fault shape does not bury a throw — see [`may_bury_a_throw`].
+    WrongFaultShape,
+    /// The walk produced no usable anchor, so there was nowhere to start from.
+    NoAnchor,
 }
 
 /// Where to start the buried-throw scan, given the walked frames' stack pointers in order.
@@ -1507,7 +1560,7 @@ fn kind_word(kind: &FaultKind) -> &'static str {
 /// The word [`crate::structured::ThrownErrorInfo::provenance`] carries.
 fn provenance_word(evidence: ThrowEvidence) -> Option<&'static str> {
     match evidence {
-        ThrowEvidence::None => None,
+        ThrowEvidence::NoneFound | ThrowEvidence::NotSearched(_) => None,
         ThrowEvidence::Reported => Some("reported"),
         ThrowEvidence::Scanned => Some("scanned"),
     }
@@ -2313,7 +2366,8 @@ mod tests {
     fn test_a_gs_cookie_failure_is_not_told_it_is_not_stack_corruption() {
         for subcode in [0u64, 2] {
             let kind = classify(STATUS_STACK_BUFFER_OVERRUN, &[subcode], Bitness::Bits64);
-            let text = summary_of(&kind, ThrowEvidence::None).expect("a fail-fast gets a summary");
+            let text =
+                summary_of(&kind, ThrowEvidence::NoneFound).expect("a fail-fast gets a summary");
             assert!(
                 !text.contains("not a stack buffer overrun"),
                 "subcode {subcode} is a /GS cookie failure and was told it was not corruption: \
@@ -2331,7 +2385,8 @@ mod tests {
             &[FAST_FAIL_FATAL_APP_EXIT],
             Bitness::Bits64,
         );
-        let text = summary_of(&abort, ThrowEvidence::None).expect("a fail-fast gets a summary");
+        let text =
+            summary_of(&abort, ThrowEvidence::NoneFound).expect("a fail-fast gets a summary");
         assert!(text.contains("not a stack buffer overrun"), "{text}");
 
         // **The three arms are three, and the difference between the second and the third is the
@@ -2340,7 +2395,7 @@ mod tests {
         // a change that collapses them back into two fails here rather than in a summary nobody
         // reads until it has misled someone.
         let bare = classify(STATUS_STACK_BUFFER_OVERRUN, &[], Bitness::Bits64);
-        let bare = summary_of(&bare, ThrowEvidence::None).expect("a fail-fast gets a summary");
+        let bare = summary_of(&bare, ThrowEvidence::NoneFound).expect("a fail-fast gets a summary");
         assert_ne!(
             text.contains("not a stack buffer overrun"),
             bare.contains("not a stack buffer overrun"),
@@ -2410,8 +2465,8 @@ mod tests {
             Bitness::Bits64,
         );
 
-        let alone =
-            summary_of(&abort, ThrowEvidence::None).expect("a fail-fast always gets a summary");
+        let alone = summary_of(&abort, ThrowEvidence::NoneFound)
+            .expect("a fail-fast always gets a summary");
         assert!(
             alone.contains("FAST_FAIL_FATAL_APP_EXIT"),
             "the subcode is what says why, and has to be named: {alone}"
@@ -2446,8 +2501,8 @@ mod tests {
         // And another subcode gets neither sentence, rather than the abort story with a different
         // number in it.
         let cookie = classify(STATUS_STACK_BUFFER_OVERRUN, &[2], Bitness::Bits64);
-        let text =
-            summary_of(&cookie, ThrowEvidence::None).expect("a fail-fast always gets a summary");
+        let text = summary_of(&cookie, ThrowEvidence::NoneFound)
+            .expect("a fail-fast always gets a summary");
         assert!(!text.contains("abort()"), "{text}");
         assert!(
             text.contains("FAST_FAIL_STACK_COOKIE_CHECK_FAILURE"),
@@ -2648,7 +2703,7 @@ mod tests {
                 true,
                 &kind,
                 None,
-                ThrowEvidence::None,
+                ThrowEvidence::NoneFound,
                 frames,
                 false,
                 stored_crash_context,
@@ -2748,7 +2803,7 @@ mod tests {
             "a parameterless fail-fast was given a subcode it does not carry"
         );
 
-        let text = summary_of(&bare, ThrowEvidence::None).expect("a fail-fast gets a summary");
+        let text = summary_of(&bare, ThrowEvidence::NoneFound).expect("a fail-fast gets a summary");
         assert!(
             !text.contains("LEGACY_GS_VIOLATION"),
             "an absent subcode was named as a specific check: {text}"
@@ -3297,6 +3352,73 @@ mod tests {
             describe_type(&read, &throw),
             Err(TypeUnread::Unreadable("the `TypeDescriptor`'s name"))
         );
+    }
+
+    /// **A search that did not happen has no result, and this said it came back empty.**
+    ///
+    /// `ThrowEvidence::None` meant both "the stack was searched and nothing on it parsed as a throw
+    /// record" and "nothing was searched" — its own doc said so — and the subcode-7 summary then
+    /// told every caller in either state that *no throw record was found on this stack*. A caller
+    /// who passed `scan_stack: false` was given the result of the search they had just declined.
+    ///
+    /// Third of these on this branch, after an absent subcode handed the verdict a known one earns
+    /// and a crash context that would not walk reported as a target that had none. The shape of the
+    /// fix is the same each time: the state that means "we did not look" is its own, and it carries
+    /// why.
+    #[test]
+    fn test_a_search_that_did_not_run_is_not_reported_as_one_that_found_nothing() {
+        let abort = classify(
+            STATUS_STACK_BUFFER_OVERRUN,
+            &[FAST_FAIL_FATAL_APP_EXIT],
+            Bitness::Bits64,
+        );
+        let summary = |evidence| summary_of(&abort, evidence).expect("a fail-fast gets a summary");
+
+        // Searched, and the stack held nothing: the only state that may say so.
+        let found_none = summary(ThrowEvidence::NoneFound);
+        assert!(
+            found_none.contains("no throw record was found on this stack"),
+            "a completed search stopped reporting its result: {found_none}"
+        );
+
+        // Not searched. Every reason must decline to report a result, and the two the caller can
+        // act on say which happened.
+        for why in [
+            NoSearch::CallerDeclined,
+            NoSearch::NoAnchor,
+            NoSearch::WrongFaultShape,
+            NoSearch::AlreadyHadOne,
+        ] {
+            let text = summary(ThrowEvidence::NotSearched(why));
+            assert!(
+                !text.contains("no throw record was found on this stack"),
+                "a search that never ran reported an empty result ({why:?}): {text}"
+            );
+            assert!(
+                text.contains("abort()"),
+                "the subcode is still explained whatever the scan did: {text}"
+            );
+        }
+        assert!(
+            summary(ThrowEvidence::NotSearched(NoSearch::CallerDeclined))
+                .contains("`scan_stack` was off"),
+            "a caller who turned the scan off is not told why there is no answer"
+        );
+        assert!(
+            summary(ThrowEvidence::NotSearched(NoSearch::NoAnchor))
+                .contains("no frame to anchor on"),
+            "a walk that gave nothing to anchor on is not distinguished from a caller's choice"
+        );
+
+        // And a record that *was* found still claims nothing about cause, which is the rule these
+        // states exist to serve rather than a separate one.
+        for evidence in [ThrowEvidence::Scanned, ThrowEvidence::Reported] {
+            assert!(
+                summary(evidence).contains("confirm the throw site"),
+                "a found record stopped being a candidate: {}",
+                summary(evidence)
+            );
+        }
     }
 
     /// **`HRESULT_FROM_NT` wraps an NTSTATUS, and ntdll's table only knows the thing inside.**

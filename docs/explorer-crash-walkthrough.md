@@ -314,21 +314,44 @@ adopts, walked without `.ecxr`'s effect on the session, so the caller's selected
 they left it. §4 and §5 are one call:
 
 ```text
-EXCEPTION: 0xc0000409 at 0x00007ff6a1db2989
+EXCEPTION: 0xc0000409 at 0x00007ff79e442989
   The system detected an overrun of a stack-based buffer in this application. […]
   second chance — nothing in the target handled it, noncontinuable
   Parameter[0]: 0x0000000000000007
 WHAT THIS IS: a __fastfail — a deliberate process exit, not a stack buffer overrun, whatever the
   code's name and the system's message text for it say. FAST_FAIL_FATAL_APP_EXIT (subcode 0x7) is
-  what says why; subcode 7 is the CRT's abort(), which means a C++ exception nobody caught.
-THROWN: hresult_error at 0x0000008de693fd60
+  what says why. Subcode 7 is the CRT's abort(): an uncaught C++ exception ends here, but so does a
+  direct abort(), a failed assert and every other terminate(). A C++ throw record was found on this
+  stack — THROWN below — and such a record outlives the frames that held it, so confirm the throw
+  site is on the stack above before calling it the cause.
+THROWN: hresult_error at 0x00000054f7cff950
   carries 0x80670015 — The StateRepository cache is not initialized.
+  the thrown type named winrt::hresult_error and the sentinel then matched inside the object: two
+  routes agreeing, so the offset was expected rather than assumed.
+  CAUTION: found by scanning the stack rather than reported by the debugger. Such a record outlives
+  the frames that held it, so this may be from an exception the program caught earlier rather than
+  the cause of this fault.
 ```
+
+**That block is real output**, captured from `docs/samples/cppthrow-fastfail.dmp` — the fixture
+built to reproduce this crash's shape, which is why the HRESULT is the same and the addresses are
+not. Pasting it rather than paraphrasing is deliberate: an earlier revision of this section showed a
+sample ending *"subcode 7 is the CRT's abort(), which means a C++ exception nobody caught"*, and the
+tool had stopped saying that — so a reader following the walkthrough was pointed at a C++ exception
+in exactly the cases where there may not have been one.
 
 Note the second and third lines together, because that pairing is the point rather than a
 flourish: the tool prints the system's own message for `0xc0000409` — the misleading one §10's
 first gotcha is about — and then says what the code actually means. Suppressing it would leave a
 reader who has met that sentence in an event log unable to place it.
+
+**And note what it does not say.** Subcode 7 is `abort`, and `abort` is reached by a direct call, a
+failed `assert`, the invalid-parameter handler and every other `terminate()` as well as by an
+uncaught throw — so the summary names the throw only because the scan actually found a record, and
+then calls it a candidate rather than the cause. A record found that way outlives the frames that
+held it, which is what the `CAUTION` line and the `scanned` provenance are for. Where no search runs
+— `scan_stack` off, or a fault shape that never buries one — the summary says *that*, rather than
+reporting an empty result for a hunt that never happened.
 
 **Three things about the version that shipped differ from the recipe above, and each is a
 correction rather than a refinement.**

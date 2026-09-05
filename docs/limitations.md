@@ -157,6 +157,13 @@
   would default to — zero is `FAST_FAIL_LEGACY_GS_VIOLATION`, so defaulting named a specific
   security check that the record never mentioned. Every real `__fastfail` supplies a subcode; one
   that does not is truncated or synthetic, and the summary says so.
+- **A search that did not run reports no result.** The buried-throw scan is skipped when the
+  caller passes `scan_stack: false`, when the fault shape never buries a throw, and when the walk
+  gave no frame to anchor on — and the summary used to tell all three that *no throw record was
+  found on this stack*, which is the result of a search none of them performed. A caller who turned
+  the scan off was being handed the outcome of the search they had just declined. The state that
+  means "nothing was looked for" is now its own and carries which of the four reasons applied, so
+  the summary says the stack was not searched instead of what searching it found.
 - **And it draws no conclusion from the subcode it has not got.** Preserving the field was half of
   that: the summary went on giving such a record the dismissal above — "not a stack buffer
   overrun" — which is the *other* thing only a subcode can support, since the two `/GS` subcodes
