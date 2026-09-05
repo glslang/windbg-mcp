@@ -137,12 +137,12 @@
     },
     {
       "annotations": 123,
-      "description": 1572,
+      "description": 1602,
       "inputSchema": 1344,
-      "modelVisible": 2973,
+      "modelVisible": 3003,
       "name": "exception_triage",
       "outputSchema": 3618,
-      "wire": 6745
+      "wire": 6775
     },
     {
       "annotations": 124,
@@ -507,14 +507,14 @@
   ],
   "totals": {
     "annotations": 5970,
-    "description": 31240,
+    "description": 31270,
     "inputSchema": 46374,
     "instructions": 1983,
-    "modelVisible": 80549,
+    "modelVisible": 80579,
     "outputSchema": 120762,
-    "payload": 208868,
+    "payload": 208898,
     "tools": 56,
-    "wire": 208745,
+    "wire": 208775,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }

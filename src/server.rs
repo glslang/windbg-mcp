@@ -3575,10 +3575,10 @@ impl WindbgServer {
     /// For that subcode it recovers the thrown object and the HRESULT it carries: the record the
     /// debugger sees is the fail-fast, so the throw's own record is found by searching the
     /// crashing thread's stack, and the thrown type is decoded from the compiler's own descriptors
-    /// where the module's image is reachable. A found record carries `provenance`, because such a
-    /// record outlives the frames that held it — `dispatching` when the stack also shows the
-    /// exception machinery running, `scanned` when it does not and the object may be from an
-    /// exception this program handled earlier.
+    /// where the module's image is reachable. A found record carries `provenance`: `reported` when
+    /// the debugger stopped on the throw, and `scanned` when it was found on the stack — where it
+    /// is a candidate rather than a cause, because such a record outlives the frames that held it
+    /// and may be from an exception this program handled earlier.
     /// The stack is walked from the register context the dump was written with, so it is the
     /// crash whatever thread the session has selected — and the selection is left where it was,
     /// which is what keeps this a read of the target.
@@ -3646,9 +3646,14 @@ impl WindbgServer {
     ) -> Result<CallToolResult, ErrorData> {
         // Semantic input validation, not a malformed request: the schema is satisfied either way,
         // so this belongs in the result where the model can read it and correct what it passed.
+        //
+        // `typed_error`, not `tool_error`, for the same reason `disassemble` uses it: this tool
+        // declares an `outputSchema`, and a schema-aware client that is handed a text-only failure
+        // for a tool that promised structured content has been given something it may reject. The
+        // refusal is the one result a caller most needs to be able to read.
         let value = match parse_u64(&args.code) {
             Ok(value) => value,
-            Err(why) => return tool_error(why),
+            Err(why) => return typed_error(ErrorCategory::InvalidArgument, why, None),
         };
         // **A sign-extended 64-bit value is truncated rather than refused**, unlike `decode_ioctl`'s
         // width check, because that is the shape one of these actually arrives in: a WIL fail-fast
@@ -3658,10 +3663,14 @@ impl WindbgServer {
             Ok(value) => value,
             Err(_) if value >> 32 == 0xffff_ffff => value as u32,
             Err(_) => {
-                return tool_error(format!(
-                    "an error-reporting value is 32 bits (got {value:#x}). A sign-extended 64-bit \
-                     value such as 0xffffffff8000ffff is accepted; this is not one."
-                ));
+                return typed_error(
+                    ErrorCategory::InvalidArgument,
+                    format!(
+                        "an error-reporting value is 32 bits (got {value:#x}). A sign-extended \
+                         64-bit value such as 0xffffffff8000ffff is accepted; this is not one."
+                    ),
+                    None,
+                );
             }
         };
         let decoded = crate::fault::status_info(&crate::fault::decode_status(value));

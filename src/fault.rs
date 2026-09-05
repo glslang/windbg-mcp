@@ -1094,8 +1094,8 @@ pub fn status_info(decode: &StatusDecode) -> crate::structured::StatusInfo {
 ///
 /// The draft after that named the throw whenever the scan found a record, which is better and still
 /// wrong: a found record may be a *handled* exception's, left on the stack by an earlier
-/// `try`/`catch`. Only [`ThrowEvidence::Dispatching`] — a record **and** a stack that shows the
-/// exception machinery running — supports the strong sentence.
+/// `try`/`catch`. The draft after *that* tried to corroborate against the stack, which was evidence
+/// about the wrong thing — see [`ThrowEvidence`]. A scan earns no claim about cause at all.
 fn summary_of(kind: &FaultKind, evidence: ThrowEvidence) -> Option<String> {
     match kind {
         FaultKind::FailFast {
@@ -1109,17 +1109,12 @@ fn summary_of(kind: &FaultKind, evidence: ThrowEvidence) -> Option<String> {
             );
             let abort = if *subcode == FAST_FAIL_FATAL_APP_EXIT {
                 match evidence {
-                    ThrowEvidence::Dispatching => {
-                        " Subcode 7 is the CRT's abort(), the stack shows an exception being \
-                         dispatched, and the throw's own record was found on it — so this one is a \
-                         C++ exception nobody caught, and THROWN below is it."
-                    }
-                    ThrowEvidence::Scanned => {
+                    ThrowEvidence::Reported | ThrowEvidence::Scanned => {
                         " Subcode 7 is the CRT's abort(): an uncaught C++ exception ends here, but \
                          so does a direct abort(), a failed assert and every other terminate(). A \
-                         C++ throw record was found on this stack, but nothing on the stack shows \
-                         an exception in flight — and a record outlives the frames that held it, \
-                         so THROWN below may be from an exception this program handled earlier."
+                         C++ throw record was found on this stack — THROWN below — and such a \
+                         record outlives the frames that held it, so confirm the throw site is on \
+                         the stack above before calling it the cause."
                     }
                     ThrowEvidence::None => {
                         " Subcode 7 is the CRT's abort(): an uncaught C++ exception ends here, but \
@@ -1154,56 +1149,53 @@ fn summary_of(kind: &FaultKind, evidence: ThrowEvidence) -> Option<String> {
     }
 }
 
-/// How much the buried-throw scan's find is worth.
+/// Where a throw record came from, and therefore how much it is worth.
 ///
-/// **A record that parses is not a cause.** `find_cpp_records` promotes a candidate on
-/// self-consistency alone, and a C++ `EXCEPTION_RECORD` outlives the frames that held it: after a
-/// `try`/`catch`, the handler unwinds past the record but nothing erases it, so a later
-/// `abort()` — called directly, or through a failed `assert`, or through the invalid-parameter
-/// handler — that runs deeper than the old throw site finds a perfectly valid record above its
-/// stack pointer. It parses, its object is readable, its `HRESULT` decodes. It is simply from a
-/// different exception, one the program handled.
+/// **A record that parses is not a cause, and no amount of scanning makes it one.**
+/// `find_cpp_records` promotes a candidate on self-consistency alone, and a C++
+/// `EXCEPTION_RECORD` outlives the frames that held it: after a `try`/`catch` the handler unwinds
+/// past the record but nothing erases it, so a later `abort()` — called directly, or through a
+/// failed `assert`, or through the invalid-parameter handler — running deeper than the old throw
+/// site finds one above its stack pointer that parses perfectly.
 ///
-/// Geometry cannot separate the two: in both cases the record sits above the current stack pointer
-/// inside a live caller's frame. What does separate them is whether an exception is **being
-/// dispatched right now**, and the stack says so — an unhandled C++ throw reaches `abort` *through*
-/// `KiUserExceptionDispatcher` and the unhandled-exception filter, which are therefore still on the
-/// stack, while a direct `abort()` has none of them.
+/// **Geometry cannot separate the two**: in both cases the record sits above the current stack
+/// pointer inside a live caller's frame. An earlier attempt corroborated it against the *stack* —
+/// `KiUserExceptionDispatcher` and friends being present — and that was wrong twice over. It is
+/// evidence about the stack rather than about the candidate, so with a genuine unhandled throw
+/// following an earlier caught one it would promote whichever record the scan happened to return
+/// first; and it depends on symbols, so it answered differently on a host with none, which is
+/// exactly the dump-from-another-machine this tool exists for.
+///
+/// So there is no upgrade. A scanned record is reported as scanned, with the caveat, always. What
+/// *is* trustworthy is [`Self::Reported`]: the debugger stopped on the throw itself, and the record
+/// is the event rather than something found lying on the stack.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThrowEvidence {
     /// No record was found, or none was looked for.
     None,
-    /// A record was found and parsed, and nothing on the stack says an exception is in flight —
-    /// so it may predate this fault.
+    /// Found by scanning the stack. It may predate this fault.
     Scanned,
-    /// A record was found *and* the stack shows an exception being dispatched.
-    Dispatching,
+    /// The debugger stopped on this throw; it is the reported event.
+    Reported,
 }
 
-/// Frames that mean an exception is in flight, rather than merely having happened once.
+/// Whether a scanned candidate's thrown object is somewhere a thrown object can be.
 ///
-/// All from the dispatch path an unhandled throw takes to `terminate`, and none of them on the
-/// stack of a direct `abort()`. `ntdll` and `KERNELBASE` are the modules involved, so this works on
-/// a host that has no symbols for the *faulting* image — which is the ordinary case for a dump from
-/// another machine, and is why the corroboration is not keyed on the throwing module's own frames.
-const DISPATCH_FRAMES: &[&str] = &[
-    "KiUserExceptionDispatcher",
-    "UnhandledExceptionFilter",
-    "CxxThrowException",
-    "RaiseException",
-];
-
-/// Whether a walked stack shows an exception being dispatched.
+/// **The one correlation that is about the candidate rather than about the stack**, and it is
+/// cheap: `_CxxThrowException` copies the thrown object into its caller's frame, so a live throw's
+/// object is *on the stack*, inside the region being scanned. A record whose `object` points
+/// somewhere else is not a throw that belongs to this thread's current stack at all.
 ///
-/// Symbol-based, and therefore **weaker on a host with no symbols at all** — where it answers
-/// `false` and the caller says less rather than guessing more. That is the right direction: the
-/// thrown object and its `HRESULT` are reported either way, and only the claim about *cause* is
-/// withheld.
-pub fn stack_is_dispatching(symbols: impl IntoIterator<Item = impl AsRef<str>>) -> bool {
-    symbols.into_iter().any(|symbol| {
-        let symbol = symbol.as_ref();
-        DISPATCH_FRAMES.iter().any(|frame| symbol.contains(frame))
-    })
+/// Measured on `docs/samples/stale-throw-abort.dmp`, where the scan's first candidate reports an
+/// `object` of `0x7ff632c172d6` — which is a *code* address in the faulting image, and in fact the
+/// return address the walk shows for `staleabort!deep`. Four bytes of `0xe06d7363` on the stack
+/// with a plausible count behind them, and nothing more.
+///
+/// Necessary rather than sufficient: a genuinely stale record from a caught exception has its
+/// object on the stack too. That is why it filters rather than corroborates, and why a record that
+/// survives it is still only [`ThrowEvidence::Scanned`].
+pub fn object_is_on_the_scanned_stack(throw: &CppThrow, low: u64, high: u64) -> bool {
+    (low..high).contains(&throw.object)
 }
 
 /// Whether this fault is the shape that can have a C++ throw buried under it.
@@ -1243,12 +1235,11 @@ fn kind_word(kind: &FaultKind) -> &'static str {
 }
 
 /// The word [`crate::structured::ThrownErrorInfo::provenance`] carries.
-fn provenance_word(evidence: ThrowEvidence, reported: bool) -> Option<&'static str> {
-    match (evidence, reported) {
-        (ThrowEvidence::None, _) => None,
-        (_, true) => Some("reported"),
-        (ThrowEvidence::Dispatching, false) => Some("dispatching"),
-        (ThrowEvidence::Scanned, false) => Some("scanned"),
+fn provenance_word(evidence: ThrowEvidence) -> Option<&'static str> {
+    match evidence {
+        ThrowEvidence::None => None,
+        ThrowEvidence::Reported => Some("reported"),
+        ThrowEvidence::Scanned => Some("scanned"),
     }
 }
 
@@ -1256,7 +1247,6 @@ fn provenance_word(evidence: ThrowEvidence, reported: bool) -> Option<&'static s
 pub fn thrown_info(
     thrown: &ThrownError,
     evidence: ThrowEvidence,
-    reported: bool,
 ) -> crate::structured::ThrownErrorInfo {
     crate::structured::ThrownErrorInfo {
         object: format!("{:#018x}", thrown.object),
@@ -1274,7 +1264,7 @@ pub fn thrown_info(
             .to_string()
         }),
         type_note: thrown.type_note.clone(),
-        provenance: provenance_word(evidence, reported).map(str::to_string),
+        provenance: provenance_word(evidence).map(str::to_string),
     }
 }
 
@@ -1317,8 +1307,7 @@ pub fn report(
         exception: exception_info(record, first_chance),
         kind: kind_word(kind).to_string(),
         summary: summary_of(kind, evidence),
-        thrown: thrown
-            .map(|thrown| thrown_info(thrown, evidence, matches!(kind, FaultKind::CppThrow(_)))),
+        thrown: thrown.map(|thrown| thrown_info(thrown, evidence)),
         failure: match kind {
             FaultKind::FailFast { wil: Some(wil), .. } => Some(crate::structured::WilFailureInfo {
                 hresult: status_info(&decode_status(wil.hresult)),
@@ -1401,10 +1390,9 @@ pub fn render(triage: &crate::structured::ExceptionTriage) -> String {
         }
         if thrown.provenance.as_deref() == Some("scanned") {
             text.push_str(
-                "  CAUTION: found by scanning the stack, and nothing on the stack shows an \
-                 exception in flight — such a record outlives the frames that held it, so this \
-                 may be from an exception the program caught earlier rather than the cause of \
-                 this fault.\n",
+                "  CAUTION: found by scanning the stack rather than reported by the debugger. \
+                 Such a record outlives the frames that held it, so this may be from an exception \
+                 the program caught earlier rather than the cause of this fault.\n",
             );
         }
         if let Some(note) = &thrown.type_note {
@@ -1992,26 +1980,22 @@ mod tests {
             "a summary that cannot tell the causes apart has to say so: {alone}"
         );
 
-        // **A record that merely parses does not promote the claim.** The middle case, and the one
-        // a bare `found: bool` got wrong: an `abort()` called directly after the program caught an
-        // exception earlier finds that exception's record, still valid, above its stack pointer.
-        let stale =
-            summary_of(&abort, ThrowEvidence::Scanned).expect("a fail-fast always gets a summary");
-        assert!(
-            !stale.contains("nobody caught"),
-            "a scanned record with nothing corroborating it was reported as the cause: {stale}"
-        );
-        assert!(
-            stale.contains("handled earlier"),
-            "a scanned record has to carry the reason it might not be this fault's: {stale}"
-        );
-
-        let found = summary_of(&abort, ThrowEvidence::Dispatching)
-            .expect("a fail-fast always gets a summary");
-        assert!(
-            found.contains("nobody caught"),
-            "with a record *and* a dispatching stack, this one really is uncaught: {found}"
-        );
+        // **A record that parses does not become the cause, and there is no third state where it
+        // does.** An `abort()` called directly after the program caught an exception earlier finds
+        // that exception's record, still valid, above its stack pointer - and no property of the
+        // *stack* distinguishes that from a genuine unhandled throw, which is why an earlier
+        // attempt to corroborate one was withdrawn.
+        for evidence in [ThrowEvidence::Scanned, ThrowEvidence::Reported] {
+            let text = summary_of(&abort, evidence).expect("a fail-fast always gets a summary");
+            assert!(
+                !text.contains("nobody caught"),
+                "a found record was reported as the cause ({evidence:?}): {text}"
+            );
+            assert!(
+                text.contains("confirm the throw site"),
+                "a found record has to say what would settle it ({evidence:?}): {text}"
+            );
+        }
 
         // And another subcode gets neither sentence, rather than the abort story with a different
         // number in it.
@@ -2025,35 +2009,48 @@ mod tests {
         );
     }
 
-    /// **A dispatching stack is what promotes a scanned record, and symbols are how it is seen.**
+    /// **A candidate is checked against what it points at, which is about the record rather than
+    /// about the stack.**
     ///
-    /// The frames named are the exception machinery's, in `ntdll` and `KERNELBASE` — deliberately
-    /// not the throwing module's, because a dump from another machine has no symbols for *that*
-    /// image and would otherwise never corroborate.
+    /// `_CxxThrowException` copies the thrown object into its caller's frame, so a live throw's
+    /// object is on the stack inside the range being scanned. Measured on the checked-in
+    /// stale-abort dump, whose first candidate reports an `object` of `0x7ff632c172d6` - a code
+    /// address in the faulting image, and in fact the return address the walk shows for
+    /// `staleabort!deep`. Four bytes of `0xe06d7363` with a plausible count behind them, nothing
+    /// more.
+    ///
+    /// The predecessor of this check corroborated against the *stack* - looking for
+    /// `KiUserExceptionDispatcher` and friends - and was wrong twice: it said nothing about which
+    /// candidate was chosen, and it depended on symbols, so it answered differently on a host
+    /// without them. That is the dump-from-another-machine this tool is for.
     #[test]
-    fn test_the_dispatch_frames_are_what_say_an_exception_is_in_flight() {
-        assert!(stack_is_dispatching([
-            "cppthrow!abort",
-            "ntdll!KiUserExceptionDispatcher",
-            "cppthrow!main",
-        ]));
-        assert!(stack_is_dispatching([
-            "KERNELBASE!UnhandledExceptionFilter"
-        ]));
-        assert!(stack_is_dispatching(["cppthrow32!_CxxThrowException"]));
+    fn test_a_candidates_object_has_to_be_on_the_stack_that_was_scanned() {
+        let low = 0x0000_008d_e693_e000_u64;
+        let high = low + 0x1_0000;
+        let throw = |object| CppThrow {
+            object,
+            throw_info: 0,
+            image_base: 0,
+            bitness: Bitness::Bits64,
+        };
 
-        // A direct abort(): the CRT's own frames, and nothing dispatching.
+        assert!(object_is_on_the_scanned_stack(
+            &throw(low + 0x800),
+            low,
+            high
+        ));
+        assert!(object_is_on_the_scanned_stack(&throw(low), low, high));
+
+        // The measured false positive: an address in the image, not on the stack.
         assert!(
-            !stack_is_dispatching([
-                "cppthrow!abort",
-                "cppthrow!main",
-                "kernel32!BaseThreadInitThunk"
-            ]),
-            "a direct abort() was read as an exception in flight"
+            !object_is_on_the_scanned_stack(&throw(0x7ff6_32c1_72d6), low, high),
+            "a record pointing into the image was accepted as a throw on this stack"
         );
-        // And a host with no symbols at all cannot corroborate, which is the honest answer rather
-        // than a reason to assume either way.
-        assert!(!stack_is_dispatching(Vec::<String>::new()));
+        // And the ends are checked, since a record found at the very top of the range would
+        // otherwise reach past what was read.
+        assert!(!object_is_on_the_scanned_stack(&throw(high), low, high));
+        assert!(!object_is_on_the_scanned_stack(&throw(low - 1), low, high));
+        assert!(!object_is_on_the_scanned_stack(&throw(0), low, high));
     }
 
     /// **No name in this table may shadow a code this module itself classifies as a fault.**
