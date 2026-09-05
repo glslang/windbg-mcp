@@ -3661,7 +3661,10 @@ impl WindbgServer {
         // is a different number and is refused.
         let value = match u32::try_from(value) {
             Ok(value) => value,
-            Err(_) if value >> 32 == 0xffff_ffff => value as u32,
+            // An all-ones upper half is only a sign extension if the low half's sign bit is set.
+            // `0xffffffff00000005` is not `5` widened — it is a different number, and truncating it
+            // to `5` answers a question nobody asked.
+            Err(_) if value >> 32 == 0xffff_ffff && value & 0x8000_0000 != 0 => value as u32,
             Err(_) => {
                 return typed_error(
                     ErrorCategory::InvalidArgument,

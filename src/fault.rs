@@ -402,7 +402,7 @@ pub enum FaultKind {
     FailFast {
         /// The subcode, which is what says *why* — `7` is `FAST_FAIL_FATAL_APP_EXIT`, i.e. the
         /// CRT's `abort`, i.e. an unhandled C++ exception.
-        subcode: u64,
+        subcode: Option<u64>,
         /// The subcode's name, where this build knows it.
         subcode_name: Option<&'static str>,
         /// WIL's extra parameters, on a three-parameter record. See [`WilFailure`].
@@ -562,10 +562,14 @@ pub fn fail_fast_subcode(subcode: u64) -> Option<&'static str> {
 pub fn classify(code: u32, parameters: &[u64], bitness: Bitness) -> FaultKind {
     match code {
         STATUS_STACK_BUFFER_OVERRUN => {
-            let subcode = parameters.first().copied().unwrap_or_default();
+            // **Absent, not zero.** `unwrap_or_default` here named a parameterless record
+            // `FAST_FAIL_LEGACY_GS_VIOLATION`, which is subcode 0 — a diagnosis invented out of a
+            // field the record does not have. Every real `__fastfail` supplies one; a record that
+            // does not is truncated or synthetic, and the honest answer is that it does not say.
+            let subcode = parameters.first().copied();
             FaultKind::FailFast {
                 subcode,
-                subcode_name: fail_fast_subcode(subcode),
+                subcode_name: subcode.and_then(fail_fast_subcode),
                 // **Exactly three, not "at least three".** WIL writes the subcode, the HRESULT and
                 // the line and stops, so three *is* the discriminator; a record with two would be
                 // some third thing whose second parameter this has no reason to read as an
@@ -711,20 +715,39 @@ pub fn thrown_error(read: &Read<'_>, throw: &CppThrow) -> ThrownError {
     // the first says `hresult_error` and the second matches, the offset was expected rather than
     // assumed. Matched on the *mangled* name, which is always present when the graph was read —
     // demangling can decline, and a name this file will not decode is not a weaker fact.
-    let expected = out
+    //
+    // **And a name that was read and is not one is contrary evidence, not merely absent evidence.**
+    // The sentinel is four bytes with no header behind it, so `0xAABBCCDD` occurs inside objects
+    // that are nothing to do with `winrt`; the reason to believe it is that the type said to expect
+    // it. When the graph answered `std::runtime_error`, a hit is a coincidence in some member's
+    // value, and reporting the next dword as the exception's failure code invents one. So the
+    // sentinel runs when the type agrees, or when there is no type to disagree.
+    let named_hresult_error = out
         .mangled_name
         .as_deref()
-        .is_some_and(|name| name.contains("hresult_error"));
-    out.hresult = hresult_in(read, throw.object, out.size).map(|hr| {
-        (
-            hr,
-            if expected {
-                Confidence::Corroborated
-            } else {
-                Confidence::Convention
-            },
-        )
-    });
+        .map(|name| name.contains("hresult_error"));
+    out.hresult = match named_hresult_error {
+        Some(false) => None,
+        expected => hresult_in(read, throw.object, out.size).map(|hr| {
+            (
+                hr,
+                if expected == Some(true) {
+                    Confidence::Corroborated
+                } else {
+                    Confidence::Convention
+                },
+            )
+        }),
+    };
+    if out.hresult.is_none() && named_hresult_error == Some(false) {
+        out.type_note = Some(format!(
+            "the thrown type was read and is not a `winrt::hresult_error`, so the `0xAABBCCDD` \
+             sentinel was not looked for: in a type that does not carry one, those four bytes \
+             would be some member's value and the dword after it is not an HRESULT. The object is \
+             at {:#018x} and its type is above.",
+            out.object
+        ));
+    }
     out
 }
 
@@ -1103,11 +1126,13 @@ fn summary_of(kind: &FaultKind, evidence: ThrowEvidence) -> Option<String> {
             subcode_name,
             ..
         } => {
-            let named = subcode_name.map_or_else(
-                || format!("subcode {subcode:#x}"),
-                |name| format!("{name} (subcode {subcode:#x})"),
-            );
-            let abort = if *subcode == FAST_FAIL_FATAL_APP_EXIT {
+            let named = match (subcode, subcode_name) {
+                (Some(subcode), Some(name)) => format!("{name} (subcode {subcode:#x})"),
+                (Some(subcode), None) => format!("subcode {subcode:#x}"),
+                // The record carried no parameters at all, so there is no subcode to name.
+                (None, _) => "no subcode: this record carries no parameters".to_string(),
+            };
+            let abort = if *subcode == Some(FAST_FAIL_FATAL_APP_EXIT) {
                 match evidence {
                     ThrowEvidence::Reported | ThrowEvidence::Scanned => {
                         " Subcode 7 is the CRT's abort(): an uncaught C++ exception ends here, but \
@@ -1216,7 +1241,7 @@ pub fn may_bury_a_throw(kind: &FaultKind) -> bool {
     matches!(
         kind,
         FaultKind::FailFast {
-            subcode: FAST_FAIL_FATAL_APP_EXIT,
+            subcode: Some(FAST_FAIL_FATAL_APP_EXIT),
             wil: None,
             ..
         }
@@ -1757,7 +1782,7 @@ mod tests {
         assert_eq!(
             crt,
             FaultKind::FailFast {
-                subcode: 7,
+                subcode: Some(7),
                 subcode_name: Some("FAST_FAIL_FATAL_APP_EXIT"),
                 wil: None,
             },
@@ -1776,7 +1801,7 @@ mod tests {
         assert_eq!(
             four,
             FaultKind::FailFast {
-                subcode: 7,
+                subcode: Some(7),
                 subcode_name: Some("FAST_FAIL_FATAL_APP_EXIT"),
                 wil: None,
             },
@@ -2166,6 +2191,126 @@ mod tests {
             info.decoded.symbolic.is_none(),
             "an exception code was given an HRESULT name: {:?}",
             info.decoded.symbolic
+        );
+    }
+
+    /// **A record with no parameters has no subcode, and inventing one names a bug check.**
+    ///
+    /// `unwrap_or_default` made an absent subcode zero, and zero is
+    /// `FAST_FAIL_LEGACY_GS_VIOLATION` — so a truncated or synthetic `0xc0000409` was reported as a
+    /// specific security check having failed. Every real `__fastfail` supplies a subcode; a record
+    /// that does not is saying nothing, and the report has to say nothing back.
+    #[test]
+    fn test_a_fail_fast_with_no_parameters_invents_no_subcode() {
+        let bare = classify(STATUS_STACK_BUFFER_OVERRUN, &[], Bitness::Bits64);
+        assert_eq!(
+            bare,
+            FaultKind::FailFast {
+                subcode: None,
+                subcode_name: None,
+                wil: None,
+            },
+            "a parameterless fail-fast was given a subcode it does not carry"
+        );
+
+        let text = summary_of(&bare, ThrowEvidence::None).expect("a fail-fast gets a summary");
+        assert!(
+            !text.contains("LEGACY_GS_VIOLATION"),
+            "an absent subcode was named as a specific check: {text}"
+        );
+        assert!(
+            text.contains("no subcode"),
+            "a summary that has no subcode to report has to say so: {text}"
+        );
+
+        // Subcode zero really *is* that check when the record says zero, which is the other half.
+        let zero = classify(STATUS_STACK_BUFFER_OVERRUN, &[0], Bitness::Bits64);
+        assert_eq!(
+            zero,
+            FaultKind::FailFast {
+                subcode: Some(0),
+                subcode_name: Some("FAST_FAIL_LEGACY_GS_VIOLATION"),
+                wil: None,
+            },
+        );
+    }
+
+    /// **A type that was read and is not an `hresult_error` is contrary evidence.**
+    ///
+    /// The sentinel is four bytes with nothing behind it, so `0xAABBCCDD` occurs inside objects
+    /// that have nothing to do with `winrt`. What makes a hit believable is the type saying to
+    /// expect one. When the graph answered a different type, a hit is a coincidence in some
+    /// member's value — and reporting the dword after it as the exception's failure code invents
+    /// one out of an unrelated object.
+    #[test]
+    fn test_a_readable_type_that_is_not_an_hresult_error_suppresses_the_sentinel() {
+        let base = 0x7ff6_a1d9_0000;
+        let object_at = 0x0000_008d_e693_fd60;
+        let mut memory = FakeMemory::new();
+        // A type that is definitely not one of these, and an object that happens to carry the
+        // sentinel bytes at the offset a `winrt::hresult_error` would.
+        eh_graph(
+            &mut memory,
+            base,
+            ".?AVruntime_error@std@@",
+            0x10,
+            Bitness::Bits64,
+        );
+        memory.put(object_at, hresult_object(0x8007_0005));
+        let read = |address, len| memory.read(address, len);
+
+        let thrown = thrown_error(
+            &read,
+            &CppThrow {
+                object: object_at,
+                throw_info: base + 0x1000,
+                image_base: base,
+                bitness: Bitness::Bits64,
+            },
+        );
+        assert_eq!(
+            thrown.type_name.as_deref(),
+            Some("std::runtime_error"),
+            "the fixture is not exercising the case: the type has to be readable"
+        );
+        assert_eq!(
+            thrown.hresult, None,
+            "a coincidental sentinel in an unrelated type was reported as an HRESULT: {thrown:?}"
+        );
+        assert!(
+            thrown
+                .type_note
+                .as_deref()
+                .unwrap_or_default()
+                .contains("not a `winrt::hresult_error`"),
+            "declining to read an HRESULT has to say why: {thrown:?}"
+        );
+
+        // And the same object under a type that *does* expect it still reports, corroborated —
+        // which is what says this suppresses on the type rather than on the bytes.
+        let mut memory = FakeMemory::new();
+        eh_graph(
+            &mut memory,
+            base,
+            ".?AVhresult_error@winrt@@",
+            0x10,
+            Bitness::Bits64,
+        );
+        memory.put(object_at, hresult_object(0x8007_0005));
+        let read = |address, len| memory.read(address, len);
+        let thrown = thrown_error(
+            &read,
+            &CppThrow {
+                object: object_at,
+                throw_info: base + 0x1000,
+                image_base: base,
+                bitness: Bitness::Bits64,
+            },
+        );
+        assert_eq!(
+            thrown.hresult,
+            Some((0x8007_0005, Confidence::Corroborated)),
+            "{thrown:?}"
         );
     }
 

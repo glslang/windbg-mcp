@@ -2580,7 +2580,13 @@ pub struct ThrownErrorInfo {
     /// and a number that resolves to a message naming the failing subsystem is.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hresult: Option<StatusInfo>,
-    /// How [`Self::hresult`] was found: `convention`, always, and named rather than assumed.
+    /// How [`Self::hresult`] was found, named rather than assumed.
+    ///
+    /// `corroborated` when the EH graph independently named the thrown type a `winrt::hresult_error`
+    /// — the sentinel then confirmed an offset that was already expected. `convention` when the
+    /// type could not be read at all and the sentinel stands alone, which is the ordinary case for
+    /// a minidump without the throwing module's image. A type that was read and is *not* one of
+    /// these yields no `hresult` at all rather than a third confidence.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hresult_confidence: Option<String>,
     /// How this record was obtained, which is the whole of what can be said about whether it
