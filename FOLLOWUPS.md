@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in fifteen clusters: items 2–6 come from the reachability-confirmation effort (path
+Deferred work, in sixteen clusters: items 2–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9 and 11 from surveying this server against
 the MCP `2026-07-28` extensions (tasks, apps), item 13 from the bounded-command coverage review (#46,
 2026-08-02), item 15 from the private worker channel (#65 / #72, 2026-08-04), item 19 from
@@ -19,10 +19,12 @@ turned out to cover only half the prose a client is served (2026-08-29), and whe
 in the microseconds after a run built its stop is recorded in that result's prose and not in its flag
 (2026-08-30), item 54 from
 [#85](https://github.com/glslang/windbg-mcp/issues/85)'s module-inventory refresh, whose engine call
-no watchdog in either crate can currently cut short (2026-08-30), and item 56 from closing item 14 —
+no watchdog in either crate can currently cut short (2026-08-30), item 56 from closing item 14 —
 collapsing the coverage rule to "bound every command except `index_trace`" meant enumerating the
 `Execute` calls rather than the ops, which found one left on a shared helper that three callers
-reach on three different clocks (2026-08-31).
+reach on three different clocks (2026-08-31) — and item 58 from
+[#286](https://github.com/glslang/windbg-mcp/pull/286)'s user-mode fault triage, where the engine
+call that names a target's machine turns out to name the *processor's* (2026-09-05).
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and the
 2026-08-02 entries that item 13 extends.
@@ -794,3 +796,33 @@ its op is its own; this one is not, for the reason below.
   server can block that too — see `EngineOp::Backtrace`. This item is worth doing because a
   *command* is bounded cheaply and there is no reason to leave one that is not; it is not worth
   doing as a claim that the symbol-server hazard is gone.
+
+## 58. [dbgscope + windbg-mcp] `GetEffectiveProcessorType` is the question, and is not bound
+
+`worker::target_bitness` decides how wide to lay a fault's `EXCEPTION_RECORD` out, and asks two
+sources that each answer a slightly different question. `GetActualProcessorType` answers for the
+**physical processor** — measured, by launching `C:\Windows\SysWOW64\cmd.exe`: `0x8664`, under a
+64-bit worker, for a process whose every C++ throw raises three parameters and whose record is 80
+bytes. `IsWow64Process2`, through `target::process_arch`, answers for the **process**. Between them
+a WoW64 target comes out right, which is what
+[#286](https://github.com/glslang/windbg-mcp/pull/286) shipped after Codex found the case.
+
+Neither is the question actually being asked. `IDebugControl::GetEffectiveProcessorType` is: the
+machine the engine is *currently decoding for*, which follows a WoW64 target across the transition
+— measured on that same launch, `x64 (AMD64)` at the initial break and `x86 compatible (x86)` once
+the process is running in its own code.
+
+- **Why deferred:** it is not in the pinned `dbgscope`, so closing this is the two-repo flow — a
+  typed method on `DebugEngine`, a `rev` pin moved, and both committed together — for a correction
+  the pair of calls already makes on every target this bench can build.
+- **What would close it:** `DebugEngine::effective_processor_type` in dbgscope, and
+  `worker::decide_bitness` taking it as a third source, ahead of both: a 32-bit answer from it is
+  decisive, and the two existing sources become what answers before the target has been resumed.
+- **What the approximation costs meanwhile:** the two disagree only at the initial breakpoint of a
+  WoW64 launch, where the engine is still 64-bit and the process has not entered its own code. That
+  break carries no C++ throw to decode, so nothing reads a record at the wrong width there. It is
+  an approximation with a known gap rather than one that happens to hold.
+
+**Where it picks up.** `worker::target_bitness` and `worker::decide_bitness` in `src/worker.rs`,
+the module docs in `src/target.rs` — which already name this call as the authoritative one, and say
+why the *routing* cannot use it — and dbgscope's `src/dbgeng.rs` beside `processor_type`.

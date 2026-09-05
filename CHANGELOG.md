@@ -49,7 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   security check the record never mentioned. And the `0xAABBCCDD` sentinel is **not** read when the
   thrown type was read and is not an `hresult_error`: those four bytes occur inside unrelated
   objects, and what makes a hit believable is the type expecting one, so a type that disagrees is
-  contrary evidence rather than absent evidence.
+  contrary evidence rather than absent evidence. That is asked of the **whole** catchable-type
+  array rather than of the entry whose name is displayed — C++/WinRT throws `hresult_access_denied`
+  and a dozen siblings, one-line derivations that mangle to a name containing no `hresult_error`
+  while carrying the base's `m_code` in the object exactly where it has always been. Only a
+  complete walk of the bases counts as a disagreement; one that could not be finished leaves the
+  sentinel to answer, as it does on a dump with no image at all.
 
   `decode_error_reporting` also stopped accepting `0xffffffff00000005` as a sign extension — an
   all-ones upper half is only one when the low half's sign bit is set — and its two validation
@@ -74,8 +79,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A 32-bit throw raises three parameters where a 64-bit one raises four, its `EXCEPTION_RECORD` is
   80 bytes rather than 152, and `TypeDescriptor::name` is at `+8` rather than `+16` — each of which
   makes a mismatched reader come back empty rather than fail, so a 32-bit fault previously reported
-  no thrown object at all. The width comes from `GetActualProcessorType` per target, and
-  `docs/samples/cppthrow-fastfail-x86.dmp` is the second checked-in fixture that holds it.
+  no thrown object at all. `docs/samples/cppthrow-fastfail-x86.dmp` is the second checked-in
+  fixture, and it is where those numbers were measured.
+
+  The width is **two questions**, because a WoW64 process is a 32-bit target that no single call
+  will admit is one. `GetActualProcessorType` answers for the physical processor — measured, by
+  launching `C:\Windows\SysWOW64\cmd.exe`: `0x8664`, under a 64-bit worker — and it is right for a
+  dump, whose header records the machine it was written for. So for a **live** target the OS is
+  asked about the process as well, which is the `IsWow64Process2` the worker routing already uses;
+  and only for a live one, since a dump's recorded process id names a process that exited before
+  the file was written and may since have been inherited by an unrelated one. It is not a case the
+  routing prevents: a `launch` has no image to parse and no process to ask about until after the
+  worker exists, so the supervisor cannot preselect the 32-bit worker for it.
 
   The stack comes from the **stored crash context** ([dbgscope#144]), so it is the crash whatever
   thread the session has selected, and the selection is left where it was — which is why this is

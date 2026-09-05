@@ -734,11 +734,21 @@ pub fn thrown_error(read: &Read<'_>, throw: &CppThrow) -> ThrownError {
     // it. When the graph answered `std::runtime_error`, a hit is a coincidence in some member's
     // value, and reporting the next dword as the exception's failure code invents one. So the
     // sentinel runs when the type agrees, or when there is no type to disagree.
-    let named_hresult_error = out
-        .mangled_name
-        .as_deref()
-        .map(|name| name.contains("hresult_error"));
-    out.hresult = match named_hresult_error {
+    //
+    // **But the displayed name is the most-derived one, and it is the base that carries the
+    // sentinel.** C++/WinRT throws `hresult_access_denied`, `hresult_invalid_argument` and a dozen
+    // more, each a one-line derivation from `hresult_error` and each mangling to a name that does
+    // not contain `hresult_error` — while the `m_code` the sentinel marks is inherited from the
+    // base and sits in the object exactly where it always did. Reading only the first catchable
+    // type calls those contrary evidence and drops the HRESULT, which is the reverse of the truth:
+    // the graph *is* saying `hresult_error`, one entry further down. So a first entry that does
+    // not name it asks the rest of the array before the answer counts as a no.
+    let is_an_hresult_error = match out.mangled_name.as_deref() {
+        None => None,
+        Some(name) if name.contains("hresult_error") => Some(true),
+        Some(_) => caught_as_an_hresult_error(read, throw),
+    };
+    out.hresult = match is_an_hresult_error {
         Some(false) => None,
         expected => hresult_in(read, throw.object, out.size).map(|hr| {
             (
@@ -751,12 +761,12 @@ pub fn thrown_error(read: &Read<'_>, throw: &CppThrow) -> ThrownError {
             )
         }),
     };
-    if out.hresult.is_none() && named_hresult_error == Some(false) {
+    if out.hresult.is_none() && is_an_hresult_error == Some(false) {
         out.type_note = Some(format!(
-            "the thrown type was read and is not a `winrt::hresult_error`, so the `0xAABBCCDD` \
-             sentinel was not looked for: in a type that does not carry one, those four bytes \
-             would be some member's value and the dword after it is not an HRESULT. The object is \
-             at {:#018x} and its type is above.",
+            "the thrown type was read — it, and every type it can be caught as — and none of them \
+             is a `winrt::hresult_error`, so the `0xAABBCCDD` sentinel was not looked for: in a \
+             type that does not carry one, those four bytes would be some member's value and the \
+             dword after it is not an HRESULT. The object is at {:#018x} and its type is above.",
             out.object
         ));
     }
@@ -765,6 +775,34 @@ pub fn thrown_error(read: &Read<'_>, throw: &CppThrow) -> ThrownError {
 
 /// The mangled type name and object size, from the EH graph. `None` if any link is unreadable.
 fn describe_type(read: &Read<'_>, throw: &CppThrow) -> Option<(String, Option<u32>)> {
+    let (rvas, _) = catchable_types(read, throw)?;
+    // **The first entry, and only the first.** The array is the thrown type followed by everything
+    // it can be caught as — its bases, and `void*` — most-derived first. The rest are how a
+    // `catch` matches, not what was thrown, so they are no answer to "what type is this object".
+    // They do answer a narrower question, which [`caught_as_an_hresult_error`] asks.
+    catchable_type_at(read, throw, rvas, 0)
+}
+
+/// Whether the thrown object can be caught as a `winrt::hresult_error` — because that is what it
+/// is, or because it derives from one.
+///
+/// **`None` means the walk did not finish, which is not the same as no.** A base whose descriptor
+/// is unreadable is a base whose name was never compared, and the caller's whole reason to ask is
+/// to decide whether the graph contradicts the sentinel. Only a complete pass over the array can
+/// say it does.
+fn caught_as_an_hresult_error(read: &Read<'_>, throw: &CppThrow) -> Option<bool> {
+    let (rvas, count) = catchable_types(read, throw)?;
+    for index in 0..count {
+        let (name, _) = catchable_type_at(read, throw, rvas, index)?;
+        if name.contains("hresult_error") {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// The `CatchableTypeArray` a throw points at: where its RVAs start, and how many there are.
+fn catchable_types(read: &Read<'_>, throw: &CppThrow) -> Option<(u64, u32)> {
     let info = read(throw.throw_info, eh::THROW_INFO_SIZE)?;
     let array_rva = u32::from_le_bytes(
         info.get(eh::THROW_INFO_CATCHABLE_ARRAY..eh::THROW_INFO_CATCHABLE_ARRAY + 4)?
@@ -779,11 +817,18 @@ fn describe_type(read: &Read<'_>, throw: &CppThrow) -> Option<(String, Option<u3
     if count == 0 || count > eh::MAX_CATCHABLE_TYPES {
         return None;
     }
-    // **The first entry, and only the first.** The array is the thrown type followed by everything
-    // it can be caught as — its bases, and `void*` — most-derived first. The rest are how a
-    // `catch` matches, not what was thrown.
-    let first_rva = u32_at(read, array.checked_add(eh::ARRAY_FIRST_RVA as u64)?)?;
-    let catchable = throw.image_base.checked_add(first_rva as u64)?;
+    Some((array.checked_add(eh::ARRAY_FIRST_RVA as u64)?, count))
+}
+
+/// One entry of the `CatchableTypeArray`: its mangled type name, and the object size it records.
+fn catchable_type_at(
+    read: &Read<'_>,
+    throw: &CppThrow,
+    rvas: u64,
+    index: u32,
+) -> Option<(String, Option<u32>)> {
+    let rva = u32_at(read, rvas.checked_add(index as u64 * 4)?)?;
+    let catchable = throw.image_base.checked_add(rva as u64)?;
     let entry = read(catchable, eh::CATCHABLE_TYPE_SIZE)?;
     let descriptor_rva = u32::from_le_bytes(
         entry
@@ -1554,31 +1599,66 @@ mod tests {
     /// zero and the "RVAs" written here are then the absolute addresses, which is exactly how the
     /// real thing works.
     fn eh_graph(memory: &mut FakeMemory, base: u64, mangled: &str, size: u32, bitness: Bitness) {
+        eh_graph_hierarchy(memory, base, &[mangled], size, bitness);
+    }
+
+    /// The same graph with a whole `catch` hierarchy in it: the thrown type first, then each type
+    /// it can be caught as.
+    ///
+    /// **A single-entry array is the shape that hides a base-class bug**, and it was the only shape
+    /// this file could stage. The compiler writes one entry per catchable type — for
+    /// `throw winrt::hresult_access_denied{}` that is the derived class, then `hresult_error`, then
+    /// `void*` — so a rule about "what this object can be caught as" is untestable against a
+    /// fixture that has only ever had one thing in it.
+    fn eh_graph_hierarchy(
+        memory: &mut FakeMemory,
+        base: u64,
+        mangled: &[&str],
+        size: u32,
+        bitness: Bitness,
+    ) {
         // ThrowInfo at base+0x1000, pointing at the array by RVA.
         let mut info = vec![0u8; eh::THROW_INFO_SIZE];
         info[eh::THROW_INFO_CATCHABLE_ARRAY..eh::THROW_INFO_CATCHABLE_ARRAY + 4]
             .copy_from_slice(&0x2000u32.to_le_bytes());
         memory.put(base + 0x1000, info);
 
-        // The array: one entry, pointing at the catchable type by RVA.
-        let mut array = vec![0u8; 8];
-        array[eh::ARRAY_COUNT..eh::ARRAY_COUNT + 4].copy_from_slice(&1u32.to_le_bytes());
-        array[eh::ARRAY_FIRST_RVA..eh::ARRAY_FIRST_RVA + 4]
-            .copy_from_slice(&0x3000u32.to_le_bytes());
+        // The array: a count, then one RVA per entry, most-derived first.
+        let mut array = vec![0u8; eh::ARRAY_FIRST_RVA + 4 * mangled.len()];
+        array[eh::ARRAY_COUNT..eh::ARRAY_COUNT + 4]
+            .copy_from_slice(&(mangled.len() as u32).to_le_bytes());
+        for index in 0..mangled.len() {
+            let at = eh::ARRAY_FIRST_RVA + index * 4;
+            array[at..at + 4].copy_from_slice(&catchable_rva(index).to_le_bytes());
+        }
         memory.put(base + 0x2000, array);
 
-        // The catchable type: descriptor RVA and the object's size.
-        let mut catchable = vec![0u8; eh::CATCHABLE_TYPE_SIZE];
-        catchable[eh::CATCHABLE_TYPE_DESCRIPTOR..eh::CATCHABLE_TYPE_DESCRIPTOR + 4]
-            .copy_from_slice(&0x4000u32.to_le_bytes());
-        catchable[eh::CATCHABLE_SIZE..eh::CATCHABLE_SIZE + 4].copy_from_slice(&size.to_le_bytes());
-        memory.put(base + 0x3000, catchable);
+        for (index, name) in mangled.iter().enumerate() {
+            // The catchable type: descriptor RVA and the object's size.
+            let mut catchable = vec![0u8; eh::CATCHABLE_TYPE_SIZE];
+            catchable[eh::CATCHABLE_TYPE_DESCRIPTOR..eh::CATCHABLE_TYPE_DESCRIPTOR + 4]
+                .copy_from_slice(&descriptor_rva(index).to_le_bytes());
+            catchable[eh::CATCHABLE_SIZE..eh::CATCHABLE_SIZE + 4]
+                .copy_from_slice(&size.to_le_bytes());
+            memory.put(base + catchable_rva(index) as u64, catchable);
 
-        // The descriptor: vtable, spare, then the name.
-        let mut descriptor = vec![0u8; bitness.type_descriptor_name()];
-        descriptor.extend_from_slice(mangled.as_bytes());
-        descriptor.push(0);
-        memory.put(base + 0x4000, descriptor);
+            // The descriptor: vtable, spare, then the name.
+            let mut descriptor = vec![0u8; bitness.type_descriptor_name()];
+            descriptor.extend_from_slice(name.as_bytes());
+            descriptor.push(0);
+            memory.put(base + descriptor_rva(index) as u64, descriptor);
+        }
+    }
+
+    /// Where [`eh_graph_hierarchy`] puts entry `index`'s `CatchableType`. Entry zero keeps the
+    /// address the single-entry fixture always used, which is what a few tests overwrite by hand.
+    fn catchable_rva(index: usize) -> u32 {
+        0x3000 + index as u32 * 0x100
+    }
+
+    /// Where [`eh_graph_hierarchy`] puts entry `index`'s `TypeDescriptor`.
+    fn descriptor_rva(index: usize) -> u32 {
+        0x4000 + index as u32 * 0x100
     }
 
     /// An `EXCEPTION_RECORD` for a C++ throw, laid out at the target's width.
@@ -2417,7 +2497,7 @@ mod tests {
                 .type_note
                 .as_deref()
                 .unwrap_or_default()
-                .contains("not a `winrt::hresult_error`"),
+                .contains("none of them is a `winrt::hresult_error`"),
             "declining to read an HRESULT has to say why: {thrown:?}"
         );
 
@@ -2446,6 +2526,107 @@ mod tests {
             thrown.hresult,
             Some((0x8007_0005, Confidence::Corroborated)),
             "{thrown:?}"
+        );
+    }
+
+    /// **A derived C++/WinRT exception carries its base's HRESULT, and the base is entry one.**
+    ///
+    /// `winrt::hresult_access_denied` and its dozen siblings are one-line derivations from
+    /// `hresult_error`: they add no members, and the `m_code` the `0xAABBCCDD` sentinel marks is
+    /// the inherited one, in the object at the offset it has always been at. The name the compiler
+    /// puts in the *first* catchable type is the derived one, which does not contain
+    /// `hresult_error` — so reading only that entry turns the strongest corroboration this module
+    /// has into a reason to throw the answer away. The graph is not disagreeing; it is agreeing one
+    /// entry further down.
+    #[test]
+    fn test_a_derived_winrt_exception_reports_the_hresult_its_base_carries() {
+        let base = 0x7ff6_a1d9_0000;
+        let object_at = 0x0000_008d_e693_fd60;
+        let throw = CppThrow {
+            object: object_at,
+            throw_info: base + 0x1000,
+            image_base: base,
+            bitness: Bitness::Bits64,
+        };
+
+        let mut memory = FakeMemory::new();
+        eh_graph_hierarchy(
+            &mut memory,
+            base,
+            &[
+                ".?AVhresult_access_denied@winrt@@",
+                ".?AVhresult_error@winrt@@",
+                ".PAX",
+            ],
+            0x10,
+            Bitness::Bits64,
+        );
+        memory.put(object_at, hresult_object(0x8007_0005));
+        let read = |address, len| memory.read(address, len);
+
+        let thrown = thrown_error(&read, &throw);
+        assert_eq!(
+            thrown.type_name.as_deref(),
+            Some("winrt::hresult_access_denied"),
+            "the displayed type is still the most-derived one: {thrown:?}"
+        );
+        assert_eq!(
+            thrown.hresult,
+            Some((0x8007_0005, Confidence::Corroborated)),
+            "the base named `hresult_error`, so the sentinel is corroborated rather than \
+             suppressed: {thrown:?}"
+        );
+        assert_eq!(
+            thrown.type_note, None,
+            "nothing was declined, so there is nothing to explain: {thrown:?}"
+        );
+    }
+
+    /// **A base that could not be read is not a base that said no.**
+    ///
+    /// Suppressing the sentinel is a claim about what the graph says, and a descriptor the target
+    /// will not hand over says nothing. Treating a short walk as a denial would put this module
+    /// back where the derived-type bug had it — silently dropping an HRESULT — on exactly the dumps
+    /// where the second route is the only one left.
+    #[test]
+    fn test_a_base_that_cannot_be_read_does_not_suppress_the_sentinel() {
+        let base = 0x7ff6_a1d9_0000;
+        let object_at = 0x0000_008d_e693_fd60;
+        let throw = CppThrow {
+            object: object_at,
+            throw_info: base + 0x1000,
+            image_base: base,
+            bitness: Bitness::Bits64,
+        };
+
+        let mut memory = FakeMemory::new();
+        eh_graph_hierarchy(
+            &mut memory,
+            base,
+            &[
+                ".?AVhresult_access_denied@winrt@@",
+                ".?AVhresult_error@winrt@@",
+            ],
+            0x10,
+            Bitness::Bits64,
+        );
+        memory.put(object_at, hresult_object(0x8007_0005));
+        // The base's `CatchableType` is gone — a paged-out `.rdata` page, or a dump that captured
+        // the first one and not the second.
+        memory.put(base + catchable_rva(1) as u64, Vec::new());
+        let read = |address, len| memory.read(address, len);
+
+        assert_eq!(
+            caught_as_an_hresult_error(&read, &throw),
+            None,
+            "an incomplete walk answered `no` instead of `do not know`"
+        );
+        let thrown = thrown_error(&read, &throw);
+        assert_eq!(
+            thrown.hresult,
+            Some((0x8007_0005, Confidence::Convention)),
+            "an unreadable base suppressed the sentinel, and it is only ever the type saying so \
+             that may do that: {thrown:?}"
         );
     }
 
