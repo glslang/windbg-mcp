@@ -4967,6 +4967,32 @@ fn a_sign_extended_error_code_is_accepted_and_a_wider_one_is_refused() {
     );
     assert_eq!(data["value"], "0x80070005", "{data}");
     assert_eq!(data["symbolic"], "E_ACCESSDENIED", "{data}");
+
+    // **An HRESULT_FROM_NT value resolves through the status it wraps**, and the text says which
+    // number the message actually belongs to. Measured before the fix: 0xd0000005 came back with
+    // no message of any kind, which is the whole class of these.
+    let out = server.call_tool(
+        "decode_error_reporting",
+        json!({ "code": "0xd0000005" }),
+        STEP,
+    );
+    let data = &out["result"]["structuredContent"];
+    assert_eq!(data["status"], "ok", "{out}");
+    assert_eq!(data["nt_mapped"], true, "{data}");
+    assert!(
+        data["ntstatus_message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("instruction"),
+        "an HRESULT_FROM_NT value did not resolve through the status it wraps: {data}"
+    );
+    let text = out["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("0xc0000005"),
+        "the text gave the wrapped status's message without naming it: {text}"
+    );
 }
 
 /// A live user-mode target that runs long enough to be driven and exits on its own.

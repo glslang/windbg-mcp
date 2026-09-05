@@ -123,6 +123,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value, because that is the shape a WIL fail-fast's HRESULT arrives in — `0xffffffff8000ffff`
   decodes to `E_UNEXPECTED`.
 
+  **An `HRESULT_FROM_NT` value is decoded as the status it wraps.** Bit 28 is `FACILITY_NT_BIT`, so
+  `0xd0000005` is `STATUS_ACCESS_VIOLATION` carried inside an HRESULT — and `ntdll`'s table knows
+  the status, not the wrapper. Measured: before this, `0xd0000005` resolved to nothing at all while
+  `0xc0000005` gave "The instruction at 0x%p referenced memory at 0x%p...", so the whole class came
+  back an unexplained number. The bit is reported as `nt_mapped`, the message is the wrapped
+  status's, and the text names which value it belongs to. Unwrapped only for a value of unknown
+  provenance: bit 28 is `N` in the HRESULT layout and reserved in the NTSTATUS one, so a caller that
+  has said "this is an NTSTATUS" has said this bit is not a wrapper — the same gate the well-known
+  name is behind.
+
   **The facility is two fields for the same reason.** An HRESULT's is bits 16..=26 and an
   NTSTATUS's is 16..=27, so bit 27 — an HRESULT's reserved `X` — is inside one and outside the
   other: `0x88070005` is NTSTATUS facility `0x807` and HRESULT facility `0x7`, `FACILITY_WIN32`

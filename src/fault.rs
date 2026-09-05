@@ -109,6 +109,13 @@ pub struct StatusDecode {
     pub hresult_failed: bool,
     /// The severity of the value **read as an `NTSTATUS`**, which is a two-bit field.
     pub ntstatus_severity: Severity,
+    /// Whether bit 28 — `N`, `FACILITY_NT_BIT` — is set.
+    ///
+    /// As an **HRESULT** that says the rest of the value is an `NTSTATUS` that `HRESULT_FROM_NT`
+    /// wrapped, and [`StatusDecode::ntstatus_message`] is then the message for what it wraps. As
+    /// an **NTSTATUS** the same bit is reserved and says nothing, which is why it is only unwrapped
+    /// for a value of unknown provenance.
+    pub nt_mapped: bool,
     /// The facility as an **NTSTATUS** reads it: bits 16..=27, twelve of them.
     pub ntstatus_facility: u32,
     /// The facility as an **HRESULT** reads it: bits 16..=26, eleven — bit 27 is `X`, reserved,
@@ -266,6 +273,13 @@ const WELL_KNOWN: &[(u32, &str)] = &[
     (0x0000_0001, "S_FALSE"),
 ];
 
+/// `FACILITY_NT_BIT` — bit 28, `N` in the HRESULT layout.
+///
+/// `HRESULT_FROM_NT(status)` is `status | FACILITY_NT_BIT`, so a set `N` says the rest of the value
+/// is an `NTSTATUS` carried inside an `HRESULT`. In the *NTSTATUS* layout the same bit is merely
+/// reserved, which is why unwrapping is gated on the reading below.
+const FACILITY_NT_BIT: u32 = 0x1000_0000;
+
 /// Decodes a status value structurally, and asks the host what it means.
 ///
 /// The structural half is arithmetic and cannot be wrong. The message half comes from **this
@@ -275,8 +289,26 @@ const WELL_KNOWN: &[(u32, &str)] = &[
 /// engine — reads the same tables from the same machine.
 pub fn decode_status_as(value: u32, reading: Reading) -> StatusDecode {
     let customer_defined = value & 0x2000_0000 != 0;
+    let nt_mapped = value & FACILITY_NT_BIT != 0;
+    // **`ntdll`'s table knows the status, not the wrapper.** Measured: `0xd0000005` resolves to
+    // nothing at all and `0xc0000005` — the same value with `N` cleared — to "The instruction at
+    // 0x%p referenced memory at 0x%p...". So an `HRESULT_FROM_NT` value used to come back an
+    // unexplained number, which is the whole class of them.
+    //
+    // **Unwrapped only under `Reading::Unknown`**, the same gate `symbolic` is behind and for the
+    // same reason: bit 28 is `N` in the HRESULT layout and reserved in the NTSTATUS one, so a
+    // caller who has said "this is an NTSTATUS" has said this bit is not a wrapper. Answering as
+    // though it were would be this module picking a reading, which is the thing it exists not to
+    // do. The bit itself is reported either way — that is arithmetic, and true of the value
+    // whatever it turns out to mean.
+    let ask_ntdll_about = if nt_mapped && reading == Reading::Unknown {
+        value & !FACILITY_NT_BIT
+    } else {
+        value
+    };
     StatusDecode {
         value,
+        nt_mapped,
         hresult_failed: value & 0x8000_0000 != 0,
         ntstatus_severity: Severity::of(value),
         ntstatus_facility: (value >> 16) & 0x0fff,
@@ -300,7 +332,7 @@ pub fn decode_status_as(value: u32, reading: Reading) -> StatusDecode {
             .then(|| message::from_system(value))
             .flatten(),
         ntstatus_message: (!customer_defined)
-            .then(|| message::from_ntdll(value))
+            .then(|| message::from_ntdll(ask_ntdll_about))
             .flatten(),
         reading,
     }
@@ -1259,6 +1291,7 @@ pub fn status_info(decode: &StatusDecode) -> crate::structured::StatusInfo {
         ntstatus_message: decode.ntstatus_message.clone(),
         hresult_failed: decode.hresult_failed,
         ntstatus_severity: decode.ntstatus_severity.as_str().to_string(),
+        nt_mapped: decode.nt_mapped,
         ntstatus_facility: decode.ntstatus_facility,
         hresult_facility: decode.hresult_facility,
         code: u32::from(decode.code),
@@ -3264,6 +3297,56 @@ mod tests {
             describe_type(&read, &throw),
             Err(TypeUnread::Unreadable("the `TypeDescriptor`'s name"))
         );
+    }
+
+    /// **`HRESULT_FROM_NT` wraps an NTSTATUS, and ntdll's table only knows the thing inside.**
+    ///
+    /// Measured through the built server before anything was changed: `0xd0000005` resolved to
+    /// **nothing at all** — no system message, no ntdll message, no name — while `0xc0000005`, the
+    /// same value with bit 28 cleared, gave "The instruction at 0x%p referenced memory at 0x%p...".
+    /// Same for `0xd0000034` against `0xc0000034` ("Object Name not found."). So the whole
+    /// `HRESULT_FROM_NT` class came back an unexplained number.
+    ///
+    /// The unwrap is gated on the reading, which is the point rather than a detail: bit 28 is `N`
+    /// in the HRESULT layout and reserved in the NTSTATUS one, so a caller who has already said
+    /// "this is an NTSTATUS" has said this bit is not a wrapper — the same gate `symbolic` is
+    /// behind, for the same reason.
+    #[test]
+    fn test_an_nt_mapped_hresult_is_decoded_as_the_status_it_wraps() {
+        // The bit is structural and reported under either reading.
+        assert!(decode_status(0xd000_0005).nt_mapped);
+        assert!(decode_status_as(0xd000_0005, Reading::NtStatus).nt_mapped);
+        assert!(!decode_status(0xc000_0005).nt_mapped);
+
+        // Unknown provenance: the wrapper is opened, and the answer is the wrapped status's.
+        let wrapped = decode_status(0xd000_0005);
+        let bare = decode_status(0xc000_0005);
+        assert!(
+            wrapped.ntstatus_message.is_some(),
+            "an HRESULT_FROM_NT value resolved to nothing: {wrapped:?}"
+        );
+        assert_eq!(
+            wrapped.ntstatus_message, bare.ntstatus_message,
+            "the wrapper's message must be the message of what it wraps"
+        );
+        assert_eq!(wrapped.best_effort(), bare.best_effort());
+
+        // Told it is an NTSTATUS, the bit is reserved and means nothing, so nothing is unwrapped —
+        // this module does not pick a reading the caller has already given it.
+        let as_status = decode_status_as(0xd000_0005, Reading::NtStatus);
+        assert_eq!(
+            as_status.ntstatus_message, None,
+            "a caller that said `NTSTATUS` had bit 28 read as an HRESULT wrapper: {as_status:?}"
+        );
+
+        // A value with the bit clear is untouched either way.
+        assert_eq!(
+            decode_status(0x8007_0005).ntstatus_message,
+            decode_status_as(0x8007_0005, Reading::NtStatus).ntstatus_message
+        );
+
+        // And the wire carries the flag, so a consumer can tell which number the message is for.
+        assert!(status_info(&decode_status(0xd000_0034)).nt_mapped);
     }
 
     /// **The two layouts disagree about the facility, and one field said they agree.**

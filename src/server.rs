@@ -3703,10 +3703,19 @@ impl WindbgServer {
             }
         };
         let decoded = crate::fault::status_info(&crate::fault::decode_status(value));
+        // **Where the message was reached through the NT wrapper, the line says so.** The text for
+        // `0xd0000005` is `STATUS_ACCESS_VIOLATION`'s, and it is that value's message only by way
+        // of `HRESULT_FROM_NT` — presenting it as though the number itself were in a table is the
+        // same overclaim the fault notes were carrying two rounds ago.
+        let wrapped = if decoded.nt_mapped {
+            format!(" (as the NTSTATUS {:#010x} it wraps)", value & !0x1000_0000)
+        } else {
+            String::new()
+        };
         let text = decoded
             .best_effort
             .clone()
-            .map(|best| format!("{} — {best}", decoded.value))
+            .map(|best| format!("{} — {best}{wrapped}", decoded.value))
             .unwrap_or_else(|| {
                 format!(
                     "{} — no message in this host's tables{}",
