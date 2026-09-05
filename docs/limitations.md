@@ -221,15 +221,25 @@
 - **`exception_triage`'s stack comes from the stored crash context where the target has one.** That
   is what `.ecxr` adopts, walked without `.ecxr`'s effect on the session, so the caller's selected
   thread and frame are left alone — which is what lets the tool be read-only where `crash_triage`
-  needed a scope guard. `frames_from_stored_context` says which happened: a **live** target stores
-  no event, so there the stack is whatever thread is selected and is not promised to be a crash.
-  A kernel session is **refused** — a kernel crash dump carries no stored event at all, measured,
-  and its bug check is `crash_triage`'s.
+  needed a scope guard. A kernel session is **refused** — a kernel crash dump carries no stored
+  event at all, measured, and its bug check is `crash_triage`'s.
+- **Two fields, because "not from the stored context" has two causes and they are not the same
+  news.** `stored_crash_context` is what the target *had*; `frames_from_stored_context` is what the
+  walk got. Both true is the crash. Both false is a **live** target, where the stack is whatever
+  thread is selected and is not promised to be a crash. The pair that matters is
+  `stored_crash_context` true with `frames_from_stored_context` false: a dump written *for* a fault
+  whose own crash context would not walk, which on a dump usually means the faulting module's image
+  — and so its unwind data — is not where the debugger can read it. The walk is best-effort by
+  design, since the record and the thrown object are the answer and a triage that could not walk
+  still carries both; what it must not do is describe that failure as a target that had nothing to
+  walk from.
 - **`decode_error_reporting` reads the host's message tables, not the target's.** The structural
   fields — severity, facility, code, the customer bit — are arithmetic and cannot differ. The
   message text comes from this machine (`FormatMessageW`, plus `ntdll`'s table for an `NTSTATUS`),
   so a dump from a build that words an error differently is described in this host's words;
-  `message_provenance` says so on every answer that carries one. It reports **both** readings
+  `message_provenance` says so on every answer that carries one — and says only that, since this
+  tool is pure and the value it decoded came from its own argument rather than from any target. It
+  reports **both** readings
   rather than choosing, because a bare dword does not say which space it came from: severity is one
   bit as an HRESULT and two as an NTSTATUS, and `0x80670015` is a *failed* HRESULT whose top two
   bits read as an NTSTATUS *warning*.

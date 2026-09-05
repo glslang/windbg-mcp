@@ -2484,6 +2484,15 @@ pub struct ExceptionTriage {
     /// `false` is not a failure — a live target has no stored event, and there is nothing to walk
     /// from but the current context. It matters because only `true` promises the crash.
     pub frames_from_stored_context: bool,
+    /// Whether the target **had** a stored crash context, whatever the walk then managed.
+    ///
+    /// The pair distinguishes the two ways [`Self::frames_from_stored_context`] is `false`, which
+    /// are not the same news: `false` here is a live target with nothing to walk from but the
+    /// current thread, and `true` here with `false` there is a dump written for a fault whose own
+    /// crash context the walker could not follow — usually a missing image, and so missing unwind
+    /// data. Reported rather than derived from an empty `frames`, because a walk can also return
+    /// nothing for reasons this cannot see.
+    pub stored_crash_context: bool,
     /// The process the fault happened in, where the engine could name it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_name: Option<String>,

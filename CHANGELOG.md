@@ -102,6 +102,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   annotated read-only where `crash_triage` needed a scope guard. A kernel session is refused, since
   a kernel crash dump carries no stored event at all and its bug check is `crash_triage`'s.
 
+  Two fields report that, not one, because the walk is best-effort and "not from the stored
+  context" therefore has two causes. `stored_crash_context` is what the target had;
+  `frames_from_stored_context` is what the walk got. Both false is a live target with nothing to
+  walk from but the selected thread. The first true and the second false is the case worth seeing:
+  a dump written *for* a fault whose own crash context would not walk, which usually means the
+  faulting module's image — and so its unwind data — is not where the debugger can read it. One
+  bool described that as a target that had no context at all.
+
 - **`decode_error_reporting` — an HRESULT, NTSTATUS or Win32 error as fields**, with the message the
   system's own tables give it: `!error` as a typed call rather than a scrape of an extension's
   output. `FormatMessageW` was measured to answer for both of that investigation's exotic codes

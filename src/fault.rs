@@ -1165,8 +1165,16 @@ pub fn record_at(read: &Read<'_>, address: u64, bitness: Bitness) -> Option<CppT
 /// error differently is described in this machine's words. Worth stating: everything else in an
 /// `exception_triage` is a read of the dump, and a sentence that quietly is not would be the one
 /// field a caller could not place.
-const MESSAGE_PROVENANCE: &str = "the message text is from this host's message tables, not the target's — the codes and the \
-     structure beside it are read from the dump";
+///
+/// **It says nothing about where the value came from**, because this type has two callers and only
+/// one of them has a target. `decode_error_reporting` is pure — the code arrives in its argument —
+/// so a sentence claiming the codes were "read from the dump" told a caller passing
+/// `{"code":"0x80070005"}` that its own number came out of a file it never opened (Codex, round
+/// eleven of [#286](https://github.com/glslang/windbg-mcp/pull/286)). What the field is for is the
+/// contrast that is true either way: the *message* is this host's, and everything beside it is
+/// arithmetic on the value.
+const MESSAGE_PROVENANCE: &str = "the message text is from this host's message tables, not the target's — the fields beside it \
+     are arithmetic on the value itself";
 
 /// [`StatusDecode`] as the wire type.
 pub fn status_info(decode: &StatusDecode) -> crate::structured::StatusInfo {
@@ -1456,7 +1464,7 @@ pub fn report(
     evidence: ThrowEvidence,
     frames: Vec<crate::structured::FrameInfo>,
     frames_truncated: bool,
-    frames_from_stored_context: bool,
+    stored_crash_context: bool,
     process_name: Option<String>,
 ) -> crate::structured::ExceptionTriage {
     crate::structured::ExceptionTriage {
@@ -1471,9 +1479,14 @@ pub fn report(
             }),
             _ => None,
         },
+        // **Derived here rather than passed in, because the two facts are not independent and
+        // the caller got the relationship wrong.** Frames come from the stored context exactly
+        // when there was one *and* the walk produced something; a caller computing that itself is
+        // a second place for the `&&` to live, which is where the wrong sentence below came from.
+        frames_from_stored_context: stored_crash_context && !frames.is_empty(),
+        stored_crash_context,
         frames,
         frames_truncated,
-        frames_from_stored_context,
         process_name,
     }
 }
@@ -1560,15 +1573,33 @@ pub fn render(triage: &crate::structured::ExceptionTriage) -> String {
     if let Some(process) = &triage.process_name {
         text.push_str(&format!("PROCESS: {process}\n"));
     }
-    text.push_str(&format!(
-        "\nSTACK ({} frames, {}):\n",
-        triage.frames.len(),
-        if triage.frames_from_stored_context {
-            "from the stored crash context"
-        } else {
-            "from the selected thread — this target stores no event, so it is not promised to be \
-             the crash"
+    // **Three outcomes, because "not from the stored context" has two quite different causes.**
+    // The walk is best-effort — a failure becomes an empty stack rather than a failed call, since
+    // the record and the thrown object are the answer and a triage that could not walk still
+    // carries both. So `frames_from_stored_context` is false both when there was no context and
+    // when there was one the walker could not follow, and a single `else` told the second case
+    // that this target stores no event: false, and it hid the only interesting thing about it —
+    // that a dump written *for* a fault could not be walked from its own crash context, which is
+    // missing unwind data rather than a live target's ordinary state.
+    let source = match (
+        triage.frames_from_stored_context,
+        triage.stored_crash_context,
+    ) {
+        (true, _) => "from the stored crash context".to_string(),
+        (false, true) => "the stored crash context could not be walked — on a dump that usually \
+             means the faulting module's image, and so its unwind data, is not where the debugger \
+             can read it"
+            .to_string(),
+        (false, false) if triage.frames.is_empty() => {
+            "no stored crash context, and the selected thread did not walk either".to_string()
         }
+        (false, false) => "from the selected thread — this target stored no crash context, so it \
+             is not promised to be the crash"
+            .to_string(),
+    };
+    text.push_str(&format!(
+        "\nSTACK ({} frames, {source}):\n",
+        triage.frames.len(),
     ));
     for frame in &triage.frames {
         text.push_str(&format!(
@@ -2449,6 +2480,120 @@ mod tests {
             info.decoded.symbolic.is_none(),
             "an exception code was given an HRESULT name: {:?}",
             info.decoded.symbolic
+        );
+    }
+
+    /// **The four ways a triage's stack turns out, and the two that used to read alike.**
+    ///
+    /// The walk is best-effort: a failure becomes an empty stack rather than a failed call, because
+    /// the record and the thrown object are the answer and a triage that could not walk still
+    /// carries both. So "the frames did not come from the stored context" covers both a live target
+    /// that never had one and a dump whose own crash context the walker could not follow — and the
+    /// rendering told the second it was the first, which is false and buries the one interesting
+    /// thing about it.
+    #[test]
+    fn test_a_stored_context_that_would_not_walk_is_not_a_target_that_had_none() {
+        let record = dbgscope::dbgeng::ExceptionRecord {
+            code: STATUS_BREAKPOINT,
+            flags: 0,
+            address: 0x7ff6_a1d9_1000,
+            parameters: Vec::new(),
+            nested: None,
+        };
+        let kind = classify(record.code, &record.parameters, Bitness::Bits64);
+        let frame = crate::structured::FrameInfo {
+            index: 0,
+            address: "0x00007ff6a1d91000".to_string(),
+            module: None,
+            rva: None,
+            symbol: None,
+            displacement: None,
+            attribution_failed: false,
+        };
+        let built = |frames: Vec<crate::structured::FrameInfo>, stored_crash_context: bool| {
+            report(
+                &record,
+                true,
+                &kind,
+                None,
+                ThrowEvidence::None,
+                frames,
+                false,
+                stored_crash_context,
+                None,
+            )
+        };
+
+        // 1. A context, and a walk that followed it: the crash, and the only case that promises it.
+        let walked = built(vec![frame.clone()], true);
+        assert!(walked.frames_from_stored_context);
+        assert!(render(&walked).contains("from the stored crash context"),);
+
+        // 2. A context the walk could not follow. This is the finding: it must not be described as
+        //    a target that stores no context, and it must say what actually happened.
+        let unwalkable = built(Vec::new(), true);
+        assert!(
+            !unwalkable.frames_from_stored_context,
+            "no frames came from it, whatever the target had"
+        );
+        assert!(
+            unwalkable.stored_crash_context,
+            "the target had one, and that is the fact worth reporting"
+        );
+        let text = render(&unwalkable);
+        assert!(
+            !text.contains("stored no crash context"),
+            "a dump with a crash context was told it had none: {text}"
+        );
+        assert!(
+            text.contains("could not be walked"),
+            "the one interesting thing about this case was not said: {text}"
+        );
+
+        // 3. No context, and the selected thread walked: a live target's ordinary state.
+        let selected = built(vec![frame], false);
+        assert!(!selected.frames_from_stored_context);
+        let text = render(&selected);
+        assert!(text.contains("from the selected thread"), "{text}");
+        assert!(text.contains("stored no crash context"), "{text}");
+
+        // 4. Neither. Nothing to claim, so nothing is claimed about why.
+        let nothing = built(Vec::new(), false);
+        let text = render(&nothing);
+        assert!(text.contains("did not walk either"), "{text}");
+        assert!(
+            !text.contains("could not be walked"),
+            "a target with no crash context was told its crash context would not walk: {text}"
+        );
+    }
+
+    /// **`decode_error_reporting` has no dump, and the provenance sentence used to say it did.**
+    ///
+    /// [`status_info`] serves two callers: `exception_triage`, where everything but the message
+    /// really is read from a dump, and a pure tool whose value arrives in its own argument. One
+    /// sentence has to be true for both, so it draws the contrast that is — the message is the
+    /// host's, the fields beside it are arithmetic — and names no source for the value.
+    #[test]
+    fn test_the_message_provenance_claims_no_source_for_the_value() {
+        let info = status_info(&decode_status(0x8007_0005));
+        let provenance = info
+            .message_provenance
+            .as_deref()
+            .expect("a code with a message carries the note");
+        assert!(
+            !provenance.contains("dump"),
+            "a caller that passed its own number was told it came out of a dump: {provenance}"
+        );
+        assert!(
+            provenance.contains("this host's message tables"),
+            "the note exists to say the message is this machine's: {provenance}"
+        );
+
+        // And it is still absent where there is no message to qualify, which is what it is for.
+        let unknown = status_info(&decode_status(0xe000_1234));
+        assert!(
+            unknown.best_effort.is_none() && unknown.message_provenance.is_none(),
+            "a value with no message was given a note about its message: {unknown:?}"
         );
     }
 
