@@ -195,9 +195,20 @@
   bytes rather than 152 with the parameter count and the parameters both earlier, and
   `TypeDescriptor::name` sits at `+8` rather than `+16`. All measured, by building one program twice
   and having it print its own record and walk its own graph. Every one of those differences makes a
-  mismatched reader come back *empty* rather than fail, so the width is read from the engine
-  (`GetActualProcessorType`) per target rather than assumed; `docs/samples/cppthrow-fastfail-x86.dmp`
-  is the fixture that keeps it honest.
+  mismatched reader come back *empty* rather than fail, so the width is asked per target rather
+  than assumed; `docs/samples/cppthrow-fastfail-x86.dmp` is the fixture that keeps it honest.
+- **Asking takes two questions, and one of them cannot be asked about a dump.** The engine's
+  `GetActualProcessorType` answers for the **physical processor**, so a WoW64 process on an x64 box
+  comes back `0x8664` — measured, by launching `C:\Windows\SysWOW64\cmd.exe` under a 64-bit
+  worker. It is nonetheless the right answer for a dump, whose header records the machine it was
+  written for, so a **live** target is asked about a second way: `IsWow64Process2` on the process
+  id, which is what the worker routing already uses to pick an image. A dump is not, because its
+  recorded process id names a process that had exited before the file was written and some
+  unrelated live process may have inherited the number since — a confident wrong width, on the one
+  target kind whose own header is already right. What neither tracks is the engine's *effective*
+  machine (`GetEffectiveProcessorType`), which follows a WoW64 target across the transition and is
+  not in the pinned `dbgscope`; `FOLLOWUPS.md` item 58 carries it, with the measurement of where
+  the approximation and the authoritative answer differ.
 - **`exception_triage`'s stack comes from the stored crash context where the target has one.** That
   is what `.ecxr` adopts, walked without `.ecxr`'s effect on the session, so the caller's selected
   thread and frame are left alone — which is what lets the tool be read-only where `crash_triage`
