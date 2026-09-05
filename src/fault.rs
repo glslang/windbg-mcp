@@ -59,14 +59,24 @@
 /// structure.
 pub type Read<'a> = dyn Fn(u64, usize) -> Option<Vec<u8>> + 'a;
 
-/// How much weight a decoded field can bear. See the module docs.
+/// How much weight a convention-located field can bear. See the module docs.
+///
+/// **Only ever attached to the sentinel-located `HRESULT`**, because that is the one value here
+/// whose provenance varies. The record's fields and the EH graph's are read from the dump and from
+/// a layout the compiler fixes; they need no qualifier, and giving them one would suggest the
+/// question is open where it is not.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Confidence {
-    /// Read straight out of the exception record, or decoded from a structure whose layout the
-    /// compiler fixes.
-    Documented,
-    /// Recognised by a pattern that no header states — a sentinel, or a convention a library
-    /// happens to follow. Corroborated where possible, and reported as a guess either way.
+    /// Two independent routes agree: the EH graph named the thrown type an `hresult_error`, *and*
+    /// the sentinel scan of the object found a code.
+    ///
+    /// This is the cross-check the walkthrough argued for — "a number that decodes to a plausible
+    /// message is evidence; a number at an assumed offset is not" — with the type name supplying
+    /// the half that says the offset was not assumed but expected.
+    Corroborated,
+    /// One route: the sentinel matched, and nothing said what the thrown type was. The ordinary
+    /// case on a minidump without the throwing module's image, and still the answer — it is just
+    /// an answer resting on a pattern no header states.
     Convention,
 }
 
@@ -557,7 +567,25 @@ pub fn thrown_error(read: &Read<'_>, throw: &CppThrow) -> ThrownError {
         }
     }
 
-    out.hresult = hresult_in(read, throw.object, out.size).map(|hr| (hr, Confidence::Convention));
+    // **Corroborated exactly when the other route independently expected this shape.** The type
+    // name comes from the compiler's descriptors and the code from a sentinel in the object; when
+    // the first says `hresult_error` and the second matches, the offset was expected rather than
+    // assumed. Matched on the *mangled* name, which is always present when the graph was read —
+    // demangling can decline, and a name this file will not decode is not a weaker fact.
+    let expected = out
+        .mangled_name
+        .as_deref()
+        .is_some_and(|name| name.contains("hresult_error"));
+    out.hresult = hresult_in(read, throw.object, out.size).map(|hr| {
+        (
+            hr,
+            if expected {
+                Confidence::Corroborated
+            } else {
+                Confidence::Convention
+            },
+        )
+    });
     out
 }
 
@@ -755,9 +783,16 @@ pub fn find_cpp_records(read: &Read<'_>, stack_low: u64, stack_high: u64) -> Vec
     let mut at = stack_low;
     while at < stack_high && found.len() < MAX_RECORDS {
         let want = SCAN_CHUNK.min((stack_high - at) as usize);
-        let Some(chunk) = read(at, want) else {
-            // An unreadable page in the middle of a stack range is ordinary in a minidump; step
-            // over it rather than giving up on the range.
+        // **Shrunk before it is skipped**, and the order matters. A debug engine refuses a read
+        // that runs past what the dump captured rather than returning the readable prefix, so a
+        // fixed 4 KB chunk fails at every region boundary — and skipping a whole chunk on that
+        // failure steps over up to 4 KB of perfectly readable stack. Measured: on the fail-fast
+        // dump this walk was written for, the throw's record sits in such a chunk, and the scan
+        // found nothing at all until this shrank instead of skipping.
+        let Some(chunk) = read_upto(read, at, want) else {
+            // Genuinely unreadable even one byte at a time — an unmapped page in the middle of a
+            // stack range, which is ordinary in a minidump. Step over it rather than giving up on
+            // the range.
             at = at.saturating_add(SCAN_CHUNK as u64);
             continue;
         };
@@ -789,8 +824,6 @@ pub fn find_cpp_records(read: &Read<'_>, stack_low: u64, stack_high: u64) -> Vec
 /// slot is the mistake the walkthrough records making, which is why the parameters are reached from
 /// the *count* rather than by assuming four.
 mod record {
-    pub const FLAGS: usize = 4;
-    pub const ADDRESS: usize = 16;
     pub const NUMBER_PARAMETERS: usize = 24;
     pub const FIRST_PARAMETER: usize = 32;
     pub const MAX_PARAMETERS: u32 = 15;
@@ -831,23 +864,251 @@ pub fn record_at(read: &Read<'_>, address: u64) -> Option<CppThrow> {
     })
 }
 
-/// The flags and faulting address of a record found by scanning, for a caller that wants to render
-/// what it found rather than only follow it.
-pub fn record_details(read: &Read<'_>, address: u64) -> Option<(u32, u64)> {
-    let bytes = read(address, record::SIZE)?;
-    let flags = u32::from_le_bytes(
-        bytes
-            .get(record::FLAGS..record::FLAGS + 4)?
-            .try_into()
-            .ok()?,
-    );
-    let at = u64::from_le_bytes(
-        bytes
-            .get(record::ADDRESS..record::ADDRESS + 8)?
-            .try_into()
-            .ok()?,
-    );
-    Some((flags, at))
+// ---------------------------------------------------------------------------
+// Building the caller's answer
+// ---------------------------------------------------------------------------
+
+/// Where a message came from, said once rather than implied.
+///
+/// The tables are the **host's**, not the target's, so a dump written on a build that words an
+/// error differently is described in this machine's words. Worth stating: everything else in an
+/// `exception_triage` is a read of the dump, and a sentence that quietly is not would be the one
+/// field a caller could not place.
+const MESSAGE_PROVENANCE: &str = "the message text is from this host's message tables, not the target's — the codes and the \
+     structure beside it are read from the dump";
+
+/// [`StatusDecode`] as the wire type.
+pub fn status_info(decode: &StatusDecode) -> crate::structured::StatusInfo {
+    let has_message = decode.system_message.is_some() || decode.ntstatus_message.is_some();
+    crate::structured::StatusInfo {
+        value: format!("{:#010x}", decode.value),
+        best_effort: decode.best_effort(),
+        symbolic: decode.symbolic.map(str::to_string),
+        system_message: decode.system_message.clone(),
+        ntstatus_message: decode.ntstatus_message.clone(),
+        hresult_failed: decode.hresult_failed,
+        ntstatus_severity: decode.ntstatus_severity.as_str().to_string(),
+        facility: decode.facility,
+        code: u32::from(decode.code),
+        customer_defined: decode.customer_defined,
+        message_provenance: has_message.then(|| MESSAGE_PROVENANCE.to_string()),
+    }
+}
+
+/// The one sentence a fault gets, where the code alone would mislead.
+fn summary_of(kind: &FaultKind) -> Option<String> {
+    match kind {
+        FaultKind::FailFast {
+            subcode,
+            subcode_name,
+            ..
+        } => {
+            let named = subcode_name.map_or_else(
+                || format!("subcode {subcode:#x}"),
+                |name| format!("{name} (subcode {subcode:#x})"),
+            );
+            Some(format!(
+                "a __fastfail — a deliberate process exit, not a stack buffer overrun, whatever \
+                 the code's name and the system's message text for it say. {named} is what says \
+                 why; subcode 7 is the CRT's abort(), which means a C++ exception nobody caught."
+            ))
+        }
+        FaultKind::CppThrow(_) => Some(
+            "a C++ throw that reached RaiseException. The thrown object is what carries the \
+             failure; the exception code says only that a throw happened."
+                .to_string(),
+        ),
+        FaultKind::AccessViolation { operation, address } => Some(format!(
+            "an access violation: the target tried to {operation} {address:#x}."
+        )),
+        FaultKind::Breakpoint => Some(
+            "a breakpoint (int3). On a live target this is usually the debugger's own initial \
+             break rather than a fault."
+                .to_string(),
+        ),
+        FaultKind::Other => None,
+    }
+}
+
+/// The kind, as the one stable word a caller branches on.
+fn kind_word(kind: &FaultKind) -> &'static str {
+    match kind {
+        FaultKind::FailFast { .. } => "fail_fast",
+        FaultKind::CppThrow(_) => "cpp_throw",
+        FaultKind::AccessViolation { .. } => "access_violation",
+        FaultKind::Breakpoint => "breakpoint",
+        FaultKind::Other => "other",
+    }
+}
+
+/// [`ThrownError`] as the wire type.
+pub fn thrown_info(thrown: &ThrownError) -> crate::structured::ThrownErrorInfo {
+    crate::structured::ThrownErrorInfo {
+        object: format!("{:#018x}", thrown.object),
+        type_name: thrown.type_name.clone(),
+        mangled_name: thrown.mangled_name.clone(),
+        size: thrown.size,
+        hresult: thrown
+            .hresult
+            .map(|(code, _)| status_info(&decode_status(code))),
+        hresult_confidence: thrown.hresult.map(|(_, confidence)| {
+            match confidence {
+                Confidence::Corroborated => "corroborated",
+                Confidence::Convention => "convention",
+            }
+            .to_string()
+        }),
+        type_note: thrown.type_note.clone(),
+    }
+}
+
+/// The exception record as the wire type, with its code decoded.
+pub fn exception_info(
+    record: &dbgscope::dbgeng::ExceptionRecord,
+    first_chance: bool,
+) -> crate::structured::ExceptionInfo {
+    crate::structured::ExceptionInfo {
+        code: format!("{:#010x}", record.code),
+        decoded: status_info(&decode_status(record.code)),
+        address: format!("{:#018x}", record.address),
+        flags: format!("{:#x}", record.flags),
+        noncontinuable: record.noncontinuable(),
+        first_chance,
+        parameters: record
+            .parameters
+            .iter()
+            .map(|value| format!("{value:#018x}"))
+            .collect(),
+        nested_record: record.nested.map(|at| format!("{at:#018x}")),
+    }
+}
+
+/// Assembles the caller's answer from the pieces each half established.
+#[allow(clippy::too_many_arguments)]
+pub fn report(
+    record: &dbgscope::dbgeng::ExceptionRecord,
+    first_chance: bool,
+    kind: &FaultKind,
+    thrown: Option<&ThrownError>,
+    frames: Vec<crate::structured::FrameInfo>,
+    frames_truncated: bool,
+    frames_from_stored_context: bool,
+    process_name: Option<String>,
+) -> crate::structured::ExceptionTriage {
+    crate::structured::ExceptionTriage {
+        exception: exception_info(record, first_chance),
+        kind: kind_word(kind).to_string(),
+        summary: summary_of(kind),
+        thrown: thrown.map(thrown_info),
+        failure: match kind {
+            FaultKind::FailFast { wil: Some(wil), .. } => Some(crate::structured::WilFailureInfo {
+                hresult: status_info(&decode_status(wil.hresult)),
+                line: wil.line,
+            }),
+            _ => None,
+        },
+        frames,
+        frames_truncated,
+        frames_from_stored_context,
+        process_name,
+    }
+}
+
+/// The text half of the answer, rendered from the same values so the two cannot disagree.
+pub fn render(triage: &crate::structured::ExceptionTriage) -> String {
+    let mut text = String::new();
+    text.push_str(&format!(
+        "EXCEPTION: {} at {}\n",
+        triage.exception.code, triage.exception.address
+    ));
+    if let Some(best) = &triage.exception.decoded.best_effort {
+        text.push_str(&format!("  {best}\n"));
+    }
+    text.push_str(&format!(
+        "  {}, {}\n",
+        if triage.exception.first_chance {
+            "first chance"
+        } else {
+            "second chance — nothing in the target handled it"
+        },
+        if triage.exception.noncontinuable {
+            "noncontinuable"
+        } else {
+            "continuable"
+        }
+    ));
+    for (index, value) in triage.exception.parameters.iter().enumerate() {
+        text.push_str(&format!("  Parameter[{index}]: {value}\n"));
+    }
+    if let Some(summary) = &triage.summary {
+        text.push_str(&format!("WHAT THIS IS: {summary}\n"));
+    }
+
+    if let Some(failure) = &triage.failure {
+        text.push_str(&format!(
+            "FAILED WITH: {}{}  (line {})\n",
+            failure.hresult.value,
+            failure
+                .hresult
+                .best_effort
+                .as_ref()
+                .map(|best| format!(" — {best}"))
+                .unwrap_or_default(),
+            failure.line
+        ));
+    }
+
+    if let Some(thrown) = &triage.thrown {
+        let named = thrown
+            .type_name
+            .as_deref()
+            .or(thrown.mangled_name.as_deref())
+            .unwrap_or("<type unread>");
+        text.push_str(&format!("THROWN: {named} at {}\n", thrown.object));
+        if let Some(hresult) = &thrown.hresult {
+            text.push_str(&format!(
+                "  carries {}{}\n",
+                hresult.value,
+                hresult
+                    .best_effort
+                    .as_ref()
+                    .map(|best| format!(" — {best}"))
+                    .unwrap_or_default()
+            ));
+            text.push_str(
+                "  found by the winrt::hresult_error sentinel, which no header states — it is \
+                 believable because it decodes, not because of where it sat.\n",
+            );
+        }
+        if let Some(note) = &thrown.type_note {
+            text.push_str(&format!("  {note}\n"));
+        }
+    }
+
+    if let Some(process) = &triage.process_name {
+        text.push_str(&format!("PROCESS: {process}\n"));
+    }
+    text.push_str(&format!(
+        "\nSTACK ({} frames, {}):\n",
+        triage.frames.len(),
+        if triage.frames_from_stored_context {
+            "from the stored crash context"
+        } else {
+            "from the selected thread — this target stores no event, so it is not promised to be \
+             the crash"
+        }
+    ));
+    for frame in &triage.frames {
+        text.push_str(&format!(
+            "  {:02} {}\n",
+            frame.index,
+            crate::triage::describe(frame)
+        ));
+    }
+    if triage.frames_truncated {
+        text.push_str("  ... (stack continues; raise `frames`)\n");
+    }
+    text
 }
 
 /// A memory image for tests: address to bytes, read as one flat space.
@@ -955,7 +1216,14 @@ mod tests {
             Some(".?AVhresult_error@winrt@@")
         );
         assert_eq!(thrown.size, Some(0x10));
-        assert_eq!(thrown.hresult, Some((0x8067_0015, Confidence::Convention)));
+        // **Corroborated, not merely conventional**: the graph named the type an
+        // `hresult_error` and the sentinel then matched, which is the cross-check that makes the
+        // offset expected rather than assumed. The test below is the same object with no image to
+        // name it, and reads `Convention` — the pair is the assertion.
+        assert_eq!(
+            thrown.hresult,
+            Some((0x8067_0015, Confidence::Corroborated))
+        );
         assert!(
             thrown.type_note.is_none(),
             "a walk that succeeded still explained why it had not"
@@ -986,7 +1254,11 @@ mod tests {
         );
         assert_eq!(thrown.type_name, None);
         assert_eq!(thrown.mangled_name, None);
-        assert_eq!(thrown.hresult, Some((0x8007_3d54, Confidence::Convention)));
+        assert_eq!(
+            thrown.hresult,
+            Some((0x8007_3d54, Confidence::Convention)),
+            "with no type name to expect the shape, the sentinel stands alone and must say so"
+        );
         let note = thrown
             .type_note
             .expect("no note explained the missing type");
@@ -1100,19 +1372,17 @@ mod tests {
             throw.image_base, base,
             "parameter 3 is the image base, and the RVAs below are relative to it"
         );
-        assert_eq!(
-            record_details(&read, throw_record),
-            Some((0x81, 0x0000_7ffc_98f7_187a)),
-            "the flags and the raising address did not read back — the record layout is off by a \
-             slot, which is the mistake this offset set exists to prevent"
-        );
 
         // And the whole graph resolves, both routes agreeing.
         let thrown = thrown_error(&read, &throw);
         assert_eq!(thrown.mangled_name.as_deref(), Some(".?AUhresult_error@@"));
         assert_eq!(thrown.type_name.as_deref(), Some("hresult_error"));
         assert_eq!(thrown.size, Some(0x10));
-        assert_eq!(thrown.hresult.map(|(hr, _)| hr), Some(0x8067_0015));
+        assert_eq!(
+            thrown.hresult,
+            Some((0x8067_0015, Confidence::Corroborated)),
+            "the graph named the type, so the sentinel hit is corroborated"
+        );
 
         // The code decodes to the sentence that redirected the whole investigation — which is what
         // makes a number found at a convention-located offset believable.
@@ -1198,9 +1468,6 @@ mod tests {
         let record_at_offset = 0x400;
         let mut rec = vec![0u8; record::SIZE];
         rec[..4].copy_from_slice(&STATUS_CPP_EH_EXCEPTION.to_le_bytes());
-        rec[record::FLAGS..record::FLAGS + 4].copy_from_slice(&0x81u32.to_le_bytes());
-        rec[record::ADDRESS..record::ADDRESS + 8]
-            .copy_from_slice(&0x7ffc_98f7_187au64.to_le_bytes());
         rec[record::NUMBER_PARAMETERS..record::NUMBER_PARAMETERS + 4]
             .copy_from_slice(&4u32.to_le_bytes());
         for (index, value) in [CPP_EH_MAGIC, object_at, base + 0x1000, base]
@@ -1226,10 +1493,58 @@ mod tests {
         let throw = record_at(&read, hits[0]).expect("the reported record did not parse");
         let thrown = thrown_error(&read, &throw);
         assert_eq!(thrown.type_name.as_deref(), Some("winrt::hresult_error"));
-        assert_eq!(thrown.hresult.map(|(hr, _)| hr), Some(0x8067_0015));
         assert_eq!(
-            record_details(&read, hits[0]),
-            Some((0x81, 0x7ffc_98f7_187a))
+            thrown.hresult,
+            Some((0x8067_0015, Confidence::Corroborated)),
+            "the graph named the type, so the sentinel hit is corroborated"
+        );
+    }
+
+    /// **The scan shrinks its read rather than skipping the chunk that refused it.**
+    ///
+    /// A debug engine refuses a read running past what the dump captured rather than returning
+    /// the readable prefix, so a fixed 4 KB chunk fails at every region boundary — and the first
+    /// version skipped a whole chunk on that failure, stepping over up to 4 KB of perfectly
+    /// readable stack. It found nothing at all on the real fail-fast dump this tool was written
+    /// for, while every synthetic test passed: they all gave the scan a region at least as large
+    /// as its chunk, so the read never refused. The construction that exposes it is a region
+    /// **smaller** than the chunk, with the record inside it.
+    #[test]
+    fn test_the_scan_shrinks_its_read_rather_than_skipping_the_chunk() {
+        let stack = 0x0000_008d_e693_e000;
+        let base = 0x7ff6_a1d9_0000;
+        let object_at = stack + 0x100;
+        let mut memory = FakeMemory::new();
+        eh_graph(&mut memory, base, ".?AVhresult_error@winrt@@", 0x10);
+
+        // Half a chunk of readable stack, and the record inside it. A 4 KB read of this refuses.
+        let mut page = vec![0u8; SCAN_CHUNK / 2];
+        page[0x100..0x110].copy_from_slice(&hresult_object(0x8067_0015));
+        let record_offset = 0x200;
+        let mut rec = vec![0u8; record::SIZE];
+        rec[..4].copy_from_slice(&STATUS_CPP_EH_EXCEPTION.to_le_bytes());
+        rec[record::NUMBER_PARAMETERS..record::NUMBER_PARAMETERS + 4]
+            .copy_from_slice(&4u32.to_le_bytes());
+        for (index, value) in [CPP_EH_MAGIC, object_at, base + 0x1000, base]
+            .into_iter()
+            .enumerate()
+        {
+            let at = record::FIRST_PARAMETER + index * 8;
+            rec[at..at + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        page[record_offset..record_offset + rec.len()].copy_from_slice(&rec);
+        memory.put(stack, page);
+        let read = |address, len| memory.read(address, len);
+
+        // The range asked about is a whole chunk, of which only half is readable.
+        assert!(
+            read(stack, SCAN_CHUNK).is_none(),
+            "the fixture is not exercising the case: a full-chunk read has to refuse here"
+        );
+        assert_eq!(
+            find_cpp_records(&read, stack, stack + SCAN_CHUNK as u64),
+            vec![stack + record_offset as u64],
+            "the scan skipped the chunk its read refused, and stepped over the record in it"
         );
     }
 

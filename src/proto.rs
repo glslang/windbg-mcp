@@ -328,6 +328,25 @@ pub enum EngineOp {
         analyze: bool,
         patience_ms: u32,
     },
+    /// A user-mode fault as fields: the exception record, what kind of fault it is, the thrown
+    /// object where there was one, and the crashing stack ([`crate::fault`]).
+    ///
+    /// [`Self::CrashTriage`]'s counterpart, and indivisible for a sharper version of the same
+    /// reason. The reads chain: the record's parameters name a `ThrowInfo` whose RVAs are relative
+    /// to an image base in the *same* record, and the stack scan that finds a buried throw is
+    /// bounded by a stack pointer read from the stored context. A target that moved between any
+    /// two of those would have the later read resolved against state the earlier one did not
+    /// describe — and the result would be a plausible answer rather than an error, which is the
+    /// failure mode this whole tool exists to avoid.
+    ExceptionTriage {
+        /// How many stack frames to walk. Bounded by the supervisor before it gets here.
+        frames: u32,
+        /// Whether to scan the crashing thread's stack for a C++ throw the fault buried.
+        ///
+        /// On by default and worth being able to turn off: it is the only *search* here, and on a
+        /// target whose stack is large and mostly unreadable it is reads that buy nothing.
+        scan_stack: bool,
+    },
     /// A whole transaction: ordered steps, their assertions, and the rollback block that runs
     /// whatever happens to them ([`crate::batch`]).
     ///

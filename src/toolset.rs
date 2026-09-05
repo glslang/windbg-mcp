@@ -176,7 +176,7 @@ const GROUPS: &[Group] = &[
     },
     Group {
         name: "crash",
-        tools: &["crash_triage"],
+        tools: &["crash_triage", "exception_triage", "decode_error_reporting"],
     },
     Group {
         name: "batch",
@@ -509,7 +509,7 @@ mod tests {
         assert!(set.includes("end_session"));
         assert!(!set.includes("ttd_calls"));
         assert!(!set.includes("debug_batch"));
-        assert_eq!(set.summary(), "11 of 54 tools (session, crash)");
+        assert_eq!(set.summary(), "13 of 56 tools (session, crash)");
     }
 
     #[test]
@@ -520,7 +520,7 @@ mod tests {
         assert!(!set.includes("disassemble"));
         assert_eq!(
             set.summary(),
-            "12 of 54 tools (session, backtrace, registers)"
+            "12 of 56 tools (session, backtrace, registers)"
         );
     }
 
@@ -632,7 +632,7 @@ mod tests {
         // Both name the tool and what is served, because those do not depend on who chose it.
         for said in [&run, &own] {
             assert!(said.contains("`debug_batch`"), "{said}");
-            assert!(said.contains("11 of 54 tools (session, crash)"), "{said}");
+            assert!(said.contains("13 of 56 tools (session, crash)"), "{said}");
         }
     }
 

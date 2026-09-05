@@ -2086,6 +2086,33 @@ pub struct CrashTriageArgs {
     pub session_id: Option<String>,
 }
 
+#[derive(Deserialize, JsonSchema)]
+pub struct ExceptionTriageArgs {
+    /// How many stack frames to walk (default 16, maximum 128). The default reaches past the CRT's
+    /// and the exception dispatcher's own frames to the throw site on every fault seen so far.
+    #[serde(default)]
+    pub frames: Option<u32>,
+    /// Search the crashing thread's stack for a C++ throw the fault buried (default true).
+    ///
+    /// It is what finds the answer on the ordinary unhandled-exception crash, where the record the
+    /// debugger sees is the CRT's fail-fast and the throw's own record is a local of an earlier
+    /// frame. Set false to skip the only search this tool does.
+    #[serde(default)]
+    pub scan_stack: Option<bool>,
+    /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
+    /// session and be refused if its target was replaced or closed.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DecodeErrorReportingArgs {
+    /// A 32-bit status value (decimal or 0x-hex): an HRESULT, an NTSTATUS, or a Win32 error —
+    /// e.g. "0x80670015". A 64-bit sign-extended value is accepted and truncated, since that is
+    /// how one arrives in an exception parameter.
+    pub code: String,
+}
+
 /// The most frames `crash_triage` will walk, and its default.
 ///
 /// The cap is not about cost — a stack walk is cheap — but about the answer staying readable: a
@@ -2947,18 +2974,31 @@ impl WindbgServer {
         if message != structured::USER_MODE_NO_BUG_CHECK {
             return message;
         }
-        // All of them or none, as everywhere else: half the pointer is worse than no pointer,
-        // since it reads as the whole answer.
-        if !["backtrace", "execute"]
-            .iter()
-            .all(|named| self.surface.includes(named))
-        {
+        // **Gated on the tool it names, which is now a different tool from the one it used to
+        // name.** This used to send a user-mode caller to `backtrace` plus
+        // `execute {"command": "!analyze -v"}` and was gated on both — two `inspect` tools, so a
+        // `--tools crash` caller got the bare fact and no pointer at all. The pointer is now the
+        // tool that answers the question, which is in `crash` beside this one, so the narrowest
+        // surface that can be refused here is also one that can act on the refusal.
+        if !self.surface.includes("exception_triage") {
             return message;
         }
-        format!(
-            "{message} For a user-mode crash use `backtrace` for the stack and \
-             `execute {{\"command\": \"!analyze -v\"}}` for the exception."
-        )
+        format!("{message} `exception_triage` is the user-mode counterpart.")
+    }
+
+    /// [`Self::triage_refusal`]'s mirror, for the other direction.
+    ///
+    /// Same mechanism and same reason: the worker owns one session and has never heard of this
+    /// client's surface, so the pointer is appended here — against an equality with the constant
+    /// rather than a sniff at prose, and only where the surface serves what it names.
+    fn exception_refusal(&self, message: String) -> String {
+        if message != structured::KERNEL_MODE_NO_EXCEPTION {
+            return message;
+        }
+        if !self.surface.includes("crash_triage") {
+            return message;
+        }
+        format!("{message} `crash_triage` is what reads it.")
     }
 
     /// Open a crash dump (.dmp) or a Time Travel Debugging trace (.run) and wait for it to load.
@@ -3517,6 +3557,121 @@ impl WindbgServer {
             other => other,
         };
         engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Read a user-mode fault as fields: the exception record with its code decoded, what kind of
+    /// fault it is, the thrown C++ object where there was one, and the crashing stack.
+    /// The counterpart to a bug check for a process rather than a machine.
+    /// Answers the question a stack alone cannot: `0xc0000409` is a deliberate process exit
+    /// rather than the stack buffer overrun its name and the system's message text claim, and
+    /// what says why is the subcode — 7 is the CRT's abort, i.e. a C++ exception nobody caught.
+    /// For an unhandled throw it recovers the thrown object and the HRESULT it carries: the
+    /// record the debugger sees is the fail-fast, so the throw's own record is found by searching
+    /// the crashing thread's stack, and the thrown type is decoded from the compiler's own
+    /// descriptors where the module's image is reachable.
+    /// The stack is walked from the register context the dump was written with, so it is the
+    /// crash whatever thread the session has selected — and the selection is left where it was,
+    /// which is what keeps this a read of the target.
+    /// A thrown HRESULT is located by a sentinel no header states, and the result says so rather
+    /// than presenting it beside the facts read from the record.
+    #[rmcp::tool(
+        annotations(
+            title = "Triage a user-mode fault",
+            // Reads two events, a stack and some memory, and writes nothing. Unlike
+            // `crash_triage` this needs no scope guard to earn the annotation: it walks the
+            // crash from the stored context rather than selecting it, so the session's thread
+            // and frame are where the caller left them.
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::ExceptionTriage>>()
+    )]
+    async fn exception_triage(
+        &self,
+        Parameters(args): Parameters<ExceptionTriageArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::ExceptionTriage {
+                    frames: args
+                        .frames
+                        .unwrap_or(DEFAULT_TRIAGE_FRAMES)
+                        .clamp(1, MAX_TRIAGE_FRAMES),
+                    scan_stack: args.scan_stack.unwrap_or(true),
+                },
+            )
+            .await;
+        let out = match out {
+            Err(EngineError::Debugger(message)) => {
+                Err(EngineError::Debugger(self.exception_refusal(message)))
+            }
+            other => other,
+        };
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Decode a 32-bit error-reporting value — an HRESULT, an NTSTATUS or a Win32 error — into
+    /// its severity, facility and code, its well-known name, and the message the system's own
+    /// tables give it. What a debugger's `!error` answers, as fields.
+    /// Reports every reading rather than choosing one, because a bare value does not say which
+    /// space it came from: `0xc0000005` is an NTSTATUS while `0x80070005` is an HRESULT wrapping
+    /// a Win32 error, and severity is one bit in the first space and two in the second.
+    /// The message text comes from this host's message tables, so it describes the value rather
+    /// than the machine a dump came from; the structural fields are arithmetic and cannot differ.
+    /// Pure — needs no debug session, so it takes no `session_id`.
+    #[rmcp::tool(
+        annotations(
+            title = "Decode an error-reporting value",
+            read_only_hint = true,
+            open_world_hint = false
+        ),
+        output_schema = constraints_of::<Outcome<structured::StatusInfo>>()
+    )]
+    async fn decode_error_reporting(
+        &self,
+        Parameters(args): Parameters<DecodeErrorReportingArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // Semantic input validation, not a malformed request: the schema is satisfied either way,
+        // so this belongs in the result where the model can read it and correct what it passed.
+        let value = match parse_u64(&args.code) {
+            Ok(value) => value,
+            Err(why) => return tool_error(why),
+        };
+        // **A sign-extended 64-bit value is truncated rather than refused**, unlike `decode_ioctl`'s
+        // width check, because that is the shape one of these actually arrives in: a WIL fail-fast
+        // carries its HRESULT as `0xffffffff8000ffff`. Anything wider that is *not* sign extension
+        // is a different number and is refused.
+        let value = match u32::try_from(value) {
+            Ok(value) => value,
+            Err(_) if value >> 32 == 0xffff_ffff => value as u32,
+            Err(_) => {
+                return tool_error(format!(
+                    "an error-reporting value is 32 bits (got {value:#x}). A sign-extended 64-bit \
+                     value such as 0xffffffff8000ffff is accepted; this is not one."
+                ));
+            }
+        };
+        let decoded = crate::fault::status_info(&crate::fault::decode_status(value));
+        let text = decoded
+            .best_effort
+            .clone()
+            .map(|best| format!("{} — {best}", decoded.value))
+            .unwrap_or_else(|| {
+                format!(
+                    "{} — no message in this host's tables{}",
+                    decoded.value,
+                    if decoded.customer_defined {
+                        "; the customer bit is set, so this value is not Microsoft's and is in \
+                         nobody's table"
+                    } else {
+                        ""
+                    }
+                )
+            });
+        structured_result(text, decoded)
     }
 
     /// Attach to an existing user-mode process by PID and break in.
@@ -5708,9 +5863,14 @@ mod tests {
         );
     }
 
-    /// The same rule on an error, where the tool being refused and the tools worth naming are in
-    /// different groups — so the caller that reaches this message is the one least able to act on
-    /// the pointer it used to carry.
+    /// The same rule on the two refusals that point across the kernel/user boundary.
+    ///
+    /// **The user-mode one used to point where its caller could not go.** It named `backtrace` and
+    /// `execute`, both `inspect`, while `crash_triage` is `crash` — so the surface most likely to
+    /// hit the refusal was the one guaranteed to get no pointer with it. It now names
+    /// `exception_triage`, which is in `crash` beside the tool being refused, so the narrowest
+    /// surface that can reach the message can also act on it. Asserted rather than remarked on:
+    /// `narrow` is the case that used to come back bare.
     #[test]
     fn a_user_mode_refusal_points_only_where_the_client_can_go() {
         let refusal = |spec: &str| {
@@ -5727,27 +5887,53 @@ mod tests {
             "the fact is the answer and is served on every surface: {narrow}"
         );
         assert!(
-            !narrow.contains("`backtrace`") && !narrow.contains("`execute`"),
-            "both are `inspect`; this client has neither: {narrow}"
+            narrow.contains("`exception_triage`"),
+            "the tool that answers this is in the same group as the one being refused, so the              pointer ships here too: {narrow}"
         );
 
         let full = refusal("all");
         assert!(
-            full.contains("`backtrace`") && full.contains("!analyze -v"),
+            full.contains("`exception_triage`"),
             "a full surface keeps the pointer: {full}"
         );
 
-        // Half a pointer reads as the whole answer, so a surface with one of the two gets neither.
-        let half = refusal("crash,backtrace");
+        // The single-tool surface is the one that must not carry it: `crash_triage` alone can be
+        // refused and cannot call what the pointer names.
+        let alone = refusal("crash_triage");
         assert!(
-            !half.contains("!analyze -v"),
-            "`execute` is not served here, so the sentence does not ship: {half}"
+            alone.contains("no bug check") && !alone.contains("`exception_triage`"),
+            "a client served only `crash_triage` was told to call a tool it does not have: {alone}"
         );
 
         // Anything else passes through untouched — this is an equality against one constant, not
         // a rewrite of every debugger error.
         let untouched = WindbgServer::new(Sessions::new(Duration::from_secs(1)))
             .triage_refusal("no such symbol".to_string());
+        assert_eq!(untouched, "no such symbol");
+    }
+
+    /// And the mirror, for a kernel session asked for a user-mode fault.
+    #[test]
+    fn a_kernel_refusal_points_only_where_the_client_can_go() {
+        let refusal = |spec: &str| {
+            let surface = crate::toolset::Toolset::parse(spec)
+                .unwrap_or_else(|e| panic!("`{spec}` should be a valid spec: {e}"));
+            WindbgServer::new(Sessions::new(Duration::from_secs(1)))
+                .with_tools(surface, crate::toolset::Chosen::ForTheRun)
+                .exception_refusal(structured::KERNEL_MODE_NO_EXCEPTION.to_string())
+        };
+
+        assert!(
+            refusal("crash").contains("`crash_triage`"),
+            "the pointer ships where the tool it names is served"
+        );
+        let alone = refusal("exception_triage");
+        assert!(
+            alone.contains("bug check") && !alone.contains("`crash_triage`"),
+            "a client served only `exception_triage` was told to call a tool it does not have:              {alone}"
+        );
+        let untouched = WindbgServer::new(Sessions::new(Duration::from_secs(1)))
+            .exception_refusal("no such symbol".to_string());
         assert_eq!(untouched, "no such symbol");
     }
 
@@ -5971,7 +6157,15 @@ mod tests {
             .map(|t| t.name.to_string())
             .collect();
 
-        assert_eq!(closed, ["decode_ioctl", "server_log", "session_status"]);
+        assert_eq!(
+            closed,
+            [
+                "decode_error_reporting",
+                "decode_ioctl",
+                "server_log",
+                "session_status"
+            ]
+        );
     }
 
     /// Session-scoped tools take a handle; the two that are genuinely session-independent

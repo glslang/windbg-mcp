@@ -73,6 +73,15 @@
       "wire": 13362
     },
     {
+      "annotations": 85,
+      "description": 752,
+      "inputSchema": 375,
+      "modelVisible": 1190,
+      "name": "decode_error_reporting",
+      "outputSchema": 1636,
+      "wire": 2942
+    },
+    {
       "annotations": 79,
       "description": 219,
       "inputSchema": 215,
@@ -125,6 +134,15 @@
       "name": "end_session",
       "outputSchema": 1351,
       "wire": 2934
+    },
+    {
+      "annotations": 123,
+      "description": 1200,
+      "inputSchema": 992,
+      "modelVisible": 2249,
+      "name": "exception_triage",
+      "outputSchema": 3578,
+      "wire": 5981
     },
     {
       "annotations": 124,
@@ -488,15 +506,15 @@
     }
   ],
   "totals": {
-    "annotations": 5762,
-    "description": 28916,
-    "inputSchema": 44655,
+    "annotations": 5970,
+    "description": 30868,
+    "inputSchema": 46022,
     "instructions": 1983,
-    "modelVisible": 76386,
-    "outputSchema": 115508,
-    "payload": 199179,
-    "tools": 54,
-    "wire": 199058,
+    "modelVisible": 79825,
+    "outputSchema": 120722,
+    "payload": 208104,
+    "tools": 56,
+    "wire": 207981,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }

@@ -121,6 +121,16 @@ pub const USER_MODE_NO_BUG_CHECK: &str = "this is a user-mode session, which has
      `crash_triage` reads the kernel bug check data a crash dump or a bug-checked live kernel \
      carries.";
 
+/// `exception_triage`'s refusal on a kernel session, without the pointer to what to read instead.
+///
+/// [`USER_MODE_NO_BUG_CHECK`]'s mirror, and the same mechanism for the same reason: the worker
+/// owns one session and has never heard of the client's surface, so the pointer is appended by the
+/// server where `self.surface` is, against an equality with this constant rather than a sniff at
+/// prose.
+pub const KERNEL_MODE_NO_EXCEPTION: &str = "this is a kernel session, whose fault is a bug check \
+     rather than a user-mode exception: a kernel crash dump carries no stored event at all, and \
+     the engine reads its bug check through a different call entirely.";
+
 /// Why a tool call failed, as a value a caller can branch on.
 ///
 /// Deliberately coarse. These are the distinctions that change what a caller *does* next, and
@@ -2417,6 +2427,185 @@ impl From<&crate::batch::SessionAfter> for SessionAfterInfo {
             SessionAfter::Uncertain { why } => Self::Uncertain { why: why.clone() },
         }
     }
+}
+
+/// What `exception_triage` read off a user-mode fault.
+///
+/// The user-mode counterpart to [`CrashTriage`], and it keeps its provenances apart for the same
+/// reason — but there are **three** here rather than two, and the third is the one a caller must
+/// not mistake for the others. [`Self::exception`] and [`Self::frames`] are reads of the dump.
+/// [`ThrownErrorInfo::type_name`] is decoded from a structure the compiler's layout fixes.
+/// [`ThrownErrorInfo::hresult`] is found by a **convention** — a sentinel no header states — and
+/// says so in its own `hresult_confidence`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ExceptionTriage {
+    /// The exception itself, as the engine reports it.
+    pub exception: ExceptionInfo,
+    /// What kind of fault this is, in one word: `fail_fast`, `cpp_throw`, `access_violation`,
+    /// `breakpoint`, `other`. Stable across rewordings of the prose beside it.
+    pub kind: String,
+    /// One sentence saying what the fault *is*, where the code alone would mislead.
+    ///
+    /// The case this exists for is `0xc0000409`, whose name is `STATUS_STACK_BUFFER_OVERRUN` and
+    /// whose system message says "an overrun of a stack-based buffer" — on any build since
+    /// Windows 8 that is almost never what happened, and an investigation that believes it goes
+    /// looking for corruption that is not there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// The thrown object, on a fault that came from a C++ `throw`.
+    ///
+    /// Present for a `cpp_throw`, and also for a `fail_fast` whose cause was an unhandled throw —
+    /// which is the ordinary shape, since by the time the debugger sees the process it is stopped
+    /// in `abort` and the throw's own record is a local of an earlier frame.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thrown: Option<ThrownErrorInfo>,
+    /// The `HRESULT` a WIL fail-fast puts in its second parameter, decoded.
+    ///
+    /// A different retrieval route for the same fact [`Self::thrown`] carries, and which one
+    /// answers is decided by the record's **parameter count**. Both are never present at once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure: Option<WilFailureInfo>,
+    /// The crashing stack, innermost first.
+    ///
+    /// Walked from the **stored event's** register context where the target has one — a dump
+    /// written for a fault — so this is the crash whatever thread the session has selected, and
+    /// the selection is left where it was. Otherwise it is the current thread's stack, and
+    /// [`Self::frames_from_stored_context`] says which happened.
+    pub frames: Vec<FrameInfo>,
+    /// Whether the stack went on past the cap, established exactly as [`StackTrace`]'s is.
+    pub frames_truncated: bool,
+    /// Whether [`Self::frames`] came from the stored event's context rather than from whatever
+    /// thread is currently selected.
+    ///
+    /// `false` is not a failure — a live target has no stored event, and there is nothing to walk
+    /// from but the current context. It matters because only `true` promises the crash.
+    pub frames_from_stored_context: bool,
+    /// The process the fault happened in, where the engine could name it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_name: Option<String>,
+}
+
+/// An exception record, as the engine reports it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ExceptionInfo {
+    /// The code, `0x`-prefixed, lowercase and zero-padded to eight digits — `"0xc0000409"`. Padded
+    /// unlike a bug check's, because these are read as fixed-width values everywhere they appear.
+    pub code: String,
+    /// What the code means, decoded. See [`StatusInfo`].
+    pub decoded: StatusInfo,
+    /// The instruction that raised it.
+    pub address: String,
+    /// `ExceptionFlags`.
+    pub flags: String,
+    /// Whether resuming past this one is impossible — true of every fail-fast.
+    pub noncontinuable: bool,
+    /// Whether the debugger saw this before the target's own handlers did.
+    ///
+    /// **Second-chance is the interesting one on a crash**: it means nothing in the target handled
+    /// it, which for a C++ exception is the whole finding.
+    pub first_chance: bool,
+    /// `ExceptionInformation`, already cut to the count the record declares — never the fifteen
+    /// slots it has room for. The count is load-bearing: it is what tells the two shapes of a
+    /// `0xc0000409` apart.
+    pub parameters: Vec<String>,
+    /// The address of the record this one is nested inside, where there is one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nested_record: Option<String>,
+}
+
+/// A status value decoded every way it can be read.
+///
+/// **Both readings, because a bare dword does not say which space it came from.** `0xc0000005` is
+/// an `NTSTATUS`; `0x80070005` is an `HRESULT` wrapping a Win32 error. The caller knows where the
+/// number came from and this does not, so it reports what each reading yields rather than picking.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct StatusInfo {
+    /// The value, `0x`-prefixed and padded.
+    pub value: String,
+    /// The single most useful sentence about it, where there is one — the symbolic name and the
+    /// message together when both are known.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_effort: Option<String>,
+    /// The well-known name, for the codes whose message text is unhelpful — `E_UNEXPECTED`, whose
+    /// system message is the uninformative "Catastrophic failure".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbolic: Option<String>,
+    /// What the host's system message table says, reading it as an `HRESULT` or Win32 error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_message: Option<String>,
+    /// What `ntdll`'s message table says, reading it as an `NTSTATUS`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ntstatus_message: Option<String>,
+    /// Whether the value read as an `HRESULT` is a failure — bit 31, which is the whole of an
+    /// `HRESULT`'s severity.
+    pub hresult_failed: bool,
+    /// The severity of the value read as an `NTSTATUS`, which is a **two**-bit field in that space
+    /// and therefore a different question from [`Self::hresult_failed`]: `0x80670015` is a failed
+    /// `HRESULT` and reads as a *warning* here.
+    pub ntstatus_severity: String,
+    /// The facility, where the two layouts agree.
+    pub facility: u32,
+    /// The low sixteen bits.
+    pub code: u32,
+    /// Whether the customer bit is set, marking a value that is in nobody's message table.
+    pub customer_defined: bool,
+    /// **Where the message text came from.** The host's tables, not the target's — so a dump from
+    /// a build that words an error differently is described in this machine's words. Present only
+    /// when there is a message to qualify.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_provenance: Option<String>,
+}
+
+/// What could be established about a thrown C++ object.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ThrownErrorInfo {
+    /// Where the object is.
+    pub object: String,
+    /// The thrown type, demangled — `winrt::hresult_error`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_name: Option<String>,
+    /// The mangled name exactly as the compiler emitted it, whenever the walk reached one. It is
+    /// the ground truth behind [`Self::type_name`], and the answer when demangling declines — the
+    /// grammar has templates and back-references this does not decode, and a name it will not
+    /// decode still pastes into a demangler that does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mangled_name: Option<String>,
+    /// The object's size in bytes, from the compiler's own descriptor.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u32>,
+    /// The `HRESULT` the object carries, decoded.
+    ///
+    /// Found by a sentinel that no header states — see [`Self::hresult_confidence`]. It is
+    /// believable to the extent that it *decodes*: a number at an assumed offset is not evidence,
+    /// and a number that resolves to a message naming the failing subsystem is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hresult: Option<StatusInfo>,
+    /// How [`Self::hresult`] was found: `convention`, always, and named rather than assumed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hresult_confidence: Option<String>,
+    /// Why the type could not be named, when it could not.
+    ///
+    /// Nearly always the same reason, and it is a fact about **dumps** rather than about this
+    /// server: the descriptors live in the throwing module's image, which a minidump does not
+    /// capture, so the debugger reads them from the binary on disk. A dump from another machine
+    /// has no type name and still has the `HRESULT`, which is why both routes are tried.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_note: Option<String>,
+}
+
+/// The `HRESULT` and line number a WIL fail-fast carries in its parameters.
+///
+/// **A convention of one library, read off real records rather than out of a header**, so it is
+/// reported beside the raw parameters and never instead of them.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct WilFailureInfo {
+    /// The `HRESULT`, decoded — taken from parameter 1 and trimmed of its sign extension, so
+    /// `0xffffffff8000ffff` is `0x8000ffff`.
+    pub hresult: StatusInfo,
+    /// Parameter 2, which WIL sets to the line number of the failing check. The **file** is not
+    /// here: it is a string the fail-fast was handed rather than a field of the record, so it is
+    /// read by disassembling back from the call.
+    pub line: u64,
 }
 
 /// A duration in whole milliseconds, saturating rather than wrapping.
