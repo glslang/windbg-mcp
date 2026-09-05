@@ -1393,6 +1393,59 @@ assertion that fires), the unconditional early-exit failure, `.arg(target)` for 
 line, and the probe against this process's directory — which fails with `` `a01.run` is not a
 recording of `a program.exe` ``, the wrong-program recording exactly as it was first measured.
 
+## The user-mode fault fixture
+
+`docs/samples/cppthrow-fastfail.dmp` is the only **user-mode** dump checked in, and the only sample
+purpose-built rather than captured. It is what
+`a_user_mode_fault_is_triaged_from_its_exception_record` opens, and it exists because the faults
+that motivated `exception_triage` could not be checked in at all: they were 122-345 MB and carried
+a live desktop session (`explorer-crash-walkthrough.md` §10).
+
+`docs/samples/cppthrow.cpp` is the whole program — a C++ object thrown and nothing catching it, so
+the CRT calls `terminate` -> `abort` -> `__fastfail`, which is that walkthrough's first fault
+exactly. The thrown type is laid out like a `winrt::hresult_error`, a `0xAABBCCDD` sentinel
+immediately before the HRESULT, so the sentinel route has something real to find; a second thread
+parks in `Sleep(INFINITE)` so the dump can also answer questions about thread selection.
+
+To rebuild it:
+
+```pwsh
+$dir = 'C:\wmfixture'
+New-Item -ItemType Directory -Force $dir | Out-Null
+Copy-Item docs\samples\cppthrow.cpp $dir
+cmd /c '"C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Auxiliary\Build\vcvars64.bat" && cd /d C:\wmfixture && cl /nologo /EHsc /Zi /MT /Od cppthrow.cpp /Fe:cppthrow.exe'
+
+$k = 'HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps\cppthrow.exe'
+New-Item -Path $k -Force | Out-Null
+New-ItemProperty -Path $k -Name DumpFolder -Value "$dir\dumps" -PropertyType ExpandString -Force
+New-ItemProperty -Path $k -Name DumpType   -Value 1 -PropertyType DWord -Force   # 1 = mini
+New-ItemProperty -Path $k -Name DumpCount  -Value 2 -PropertyType DWord -Force
+```
+
+**Run it with a scrubbed environment**, which is not optional and is the step that is easy to skip:
+
+```pwsh
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = "$dir\cppthrow.exe"; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+$psi.EnvironmentVariables.Clear()
+$psi.EnvironmentVariables.Add('SystemRoot', 'C:\Windows')
+$psi.EnvironmentVariables.Add('windir', 'C:\Windows')
+$psi.EnvironmentVariables.Add('Path', 'C:\Windows\system32;C:\Windows')
+[System.Diagnostics.Process]::Start($psi).WaitForExit()
+```
+
+**A minidump captures the process environment block**, so the first attempt at this fixture carried
+the machine's user name, its whole `Path` and the harness's own variables — none of which is
+visible in anything a debugger prints, and all of which is in the file. Check before committing one:
+search the dump for `\Users\` as both ASCII and UTF-16LE, and expect the only paths in it to be
+`C:\Windows\System32\*` and `C:\wmfixture\cppthrow.exe`.
+
+**Delete `C:\wmfixture` afterwards, or know that you are the one host the test behaves differently
+on.** The dump carries no image, and on x64 the unwind data lives in the image's `.pdata` — so a
+host that still has `cppthrow.exe` unwinds the whole stack and reads the thrown type, and every
+other host gets frame 0, the HRESULT from the sentinel alone, and a `SKIPPED` line saying so. Both
+branches are asserted; the way to see the second is to rename the binary and re-run.
+
 ## The 32-bit managed target tier
 
 ```pwsh

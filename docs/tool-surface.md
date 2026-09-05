@@ -5,8 +5,10 @@ how much of that surface a run serves, and three behaviours the table has no roo
 
 ## Serving fewer tools (`--tools`)
 
-All fifty-four tools are served unless you say otherwise, and their definitions cost the model
-**75,547 bytes — about 19k tokens — before it has asked anything**, once per conversation. Seven
+All fifty-six tools are served unless you say otherwise, and their definitions cost the model
+**79,825 bytes — about 20k tokens — before it has asked anything**, once per conversation. Every
+figure on this page is a measurement of 2026-09-05 rather than an invariant: any edit to a tool's
+description moves it, so re-derive before quoting one. Seven
 tenths of that is the prose that tells a model how to drive them, so it cannot be trimmed without
 making the tools harder to use correctly (see
 [`token-budget.md`](token-budget.md)). What *can* change is how many of them a given run
@@ -18,10 +20,10 @@ windbg-mcp.exe --tools session,inspect,crash
 
 | `--tools` | Tools | Model context |
 |---|---:|---:|
-| *(absent)* — every tool | 54 | 75,547 B |
-| `session,inspect,exec,crash` | 28 | 34,825 B |
-| `session,inspect,crash` | 20 | 26,305 B |
-| `crash` | 11 | 14,587 B |
+| *(absent)* — every tool | 56 | 79,825 B |
+| `session,inspect,exec,crash` | 30 | 39,103 B |
+| `session,inspect,crash` | 22 | 29,744 B |
+| `crash` | 13 | 18,026 B |
 
 The spec is a comma-separated list of the group names in the [tool table](../README.md#tools), of
 individual tool names, or `all`.
@@ -55,7 +57,7 @@ is written into the command line the SCM stores, and read back at every start). 
 
 A `--listen` server names its clients, and **a client may be served a surface of its own** — which
 is what lets one listener hold a local model that can fit twenty tools beside a hosted client that
-can hold fifty-four, against the same debug sessions:
+can hold fifty-six, against the same debug sessions:
 
 ```pwsh
 setx WINDBG_MCP_LISTEN_TOKEN_BENCH "<a long random string>"

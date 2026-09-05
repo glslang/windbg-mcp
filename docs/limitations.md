@@ -110,6 +110,44 @@
   target
   *stopped at a bug check* — a live kernel that has not crashed yet, and a dump that is not a crash
   dump, are both **refused** with a message saying which of the two they are.
+- **`exception_triage` reports three kinds of fact and labels the weakest.** The exception record,
+  its decoded code and the stack are reads of the dump. The thrown C++ **type** is decoded from
+  MSVC's own `ThrowInfo`/`CatchableType`/`TypeDescriptor` chain, whose layout the compiler fixes.
+  The thrown **HRESULT** is located by the `0xAABBCCDD` sentinel a `winrt::hresult_error` carries,
+  which no header states — so it comes with `hresult_confidence`, `corroborated` when the type name
+  independently said `hresult_error` and `convention` when the sentinel stands alone.
+- **The thrown type needs the throwing module's image, and a minidump does not contain it.**
+  `ThrowInfo` and everything it points at live in the image's `.rdata`, which the debugger reads
+  off the binary on disk — measured: the walk succeeds while the executable is at its recorded path
+  and returns `????????` once it is moved aside. So a dump from another machine, or one whose
+  binaries have moved, reports no `type_name` and says why in `type_note`, and the HRESULT still
+  comes back, because the thrown object is on the *stack* and therefore captured. Neither route is
+  a superset of the other; both are tried.
+- **A minidump without the faulting module's image unwinds badly on x64, and that is a fact about
+  dumps rather than about this server.** The unwind data lives in the image's `.pdata`, which a
+  minidump does not capture, so the engine reads it off the binary on disk. Measured on the
+  checked-in fixture with its executable moved aside: frame 0 is right either way — it comes from
+  the recorded context rather than from unwinding — and beyond it the frames alternate between
+  resolved ones and frames attributed to no module at all. Every frame's `module`+`rva` is still
+  computed rather than guessed, so a *hole* in the attribution is the signal: a walk with one is a
+  walk this host could not do, not a stack with an unusual frame in it. Put the binaries where the
+  debugger can find them (`.exepath`, or beside the dump) before reading a stack from a dump that
+  came from another machine.
+- **`exception_triage`'s stack comes from the stored crash context where the target has one.** That
+  is what `.ecxr` adopts, walked without `.ecxr`'s effect on the session, so the caller's selected
+  thread and frame are left alone — which is what lets the tool be read-only where `crash_triage`
+  needed a scope guard. `frames_from_stored_context` says which happened: a **live** target stores
+  no event, so there the stack is whatever thread is selected and is not promised to be a crash.
+  A kernel session is **refused** — a kernel crash dump carries no stored event at all, measured,
+  and its bug check is `crash_triage`'s.
+- **`decode_error_reporting` reads the host's message tables, not the target's.** The structural
+  fields — severity, facility, code, the customer bit — are arithmetic and cannot differ. The
+  message text comes from this machine (`FormatMessageW`, plus `ntdll`'s table for an `NTSTATUS`),
+  so a dump from a build that words an error differently is described in this host's words;
+  `message_provenance` says so on every answer that carries one. It reports **both** readings
+  rather than choosing, because a bare dword does not say which space it came from: severity is one
+  bit as an HRESULT and two as an NTSTATUS, and `0x80670015` is a *failed* HRESULT whose top two
+  bits read as an NTSTATUS *warning*.
 - **`crash_triage` tries `!analyze -v` and then `!ext.analyze -v`**, and reports which one worked
   under `analysis.command`. A **manual** `execute` has to pick, and on the bundled engine the
   answer is the module-qualified `!ext.analyze -v` — the unqualified form does not resolve there

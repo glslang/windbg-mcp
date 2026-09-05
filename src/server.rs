@@ -2908,7 +2908,7 @@ impl WindbgServer {
     /// the cross-references this surface may read.
     ///
     /// Built per call, which is what `Self::tool_router()` already was — the schemas underneath it
-    /// are cached by type, so this is a map of fifty-four `Arc` clones and a `retain`.
+    /// are cached by type, so this is a map of fifty-six `Arc` clones and a `retain`.
     ///
     /// It is also the path `call_tool` takes, which pays for [`Self::annotate`] on every call and
     /// reads none of it. That is deliberate: `list_tools` and `get_tool` are the macro's and take
@@ -5491,7 +5491,7 @@ const TOOL_NOTES: &[ToolNote] = &[
     // `list_tools` and `get_tool` come from the macro; what they list is this instance's router
     // rather than the crate-wide one, which is what makes `--tools` visible on the wire. The
     // default here is `Self::tool_router()`, and leaving it would have narrowed the calls a tool
-    // may make (`dispatch`) while still advertising all fifty-four.
+    // may make (`dispatch`) while still advertising all fifty-six.
     //
     // `name` and `instructions` used to be here too. They moved into the hand-written `get_info`
     // below, which the macro yields to - the instructions are now assembled for the client's own

@@ -290,30 +290,82 @@ four identity-bearing shell packages were already registered and still the call 
 mechanism was never pinned down — what is established is the fix, not the chain. Saying which is
 which costs a sentence and saves the next reader an afternoon.
 
-## 9. What this exercised, and the gap it found
+## 9. What this exercised, and the gap it found — since closed
 
 Three faults, three dumps, and the useful part is what each one needed:
 
-| Fault | What answered it |
+| Fault | What answered it, in 2026-08 |
 | --- | --- |
 | `abort` in `ucrtbase` | `.exr -1` for the subcode, `k` for the throw path, object walk for the HRESULT |
 | WIL `FailFast_Unexpected` | `.exr -1` alone — the HRESULT is a fail-fast parameter |
 | `abort` in `Taskbar.dll` | identical to the first, in a different module |
 
-**The typed surface got to the frame and stopped there.** `open_dump` and `backtrace` are enough to
-say *where* a C++/WinRT process died, and in all three cases the fact that mattered — the HRESULT —
-came out of `execute`: `.exr`, `.ecxr`, `s -d`, `dd`, `!error`, `ub`, `da`. That is the escape hatch
-doing its job, and it is also a legible argument for a primitive this server does not have: *given
-a user-mode dump that died on an unhandled C++ exception, return the thrown HRESULT and its
+**The typed surface got to the frame and stopped there.** `open_dump` and `backtrace` were enough
+to say *where* a C++/WinRT process died, and in all three cases the fact that mattered — the
+HRESULT — came out of `execute`: `.exr`, `.ecxr`, `s -d`, `dd`, `!error`, `ub`, `da`. That was the
+escape hatch doing its job, and it was a legible argument for a primitive this server did not have:
+*given a user-mode dump that died on an unhandled C++ exception, return the thrown HRESULT and its
 message*. The routine is mechanical — find the `0xE06D7363` record, take the object after the EH
-magic, decode — and it was performed by hand three times in one evening. That belongs in
-[`dbgscope`](https://github.com/glslang/dbgscope) as a typed method rather than in a walkthrough as
-a recipe, per the rule in `CLAUDE.md` that new primitives are typed methods, not text hatches.
+magic, decode — and it was performed by hand three times in one evening.
 
-Two smaller notes for the same list. `!error` earned its place — three times it turned a bare dword
-into the sentence that redirected the whole investigation. And **nothing about a user-mode dump of
-a live process needed special handling**: same opener, same routing, same `end_session`, on a
-machine where the debuggee was the shell of the box running the server.
+**It is `exception_triage` now**, on the primitives [dbgscope#144] added: `last_event` and
+`stored_event` for the record, and `stack_frames_from` for the crash stack — which is what `.ecxr`
+adopts, walked without `.ecxr`'s effect on the session, so the caller's selected thread stays where
+they left it. §4 and §5 are one call:
+
+```text
+EXCEPTION: 0xc0000409 at 0x00007ff6a1db2989
+  The system detected an overrun of a stack-based buffer in this application. […]
+  second chance — nothing in the target handled it, noncontinuable
+  Parameter[0]: 0x0000000000000007
+WHAT THIS IS: a __fastfail — a deliberate process exit, not a stack buffer overrun, whatever the
+  code's name and the system's message text for it say. FAST_FAIL_FATAL_APP_EXIT (subcode 0x7) is
+  what says why; subcode 7 is the CRT's abort(), which means a C++ exception nobody caught.
+THROWN: hresult_error at 0x0000008de693fd60
+  carries 0x80670015 — The StateRepository cache is not initialized.
+```
+
+Note the second and third lines together, because that pairing is the point rather than a
+flourish: the tool prints the system's own message for `0xc0000409` — the misleading one §10's
+first gotcha is about — and then says what the code actually means. Suppressing it would leave a
+reader who has met that sentence in an event log unable to place it.
+
+**Three things about the version that shipped differ from the recipe above, and each is a
+correction rather than a refinement.**
+
+*The type is decoded, not assumed.* MSVC's throw passes four parameters — magic, thrown object,
+`ThrowInfo`, image base — and `ThrowInfo → CatchableTypeArray → CatchableType → TypeDescriptor`
+yields the mangled type name from a layout the compiler fixes. So the `0xAABBCCDD` sentinel is no
+longer the thing that *finds* the code; it is the thing that confirms an offset the type name
+already predicted, which is the cross-check §5 argued for, made mechanical. The result says which
+it got: `corroborated` when both routes agree, `convention` when only the sentinel does.
+
+*Both routes are needed, because neither is a superset.* `ThrowInfo` and everything it points at
+live in the **image**, and a `MiniDumpNormal` does not capture that — the debugger reads it off the
+binary on disk. Measured: the walk succeeds on a WER minidump while the executable is at its
+recorded path, and returns `????????` once it is moved aside. So on a dump from another machine the
+sentinel scan of the thrown object — which is on the *stack*, and therefore captured — is the only
+route there is.
+
+*The throw's record is searched for, not read.* When a C++ exception goes unhandled the event the
+debugger sees is `abort`'s fail-fast; the throw's own record is a local of a frame between the
+throw site and `RaiseException`, and no engine call returns it. `exception_triage` scans the
+crashing thread's stack for it, bounded by the frames it has already walked — which is §5's
+`s -d` with the range derived rather than eyeballed.
+
+The other note on that list is closed too. **`!error` earned its place** — three times it turned a
+bare dword into the sentence that redirected the whole investigation — and it is
+`decode_error_reporting` now, which is a **pure host call** rather than a scrape of the extension's
+output: `FormatMessageW` was measured to answer for both of this investigation's exotic codes
+verbatim, `0x80670015` and `0x80073D54`, and an `NTSTATUS` resolves from `ntdll`'s table beside it.
+It takes a sign-extended 64-bit value because that is the shape §7's HRESULT arrives in —
+`0xffffffff8000ffff` decodes to `E_UNEXPECTED`.
+
+And **nothing about a user-mode dump of a live process needed special handling**: same opener, same
+routing, same `end_session`, on a machine where the debuggee was the shell of the box running the
+server.
+
+[dbgscope#144]: https://github.com/glslang/dbgscope/pull/144
 
 ## 10. Gotchas worth keeping
 
