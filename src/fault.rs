@@ -1204,6 +1204,24 @@ pub enum ThrowEvidence {
     Reported,
 }
 
+/// Where to start the buried-throw scan, given the walked frames' stack pointers in order.
+///
+/// **Frame 0, not the lowest.** The two agree on a healthy walk, and the whole reason the scan is
+/// anchored here is the *unhealthy* one: frame 0's stack pointer is read from the recorded context
+/// rather than produced by unwinding, so it is as good as the dump whatever the frames behind it
+/// did. Taking the minimum hands that guarantee back to the unwinder — a frame it could not
+/// establish reports a stack pointer of its own, and one bogus low value moves the whole fixed
+/// span to the wrong place. A bogus **zero** is worse than that: it is indistinguishable from
+/// having no anchor, and the scan is skipped entirely on a dump that has a throw in it.
+///
+/// Measured on the checked-in x64 fixture with its image moved aside — the case where the outer
+/// frames really are garbage — the two agree: the engine still reports increasing stack pointers
+/// there. So this is not a bug reproduced on a fixture; it is a guarantee that was being taken from
+/// the one frame that has it and given to thirteen that do not.
+pub fn scan_anchor(stack_offsets: impl IntoIterator<Item = u64>) -> Option<u64> {
+    stack_offsets.into_iter().next().filter(|at| *at != 0)
+}
+
 /// Whether a scanned candidate's thrown object is somewhere a thrown object can be.
 ///
 /// **The one correlation that is about the candidate rather than about the stack**, and it is
@@ -2312,6 +2330,34 @@ mod tests {
             Some((0x8007_0005, Confidence::Corroborated)),
             "{thrown:?}"
         );
+    }
+
+    /// **The scan is anchored on frame 0, whose stack pointer is the recorded context's.**
+    ///
+    /// The minimum over all frames is the same thing on a healthy walk and gives the guarantee away
+    /// on an unhealthy one, which is the only walk this matters for: one frame the unwinder could
+    /// not establish moves the fixed span somewhere else, and a bogus zero reads as "no anchor" and
+    /// skips the scan on a dump that does have a throw in it.
+    #[test]
+    fn test_the_scan_is_anchored_on_the_recorded_context_not_the_lowest_frame() {
+        let real = 0x0000_008d_e693_fd60_u64;
+
+        // The healthy walk: increasing, and the two rules agree.
+        assert_eq!(scan_anchor([real, real + 8, real + 16]), Some(real));
+
+        // A later frame the unwinder invented, lower than frame 0. Frame 0 still wins.
+        assert_eq!(scan_anchor([real, real - 0x4000, real + 8]), Some(real));
+
+        // And the case that silently disabled the scan: a bogus zero further down the walk.
+        assert_eq!(
+            scan_anchor([real, 0, real + 8]),
+            Some(real),
+            "one frame with no stack pointer turned off the scan for the whole dump"
+        );
+
+        // Frame 0 itself having none is the real "no anchor", and is the only one.
+        assert_eq!(scan_anchor([0, real]), None);
+        assert_eq!(scan_anchor(std::iter::empty()), None);
     }
 
     /// A throw is recognised by its magic, not by its code alone.

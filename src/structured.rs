@@ -2452,11 +2452,15 @@ pub struct ExceptionTriage {
     /// looking for corruption that is not there.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
-    /// The thrown object, on a fault that came from a C++ `throw`.
+    /// A thrown C++ object: the fault's own for a `cpp_throw`, and a **candidate** for a
+    /// `fail_fast`.
     ///
-    /// Present for a `cpp_throw`, and also for a `fail_fast` whose cause was an unhandled throw —
-    /// which is the ordinary shape, since by the time the debugger sees the process it is stopped
-    /// in `abort` and the throw's own record is a local of an earlier frame.
+    /// For a `cpp_throw` the debugger stopped on the throw and this is it. For a `fail_fast` it was
+    /// found by scanning the crashing thread's stack, because by then the process is stopped in
+    /// `abort` and the throw's own record is a local of an earlier frame — and such a record
+    /// outlives the frames that held it, so it may belong to an exception the program handled
+    /// rather than to this fault. [`ThrownErrorInfo::provenance`] is the field that says which of
+    /// those two this is; do not read the presence of this one as a cause.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thrown: Option<ThrownErrorInfo>,
     /// The `HRESULT` a WIL fail-fast puts in its second parameter, decoded.
