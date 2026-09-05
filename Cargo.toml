@@ -61,6 +61,15 @@ windows-sys = { version = "0.61", features = [
     # rather than by subject — the same trap `IMAGE_NT_HEADERS64` hit, recorded in
     # `.claude/rules/cross-target-check.md`.
     "Win32_System_SystemInformation",
+    # `FormatMessageW`, which is how `src/fault.rs` turns a bare status dword into the sentence
+    # `!error` prints — measured to answer for the two codes the explorer walkthrough turned on
+    # (`0x80670015`, `0x80073d54`), which is what makes that decoder a typed host call rather than
+    # a scrape of an extension's output.
+    "Win32_System_Diagnostics_Debug",
+    # `GetModuleHandleW`, for the other half of the same decode: an `NTSTATUS` is in `ntdll`'s
+    # message table and in no other, so `0xc0000409` resolves there or nowhere. A handle lookup and
+    # never a load — ntdll is mapped into every process that exists.
+    "Win32_System_LibraryLoader",
 ] }
 # The Windows service role (`src/service.rs`). A wrapper rather than hand-rolled SCM FFI because
 # that lifecycle is the one part of this which must not be subtly wrong: a service that mishandles
