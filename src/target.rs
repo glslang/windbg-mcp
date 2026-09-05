@@ -547,32 +547,58 @@ mod tests {
         assert!(read_bytes(&bytes).is_err());
     }
 
+    /// The one checked-in **user-mode** dump, named because it is the exception to the rule below.
+    ///
+    /// `cppthrow-fastfail.dmp` is `exception_triage`'s fixture — a C++ throw nothing caught, so the
+    /// CRT fail-fasted. It is a `MiniDumpWriteDump` capture of an x64 process, which is exactly the
+    /// shape this parser routes on, so it is asserted rather than skipped.
+    const USER_MODE_SAMPLE: &str = "cppthrow-fastfail.dmp";
+
     /// The synthesised headers above are this parser's own idea of the format, so they cannot
     /// show it reads a file somebody else wrote. **These are real dumps**, checked in and opened
-    /// by the smoke tier: every one is a kernel crash dump, and each must come back `Other` so a
-    /// kernel target is never routed at a 32-bit worker that could not open it.
+    /// by the smoke tier.
+    ///
+    /// Every kernel crash dump must come back `Other`, so a kernel target is never routed at a
+    /// 32-bit worker that could not open it. The one user-mode sample must come back
+    /// `UserMinidump(X64)` — it is the only file here that exercises this parser against a real
+    /// minidump somebody else's code wrote, since the 32-bit case below is built at test time.
+    ///
+    /// **Both halves are named, rather than the loop accepting either answer.** The rule this
+    /// started as was "every sample is a kernel dump", and the tempting way to admit a user-mode
+    /// one is to relax the assertion; that would leave a kernel dump misread as a user minidump
+    /// passing silently, which is the routing bug the whole module exists to prevent.
     #[test]
-    fn the_checked_in_samples_are_all_kernel_dumps() {
+    fn the_checked_in_samples_route_to_the_worker_their_target_needs() {
         let samples = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/samples");
-        let mut seen = 0;
+        let (mut kernel, mut user) = (0, 0);
         for entry in std::fs::read_dir(&samples).expect("the sample directory is checked in") {
             let path = entry.expect("a readable directory entry").path();
             if path.extension().is_none_or(|e| e != "dmp") {
                 continue;
             }
-            seen += 1;
-            assert_eq!(
-                read(&path).expect("a checked-in sample reads"),
-                DumpTarget::Other,
-                "{}",
-                path.display()
-            );
+            let read = read(&path).expect("a checked-in sample reads");
+            let user_mode = path
+                .file_name()
+                .is_some_and(|name| name == USER_MODE_SAMPLE);
+            if user_mode {
+                user += 1;
+                assert_eq!(
+                    read,
+                    DumpTarget::UserMinidump(Arch::X64),
+                    "{}",
+                    path.display()
+                );
+            } else {
+                kernel += 1;
+                assert_eq!(read, DumpTarget::Other, "{}", path.display());
+            }
         }
         // Or the loop above asserted nothing at all, which is the way a table-driven test rots.
         assert!(
-            seen >= 4,
-            "expected the checked-in kernel samples, saw {seen}"
+            kernel >= 4,
+            "expected the checked-in kernel samples, saw {kernel}"
         );
+        assert_eq!(user, 1, "expected exactly one user-mode sample, saw {user}");
     }
 
     /// The parser against a **real 32-bit user minidump** — the file this whole routing exists

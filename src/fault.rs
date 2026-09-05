@@ -51,6 +51,12 @@
 //! So on a dump from another machine, or one whose binaries have moved, the sentinel scan of the
 //! *thrown object* — which is on the stack, and therefore in the dump — is the only route that
 //! works. Neither is a superset of the other, and [`thrown_error`] tries both.
+//!
+//! **That second route is only as good as the range it is given**, which is why the caller anchors
+//! its scan on the innermost frame rather than on the walk. The same missing image costs x64 its
+//! unwind data, so the outer frames of such a dump are not trustworthy either — see
+//! `worker::exception_triage`, where getting that wrong meant the fallback found nothing on
+//! exactly the dumps it exists for.
 
 /// Reads `len` bytes of the target at `address`, or `None` if that memory is not readable.
 ///

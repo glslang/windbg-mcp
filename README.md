@@ -105,7 +105,7 @@ Fifty-four tools in eight `--tools` groups; the rows below split some of those g
 | Session | `session` | `open_dump`, `open_trace`, `attach_kernel_local`, `attach_kernel`, `attach_process`, `launch`, `interrupt`, `end_session`, `session_status` |
 | Server   | `session` | `server_log` — the server's own log: the supervisor's records, plus those of the sessions you opened, tagged with the session each belongs to |
 | State   | `inspect` | `registers`, `read_memory`, `backtrace` (the stack as typed frames, each carrying `module`+`RVA` where the engine can place it, as well as its symbol), `modules` (`refresh: true` resynchronises the debugger's inventory with the target first — what a fresh kernel attach needs before "not loaded" means anything), `threads`, `disassemble` (instructions as records, each with its encoding and, where the engine can place it, its `RVA`), `dx`, `set_symbol_path` |
-| Crash   | `crash` | `crash_triage` — a bug check as fields: code and parameters, crashing process, the stack as `module+RVA`, and the faulting driver frame |
+| Crash   | `crash` | `crash_triage` — a bug check as fields: code and parameters, crashing process, the stack as `module+RVA`, and the faulting driver frame; `exception_triage` — the user-mode counterpart: the exception record decoded, what kind of fault it is, the thrown C++ object and the HRESULT it carries, and the stack walked from the crash context; `decode_error_reporting` — an HRESULT, NTSTATUS or Win32 error as fields, with the message the system's own tables give it |
 | Control | `exec` | `go`, `step_over`, `step_into`, `set_breakpoint`, `run_to_address` |
 | Async control | `exec` | `continue_async` (resume and return a handle), `wait_for_stop` (collect the stop; running out of the wait is a poll, not a failure), `break_in` |
 | Transaction | `batch` | `debug_batch` — an ordered sequence with assertions and a rollback the engine process runs on every path |
@@ -117,10 +117,10 @@ Fifty-four tools in eight `--tools` groups; the rows below split some of those g
 | Structure walk | `allocator` | `walk_memory` |
 | Raw     | `inspect` | `execute` — run any debugger command, returns full text output |
 
-All of them are served unless you say otherwise, and the definitions cost the model **75,547 bytes —
-about 19k tokens — before it has asked anything**. `--tools session,inspect,crash` cuts that to
-26,305 B for twenty tools, and a `--listen` client can be given a narrower surface than the run's
-default. [`docs/tool-surface.md`](docs/tool-surface.md) has the arithmetic, the rule that `session`
+All of them are served unless you say otherwise, and the definitions cost the model **79,825 bytes —
+about 20k tokens — before it has asked anything** (measured 2026-09-05). `--tools
+session,inspect,crash` cuts that to 29,744 B for twenty-two tools, and a `--listen` client can be
+given a narrower surface than the run's default. [`docs/tool-surface.md`](docs/tool-surface.md) has the arithmetic, the rule that `session`
 is always included, and what a typed operand may not contain.
 
 Most of the tools also answer with MCP `structuredContent`, so a program can read a field

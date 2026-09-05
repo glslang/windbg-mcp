@@ -1,7 +1,8 @@
-//! Which of this server's fifty-four tools a run advertises.
+//! Which of this server's fifty-six tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
-//! 75,547 bytes — roughly 19k tokens. Seven tenths of that is prose, and the prose is what tells
+//! 79,825 bytes — roughly 20k tokens (measured 2026-09-05; every figure here moves with any edit
+//! to a description, so re-derive rather than cite). Seven tenths of that is prose, and the prose is what tells
 //! a model how to drive the tools, so there is no strip here the way there was in
 //! [`crate::schema`]: `FOLLOWUPS.md` item 24 measured it and the only honest lever left is the one
 //! this module is — **not offering every tool to every caller**.
@@ -15,22 +16,22 @@
 //!
 //! A group is *an activity*, not a subsystem: the tools you reach for while doing one kind of
 //! debugging. A caller reading a crash dump has no use for the nine TTD tools or the ten allocator
-//! ones, and pays 22,798 bytes for them at the start of every conversation.
+//! ones, and pays 23,286 bytes for them at the start of every conversation.
 //!
 //! ```text
 //!   group      tools   bytes   what it is for
-//!   session       10   12,817  opening a target, ending it, and watching this server
 //!   allocator     10   16,457  pool and heap walks, and `walk_memory`
+//!   session       10   12,817  opening a target, ending it, and watching this server
 //!   inspect        9   11,626  registers, stacks, memory, modules, symbols, raw commands
+//!   batch          1   10,021  `debug_batch`
+//!   exec           8    9,206  breakpoints and execution control
 //!   ttd            9    6,829  recording, indexing and querying a Time Travel trace
 //!   ioctl          6    6,494  driver objects, IRP stacks, and dispatch reachability
-//!   exec           8    8,367  breakpoints and execution control
-//!   batch          1   10,021  `debug_batch`
-//!   crash          1    2,936  `crash_triage`
+//!   crash          3    6,375  a bug check, a user-mode fault, and an error code
 //! ```
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
-//! 14,587 bytes, not the 15,753 its two rows add to, because the eleven tools it keeps also stop
+//! 18,026 bytes, not the 19,192 its two rows add to, because the thirteen tools it keeps also stop
 //! carrying the sentences that pointed at `modules`, `debug_batch`, `backtrace`, `continue_async`
 //! and `break_in` — 1,166 bytes of them. A spec is always cheaper than its rows suggest, never
 //! dearer.
@@ -40,7 +41,7 @@
 //! Not a convenience: every other tool here routes by a `session_id`, and this server is the only
 //! thing that can issue one. A surface with `registers` and no opener cannot be used at all, so a
 //! spec that leaves one out is asking for something that does not exist. On its own it is 11,714
-//! bytes, and that is the floor of any usable surface — `--tools crash` is eleven tools, not one,
+//! bytes, and that is the floor of any usable surface — `--tools crash` is thirteen tools, not three,
 //! and the startup line says so rather than leaving the addition to be discovered.
 //!
 //! # Who a surface belongs to
@@ -51,7 +52,7 @@
 //!
 //! A listener names its clients already ([`crate::client`]), and they do not have one budget
 //! between them: the arrangement this exists for is a local model that can hold twenty tools and a
-//! hosted client that can hold fifty-four, pointed at the same Windows box and the same debug
+//! hosted client that can hold fifty-six, pointed at the same Windows box and the same debug
 //! sessions and told apart by their bearer tokens. So a client may be configured with a spec of
 //! its own — `WINDBG_MCP_TOOLS_<NAME>`, or a `tools` field in the credential file — and is served
 //! that instead of the run's. The run's `--tools` is the **default**, not a ceiling: a client's
@@ -251,7 +252,7 @@ impl Toolset {
             named_anything = true;
             if entry == ALL {
                 // Noted and carried on with, not returned on. Returning here would stop validating
-                // the rest, so `all,ttdd` served all 54 tools while `ttdd,all` was refused — the
+                // the rest, so `all,ttdd` served all 56 tools while `ttdd,all` was refused — the
                 // same spec, judged by where the typo happened to sit. A refusal that depends on
                 // entry order is worse than no refusal, because it is the one nobody reproduces.
                 everything = true;

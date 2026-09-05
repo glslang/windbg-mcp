@@ -3262,19 +3262,28 @@ fn exception_triage(e: &DebugEngine, frames: usize, scan_stack: bool) -> Result<
         _ => None,
     };
     if throw.is_none() && scan_stack {
-        // **Bounded by the frames already walked, not by a guess.** Every frame carries the stack
-        // pointer it was walked with, so the range between the innermost and the outermost is
-        // exactly the region a throw's record can be in — and it is a region this call has already
-        // established is readable, rather than a span picked from a register.
-        if let (Some(low), Some(high)) = (
-            attributed.iter().map(|f| f.frame.stack_offset).min(),
-            attributed.iter().map(|f| f.frame.stack_offset).max(),
-        ) && high > low
+        // **Anchored on the innermost frame and a fixed span, not on the outermost frame.**
+        //
+        // The obvious range is `min(stack_offset)..max(stack_offset)` — the region the walk itself
+        // covers — and it is wrong in exactly the case this scan exists for. On **x64 the unwind
+        // data lives in the image's `.pdata`**, which a minidump does not capture, so a dump whose
+        // binaries are not on this host unwinds badly: measured on the checked-in fixture with its
+        // executable moved aside, the walk alternates between resolved frames and frames in no
+        // module at all, and `max(stack_offset)` is then a number from a bogus frame. A range
+        // derived from it scans the wrong memory and finds nothing — which is how "the sentinel
+        // route works where the type route cannot" was nearly shipped as a claim that fails on the
+        // one target type it was written for.
+        //
+        // The innermost frame's stack pointer comes from the stored context rather than from
+        // unwinding, so it is as good as the dump whatever the rest of the walk did. The record is
+        // above it by construction — it is a local of a frame *between* the throw site and
+        // `RaiseException`, both outward of where the target is stopped — so this scans up from
+        // there by a bounded span.
+        if let Some(innermost) = attributed.iter().map(|f| f.frame.stack_offset).min()
+            && innermost != 0
         {
-            // One frame's worth past the outermost, so a record sitting in the last frame walked
-            // is inside the range rather than exactly at its edge.
-            let end = high.saturating_add(STACK_SCAN_TAIL);
-            throw = fault::find_cpp_records(&read, low, end)
+            let end = innermost.saturating_add(STACK_SCAN_SPAN);
+            throw = fault::find_cpp_records(&read, innermost, end)
                 .first()
                 .and_then(|at| fault::record_at(&read, *at));
         }
@@ -3301,12 +3310,19 @@ fn exception_triage(e: &DebugEngine, frames: usize, scan_stack: bool) -> Result<
     Ok(Output::typed(fault::render(&report), report))
 }
 
-/// How far past the outermost frame's stack pointer the throw scan runs.
+/// How far above the innermost frame's stack pointer the throw scan runs.
 ///
-/// One frame's worth, so a record in the last frame walked is inside the range rather than exactly
-/// at its edge. Small deliberately: the scan is the only *search* here, and a wide one on a stack
-/// that is mostly unreadable is reads that buy nothing.
-const STACK_SCAN_TAIL: u64 = 0x1000;
+/// **A span rather than a second frame's address**, for the reason `exception_triage` gives where
+/// it uses this: the outer frames of a dump with no image on this host are not trustworthy, so a
+/// range derived from them scans the wrong memory. This is anchored on the one stack pointer that
+/// comes from the recorded context rather than from unwinding.
+///
+/// 64 KB because that is comfortably more than the frames between a `throw` and `RaiseException`
+/// occupy — on the checked-in fixture the record sits about 4 KB up — and comfortably less than a
+/// default 1 MB stack, so a miss costs sixteen reads rather than a walk of the whole thing. It is a
+/// bound on a *search*, so being generous costs reads and being mean costs answers; this errs
+/// generous, and `scan_stack: false` is the way out for a caller who wants neither.
+const STACK_SCAN_SPAN: u64 = 0x10000;
 
 /// The current thread's stack, each frame attributed to the module holding it, and whether the
 /// stack went on past `frames`.

@@ -287,7 +287,9 @@ None of these is a bug. They are recorded because they were invisible, and
    `debug_batch` alone is 10,021 B — 13% of everything a model is given before it asks anything — of
    which 7,980 B is the `StepAction`/`Check` vocabulary its schema pulls out of `src/batch.rs`.
    Then `walk_memory` 4,080, `crash_triage` 2,936, `reachable_from_dispatch` 2,628, `server_log`
-   2,599: **21,989 B, 33%**, against a median tool of 900 B.
+   2,599: **21,989 B, 33%**, against a median tool of 900 B. (Those per-tool figures are of
+   2026-08-22; the surface has since grown to 56 tools and 79,825 B, so the *share* is now 27.5%
+   while none of the tools named has changed. A share is the half that goes stale.)
 
    This is where the weight is, and it is a different kind of problem from findings 1–4. Those were
    duplication and waste — the same string paid for repeatedly, or a tail nobody reads. This is one
@@ -298,7 +300,7 @@ None of these is a bug. They are recorded because they were invisible, and
    **Finding 1's answer does not transfer here, and that is what settled it.** Prose came out of the
    output schemas because nothing read it. Prose in an *input* schema is the opposite: it is most of
    what tells a model how to drive the tool, and `debug_batch` is the tool where getting that wrong
-   leaves a patched byte in a running kernel. Measured across all 54 tools, **70% of the
+   leaves a patched byte in a running kernel. Measured across all 54 tools of the day, **70% of the
    model-visible surface is prose** — 28,470 B of tool descriptions and 24,911 B in the 155
    `description` strings nested inside the input schemas — so a strip here buys context by making
    the tools harder to drive correctly. (Re-derived 2026-08-30 by walking a `tools/list`; the
@@ -312,39 +314,42 @@ None of these is a bug. They are recorded because they were invisible, and
    2.3%. The other candidates are not free: `$schema` is 3,074 B but is how a client picks a
    validator dialect (and `tool_schemas_declare_one_dialect_and_are_self_contained` pins it), and
    `minimum`/`format` are constraints. **Roughly 1.7 KB of 75,547 is the whole honest total** for
-   trimming the schemas.
+   trimming the schemas (of the 2026-08-30 surface; the numerator is structural and did not move
+   when the surface did).
 
    So the third lever is the one taken: `--tools` (`src/toolset.rs`) advertises a named subset. A
    caller that is reading a crash dump stops paying for nine TTD tools and ten allocator ones —
    and, since item 41, for the sentences the tools it keeps used to spend on pointing at them.
    Where the bytes sit, and what each profile costs:
 
+   Both tables are measurements of **2026-09-05** and move with any edit to a description.
+
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 10 | 16,457 | 21.8% |
-   | `session` | 10 | 12,817 | 17.0% |
-   | `inspect` | 9 | 11,626 | 15.4% |
-   | `batch` | 1 | 10,021 | 13.3% |
-   | `exec` | 8 | 8,367 | 11.1% |
-   | `ttd` | 9 | 6,829 | 9.0% |
-   | `ioctl` | 6 | 6,494 | 8.6% |
-   | `crash` | 1 | 2,936 | 3.9% |
+   | `allocator` | 10 | 16,457 | 20.6% |
+   | `session` | 10 | 12,817 | 16.1% |
+   | `inspect` | 9 | 11,626 | 14.6% |
+   | `batch` | 1 | 10,021 | 12.6% |
+   | `exec` | 8 | 9,206 | 11.5% |
+   | `ttd` | 9 | 6,829 | 8.6% |
+   | `ioctl` | 6 | 6,494 | 8.1% |
+   | `crash` | 3 | 6,375 | 8.0% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 54 | 75,547 |
-   | `session,inspect,exec,crash` | 28 | 34,825 |
-   | `session,inspect,crash` | 20 | 26,305 |
-   | `crash` | 11 | 14,587 |
+   | *(absent)* | 56 | 79,825 |
+   | `session,inspect,exec,crash` | 30 | 39,103 |
+   | `session,inspect,crash` | 22 | 29,744 |
+   | `crash` | 13 | 18,026 |
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`
-   is 14,587 rather than the 15,753 its two rows sum to, because the cross-references leave with
+   is 18,026 rather than the 19,192 its two rows sum to, because the cross-references leave with
    the tools they name — 1,166 B of them, pointing at `modules`, `debug_batch`, `backtrace`,
    `continue_async` and `break_in`.
 
    `session` is in every surface because every other tool routes by a `session_id` this server is
-   the only issuer of — 11,714 B is the floor, and `crash` is eleven tools rather than one. The
+   the only issuer of — 11,714 B is the floor, and `crash` is thirteen tools rather than three. The
    flag is a **run's** choice, and on a listener it is the *default*: a named client may be
    configured with a spec of its own (`WINDBG_MCP_TOOLS_<NAME>`), so the figures above are per
    client rather than per server — which is what lets a local model and a hosted client share one
@@ -369,7 +374,7 @@ put in a group would vanish from every narrowed surface without a word — the d
 still carry it, so nothing else would notice. And
 `a_narrowed_tool_surface_serves_only_what_it_was_asked_for` starts a server with `--tools crash` and
 checks the three things that makes true: eleven tools, a refusal by name for a tool that exists and
-is not served, and a figure under half the whole surface (it prints 14,587 B).
+is not served, and a figure under half the whole surface (it prints 18,026 B).
 
 Beside them, `output_schemas_carry_constraints_not_prose` is the
 assertion that finding 1 stays fixed. It reads `tools/list` off the wire, so it catches the way that

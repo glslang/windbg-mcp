@@ -33,9 +33,10 @@
 - [`explorer-crash-walkthrough.md`](explorer-crash-walkthrough.md) — the server debugging **its own
   host**: a Windows 11 shell that would not start, traced through three consecutive faults to a
   malformed AppModel State Repository. A user-mode counterpart to the kernel walkthroughs, and the
-  one with no checked-in sample — the target was the live machine. Its subject is the fact no typed
-  tool returns: the **HRESULT thrown through `winrt::check_hresult`**, dug out of the C++ exception
+  one with no checked-in sample — the target was the live machine. Its subject was a fact no typed
+  tool returned: the **HRESULT thrown through `winrt::check_hresult`**, dug out of the C++ exception
   record by hand (`.exr`, the `0x19930520` EH magic, the `0xAABBCCDD` sentinel, `!error`) three
-  times in one evening, which is the argument for making it a primitive. Also contrasts the two
-  shapes of `0xc0000409`: a CRT `abort` that hides the code in the thrown object against a WIL
-  fail-fast that puts it in a parameter.
+  times in one evening. §9 is the argument that made it a primitive, and now records what shipped —
+  `exception_triage` and `decode_error_reporting`, and the three ways the tool differs from the
+  recipe. Also contrasts the two shapes of `0xc0000409`: a CRT `abort` that hides the code in the
+  thrown object against a WIL fail-fast that puts it in a parameter.

@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`exception_triage` — a user-mode fault as fields**, which is `crash_triage`'s counterpart for a
+  process rather than a machine. The exception record with its code decoded, what kind of fault it
+  is, the thrown C++ object and the `HRESULT` it carries, and the crashing stack. It closes the gap
+  [`docs/explorer-crash-walkthrough.md`](docs/explorer-crash-walkthrough.md) §9 argued for: three
+  faults in one evening whose answer came out of `execute` — `.exr`, `.ecxr`, `s -d`, `dd`,
+  `!error` — are now one call.
+
+  Three things it does that the hand recipe did not. The thrown **type** is decoded from MSVC's own
+  `ThrowInfo` → `CatchableTypeArray` → `CatchableType` → `TypeDescriptor` chain rather than assumed,
+  so the `0xAABBCCDD` sentinel confirms an offset the type name already predicted instead of being
+  the thing that finds it — reported as `hresult_confidence: corroborated`, against `convention`
+  when the sentinel stands alone. Both routes are tried, because neither is a superset: `ThrowInfo`
+  lives in the throwing module's image, which a minidump does **not** capture (measured — the walk
+  succeeds while the binary is at its recorded path and returns `????????` once it is moved aside),
+  while the thrown object is on the stack and always is. And the throw's own record is **searched
+  for**: when a C++ exception goes unhandled the event the debugger sees is `abort`'s fail-fast, so
+  the crashing thread's stack is scanned for the `0xe06d7363` record, bounded by the frames the same
+  call already walked.
+
+  The stack comes from the **stored crash context** ([dbgscope#144]), so it is the crash whatever
+  thread the session has selected, and the selection is left where it was — which is why this is
+  annotated read-only where `crash_triage` needed a scope guard. A kernel session is refused, since
+  a kernel crash dump carries no stored event at all and its bug check is `crash_triage`'s.
+
+- **`decode_error_reporting` — an HRESULT, NTSTATUS or Win32 error as fields**, with the message the
+  system's own tables give it: `!error` as a typed call rather than a scrape of an extension's
+  output. `FormatMessageW` was measured to answer for both of that investigation's exotic codes
+  verbatim — `0x80670015` "The StateRepository cache is not initialized." and `0x80073D54` "The
+  process has no package identity." — with `ntdll`'s table beside it for an `NTSTATUS`. Pure: no
+  session, no `session_id`.
+
+  It reports every **reading** rather than choosing one, because a bare dword does not say which
+  space it came from: severity is one bit as an HRESULT and two as an NTSTATUS, so `0x80670015` is a
+  failed HRESULT whose top two bits read as an NTSTATUS *warning*. It takes a sign-extended 64-bit
+  value, because that is the shape a WIL fail-fast's HRESULT arrives in — `0xffffffff8000ffff`
+  decodes to `E_UNEXPECTED`.
+
+### Changed
+
+- Both new tools join the **`crash`** group, which is why `crash_triage`'s refusal on a user-mode
+  session stopped pointing at `backtrace` and `execute`. Those are `inspect`, so a `--tools crash`
+  caller — the surface most likely to hit that refusal — was guaranteed to get no pointer with it.
+  It names `exception_triage` now, which that caller has.
+- The tool surface is **56 tools and 79,825 B** of model context, from 54 and 75,547 (measured
+  2026-09-05). `--tools crash` is 13 tools and 18,026 B.
+
+[dbgscope#144]: https://github.com/glslang/dbgscope/pull/144
+
 ## [0.15.0] - 2026-09-04
 
 ### Fixed

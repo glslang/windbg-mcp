@@ -157,6 +157,29 @@ const ARM64_SAMPLE_DUMP: &str = concat!(
     "/docs/samples/121524-4703-01.dmp"
 );
 
+/// A **user-mode** fault dump, which nothing else here is: a C++ object thrown, nothing catching
+/// it, so the CRT calls `terminate` -> `abort` -> `__fastfail`. That is the explorer walkthrough's
+/// first fault exactly, and the shape `exception_triage` exists for.
+///
+/// **Purpose-built rather than captured**, because the faults that motivated the tool could not be
+/// checked in: they were 122-345 MB and carried a live desktop session. `docs/samples/cppthrow.cpp`
+/// is the whole program, and the recipe is in `docs/smoke-test.md`. Two things about how it was
+/// made are load-bearing rather than incidental. It was run with a **scrubbed environment**,
+/// because a minidump captures the process environment block -- the first attempt carried this
+/// machine's user name, its whole `Path`, and the harness's own variables. And the thrown type is
+/// laid out like a `winrt::hresult_error`, a `0xAABBCCDD` sentinel immediately before the HRESULT,
+/// so the sentinel route has something real to find.
+///
+/// It carries **no image**, which is deliberate and is the more interesting half: `ThrowInfo` and
+/// the descriptors it points at live in the executable, which a minidump does not capture, so a
+/// host without `C:\wmfixture\cppthrow.exe` -- which is every host but the one that made this --
+/// reads no type name and must still get the HRESULT. That is the "dump from another machine" case
+/// the two-route design is for, and the only case CI can run.
+const USER_FAULT_DUMP: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/docs/samples/cppthrow-fastfail.dmp"
+);
+
 /// A checked-in **driver** crash and the facts about it that
 /// [`a_driver_crash_names_the_driver_frame_an_all_kernel_walk_would_miss`] asserts, so one test
 /// body covers both architectures' stacks rather than naming one file.
@@ -4528,6 +4551,150 @@ fn launch_tier() -> bool {
         return false;
     }
     true
+}
+
+/// **The §9 routine, as one call**, against a real unhandled-C++-exception dump.
+///
+/// This is the test `every_tool_with_an_output_schema_answers_with_structured_content` defers to
+/// when it lists `exception_triage` as unreachable: that one calls every tool without a session,
+/// and this fault cannot be produced without one.
+///
+/// What it pins is the chain the walkthrough performed by hand, and each link is a separate
+/// assertion because each was a separate manual step. The fail-fast is classified rather than
+/// taken at its name; its subcode is what says why; the stack comes from the *stored* context; and
+/// the thrown HRESULT is recovered from a record that is not the one the debugger stopped on --
+/// found by scanning the crashing thread's stack, since the event is `abort`'s fail-fast.
+#[test]
+fn a_user_mode_fault_is_triaged_from_its_exception_record() {
+    if !launch_tier() {
+        return;
+    }
+    if !std::path::Path::new(USER_FAULT_DUMP).exists() {
+        skip(&format!(
+            "user-mode fault dump not found at {USER_FAULT_DUMP}"
+        ));
+        return;
+    }
+    let mut server = Server::started();
+    let session = server.open_session("open_dump", json!({ "path": USER_FAULT_DUMP }), TARGET_STEP);
+
+    let out = server.call_tool(
+        "exception_triage",
+        json!({ "session_id": session }),
+        TARGET_STEP,
+    );
+    // `Outcome::Ok` flattens: `status` sits beside the payload's own fields rather than
+    // wrapping them, so the payload *is* `structuredContent`.
+    let data = &out["result"]["structuredContent"];
+    assert_eq!(data["status"], "ok", "{out}");
+
+    // The record, read rather than inferred. One parameter is the CRT's shape; three would be
+    // WIL's, and the count is the only thing that tells them apart.
+    assert_eq!(data["exception"]["code"], "0xc0000409", "{data}");
+    assert_eq!(data["kind"], "fail_fast", "{data}");
+    assert_eq!(
+        data["exception"]["parameters"].as_array().map(Vec::len),
+        Some(1),
+        "a one-parameter fail-fast is the CRT's; a different count is a different fault: {data}"
+    );
+    assert_eq!(data["exception"]["first_chance"], false, "{data}");
+    assert_eq!(data["exception"]["noncontinuable"], true, "{data}");
+
+    // **The summary is the point of the tool, not decoration.** The decoded message for this code
+    // is the misleading one -- "an overrun of a stack-based buffer" -- and is reported because a
+    // reader who has met it elsewhere needs to place it. What corrects it is the subcode.
+    let summary = data["summary"].as_str().unwrap_or_default();
+    assert!(
+        summary.contains("FAST_FAIL_FATAL_APP_EXIT"),
+        "the subcode is what says why a fail-fast happened: {data}"
+    );
+    assert!(
+        data["exception"]["decoded"]["ntstatus_message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("stack-based buffer"),
+        "the misleading system message is reported rather than hidden: {data}"
+    );
+
+    // The stack is the crash's, from the stored context rather than from whatever is selected.
+    assert_eq!(data["frames_from_stored_context"], true, "{data}");
+    let frames = data["frames"].as_array().expect("no frames");
+    assert_eq!(
+        frames[0]["module"], "cppthrow",
+        "the innermost frame is in the faulting image, and `module`+`rva` is computed from the \
+         load base rather than resolved -- so it answers on a host with no symbols at all: {data}"
+    );
+
+    // **The rest of the walk is gated on the walk having worked, which is a fact about this host.**
+    // On x64 the unwind data is in the image's `.pdata`, and a minidump does not capture it -- so
+    // on a host without the fixture's own binary the engine unwinds badly and the stack comes back
+    // with holes in it. Measured, by moving the binary aside: frame 0 is right either way (it comes
+    // from the recorded context, not from unwinding), and beyond it the frames alternate between
+    // resolved and attributed to no module at all. A complete attribution is therefore the signal
+    // that this host could unwind at all, and only then are the deeper frames worth asserting on.
+    let unwound = frames.iter().all(|f| f["module"].is_string());
+    if unwound {
+        let symbols: Vec<&str> = frames.iter().filter_map(|f| f["symbol"].as_str()).collect();
+        assert!(
+            symbols.iter().any(|s| s.contains("abort")),
+            "frame 0 of an unhandled C++ exception is the CRT's abort: {symbols:?}"
+        );
+        assert!(
+            symbols.iter().any(|s| s.contains("CxxThrowException")),
+            "the throw site is on the stack of a fault that came from a throw: {symbols:?}"
+        );
+    } else {
+        skip("this host has not got the fixture's image, so it cannot unwind past frame 0");
+    }
+
+    // **The thrown HRESULT, from a record the debugger never stopped on.** This is §5: the event
+    // is the fail-fast, and the throw's own record is a local of an earlier frame, found by
+    // scanning. That it decodes to a sentence naming a real subsystem is what makes a
+    // sentinel-located number believable.
+    let thrown = &data["thrown"];
+    assert_eq!(thrown["hresult"]["value"], "0x80670015", "{data}");
+    assert!(
+        thrown["hresult"]["system_message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("StateRepository"),
+        "the recovered HRESULT did not resolve to a message: {thrown}"
+    );
+
+    // **Both branches are asserted, and the pair is the point.** The descriptors live in the
+    // executable, which this dump does not carry -- so a host with the binary reads the type and
+    // corroborates the sentinel, and a host without it gets the HRESULT from the sentinel alone and
+    // has to say so. Neither route is a superset, and the assertion above -- which runs either way
+    // -- is what says the second one really does stand on its own.
+    match thrown["type_name"].as_str() {
+        None => {
+            assert_eq!(
+                thrown["hresult_confidence"], "convention",
+                "with no type read, the sentinel stands alone and must not claim otherwise: \
+                 {thrown}"
+            );
+            assert!(
+                thrown["type_note"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("minidump"),
+                "an unread type has to say why: {thrown}"
+            );
+        }
+        Some(name) => {
+            assert!(name.contains("hresult_error"), "{thrown}");
+            assert_eq!(
+                thrown["hresult_confidence"], "corroborated",
+                "with the type read, the sentinel hit is corroborated: {thrown}"
+            );
+            assert!(
+                thrown["type_note"].is_null(),
+                "a walk that succeeded still explained why it had not: {thrown}"
+            );
+        }
+    }
+
+    server.call_tool("end_session", json!({ "session_id": session }), STEP);
 }
 
 /// A live user-mode target that runs long enough to be driven and exits on its own.
