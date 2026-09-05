@@ -3318,13 +3318,13 @@ fn exception_triage(e: &DebugEngine, frames: usize, scan_stack: bool) -> Result<
         // route works where the type route cannot" was nearly shipped as a claim that fails on the
         // one target type it was written for.
         //
-        // The innermost frame's stack pointer comes from the stored context rather than from
-        // unwinding, so it is as good as the dump whatever the rest of the walk did. The record is
-        // above it by construction — it is a local of a frame *between* the throw site and
+        // Frame 0's stack pointer comes from the stored context rather than from unwinding, so it
+        // is as good as the dump whatever the rest of the walk did — see `fault::scan_anchor`,
+        // which is why this is frame 0 rather than the lowest offset the walk produced. The record
+        // is above it by construction — it is a local of a frame *between* the throw site and
         // `RaiseException`, both outward of where the target is stopped — so this scans up from
         // there by a bounded span.
-        if let Some(innermost) = attributed.iter().map(|f| f.frame.stack_offset).min()
-            && innermost != 0
+        if let Some(innermost) = fault::scan_anchor(attributed.iter().map(|f| f.frame.stack_offset))
         {
             let end = innermost.saturating_add(STACK_SCAN_SPAN);
             // **Every candidate is checked against what it points at, not just the first.**
