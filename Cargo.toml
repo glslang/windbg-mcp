@@ -10,11 +10,7 @@ repository = "https://github.com/glslang/windbg-mcp"
 license = "MIT"
 
 [dependencies]
-# **Pinned at a branch commit while this lands, not at `main`.** dbgscope#144 is the exception,
-# event and context-walk half of this change and has to merge first; repoint at whatever
-# `dbgscope`'s `main` then is, and check the pin is an ancestor of it rather than assuming — that
-# repo rebase-merges, so the branch head this names may be an ancestor of nothing.
-dbgscope = { git = "https://github.com/glslang/dbgscope", rev = "9d68bd55ea34f111adf57889076ce3b526d91fb5" }
+dbgscope = { git = "https://github.com/glslang/dbgscope", rev = "bb26d44cacff77113fe4f6c049c62249054ccf6d" }
 # 3.1.1 is a floor, not a preference: every 3.x before it generates a `tools/list` that omits
 # SEP-2549's required `ttlMs`/`cacheScope`, which a spec-strict `2026-07-28` client rejects
 # outright — the server connects and appears to expose no tools at all (upstream issue #1114).
