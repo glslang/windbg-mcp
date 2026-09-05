@@ -288,7 +288,7 @@ None of these is a bug. They are recorded because they were invisible, and
    which 7,980 B is the `StepAction`/`Check` vocabulary its schema pulls out of `src/batch.rs`.
    Then `walk_memory` 4,080, `crash_triage` 2,936, `reachable_from_dispatch` 2,628, `server_log`
    2,599: **21,989 B, 33%**, against a median tool of 900 B. (Those per-tool figures are of
-   2026-08-22; the surface has since grown to 56 tools and 80,549 B, so the *share* is now 27.3%
+   2026-08-22; the surface has since grown to 56 tools and 80,579 B, so the *share* is now 27.3%
    while none of the tools named has changed. A share is the half that goes stale.)
 
    This is where the weight is, and it is a different kind of problem from findings 1–4. Those were
@@ -331,20 +331,20 @@ None of these is a bug. They are recorded because they were invisible, and
    | `inspect` | 9 | 11,626 | 14.4% |
    | `batch` | 1 | 10,021 | 12.4% |
    | `exec` | 8 | 9,206 | 11.4% |
-   | `crash` | 3 | 7,099 | 8.8% |
+   | `crash` | 3 | 7,129 | 8.8% |
    | `ttd` | 9 | 6,829 | 8.5% |
    | `ioctl` | 6 | 6,494 | 8.1% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 56 | 80,549 |
-   | `session,inspect,exec,crash` | 30 | 39,827 |
-   | `session,inspect,crash` | 22 | 30,468 |
-   | `crash` | 13 | 18,750 |
+   | *(absent)* | 56 | 80,579 |
+   | `session,inspect,exec,crash` | 30 | 39,857 |
+   | `session,inspect,crash` | 22 | 30,498 |
+   | `crash` | 13 | 18,780 |
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`
-   is 18,750 rather than the 19,916 its two rows sum to, because the cross-references leave with
+   is 18,780 rather than the 19,946 its two rows sum to, because the cross-references leave with
    the tools they name — 1,166 B of them, pointing at `modules`, `debug_batch`, `backtrace`,
    `continue_async` and `break_in`.
 
@@ -374,7 +374,7 @@ put in a group would vanish from every narrowed surface without a word — the d
 still carry it, so nothing else would notice. And
 `a_narrowed_tool_surface_serves_only_what_it_was_asked_for` starts a server with `--tools crash` and
 checks the three things that makes true: thirteen tools, a refusal by name for a tool that exists
-and is not served, and a figure under half the whole surface (it prints 18,750 B).
+and is not served, and a figure under half the whole surface (it prints 18,780 B).
 
 Beside them, `output_schemas_carry_constraints_not_prose` is the
 assertion that finding 1 stays fixed. It reads `tools/list` off the wire, so it catches the way that

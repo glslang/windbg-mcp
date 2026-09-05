@@ -40,11 +40,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A recovered record carries **`provenance`**, because finding one does not make it this fault's:
   a C++ `EXCEPTION_RECORD` outlives the frames that held it, so a direct `abort()` deeper than an
   earlier `try`/`catch` finds a valid record above its stack pointer — measured, on
-  `docs/samples/stale-throw-abort.dmp`, which is checked in as the negative case. `dispatching`
-  means the stack also shows the exception machinery running (`KiUserExceptionDispatcher` and the
-  unhandled-exception filter, whose symbols come from `ntdll`/`KERNELBASE` rather than the faulting
-  image), `scanned` means it does not, and only the first lets the summary name an uncaught
-  exception.
+  `docs/samples/stale-throw-abort.dmp`, which is checked in as the negative case. It is `scanned`
+  for anything the scan produced and `reported` only when the debugger stopped on the throw itself,
+  and the summary never names an uncaught exception on the strength of a scan.
+
+  Each **candidate** is checked against what it points at, which is the part that is about the
+  record rather than about the stack: a thrown object is copied onto the stack, so one whose
+  `object` lies outside the scanned range belongs to no throw on this thread. That rejects the
+  stale-abort fixture's only candidate — its `object` is a code address in the faulting image — so
+  the tool reports no throw there at all.
 
   **An exception record's code is decoded as an `NTSTATUS`.** The namespaces overlap and the system
   message table answers for the wrong one where they do: `0x80000003` is `STATUS_BREAKPOINT`, and
@@ -86,8 +90,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   session stopped pointing at `backtrace` and `execute`. Those are `inspect`, so a `--tools crash`
   caller — the surface most likely to hit that refusal — was guaranteed to get no pointer with it.
   It names `exception_triage` now, which that caller has.
-- The tool surface is **56 tools and 80,549 B** of model context, from 54 and 75,547 (measured
-  2026-09-05). `--tools crash` is 13 tools and 18,750 B.
+- The tool surface is **56 tools and 80,579 B** of model context, from 54 and 75,547 (measured
+  2026-09-05). `--tools crash` is 13 tools and 18,780 B.
 
 [dbgscope#144]: https://github.com/glslang/dbgscope/pull/144
 

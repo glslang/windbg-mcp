@@ -4778,14 +4778,14 @@ fn a_32_bit_user_mode_fault_is_triaged_at_its_own_pointer_width() {
         "the recovered HRESULT did not resolve to a message: {thrown}"
     );
 
-    // And the summary may now name the uncaught exception, because a record was actually found --
-    // which is the difference between reporting a cause and assuming one.
-    assert!(
-        data["summary"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("nobody caught"),
-        "a throw was recovered, so the summary is entitled to say so: {data}"
+    // **No assertion about the summary naming a cause**, because there is none to make: a record
+    // found by scanning never becomes this fault's cause, whatever else is on the stack. An earlier
+    // version of this test asserted the confident wording and passed here and failed on CI, because
+    // the wording had been made conditional on symbols this host happens to have cached and CI does
+    // not. The claim below is the one that is about the target rather than about the host.
+    assert_eq!(
+        data["thrown"]["provenance"], "scanned",
+        "a record the debugger did not stop on has to say where it came from: {data}"
     );
 
     // The type route is gated the same way as on x64: the descriptors are in the image, which this
@@ -4873,19 +4873,19 @@ fn a_stale_throw_record_is_not_reported_as_this_faults_cause() {
         "a direct abort() was reported as an uncaught C++ exception: {summary}"
     );
 
-    match data["thrown"].as_object() {
-        Some(thrown) => {
-            assert_eq!(
-                thrown["provenance"], "scanned",
-                "a record found with nothing dispatching must say so: {thrown:?}"
-            );
-            assert!(
-                summary.contains("handled earlier"),
-                "the summary has to carry the caveat the provenance implies: {summary}"
-            );
-        }
-        None => skip("no throw record was found on this host's read of the stale-abort dump"),
-    }
+    // **And the candidate filter is what this dump is really for.** Its first structurally valid
+    // candidate points at a *code* address in the faulting image rather than at a thrown object on
+    // the stack -- `0x7ff632c172d6`, the return address the walk shows for `staleabort!deep`. A
+    // scan that promotes anything self-consistent reports that as the thrown object; one that
+    // checks where the record points reports nothing here, which is the right answer.
+    assert!(
+        data["thrown"].is_null(),
+        "the only structurally valid candidate on this dump points at a code address, so nothing          should have been reported as thrown: {data}"
+    );
+    assert!(
+        summary.contains("no throw record was found"),
+        "with the candidate rejected, the summary has to say the record does not say why:          {summary}"
+    );
 
     server.call_tool("end_session", json!({ "session_id": session }), STEP);
 }

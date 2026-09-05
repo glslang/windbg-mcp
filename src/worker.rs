@@ -3327,29 +3327,26 @@ fn exception_triage(e: &DebugEngine, frames: usize, scan_stack: bool) -> Result<
             && innermost != 0
         {
             let end = innermost.saturating_add(STACK_SCAN_SPAN);
+            // **Every candidate is checked against what it points at, not just the first.**
+            // `find_cpp_records` promotes on self-consistency, and four bytes of `0xe06d7363` with
+            // a plausible count behind them occur: on the checked-in stale-abort dump the first
+            // candidate's `object` is a *code* address in the faulting image. A thrown object is
+            // copied onto the stack by `_CxxThrowException`, so one that is not in the range being
+            // scanned belongs to no throw on this stack.
             throw = fault::find_cpp_records(&read, innermost, end, bitness)
-                .first()
-                .and_then(|at| fault::record_at(&read, *at, bitness));
+                .into_iter()
+                .filter_map(|at| fault::record_at(&read, at, bitness))
+                .find(|throw| fault::object_is_on_the_scanned_stack(throw, innermost, end));
         }
     }
     let thrown = throw
         .as_ref()
         .map(|throw| fault::thrown_error(&read, throw));
 
-    // **What the find is worth, which is not the same as whether there was one.** A record that
-    // parses may be a *handled* exception's, left on the stack by an earlier try/catch and never
-    // erased -- see `fault::ThrowEvidence`. The stack is what tells them apart: an unhandled throw
-    // reaches abort through the exception dispatch, so those frames are still on it.
+    // Where the record came from, which is the only thing that can be said about it honestly --
+    // see `fault::ThrowEvidence`. A scan earns no claim about cause however much it corroborates.
     let evidence = match (&throw, &kind) {
-        (Some(_), _)
-            if fault::stack_is_dispatching(
-                attributed.iter().filter_map(|f| f.frame.symbol.as_deref()),
-            ) =>
-        {
-            fault::ThrowEvidence::Dispatching
-        }
-        // A throw that *is* the reported fault needs no corroboration: the debugger stopped on it.
-        (Some(_), fault::FaultKind::CppThrow(_)) => fault::ThrowEvidence::Dispatching,
+        (Some(_), fault::FaultKind::CppThrow(_)) => fault::ThrowEvidence::Reported,
         (Some(_), _) => fault::ThrowEvidence::Scanned,
         (None, _) => fault::ThrowEvidence::None,
     };

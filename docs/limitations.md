@@ -134,19 +134,23 @@
   walk this host could not do, not a stack with an unusual frame in it. Put the binaries where the
   debugger can find them (`.exepath`, or beside the dump) before reading a stack from a dump that
   came from another machine.
-- **A scanned throw record is labelled, because finding one does not make it this fault's.** A
-  C++ `EXCEPTION_RECORD` outlives the frames that held it: a `try`/`catch` unwinds past one without
+- **A scanned throw record is never this fault's cause, only a candidate for it.** A C++
+  `EXCEPTION_RECORD` outlives the frames that held it: a `try`/`catch` unwinds past one without
   erasing it, so a later direct `abort()` running deeper than the old throw site finds a valid
   record above its stack pointer. Measured, on `docs/samples/stale-throw-abort.dmp` — the scan
-  really does promote a candidate there, so "the scan will not find anything" is not the guard.
-  What separates the two is whether an exception is **being dispatched**, which the stack shows:
-  `KiUserExceptionDispatcher` and the unhandled-exception filter are on it for a genuine unhandled
-  throw and on nothing else. `thrown.provenance` reports which case this is — `reported` when the
-  debugger stopped on the throw, `dispatching` when the stack corroborates, `scanned` when it does
-  not and the object may belong to an exception the program handled. Corroboration needs symbols
-  for `ntdll`/`KERNELBASE`, not for the faulting image, so a dump from another machine can still
-  reach `dispatching`; a host with no symbols at all reports `scanned` and says less rather than
-  guessing more.
+  really does promote a candidate there, so "the scan will not find one" is not the guard. And
+  **no property of the stack separates the two**: in both cases the record sits above the stack
+  pointer inside a live caller's frame. So `thrown.provenance` says `scanned` for anything the scan
+  produced and `reported` only when the debugger stopped on the throw itself, and the summary never
+  names an uncaught exception on the strength of a scan. What settles it is whether the throw site
+  is on the stack above, which the frames are there for a reader to check.
+
+  What *is* checked is the candidate rather than the stack: a thrown object is copied onto the
+  stack by `_CxxThrowException`, so a record whose `object` points outside the scanned range
+  belongs to no throw on this thread. On the stale-abort fixture that rejects the only candidate —
+  its `object` is a code address in the faulting image — and the tool reports no throw at all,
+  which is right. It is necessary rather than sufficient: a genuinely stale record has its object
+  on the stack too.
 - **An exception code is decoded as an `NTSTATUS`, and a bare code is decoded as both.** The two
   namespaces overlap and the system message table answers for the wrong one where they do:
   `0x80000003` is `STATUS_BREAKPOINT`, and `FormatMessage` reads it as `E_INVALIDARG` — "One or
