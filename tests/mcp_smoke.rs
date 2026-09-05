@@ -4630,6 +4630,10 @@ fn a_user_mode_fault_is_triaged_from_its_exception_record() {
 
     // The stack is the crash's, from the stored context rather than from whatever is selected.
     assert_eq!(data["frames_from_stored_context"], true, "{data}");
+    assert_eq!(
+        data["stored_crash_context"], true,
+        "the walk came from a context, so the target had one: {data}"
+    );
     let frames = data["frames"].as_array().expect("no frames");
     assert_eq!(
         frames[0]["module"], "cppthrow",
@@ -4812,6 +4816,10 @@ fn a_32_bit_user_mode_fault_is_triaged_at_its_own_pointer_width() {
     // The stack is the crash's, and frame 0 is in the faulting image whatever symbols this host
     // has, because `module`+`rva` is computed from the load base rather than resolved.
     assert_eq!(data["frames_from_stored_context"], true, "{data}");
+    assert_eq!(
+        data["stored_crash_context"], true,
+        "the walk came from a context, so the target had one: {data}"
+    );
     let frames = data["frames"].as_array().expect("no frames");
     assert_eq!(frames[0]["module"], "cppthrow32", "{data}");
 

@@ -3394,10 +3394,14 @@ fn exception_triage(e: &DebugEngine, frames: usize, scan_stack: bool) -> Result<
             tracing::debug!("worker: exception triage could not walk the stack: {why}");
             (Vec::new(), false)
         });
-    let walked_stored_context = stored
+    // **What the target *had*, not what the walk got.** Whether the frames actually came from it
+    // is `&&`-ed with the walk's result, and that belongs in one place — `fault::report` — because
+    // the two facts together are what tells a failed walk of a real crash context apart from a
+    // live target that never had one. Computing the conjunction here left the renderer with only
+    // its result, and it told the first case it was the second.
+    let stored_crash_context = stored
         .as_ref()
-        .is_some_and(|stored| stored.context.is_some())
-        && !attributed.is_empty();
+        .is_some_and(|stored| stored.context.is_some());
 
     let bitness = target_bitness(e);
     let kind = fault::classify(record.code, &record.parameters, bitness);
@@ -3471,7 +3475,7 @@ fn exception_triage(e: &DebugEngine, frames: usize, scan_stack: bool) -> Result<
         evidence,
         attributed.iter().map(triage::frame_info).collect(),
         truncated,
-        walked_stored_context,
+        stored_crash_context,
         process_name,
     );
     Ok(Output::typed(fault::render(&report), report))

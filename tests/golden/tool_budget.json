@@ -141,8 +141,8 @@
       "inputSchema": 1344,
       "modelVisible": 3003,
       "name": "exception_triage",
-      "outputSchema": 3618,
-      "wire": 6775
+      "outputSchema": 3683,
+      "wire": 6840
     },
     {
       "annotations": 124,
@@ -511,10 +511,10 @@
     "inputSchema": 46465,
     "instructions": 1983,
     "modelVisible": 80670,
-    "outputSchema": 120762,
-    "payload": 208989,
+    "outputSchema": 120827,
+    "payload": 209054,
     "tools": 56,
-    "wire": 208866,
+    "wire": 208931,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }
