@@ -1430,11 +1430,13 @@ New-ItemProperty -Path $k -Name DumpType   -Value 1 -PropertyType DWord -Force  
 New-ItemProperty -Path $k -Name DumpCount  -Value 2 -PropertyType DWord -Force
 ```
 
-**Run it with a scrubbed environment**, which is not optional and is the step that is easy to skip:
+**Run it with a scrubbed environment *and* a scrubbed working directory**, which is not optional
+and is the step that is easy to skip:
 
 ```pwsh
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = "$dir\cppthrow.exe"; $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+$psi.WorkingDirectory = $dir
 $psi.EnvironmentVariables.Clear()
 $psi.EnvironmentVariables.Add('SystemRoot', 'C:\Windows')
 $psi.EnvironmentVariables.Add('windir', 'C:\Windows')
@@ -1442,11 +1444,26 @@ $psi.EnvironmentVariables.Add('Path', 'C:\Windows\system32;C:\Windows')
 [System.Diagnostics.Process]::Start($psi).WaitForExit()
 ```
 
-**A minidump captures the process environment block**, so the first attempt at this fixture carried
-the machine's user name, its whole `Path` and the harness's own variables — none of which is
-visible in anything a debugger prints, and all of which is in the file. Check before committing one:
-search the dump for `\Users\` as both ASCII and UTF-16LE, and expect the only paths in it to be
-`C:\Windows\System32\*` and `C:\wmfixture\cppthrow.exe`.
+**A minidump captures the process parameters, and the environment block is only half of them.** The
+first attempt at this fixture carried the machine's user name, its whole `Path` and the harness's
+own variables — none of which is visible in anything a debugger prints, and all of which is in the
+file. Clearing `EnvironmentVariables` fixes that half and **nothing else**: `WorkingDirectory` left
+unset means the child inherits the launching shell's, so a capture run from the repository checkout
+records `C:\workspace\windbg-mcp\` in `RTL_USER_PROCESS_PARAMETERS.CurrentDirectory` with a
+perfectly clean environment beside it. Codex found exactly that in the first
+`cppthrow-fastfail-x86.dmp` and `stale-throw-abort.dmp`, twice each in UTF-16LE, on
+[#286](https://github.com/glslang/windbg-mcp/pull/286) — and the 64-bit fixture beside them did
+*not* have it, because that one happened to be launched from `C:\wmfixture`. A leak that depends
+on which directory you were standing in is not one a reader will reproduce, so the line is in the
+block above rather than in a warning under it.
+
+**Check before committing one, and check the whole file rather than the fields you thought of.**
+`!peb` is the quick read — `CurrentDirectory` and `Environment` are both in its first dozen lines,
+and both have to name only `C:\wmfixture` and `C:\Windows`. Then search the bytes, because a
+field nobody has thought to print is exactly the one that leaks: every drive-letter path in the
+file, ASCII **and** UTF-16LE (at both byte alignments), should be under `C:\Windows\` or
+`C:\wmfixture\` — the second of those includes the `.pdb` path the linker wrote into the image's
+debug directory, which is captured with the module headers and is expected.
 
 The 32-bit one is the **same source** through `vcvars32.bat`, copied under its own name so the
 two builds do not share object files, and with a WER key of its own — the key is matched on the
@@ -1473,8 +1490,9 @@ Then run it with the same scrubbed environment as above, pointing `$psi.FileName
 throw site, so the handled exception's record is still on the stack above the aborting frame — and
 the buried-throw scan **does** find one there. The fault is `0xc0000409` subcode 7 with one
 parameter, byte for byte the shape of a genuine unhandled throw, so only the absence of the
-exception machinery on the stack tells them apart. Build and capture it exactly as above, with the
-scrubbed environment, under its own WER key.
+exception machinery on the stack tells them apart. Build and capture it exactly as above — the
+scrubbed environment *and* `WorkingDirectory`, under its own WER key — and run the same two checks
+over the file it produces.
 
 **Delete `C:\wmfixture` afterwards, or know that you are the one host the tests behave differently
 on.** The dumps carry no image, and on x64 the unwind data lives in the image's `.pdata` — so a
