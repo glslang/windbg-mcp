@@ -201,11 +201,14 @@
   `GetActualProcessorType` answers for the **physical processor**, so a WoW64 process on an x64 box
   comes back `0x8664` — measured, by launching `C:\Windows\SysWOW64\cmd.exe` under a 64-bit
   worker. It is nonetheless the right answer for a dump, whose header records the machine it was
-  written for, so a **live** target is asked about a second way: `IsWow64Process2` on the process
-  id, which is what the worker routing already uses to pick an image. A dump is not, because its
-  recorded process id names a process that had exited before the file was written and some
-  unrelated live process may have inherited the number since — a confident wrong width, on the one
-  target kind whose own header is already right. What neither tracks is the engine's *effective*
+  written for, so a process **running on this machine** is asked about a second way:
+  `IsWow64Process2` on the process id, which is what the worker routing already uses to pick an
+  image. Nothing else is: a dump's and a TTD trace's recorded process ids name a process that had
+  exited before the file was written, and some unrelated live process may have inherited the number
+  since — which is not a query that fails but one that succeeds about the wrong process, so it would
+  be a confident wrong width on a target whose own file already says the right one. A kernel's
+  belong to the debugged machine and were never this host's at all. What neither source tracks is
+  the engine's *effective*
   machine (`GetEffectiveProcessorType`), which follows a WoW64 target across the transition and is
   not in the pinned `dbgscope`; `FOLLOWUPS.md` item 58 carries it, with the measurement of where
   the approximation and the authoritative answer differ.

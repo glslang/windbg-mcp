@@ -631,7 +631,33 @@ mod tests {
     /// would accept whatever the next capture leaks, which is the failure mode this exists to
     /// stop: the leak that prompted it looked exactly like a correct capture from every angle
     /// except the bytes.
-    const FIXTURE_ROOTS: &[&str] = &[r"C:\Windows", r"C:\WINDOWS", r"C:\wmfixture"];
+    ///
+    /// One spelling each, because [`under_a_fixture_root`] compares without case — a dump holds
+    /// `C:\Windows`, `C:\WINDOWS` and `c:\windows` in the same file, written by different parts of
+    /// the loader, and three spellings of a two-entry list is a list that gets a fourth wrong.
+    const FIXTURE_ROOTS: &[&str] = &[r"C:\Windows", r"C:\wmfixture"];
+
+    /// Whether a captured path is inside one of [`FIXTURE_ROOTS`].
+    ///
+    /// **A directory, not a prefix.** `C:\WindowsDev\windbg-mcp` starts with `C:\Windows` and is
+    /// somewhere else entirely — the first version of this test accepted it, and would have waved
+    /// through exactly the kind of checkout path it was written to catch (Codex, round nine of
+    /// [#286](https://github.com/glslang/windbg-mcp/pull/286)). So the root has to be the whole
+    /// path or be followed by a separator.
+    ///
+    /// Compared without case because Windows paths are, and a dump holds several spellings of the
+    /// same directory. `to_ascii_lowercase` rather than a locale-aware fold: these are ASCII
+    /// directory names, and the alternative would make the rule depend on the host's locale.
+    fn under_a_fixture_root(path: &str) -> bool {
+        let path = path.to_ascii_lowercase();
+        FIXTURE_ROOTS.iter().any(|root| {
+            let root = root.to_ascii_lowercase();
+            path == root
+                || path
+                    .strip_prefix(&root)
+                    .is_some_and(|rest| rest.starts_with('\\'))
+        })
+    }
 
     /// **A minidump is a capture of the machine that wrote it, and a debugger does not print most
     /// of it.**
@@ -670,10 +696,7 @@ mod tests {
             let bytes = std::fs::read(&path)
                 .unwrap_or_else(|why| panic!("{name} is a checked-in fixture: {why}"));
             for found in drive_paths(&bytes) {
-                if !FIXTURE_ROOTS
-                    .iter()
-                    .any(|root| found.starts_with(root) || root.starts_with(&found))
-                {
+                if !under_a_fixture_root(&found) {
                     leaks.push(format!("{name}: {found:?}"));
                 }
             }
@@ -717,16 +740,64 @@ mod tests {
             );
         }
         // And the fixture bench's own paths are not findings, or the rule above is unusable.
-        let clean: Vec<u8> = r"C:\wmfixture\cppthrow.exe"
+        // Both real shapes: a quoted command line, and the semicolon-separated `DllPath` whose
+        // last entry has no separator after it.
+        let clean: Vec<u8> = concat!(
+            r#""C:\wmfixture\cppthrow.exe" "#,
+            r"C:\WINDOWS\SYSTEM32;C:\WINDOWS\system;C:\WINDOWS;"
+        )
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+        let found = drive_paths(&clean);
+        assert!(
+            !found.is_empty() && found.iter().all(|p| under_a_fixture_root(p)),
+            "a path list and a quoted command line are not leaks: {found:?}"
+        );
+
+        // But a leak inside one still is, because the piece it starts in is what is reported.
+        let mixed: Vec<u8> = r"C:\WINDOWS\SYSTEM32;C:\workspace\windbg-mcp;C:\WINDOWS"
             .encode_utf16()
             .flat_map(u16::to_le_bytes)
             .collect();
         assert!(
-            drive_paths(&clean)
-                .iter()
-                .all(|p| FIXTURE_ROOTS.iter().any(|root| p.starts_with(root))),
-            "the fixture bench's own path was read as something else"
+            drive_paths(&mixed).iter().any(|p| !under_a_fixture_root(p)),
+            "a leaked entry in the middle of a path list was not reported"
         );
+    }
+
+    /// **An allowed root is a directory, and a directory ends somewhere.**
+    ///
+    /// `C:\WindowsDev\windbg-mcp` is a different place from `C:\Windows`, and a `starts_with`
+    /// against the root cannot tell them apart — so the check that was meant to stop a checkout
+    /// path reaching version control would have passed one whose name happened to begin the same
+    /// way. That is the whole rule this test exists for; the rest of the cases are the ones it
+    /// must not break to get there.
+    #[test]
+    fn a_root_is_matched_at_a_directory_boundary_and_without_case() {
+        for inside in [
+            r"C:\Windows",
+            r"C:\Windows\System32\ntdll.dll",
+            r"c:\windows\system32\wow64cpu.dll",
+            r"C:\WINDOWS\SYSTEM32\KERNEL32.DLL",
+            r"C:\wmfixture\",
+            r"C:\wmfixture\cppthrow32.pdb",
+        ] {
+            assert!(under_a_fixture_root(inside), "{inside} was called a leak");
+        }
+        for outside in [
+            r"C:\WindowsDev\windbg-mcp",
+            r"C:\Windows.old\Users\someone",
+            r"C:\wmfixtures\other.exe",
+            r"C:\workspace\windbg-mcp\",
+            r"C:\Users\Admin\Desktop\thing.sys",
+            r"D:\Windows\System32\ntdll.dll",
+        ] {
+            assert!(
+                !under_a_fixture_root(outside),
+                "{outside} was accepted as the fixture bench"
+            );
+        }
     }
 
     /// Every `X:\...` in `bytes`, read as ASCII and as UTF-16LE at both byte alignments.
@@ -764,13 +835,29 @@ mod tests {
         out
     }
 
-    /// The `X:\...` substrings of one printable run, each taken to its end.
+    /// The `X:\...` substrings of one printable run, each taken to the end of its field.
+    ///
+    /// **A run is not a path**, and the two characters that end one here are `;` and `"`: a
+    /// process's `DllPath` is `C:\WINDOWS\SYSTEM32;C:\WINDOWS\system;C:\WINDOWS;`, and its command
+    /// line is the image path in quotes. Taking each match to the end of the *run* made the last
+    /// entry of that list read as the directory `C:\WINDOWS;`, which is not one and is not under
+    /// any root — a false finding, on all three fixtures, from the scanner rather than from the
+    /// dumps.
+    ///
+    /// Splitting cannot hide a real one. A leaked path is reported by the piece it *starts* in,
+    /// and a separator inside it would only shorten the tail this never reads: the caller matches
+    /// on the root, which is at the front.
     fn drive_paths_in(run: &str) -> Vec<String> {
-        let bytes = run.as_bytes();
         let mut out = Vec::new();
-        for at in 0..bytes.len().saturating_sub(2) {
-            if bytes[at].is_ascii_alphabetic() && bytes[at + 1] == b':' && bytes[at + 2] == b'\\' {
-                out.push(run[at..].to_string());
+        for field in run.split([';', '"']) {
+            let bytes = field.as_bytes();
+            for at in 0..bytes.len().saturating_sub(2) {
+                if bytes[at].is_ascii_alphabetic()
+                    && bytes[at + 1] == b':'
+                    && bytes[at + 2] == b'\\'
+                {
+                    out.push(field[at..].trim_end().to_string());
+                }
             }
         }
         out

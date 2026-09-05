@@ -85,12 +85,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The width is **two questions**, because a WoW64 process is a 32-bit target that no single call
   will admit is one. `GetActualProcessorType` answers for the physical processor — measured, by
   launching `C:\Windows\SysWOW64\cmd.exe`: `0x8664`, under a 64-bit worker — and it is right for a
-  dump, whose header records the machine it was written for. So for a **live** target the OS is
-  asked about the process as well, which is the `IsWow64Process2` the worker routing already uses;
-  and only for a live one, since a dump's recorded process id names a process that exited before
-  the file was written and may since have been inherited by an unrelated one. It is not a case the
-  routing prevents: a `launch` has no image to parse and no process to ask about until after the
-  worker exists, so the supervisor cannot preselect the 32-bit worker for it.
+  dump, whose header records the machine it was written for. So for a process **running on this
+  machine** the OS is asked about it as well, which is the `IsWow64Process2` the worker routing
+  already uses; and only for one of those, since a dump's and a TTD trace's recorded process ids
+  name a process that exited before the file was written and may since have been inherited by an
+  unrelated one — not a query that fails, but one that succeeds about the wrong process. It is not
+  a case the routing prevents: a `launch` has no image to parse and no process to ask about until
+  after the worker exists, so the supervisor cannot preselect the 32-bit worker for it.
 
   The stack comes from the **stored crash context** ([dbgscope#144]), so it is the crash whatever
   thread the session has selected, and the selection is left where it was — which is why this is
