@@ -1,14 +1,36 @@
-# Binary Ninja–WinDbg MCP Bridge
+# Binary Ninja–WinDbg MCP Companion
 
 ## Summary
 
-Create `binja-windbg-mcp`, a macOS-first Binary Ninja Python UI plugin exposing authenticated Streamable HTTP MCP. Initial support targets Apple Silicon macOS, Binary Ninja 5.3 Personal, and its Python 3.10 environment.
+Create `binja-windbg-mcp`, a macOS-first Binary Ninja Python UI plugin exposing authenticated Streamable HTTP MCP. Initial support targets Apple Silicon macOS, Binary Ninja 6.0 Personal, and its Python 3.13 environment.
 
 Use the official [modelcontextprotocol/python-sdk](https://github.com/modelcontextprotocol/python-sdk), distributed as `mcp`, for both the server and outbound WinDbg client. Pin a tested v2 release and its dependencies. Use its protocol and transport implementation; exclude third-party MCP frameworks and bridge projects.
 
 The MCP host orchestrates both servers through `(module, PE identity, RVA)` coordinates. Optional direct pairing follows a selected debugger session and provides explicit breakpoint, run-to, and byte-comparison actions.
 
 V1 supports driver analysis, navigation, and evidence capture. Breakpoint installation and run-to execution are the only direct debugger mutations exposed by this plugin. Automatic execution, arbitrary debugger commands, memory/register writes, exploitation, vulnerability verdicts, and report submission are outside V1.
+
+## Native MCP integration (revised 2026-09-06)
+
+The [installed Binary Ninja 6 test drive](binja6-native-mcp-test-drive.md) established the
+scope split. The host connects independently to native Binary Ninja MCP for general analysis
+and editing, this companion for specialized operations, and WinDbg MCP for debugging.
+The companion lives in its own `binja-windbg-mcp` repository and calls the Binary Ninja API
+directly. It does not proxy native MCP or manage its listener, credentials, or active view.
+
+Native MCP supplies file management, code/IL rendering, CFG, references, search, comments,
+symbol/local-variable edits, and types. Remove the companion's overlapping analysis group and
+ordinary edits. Keep structured driver recovery because native IL is text-only. Keep explicit
+binary IDs because native active selection is shared by all clients; selecting a native view
+and then issuing a call cannot enforce the companion's binary/identity guard atomically.
+The two servers' opaque view handles are not interchangeable. Read PE identity from headers;
+view span is not `SizeOfImage`.
+
+The retained `wait_for_analysis` is scoped to a companion binary ID, cancellable and bounded
+by a deadline. Native analysis control remains available for general use. Evidence is the
+companion's only analysis edit: append provenance within an undoable edit after revalidating
+identity, image name, and the captured view generation. Native edits must invalidate driver
+captures through BinaryDataNotification, just like companion edits.
 
 ## Shared contract and WinDbg changes
 
@@ -40,14 +62,13 @@ Run one listener per Binary Ninja process on `127.0.0.1:8766/mcp`, using a dedic
 
 Generate a 32-byte bearer token. Validate HTTP host and origin information. Store credentials and named WinDbg profiles in a user-only `profiles.json` under Binary Ninja's per-user data directory, with macOS mode `0600`. Tokens never appear in tool arguments, logs, or BNDB metadata. WinDbg connections use loopback/tunneled HTTP or authenticated HTTPS, with certificate verification and no credential-bearing redirects.
 
-Expose 24 tools with startup-configured groups:
+Expose 16 tools with startup-configured groups:
 
 | Group | Tools |
 |---|---|
 | `workspace` | `list_binaries`, `current_location`, `navigate`, `wait_for_analysis` |
-| `analysis` | `get_code`, `function_info`, `function_cfg`, `xrefs`, `search` |
 | `driver` | `driver_entry`, `sink_imports`, `device_security`, `ioctl_map`, `driver_surface` |
-| `edit` | `set_comment`, `add_evidence`, `rename_symbol`, `apply_type` |
+| `evidence` | `add_evidence` |
 | `pair` | `pair_windbg`, `windbg_pair_status`, `unpair_windbg` |
 | `debug` | `set_breakpoint_here`, `run_to_here`, `compare_runtime_bytes` |
 
@@ -57,7 +78,6 @@ All groups are enabled by default. `workspace` is always included; selecting `de
 
 - Return process-lifetime opaque binary IDs, path/display name, active state, architecture, analysis state, current image base, and PE identity. Read identity from PE headers, including for rebased BNDBs.
 - Require a selected binary and matching identity for debugger-origin navigation. Reject ambiguous views, invalid RVAs, and unmapped destinations.
-- `get_code` supports disassembly, LLIL, MLIL, and HLIL. `auto` selects the best available representation and reports the actual choice. Preserve source-address mappings. CFG, xref, search, and code responses are typed and capped, with explicit truncation.
 - Perform short UI operations on the main thread and analysis work outside the UI and network loops. Implement `wait_for_analysis` through completion notifications with cancellation and a deadline.
 - Retain BinaryView handles only for active jobs or completion subscriptions. Cache immutable results by binary identity, view generation, analysis revision, and analysis parameters. Invalidate on relevant edits, reanalysis, rebase, or close; discard stale results before rendering or navigating.
 
@@ -74,9 +94,9 @@ Define one shared IOCTL-case shape using `code`, `device_type`, `function`, `met
 
 Correct the playbook example: `0x0022e004` requires read and write access. Probe evidence records observed sites and analysis coverage; it does not certify safe buffer handling or establish a vulnerability.
 
-Use available NT types and report their provider, architecture, and missing prerequisites. Analysis tools do not apply types automatically. Explicit `apply_type` may import an available named type and apply it within an undoable edit. Validate required layouts rather than assuming libraries named `wdm` or `ntddk` exist.
+Use available NT types and report their provider, architecture, and missing prerequisites. Analysis tools do not apply types automatically. Apply required types explicitly through native MCP or the UI before retrying analysis. Validate required layouts rather than assuming libraries named `wdm` or `ntddk` exist.
 
-All edits are explicit and undoable. Comments append by default. Evidence stores the image coordinate, available file identity, session ID, profile name, runtime address, context, timestamp, and note. It never stores bearer tokens or kernel connection strings. Function/data renaming and typing are supported; local-variable edits are deferred.
+Evidence edits are explicit, undoable, and append to existing comments. Evidence stores the image coordinate, available file identity, session ID, profile name, runtime address, context, timestamp, and note. It never stores bearer tokens or kernel connection strings. General comments, function/data/local-variable renaming, and typing use native MCP.
 
 ## Direct pairing and focused actions
 
@@ -90,17 +110,17 @@ All edits are explicit and undoable. Comments append by default. Evidence stores
 
 ## Verification and delivery
 
-Deliver in this order: official-SDK/UI compatibility proof; coordinate and memory contracts; workspace and static analysis; explicit edits; direct pairing and focused actions. Keep the existing host-orchestrated workflow usable throughout.
+Deliver in this order: official-SDK/UI compatibility proof; coordinate and memory contracts; explicit PE workspace and structured driver analysis; evidence edits; direct pairing and focused actions. Keep the existing host-orchestrated workflow usable throughout.
 
 Verification must cover:
 
 - **WinDbg:** mapped/unmapped/failed-attribution locations, running-target refusals, memory boundaries and partial reads, batch compatibility, structured errors, group membership, both surface goldens, and result budgets. Test module replacement between pairing and action: guarded operations must refuse without applying changes.
 - **Binary Ninja core:** rebased coordinates, duplicate views, identity mismatch, CTL decoding, conditional sizes, compare chains, jump tables, unresolved KMDF dispatch, missing types, bounded sink paths, partial composite results, and cache invalidation.
-- **Lifecycle and transport:** official-SDK client/server interoperability, authentication, loopback binding, group selection, start/stop/restart, closed views, cancelled analysis waits, stale poll responses, reconnect validation, manual navigation, and ambiguous mutation timeouts.
+- **Lifecycle and transport:** official-SDK client/server interoperability, authentication, loopback binding, group selection, start/stop/restart, closed views, cancelled analysis waits, stale poll responses, reconnect validation, manual navigation, and ambiguous mutation timeouts. Verify native MCP view changes cannot retarget companion operations, and native edits invalidate cached driver results.
 - **Real analysis fixtures:** capture adapter outputs from Binary Ninja and replay immutable fixtures in offline tests. Pin binary hashes, architecture, analysis version, and expected code-to-handler mappings. Mocks supplement these captures.
 - **End-to-end validation:** rerun the HEVD and mountmgr workflows against identified builds. Verify HEVD's actual dispatch mapping rather than a published table. Establish a complete mountmgr fixture separately from its abbreviated walkthrough, and compare static security evidence with independently observed runtime access.
-- **Required checks:** formatting and documentation lint; Windows-target checks/clippy from macOS; Windows `cargo test` and the explicitly enabled debugger smoke tier. Manually validate on Binary Ninja 5.3 Personal and a Windows WinDbg VM.
+- **Required checks:** formatting and documentation lint; Windows-target checks/clippy from macOS; Windows `cargo test` and the explicitly enabled debugger smoke tier. Manually validate on Binary Ninja 6 Personal and a Windows WinDbg VM.
 
-Keep structured `reachable_from_dispatch` output as a separate follow-up: preserve text, expose paths and branch recipes, and perform worker-side module attribution for coordinate-bearing addresses. Allocate its follow-up number when filed.
+Keep structured `reachable_from_dispatch` output as a separate follow-up: preserve text, expose paths and branch recipes, and perform worker-side module attribution for coordinate-bearing addresses. Tracked as windbg-mcp FOLLOWUPS.md item 60.
 
-Defer automatic binary acquisition, bulk runtime coverage import, local-variable edits, and report export. Any later coverage import must describe observed execution only; an unobserved location is not proof of unreachability.
+Defer automatic binary acquisition, bulk runtime coverage import and report export. Any later coverage import must describe observed execution only; an unobserved location is not proof of unreachability.

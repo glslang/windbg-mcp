@@ -175,4 +175,7 @@ address from pairing is used for an action.
 
 See [the bridge plan](binja-windbg-mcp-plan.md) and
 [validation record](binja-windbg-mcp-validation.md). The independently usable Binary Ninja
-plugin is maintained in the separate `binja-windbg-mcp` repository.
+companion is maintained in the separate `binja-windbg-mcp` repository. Binary Ninja 6 native
+MCP handles general inspection and edits; the companion adds identity-guarded coordinates,
+structured driver evidence, and direct WinDbg pairing. Native view handles and companion
+binary IDs are separate namespaces; native view span is not PE `SizeOfImage`.
