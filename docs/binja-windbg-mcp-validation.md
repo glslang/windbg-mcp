@@ -7,7 +7,7 @@ contains 16 tools; general inspection and editing use native MCP. The hash-pinne
 `mcp==2.1.1` runtime lock was resolved for 3.13 and installed with hash checking in a fresh
 CPython 3.13.15 environment. The installed application bundles 3.13.14.
 
-- Python tests after dependency/UI fixes: 40 passed; one real-driver capture parameterization skipped.
+- Python tests after dependency/UI/shutdown fixes: 59 passed; one real-driver capture parameterization skipped.
 - The official-SDK loopback test passed and checked the regenerated 16-tool golden.
 - Regression tests cover binary selection independent of active view, cache invalidation,
   stale/mismatched evidence refusal, inactive-cursor pairing validation, and retired profile
@@ -54,6 +54,22 @@ The dedicated test instance was closed after read-only verification. The fixture
 were unchanged. Existing Binary Ninja sessions were not restarted. Manual menu interaction,
 active-view navigation, evidence undo, close/rebase races, and direct WinDbg pairing still
 require acceptance testing.
+
+## Application quit verification (2026-09-06)
+
+A temporary, environment-gated probe in a separate empty Binary Ninja 6.0.10601 Personal
+instance exercised normal Qt application quit after an authenticated companion MCP call.
+The process exited with code 0 in 0.327 seconds. At the quit signal, cleanup had marked
+the plugin shutting down, stopped its listener thread, and left no local pairing. The
+TCP port refused connections after exit. The probe was removed after the test; the
+existing Binary Ninja instance was not restarted or closed.
+
+The native command registry also confirmed the four controls with an empty binary-view
+context: Start disabled while listening, Stop enabled, and Status/Connection Information
+enabled. Automated regressions cover duplicate quit/exit hooks, late dependency setup,
+cancelled analysis subscriptions and budgets, abandoned UI dispatch, polling-task cleanup,
+and Stop arriving before the HTTP server is constructed. These checks do not establish
+shutdown against a live paired WinDbg VM or force-quit cleanup.
 
 ## WinDbg verification (2026-09-05)
 

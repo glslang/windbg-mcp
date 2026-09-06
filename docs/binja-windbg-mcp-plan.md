@@ -69,6 +69,12 @@ menus available on setup failure, with Start retrying and Status explaining erro
 conflicts with existing user-installed versions; supported updates over bundled packages
 go in the user directory and require a restart before loading the listener.
 
+Use the application's quit signal to cancel pending UI and analysis work, stop the
+listener, and close the outbound pairing before Binary Ninja tears down its UI. Bound
+network cleanup to three seconds; retain an idempotent interpreter-exit fallback. Suppress
+late dependency setup and queued autostart after shutdown begins. Closing one view does
+not stop the process-wide listener or end a debugger session.
+
 Generate a 32-byte bearer token. Validate HTTP host and origin information. Store credentials and named WinDbg profiles in a user-only `profiles.json` under Binary Ninja's per-user data directory, with macOS mode `0600`. Tokens never appear in tool arguments, logs, or BNDB metadata. WinDbg connections use loopback/tunneled HTTP or authenticated HTTPS, with certificate verification and no credential-bearing redirects.
 
 Expose 16 tools with startup-configured groups:
