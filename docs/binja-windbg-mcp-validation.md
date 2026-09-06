@@ -7,7 +7,7 @@ contains 16 tools; general inspection and editing use native MCP. The hash-pinne
 `mcp==2.1.1` runtime lock was resolved for 3.13 and installed with hash checking in a fresh
 CPython 3.13.15 environment. The installed application bundles 3.13.14.
 
-- Python tests after dependency/UI/shutdown fixes: 70 passed, including original/fixed HEVD captures and a real typed-input replay; no skips.
+- Python tests after dependency/UI/shutdown and pairing fixes: 78 passed, including original/fixed HEVD captures and a real typed-input replay; no skips.
 - The official-SDK loopback test passed and checked the regenerated 16-tool golden.
 - Regression tests cover binary selection independent of active view, cache invalidation,
   stale/mismatched evidence refusal, inactive-cursor pairing validation, and retired profile
@@ -19,6 +19,22 @@ CPython 3.13.15 environment. The installed application bundles 3.13.14.
 The [native MCP test drive](binja6-native-mcp-test-drive.md) exercised 32 of the installed
 server's 75 tools. The companion has now also passed the limited UI smoke below. Full UI
 lifecycle and real-driver acceptance remain separate gates.
+
+## Pairing failure regression checks (2026-09-06)
+
+Fault injection through the official SDK's in-memory client/server reproduced and fixed
+HTTP 401/403 failures being retried when wrapped in exception groups. Direct and nested
+failures now stop polling with `authentication_failed` and close the client.
+
+Every polling-task exit resolves queued actions as unsent, including terminal session
+errors, invalid structured contracts, authentication failure and explicit unpairing.
+Cancelled callers are skipped. Unpairing during an active request now resolves that
+request with an uncertain outcome while rejecting its queued successors; no mutation
+is retried. Eight new regression cases failed before the fixes and pass afterward.
+
+The complete Python suite passed: **78 tests, no skips**. Ruff formatting/lint and
+Markdown lint passed. These are automated failure-path checks; they do not complete
+the live reconnect and module-replacement acceptance gates below.
 
 ## Native dependency installation and companion UI smoke (2026-09-06)
 
