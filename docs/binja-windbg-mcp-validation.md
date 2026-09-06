@@ -17,8 +17,8 @@ CPython 3.13.15 environment. The installed application bundles 3.13.14.
   compares the snapshots only; it excludes server instructions and protocol envelopes.
 
 The [native MCP test drive](binja6-native-mcp-test-drive.md) exercised 32 of the installed
-server's 75 tools. The companion has now also passed the limited UI smoke below. Full UI
-lifecycle and real-driver acceptance remain separate gates.
+server's 75 tools. The companion has now also passed the limited UI smoke below. The completed UI
+lifecycle and identified-driver acceptance results appear below.
 
 ## Pairing failure regression checks (2026-09-06)
 
@@ -67,8 +67,8 @@ completion events. Focused regression tests cover these and zipped bundled-packa
 shared-package conflicts, setup retries, and Stop during installation.
 
 The dedicated test instance was closed after read-only verification. The fixture bytes
-were unchanged. Existing Binary Ninja sessions were not restarted. Manual menu interaction,
-evidence undo and close/rebase races remain outstanding. Active navigation and direct
+were unchanged. Existing Binary Ninja sessions were not restarted. At this stage, menu interaction,
+evidence undo and close/rebase races had not yet been exercised. Active navigation and direct
 WinDbg pairing subsequently passed the HEVD test below.
 
 ## Application quit verification (2026-09-06)
@@ -147,19 +147,52 @@ main-thread scheduling, completion events, undo APIs, relocation ranges, and UI 
 The public API intentionally refuses `binaryninjaui` in a headless context. Signature
 inspection is not a substitute for running the adapter inside the application.
 
-## Outstanding acceptance gates
+## Mountmgr and remaining live acceptance (2026-09-06)
 
-- Complete companion UI acceptance in Binary Ninja 6 Personal: manual startup menu
-  interaction, view close/rebase, busy analysis completion/cancellation, and evidence
-  undo. Exercise cache invalidation through actual native MCP symbol/type edits.
-- Capture and validate a complete mountmgr build, pinning file hash, architecture, analysis
-  version and independent mapping expectations. Extend HEVD coverage to other builds;
-  this build's 29 verified static cases do not establish universal driver recovery.
-- Compare static security defaults with independently observed runtime access, including
-  ordinary-user access. HEVD's runtime bridge trigger only exercised open/close as SYSTEM.
-- Extend the passing live pairing workflow to reconnect, rebase, stale responses and deliberate
-  module replacement between pairing and an action. Changed-coordinate refusal alone does not
-  exercise an actual unload/reload race.
+The complete ARM64 mountmgr 10.0.26100.1 fixture pins SHA-256
+`734b4a45381ca6850d827f895e86e50ad03a882689483510402d96757fe15497`, PE/PDB identity,
+explicit type prerequisites, 184 functions and independent instruction/table evidence.
+All 93 code/site records match the adapter and authenticated MCP: 48 host/silo routes for
+24 recognized codes and 45 explicit default-rejection table slots. Three jump tables and
+real branch shapes are retained. Exact buffer sizes remain unproven. The ordinary map
+succeeds; the composite retains partial security and bounded traversal results.
 
-These gates remain open. The implementation should not be represented as accepted for
-real-driver analysis until they are completed. See the [plan](binja-windbg-mcp-plan.md) and [installation instructions](../README.md).
+The companion's [mountmgr report](https://github.com/glslang/binja-windbg-mcp/blob/main/docs/mountmgr-e2e.md)
+contains the full mapping, structured results and reproduction tools. It is separate from
+the older abbreviated WinDbg walkthrough, which used a different build.
+
+Live checks passed for equal bytes, breakpoint/hit at RVA `0x18eb4`, following, manual
+navigation, run-to at `0x18ec4`, and successful completion of a read-only query. Independent
+SYSTEM and standard-user tests confirmed mountmgr access restrictions, the live DACL and
+namespace, and successful standard-user `QUERY_AUTO_MOUNT` on a zero-access handle.
+HEVD standard-user opens also succeeded; no HEVD IOCTL was sent.
+
+Real GUI acceptance covered evidence undo, cache invalidation after native symbol/type
+edits, Start/Stop/restart and disabled menu states, busy-analysis cancellation/completion,
+rebase, stale responses, close and reopen. A forwarding fault proxy verified reconnect
+module validation, terminal authentication failure and an uncertain breakpoint timeout
+with exactly one forwarded mutation. A disposable DLL loader replaced the paired image
+at the same address; all guarded actions refused without changing breakpoints or IP.
+Normal GUI quit while paired closed the listener/client and preserved the debugger
+session, which was explicitly released afterward. Temporary users and loader files were
+removed, and the test guest was resumed.
+
+Live testing exposed and fixed generic goto/fallthrough/block case destinations, abandoned
+analysis requests in the SDK's JSON-only response mode, and loss of HTTP 401/403 identity
+through SDK error normalization. Regressions now use the actual HTTP transport. The final
+Python suite passed **88 tests, no skips**; Ruff formatting/lint, independent routing replay
+and Markdown lint passed. No Rust source changed in this acceptance pass.
+
+A temporary probe crashed the owned BN instance by passing an invalid object to a native
+UI binding. The fixture/database survived; the test restarted and completed using valid
+registered UI actions. The probe is not part of the delivered plugin.
+
+## Acceptance scope
+
+The previously outstanding mountmgr and live lifecycle gates are completed for these
+identified ARM64 HEVD/mountmgr builds in Binary Ninja 6.0.10601 Personal. These results do
+not establish recovery for other builds, runtime execution of every static case, silo
+runtime behavior, force-quit cleanup, or other Windows security configurations. Partial
+security recovery and bounded sink traversal remain explicit supported outcomes.
+Structured `reachable_from_dispatch` remains follow-up #60; broader coverage import and
+report export remain deferred as specified in the [plan](binja-windbg-mcp-plan.md).

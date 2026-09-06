@@ -1,5 +1,9 @@
 # Driver IOCTL walkthrough: enumerating & gating `\Driver\mountmgr`
 
+A separate [complete ARM64 mountmgr fixture and live acceptance](https://github.com/glslang/binja-windbg-mcp/blob/main/docs/mountmgr-e2e.md)
+pins build 10.0.26100.1 and verifies all dispatch routes plus observed runtime access.
+The abbreviated walkthrough below uses a different build and retains its original addresses.
+
 A hands-on tour of the driver-IOCTL tools against a **live KDNET kernel** (Windows
 26100.32995), mirroring the skill's
 [`driver-ioctl.md`](../skills/windbg-debugging/driver-ioctl.md) playbook. It shows the real
