@@ -7,7 +7,7 @@ contains 16 tools; general inspection and editing use native MCP. The hash-pinne
 `mcp==2.1.1` runtime lock was resolved for 3.13 and installed with hash checking in a fresh
 CPython 3.13.15 environment. The installed application bundles 3.13.14.
 
-- Python tests after dependency/UI/shutdown fixes: 62 passed, including a real partial HEVD capture replay; no skips.
+- Python tests after dependency/UI/shutdown fixes: 70 passed, including original/fixed HEVD captures and a real typed-input replay; no skips.
 - The official-SDK loopback test passed and checked the regenerated 16-tool golden.
 - Regression tests cover binary selection independent of active view, cache invalidation,
   stale/mismatched evidence refusal, inactive-cursor pairing validation, and retired profile
@@ -90,9 +90,14 @@ The test exposed and fixed loss of the selected cursor when macOS deactivates Bi
 Ninja. The sole window's selected tab remains available; multiple inactive windows are
 still refused as ambiguous. Real adapter output now covers 108 HEVD functions and is
 replayed offline. Dispatch registration, import inventory and bounded traversal succeed;
-IOCTL input recovery remains explicitly unresolved. This is not complete IOCTL acceptance.
-The companion repository contains `docs/hevd-e2e.md`, selected structured results, the
-partial fixture and the opt-in `tools/hevd_e2e.py` runner.
+the initial IOCTL input failure was subsequently fixed using the actual database layout.
+The ordinary map now recovers all 29 cases for this build, with no unresolved entries,
+verified against independent ARM64 branch evidence and through authenticated MCP.
+The original partial capture is retained alongside the successful capture and a real
+input-layout replay. Buffer sizes remain unproven; no IOCTLs were executed. Callbacks shared
+with other major functions and missing layouts remain conservative. The companion repository
+contains `docs/hevd-e2e.md`, selected structured results, both captures and the opt-in
+`tools/hevd_e2e.py` runner.
 
 ## WinDbg verification (2026-09-05)
 
@@ -131,11 +136,11 @@ inspection is not a substitute for running the adapter inside the application.
 - Complete companion UI acceptance in Binary Ninja 6 Personal: manual startup menu
   interaction, view close/rebase, busy analysis completion/cancellation, and evidence
   undo. Exercise cache invalidation through actual native MCP symbol/type edits.
-- Complete the partial HEVD capture with independently reviewed IOCTL mappings, and capture
-  a full mountmgr build. Pin file hashes, architecture, analysis version and expectations.
-  The HEVD partial replay does not close this complete-analysis gate.
-- Validate the actual HEVD dispatch mapping and a complete mountmgr mapping. Compare static
-  security defaults with independently observed runtime access for that build.
+- Capture and validate a complete mountmgr build, pinning file hash, architecture, analysis
+  version and independent mapping expectations. Extend HEVD coverage to other builds;
+  this build's 29 verified static cases do not establish universal driver recovery.
+- Compare static security defaults with independently observed runtime access, including
+  ordinary-user access. HEVD's runtime bridge trigger only exercised open/close as SYSTEM.
 - Extend the passing live pairing workflow to reconnect, rebase, stale responses and deliberate
   module replacement between pairing and an action. Changed-coordinate refusal alone does not
   exercise an actual unload/reload race.
