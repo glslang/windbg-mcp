@@ -60,6 +60,15 @@ captures through BinaryDataNotification, just like companion edits.
 
 Run one listener per Binary Ninja process on `127.0.0.1:8766/mcp`, using a dedicated network thread and asyncio loop. Expose Streamable HTTP only; exclude legacy SSE endpoints and stdio. Autostart by default, with Start, Stop, Status, and Connection Information menu actions. Port collisions are visible startup failures.
 
+Ship plain, exact-version `requirements.txt` entries for Binary Ninja's Extension Manager,
+plus a matching hash-pinned `requirements.lock` for development verification. Manual and
+symlink installs bootstrap missing dependencies through Binary Ninja's own Python module
+installer in a background task. Use its shared per-user `python313/site-packages` directory
+and configured interpreter/proxy; do not require a separate package path. Keep startup
+menus available on setup failure, with Start retrying and Status explaining errors. Report
+conflicts with existing user-installed versions; supported updates over bundled packages
+go in the user directory and require a restart before loading the listener.
+
 Generate a 32-byte bearer token. Validate HTTP host and origin information. Store credentials and named WinDbg profiles in a user-only `profiles.json` under Binary Ninja's per-user data directory, with macOS mode `0600`. Tokens never appear in tool arguments, logs, or BNDB metadata. WinDbg connections use loopback/tunneled HTTP or authenticated HTTPS, with certificate verification and no credential-bearing redirects.
 
 Expose 16 tools with startup-configured groups:
