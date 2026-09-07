@@ -158,13 +158,20 @@ teeth: a disconnect must also take every **engine worker** process with it, whic
 checks by pid.
 
 **Protocol revisions.** Every revision the README promises — `2026-07-28`, `2025-11-25`,
-`2025-06-18`, `2025-03-26`, `2024-11-05` — is offered a handshake, served *that* revision, and can
-reach `tools/list` — whose reply carries SEP-2549's `ttlMs`/`cacheScope` on `2026-07-28` and omits
-them on the revisions that predate the fields. Those come from the SDK, so the assertion guards the
-`rmcp = "3.1.1"` floor: earlier 3.x omitted them everywhere, and a client validating against the
+`2025-06-18`, `2025-03-26`, `2024-11-05` — is offered a handshake and can reach `tools/list`. What
+it is *served* splits at `2026-07-28`: the legacy revisions are echoed back, while a handshake
+naming `2026-07-28` settles on `2025-11-25`, since SEP-2567 abolished the handshake and it cannot
+negotiate a revision that has none (`rmcp` 3.2.0, upstream #1228). That revision is served over
+`server/discover` instead, which is the opener a client on it actually sends.
+
+The `tools/list` reply carries SEP-2549's `ttlMs`/`cacheScope` on `2026-07-28` and omits them on the
+revisions that predate the fields. Those come from the SDK, so the assertion guards the
+`rmcp` floor: earlier 3.x omitted them everywhere, and a client validating against the
 spec schema then rejects the *whole* list, leaving a server that connects and appears to have no
 tools. The reply is a valid JSON-RPC result either way, so no error-shaped assertion can see it.
-An unknown revision negotiates down to `2025-11-25`. `server/discover` opens a
+**The fields follow the revision in force, so that guard now lives on the stateless path alone** —
+key it on an *offered* revision and it inverts into a check that the fields are absent, which every
+broken SDK also passes. An unknown revision negotiates down to `2025-11-25`. `server/discover` opens a
 session with no handshake at all, and — the rule that is easy to get wrong — in that stateless mode
 **every** request must carry the `_meta` protocol keys, not just the opener; a request without them
 is refused with `-32602`.
@@ -734,11 +741,15 @@ everything](#two-clients-two-of-everything) below are what closed it:
   the id it left with is served; after a `DELETE` that id is not. The second half used to be read off
   the `409` a second `initialize` got while the first was held, which is exactly what no longer
   happens.
-- *`2026-07-28` is served — the handshake **and** everything after it.* The revision current clients
+- *`2026-07-28` is served — the opening **and** everything after it.* The revision current clients
   negotiate has no session id
   ([SEP-2567](https://modelcontextprotocol.io/seps/2567-sessionless-mcp)), so it exercises the
-  listener as a client that never presents one: the handshake mints nothing, and a `tools/list` and
-  a `tools/call` after it are answered. It exists because
+  listener as a client that never presents one: a `tools/list` and a `tools/call` carrying only
+  per-request `_meta` are answered. The opening is the other half and is deliberately *not* like
+  them — an `initialize` is a legacy request whatever revision it names, so it negotiates down to
+  `2025-11-25` and mints a session id the requests after it then ignore. #168's failure lived in
+  exactly that seam, so making both halves agree would stop the test driving the shape that broke.
+  It exists because
   [#168](https://github.com/glslang/windbg-mcp/issues/168) reported the opposite from a hand-rolled
   probe, so it spells the revision the way it has to be spelled — the `MCP-Protocol-Version`
   header, `params._meta` carrying the protocol version and the client's capabilities, and
@@ -759,9 +770,9 @@ Three more need no debugger either, and none of them is about the lease:
   boundary unreachable in the deployment `docs/remote-listener.md` recommends (item 31). The parse
   and precedence rules are unit-tested in [`client.rs`](../src/client.rs); what this reaches is the
   call site, a real listener reading a real file.
-- *A `2026-07-28` handshake may **omit** `MCP-Protocol-Version`, and the client is ordinary
-  afterwards.* It is the one request of that revision which may — `initialize` *establishes* the
-  revision — and it was the likeliest shape a real client sends and the only one nothing drove:
+- *A handshake naming `2026-07-28` may **omit** `MCP-Protocol-Version`, and the client is ordinary
+  afterwards.* It is the one request the listener exempts — `initialize` *establishes* the
+  revision — and it was the likeliest opening a real client sends and the only one nothing drove:
   stdio has no headers to omit, and the harness's own stateless opener sends one. The hazard it
   used to carry is deleted rather than covered (a headerless handshake was classified as an opener
   and armed a deadline that would release the client's own targets one grace later), so what this

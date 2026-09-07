@@ -176,6 +176,13 @@ held until this process exits, which for a live kernel means a machine owned by 
 [#162](https://github.com/glslang/windbg-mcp/issues/162) for the whole of it; this is the half that
 needs no client identity and so keeps working whatever the transport does.
 
+**"A client on `2026-07-28`" throughout this document means one that behaves like it** — opening
+with `server/discover` and carrying its revision in per-request `_meta` — and not merely one that
+names the revision somewhere. The distinction has teeth since `rmcp` 3.2.0: an `initialize` is a
+legacy request whatever version it offers, so a client that opens with one negotiates down to
+`2025-11-25`, is minted an `Mcp-Session-Id`, and **is** leased like any other legacy client. What
+decides whether a clock is armed is the session, and what decides the session is the opener.
+
 **Not fixed by arming the lease from the credential instead**, which is now what identifies a
 client and could perfectly well carry a clock. The two mechanisms answer different questions on
 purpose. A lease releases *everything* that credential holds, busy sessions included, on the

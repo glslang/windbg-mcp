@@ -427,7 +427,9 @@ thinking one is. Nothing here has been throttled yet, so that is a prediction ra
 measurement; the keepalive costs nothing either way, which is why it stays on by default.
 
 **And it is the driver's answer, not everyone's.** This whole failure is a *lease* failure, and the
-driver is leased because it negotiates `2025-06-18`. A client on `2026-07-28` is never leased at
+driver is leased because it negotiates `2025-06-18`. A client that opens the `2026-07-28` way —
+`server/discover` and per-request `_meta`, rather than an `initialize` naming it, which is a legacy
+handshake and *is* leased — is never leased at
 all: its targets are reclaimed by the 30-minute per-session idle release instead, which a ping
 cannot refresh — only a call that reaches that session's engine counts, so `session_status` polling
 does not either. A keepalive fitted to such a client keeps nothing alive.
