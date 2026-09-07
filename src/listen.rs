@@ -258,7 +258,9 @@ struct Presence {
     /// so this mirrors rather than accumulates — and an expiry closes the lot.
     ///
     /// Empty for a `2026-07-28` client, which is sent no id at all — and so is never given a clock
-    /// either. Abandonment there is [`IDLE_RELEASE`]'s, per session and far longer.
+    /// either. Abandonment there is [`IDLE_RELEASE`]'s, per session and far longer. *A client on
+    /// that revision* means one that opens the way it prescribes; an `initialize` naming it is a
+    /// legacy handshake since rmcp 3.2.0, and it mints an id here like any other.
     mcp: BTreeSet<String>,
     /// This credential's lease has run out and its sessions are being released.
     ///
@@ -1494,13 +1496,18 @@ mod tests {
     /// **Nothing arms a clock before an MCP session exists**, which is the trap the reservation
     /// took with it.
     ///
-    /// A `2026-07-28` `initialize` may omit the `MCP-Protocol-Version` header — it is the request
-    /// that establishes the revision — so it arrives looking like any other request and mints
-    /// nothing at all. Reserving armed a deadline on arrival, and one that took nothing had to hand
+    /// A request on the stateless revision arrives looking like any other and mints nothing at all.
+    /// Reserving armed a deadline on arrival, and one that took nothing had to hand
     /// that deadline back or it would start a teardown one grace later against a credential holding
     /// nothing, release whatever it had since opened, and refuse its next request while it was
     /// working normally. There is no arrival-time deadline to hand back any more; this pins that it
     /// stays that way.
+    ///
+    /// The example this used to give was a headerless `2026-07-28` `initialize`, which is no longer
+    /// one: since rmcp 3.2.0 a handshake is a legacy request whatever revision it names, so it
+    /// negotiates down and *does* mint a session. The invariant is unchanged — it was never about
+    /// the handshake, only about a request that takes nothing — and the requests that take nothing
+    /// are now exactly the stateless ones.
     #[test]
     fn nothing_arms_a_clock_before_an_mcp_session_exists() {
         let lease = lease();

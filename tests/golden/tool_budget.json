@@ -521,7 +521,7 @@
     "instructions": 1983,
     "modelVisible": 84506,
     "outputSchema": 124715,
-    "payload": 216895,
+    "payload": 216839,
     "tools": 57,
     "wire": 216771,
     "worstTool": "debug_batch",

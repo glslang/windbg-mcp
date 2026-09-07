@@ -119,13 +119,19 @@ property the epochs and claim generations were protecting one layer above, and i
 enforced.
 
 **What rmcp does with session ids, which the ownership answer now leans on.** Two facts, both in
-`…/rmcp-3.1.2/src/transport/streamable_http_server/tower.rs`:
+`<rmcp>/src/transport/streamable_http_server/tower.rs` — `<rmcp>` being the directory `cargo
+metadata` reports for the pinned version, never a path assembled by hand, for the reason
+`.claude/rules/cargo-and-dependencies.md` gives (this line named `rmcp-3.1.2` for three releases
+after the pin had moved past it):
 
 - a legacy `initialize` **always** mints one — `create_session()` then `spawn_session_worker`, with no
   check on who is asking — so nothing but this server ever refused a credential a second MCP session,
   and now nothing does. Hence a client's ids are a **set** (an id this server stops recording is one
   any credential may present) and an expiry closes **every** one of them (each abandoned handshake
-  otherwise leaves a live service task behind).
+  otherwise leaves a live service task behind). **And since 3.2.0 every `initialize` is a legacy
+  one**, whatever revision its body names: `is_legacy_version` gates the negotiation, so a handshake
+  offering `2026-07-28` settles on `2025-11-25` and mints an id like the rest. A client is on the
+  sessionless revision because of the *opener it sends*, never because of a version string.
 - an id the service does not know — never issued, closed by a `DELETE`, or closed by the sweep —
   comes back `404 Not Found: Session not found`. That is deliberately the same status
   `Admission::NotYours` answers with: from the caller's side "not yours" and "not a session here"
