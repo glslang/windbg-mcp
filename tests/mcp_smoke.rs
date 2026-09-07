@@ -6752,7 +6752,8 @@ fn a_malformed_disassemble_address_is_refused_as_a_typed_error() {
 ///
 /// It asserts the milestones and not the *whole* notification stream, because those are two claims
 /// and only the first belongs to an open. A slow one also emits heartbeats, which is the heartbeat
-/// working rather than the open misbehaving — see the filter below.
+/// working rather than the open misbehaving — `src/progress.rs`'s paused-clock tests are where that
+/// half is pinned, and the filter below is what keeps the two apart.
 ///
 /// Needs a real target because the sequence is the point. A failed open reports the first milestone
 /// and stops, which proves the route and not the order.
@@ -6778,19 +6779,15 @@ fn an_open_reports_its_milestones_before_it_answers() {
         .filter_map(|s| s["params"]["message"].as_str())
         .collect();
 
-    // **A heartbeat is not a milestone**, and counting every message made this a stopwatch rather
-    // than an assertion. [`crate::progress::HEARTBEAT`]'s ten seconds of silence is a bound this
-    // open has no reason to respect — a dump load that reaches a symbol server takes as long as the
-    // network does — so `still running (…)` legitimately interleaves with the three
-    // [`Step`](../src/progress.rs) messages. It failed exactly that way on a slow CI runner: a 36s
-    // open, three heartbeats, six messages against an expected three, and a panic that named the
-    // milestones while the thing that had changed was the clock. What an open *promises* is the
-    // three steps in order; how often it says it is still working is the heartbeat's business, and
-    // `src/progress.rs`'s own paused-clock tests are where that is pinned.
+    // **A heartbeat is not a milestone.** `progress::HEARTBEAT` fires after ten seconds of silence,
+    // and an open has no reason to respect that bound — a dump load reaching a symbol server takes
+    // as long as the network does — so `still running (…)` interleaves with the three `Step`
+    // messages on a slow target. Counting every notification made this a stopwatch instead, which
+    // is how it failed on a slow CI runner rather than on any change to what an open reports.
     //
     // Filtering on the text couples this to the heartbeat's wording, which is the price of a
-    // notification carrying no kind of its own — and it fails **loudly** if that wording moves,
-    // because an unfiltered heartbeat lands on the count below rather than passing quietly.
+    // notification carrying no kind of its own. It fails **loudly** if that wording moves — an
+    // unfiltered heartbeat lands on the count below rather than passing quietly.
     let milestones: Vec<&str> = said
         .iter()
         .copied()
