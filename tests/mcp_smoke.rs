@@ -64,7 +64,7 @@
 //!
 //! See `docs/smoke-test.md` for the runbook.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -2287,10 +2287,21 @@ fn a_narrowed_tool_surface_serves_only_what_it_was_asked_for() {
 /// Three copies rather than one, deliberately: they answer different questions for different
 /// readers — the module's own summary, the operator's page, and the budget analysis — and a
 /// *checked* copy is not the failure mode. An unchecked one is.
-const SURFACE_TABLES: &[&str] = &[
-    "src/toolset.rs",
-    "docs/tool-surface.md",
-    "docs/token-budget.md",
+/// Each file, and **which tables it must carry** — not merely which it happens to contain.
+///
+/// The pair is what makes a deletion fail. Counting the rows a file turns out to have asks nothing
+/// of a file that has none, so a table removed wholesale, or reformatted past recognition, passed
+/// the first version of this test with the remaining figures still agreeing: measured, deleting
+/// `docs/tool-surface.md`'s four spec rows left 23 of 24 checked and green, and deleting
+/// `src/toolset.rs`'s group table outright left 16. A **declared** table that goes missing has an
+/// expected set of labels to be missing from.
+const SURFACE_TABLES: &[(&str, &[TableKind])] = &[
+    ("src/toolset.rs", &[TableKind::Groups]),
+    ("docs/tool-surface.md", &[TableKind::Specs]),
+    (
+        "docs/token-budget.md",
+        &[TableKind::Groups, TableKind::Specs],
+    ),
 ];
 
 /// The `--tools` specs the tables quote, `None` being the whole surface.
@@ -2303,7 +2314,7 @@ const DOCUMENTED_SPECS: &[Option<&str>] = &[
 
 /// Which table a row was found in. The two carry different columns and one label — `crash` — that
 /// means a group in the first and a spec in the second, so the row alone cannot say.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 enum TableKind {
     /// Each group's share of the *whole* surface: name, tools, bytes, and sometimes a percentage.
     Groups,
@@ -2493,9 +2504,17 @@ fn every_documented_surface_figure_matches_the_served_surface() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut checked = 0usize;
     let mut wrong: Vec<String> = Vec::new();
-    let mut seen_groups: BTreeMap<&str, usize> = BTreeMap::new();
+    // What each declared table was actually found to state, so a row that is *not* there is as
+    // visible as one that is wrong. Keyed by file and kind, and a set rather than a count: eight
+    // rows naming seven groups twice is the shape a count waves through.
+    let mut found: BTreeMap<(&str, TableKind), BTreeSet<String>> = BTreeMap::new();
+    for (file, kinds) in SURFACE_TABLES {
+        for kind in *kinds {
+            found.entry((file, *kind)).or_default();
+        }
+    }
 
-    for file in SURFACE_TABLES {
+    for (file, _) in SURFACE_TABLES {
         let text =
             std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| panic!("read {file}: {e}"));
         for row in documented_rows(&text) {
@@ -2506,8 +2525,8 @@ fn every_documented_surface_figure_matches_the_served_surface() {
             let Some(&(tools, bytes)) = expected else {
                 continue;
             };
-            if row.kind == TableKind::Groups {
-                *seen_groups.entry(file).or_default() += 1;
+            if let Some(seen) = found.get_mut(&(file, row.kind)) {
+                seen.insert(row.label.clone());
             }
             checked += 1;
             let stated_tools = documented_number(&row.numbers[0]);
@@ -2541,21 +2560,32 @@ fn every_documented_surface_figure_matches_the_served_surface() {
         wrong.join("\n  ")
     );
 
-    // A table that lost a row would otherwise pass by having nothing left to disagree with.
-    for (file, found) in &seen_groups {
-        assert_eq!(
-            *found,
-            group_share.len(),
-            "{file} has a group table with {found} of the {} groups in it — a row that goes \
-             missing takes its figure out of this check with it",
-            group_share.len()
-        );
+    // A row that is absent disagrees with nothing, so every declared table is required to state
+    // its whole set of labels. This is the half that has to be complete: the comparison above only
+    // ever reaches figures that are still written down.
+    let mut missing: Vec<String> = Vec::new();
+    for ((file, kind), seen) in &found {
+        let expected: BTreeSet<String> = match kind {
+            TableKind::Groups => group_share.keys().cloned().collect(),
+            TableKind::Specs => spec_cost.keys().cloned().collect(),
+        };
+        let absent: Vec<&String> = expected.difference(seen).collect();
+        if !absent.is_empty() {
+            missing.push(format!(
+                "{file} declares a {kind:?} table and does not state {absent:?} in it \
+                 ({} of {} rows found)",
+                seen.len(),
+                expected.len()
+            ));
+        }
     }
     assert!(
-        checked >= SURFACE_TABLES.len(),
-        "no surface table was found in {SURFACE_TABLES:?} — this test passed by reading nothing, \
-         which is what a moved or reformatted table looks like from here"
+        missing.is_empty(),
+        "a documented surface table has lost rows, which takes their figures out of this check \
+         rather than failing it.\n  {}",
+        missing.join("\n  ")
     );
+
     eprintln!("RAN: {checked} documented surface figures against the served surface");
 }
 
