@@ -2280,6 +2280,285 @@ fn a_narrowed_tool_surface_serves_only_what_it_was_asked_for() {
     );
 }
 
+// ---- the documented surface tables, checked against the served one ------------------------
+
+/// The files carrying a table of what the tool surface costs.
+///
+/// Three copies rather than one, deliberately: they answer different questions for different
+/// readers — the module's own summary, the operator's page, and the budget analysis — and a
+/// *checked* copy is not the failure mode. An unchecked one is.
+const SURFACE_TABLES: &[&str] = &[
+    "src/toolset.rs",
+    "docs/tool-surface.md",
+    "docs/token-budget.md",
+];
+
+/// The `--tools` specs the tables quote, `None` being the whole surface.
+const DOCUMENTED_SPECS: &[Option<&str>] = &[
+    None,
+    Some("session,inspect,exec,crash"),
+    Some("session,inspect,crash"),
+    Some("crash"),
+];
+
+/// Which table a row was found in. The two carry different columns and one label — `crash` — that
+/// means a group in the first and a spec in the second, so the row alone cannot say.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TableKind {
+    /// Each group's share of the *whole* surface: name, tools, bytes, and sometimes a percentage.
+    Groups,
+    /// What a `--tools` spec actually serves, which is less. See `src/toolset.rs`.
+    Specs,
+}
+
+/// One row of a documented table: its label, and every number after it, in order.
+#[derive(Debug)]
+struct DocumentedRow {
+    line: usize,
+    kind: TableKind,
+    label: String,
+    numbers: Vec<String>,
+}
+
+/// Splits a table row into cells, for the two shapes these tables come in.
+///
+/// A markdown row is pipe-delimited; `src/toolset.rs`'s is a fenced text table aligned with runs
+/// of spaces. Taking both here rather than writing two parsers is what lets one expectation check
+/// a figure wherever it is written down.
+fn table_cells(line: &str) -> Vec<String> {
+    let cells: Vec<String> = if line.starts_with('|') {
+        line.split('|').map(|c| c.trim().to_string()).collect()
+    } else {
+        line.split("  ").map(|c| c.trim().to_string()).collect()
+    };
+    cells.into_iter().filter(|c| !c.is_empty()).collect()
+}
+
+/// A cell's label, normalised to the thing it names: backticks and emphasis off, and any trailing
+/// gloss (`*(absent)* — every tool`) dropped at the dash.
+fn row_label(cell: &str) -> String {
+    let cell = cell.split(" — ").next().unwrap_or(cell);
+    cell.trim()
+        .trim_matches(|c| c == '`' || c == '*' || c == ' ')
+        .to_ascii_lowercase()
+}
+
+/// Every row of every surface table in one file, tagged with which table it came from.
+///
+/// The table is identified by its **header**, not by the row — `crash` is a group in one and a
+/// spec in the other, and reading a spec row as a group's share is exactly the confusion the two
+/// tables exist to keep apart (`FOLLOWUPS.md` item 41).
+fn documented_rows(text: &str) -> Vec<DocumentedRow> {
+    let mut rows = Vec::new();
+    let mut kind = None;
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim().trim_start_matches("//!").trim();
+        if line.is_empty() || line.starts_with("```") {
+            kind = None;
+            continue;
+        }
+        let cells = table_cells(line);
+        let Some(first) = cells.first() else {
+            kind = None;
+            continue;
+        };
+        let label = row_label(first);
+        match label.as_str() {
+            "group" => {
+                kind = Some(TableKind::Groups);
+                continue;
+            }
+            "--tools" => {
+                kind = Some(TableKind::Specs);
+                continue;
+            }
+            _ => {}
+        }
+        let Some(kind) = kind else { continue };
+        // A markdown separator row, and anything else with no figures in it.
+        let numbers: Vec<String> = cells[1..]
+            .iter()
+            .filter(|c| c.starts_with(|c: char| c.is_ascii_digit()))
+            .map(|c| c.to_string())
+            .collect();
+        if numbers.is_empty() {
+            continue;
+        }
+        rows.push(DocumentedRow {
+            line: index + 1,
+            kind,
+            label,
+            numbers,
+        });
+    }
+    rows
+}
+
+/// The integer a table cell states, ignoring thousands separators and any trailing unit.
+fn documented_number(cell: &str) -> usize {
+    cell.chars()
+        .take_while(|c| c.is_ascii_digit() || *c == ',')
+        .filter(|c| *c != ',')
+        .collect::<String>()
+        .parse()
+        .unwrap_or_else(|_| panic!("`{cell}` should begin with a number"))
+}
+
+/// **Every documented tool-surface figure is checked against the surface actually served.**
+///
+/// This exists because the figures went stale in seven files at once, and three consecutive review
+/// rounds on [#293](https://github.com/glslang/windbg-mcp/pull/293) each found more of them — every
+/// finding locally real, every fix locally correct, and the count of wrong numbers going *up* each
+/// round. The thing generating them was a measurement hand-copied into prose that nothing reads,
+/// so no amount of care at the copying end was going to end it.
+///
+/// **What is checked is the tables, not the prose, and that is the whole design.** A sweep over
+/// text for anything that looks like a surface figure was prototyped first and measured: 63 lines
+/// would have to be triaged, none of which carried a date, and most of which are neither stale nor
+/// even about the surface — `15,610 B` is a wire cost, `53,933 B` is a `modules` *result*, and
+/// `CHANGELOG.md` and `DONE.md` are records that must never be updated at all. A test with that
+/// false-positive rate would file findings of its own, which is the failure it was meant to end.
+/// A table row states one quantity, in one place, and can be compared exactly — so the tables are
+/// checked here and the loose restatements were deleted rather than made checkable.
+///
+/// Group membership is **derived from the server** rather than read out of `src/toolset.rs`, so
+/// this cannot agree with a table by sharing its mistake: `session` is in every surface, so a
+/// group's tools are what `--tools <group>` serves that `--tools session` does not.
+#[test]
+fn every_documented_surface_figure_matches_the_served_surface() {
+    let listing = |spec: Option<&str>| -> Vec<Value> {
+        let mut server = match spec {
+            None => Server::started(),
+            Some(spec) => Server::started_with_args(&[], &["--tools", spec]),
+        };
+        let response = server.request("tools/list", json!({}), STEP);
+        assert_no_error(&response, "tools/list");
+        response["result"]["tools"]
+            .as_array()
+            .expect("tools/list returns an array")
+            .clone()
+    };
+
+    let whole = listing(None);
+    let size_of: BTreeMap<&str, usize> = whole
+        .iter()
+        .map(|t| {
+            (
+                t["name"].as_str().expect("a tool has a name"),
+                model_visible_bytes(t),
+            )
+        })
+        .collect();
+    let whole_bytes: usize = size_of.values().sum();
+
+    let names = |tools: &[Value]| -> Vec<String> {
+        tools
+            .iter()
+            .map(|t| t["name"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    let always = names(&listing(Some("session")));
+
+    // Each group's share of the whole surface: its tools, sized as the whole surface sizes them.
+    let mut group_share: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for group in [
+        "session",
+        "inspect",
+        "exec",
+        "ttd",
+        "ioctl",
+        "allocator",
+        "crash",
+        "batch",
+    ] {
+        let served = names(&listing(Some(group)));
+        let members: Vec<String> = if group == "session" {
+            served
+        } else {
+            served.into_iter().filter(|n| !always.contains(n)).collect()
+        };
+        let bytes = members.iter().map(|n| size_of[n.as_str()]).sum::<usize>();
+        group_share.insert(group.to_string(), (members.len(), bytes));
+    }
+
+    // What each documented spec actually serves, which is less than its groups' rows add to.
+    let mut spec_cost: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    for spec in DOCUMENTED_SPECS {
+        let served = listing(*spec);
+        let bytes: usize = served.iter().map(model_visible_bytes).sum();
+        let label = spec.map_or("(absent)".to_string(), str::to_string);
+        spec_cost.insert(label, (served.len(), bytes));
+    }
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut checked = 0usize;
+    let mut wrong: Vec<String> = Vec::new();
+    let mut seen_groups: BTreeMap<&str, usize> = BTreeMap::new();
+
+    for file in SURFACE_TABLES {
+        let text =
+            std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| panic!("read {file}: {e}"));
+        for row in documented_rows(&text) {
+            let expected = match row.kind {
+                TableKind::Groups => group_share.get(&row.label),
+                TableKind::Specs => spec_cost.get(&row.label),
+            };
+            let Some(&(tools, bytes)) = expected else {
+                continue;
+            };
+            if row.kind == TableKind::Groups {
+                *seen_groups.entry(file).or_default() += 1;
+            }
+            checked += 1;
+            let stated_tools = documented_number(&row.numbers[0]);
+            let stated_bytes = documented_number(&row.numbers[1]);
+            if stated_tools != tools || stated_bytes != bytes {
+                wrong.push(format!(
+                    "{file}:{}  `{}` says {stated_tools} tools and {stated_bytes} B; \
+                     the server serves {tools} and {bytes}",
+                    row.line, row.label
+                ));
+            }
+            // A percentage column, where the table carries one. Shares move when *any* group
+            // does, so this is the column most likely to be left behind by an edit elsewhere.
+            if let Some(share) = row.numbers.get(2).filter(|c| c.ends_with('%')) {
+                let stated: f64 = share.trim_end_matches('%').parse().unwrap_or(-1.0);
+                let actual = (bytes as f64 * 1000.0 / whole_bytes as f64).round() / 10.0;
+                if (stated - actual).abs() > 0.05 {
+                    wrong.push(format!(
+                        "{file}:{}  `{}` says {stated}% of the surface; it is {actual}%",
+                        row.line, row.label
+                    ));
+                }
+            }
+        }
+    }
+
+    assert!(
+        wrong.is_empty(),
+        "the documented tool surface disagrees with the served one. The server is right; \
+         `docs/token-budget.md` says how these are measured.\n  {}",
+        wrong.join("\n  ")
+    );
+
+    // A table that lost a row would otherwise pass by having nothing left to disagree with.
+    for (file, found) in &seen_groups {
+        assert_eq!(
+            *found,
+            group_share.len(),
+            "{file} has a group table with {found} of the {} groups in it — a row that goes \
+             missing takes its figure out of this check with it",
+            group_share.len()
+        );
+    }
+    assert!(
+        checked >= SURFACE_TABLES.len(),
+        "no surface table was found in {SURFACE_TABLES:?} — this test passed by reading nothing, \
+         which is what a moved or reformatted table looks like from here"
+    );
+    eprintln!("RAN: {checked} documented surface figures against the served surface");
+}
+
 /// A tool that declares an `outputSchema` must return `structuredContent` — on **both** paths.
 ///
 /// The spec's requirement is on the success path, and the failure path is where this would break
