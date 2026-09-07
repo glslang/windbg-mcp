@@ -10928,10 +10928,46 @@ fn a_pool_query_with_no_time_to_walk_is_refused_rather_than_run() {
 #[test]
 fn a_running_command_is_interrupted_on_request_and_frees_its_session() {
     let Some(dump) = target_tier() else { return };
-    // A short call budget so a failure fails *fast*: if the interrupt never lands, the watchdog
-    // ends the runaway at the 15s floor and the assertions below say so, instead of this test
+    // A short call budget so a failure fails *fast*: if the interrupt never lands the watchdog ends
+    // the runaway at [`RUNAWAY_FLOOR`] and the assertion at the end says so, instead of this test
     // sitting out five minutes of the default timeout.
-    let mut server = Server::started_with(&[("WINDBG_MCP_CALL_TIMEOUT_SECS", "30")]);
+    //
+    // **It has to outlast the open as well, which is what it did not.** The budget is the
+    // *server's*, so it governs the `open_dump` on the next line too — and that open is no cheaper
+    // here than in the dump tests that run under the 300s default: it resolves symbols over the
+    // network, so how long it takes is the symbol server's to decide, not this bench's. 36s was
+    // measured on a CI runner against a budget of 30, and the test then failed inside the open
+    // rather than in anything it is about. Sized for the open now; the floor follows the budget,
+    // which only widens the margin the closing assertion needs.
+    const CALL_BUDGET_SECS: u64 = 90;
+    // What a command is bounded at when no interrupt arrives. Named because the closing assertion
+    // is meaningful only *under* it — that is the whole of how an interrupt is told apart from a
+    // deadline.
+    //
+    // `worker::watchdog_budget_ms`'s arithmetic rather than a subtraction, which is what this was
+    // first written as. That formula floors at the headroom as well as subtracting it
+    // (`saturating_sub(H).max(H)`), so `budget - H` is only the same answer while the budget is at
+    // least twice the headroom: at 20s the real floor is 15s and a subtraction says 5s, and the
+    // closing assertion would then be checking against a bound three times tighter than the one
+    // that actually applies. Right for 90s either way — but wrong for a value someone might
+    // plausibly try next, and silently so.
+    //
+    // `watchdog_budget_ms` and **not** `walk_budget`, which is the neighbouring function and does
+    // not floor at all: the runaway here is a bounded *command*. It also subtracts however long the
+    // job sat queued, which is nothing in this test — the session is idle when the command is sent,
+    // and the interrupt loop below is what proves it was picked up.
+    const WATCHDOG_HEADROOM_SECS: u64 = 15;
+    const RUNAWAY_FLOOR: Duration = {
+        let bounded = CALL_BUDGET_SECS.saturating_sub(WATCHDOG_HEADROOM_SECS);
+        Duration::from_secs(if bounded > WATCHDOG_HEADROOM_SECS {
+            bounded
+        } else {
+            WATCHDOG_HEADROOM_SECS
+        })
+    };
+
+    let budget = CALL_BUDGET_SECS.to_string();
+    let mut server = Server::started_with(&[("WINDBG_MCP_CALL_TIMEOUT_SECS", &budget)]);
     let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
 
     // An idle session says so and does nothing. Deterministic: the open above has been answered
@@ -10987,7 +11023,11 @@ fn a_running_command_is_interrupted_on_request_and_frees_its_session() {
         "the interrupt should say what it did:\n{raised}"
     );
 
-    let response = server.await_id(runaway, "the interrupted command", Duration::from_secs(60));
+    // Longer than [`RUNAWAY_FLOOR`] on purpose. If the interrupt did nothing, the watchdog ends the
+    // command at the floor and the assertion below reports *that*, with the diagnosis in it; a wait
+    // that expired first would fail this test on a timeout instead, which says only that something
+    // was slow. The wait is the backstop, so it has to sit behind the assertion it protects.
+    let response = server.await_id(runaway, "the interrupted command", Duration::from_secs(120));
     let elapsed = started.elapsed();
     assert_no_error(&response, "an interrupted command");
     let out = text_of(&response["result"]);
@@ -11001,13 +11041,21 @@ fn a_running_command_is_interrupted_on_request_and_frees_its_session() {
         "the caller of the interrupted command is the one who cannot otherwise know why their \
          result is short, so it has to say:\n{out}"
     );
-    // The watchdog's floor is 15s (30s call budget less the headroom), so anything under that
-    // could only have been the request. Without this the test would pass on a run where the
-    // interrupt did nothing and the deadline did all the work.
+    // Anything under [`RUNAWAY_FLOOR`] could only have been the request: past it the watchdog would
+    // have ended the command whatever the interrupt did. Without this the test would pass on a run
+    // where the interrupt did nothing and the deadline did all the work.
+    //
+    // Bounded well *below* the floor rather than just under it. This read `< 14s` against a 15s
+    // floor — one second of margin, with a retry loop above that is allowed ten — so a loaded
+    // runner that took its time landing the interrupt would have failed here blaming the deadline,
+    // which is a second flake wearing the first one's error message. The ceiling is a third of the
+    // floor now, leaving 50s between the two, and the claim is unchanged: an interrupt and a
+    // deadline are still being told apart by a margin neither can cross.
+    let ceiling = RUNAWAY_FLOOR / 3;
     assert!(
-        elapsed < Duration::from_secs(14),
-        "the command took {elapsed:?}, which is the watchdog's floor rather than the interrupt — \
-         this run proves nothing about the request path"
+        elapsed < ceiling,
+        "the command took {elapsed:?}, which is nearer the watchdog's floor ({RUNAWAY_FLOOR:?}) \
+         than the interrupt — this run proves nothing about the request path"
     );
     assert!(
         !out.contains("interrupted after"),
