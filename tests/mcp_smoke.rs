@@ -2329,6 +2329,11 @@ struct DocumentedRow {
     kind: TableKind,
     label: String,
     numbers: Vec<String>,
+    /// Whether this row's **table** declares a share column, read off its header rather than off
+    /// the row. A row is not asked whether it has a percentage — it is told that its table has
+    /// one, because a row that lost its `%` would otherwise answer no and be believed: measured,
+    /// stripping one `%` from `docs/token-budget.md` left the share unchecked and the test green.
+    share_expected: bool,
 }
 
 /// Splits a table row into cells, for the two shapes these tables come in.
@@ -2361,31 +2366,35 @@ fn row_label(cell: &str) -> String {
 /// tables exist to keep apart (`FOLLOWUPS.md` item 41).
 fn documented_rows(text: &str) -> Vec<DocumentedRow> {
     let mut rows = Vec::new();
-    let mut kind = None;
+    // The table now open: its kind, and whether its header declared a `share` column.
+    let mut table: Option<(TableKind, bool)> = None;
     for (index, raw) in text.lines().enumerate() {
         let line = raw.trim().trim_start_matches("//!").trim();
         if line.is_empty() || line.starts_with("```") {
-            kind = None;
+            table = None;
             continue;
         }
         let cells = table_cells(line);
         let Some(first) = cells.first() else {
-            kind = None;
+            table = None;
             continue;
         };
         let label = row_label(first);
+        let shares = cells.iter().any(|c| row_label(c) == "share");
         match label.as_str() {
             "group" => {
-                kind = Some(TableKind::Groups);
+                table = Some((TableKind::Groups, shares));
                 continue;
             }
             "--tools" => {
-                kind = Some(TableKind::Specs);
+                table = Some((TableKind::Specs, shares));
                 continue;
             }
             _ => {}
         }
-        let Some(kind) = kind else { continue };
+        let Some((kind, share_expected)) = table else {
+            continue;
+        };
         // A markdown separator row, and anything else with no figures in it.
         let numbers: Vec<String> = cells[1..]
             .iter()
@@ -2400,6 +2409,7 @@ fn documented_rows(text: &str) -> Vec<DocumentedRow> {
             kind,
             label,
             numbers,
+            share_expected,
         });
     }
     rows
@@ -2573,8 +2583,17 @@ fn every_documented_surface_figure_matches_the_served_surface() {
                 ));
                 continue;
             };
-            if let Some(seen) = found.get_mut(&(file, row.kind)) {
-                seen.insert(row.label.clone());
+            // A label stated twice is not caught by the completeness pass below, since a set that
+            // already holds it is still complete — so it is caught here, where the second row is
+            // still in hand. A duplicate is worth failing on rather than tolerating: two rows for
+            // one quantity are one edit away from disagreeing, and only one of them would be read.
+            if let Some(seen) = found.get_mut(&(file, row.kind))
+                && !seen.insert(row.label.clone())
+            {
+                wrong.push(format!(
+                    "{file}:{}  `{}` has more than one row in its {:?} table",
+                    row.line, row.label, row.kind
+                ));
             }
             checked += 1;
             let stated_tools = documented_number(&row.numbers[0]);
@@ -2586,17 +2605,27 @@ fn every_documented_surface_figure_matches_the_served_surface() {
                     row.line, row.label
                 ));
             }
-            // A percentage column, where the table carries one. Shares move when *any* group
-            // does, so this is the column most likely to be left behind by an edit elsewhere.
-            if let Some(share) = row.numbers.get(2).filter(|c| c.ends_with('%')) {
-                let stated: f64 = share.trim_end_matches('%').parse().unwrap_or(-1.0);
-                let actual = (bytes as f64 * 1000.0 / whole_bytes as f64).round() / 10.0;
-                if (stated - actual).abs() > 0.05 {
-                    wrong.push(format!(
-                        "{file}:{}  `{}` says {stated}% of the surface; it is {actual}%",
-                        row.line, row.label
-                    ));
+            // The share column, required of every row of a table whose header declares one.
+            // Shares move when *any* group does, so this is the figure most likely to be left
+            // behind by an edit elsewhere — and asking the row whether it has one would let a row
+            // that lost its `%` excuse itself from the check.
+            let share = row.numbers.get(2).filter(|c| c.ends_with('%'));
+            match (row.share_expected, share) {
+                (true, None) => wrong.push(format!(
+                    "{file}:{}  `{}` is in a table with a share column and states no percentage",
+                    row.line, row.label
+                )),
+                (_, Some(share)) => {
+                    let stated: f64 = share.trim_end_matches('%').parse().unwrap_or(-1.0);
+                    let actual = (bytes as f64 * 1000.0 / whole_bytes as f64).round() / 10.0;
+                    if (stated - actual).abs() > 0.05 {
+                        wrong.push(format!(
+                            "{file}:{}  `{}` says {stated}% of the surface; it is {actual}%",
+                            row.line, row.label
+                        ));
+                    }
                 }
+                (false, None) => {}
             }
         }
     }

@@ -791,13 +791,20 @@ Three more need no debugger either, and none of them is about the lease:
   group **names** — an invalid `--tools` spec lists them — rather than either being read out of
   `GROUPS`, so a table cannot pass by sharing the code's mistake and a ninth group arrives here
   with nothing added. Each file **declares which tables it carries**, each declared table has to
-  state its whole set of labels, and a row whose label is neither a group nor a measured spec is a
-  failure rather than a skip. Those last three were review findings rather than design, and each
-  was a way to pass while checking less: the first version counted observed group rows only, so
-  deleting `tool-surface.md`'s spec rows (23 of 24 still checked) and deleting `toolset.rs`'s group
-  table outright (16 of 24) both passed; the second skipped unrecognised rows, so an invented
-  `network` row with wrong figures passed. When it fails, the server is right: paste the numbers it
-  prints. It exists because these figures went stale in seven
+  state its whole set of labels, no label may appear twice, a row whose label is neither a group
+  nor a measured spec is a failure rather than a skip, and a table whose **header** declares a
+  share column must carry a percentage on every row — the header, because a row that lost its `%`
+  would otherwise be asked whether it had one and believed. Every one of those was a review finding
+  rather than a design, and each was a way to pass while checking less: the first version counted
+  observed group rows only, so deleting `tool-surface.md`'s spec rows (23 of 24 still checked) and
+  deleting `toolset.rs`'s group table outright (16 of 24) both passed; the second skipped
+  unrecognised rows, so an invented `network` row with wrong figures passed; the third ignored
+  `BTreeSet::insert`'s answer and read the share off the row, so a duplicated row passed (25 of 24)
+  and a stripped `%` took a figure out of the check. **The pattern is worth more than any of the
+  fixes**: a row that is missing, duplicated, unrecognised or malformed disagrees with nothing, so
+  the comparison can only ever reach figures still written down — every guard that matters is on
+  the *set and shape* of the rows rather than on their contents. When it fails, the server is
+  right: paste the numbers it prints. It exists because these figures went stale in seven
   files at once and three review rounds on #293 each found more of them; the test's own doc comment
   records why the prose around the tables is deliberately not swept.
 
