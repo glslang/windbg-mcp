@@ -44,7 +44,16 @@ consequences when you add one. The invariant is checked on `--tools <that tool>`
 because that is the tightest surface it can be served on and every wider one is covered by
 construction. **Group bytes no longer add up to a surface's**: `crash` is 19,078 B against the
 20,244 its two groups sum to in `docs/token-budget.md` (2026-09-07), since narrowing shortens what stays as well
-as dropping what goes. And the check for "names a tool" is deliberately not word containment — this
+as dropping what goes. Neither of those two figures is worth checking by hand:
+`every_documented_surface_figure_matches_the_served_surface` reads the tables in `src/toolset.rs`,
+`docs/tool-surface.md` and `docs/token-budget.md` and compares every count, byte total and
+percentage in them against a server it starts — so a group that grows fails `cargo test` with the
+row and the right number, and the way to update a table is to run it and paste what it says. It
+derives group membership from the server rather than from `GROUPS`, so it cannot agree with a table
+by sharing its mistake. **Prose is not swept, deliberately** — a text search for anything
+surface-shaped was prototyped and measured at 63 lines to triage, most of them neither stale nor
+about the surface — so a figure written into a *sentence* is still yours to re-derive, and the
+tables are where to re-derive it from. And the check for "names a tool" is deliberately not word containment — this
 prose says frames are "attributed to modules" and that a stuck session "does not let go", while a
 TTD description quotes `dx @$cursession.TTD.Calls(...)`, which is the debugger command and not the
 `dx` tool; the rule is a code span that *is* the name or opens a call with it, plus bare-if-it-has-

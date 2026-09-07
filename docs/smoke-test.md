@@ -783,6 +783,16 @@ Three more need no debugger either, and none of them is about the lease:
   wrong before. `--tools crash` is asserted as the thirteen tools it is — `crash_triage` and the
   openers present, `debug_batch` absent — and the startup line as the surface it ended up with,
   which is not the spec that was typed.
+- *Every documented surface figure is the served one.* The tables in `src/toolset.rs`,
+  [`tool-surface.md`](tool-surface.md) and [`token-budget.md`](token-budget.md) are read back and
+  compared — 24 figures, being each group's share of the whole surface and what each documented
+  `--tools` spec actually serves, plus the percentage column where a table carries one. Group
+  membership is derived from the server (`--tools <group>` less `--tools session`) rather than read
+  out of `GROUPS`, so a table cannot pass by sharing the code's mistake, and a table that loses a
+  row fails on the row count rather than passing with less to disagree with. When it fails, the
+  server is right: paste the numbers it prints. It exists because these figures went stale in seven
+  files at once and three review rounds on #293 each found more of them; the test's own doc comment
+  records why the prose around the tables is deliberately not swept.
 
 Two more of the lease's own assertions are in the debugger tier, because each needs a real engine
 worker.
