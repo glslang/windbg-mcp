@@ -2405,6 +2405,43 @@ fn documented_rows(text: &str) -> Vec<DocumentedRow> {
     rows
 }
 
+/// Every group name, taken from **the server's own refusal** rather than from a list here.
+///
+/// `--tools <nonsense>` answers `Groups: session, inspect, …`, which is `src/toolset.rs`'s `GROUPS`
+/// rendered by the code that owns it. A ninth group therefore arrives in this test with nothing
+/// added to it, and its row in the tables is checked from the first run — where a list written out
+/// here would leave that row unrecognised, and an unrecognised row was being skipped in silence.
+/// Deriving it is half the answer; the other half is that an unknown label is now a failure.
+fn group_names() -> Vec<String> {
+    let out = Command::new(EXE)
+        .args(["--tools", "windbg-mcp-smoke-no-such-group"])
+        .output()
+        .expect("run the server with an invalid `--tools` spec");
+    let said = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let listed = said
+        .split_once("Groups:")
+        .unwrap_or_else(|| panic!("an invalid `--tools` spec should list the groups:\n{said}"))
+        .1;
+    let groups: Vec<String> = listed
+        .split(['(', ';', '\n'])
+        .next()
+        .unwrap_or_default()
+        .split(',')
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect();
+    assert!(
+        groups.iter().any(|g| g == "session"),
+        "`session` is in every surface, so a group list without it is a parse of the wrong \
+         sentence: {groups:?} out of\n{said}"
+    );
+    groups
+}
+
 /// The integer a table cell states, ignoring thousands separators and any trailing unit.
 fn documented_number(cell: &str) -> usize {
     cell.chars()
@@ -2472,24 +2509,15 @@ fn every_documented_surface_figure_matches_the_served_surface() {
 
     // Each group's share of the whole surface: its tools, sized as the whole surface sizes them.
     let mut group_share: BTreeMap<String, (usize, usize)> = BTreeMap::new();
-    for group in [
-        "session",
-        "inspect",
-        "exec",
-        "ttd",
-        "ioctl",
-        "allocator",
-        "crash",
-        "batch",
-    ] {
-        let served = names(&listing(Some(group)));
+    for group in group_names() {
+        let served = names(&listing(Some(&group)));
         let members: Vec<String> = if group == "session" {
             served
         } else {
             served.into_iter().filter(|n| !always.contains(n)).collect()
         };
         let bytes = members.iter().map(|n| size_of[n.as_str()]).sum::<usize>();
-        group_share.insert(group.to_string(), (members.len(), bytes));
+        group_share.insert(group, (members.len(), bytes));
     }
 
     // What each documented spec actually serves, which is less than its groups' rows add to.
@@ -2522,7 +2550,27 @@ fn every_documented_surface_figure_matches_the_served_surface() {
                 TableKind::Groups => group_share.get(&row.label),
                 TableKind::Specs => spec_cost.get(&row.label),
             };
+            // An unrecognised row is a failure and not a skip. Skipping it meant a table could
+            // gain a row — a ninth group, a fifth `--tools` profile — and have it checked by
+            // nothing, while the completeness pass below stayed happy because every label it knew
+            // about was still there. Measured on the version before this one: a `network` row
+            // invented with wrong figures passed.
             let Some(&(tools, bytes)) = expected else {
+                let remedy = match row.kind {
+                    TableKind::Groups => {
+                        "this server has no such group — the names come from its \
+                                          own `--tools` refusal, so correct the row or add the \
+                                          group to `src/toolset.rs`"
+                    }
+                    TableKind::Specs => {
+                        "this test measures no such spec — add it to \
+                                         `DOCUMENTED_SPECS` so the row is checked, or correct it"
+                    }
+                };
+                wrong.push(format!(
+                    "{file}:{}  `{}` is a row in a {:?} table that nothing checks: {remedy}",
+                    row.line, row.label, row.kind
+                ));
                 continue;
             };
             if let Some(seen) = found.get_mut(&(file, row.kind)) {
