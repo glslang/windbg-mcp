@@ -291,12 +291,13 @@ None of these is a bug. They are recorded because they were invisible, and
    even covers `w29`.
 8. **Five tools are a third of the model-visible surface**, and it is their *input* schemas rather
    than their prose — **answered** (2026-08-22) by serving fewer tools rather than smaller ones.
-   `debug_batch` alone is 10,021 B — 13% of everything a model is given before it asks anything — of
+   `debug_batch` alone is 10,021 B — 12% of everything a model is given before it asks anything — of
    which 7,980 B is the `StepAction`/`Check` vocabulary its schema pulls out of `src/batch.rs`.
    Then `walk_memory` 4,080, `crash_triage` 2,936, `reachable_from_dispatch` 2,628, `server_log`
-   2,599: **21,989 B, 33%**, against a median tool of 900 B. (Those per-tool figures are of
-   2026-08-22; the surface has since grown to 56 tools and 80,579 B, so the *share* is now 27.3%
-   while none of the tools named has changed. A share is the half that goes stale.)
+   2,599: **22,264 B**, against a median tool of 1,029 B. (Re-measured 2026-09-07: none of the five
+   has moved a byte since 2026-08-22, and the sum was recorded as 21,989 then, which its own five
+   rows never summed to. The *share* is what actually went stale — 33% of the 54-tool surface,
+   26.3% of today's 57 tools and 84,506 B. A share is the half that does.)
 
    This is where the weight is, and it is a different kind of problem from findings 1–4. Those were
    duplication and waste — the same string paid for repeatedly, or a tail nobody reads. This is one
@@ -329,29 +330,29 @@ None of these is a bug. They are recorded because they were invisible, and
    and, since item 41, for the sentences the tools it keeps used to spend on pointing at them.
    Where the bytes sit, and what each profile costs:
 
-   Both tables are measurements of **2026-09-05** and move with any edit to a description.
+   Both tables are measurements of **2026-09-07** and move with any edit to a description.
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 10 | 16,457 | 20.4% |
-   | `session` | 10 | 12,817 | 15.9% |
-   | `inspect` | 9 | 11,626 | 14.4% |
-   | `batch` | 1 | 10,021 | 12.4% |
-   | `exec` | 8 | 9,206 | 11.4% |
-   | `crash` | 3 | 7,129 | 8.8% |
-   | `ttd` | 9 | 6,829 | 8.5% |
-   | `ioctl` | 6 | 6,494 | 8.1% |
+   | `allocator` | 10 | 16,457 | 19.5% |
+   | `inspect` | 10 | 13,152 | 15.6% |
+   | `session` | 10 | 12,817 | 15.2% |
+   | `exec` | 8 | 11,309 | 13.4% |
+   | `batch` | 1 | 10,021 | 11.9% |
+   | `crash` | 3 | 7,427 | 8.8% |
+   | `ttd` | 9 | 6,829 | 8.1% |
+   | `ioctl` | 6 | 6,494 | 7.7% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 56 | 80,579 |
-   | `session,inspect,exec,crash` | 30 | 39,857 |
-   | `session,inspect,crash` | 22 | 30,498 |
-   | `crash` | 13 | 18,780 |
+   | *(absent)* | 57 | 84,506 |
+   | `session,inspect,exec,crash` | 31 | 43,784 |
+   | `session,inspect,crash` | 23 | 32,322 |
+   | `crash` | 13 | 19,078 |
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`
-   is 18,780 rather than the 19,946 its two rows sum to, because the cross-references leave with
+   is 19,078 rather than the 20,244 its two rows sum to, because the cross-references leave with
    the tools they name — 1,166 B of them, pointing at `modules`, `debug_batch`, `backtrace`,
    `continue_async` and `break_in`.
 
@@ -381,7 +382,7 @@ put in a group would vanish from every narrowed surface without a word — the d
 still carry it, so nothing else would notice. And
 `a_narrowed_tool_surface_serves_only_what_it_was_asked_for` starts a server with `--tools crash` and
 checks the three things that makes true: thirteen tools, a refusal by name for a tool that exists
-and is not served, and a figure under half the whole surface (it prints 18,780 B).
+and is not served, and a figure under half the whole surface (it prints 19,078 B).
 
 Beside them, `output_schemas_carry_constraints_not_prose` is the
 assertion that finding 1 stays fixed. It reads `tools/list` off the wire, so it catches the way that

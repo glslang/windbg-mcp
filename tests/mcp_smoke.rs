@@ -1865,11 +1865,12 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 const MODEL_VISIBLE_CEILING: usize = 88_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
-/// the array's own punctuation and every result-level field are inside it. 192,971 bytes today,
-/// 58% of that `outputSchema` no model reads, which is why this is a separate and much looser
-/// number rather than a scaled version of the one above. (The figure said 177,460 until
-/// 2026-08-30 — a payload measured two re-recordings ago, which is the way a number in a doc
-/// comment goes stale: nothing reads it, so nothing notices.)
+/// the array's own punctuation and every result-level field are inside it. 216,839 bytes as of
+/// 2026-09-07, 58% of that `outputSchema` no model reads, which is why this is a separate and much
+/// looser number rather than a scaled version of the one above. (The figure said 177,460 until
+/// 2026-08-30 and 192,971 until this line was re-derived — a payload measured several
+/// re-recordings ago each time, which is the way a number in a doc comment goes stale: nothing
+/// reads it, so nothing notices.)
 ///
 /// It is a client-side parse and memory cost, and it is the one that grows silently: `schemars`
 /// inlines `$defs` per tool, so adding one shared type to one more output shape still lands here

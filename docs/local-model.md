@@ -220,8 +220,8 @@ setx WINDBG_MCP_LISTEN_TOKEN_DRIVER "<another long random string>"
 setx WINDBG_MCP_TOOLS_DRIVER        "session,inspect,crash"
 ```
 
-The second line is what makes this work on a listener the editor also uses: the driver is served 20
-tools and 26,305 B while every other client on that listener keeps all 54. Leave it out and the
+The second line is what makes this work on a listener the editor also uses: the driver is served 23
+tools and 32,322 B while every other client on that listener keeps all 57. Leave it out and the
 driver is served whatever the listener was started with, which is the older behaviour and is the
 right one when the listener is the driver's own.
 
@@ -288,9 +288,9 @@ spec. Re-read them rather than trusting this table, which has been stale before.
 
 | | bytes | ≈tokens |
 |---|---|---|
-| The tool surface, paid once per conversation | 80,579 (56 tools) | ~20k |
-| — the same surface as `--tools session,inspect,crash` | 26,305 (20 tools) | ~6.5k |
-| — as `--tools crash` | 18,780 (13 tools) | ~4.5k |
+| The tool surface, paid once per conversation | 84,506 (57 tools) | ~21k |
+| — the same surface as `--tools session,inspect,crash` | 32,322 (23 tools) | ~8k |
+| — as `--tools crash` | 19,078 (13 tools) | ~4.5k |
 | Its worst single tool (`debug_batch`) | 10,021 | ~2.5k |
 | The largest answer this server gives (`modules`) | 53,875 | ~13k |
 | `read_memory` at its design limit | ~4 MiB of hex | ~1M |
@@ -464,10 +464,11 @@ budget, a text-or-data content switch. **Two of the three now exist, and neither
 client-side.**
 
 - **The tool-surface profile is `--tools`** (2026-08-22). Start the listener with
-  `--tools session,inspect,crash` and the surface is 20 tools and 25,465 B instead of 51 and
-  68,893 — `--tools crash` is 13 and 18,780 B, which is the difference between "roughly twice an 8k
-  window" and "half of one". The tools that remain are the tools they were, less the sentences
-  pointing at ones that went (item 41).
+  `--tools session,inspect,crash` and the surface is 23 tools and 32,322 B instead of 57 and
+  84,506 — `--tools crash` is 13 and 19,078 B, which is the difference between "roughly twice an 8k
+  window" and "half of one" (re-measured 2026-09-07; it was 20 tools and 25,465 B against 51 and
+  68,893 when the flag landed, and every one of those figures moves with the surface). The tools
+  that remain are the tools they were, less the sentences pointing at ones that went (item 41).
   The whole table is in [`token-budget.md`](./token-budget.md) under finding 8, and the README has
   the operator's half. **And it is per client as well as per run** (2026-08-22): a listener's
   clients are named already, so `WINDBG_MCP_TOOLS_<NAME>` beside the token gives one of them its
