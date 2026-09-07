@@ -34,7 +34,7 @@ Two things worth knowing:
 
 - **`session` is always included**, whatever the spec says. Every other tool routes by a
   `session_id`, and this server is the only thing that issues one, so a surface with `registers`
-  and no opener cannot be used at all. That is why `--tools crash` is eleven tools rather than one.
+  and no opener cannot be used at all. That is why `--tools crash` is thirteen tools rather than three.
   The startup log line names the surface it ended up with.
 - **The prose narrows with the list.** A client is told about the tools it has and no others: the
   `instructions` sent at `initialize` are assembled from the surface, and a tool's description

@@ -21,7 +21,7 @@ test, because `Toolset::parse` resolves group names first and would decide it si
 
 Four rules worth knowing before touching it. **`session` is in every surface** whatever the spec
 says, because every other tool routes by a `session_id` this server alone issues — so `--tools
-crash` is eleven tools and 11,714 B is the floor. **Output schemas carry no prose at all**
+crash` is thirteen tools and 11,714 B is the floor. **Output schemas carry no prose at all**
 (`src/schema.rs`): declare one with `schema::constraints_of`, never rmcp's `schema_for_output`, or
 the tool ships every doc comment in its `$defs` closure and the wire ceiling notices. That call is
 also what supplies the root `type: "object"` a discriminated union does not generate and rmcp does
@@ -42,8 +42,8 @@ tool but the always-served ones, and `no_description_names_a_tool_the_client_can
 build if a new tool's prose points at one its own single-tool spec does not serve. Three
 consequences when you add one. The invariant is checked on `--tools <that tool>` and nowhere else,
 because that is the tightest surface it can be served on and every wider one is covered by
-construction. **Group bytes no longer add up to a surface's**: `crash` is 14,587 B against the
-15,753 its two groups sum to in `docs/token-budget.md`, since narrowing shortens what stays as well
+construction. **Group bytes no longer add up to a surface's**: `crash` is 19,078 B against the
+20,244 its two groups sum to in `docs/token-budget.md` (2026-09-07), since narrowing shortens what stays as well
 as dropping what goes. And the check for "names a tool" is deliberately not word containment — this
 prose says frames are "attributed to modules" and that a stuck session "does not let go", while a
 TTD description quotes `dx @$cursession.TTD.Calls(...)`, which is the debugger command and not the

@@ -780,7 +780,7 @@ Three more need no debugger either, and none of them is about the lease:
 - *A run started with `--tools` advertises the narrowed surface **over HTTP**.* stdio builds one
   `WindbgServer` in `main` and the listener builds one per MCP session in its service factory, so
   the narrowing is applied on two different lines and only one of them is the one that has been
-  wrong before. `--tools crash` is asserted as the eleven tools it is — `crash_triage` and the
+  wrong before. `--tools crash` is asserted as the thirteen tools it is — `crash_triage` and the
   openers present, `debug_batch` absent — and the startup line as the surface it ended up with,
   which is not the spec that was typed.
 
@@ -844,7 +844,7 @@ passed, because each supplies the identity itself.
   and no description `bench` is served names `modules`, `debug_batch`, `go` or `backtrace` (item
   41), while `local`'s `open_dump` still says which tool lists the module table. Both directions
   are asserted, because deleting the cross-references outright would satisfy the first and lose the
-  pointer the fifty-one-tool client is the one that can use. Backticked names, not bare ones: this
+  pointer the fifty-seven-tool client is the one that can use. Backticked names, not bare ones: this
   surface says frames are "attributed to modules" and that a stuck session "does not let go", and
   neither sentence points anywhere.
 - *A **token file** naming two clients serves both* — the item-31 test in the list further up,
