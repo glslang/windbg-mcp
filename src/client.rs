@@ -37,7 +37,7 @@
 //!
 //! A **tool surface of its own**. A client is a budget as much as it is a boundary: the
 //! arrangement this listener was built for is a local model that can hold twenty-three tools beside a
-//! hosted client that can hold fifty-one, on the same box and against the same debug sessions. So
+//! hosted client that can hold fifty-seven, on the same box and against the same debug sessions. So
 //! a credential may carry a [`crate::toolset::Toolset`] as well as a name — configured beside the
 //! token, under the same variable prefix or in the same file entry — and a client that names none
 //! is served whatever the run serves. That is `FOLLOWUPS.md` item 36, and the identity above is
@@ -1907,7 +1907,7 @@ mod tests {
     /// **`None` rather than every tool** is the half worth asserting: a listener started with
     /// `--tools crash` and one client given `inspect` serves that client `inspect` and everybody
     /// else `crash`, which only works if "no surface configured" stays distinguishable from "all
-    /// fifty-one".
+    /// fifty-seven".
     #[test]
     fn a_client_may_be_configured_with_a_surface_of_its_own() {
         let configured = &[

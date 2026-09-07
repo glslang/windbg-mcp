@@ -752,7 +752,7 @@ pub async fn serve(
                 let client = crate::client::current();
                 // **And the one moment its surface is knowable, for the same reason.** A client
                 // configured with a spec of its own is served that; every other client is served
-                // whatever this run serves, which is `--tools` or all fifty-one. The run's flag is
+                // whatever this run serves, which is `--tools` or all fifty-seven. The run's flag is
                 // the default rather than a ceiling — see [`crate::toolset`], which also says why
                 // a change here reaches a client the next time it is identified and not before.
                 let (surface, chosen) = match credentials.surface_for(&client) {

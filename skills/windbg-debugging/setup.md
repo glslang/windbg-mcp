@@ -731,8 +731,8 @@ Four things decide whether the ollama route works, and none of them is about the
   needs real work, a longer `WINDBG_MCP_SESSION_IDLE_SECS`, or nothing at all — thirty minutes of
   thinking is a much rarer thing than the lease's grace, and a session with a call still outstanding
   is spared either way.
-- **The surface is the fixed cost and a single answer is the variable one.** All 51 tools are about
-  70 kB of JSON, paid once per conversation and narrowable per client with `--tools`; one careless
+- **The surface is the fixed cost and a single answer is the variable one.** All 57 tools are about
+  85 kB of JSON, paid once per conversation and narrowable per client with `--tools`; one careless
   `read_memory` is up to ~4 MiB, paid on the spot. Narrowing costs fewer *answers* than it does
   tools — most facts here are reachable by more than one route — so it is a real option rather than
   a mutilation.

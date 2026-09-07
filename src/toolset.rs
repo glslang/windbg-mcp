@@ -1,7 +1,7 @@
 //! Which of this server's fifty-seven tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
-//! 79,825 bytes — roughly 20k tokens (measured 2026-09-05; every figure here moves with any edit
+//! 84,506 bytes — roughly 21k tokens (measured 2026-09-07; every figure here moves with any edit
 //! to a description, so re-derive rather than cite). Seven tenths of that is prose, and the prose is what tells
 //! a model how to drive the tools, so there is no strip here the way there was in
 //! [`crate::schema`]: `FOLLOWUPS.md` item 24 measured it and the only honest lever left is the one
@@ -365,7 +365,7 @@ impl Toolset {
     }
 
     /// What this surface is, for the startup log. Names the groups it covers whole, then whatever
-    /// is left over, so `--tools crash` reads as the eleven tools it is.
+    /// is left over, so `--tools crash` reads as the thirteen tools it is.
     pub fn summary(&self) -> String {
         let Some(included) = &self.included else {
             return format!("all {} tools", Self::total());
