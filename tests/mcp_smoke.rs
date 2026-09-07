@@ -6750,6 +6750,10 @@ fn a_malformed_disassemble_address_is_refused_as_a_typed_error() {
 /// mapping onto MCP, which is the only part a client can see: one notification per milestone, on
 /// the token the call supplied, all of them **before** the result rather than summarised after it.
 ///
+/// It asserts the milestones and not the *whole* notification stream, because those are two claims
+/// and only the first belongs to an open. A slow one also emits heartbeats, which is the heartbeat
+/// working rather than the open misbehaving — see the filter below.
+///
 /// Needs a real target because the sequence is the point. A failed open reports the first milestone
 /// and stops, which proves the route and not the order.
 #[test]
@@ -6773,14 +6777,33 @@ fn an_open_reports_its_milestones_before_it_answers() {
         .iter()
         .filter_map(|s| s["params"]["message"].as_str())
         .collect();
+
+    // **A heartbeat is not a milestone**, and counting every message made this a stopwatch rather
+    // than an assertion. [`crate::progress::HEARTBEAT`]'s ten seconds of silence is a bound this
+    // open has no reason to respect — a dump load that reaches a symbol server takes as long as the
+    // network does — so `still running (…)` legitimately interleaves with the three
+    // [`Step`](../src/progress.rs) messages. It failed exactly that way on a slow CI runner: a 36s
+    // open, three heartbeats, six messages against an expected three, and a panic that named the
+    // milestones while the thing that had changed was the clock. What an open *promises* is the
+    // three steps in order; how often it says it is still working is the heartbeat's business, and
+    // `src/progress.rs`'s own paused-clock tests are where that is pinned.
+    //
+    // Filtering on the text couples this to the heartbeat's wording, which is the price of a
+    // notification carrying no kind of its own — and it fails **loudly** if that wording moves,
+    // because an unfiltered heartbeat lands on the count below rather than passing quietly.
+    let milestones: Vec<&str> = said
+        .iter()
+        .copied()
+        .filter(|m| !m.starts_with("still running"))
+        .collect();
     assert_eq!(
-        said.len(),
+        milestones.len(),
         3,
         "an open has three milestones — worker up, target claimed, target open: {steps:?}"
     );
-    assert!(said[0].contains("engine worker started"), "{said:?}");
-    assert!(said[1].contains("created or claimed"), "{said:?}");
-    assert!(said[2].contains("target is open"), "{said:?}");
+    assert!(milestones[0].contains("engine worker started"), "{said:?}");
+    assert!(milestones[1].contains("created or claimed"), "{said:?}");
+    assert!(milestones[2].contains("target is open"), "{said:?}");
 
     // Seconds elapsed, strictly increasing, and no `total` — the budget differs per tool and an
     // opener spends time outside it, so a denominator here would be a number the server cannot
