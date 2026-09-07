@@ -294,10 +294,14 @@ None of these is a bug. They are recorded because they were invisible, and
    `debug_batch` alone is 10,021 B — 12% of everything a model is given before it asks anything — of
    which 7,980 B is the `StepAction`/`Check` vocabulary its schema pulls out of `src/batch.rs`.
    Then `walk_memory` 4,080, `crash_triage` 2,936, `reachable_from_dispatch` 2,628, `server_log`
-   2,599: **22,264 B**, against a median tool of 1,029 B. (Re-measured 2026-09-07: none of the five
-   has moved a byte since 2026-08-22, and the sum was recorded as 21,989 then, which its own five
-   rows never summed to. The *share* is what actually went stale — 33% of the 54-tool surface,
-   26.3% of today's 57 tools and 84,506 B. A share is the half that does.)
+   2,599: **22,264 B**, against a median tool of 1,029 B (measured 2026-09-07). Two things this
+   paragraph got wrong, both worth leaving on the record. The **33%** was never a share of *this*
+   surface: it is 21,961 B of the 51-tool, 67,076 B surface the finding was first recorded against
+   on 2026-08-18, where today the five are 26.3% of 84,506 B. And the total read **21,989** — right
+   when it was written and right when four of the five were re-measured on 2026-08-24, then 275 B
+   short from 2026-08-30, when `debug_batch`'s own figure above was updated 9,746 → 10,021 and the
+   line adding it up was not. The share at least carried a date saying it moved; the total looked
+   like arithmetic and so nobody re-added it.
 
    This is where the weight is, and it is a different kind of problem from findings 1–4. Those were
    duplication and waste — the same string paid for repeatedly, or a tail nobody reads. This is one
