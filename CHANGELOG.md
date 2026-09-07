@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-09-07
+
 ### Added
 
 - **`exception_triage` — a user-mode fault as fields**, which is `crash_triage`'s counterpart for a
@@ -148,14 +150,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and it picked the twelve-bit one for both. `ntstatus_facility` and `hresult_facility` now sit
   beside `ntstatus_severity` and `hresult_failed`, which had the naming right already.
 
+- **`current_location` — the instruction pointer as a coordinate**, and `coordinate` accepted as an
+  input by `set_breakpoint`, `run_to_address` and `read_memory`. It answers with the selected
+  address, the thread and kernel processor where the target has them, and the containing
+  `(module, image identity, RVA)` — the form [`docs/coordinates.md`](docs/coordinates.md) already
+  documented on `crash_triage`, `backtrace` and `disassemble` frames, now readable for the current
+  position and accepted back as a place to act on.
+
+  **`location_state` names which of four answers this is** — `mapped`, `unmapped`,
+  `attribution_failed` or `context_unavailable` — rather than leaving an absent coordinate to be
+  read as any of them: a module lookup that *failed* is not the same fact as an address in no
+  loaded image, and neither is a position with no thread context at all. A running target is
+  refused as a typed `target_running` error, so polling this does not interrupt one.
+
+  Acting on a coordinate resolves it **inside the same serialized engine job that acts on it**: the
+  worker finds the unique loaded module, validates its identity and the whole requested range, and
+  refuses a missing, ambiguous, unloaded, replaced or out-of-range image. No address cached from an
+  earlier pairing is reused. Timestamp and `SizeOfImage` are matching metadata rather than
+  cryptographic identity, which is why a SHA-256 the caller has is kept beside them rather than
+  folded into them. The Binary Ninja companion that consumes this is maintained in its own
+  `binja-windbg-mcp` repository.
+
 ### Changed
 
-- Both new tools join the **`crash`** group, which is why `crash_triage`'s refusal on a user-mode
+- `exception_triage` and `decode_error_reporting` join the **`crash`** group (`current_location`
+  joins `inspect`), which is why `crash_triage`'s refusal on a user-mode
   session stopped pointing at `backtrace` and `execute`. Those are `inspect`, so a `--tools crash`
   caller — the surface most likely to hit that refusal — was guaranteed to get no pointer with it.
   It names `exception_triage` now, which that caller has.
-- The tool surface is **56 tools and 80,579 B** of model context, from 54 and 75,547 (measured
-  2026-09-05). `--tools crash` is 13 tools and 18,780 B.
+- The tool surface is **57 tools and 84,506 B** of model context, from 54 tools and 76,386 B at
+  v0.15.0 (measured 2026-09-07). `--tools crash` is 13 tools and 19,078 B.
 - **A client that offers `2026-07-28` to `initialize` is now answered with `2025-11-25`**, which is
   the SDK's rule rather than this server's. SEP-2567 abolished the handshake in `2026-07-28` — the
   revision travels in per-request `_meta`, and a client on it opens with `server/discover` — so
@@ -3528,7 +3552,8 @@ Initial release, packaged as a single-plugin Claude Code marketplace.
 - Crash-dump `!analyze` support via automatic WinDbg extension DLL loading.
 - Windows CI (format, clippy, build, test) and walkthrough docs with sample dumps.
 
-[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/glslang/windbg-mcp/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/glslang/windbg-mcp/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/glslang/windbg-mcp/compare/v0.13.2...v0.14.0
 [0.13.2]: https://github.com/glslang/windbg-mcp/compare/v0.13.1...v0.13.2
