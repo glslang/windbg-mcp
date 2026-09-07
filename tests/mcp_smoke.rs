@@ -98,6 +98,32 @@ const SUPPORTED_REVISIONS: &[&str] = &[
 /// What a client offering something the SDK does not know gets answered with.
 const FALLBACK_REVISION: &str = "2025-11-25";
 
+/// The first revision with **no `initialize` handshake at all**.
+///
+/// [SEP-2567] replaced the handshake with per-request `_meta`, so a client on this revision opens
+/// with `server/discover` and never sends `initialize`. rmcp 3.2.0 turned that from a convention
+/// into a rule (upstream #1228): `initialize` selects legacy semantics *whatever version it names*,
+/// so a handshake naming this revision or later is answered with the newest revision that still has
+/// one. Every 3.x before it echoed the offer back, which is the behaviour the `rmcp = "3.2.0"` floor
+/// in `Cargo.toml` exists to keep out — a handshake cannot negotiate a revision that abolished it.
+///
+/// [SEP-2567]: https://modelcontextprotocol.io/seps/2567-sessionless-mcp
+const POST_HANDSHAKE_REVISION: &str = "2026-07-28";
+
+/// What `initialize` answers a client that offered `revision`.
+///
+/// A revision from the handshake era is echoed; one from after it negotiates down to
+/// [`FALLBACK_REVISION`]. ISO-8601 dates sort lexicographically, which is how the SDK decides it
+/// too (`rmcp::service::is_legacy_version` is this same comparison) — so this is the rule restated,
+/// not a list of cases that has to be extended when the spec revs.
+fn handshake_answer(revision: &str) -> &str {
+    if revision < POST_HANDSHAKE_REVISION {
+        revision
+    } else {
+        FALLBACK_REVISION
+    }
+}
+
 const GOLDEN: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/golden/tools_list.json");
 /// Companion to [`GOLDEN`], and deliberately the thing it is blind to. That one digests the tool
 /// surface down to its *shape* — `digest_tool` drops every `description` on purpose — which is
@@ -1063,6 +1089,15 @@ fn read_version_field(exe: &str, field: &str) -> String {
 
 /// `docs/architecture.md` names the revisions this server speaks. When the spec revs, this is the
 /// list to extend — and the test that says whether the SDK bump actually delivered it.
+///
+/// **Being served a revision is not the same as negotiating it in the handshake**, and
+/// [`POST_HANDSHAKE_REVISION`] is where the two part company: `2026-07-28` abolished `initialize`,
+/// so there is no handshake for it to be the outcome of, and a client naming it here is answered
+/// with the newest revision that still has one. That revision is served all the same — over
+/// `server/discover` and per-request `_meta`, which is what a client on it actually sends, and what
+/// [`discover_opens_a_session_without_initialize`] and the listener's stateless tier cover. So this
+/// test asserts the handshake's rule ([`handshake_answer`]) rather than an echo, and the revisions
+/// with no handshake are covered by the tests that drive the opener they really use.
 #[test]
 fn every_documented_protocol_revision_is_served() {
     for revision in SUPPORTED_REVISIONS {
@@ -1072,9 +1107,11 @@ fn every_documented_protocol_revision_is_served() {
         let served = result["protocolVersion"]
             .as_str()
             .unwrap_or_else(|| panic!("initialize({revision}) returned no protocolVersion"));
+        let expected = handshake_answer(revision);
         assert_eq!(
-            served, *revision,
-            "a client offering `{revision}` must be served that revision, not `{served}`"
+            served, expected,
+            "a client offering `{revision}` to `initialize` must be served `{expected}`, not \
+             `{served}`"
         );
         assert!(
             !result["capabilities"]["tools"].is_null(),
@@ -1116,7 +1153,9 @@ fn every_documented_protocol_revision_is_served() {
                 .is_some_and(|t| !t.is_empty()),
             "tools/list must be non-empty on {revision}"
         );
-        assert_cache_fields_match_revision(&tools["result"], revision, "tools/list");
+        // Keyed on what was **negotiated**, not on what was offered: the cache fields follow the
+        // revision actually in force, and those are no longer the same thing for `2026-07-28`.
+        assert_cache_fields_match_revision(&tools["result"], expected, "tools/list");
     }
 }
 
@@ -1126,9 +1165,17 @@ fn every_documented_protocol_revision_is_served() {
 /// reply when they are missing — the server reads as connected with zero tools. That is not
 /// hypothetical: every `rmcp` before 3.1.1 generated exactly that response from the documented
 /// macro path, and it shipped (upstream issue #1114, fixed by #1120). The fields come from the
-/// SDK, so this is a guard on the dependency floor in `Cargo.toml` — the one test that fails if
-/// a resolver ever picks an older 3.x. Older revisions never defined the fields and must not be
+/// SDK, so this is a guard on the dependency floor in `Cargo.toml` — what fails if a resolver ever
+/// picks an older 3.x. Older revisions never defined the fields and must not be
 /// served them. `assert_no_error` sees none of this: both shapes are valid JSON-RPC results.
+///
+/// **`revision` is the revision *negotiated*, never the one a client offered** — and since rmcp
+/// 3.2.0 those differ for precisely the revision this guard is about, a handshake naming
+/// `2026-07-28` settling on [`FALLBACK_REVISION`] instead. So the branch that does the guarding is
+/// now reached from the stateless caller in [`discover_opens_a_session_without_initialize`] alone,
+/// where the revision arrives per-request and is therefore really in force. Hand this an *offered*
+/// revision and the floor guard quietly inverts into a check that the fields are absent — which the
+/// broken SDKs it exists to catch would pass just as happily.
 fn assert_cache_fields_match_revision(result: &Value, revision: &str, what: &str) {
     if revision >= "2026-07-28" {
         assert_eq!(
@@ -3062,10 +3109,16 @@ const LEASE_REVISION: &str = "2025-06-18";
 
 /// The revision that removed the session id, and therefore the lease's grip on a client.
 ///
-/// [SEP-2567] made `2026-07-28` stateless: the handshake mints no `Mcp-Session-Id`, so a client on
-/// this revision never becomes a holder and never sends an id back. It is also the revision current
-/// clients negotiate, which is why "answered the handshake and then refused everything after it"
-/// was worth a tier of its own.
+/// [SEP-2567] made `2026-07-28` stateless by removing the handshake itself: a client on this
+/// revision opens with `server/discover` and carries its context in per-request `_meta`, so it is
+/// minted no `Mcp-Session-Id`, never becomes a holder, and never sends an id back. It is also the
+/// revision current clients negotiate, which is why "answered the opening and then refused
+/// everything after it" was worth a tier of its own.
+///
+/// **The statelessness belongs to the request path, not to `initialize`.** Since rmcp 3.2.0 a
+/// handshake that merely *names* this revision is a legacy one — it negotiates down and mints an id
+/// like any other (see [`POST_HANDSHAKE_REVISION`]). What stays stateless is everything after it,
+/// and that is what this constant builds.
 ///
 /// [SEP-2567]: https://modelcontextprotocol.io/seps/2567-sessionless-mcp
 const STATELESS_REVISION: &str = "2026-07-28";
@@ -3715,10 +3768,12 @@ impl Listener {
         stream
     }
 
-    /// The `2026-07-28` handshake, which mints nothing and is therefore not a session.
+    /// An `initialize` naming `2026-07-28` — which, since rmcp 3.2.0, is a *legacy* handshake
+    /// whatever it names: it negotiates down to [`FALLBACK_REVISION`] and mints a session id.
     ///
-    /// Sent for the same reason a stateless client sends it: to learn what the server is. Nothing
-    /// afterwards depends on it having happened, which is the property being asserted.
+    /// Sent for the reason a client that has not been told otherwise sends it: to learn what the
+    /// server is. Nothing afterwards depends on it having happened, or on what it settled on, which
+    /// is the property being asserted — the stateless requests that follow carry no id of their own.
     fn stateless_opening(&mut self) -> Reply {
         self.stateless_opening_with(&[("MCP-Protocol-Version", STATELESS_REVISION)])
     }
@@ -4260,7 +4315,7 @@ fn a_second_session_for_one_credential_is_served_alongside_the_first() {
     );
 }
 
-/// The listener serves `2026-07-28` — the handshake *and* everything after it.
+/// The listener serves `2026-07-28` — the opening *and* everything after it.
 ///
 /// [#168](https://github.com/glslang/windbg-mcp/issues/168) reported the opposite: the handshake
 /// answered `200` and the next request `400`, which would leave `--listen` usable only by clients
@@ -4269,6 +4324,12 @@ fn a_second_session_for_one_credential_is_served_alongside_the_first() {
 /// what it found was the server enforcing the spec rather than failing to implement it. This is the
 /// same sequence, spelled the way the revision requires — and it is the reason
 /// [`Listener::stateless`] carries three things instead of one.
+///
+/// **The opening is a legacy handshake and the requests after it are not**, which is not a muddle
+/// but the point: since rmcp 3.2.0 an `initialize` naming `2026-07-28` negotiates down and opens an
+/// ordinary session (see [`POST_HANDSHAKE_REVISION`]), and the client goes on to send stateless
+/// requests carrying no id at all. #168's failure lived exactly in that seam, so a test that made
+/// both halves agree would no longer be driving the shape that broke.
 #[test]
 fn the_listener_serves_the_stateless_revision_it_negotiates() {
     let mut server = Listener::start(&[]);
@@ -4284,16 +4345,18 @@ fn the_listener_serves_the_stateless_revision_it_negotiates() {
     );
     assert_eq!(
         opening.result("initialize")["protocolVersion"],
-        json!(STATELESS_REVISION),
-        "the handshake must negotiate the revision it was offered: {}",
+        json!(FALLBACK_REVISION),
+        "the handshake must settle on a revision that still has one: {}",
         opening.body
     );
-    // SEP-2567 removed the session id, so there is nothing here for a lease to be armed by.
-    // Asserted rather than assumed: ownership is what the listener still reads this header for,
-    // and its absence is what makes the rest of this test a different client to the ones above.
+    // And it is an ordinary session, because it is an ordinary handshake: `initialize` is a legacy
+    // request whatever revision it names, so the listener mints an id and arms a lease off it just
+    // as it would for a client that had named `2025-11-25` outright. Asserted rather than shrugged
+    // at, because it is the half of this sequence that the next few requests do *not* use — what
+    // makes them a stateless client is that they carry none of it.
     assert!(
-        opening.session.is_none(),
-        "{STATELESS_REVISION} must mint no Mcp-Session-Id: {}",
+        opening.session.is_some(),
+        "a handshake that negotiated {FALLBACK_REVISION} mints an Mcp-Session-Id: {}",
         opening.body
     );
 
@@ -4338,10 +4401,11 @@ fn the_listener_serves_the_stateless_revision_it_negotiates() {
 
 /// The handshake may omit `MCP-Protocol-Version`, and the client is ordinary afterwards.
 ///
-/// It is the one request of `2026-07-28` that may: `initialize` *establishes* the revision, so rmcp
-/// does not require the header that restates it. Nothing here drove that shape until now — stdio
-/// has no headers to omit and [`Listener::stateless_opening`] sends one — which left the likeliest
-/// handshake a real client sends as the only one untested.
+/// It is the one request the listener exempts: `initialize` *establishes* the revision — it is the
+/// request that settles which one is in force — so rmcp does not require the header that would
+/// restate it. Nothing here drove that shape until now — stdio has no headers to omit and
+/// [`Listener::stateless_opening`] sends one — which left the likeliest opening a real client sends
+/// as the only one untested.
 ///
 /// **The hazard it carried has been deleted rather than covered**, and that is why this asserts
 /// what it does. The listener used to classify a request by that header, so a headerless handshake
@@ -4364,15 +4428,18 @@ fn a_stateless_handshake_may_omit_the_protocol_header() {
         opening.body,
         server.stderr()
     );
+    // The route that omits the header has to reach the same place as the route that sends it —
+    // that is the whole claim — so this restates the outcome the test above asserts rather than
+    // adding a rule of its own: negotiated down, and a session minted.
     assert_eq!(
         opening.result("initialize")["protocolVersion"],
-        json!(STATELESS_REVISION),
-        "the handshake must negotiate the revision its body offered, header or no header: {}",
+        json!(FALLBACK_REVISION),
+        "the handshake must settle where its body's offer sends it, header or no header: {}",
         opening.body
     );
     assert!(
-        opening.session.is_none(),
-        "{STATELESS_REVISION} mints no Mcp-Session-Id, however it arrives: {}",
+        opening.session.is_some(),
+        "a handshake mints an Mcp-Session-Id however it arrives: {}",
         opening.body
     );
 

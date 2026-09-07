@@ -11,10 +11,14 @@ license = "MIT"
 
 [dependencies]
 dbgscope = { git = "https://github.com/glslang/dbgscope", rev = "bb26d44cacff77113fe4f6c049c62249054ccf6d" }
-# 3.1.1 is a floor, not a preference: every 3.x before it generates a `tools/list` that omits
-# SEP-2549's required `ttlMs`/`cacheScope`, which a spec-strict `2026-07-28` client rejects
-# outright — the server connects and appears to expose no tools at all (upstream issue #1114).
-rmcp = { version = "3.1.1", features = [
+# 3.2.0 is a floor, not a preference, and by now for two unrelated reasons. Every 3.x before 3.1.1
+# generates a `tools/list` that omits SEP-2549's required `ttlMs`/`cacheScope`, which a spec-strict
+# `2026-07-28` client rejects outright — the server connects and appears to expose no tools at all
+# (upstream issue #1114). And every 3.x before 3.2.0 echoes `2026-07-28` straight back out of
+# `initialize`; 3.2.0 settles that handshake on a revision which still *has* a handshake (upstream
+# #1228, `is_legacy_version`). The smoke tier asserts the second behaviour, so a build that resolved
+# 3.1.x would fail it rather than merely serve the older shape — which is what makes this a floor.
+rmcp = { version = "3.2.0", features = [
     "server",
     "transport-io",
     "macros",
