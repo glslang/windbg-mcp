@@ -36,7 +36,7 @@
 //! # What a name buys besides isolation
 //!
 //! A **tool surface of its own**. A client is a budget as much as it is a boundary: the
-//! arrangement this listener was built for is a local model that can hold twenty tools beside a
+//! arrangement this listener was built for is a local model that can hold twenty-three tools beside a
 //! hosted client that can hold fifty-one, on the same box and against the same debug sessions. So
 //! a credential may carry a [`crate::toolset::Toolset`] as well as a name — configured beside the
 //! token, under the same variable prefix or in the same file entry — and a client that names none

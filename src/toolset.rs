@@ -1,4 +1,4 @@
-//! Which of this server's fifty-six tools a run advertises.
+//! Which of this server's fifty-seven tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
 //! 79,825 bytes — roughly 20k tokens (measured 2026-09-05; every figure here moves with any edit
@@ -21,17 +21,20 @@
 //! ```text
 //!   group      tools   bytes   what it is for
 //!   allocator     10   16,457  pool and heap walks, and `walk_memory`
+//!   inspect       10   13,152  registers, stacks, memory, modules, symbols, location, raw commands
 //!   session       10   12,817  opening a target, ending it, and watching this server
-//!   inspect        9   11,626  registers, stacks, memory, modules, symbols, raw commands
+//!   exec           8   11,309  breakpoints and execution control
 //!   batch          1   10,021  `debug_batch`
-//!   exec           8    9,206  breakpoints and execution control
+//!   crash          3    7,427  a bug check, a user-mode fault, and an error code
 //!   ttd            9    6,829  recording, indexing and querying a Time Travel trace
 //!   ioctl          6    6,494  driver objects, IRP stacks, and dispatch reachability
-//!   crash          3    6,375  a bug check, a user-mode fault, and an error code
 //! ```
 //!
+//! Those bytes are a measurement of **2026-09-07** and move with any edit to a description — the
+//! whole surface they are shares of is 57 tools and 84,506 B. Re-derive rather than quoting them.
+//!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
-//! 18,026 bytes, not the 19,192 its two rows add to, because the thirteen tools it keeps also stop
+//! 19,078 bytes, not the 20,244 its two rows add to, because the thirteen tools it keeps also stop
 //! carrying the sentences that pointed at `modules`, `debug_batch`, `backtrace`, `continue_async`
 //! and `break_in` — 1,166 bytes of them. A spec is always cheaper than its rows suggest, never
 //! dearer.
@@ -51,8 +54,8 @@
 //! the flag is right there on the command line that started it.
 //!
 //! A listener names its clients already ([`crate::client`]), and they do not have one budget
-//! between them: the arrangement this exists for is a local model that can hold twenty tools and a
-//! hosted client that can hold fifty-six, pointed at the same Windows box and the same debug
+//! between them: the arrangement this exists for is a local model that can hold twenty-three tools
+//! and a hosted client that can hold fifty-seven, pointed at the same Windows box and the same debug
 //! sessions and told apart by their bearer tokens. So a client may be configured with a spec of
 //! its own — `WINDBG_MCP_TOOLS_<NAME>`, or a `tools` field in the credential file — and is served
 //! that instead of the run's. The run's `--tools` is the **default**, not a ceiling: a client's
@@ -253,7 +256,7 @@ impl Toolset {
             named_anything = true;
             if entry == ALL {
                 // Noted and carried on with, not returned on. Returning here would stop validating
-                // the rest, so `all,ttdd` served all 56 tools while `ttdd,all` was refused — the
+                // the rest, so `all,ttdd` served all 57 tools while `ttdd,all` was refused — the
                 // same spec, judged by where the typo happened to sit. A refusal that depends on
                 // entry order is worse than no refusal, because it is the one nobody reproduces.
                 everything = true;

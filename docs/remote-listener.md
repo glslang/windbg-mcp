@@ -6,7 +6,7 @@ the machine DbgEng needs — a Mac driving a Windows VM, say.
 
 **`--tools` works here exactly as it does on stdio**, and matters more: the client at the far end
 may be a local model whose window is bought in RAM. `--listen 127.0.0.1:8765 --tools
-session,inspect,crash` serves 22 tools and 30,498 B of model context instead of 56 and 80,579 — the
+session,inspect,crash` serves 23 tools and 32,322 B of model context instead of 57 and 84,506 — the
 README has the table, and [`local-model.md`](./local-model.md) is the runbook it was measured for.
 It is this listener's **default**: a client may be given a surface of its own, which is what lets
 one server hold a local model and a hosted client at once — see [A tool surface per
@@ -295,8 +295,8 @@ setx WINDBG_MCP_LISTEN_TOKEN_BENCH "<a long random string>"   # the client named
 setx WINDBG_MCP_TOOLS_BENCH        "session,inspect,crash"    # …and what it is served
 ```
 
-This is what lets one listener serve a local model that can hold twenty tools beside a hosted client
-that can hold fifty-six, against the same debug sessions on the same box. A client with no spec of
+This is what lets one listener serve a local model that can hold twenty-three tools beside a hosted
+client that can hold fifty-seven, against the same debug sessions on the same box. A client with no spec of
 its own is served whatever the run serves — `--tools` on the listener's command line, or every tool
 if it has none — so **the run's flag is the default rather than a ceiling**: a client's own spec
 replaces it, wider or narrower, because an intersection would produce a surface neither of you
