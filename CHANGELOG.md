@@ -156,6 +156,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   It names `exception_triage` now, which that caller has.
 - The tool surface is **56 tools and 80,579 B** of model context, from 54 and 75,547 (measured
   2026-09-05). `--tools crash` is 13 tools and 18,780 B.
+- **A client that offers `2026-07-28` to `initialize` is now answered with `2025-11-25`**, which is
+  the SDK's rule rather than this server's. SEP-2567 abolished the handshake in `2026-07-28` — the
+  revision travels in per-request `_meta`, and a client on it opens with `server/discover` — so
+  `rmcp` 3.2.0 settles every `initialize` on a revision that still has one
+  ([upstream #1228](https://github.com/modelcontextprotocol/rust-sdk/pull/1228)). Earlier 3.x echoed
+  the offer back, so one client saw two different answers depending on which patch release a
+  resolver happened to pick; the dependency floor moves to `rmcp = "3.2.0"` for that reason.
+
+  **Nothing changed for a client that opens the way `2026-07-28` prescribes.** `server/discover` and
+  per-request `_meta` are served exactly as before, and so are `tools/list` and `tools/call` on that
+  path over `--listen`. What changed is the answer to a *handshake*, and two things follow from it.
+  SEP-2549's `ttlMs`/`cacheScope` accompany the revision actually in force, so they no longer appear
+  after a handshake that negotiated down — the `tools/list` payload is 216,839 B against 216,895,
+  which is those three fields' 56 bytes and nothing else. And on `--listen` such a handshake now
+  mints an `Mcp-Session-Id` and is leased like the legacy client it is. So "a client on
+  `2026-07-28`" means one that opens the way that revision prescribes, never one that merely names
+  it somewhere.
 
 [dbgscope#144]: https://github.com/glslang/dbgscope/pull/144
 
