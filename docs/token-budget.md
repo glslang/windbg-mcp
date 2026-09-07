@@ -96,8 +96,8 @@ whole `StepAction`/`Check` vocabulary out of `src/batch.rs`.
 
 The payload is measured as the **serialized result**, not as the sum of its tools, and the 118-byte
 gap between those two is the reason. Result-level fields live in it, and on `2026-07-28` those are
-SEP-2549's `ttlMs`/`cacheScope` — the fields the `rmcp = "3.1.1"` floor exists for. Asking the same
-server at two revisions shows what a sum would miss:
+SEP-2549's `ttlMs`/`cacheScope` — the fields the `rmcp` floor exists for. Asking the same server at
+two revisions shows what a sum would miss:
 
 | Revision | payload | sum of tools | result-level |
 |---|---:|---:|---|
@@ -106,6 +106,13 @@ server at two revisions shows what a sum would miss:
 
 The sum is **identical** across the two; only the payload figure can tell them apart. The golden
 records both, so the gap stays visible.
+
+**Reaching the top row takes the stateless path**, and that is a change from when these were
+measured. Since `rmcp` 3.2.0 an `initialize` naming `2026-07-28` negotiates down to `2025-11-25`, so
+a handshake now lands on the *bottom* row's shape whichever revision it offers; the fields come back
+only for a client that carries its revision per request. The golden moved by exactly that difference
+when the SDK bumped — 216,895 → 216,839, the 56 bytes this table already prices — which is the
+measurement working rather than a budget being spent.
 
 ### Results, against `docs/samples/052126-34312-01.dmp`
 

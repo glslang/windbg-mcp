@@ -55,10 +55,23 @@ process. Two things follow, and they are why it is built this way:
 **MCP protocol revision:** built on `rmcp` 3.x, this server accepts every revision that SDK knows —
 `2026-07-28` and the `initialize`-handshake ("legacy") era before it (`2025-11-25`, `2025-06-18`,
 `2025-03-26`, `2024-11-05`) — and serves whichever the client selects. A `2026-07-28` client gets the
-stateless, per-request model (`server/discover`, `resultType`, per-request `_meta`) and may open with
-`server/discover` instead of `initialize`; older clients keep the handshake, and a client that offers
-an unknown revision is answered with `2025-11-25`. That revision also makes SEP-2549's cache fields
-mandatory on a paginated result, so `tools/list` answers a `2026-07-28` client with `ttlMs: 0` and
-`cacheScope: public`, and omits both for the older revisions, which never defined them. This is why
-the `rmcp` dependency has a `3.1.1` floor: every 3.x before it omitted the fields on every revision,
-and a client that validates against the spec schema then rejects the whole tool list.
+stateless, per-request model (`server/discover`, `resultType`, per-request `_meta`) and opens with
+`server/discover` rather than `initialize`; older clients keep the handshake, and a client that
+offers an unknown revision is answered with `2025-11-25`.
+
+**How a client selects it is not the same question on both sides of that line**, and it is worth
+being exact because the two look alike from the outside. `2026-07-28` did not add an option to the
+handshake — [SEP-2567](https://modelcontextprotocol.io/seps/2567-sessionless-mcp) *abolished* the
+handshake, moving what it settled into per-request `_meta`. So the revision is selected per request
+by a client on `2026-07-28`, and by `initialize` for the legacy era; and an `initialize` that names
+`2026-07-28` anyway is answered with `2025-11-25`, because a handshake cannot negotiate its way to a
+revision that has none. That is `rmcp` 3.2.0's rule rather than this server's (upstream #1228), and
+it is why the dependency carries a `3.2.0` floor — earlier 3.x echoed the offer back, so the same
+client saw a different answer depending on which patch release was resolved.
+
+`2026-07-28` also makes SEP-2549's cache fields mandatory on a paginated result, so `tools/list`
+answers a client **on** that revision with `ttlMs: 0` and `cacheScope: public`, and omits both for
+the older revisions, which never defined them. Since the fields follow the revision actually in
+force, they appear on the stateless path and not after a handshake that negotiated down. This is the
+other half of why `rmcp` has a floor at all: every 3.x before `3.1.1` omitted the fields on every
+revision, and a client that validates against the spec schema then rejects the whole tool list.
