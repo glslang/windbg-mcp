@@ -1,26 +1,26 @@
 # BN6 similarity in the Binary Ninja–WinDbg companion
 
-Status: implemented in the companion checkout, 2026-09-07. The six tools, background
-comparison lifecycle, textual differences, and capture runner have automated
-coverage. Native Ultimate execution, real similarity captures, and the live
-similarity-to-debugger acceptance workflow remain release gates. This document
-retains the agreed design; it does not claim Ultimate validation.
+Status: revised and implemented 2026-09-08 in the companion. Personal GUI exports,
+real external BinDiff comparisons, textual differences, and target navigation passed
+on synthetic identical, relocated and changed PE fixtures. The changed fixture's
+additional function was reported unmatched. Names, types, comments, bytes,
+generations, identities and modification flags stayed unchanged.
 
-The companion suite passed 125 tests with no skips, including 31 similarity cases
-and the HTTP tool golden. Ruff lint/format checks and documentation lint passed.
-
-The companion's `docs/similarity.md` documents the implementation, limits, and
-opt-in acceptance procedure.
+The helper built on Apple Silicon against BN6 ABI 187. Personal capture and
+reproduction instructions are in the companion's `docs/similarity.md`. Native
+Ultimate execution and the live similarity-to-WinDbg operation remain unvalidated;
+they are tracked separately from the completed Personal comparison acceptance.
 
 ## Summary
 
-Extend `binja-windbg-mcp` with an optional Ultimate feature that compares two open
+Extend `binja-windbg-mcp` with optional Personal and Ultimate backends comparing two open
 Windows PE views or BNDBs. Support BinDiff structural matching, WARP exact matching,
 agent-readable disassembly differences, and navigation into the existing debugging
 workflow.
 
-Use BN6's Python similarity API directly. The framework requires Ultimate; existing
-Personal workflows remain supported. See the
+Personal automatically exports views inside the running GUI and invokes a
+user-installed external BinDiff. Ultimate retains the native Python similarity
+API with BinDiff and WARP. Native similarity requires Ultimate. See the
 [BN6 announcement](https://binary.ninja/2026/09/03/binary-ninja-6.0-krypton.html#binary-similarity)
 and the [existing companion integration plan](binja-windbg-mcp-plan.md).
 
@@ -37,18 +37,55 @@ Add a `similarity` tool group, included by `groups: "all"`:
 | `similarity_cancel` | Request cancellation while retaining completed results. |
 | `similarity_close` | Release a comparison; request cancellation first if it is running. |
 
-On Personal, status explains that Ultimate is required; comparison requests return
-a structured unavailable result without affecting other tools.
+Add `backend="auto" | "native" | "external"` to `similarity_start`. With omitted
+providers, auto prefers native BinDiff plus WARP when both are available; otherwise
+it selects external BinDiff. Explicit providers must all be supported by one
+backend, preferring native under auto. Explicit external WARP is unavailable.
+Never switch backends after execution begins.
+
+Status reports availability, versions, providers, and setup errors separately for
+each backend. Status and results record backend provenance. Local optional
+`similarity.bindiff_path` takes precedence over PATH discovery; do not download or
+install BinDiff automatically.
 
 Extend existing `navigate` with an optional expected generation, reusing the
 adapter's existing generation check. Similarity results supply the coordinate and
 generation for either side.
 
-## Implementation
+## External backend implementation
+
+- Build a small helper from pinned open-source BinExport and the BN6 public SDK.
+  Expose a versioned C interface accepting an existing BinaryView and an explicit
+  destination, returning export metadata or an error. Package an Apple Silicon
+  build, reproducible build instructions, and required license notices.
+- Run inside Personal's GUI process on the comparison background thread. Serialize
+  exports, retain view ownership, validate ABI compatibility, and propagate write
+  failures. Do not invoke save dialogs or launch BN headlessly. See the
+  [BinExport source](https://github.com/google/binexport/blob/main/binaryninja/main_plugin.cc).
+- Use private temporary files per job. Capture generations, identities, image
+  bases, function inventories, export metadata and hashes. Check both generations
+  before and after export and before publishing results.
+- Invoke external BinDiff using an argument array, explicit primary/reference and
+  secondary/target exports, output directory, binary format, and disabled UI.
+  Target the [BinDiff 8 CLI](https://github.com/google/bindiff/blob/v8/main_portable.cc).
+- Read completed `.BinDiff` output using read-only SQLite. Validate schema and input
+  ownership. Map addresses directly to captured functions, recovering unsigned
+  64-bit addresses. Preserve raw similarity/confidence and map validated `0–1`
+  scores to existing `0–255` fields using `floor(score * 255 + 0.5)`.
+- Derive unmatched from exported eligible functions. Report omitted and unresolved
+  functions separately; missing export coverage must not imply unmatched functions.
+- Report export, matching and import stages without invented percentages. Bound
+  retained stdout/stderr. Cancel, timeout, invalidation and shutdown terminate only
+  the owned process group, escalate if necessary, and reap before deleting files.
+- Export cancellation is cooperative: retain views until the in-process exporter
+  returns. Never read an interrupted database; preserve only validated partial
+  records. Neither backend transfers annotations or changes analysis.
+
+## Shared and native implementation
 
 - **Inputs and providers:** Require two distinct, analyzed PE views of the same
   architecture. Use existing companion IDs, metadata, hashes, and generation stamps.
-  Default to both providers; report unavailable requested providers explicitly.
+  Default providers depend on the selected backend; report unavailable providers explicitly.
   Use session-local provider settings without changing global WARP configuration
   or enabling network services.
 - **Matching:** Create a reference-to-target session graph with no resolvers and
@@ -91,20 +128,24 @@ tool or worker-protocol changes are required.
 
 ## Validation and delivery
 
-1. Verify provider discovery, session execution, result references, and cancellation
-   in BN6 Ultimate using disposable PE fixtures.
+1. Validate GUI export and external BinDiff on BN6 Personal using disposable PE
+   fixtures. Verify native provider discovery, sessions and cancellation separately
+   in Ultimate.
 2. Add offline tests for score preservation, competing matches, reversed result
    ownership, unmatched functions, pagination, text differences, and partial results.
-3. Test Personal availability reporting, busy analysis, stale generations,
+3. Test backend selection, missing/incompatible dependencies, exporter failures,
+   corrupt SQLite, input ownership, high addresses, score conversion, omitted
+   functions, paths with spaces, process cleanup, busy analysis, stale generations,
    close/rebase races, cancellation, listener restart, and shutdown. Verify
    comparison leaves names, types, comments, and bytes unchanged.
-4. Capture Ultimate results for identical, relocated, changed, and unmatched
+4. Adapt the capture runner to select backend/providers. Capture Personal results for identical, relocated, changed, and unmatched
    functions; replay immutable captures in ordinary tests.
 5. Exercise comparison → target navigation → existing guarded debugger action,
    including wrong-build refusal.
 6. Run the companion's pytest, Ruff, transport/golden, and documentation checks.
-   Ultimate execution acceptance remains a release requirement; mocks alone do not
-   establish it.
+   Build/check the helper and update existing PR descriptions. Personal release
+   requires real GUI export and BinDiff execution; mocks alone do not establish it.
+   Track Ultimate acceptance independently.
 
 ## Assumptions and defaults
 
