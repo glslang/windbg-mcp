@@ -83,7 +83,7 @@ not stop the process-wide listener or end a debugger session.
 
 Generate a 32-byte bearer token. Validate HTTP host and origin information. Store credentials and named WinDbg profiles in a user-only `profiles.json` under Binary Ninja's per-user data directory, with macOS mode `0600`. Tokens never appear in tool arguments, logs, or BNDB metadata. WinDbg connections use loopback/tunneled HTTP or authenticated HTTPS, with certificate verification and no credential-bearing redirects.
 
-Expose 16 tools with startup-configured groups:
+Expose 22 tools with startup-configured groups:
 
 | Group | Tools |
 |---|---|
@@ -92,8 +92,9 @@ Expose 16 tools with startup-configured groups:
 | `evidence` | `add_evidence` |
 | `pair` | `pair_windbg`, `windbg_pair_status`, `unpair_windbg` |
 | `debug` | `set_breakpoint_here`, `run_to_here`, `compare_runtime_bytes` |
+| `similarity` | `similarity_start`, `similarity_status`, `similarity_results`, `similarity_diff`, `similarity_cancel`, `similarity_close` |
 
-All groups are enabled by default. `workspace` is always included; selecting `debug` also includes `pair`. Each tool belongs to exactly one group.
+The default `groups: "all"` enables every group, including `similarity`. An explicit group list enables `similarity` only when named. `workspace` is always included; selecting `debug` also includes `pair`. Each tool belongs to exactly one group.
 
 ### Workspace and analysis behavior
 
