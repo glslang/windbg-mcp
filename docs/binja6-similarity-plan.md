@@ -8,8 +8,9 @@ generations, identities and modification flags stayed unchanged.
 
 The helper built on Apple Silicon against BN6 ABI 187. Personal capture and
 reproduction instructions are in the companion's `docs/similarity.md`. Native
-Ultimate execution and the live similarity-to-WinDbg operation remain unvalidated;
-they are tracked separately from the completed Personal comparison acceptance.
+Ultimate execution remains unvalidated and tentative: Ultimate is unavailable due
+to cost, and purchasing it is not a requirement for Personal delivery. The live
+similarity-to-WinDbg operation remains a separate acceptance check.
 
 ## Summary
 
@@ -129,8 +130,8 @@ tool or worker-protocol changes are required.
 ## Validation and delivery
 
 1. Validate GUI export and external BinDiff on BN6 Personal using disposable PE
-   fixtures. Verify native provider discovery, sessions and cancellation separately
-   in Ultimate.
+   fixtures. Native provider discovery, sessions and cancellation stay tentative
+   until an Ultimate installation is available; they do not gate Personal delivery.
 2. Add offline tests for score preservation, competing matches, reversed result
    ownership, unmatched functions, pagination, text differences, and partial results.
 3. Test backend selection, missing/incompatible dependencies, exporter failures,
@@ -145,7 +146,34 @@ tool or worker-protocol changes are required.
 6. Run the companion's pytest, Ruff, transport/golden, and documentation checks.
    Build/check the helper and update existing PR descriptions. Personal release
    requires real GUI export and BinDiff execution; mocks alone do not establish it.
-   Track Ultimate acceptance independently.
+   Track Ultimate acceptance as tentative, independently of Personal delivery.
+
+### CVE-driven Personal acceptance
+
+The [MSRC patch-diff skill](../skills/msrc-patch-diff/SKILL.md) accepts a CVE,
+resolves a specific Windows product and architecture, records the current and
+previous non-preview releases, and acquires exact component binaries for external
+BinDiff. If both stable releases contain the fix, also compare the first fixed
+release with its applicable predecessor. Preserve MSRC/KB evidence, file hashes,
+PE identities and backend provenance; inferred component filenames remain candidates.
+
+Use a real run to extend the synthetic fixture acceptance with Windows component
+comparisons, unchanged-analysis checks and target navigation. Record each result
+with its capture; creating the skill or downloading binaries alone closes none of
+those checks. A suitable disposable WinDbg session can additionally validate the
+guarded read-only handoff and wrong-build refusal. Breakpoint/run-to and active
+cancellation/edit/rebase/close/quit checks still require their own recorded runs.
+Without a suitable loaded module, keep live handoff pending. Native Ultimate
+acceptance remains tentative.
+
+The [2026-09-09 CVE-driven capture](cve-patch-diff-acceptance.md) passed exact
+acquisition, a 525-match Personal comparison, unchanged analysis and target
+navigation on a real Windows component candidate. It did not identify the CVE fix
+or close live handoff/active-lifecycle acceptance.
+Its ARM64 follow-up recorded a partial secure-kernel comparison and a complete
+519-match vertdll comparison. Both preserved analysis hashes and navigated to the
+target, but failed strict generation stability; these captures do not close full
+ARM64 acceptance.
 
 ## Assumptions and defaults
 

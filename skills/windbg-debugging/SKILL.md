@@ -23,6 +23,7 @@ session of a workflow you haven't run yet in this environment.
 | Walk kernel pools or user Segment Heaps | [heap-walking.md](heap-walking.md) |
 | Record / open / navigate / analyze a `.run` trace | [ttd.md](ttd.md) |
 | Enumerate a driver's IOCTLs & test user-mode reachability | [driver-ioctl.md](driver-ioctl.md) |
+| Compare Windows component builds for an MSRC CVE with BN Personal | [MSRC patch-diff skill](../msrc-patch-diff/SKILL.md) |
 
 ## Tool map
 
