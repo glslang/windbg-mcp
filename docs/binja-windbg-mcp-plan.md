@@ -13,8 +13,10 @@ V1 supports driver analysis, navigation, and evidence capture. Breakpoint instal
 The [BN6 similarity extension plan](binja6-similarity-plan.md) specifies an optional
 Personal/external BinDiff and Ultimate/native feature for comparing two open PE builds, inspecting matches and disassembly
 differences, and navigating candidates into the existing guarded debugger workflow.
-The companion has automated coverage and real Personal GUI comparison acceptance; native Ultimate acceptance
-remains pending. The Personal companion remains supported.
+The companion has automated coverage and real Personal GUI comparison acceptance.
+Native Ultimate acceptance is tentative because Ultimate is unavailable due to cost;
+it does not gate Personal delivery. The [MSRC patch-diff skill](../skills/msrc-patch-diff/SKILL.md)
+provides the CVE-driven acquisition and comparison workflow.
 
 ## Native MCP integration (revised 2026-09-06)
 
