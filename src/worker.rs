@@ -57,8 +57,8 @@ use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
 use crate::batch::{self, BatchOp, Debuggee, Ran};
 use crate::driver::{
-    fmt_addr, format_recipe, format_report, listing_runs, parse_lm_base, parse_windbg_addr,
-    path_recipe, reachability,
+    fmt_addr, format_recipe, format_report, in_listing_order, listing_runs, parse_lm_base,
+    parse_windbg_addr, path_recipe, reachability,
 };
 use crate::fault;
 use crate::proto::{
@@ -6245,6 +6245,39 @@ fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, F
     ))
 }
 
+/// Why a bounded command stopped, as the walk reports it.
+///
+/// The two are kept apart because their remedies are, which is the same reason `Halt` has two
+/// variants at all: a deadline sends the caller to the call timeout, and a caller told "the call
+/// ran out of time" about a break they asked for themselves goes and raises a setting that was
+/// never the problem. dbgscope's own watchdog files nothing through the host handle, so
+/// `OnRequest` here is somebody's `interrupt` and nothing else.
+/// The watchdog budget for one of the walk's commands: what is left of the caller's clock, in ms,
+/// or `None` when there is nothing left to spend.
+///
+/// **Zero is never a budget**, and that is the whole reason this is a named function rather than a
+/// cast at the call site: `execute_command_bounded(cmd, 0)` arms no watchdog at all, so a walk
+/// whose remaining time rounds down to nothing would run the one command that can block for
+/// minutes as the single *unbounded* thing in it — reachable by sub-millisecond arithmetic alone.
+/// [`resolve_budget_ms`] answers the same hazard the other way, flooring at 1ms so its command
+/// runs and is cut short at once. Here `None` is better: a walk already past its deadline has a
+/// halt to report, and reporting it costs no engine call.
+fn walk_budget_ms(deadline: Instant, now: Instant) -> Option<u32> {
+    match u32::try_from(deadline.saturating_duration_since(now).as_millis()) {
+        Ok(0) => None,
+        Ok(ms) => Some(ms),
+        // Longer than a u32 of milliseconds is not a bound anyone set; spend what can be spent.
+        Err(_) => Some(u32::MAX),
+    }
+}
+
+fn halt_for(cut_short: Interruption) -> walk::Halt {
+    match cut_short {
+        Interruption::OnRequest => walk::Halt::Interrupted,
+        Interruption::Deadline { .. } => walk::Halt::Deadline,
+    }
+}
+
 fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result<String, String> {
     // Refused outright on an instruction set whose flow this build does not decode — ARM64
     // today, which this server otherwise supports (`src/target.rs`). Every instruction there
@@ -6313,11 +6346,43 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
     // handed to `reachability` separately and neither can see the other.
     let halted: std::cell::Cell<Option<walk::Halt>> = std::cell::Cell::new(None);
 
+    let expired = |e: &DebugEngine| -> Option<walk::Halt> {
+        if matches!(e.interrupted(), Ok(true)) {
+            Some(walk::Halt::Interrupted)
+        } else if Instant::now() >= deadline {
+            Some(walk::Halt::Deadline)
+        } else {
+            None
+        }
+    };
+
     let mut uf = |arg: &str| -> Option<Vec<Instruction>> {
-        let text = match e.execute_command(&format!("uf {arg}")) {
-            Ok(t) if t.contains('`') || t.contains(':') => t,
-            _ => return None,
+        // **The command carries the deadline, rather than being polled around.** A poll can only
+        // run between engine calls, and a `uf` blocked on a deferred symbol load blocks the one
+        // thread this session has — so a walk bounded only by its own polls outlives the call
+        // timeout, answers nobody, and pins the session for as long as the engine takes. Bounded,
+        // the watchdog Ctrl+Breaks it exactly as a human would and the walk reports a halt.
+        let Some(budget) = walk_budget_ms(deadline, Instant::now()) else {
+            halted.set(Some(expired(e).unwrap_or(walk::Halt::Deadline)));
+            return None;
         };
+        let run = match e.execute_command_bounded(&format!("uf {arg}"), budget) {
+            Ok(run) => run,
+            Err(_) => return None,
+        };
+        // A break is not a listing, whoever raised it. Recorded rather than returned as a short
+        // one: the output up to a Ctrl+Break is a *prefix* of the function, and a prefix walked as
+        // though it were the whole reads as a function that simply ends there.
+        if let Some(why) = run.cut_short {
+            halted.set(Some(halt_for(why)));
+            return None;
+        }
+        // A real `uf` lists backtick addresses or at least a `module!Func:` label; error text
+        // ("Couldn't resolve...", "no code") has neither, and prunes the branch.
+        let text = run.output;
+        if !text.contains('`') && !text.contains(':') {
+            return None;
+        }
         let listing: Vec<u64> = text
             .lines()
             .filter_map(|line| line.split_whitespace().next().and_then(parse_windbg_addr))
@@ -6338,16 +6403,6 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         // that becomes "could not disassemble `from`" against a symbol that was fine, and on the
         // last queued function it becomes a clean NOT REACHABLE claiming the graph was fully
         // explored. The reason goes in a cell the walk's own `halt` closure reads.
-        let expired = |e: &DebugEngine| -> Option<walk::Halt> {
-            if matches!(e.interrupted(), Ok(true)) {
-                Some(walk::Halt::Interrupted)
-            } else if Instant::now() >= deadline {
-                Some(walk::Halt::Deadline)
-            } else {
-                None
-            }
-        };
-
         let mut decoded: HashMap<u64, Instruction> = HashMap::new();
         for (start, count) in listing_runs(&listing) {
             if let Some(why) = expired(e) {
@@ -6382,15 +6437,10 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
                 decoded.insert(instruction.address, instruction);
             }
         }
-        // Emitted in the **listing's** order, not in address order. The walk takes the next
-        // element as an instruction's fall-through, and for a function split across regions
-        // those two orders are not the same.
-        Some(
-            listing
-                .iter()
-                .filter_map(|address| decoded.remove(address))
-                .collect(),
-        )
+        // Emitted in the **listing's** order and with a barrier wherever an address would not
+        // decode, both for reasons `in_listing_order` states: the order is what the walk reads a
+        // fall-through from, and a hole left in it invents an edge across whatever was missing.
+        Some(in_listing_order(&listing, &mut decoded))
     };
 
     // The interrupt is asked about first, for the reason `walk_memory`'s closure records: both
@@ -6460,6 +6510,52 @@ mod tests {
     use dbgscope::pool::WalkStalls;
 
     use super::*;
+
+    /// A budget that rounds down to nothing is not a budget, and must never reach the engine as
+    /// one.
+    ///
+    /// `execute_command_bounded(cmd, 0)` arms no watchdog, so the arithmetic that looks harmless —
+    /// a duration cast to milliseconds — is what would turn the last `uf` of a walk into the only
+    /// unbounded command in it, on precisely the call that had least time to spare. Sub-millisecond
+    /// remainders are the reachable case; a deadline already past is the obvious one.
+    #[test]
+    fn a_walk_budget_that_rounds_down_to_nothing_is_not_a_budget() {
+        let now = Instant::now();
+        assert_eq!(
+            walk_budget_ms(now, now),
+            None,
+            "nothing left is not zero ms"
+        );
+        assert_eq!(
+            walk_budget_ms(now - Duration::from_secs(1), now),
+            None,
+            "and neither is a deadline already behind us"
+        );
+        assert_eq!(
+            walk_budget_ms(now + Duration::from_micros(400), now),
+            None,
+            "a sub-millisecond remainder must refuse rather than disarm the watchdog"
+        );
+        assert_eq!(
+            walk_budget_ms(now + Duration::from_secs(30), now),
+            Some(30_000)
+        );
+    }
+
+    /// A break somebody asked for is not a deadline, and the walk must not report it as one.
+    ///
+    /// Both endings arrive as one `cut_short` on the bounded `uf`, and folding them together is
+    /// free to write and wrong in a way the caller pays for: told the call ran out of time, they
+    /// go and raise `WINDBG_MCP_CALL_TIMEOUT_SECS` over a break they raised themselves. It is the
+    /// same distinction `Halt` exists for, at the one seam where a bounded command reports it.
+    #[test]
+    fn a_break_the_caller_asked_for_is_not_reported_as_a_deadline() {
+        assert_eq!(halt_for(Interruption::OnRequest), walk::Halt::Interrupted);
+        assert_eq!(
+            halt_for(Interruption::Deadline { after_ms: 30_000 }),
+            walk::Halt::Deadline
+        );
+    }
 
     /// **"Searched and found nothing" is not "did not search", and only this reaches the mapping.**
     ///
@@ -6789,9 +6885,12 @@ mod tests {
     ///   deferral rather than a reason. It is a shared helper with three callers on three
     ///   different clocks (`disassemble`, `run_to_address`, `reachable`), two of which have no
     ///   patience to thread through it at all. `FOLLOWUPS.md` item 56.
-    /// - **`reachable`** — `lm m` and `uf`, up to `max_functions` of them in one job. A
-    ///   command-level bound is the wrong instrument: no individual `uf` is the problem.
-    ///   `FOLLOWUPS.md` item 13.
+    /// - **`reachable`** — `lm m <module>`, once, to rebase a `module`+`rva` target. A fixed
+    ///   command over the module table, run before the walk starts. Its `uf` sibling used to be
+    ///   here too, on the argument that no individual `uf` is the problem: that was wrong in the
+    ///   way a per-call bound exists to catch, since a `uf` blocked on a deferred symbol load
+    ///   blocks the one thread this session has, and no poll between calls can run while it does.
+    ///   It is `execute_command_bounded` on the remainder of the caller's clock now.
     ///
     /// Read from the source for `record::tests::this_module_never_writes_to_stdout`'s reason: the
     /// property is about what is *written*, and no runtime test can prove the absence of a call
@@ -6818,12 +6917,32 @@ mod tests {
                 enclosing = name.split(['(', '<']).next().unwrap_or(name);
             }
             // `execute_command_bounded` starts with the same text, so the open paren is what
-            // tells the two apart — which is also why a zero budget is invisible here and is
-            // `only_index_trace_runs_a_command_unbounded`'s half of the question.
+            // tells the two apart.
             if line.contains("execute_command(") {
                 sites.push(enclosing);
             }
         }
+
+        // **A zero budget arms no watchdog**, which makes it an unbounded command wearing the
+        // bounded call's name — and the count above cannot see it, since the two are told apart by
+        // spelling. This used to say the server-side test covered that half; it does not, and
+        // could not: it reads `server.rs` for ops, not this file for arguments. Every site here
+        // takes its budget from the caller's clock, and the two that could round down to nothing
+        // deal with it by name — `resolve_budget_ms` floors at 1ms, `walk_budget_ms` refuses to
+        // run the command at all.
+        // Comments are skipped, and both doc comments above are why: the hazard is *named* in the
+        // prose that explains why each site avoids it, so a scan that read them would fail on the
+        // documentation of the very rule it enforces.
+        let disarmed: Vec<&str> = code
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .filter(|line| line.contains("execute_command_bounded(") && line.contains(", 0)"))
+            .collect();
+        assert!(
+            disarmed.is_empty(),
+            "a bounded command with a zero budget runs unbounded: {disarmed:?}"
+        );
         let mut counted: Vec<(&str, usize)> = Vec::new();
         for site in sites {
             match counted.iter_mut().find(|(name, _)| *name == site) {
@@ -6838,7 +6957,7 @@ mod tests {
                 ("execute", 7),
                 ("kernel_report", 2),
                 ("pump_a_resume", 1),
-                ("reachable", 2),
+                ("reachable", 1),
                 ("resolve", 1),
             ],
             "an `Execute` with no watchdog is in a place this rule has not accounted for. Every              command a tool's op runs is bounded on the caller's clock (DECISIONS.md, 2026-08-02,              revised 2026-08-31); the sites above are the enumerated exceptions and the doc              comment says why each is one. Bound it, or add it here with its reason — including              when the count of an already-listed function goes up, which is a new unbounded              command inside a function that has some for other reasons."
