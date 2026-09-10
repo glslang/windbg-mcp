@@ -105,9 +105,19 @@ fn walk_function(block: &[Instruction], start: u64) -> Option<FnWalk> {
             }
         };
         match insn.flow {
-            // `Unreadable` stops the walk for the same reason a `ret` does: there is no
-            // instruction here, so there is nothing after it either.
-            Flow::Return | Flow::Trap | Flow::Unreadable => {}
+            // `Unreadable` stops for the same reason a `ret` does: there is no instruction here,
+            // so there is nothing after it either.
+            //
+            // **`Unknown` stops too, and the direction of that choice is the whole point.** It
+            // means an instruction is there and this build did not decode it, so whether it falls
+            // through is not known — and *assuming* it does invents an edge. On an instruction set
+            // that is not decoded at all every instruction is `Unknown`, which would make the
+            // whole listing one straight line and report REACHABLE for everything in it. This
+            // walk's contract is that REACHABLE is sound and NOT REACHABLE is best-effort within
+            // bounds, so an unknown edge has to cost the second and never the first. (A target
+            // whose set is not decoded is refused outright before the walk starts; this is the
+            // guard for the odd undecodable encoding on a set that otherwise is.)
+            Flow::Return | Flow::Trap | Flow::Unreadable | Flow::Unknown => {}
             Flow::Jmp(t) => {
                 // An unconditional jump has no fall-through, so an *indirect* one ends the path.
                 leave(insn.address, t, "jmp");
@@ -124,9 +134,7 @@ fn walk_function(block: &[Instruction], start: u64) -> Option<FnWalk> {
                     stack.push(n);
                 }
             }
-            // `Unknown` falls through with the rest: an instruction set this build does not
-            // decode still has an instruction there, and stopping would drop the function's tail.
-            Flow::Fallthrough | Flow::Unknown => {
+            Flow::Fallthrough => {
                 if let Some(n) = next {
                     stack.push(n);
                 }
@@ -1119,7 +1127,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         };
 
         // Continues past the instruction, and leaves no edge.
-        for flow in [Flow::Fallthrough, Flow::Unknown, Flow::Call(None)] {
+        for flow in [Flow::Fallthrough, Flow::Call(None)] {
             let (continues, external) = one(flow);
             assert!(
                 continues,
@@ -1128,8 +1136,17 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             assert!(external.is_empty(), "{flow:?} left an edge: {external:?}");
         }
 
-        // Stops, and leaves no edge.
-        for flow in [Flow::Return, Flow::Trap, Flow::Unreadable, Flow::Jmp(None)] {
+        // Stops, and leaves no edge. `Unknown` is here rather than above on purpose: an
+        // instruction this build did not decode might not fall through, and assuming it does
+        // invents an edge — which on an instruction set that is not decoded at all would make the
+        // whole listing one straight line and report REACHABLE for everything in it.
+        for flow in [
+            Flow::Return,
+            Flow::Trap,
+            Flow::Unreadable,
+            Flow::Unknown,
+            Flow::Jmp(None),
+        ] {
             let (continues, external) = one(flow);
             assert!(!continues, "{flow:?} should stop the walk");
             assert!(external.is_empty(), "{flow:?} left an edge: {external:?}");
