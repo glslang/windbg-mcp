@@ -463,10 +463,30 @@ fn find_path(
                 }
                 false
             }
-            Flow::Call(_) | Flow::Fallthrough => match next {
+            Flow::Fallthrough => match next {
                 Some(n) => dfs(block, idx, n, goal, visited, acc),
                 None => false,
             },
+            // A call whose target is **in this same listing** is an edge inside the function, and
+            // [`walk_function`] follows it as one — no call-path hop is recorded for it, because
+            // control never left. So the recipe has to follow it too: without this the DFS cannot
+            // reconstruct a route the walk proved, `find_path` answers `None`, and the segment is
+            // rendered from `unwrap_or_default()` as a recipe with *no conditions at all* —
+            // an empty list of gates presented as the complete set of them.
+            //
+            // The fall-through is tried first, which keeps every route this already found. A call
+            // gates nothing, so neither successor pushes a step: the branches on the way to it do.
+            Flow::Call(t) => {
+                if let Some(n) = next
+                    && dfs(block, idx, n, goal, visited, acc)
+                {
+                    return true;
+                }
+                match t.and_then(|t| idx.get(&t)) {
+                    Some(&j) => dfs(block, idx, j, goal, visited, acc),
+                    None => false,
+                }
+            }
         }
     }
     let start_i = *idx.get(&start)?;
@@ -1273,6 +1293,54 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         let (whole, none) = path_recipe("start", None, &rpt, |a| m.get(a).cloned(), never);
         assert_eq!(none, None);
         assert!(!format_recipe(&whole, none).contains("INCOMPLETE"));
+    }
+
+    /// The recipe follows a call whose target is in the same listing, because the walk does.
+    ///
+    /// `uf` lists every region of a function, so a direct `call` can land inside its own listing —
+    /// and [`walk_function`] treats that as an edge *within* the function: control never left, so
+    /// no call-path hop is recorded and the whole route stays in one segment. A recipe DFS that
+    /// followed only the fall-through could not reconstruct that route, and the failure is silent
+    /// in the worst way available: `find_path` answers `None`, `unwrap_or_default` turns it into an
+    /// empty step list, and a segment with **no conditions at all** renders as the complete set of
+    /// conditions for reaching the target. Here the only route runs through the call, so the
+    /// branch before it is a gate the caller must satisfy and an empty recipe would omit it.
+    #[test]
+    fn the_recipe_follows_a_call_that_stays_inside_the_listing() {
+        let m = functions(&[(
+            "start",
+            vec![
+                insn(0x1000, Flow::Fallthrough, "nop"),
+                insn(0x1004, Flow::Fallthrough, "cmp dword ptr [rdx+18h],222003h"),
+                insn(0x1008, Flow::Branch(Some(0x1020)), "jne A+0x20"),
+                insn(0x100c, Flow::Call(Some(0x1030)), "call A+0x30"),
+                insn(0x1010, Flow::Return, "ret"),
+                insn(0x1020, Flow::Return, "ret"),
+                // The callee, in the same listing: another region of the same function.
+                insn(0x1030, Flow::Fallthrough, "nop"),
+                insn(0x1034, Flow::Return, "ret"),
+            ],
+        )]);
+
+        let rpt = reachability("start", None, 0x1034, 256, 32, |a| m.get(a).cloned(), never);
+        assert!(rpt.verdict_reachable, "{rpt:?}");
+        assert!(
+            rpt.path.is_empty(),
+            "an in-listing call is not a hop, which is what puts the whole route in one segment"
+        );
+
+        let (recipes, stopped) = path_recipe("start", None, &rpt, |a| m.get(a).cloned(), never);
+        assert_eq!(stopped, None);
+        assert_eq!(recipes.len(), 1, "{recipes:?}");
+        let steps = &recipes[0].steps;
+        assert_eq!(
+            steps.len(),
+            1,
+            "the branch before the call is the gate; an empty recipe claims there is none: \
+             {steps:?}"
+        );
+        assert_eq!(steps[0].site, 0x1008);
+        assert_eq!(steps[0].required, Direction::Fallthrough);
     }
 
     /// A halt that lands *inside* the disassembler on the **final** segment still shortens the

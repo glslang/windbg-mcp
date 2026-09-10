@@ -269,21 +269,44 @@ pub fn read_image(
             });
         }
     };
-    // `SizeOfImage` and the data directories sit at different offsets in the two shapes, because
-    // PE32+ widens five fields between them.
-    let (size_of_image_at, directories_at) = match bitness {
-        Bitness::Bits32 => (optional + 56, optional + 96),
-        Bitness::Bits64 => (optional + 56, optional + 112),
+    // `SizeOfImage`, the directory count and the directories themselves sit at different offsets
+    // in the two shapes, because PE32+ widens five fields between them.
+    let (size_of_image_at, count_at, directories_at) = match bitness {
+        Bitness::Bits32 => (optional + 56, optional + 92, optional + 96),
+        Bitness::Bits64 => (optional + 56, optional + 108, optional + 112),
     };
+    // The optional header must be long enough to hold the fields read out of it, and
+    // `NumberOfRvaAndSizes` is the last of them in both shapes — so a header ending before it is
+    // not an optional header, and is refused rather than read. Its declared length is also where
+    // the **section table** begins, which is what makes a read past it a read of something else
+    // entirely rather than of a zero: a garbage directory count would otherwise be a section
+    // header's name.
+    let optional_end = optional + optional_size;
+    if optional_end < count_at + 4 {
+        return Err(PeError::NotAnImage {
+            reason: "the optional header is too short to hold its own fields",
+        });
+    }
     let size_of_image = u32(&headers, size_of_image_at)?;
-    let export_directory = (
-        u32(&headers, directories_at)?,
-        u32(&headers, directories_at + 4)?,
-    );
-    let import_directory = (
-        u32(&headers, directories_at + 8)?,
-        u32(&headers, directories_at + 12)?,
-    );
+
+    // **The data directories are declared, not assumed.** `NumberOfRvaAndSizes` says how many the
+    // image carries and `SizeOfOptionalHeader` says how much room there is for them; an entry is
+    // present only when both cover it. Read unconditionally, an undeclared entry is read out of
+    // the section table that begins immediately after the optional header — so a section header's
+    // `VirtualSize` and `VirtualAddress` become an import directory's RVA and size, and a valid
+    // image with no import directory is reported as importing whatever they spell. The smaller of
+    // the two bounds wins rather than their disagreement being an error: a header with no room for
+    // an entry does not contain one, whatever it declares, and that reading needs no guess.
+    let declared = u32(&headers, count_at)? as usize;
+    let directory = |index: usize| -> Result<(u32, u32), PeError> {
+        let entry = directories_at + index * 8;
+        if index >= declared || entry + 8 > optional_end {
+            return Ok((0, 0));
+        }
+        Ok((u32(&headers, entry)?, u32(&headers, entry + 4)?))
+    };
+    let export_directory = directory(0)?;
+    let import_directory = directory(1)?;
 
     if section_count > MAX_SECTIONS {
         return Err(PeError::Malformed {
@@ -575,6 +598,9 @@ mod tests {
         // Optional header at 0xf8 (0xe0 + 24), PE32+.
         put(&mut bytes, 0xf8, &0x20bu16.to_le_bytes()); // Magic
         put(&mut bytes, 0xf8 + 56, &0x4000u32.to_le_bytes()); // SizeOfImage
+        // NumberOfRvaAndSizes at 0xf8 + 108 = 0x164. Sixteen is what every real image writes, and
+        // a directory is only read when this says it is there.
+        put(&mut bytes, 0x164, &16u32.to_le_bytes());
         // Data directories at 0xf8 + 112 = 0x168: export is [0], import is [1].
         put(&mut bytes, 0x170, &0x2000u32.to_le_bytes()); // import rva
         put(&mut bytes, 0x174, &40u32.to_le_bytes()); // import size
@@ -709,6 +735,73 @@ mod tests {
         assert_eq!(
             read_imports(&image, |at, len| fake.read(at, len), || false).unwrap(),
             ImportTable::default()
+        );
+    }
+
+    /// An image that declares no data directories has none, and the section table is not one.
+    ///
+    /// `NumberOfRvaAndSizes` and `SizeOfOptionalHeader` both bound where the directories stop, and
+    /// what sits immediately after the optional header is the **section table** — so reading a
+    /// directory index unconditionally does not read a zero, it reads a section header. Here the
+    /// bytes that would be taken for the import directory are `.text`'s `VirtualSize` and
+    /// `VirtualAddress`, which spell a 4 KB directory naming 204 libraries: a perfectly valid
+    /// driver reported as malformed. Turn those two fields into a plausible descriptor table
+    /// instead and it is reported as importing functions it does not import.
+    #[test]
+    fn an_image_declaring_no_data_directories_has_none() {
+        let mut fake = driver_image();
+        // A PE32+ optional header carrying the standard fields and no directories at all: 112
+        // bytes, which puts the section table exactly where directory [0] used to be.
+        put(&mut fake.bytes, 0xf4, &112u16.to_le_bytes()); // SizeOfOptionalHeader
+        put(&mut fake.bytes, 0x164, &0u32.to_le_bytes()); // NumberOfRvaAndSizes
+        // The section table moves with it, to 0xe0 + 24 + 112 = 0x168.
+        let section = |bytes: &mut Vec<u8>, index: usize, name: &[u8], rva: u32| {
+            let at = 0x168 + index * 40;
+            put(bytes, at, name);
+            put(bytes, at + 8, &0x1000u32.to_le_bytes()); // VirtualSize
+            put(bytes, at + 12, &rva.to_le_bytes()); // VirtualAddress
+            put(bytes, at + 36, &0x6000_0020u32.to_le_bytes());
+        };
+        section(&mut fake.bytes, 0, b".text\0\0\0", 0x1000);
+        section(&mut fake.bytes, 1, b".rdata\0\0", 0x2000);
+        section(&mut fake.bytes, 2, b".data\0\0\0", 0x3000);
+
+        let image = read_image(BASE, |at, len| fake.read(at, len)).unwrap();
+        assert_eq!(
+            image.import_directory,
+            (0, 0),
+            "the first section header is not a data directory"
+        );
+        assert_eq!(image.export_directory, (0, 0));
+        assert_eq!(image.sections.len(), 3, "and the sections still read");
+        assert_eq!(
+            read_imports(&image, |at, len| fake.read(at, len), || false).unwrap(),
+            ImportTable::default(),
+            "a valid image with no import directory imports nothing, and is not malformed"
+        );
+
+        // The two bounds are independent, and this is the case where they disagree: a header
+        // declaring sixteen directories in a space with room for none. The count is not the last
+        // word — the room is — so the entry is still absent rather than read out of the section
+        // table behind it.
+        put(&mut fake.bytes, 0x164, &16u32.to_le_bytes());
+        let image = read_image(BASE, |at, len| fake.read(at, len)).unwrap();
+        assert_eq!(
+            image.import_directory,
+            (0, 0),
+            "a directory the header has no room for is not there, whatever it declares"
+        );
+
+        // And a header ending before `NumberOfRvaAndSizes` is not an optional header at all. Read
+        // anyway, the count itself would come out of the section table — here the four bytes of
+        // `.text`'s name — so this is refused rather than parsed around.
+        put(&mut fake.bytes, 0xf4, &108u16.to_le_bytes());
+        assert!(
+            matches!(
+                read_image(BASE, |at, len| fake.read(at, len)),
+                Err(PeError::NotAnImage { .. })
+            ),
+            "an optional header too short to hold its own fields is not one"
         );
     }
 
@@ -924,6 +1017,10 @@ mod tests {
         let mut fake = driver_image();
         put(&mut fake.bytes, 0xf8, &0x10bu16.to_le_bytes()); // PE32
         put(&mut fake.bytes, 0xe4, &0x014cu16.to_le_bytes()); // i386
+        // NumberOfRvaAndSizes moves with them, to 0xf8 + 92 = 0x154; the 64-bit slot is cleared
+        // for the same reason the directories below are.
+        put(&mut fake.bytes, 0x154, &16u32.to_le_bytes());
+        put(&mut fake.bytes, 0x164, &0u32.to_le_bytes());
         // Directories move to 0xf8 + 96 = 0x158, and the 64-bit slot is cleared, so a parser
         // reading the wrong one finds nothing rather than the right answer by accident.
         put(&mut fake.bytes, 0x158 + 8, &0x2000u32.to_le_bytes());
