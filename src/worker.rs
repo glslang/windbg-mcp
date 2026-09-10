@@ -1742,10 +1742,23 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             // walk that stops early reports NOT REACHABLE *with the reason attached* — which is
             // the same shape as hitting a bound, and already a thing a caller must read.
             let patience = Duration::from_millis(u64::from(args.patience_ms));
-            let deadline = Instant::now() + walk_budget(patience, queued).unwrap_or_default();
-            reachable(e, args, deadline)
-                .map(Output::text)
-                .map_err(Failed::from)
+            match walk_budget(patience, queued) {
+                Some(budget) => reachable(e, args, Instant::now() + budget)
+                    .map(Output::text)
+                    .map_err(Failed::from),
+                // Refused rather than attempted with nothing. An already-expired deadline halts
+                // before the seed is disassembled, which leaves `from_entry` unset — and that is
+                // reported as "could not disassemble `from`", sending the caller to check a symbol
+                // that was fine. The real cause is the clock, so say the clock.
+                None => Err(Failed::categorised(
+                    structured::ErrorCategory::NotRun,
+                    format!(
+                        "This reachability walk was not run: it reached the engine with {}s of                          its caller's timeout left, which is not enough to disassemble a function                          and report back before that timeout expires. Nothing was read. It waited                          {}s behind other work on this session; issue it when the session is                          idle, or raise the server's call timeout                          (WINDBG_MCP_CALL_TIMEOUT_SECS).",
+                        patience.saturating_sub(queued).as_secs(),
+                        queued.as_secs(),
+                    ),
+                )),
+            }
         }
         EngineOp::CrashTriage {
             frames,
@@ -6228,6 +6241,28 @@ fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, F
 }
 
 fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result<String, String> {
+    // Refused outright on an instruction set whose flow this build does not decode — ARM64
+    // today, which this server otherwise supports (`src/target.rs`). Every instruction there
+    // decodes to `Flow::Unknown`, and the walk stops at those, so the answer would be a NOT
+    // REACHABLE that says nothing: not "the graph was explored and it is not there" but "nothing
+    // could be read". An honest refusal beats a verdict shaped like an answer.
+    let set = e.instruction_set();
+    if !set.operands_are_read() {
+        // Named as the machine type an operator would recognise, not as a `Debug` rendering: the
+        // `0xaa64` in a refusal is searchable and `Other(43620)` is not.
+        let machine = match set {
+            dbgscope::dbgeng::InstructionSet::Other(machine) => format!("{machine:#06x}"),
+            other => format!("{other:?}"),
+        };
+        return Err(format!(
+            "this build decodes x86 and x64 instructions, and this target's are machine \
+             {machine} — so a reachability walk over it cannot follow control flow, and any \
+             verdict would be about what could not be read rather than about the target. \
+             Analysis that needs no flow is unaffected: modules, memory, stacks and `disassemble` \
+             all work here."
+        ));
+    }
+
     // Resolve the target VA: an absolute address, or module+RVA rebased against the module's
     // live base from `lm m <module>`. Both sides go through `resolve`, so a value pasted from
     // WinDbg — a `hi`lo` backtick address or a digit-only 32-bit address — reads consistently.
@@ -6280,8 +6315,21 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         // are contiguous inside a region, so a function is a handful of calls rather than one
         // per instruction. A gap wider than the longest x86 instruction starts a new run, which
         // is also what separates one region from the next.
+        // Polled between runs and between retries, not only once before the `uf`. One function
+        // can be many regions, and a listing whose grouped decodes miss many addresses adds a
+        // retry each — an unbounded number of engine calls between two of the walk's own polls,
+        // which is the bound this was supposed to add rather than move.
+        let expired =
+            |e: &DebugEngine| Instant::now() >= deadline || matches!(e.interrupted(), Ok(true));
+
         let mut decoded: HashMap<u64, Instruction> = HashMap::new();
         for (start, count) in listing_runs(&listing) {
+            if expired(e) {
+                // Pruned rather than returned half-decoded: a function missing instructions is a
+                // function missing edges, and the walk's own poll fires next and labels the
+                // report as halted rather than as a graph fully explored.
+                return None;
+            }
             decoded.extend(
                 e.disassemble(start, count)
                     .unwrap_or_default()
@@ -6296,6 +6344,9 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         // an edge or a target in the dropped part reads as NOT REACHABLE. Anything missing is
         // asked for on its own, which is the answer the ungrouped version would have given.
         for &address in &listing {
+            if expired(e) {
+                return None;
+            }
             if !decoded.contains_key(&address)
                 && let Ok(mut one) = e.disassemble(address, 1)
                 && let Some(instruction) = one.pop()

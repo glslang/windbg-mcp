@@ -318,8 +318,18 @@ pub fn read_imports(
         read(address, len).ok_or(PeError::Unreadable { at: address, len })
     };
 
-    let descriptors = at(directory, size.min(MAX_LIBRARIES as u32 * 20) as usize)?;
+    // Refused rather than truncated, which is this module's stated rule and was not followed
+    // here: reading the first `MAX_LIBRARIES` and returning `Ok` drops the rest in silence, and a
+    // hazard scan reading that concludes a dangerous import is absent when it is merely past the
+    // cut. A plausible image does not have this many.
+    if size as usize / 20 > MAX_LIBRARIES {
+        return Err(PeError::Malformed {
+            reason: "the import directory names more libraries than an image plausibly has",
+        });
+    }
+    let descriptors = at(directory, size as usize)?;
     let mut table = ImportTable::default();
+    let mut terminated = false;
     for index in 0..(descriptors.len() / 20) {
         if halt() {
             return Err(PeError::Interrupted);
@@ -330,6 +340,7 @@ pub fn read_imports(
         let iat = u32(&descriptors, offset + 16)?;
         // The table ends at an all-zero descriptor.
         if lookup == 0 && name_rva == 0 && iat == 0 {
+            terminated = true;
             break;
         }
         let library = read_c_string(name_rva, &mut at)?;
@@ -374,6 +385,13 @@ pub fn read_imports(
                 slot,
             });
         }
+    }
+    // A directory that ran out before its null descriptor is one whose size does not describe it,
+    // and the libraries past the end are exactly the ones a truncating read would have dropped.
+    if !terminated {
+        return Err(PeError::Malformed {
+            reason: "the import directory ends without a null descriptor",
+        });
     }
     Ok(table)
 }
@@ -636,6 +654,39 @@ mod tests {
             table.unnamed_libraries,
             vec!["ntoskrnl.exe".to_string()],
             "the library must be reported, not dropped: {table:?}"
+        );
+    }
+
+    /// An import directory that overruns its bound is refused, not truncated.
+    ///
+    /// Reading the first `MAX_LIBRARIES` and returning `Ok` drops the rest in silence, and a
+    /// hazard scan reading that concludes a dangerous import is absent when it is merely past the
+    /// cut. Same for a directory whose size runs out before its null descriptor: the libraries
+    /// past the end are exactly the ones a truncating read would have lost.
+    #[test]
+    fn an_import_directory_that_overruns_its_bound_is_refused() {
+        // A size claiming far more descriptors than an image plausibly has.
+        let mut oversized = driver_image();
+        put(&mut oversized.bytes, 0x174, &(20u32 * 4096).to_le_bytes());
+        let image = read_image(BASE, |at, len| oversized.read(at, len)).unwrap();
+        assert!(
+            matches!(
+                read_imports(&image, |at, len| oversized.read(at, len), || false),
+                Err(PeError::Malformed { .. })
+            ),
+            "an oversized directory must not read as a short one"
+        );
+
+        // A size that stops before the null descriptor: exactly one descriptor, no terminator.
+        let mut unterminated = driver_image();
+        put(&mut unterminated.bytes, 0x174, &20u32.to_le_bytes());
+        let image = read_image(BASE, |at, len| unterminated.read(at, len)).unwrap();
+        assert!(
+            matches!(
+                read_imports(&image, |at, len| unterminated.read(at, len), || false),
+                Err(PeError::Malformed { .. })
+            ),
+            "a directory with no terminator inside its size must not read as complete"
         );
     }
 
