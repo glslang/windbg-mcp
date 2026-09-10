@@ -4420,11 +4420,14 @@ impl WindbgServer {
     /// concrete static path exists, and the call path is reported); "NOT REACHABLE"
     /// means only that the block was not found within the bounds — indirect calls
     /// through function pointers and unresolved compiler jump tables are NOT followed.
-    #[rmcp::tool(annotations(
-        title = "Test reachability from IOCTL dispatch",
-        read_only_hint = true,
-        open_world_hint = true
-    ))]
+    #[rmcp::tool(
+        annotations(
+            title = "Test reachability from IOCTL dispatch",
+            read_only_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::Reachability>>()
+    )]
     async fn reachable_from_dispatch(
         &self,
         Parameters(args): Parameters<ReachabilityArgs>,
@@ -4438,7 +4441,10 @@ impl WindbgServer {
             if let Some(value) = value
                 && let Err(e) = reject_command_breakers(field, value, Quotes::Rejected)
             {
-                return tool_error(e);
+                // `typed_error`, not `tool_error`: this tool declares an `outputSchema` now, so
+                // every result it returns has to carry `structuredContent` — a refusal included,
+                // or a caller branching on `category` gets prose instead.
+                return typed_error(ErrorCategory::InvalidArgument, e, args.session_id.clone());
             }
         }
         // Refused rather than raised. Zero is meaningful for `max_depth` — "this function and no
@@ -4447,11 +4453,13 @@ impl WindbgServer {
         // "could not disassemble `from`", sending someone to check a symbol that was fine. The
         // two fields differ here for that reason and not by oversight.
         if args.max_functions == Some(0) {
-            return tool_error(
+            return typed_error(
+                ErrorCategory::InvalidArgument,
                 "`max_functions` must be at least 1: the walk counts the seed function itself, \
                  so a budget of zero explores nothing and can say nothing about the target. To \
                  ask for the seed and no callee, pass `max_depth: 0`."
                     .to_string(),
+                args.session_id.clone(),
             );
         }
         let out = self
@@ -4476,7 +4484,10 @@ impl WindbgServer {
                 }),
             )
             .await;
-        engine_result(out)
+        // `engine_result_for`, not `engine_result`: this tool routes by `session_id`, and a
+        // failure that does not name the session it was aimed at is one a caller holding several
+        // cannot place. Plain text had no field for it to go missing from; the typed result does.
+        engine_result_for(args.session_id.as_deref(), out)
     }
 }
 

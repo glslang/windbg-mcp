@@ -2128,6 +2128,212 @@ pub struct InstructionInfo {
     pub text: String,
 }
 
+/// One address of a reachability answer, with the coordinate that survives a reboot.
+///
+/// Every address `reachable_from_dispatch` reports comes back in this shape, for the reason
+/// `docs/coordinates.md` gives: a bare virtual address is a fact about one boot of one machine,
+/// and everything a caller might do next with it — open the image in a disassembler, compare
+/// against a previous run, ask another tool — needs the module and the offset instead.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CodeLocation {
+    /// The virtual address, as the debugger would print it.
+    pub address: String,
+    /// The image holding it, or absent if it is in none — code in a pool allocation, a driver
+    /// that has unloaded. Travels with [`Self::rva`]: either both are there or neither is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+    /// Its offset from that module's load base — the half that survives a rebase. Absent exactly
+    /// when [`Self::module`] is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rva: Option<String>,
+    /// True when the engine's module lookup **failed**, rather than answering that no module
+    /// holds this address. The same distinction as [`InstructionInfo::attribution_failed`], and
+    /// kept for the same reason: one is about the target, the other is a call that did not answer.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub attribution_failed: bool,
+}
+
+/// One image named by the locations of an answer, with the identity they are joined in.
+///
+/// **Carried once per image rather than on every address**, which is the same split
+/// [`InstructionInfo`] makes and for a sharper reason here: a reachability answer is a *list* of
+/// addresses — a call path, and a recipe with a step per branch — and a real driver's walk names
+/// the same two or three images across dozens of them. The identity is 150-odd bytes of GUID,
+/// timestamp and size, so repeating it per address costs kilobytes to say one thing several dozen
+/// times. A location carries the module name, and this says what that name means.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ImageRef {
+    /// The name a location's `module` field holds — the `nt` in `nt!KeBugCheckEx`.
+    pub module: String,
+    /// The image's own file name (`ntkrnlmp.exe`).
+    pub image_name: String,
+    /// The `TimeDateStamp` + `SizeOfImage` pair a symbol server is keyed by, and the PDB
+    /// signature where the engine resolved one. This is the half that says *which build*, and a
+    /// decompilation of the wrong one is a silent wrong answer rather than an error.
+    pub identity: ImageIdentity,
+}
+
+/// Whether a static path from the dispatch routine to the target exists.
+///
+/// The two are **not** symmetric, and a caller must not read them as a boolean. `Reachable` is
+/// sound: a concrete path was found and is reported. `NotReachable` is best-effort within
+/// everything that bounded the walk, which is why the fields beside it say what those were.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReachabilityVerdict {
+    Reachable,
+    NotReachable,
+}
+
+/// Why a walk gave up before exhausting the graph it was bounded to.
+///
+/// Distinct from a bound being hit, because the remedies are: a bound is raised on the next call,
+/// a deadline means the *call* ran out of patience, and an interrupt means somebody asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WalkHalt {
+    Deadline,
+    Interrupted,
+}
+
+/// How control left one function for the next on the path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HopKind {
+    Call,
+    Jmp,
+}
+
+/// One step of the call path: where control left, how, and where it went.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReachabilityHop {
+    pub site: CodeLocation,
+    pub kind: HopKind,
+    pub callee: CodeLocation,
+}
+
+/// Which way an on-path conditional branch has to go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BranchDirection {
+    /// Control goes to the branch's target.
+    Taken,
+    /// Control continues at the next instruction.
+    Fallthrough,
+}
+
+/// The `IO_STACK_LOCATION` field a predicate's memory operand likely reads.
+///
+/// **Heuristic, and inferred from a displacement alone** — the same `+0x18`/`+0x10`/`+0x08`
+/// mapping `ioctl_trace` encodes. A field named here is a hint about what a compare is testing,
+/// not a fact read out of a structure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum IoStackField {
+    IoControlCode,
+    InputBufferLength,
+    OutputBufferLength,
+}
+
+/// The flag-setting instruction feeding an on-path branch, decoded as far as it can be.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BranchPredicate {
+    /// The compare as the debugger renders it — `cmp dword ptr [rdx+18h],222003h`.
+    pub raw: String,
+    /// What the memory operand's displacement suggests it reads. See [`IoStackField`]: a hint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<IoStackField>,
+    /// The immediate it tests against, where the compare has one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// The relation that holds in the required direction — `==`, `!=`, `>=`. Absent when the
+    /// setter is one whose relation to a `jcc` this does not claim to derive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relation: Option<String>,
+    /// True when the setter is bitwise (`test`/`and`), so the condition is
+    /// `(field & value) relation 0` rather than `field relation value`. The difference is not
+    /// cosmetic: `test x,m; jne` means *any* of those bits, and reading it as an equality gives a
+    /// caller an input that does not take the branch.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub mask: bool,
+}
+
+/// One on-path conditional branch and the direction that keeps control on the path.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BranchStep {
+    pub site: CodeLocation,
+    /// The branch mnemonic — `je`, `jne`, `jae`.
+    pub jcc: String,
+    pub required: BranchDirection,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<BranchPredicate>,
+}
+
+/// The recipe for one function on the path: the branch decisions between where the function is
+/// entered and where control leaves it toward the target.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct RecipeSegment {
+    pub start: CodeLocation,
+    /// Where this segment routes to — the call or jump site to the next hop, or the target.
+    pub goal: CodeLocation,
+    /// The branches to satisfy, in path order. Empty means straight-line, not unknown.
+    pub steps: Vec<BranchStep>,
+}
+
+/// What a reachability walk found, as values.
+///
+/// The text rendering is unchanged and travels beside this. Two things about reading it. The
+/// verdict is asymmetric — see [`ReachabilityVerdict`] — and there are **three** independent
+/// reasons a `not_reachable` may be incomplete, each with its own remedy: a work bound
+/// ([`Self::bound_hit`]), a time or interrupt stop ([`Self::stopped`]), and instructions the walk
+/// could not see past ([`Self::blind_stops`]).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Reachability {
+    pub verdict: ReachabilityVerdict,
+    /// Every image the locations below name, in the order they were first reached. A location
+    /// carries a module name and an RVA; this is where that name's identity lives.
+    pub images: Vec<ImageRef>,
+    /// The entry of the function the walk started from, after the debugger resolved `from`.
+    ///
+    /// Absent only for a walk whose seed never disassembled, which the tool reports as an error
+    /// rather than as a verdict -- so a caller reading a result at all will find it here. It is an
+    /// `Option` rather than a zero because a coordinate nothing produced is worse than a field
+    /// nothing filled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<CodeLocation>,
+    /// The target, after the debugger resolved `address` or `module`+`rva`.
+    pub target: CodeLocation,
+    /// The entry of the function holding the target. Present only on a `reachable` verdict.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub containing_function: Option<CodeLocation>,
+    /// Seed to target, one entry per function left. Empty on a `reachable` verdict means the
+    /// target is inside the start function; on a `not_reachable` one it means nothing.
+    pub path: Vec<ReachabilityHop>,
+    pub functions_explored: usize,
+    pub max_functions: usize,
+    pub max_depth_reached: usize,
+    pub max_depth: usize,
+    /// Whether a work bound stopped the walk short of the graph. Raise the bounds and retry.
+    pub bound_hit: bool,
+    /// Why the walk stopped early, when it did. Outranks [`Self::bound_hit`] in what it means:
+    /// a walk that ran out of time did not explore the graph it was *bounded* to either.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<WalkHalt>,
+    /// How many reachable instructions the walk could not see past — bytes that would not read,
+    /// or an encoding this build does not decode. Nonzero means the explored graph has holes in
+    /// it, and the remedy is an image rather than a larger bound or a longer clock.
+    pub blind_stops: usize,
+    /// One segment per function on the path. Absent when the caller asked for no recipe, or when
+    /// the verdict is `not_reachable` and there is no path to describe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<Vec<RecipeSegment>>,
+    /// Why the *recipe* was cut short, which can differ from [`Self::stopped`]: the walk and the
+    /// recipe pass are bounded separately, and a recipe missing its last segment is a prefix
+    /// rather than a shorter version of the whole.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipe_stopped: Option<WalkHalt>,
+}
+
 /// What `!analyze -v` concluded, kept separate from the values above because it is a heuristic.
 ///
 /// Every field is `!analyze`'s own, extracted from its summary block. They are here because they

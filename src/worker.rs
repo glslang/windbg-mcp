@@ -58,7 +58,7 @@ use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 use crate::batch::{self, BatchOp, Debuggee, Ran};
 use crate::driver::{
     fmt_addr, format_recipe, format_report, in_listing_order, listing_runs, parse_lm_base,
-    parse_windbg_addr, path_recipe, reachability,
+    parse_windbg_addr, path_recipe, reachability, structured_report,
 };
 use crate::fault;
 use crate::proto::{
@@ -1743,9 +1743,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             // the same shape as hitting a bound, and already a thing a caller must read.
             let patience = Duration::from_millis(u64::from(args.patience_ms));
             match walk_budget(patience, queued) {
-                Some(budget) => reachable(e, args, Instant::now() + budget)
-                    .map(Output::text)
-                    .map_err(Failed::from),
+                Some(budget) => reachable(e, args, Instant::now() + budget).map_err(Failed::from),
                 // Refused rather than attempted with nothing. An already-expired deadline halts
                 // before the seed is disassembled, which leaves `from_entry` unset — and that is
                 // reported as "could not disassemble `from`", sending the caller to check a symbol
@@ -3611,6 +3609,122 @@ fn exception_triage(e: &DebugEngine, frames: usize, scan_stack: bool) -> Result<
 /// bound on a *search*, so being generous costs reads and being mean costs answers; this errs
 /// generous, and `scan_stack: false` is the way out for a caller who wants neither.
 const STACK_SCAN_SPAN: u64 = 0x10000;
+
+/// Turns addresses into image coordinates, asking the engine **once per module** rather than once
+/// per address.
+///
+/// The cache is one module, not a map, and that is not a compromise. Everything this attributes is
+/// a *walk*: a disassembly is a contiguous range, and a call path is a driver's own routines with
+/// an occasional hop into `nt`. So the address in hand is nearly always inside the module the last
+/// one was in, and a containment test is arithmetic where `module_at` is a call into the engine. A
+/// coordinate costs a second call for the PDB identity, which is the same argument again — asked
+/// once per module, it is nothing; asked per address, a hundred-address path would be two hundred
+/// engine calls for one repeated answer.
+///
+/// **Correctness does not rest on the guess.** An address outside the module in hand re-asks, so
+/// the cache can only ever save a call, never change an answer.
+#[derive(Default)]
+struct Attributor {
+    held: Option<(dbgscope::dbgeng::Module, structured::ImageIdentity)>,
+    /// Every image a location has named, in the order first reached — the other half of the
+    /// coordinate, kept here rather than repeated on each address.
+    seen: Vec<structured::ImageRef>,
+}
+
+impl Attributor {
+    /// The address as a coordinate: module, image identity and RVA, or none of them.
+    ///
+    /// Three outcomes and not two. A coordinate is the ordinary one; `None` with
+    /// `attribution_failed` false says the engine placed this address in no loaded image, which is
+    /// a finding about the target — a pool allocation, an unloaded driver, a corrupted address —
+    /// and `attribution_failed` says the lookup itself did not answer, which is not.
+    fn locate(&mut self, e: &DebugEngine, address: u64) -> structured::CodeLocation {
+        let inside = |(module, _): &(dbgscope::dbgeng::Module, structured::ImageIdentity)| {
+            address >= module.base && address < module.end()
+        };
+        let mut attribution_failed = false;
+        if !self.held.as_ref().is_some_and(inside) {
+            self.held = match e.module_at(address) {
+                Ok(Some(module)) => {
+                    let identity = self.identity(e, &module);
+                    Some((module, identity))
+                }
+                Ok(None) => None,
+                Err(why) => {
+                    tracing::debug!("worker: could not attribute {address:#x}: {why}");
+                    attribution_failed = true;
+                    None
+                }
+            };
+        }
+        // An unloaded module has no name to qualify anything with, exactly as in a stack walk, so
+        // it carries no coordinate either — `module` is what a coordinate is joined by.
+        let named = self
+            .held
+            .as_ref()
+            .filter(|(module, _)| !module.name.is_empty());
+        // Recorded once per image rather than on every address. See `structured::ImageRef`: a
+        // real driver's path and its recipe name the same two or three images across dozens of
+        // locations, and an identity is 150-odd bytes of GUID, timestamp and size.
+        if let Some((module, identity)) = named
+            && !self.seen.iter().any(|seen| seen.module == module.name)
+        {
+            self.seen.push(structured::ImageRef {
+                module: module.name.clone(),
+                image_name: module
+                    .image_name
+                    .rsplit(['\\', '/'])
+                    .next()
+                    .unwrap_or("")
+                    .to_string(),
+                identity: identity.clone(),
+            });
+        }
+        structured::CodeLocation {
+            address: structured::addr(address),
+            module: named.map(|(module, _)| module.name.clone()),
+            // `saturating_sub`, as the stack walk's is: the base is the engine's and the address
+            // is the walk's, and an underflow would print a 16-exabyte offset rather than fail —
+            // the sort of number nobody double-checks.
+            rva: named.map(|(module, _)| format!("{:#x}", address.saturating_sub(module.base))),
+            attribution_failed,
+        }
+    }
+
+    /// The images every location so far has named, in the order first reached.
+    fn images(self) -> Vec<structured::ImageRef> {
+        self.seen
+    }
+
+    /// The image identity for one module: the timestamp and size a symbol server is keyed by, plus
+    /// the PDB signature where the engine has resolved one.
+    ///
+    /// The PDB half is asked only of a module whose symbols are already PDB-backed, which is
+    /// [`with_pdb_identity`]'s rule and for its reason: a call per module is cheap, and a call that
+    /// will answer nothing is not worth making. A failure costs this one field — a coordinate must
+    /// not be lost over the provenance of the symbols beside it.
+    fn identity(
+        &self,
+        e: &DebugEngine,
+        module: &dbgscope::dbgeng::Module,
+    ) -> structured::ImageIdentity {
+        use dbgscope::dbgeng::SymbolKind;
+        let pdb = matches!(module.symbols, SymbolKind::Pdb | SymbolKind::Dia)
+            .then(|| match e.module_pdb(module.base) {
+                Ok(pdb) => pdb.map(structured::PdbInfo::from).map(Into::into),
+                Err(why) => {
+                    tracing::debug!("worker: no PDB identity for {}: {why}", module.name);
+                    None
+                }
+            })
+            .flatten();
+        structured::ImageIdentity {
+            timestamp: module.timestamp,
+            size: u64::from(module.size),
+            pdb,
+        }
+    }
+}
 
 /// The current thread's stack, each frame attributed to the module holding it, and whether the
 /// stack went on past `frames`.
@@ -6278,7 +6392,7 @@ fn halt_for(cut_short: Interruption) -> walk::Halt {
     }
 }
 
-fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result<String, String> {
+fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result<Output, String> {
     // Refused outright on an instruction set whose flow this build does not decode — ARM64
     // today, which this server otherwise supports (`src/target.rs`). Every instruction there
     // decodes to `Flow::Unknown`, and the walk stops at those, so the answer would be a NOT
@@ -6506,11 +6620,28 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
     // On a REACHABLE verdict, re-walk the path functions to emit the directional recipe (which
     // branch each on-path `jcc` must take, and what it tests).
     let mut out = format_report(&rpt);
-    if rpt.verdict_reachable && args.recipe {
+    let recipe = (rpt.verdict_reachable && args.recipe).then(|| {
         let (recipes, stopped) = path_recipe(&args.from, seed_start, &rpt, &mut uf, &mut halt);
         out.push_str(&format_recipe(&recipes, stopped));
-    }
-    Ok(out)
+        (recipes, stopped)
+    });
+
+    // Both halves from the one `Report`, neither derived from the other. The text is what it has
+    // always been, verbatim, because a caller reading it has a walkthrough written against it; the
+    // values are for a caller that will do something with the answer. Deriving either from the
+    // other is how the two come to disagree about a figure.
+    let mut attributor = Attributor::default();
+    let mut report = structured_report(
+        &rpt,
+        recipe
+            .as_ref()
+            .map(|(segments, stopped)| (segments.as_slice(), *stopped)),
+        |address| attributor.locate(e, address),
+    );
+    // Assigned after, because it is what the closure above *learned*: which images the walk ended
+    // up naming is not known until every address has been through it.
+    report.images = attributor.images();
+    Ok(Output::typed(out, report))
 }
 
 #[cfg(test)]
