@@ -6289,6 +6289,20 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
                     .map(|instruction| (instruction.address, instruction)),
             );
         }
+        // **Grouping is an optimisation, and this is what keeps it from being an assumption.**
+        // A run decodes forward from its first address, so any listed address the run did not
+        // land on — a grouping that merged two regions, an entry that is not an instruction
+        // boundary from that start — would otherwise be dropped from the function silently, and
+        // an edge or a target in the dropped part reads as NOT REACHABLE. Anything missing is
+        // asked for on its own, which is the answer the ungrouped version would have given.
+        for &address in &listing {
+            if !decoded.contains_key(&address)
+                && let Ok(mut one) = e.disassemble(address, 1)
+                && let Some(instruction) = one.pop()
+            {
+                decoded.insert(instruction.address, instruction);
+            }
+        }
         // Emitted in the **listing's** order, not in address order. The walk takes the next
         // element as an instruction's fall-through, and for a function split across regions
         // those two orders are not the same.

@@ -152,8 +152,10 @@ fn walk_function(block: &[Instruction], start: u64) -> Option<FnWalk> {
 /// goes backwards. Sixteen bytes is the longest an x86 instruction can be, which makes the test
 /// "could this plausibly be the next instruction" rather than a tuning knob.
 pub(crate) fn listing_runs(addresses: &[u64]) -> Vec<(u64, usize)> {
-    /// The longest an x86 instruction can be.
-    const REACH: u64 = 16;
+    /// The longest an x86 instruction can be. **Fifteen**, not sixteen: two regions starting
+    /// exactly sixteen bytes apart are not contiguous, and merging them makes the run's second
+    /// entry decode from the wrong place.
+    const REACH: u64 = 15;
 
     let mut runs: Vec<(u64, usize)> = Vec::new();
     let mut previous: Option<u64> = None;
@@ -635,6 +637,7 @@ pub(crate) fn format_recipe(recipes: &[SegmentRecipe]) -> String {
 
 /// Outcome of a reachability walk. `verdict_reachable` is sound (a concrete static
 /// path exists); a false verdict is best-effort within the explored bounds.
+#[derive(Debug)]
 pub(crate) struct Report {
     pub(crate) verdict_reachable: bool,
     /// Resolved entry of the `from` function (None if `from` didn't disassemble).
@@ -989,6 +992,39 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         );
     }
 
+    /// `max_depth: 0` means this function and no callee, and a floor clamp destroys that.
+    ///
+    /// The walk enters the seed at depth 0 and refuses `depth > max_depth`, so zero is a
+    /// meaningful bound rather than a mistake to correct. Widening it to 1 reports REACHABLE for a
+    /// target in a direct callee — outside the bound the caller asked for, and with no sign in the
+    /// answer that the request was changed.
+    #[test]
+    fn a_depth_of_zero_keeps_the_walk_inside_the_seed() {
+        let m = functions(&[
+            (
+                "start",
+                uf_fn(
+                    0x1000,
+                    vec![insn(0x1004, Flow::Call(Some(0x2000)), "call A!B")],
+                ),
+            ),
+            (
+                "0x2000",
+                uf_fn(0x2000, vec![insn(0x2004, Flow::Return, "ret")]),
+            ),
+        ]);
+
+        // Depth 0: the callee is enqueued at depth 1 and refused, so its body is out of reach.
+        let bounded = reachability("start", None, 0x2004, 256, 0, |a| m.get(a).cloned(), never);
+        assert!(!bounded.verdict_reachable, "{bounded:?}");
+        assert!(bounded.bound_hit);
+        assert_eq!(bounded.funcs_explored, 1);
+
+        // Depth 1 reaches it, which is what makes the line above a bound rather than an accident.
+        let wider = reachability("start", None, 0x2004, 256, 1, |a| m.get(a).cloned(), never);
+        assert!(wider.verdict_reachable, "{wider:?}");
+    }
+
     /// The runs a real `uf` listing groups into, and where its gaps actually are.
     ///
     /// The addresses are lifted verbatim from `uf mountmgr!MountMgrDeviceControl` on a 26100
@@ -1036,6 +1072,20 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         assert_eq!(
             listing_runs(&[0xfffff805_5ec04d49, 0xfffff805_5ec04e88]),
             vec![(0xfffff805_5ec04d49, 1), (0xfffff805_5ec04e88, 1)]
+        );
+
+        // Exactly sixteen bytes apart is **not** contiguous: the longest x86 instruction is
+        // fifteen. Merging them would make the run's second entry decode from the wrong place,
+        // and the worker would then find nothing at the address it was asked about.
+        assert_eq!(
+            listing_runs(&[0x1000, 0x1010]),
+            vec![(0x1000, 1), (0x1010, 1)],
+            "sixteen bytes is one too far for one instruction"
+        );
+        assert_eq!(
+            listing_runs(&[0x1000, 0x100f]),
+            vec![(0x1000, 2)],
+            "fifteen is reachable, and the longest that is"
         );
 
         // A backwards step is a new run too — nothing guarantees a listing is monotonic.
