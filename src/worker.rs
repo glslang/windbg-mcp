@@ -56,15 +56,17 @@ use dbgscope::pool::{
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
 use crate::batch::{self, BatchOp, Debuggee, Ran};
+use crate::driver::{
+    fmt_addr, format_recipe, format_report, parse_lm_base, parse_windbg_addr, path_recipe,
+    reachability,
+};
 use crate::fault;
 use crate::proto::{
     EngineOp, Failed, HeapBackendFilter, HeapOp, HeapStateFilter, Interrupted, MAX_MODULE_ROWS,
     Output, PoolOp, ReachabilityOp, SymbolPathSetting, TargetOrigin, WorkerMessage, WorkerRequest,
 };
 use crate::server::{
-    EXEC_WAIT_MS, fmt_addr, format_recipe, format_report, hexdump, matches_module_pattern,
-    module_pattern, parse_eval, parse_lm_base, parse_u64, parse_windbg_addr, path_recipe,
-    reachability,
+    EXEC_WAIT_MS, hexdump, matches_module_pattern, module_pattern, parse_eval, parse_u64,
 };
 use crate::structured;
 use crate::target::{Arch, Opening};
