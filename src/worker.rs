@@ -6445,8 +6445,8 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
     // branch each on-path `jcc` must take, and what it tests).
     let mut out = format_report(&rpt);
     if rpt.verdict_reachable && args.recipe {
-        let recipes = path_recipe(&args.from, seed_start, &rpt, &mut uf, &mut halt);
-        out.push_str(&format_recipe(&recipes));
+        let (recipes, stopped) = path_recipe(&args.from, seed_start, &rpt, &mut uf, &mut halt);
+        out.push_str(&format_recipe(&recipes, stopped));
     }
     Ok(out)
 }
